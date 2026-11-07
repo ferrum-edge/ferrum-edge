@@ -524,17 +524,19 @@ deferred while that generation is pinned. A cancelled, timed-out, or failed
 future before any protected mutation is dispatched starts bounded,
 owner-qualified mutex cleanup and releases the generation pin when cleanup
 settles. A cancellation after a mutation was dispatched has an uncertain write
-outcome, so Ferrum retains both the MongoDB mutex document and the process-local
-connection pin instead of deleting the fence from `Drop`. Verify the durable
-write outcome, stop or restart that admin process, and only then remove the exact
-owner-qualified mutex document. Definitive server rejections (including a
+outcome, so Ferrum retains the MongoDB mutex document instead of deleting the
+fence from `Drop`, and records an explicit process-local **admission fence**
+for that namespace (issue #7031). See
+[Retained mTLS DNS admission fences](#retained-mtls-dns-admission-fences).
+Definitive server rejections (including a
 duplicate-key loser) and definitively aborted transactions explicitly settle
 and release the mutex; they do not create a permanent operator-recovery fence.
 A settled operation also releases its process-local connection-generation pin
 when owner-qualified mutex cleanup fails or loses its acknowledgement. The
 durable document remains fail-closed when it still exists, cleanup status is
-logged for operator recovery, and reconnect/failover can recover the process;
-only an uncertain protected mutation retains both the fence and local pin.
+logged for operator recovery, and reconnect/failover can recover the process.
+An uncertain protected mutation retains the durable mutex and the namespace
+fence, but not the connection-generation pin.
 Cleanup that runs *after* a confirmed commit never changes the response: the
 release is logged (namespace and lock label only) and the durable result is
 still reported as success, so an all-or-nothing `POST /batch` cannot answer
@@ -549,10 +551,64 @@ rotated mTLS identity from a stale full-Consumer snapshot.
 If a replica-set clear returns `UnknownTransactionCommitResult`, an immediate
 read that still sees the pre-restore resource counts does not prove abort: the
 delayed commit can become visible later on another pooled connection. Ferrum
-therefore retains the owner-qualified fence and generation pin for manual
-recovery instead of admitting writes that the delayed clear could erase.
+therefore retains the owner-qualified fence and the namespace admission fence
+for manual recovery instead of admitting writes that the delayed clear could
+erase.
 
 Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time: a cross-shard write transaction cannot create a collection implicitly, and concurrent first writes inside transactions can conflict.
+
+#### Retained mTLS DNS admission fences
+
+A dispatched mutation whose outcome is unknown (cancelled future, network,
+write-concern, or `UnknownTransactionCommitResult` error) may still commit.
+While that is possible this process must not admit a conflicting mTLS DNS
+identity into the same namespace — on the original topology, or on any
+topology a later reconnect or failover publishes, where the durable mutex
+document may be absent. Ferrum therefore keeps a per-namespace fence:
+
+- The fence is recorded before the guard's `connection_generation` read pin is
+  released, and every admission checks it while holding its own generation pin.
+  mTLS DNS admissions for the fenced namespace (single writes, batch, restore,
+  namespace rename/delete) fail closed with a redacted `503` on every topology.
+  Other namespaces are unaffected.
+- The fence does **not** pin the connection generation, so primary reconnect
+  and `FERRUM_DB_FAILOVER_URLS` failover keep working. (Earlier builds held the
+  generation pin for the rest of the process, so one ambiguous write disabled
+  failover until restart.)
+- A multi-step guard (restore / clear + replay) whose borrowed mutation became
+  uncertain is converted into the same fence when its owner releases or
+  abandons it. A *settled* multi-step guard hands its generation pin to a
+  cancellation-safe cleanup state before awaiting the owner-qualified lock
+  delete: if that delete errors, or the release is cancelled (for example by
+  the Admin 5-second cleanup timeout, which is shorter than the driver's
+  default server selection), the generation pin is still released and the
+  namespace is fenced (`uncertain_cleanup`) because the lock may still exist.
+- **Exit:** verify the write outcome, then remove the exact owner-qualified
+  document from `mtls_dns_admission_locks` on the original database. The next
+  admission attempt for the namespace re-verifies each retained fence with a
+  majority, primary read through the **original** connection bundle (one
+  shared 5-second deadline for the whole pass over that namespace's retained
+  fences, before the generation pin is taken) and clears it only when the
+  owner-qualified document is proven absent. A probe error, timeout, or a
+  still-present document keeps the fence; absence on a different failover
+  topology never clears it. No restart is required. If the original topology is
+  permanently gone, the fence stays until the process is restarted after
+  operator reconciliation.
+- **Known limitation:** the exit probe always requests `readConcern:
+  "majority"` so a delete that could still roll back never clears a fence. A
+  deployment that rejects majority read concern (some MongoDB-compatible
+  services, or a primary-secondary-arbiter replica set with
+  `enableMajorityReadConcern: false`) makes every probe unverifiable, so its
+  fences clear only when the process restarts after operator reconciliation.
+  Reconnect and failover are unaffected.
+- **Visibility:** authenticated `/health` reports
+  `database.mtls_dns_admission_fence` (`fenced`, `retained_fences`,
+  `namespaces`, `oldest_retained_since_unix_ms`) while any fence is retained,
+  and `/metrics` exports the
+  `ferrum_database_mtls_dns_admission_fences_retained` gauge.
+
+The fence is process-local; other admin processes are fenced only by the
+durable mutex document on the topology they are connected to.
 
 ## Managed Services
 

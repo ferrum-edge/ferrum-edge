@@ -1108,6 +1108,9 @@ pub struct MetricsRegistry {
     /// read-only mode. Counted only on real admission attempts, not on
     /// observe-only health probes.
     admin_read_only_rejected_mutations: AtomicU64,
+    /// Process-local mTLS DNS admission fences currently retained by config
+    /// stores after an uncertain protected mutation outcome (issue #7031).
+    mtls_dns_admission_fences_retained: AtomicU64,
     /// `request_mirror` detached tasks admitted past concurrency + byte budgets.
     request_mirror_dispatched: AtomicU64,
     /// `request_mirror` tasks that fully drained a response (any status) within bounds.
@@ -1397,6 +1400,7 @@ impl MetricsRegistry {
                 DashMap::with_shard_amount(shards)
             }),
             admin_read_only_rejected_mutations: AtomicU64::new(0),
+            mtls_dns_admission_fences_retained: AtomicU64::new(0),
             request_mirror_dispatched: AtomicU64::new(0),
             request_mirror_completed: AtomicU64::new(0),
             request_mirror_request_timeouts: AtomicU64::new(0),
@@ -2182,6 +2186,32 @@ impl MetricsRegistry {
         self.admin_read_only_rejected_mutations
             .store(0, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// One mTLS DNS admission fence became retained (issue #7031). State
+    /// transitions are rare, so the cached body is invalidated immediately.
+    pub fn record_mtls_dns_admission_fence_retained(&self) {
+        self.mtls_dns_admission_fences_retained
+            .fetch_add(1, Ordering::Relaxed);
+        self.render_cache.store(Arc::new(None));
+    }
+
+    /// One retained mTLS DNS admission fence was cleared (saturating).
+    pub fn record_mtls_dns_admission_fence_cleared(&self) {
+        let _ = self.mtls_dns_admission_fences_retained.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+        self.render_cache.store(Arc::new(None));
+    }
+
+    /// Current retained mTLS DNS admission fence count.
+    // Test-crate-only; dead code in the BIN target.
+    #[allow(dead_code)]
+    pub fn mtls_dns_admission_fences_retained(&self) -> u64 {
+        self.mtls_dns_admission_fences_retained
+            .load(Ordering::Relaxed)
     }
 
     // Test-crate-only; dead code in the BIN target.
@@ -5279,6 +5309,17 @@ impl MetricsRegistry {
             output.push_str(&format!("# TYPE {name} counter\n"));
             render_process_counter(&mut output, name, value, &ns_label);
         }
+        output.push_str(
+            "# HELP ferrum_database_mtls_dns_admission_fences_retained mTLS DNS admission fences retained in this process after an uncertain protected config-store mutation outcome. Admissions for a fenced namespace fail closed; reconnect and failover are not blocked.\n",
+        );
+        output.push_str("# TYPE ferrum_database_mtls_dns_admission_fences_retained gauge\n");
+        render_process_counter(
+            &mut output,
+            "ferrum_database_mtls_dns_admission_fences_retained",
+            self.mtls_dns_admission_fences_retained
+                .load(Ordering::Relaxed),
+            &ns_label,
+        );
         output.push_str(
             "# HELP ferrum_admin_read_only_rejected_mutations_total Admin configuration mutations refused because the Admin API is in read-only mode.\n",
         );

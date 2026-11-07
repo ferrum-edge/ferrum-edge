@@ -509,6 +509,30 @@ impl Default for DbFailoverTopologyStatus {
     }
 }
 
+/// Bounded snapshot of process-local mTLS DNS admission fences (issue #7031).
+///
+/// A fence is retained when a dispatched protected mutation inside an mTLS
+/// DNS admission has an uncertain outcome (cancelled future, network or
+/// write-concern error). While retained, mTLS DNS admissions for the fenced
+/// namespaces fail closed in this process on every topology; reconnect and
+/// failover are NOT blocked. Exposed on authenticated `/health` detail only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MtlsDnsAdmissionFenceStatus {
+    /// Retained fence entries (one per uncertain guard owner).
+    pub retained_fences: usize,
+    /// Sorted, de-duplicated fenced namespaces.
+    pub namespaces: Vec<String>,
+    /// Unix epoch milliseconds of the oldest retained entry.
+    pub oldest_retained_since_unix_ms: Option<u64>,
+}
+
+impl MtlsDnsAdmissionFenceStatus {
+    /// `true` while at least one namespace is fenced.
+    pub fn fenced(&self) -> bool {
+        self.retained_fences > 0
+    }
+}
+
 /// Opaque Admin API mutation pin of the active config-store write topology.
 ///
 /// Holding this value retains a shared read lock on the backend reconnect
@@ -2273,6 +2297,23 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
 
     /// Record an Admin mutation admitted while the failover topology is pinned.
     fn note_failover_admin_write(&self) {}
+
+    /// Process-local mTLS DNS admission fences retained after an uncertain
+    /// protected mutation outcome (issue #7031). Default: none, for backends
+    /// whose admission fence is only the durable lock row.
+    fn mtls_dns_admission_fence_status(&self) -> MtlsDnsAdmissionFenceStatus {
+        MtlsDnsAdmissionFenceStatus::default()
+    }
+
+    /// Hand off a multi-step admission guard that its caller is abandoning
+    /// with an uncertain mutation outcome (it will never call
+    /// [`Self::release_mtls_dns_admission_guard`]). The backend must keep the
+    /// durable fence and fail closed for the namespace, but must not keep a
+    /// process-wide reconnect pin for the guard. Synchronous: called from
+    /// `Drop`. Default no-op.
+    fn retain_uncertain_mtls_dns_admission_guard(&self, namespace: &str, guard_owner: &str) {
+        let _ = (namespace, guard_owner);
+    }
 
     /// Acquire a mutation-only pin of the current write topology.
     ///

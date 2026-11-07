@@ -16841,6 +16841,8 @@ components:
                       type: integer
             failover_topology:
               $ref: "#/components/schemas/DatabaseFailoverTopology"
+            mtls_dns_admission_fence:
+              $ref: "#/components/schemas/DatabaseMtlsDnsAdmissionFence"
         fips:
           type: object
           description: |
@@ -19227,6 +19229,43 @@ components:
           description: |
             Credential-free redaction of the active DB URL (`redact_url`).
             Never contains userinfo.
+
+    DatabaseMtlsDnsAdmissionFence:
+      type: object
+      description: |
+        Authenticated `/health` detail only. Present while this gateway process
+        retains at least one MongoDB mTLS DNS admission fence: a protected
+        config-store mutation inside an mTLS DNS admission was dispatched and
+        its outcome is uncertain (cancelled, network, write-concern, or
+        unknown-commit-result error), so it may still commit. While fenced,
+        mTLS DNS admissions for the listed namespaces fail closed with 503 in
+        this process on every topology; other namespaces are unaffected and
+        reconnect/failover are NOT blocked. Exit: verify the write outcome,
+        then remove the owner-qualified `mtls_dns_admission_locks` document on
+        the original database; the next admission attempt for the namespace
+        re-verifies against the original connection and clears the fence. The
+        fence is process-local and is not coordinated across gateway replicas.
+        Mirrored by the `ferrum_database_mtls_dns_admission_fences_retained`
+        gauge.
+      required: [fenced, retained_fences, namespaces]
+      properties:
+        fenced:
+          type: boolean
+          description: Always `true` when the object is present.
+        retained_fences:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Retained fence entries (one per uncertain guard owner).
+        namespaces:
+          type: array
+          description: Sorted, de-duplicated namespaces whose mTLS DNS admissions are fenced.
+          items:
+            type: string
+        oldest_retained_since_unix_ms:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when the oldest retained fence was recorded.
 
     DatabaseDeltaPollingHealth:
       type: object

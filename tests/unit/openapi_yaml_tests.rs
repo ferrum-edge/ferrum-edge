@@ -11554,6 +11554,54 @@ fn health_failover_topology_and_admin_writes_openapi_parity() {
 }
 
 #[test]
+fn health_mtls_dns_admission_fence_openapi_parity() {
+    // Issue #7031: authenticated /health exposes retained Mongo mTLS DNS
+    // admission fences under `database.mtls_dns_admission_fence`.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let fence = json!({
+        "fenced": true,
+        "retained_fences": 1,
+        "namespaces": ["ferrum"],
+        "oldest_retained_since_unix_ms": 1_700_000_000_000u64
+    });
+    assert_component_validity(&spec, "DatabaseMtlsDnsAdmissionFence", &fence, true);
+    assert_component_validity(
+        &spec,
+        "DatabaseMtlsDnsAdmissionFence",
+        &json!({ "fenced": true, "retained_fences": 1 }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "database": {
+                "status": "connected",
+                "type": "mongodb",
+                "mtls_dns_admission_fence": fence
+            }
+        }),
+        true,
+    );
+
+    let desc = spec["components"]["schemas"]["DatabaseMtlsDnsAdmissionFence"]["description"]
+        .as_str()
+        .expect("DatabaseMtlsDnsAdmissionFence description");
+    assert!(
+        desc.contains("fail closed") && desc.contains("NOT blocked"),
+        "fence schema must document fail-closed admission without blocking reconnect/failover"
+    );
+    assert!(
+        desc.contains("Authenticated `/health` detail only"),
+        "fence schema must stay in the authenticated detail tier"
+    );
+}
+
+#[test]
 fn no_proxy_runtime_metrics_snapshot_is_covered_by_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, which the H1/H2 handshake already stripped. Both frontends now use
   one shared predicate; H3 still replaces `Early-Data` itself and drops
   pseudo-headers.
+- **One ambiguous MongoDB mTLS DNS admission write no longer disables
+  reconnect and failover** (#7031). A cancelled or uncertain protected
+  mutation used to keep a `connection_generation` read pin for the life of the
+  process, so every later MongoDB reconnect or `FERRUM_DB_FAILOVER_URLS`
+  failover failed fast until restart. It now retains an explicit
+  per-namespace admission fence instead: mTLS DNS admissions for that
+  namespace keep failing closed on every topology, while reconnect and
+  failover proceed. After an operator verifies the write outcome and removes
+  the owner-qualified `mtls_dns_admission_locks` document, the next admission
+  attempt re-verifies through the original connection and clears the fence
+  without a restart. Retained fences appear on authenticated `/health`
+  (`database.mtls_dns_admission_fence`) and as the
+  `ferrum_database_mtls_dns_admission_fences_retained` gauge.
 - **Admin restore keeps its mTLS DNS fence on a half-restored namespace**
   (#7032). The restore's "multi-phase restore is incomplete" hold shared one
   state with per-mutation tracking, so a completed import that returned
