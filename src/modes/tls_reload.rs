@@ -80,66 +80,36 @@ pub fn prepare_proxy_frontend_tls(
     crls: &CrlList,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> ProxyFrontendTlsReloadHandles {
-    if !env_config.frontend_tls_live_reload_enabled {
-        return ProxyFrontendTlsReloadHandles {
-            slot: None,
-            accepted_slot: None,
-            revision_rx: None,
-            watcher_handle: None,
-        };
-    }
-
-    let (Some(cert_path), Some(key_path)) = (
-        env_config.frontend_tls_cert_path.clone(),
-        env_config.frontend_tls_key_path.clone(),
-    ) else {
-        // Live reload requested but no cert/key configured — defensive
-        // no-op. The caller's listener startup path would have already
-        // skipped HTTPS for the same reason.
-        info!(
-            "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but no frontend cert/key configured; live reload disabled"
-        );
-        return ProxyFrontendTlsReloadHandles {
-            slot: None,
-            accepted_slot: None,
-            revision_rx: None,
-            watcher_handle: None,
-        };
+    let unarmed = || ProxyFrontendTlsReloadHandles {
+        slot: None,
+        accepted_slot: None,
+        revision_rx: None,
+        watcher_handle: None,
     };
-    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
-    let key_source = CertSource::parse(key_path, MaterialKind::Key);
-    let client_ca_source = env_config
-        .frontend_tls_client_ca_bundle_path
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::CaBundle));
-    let ocsp_source = env_config
-        .frontend_tls_ocsp_response_source
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::Ocsp));
-    let crl_source = env_config
-        .tls_crl_file_path
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::Crl));
-    let watched_sources = frontend_watched_sources(
-        &cert_source,
-        &key_source,
-        client_ca_source.as_ref(),
-        ocsp_source.as_ref(),
-        crl_source.as_ref(),
-    );
-    if !watched_sources
-        .iter()
-        .any(|source| source_is_refreshable(&source.source))
-    {
-        info!(
-            "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but frontend TLS sources are static inline material; live reload disabled for proxy HTTPS"
-        );
-        return ProxyFrontendTlsReloadHandles {
-            slot: None,
-            accepted_slot: None,
-            revision_rx: None,
-            watcher_handle: None,
-        };
+    let FrontendTlsSources {
+        cert: cert_source,
+        key: key_source,
+        client_ca: client_ca_source,
+        ocsp: ocsp_source,
+        watched: watched_sources,
+    } = match frontend_live_reload_sources(env_config, FrontendTlsListener::Proxy) {
+        FrontendLiveReloadSources::Disabled => return unarmed(),
+        FrontendLiveReloadSources::NoCertificate => {
+            // Live reload requested but no cert/key configured — defensive
+            // no-op. The caller's listener startup path would have already
+            // skipped HTTPS for the same reason.
+            info!(
+                "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but no frontend cert/key configured; live reload disabled"
+            );
+            return unarmed();
+        }
+        FrontendLiveReloadSources::StaticInline => {
+            info!(
+                "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but frontend TLS sources are static inline material; live reload disabled for proxy HTTPS"
+            );
+            return unarmed();
+        }
+        FrontendLiveReloadSources::Refreshable(sources) => *sources,
     };
 
     // Arm this listener family's client-trust generation from the material the
@@ -325,8 +295,10 @@ fn build_proxy_rebuild_fn(
 /// predicates before it ever looks at the accepted candidate: the process-wide
 /// opt-in, a configured cert/key pair, and at least one watched source that is
 /// actually refreshable (an all-inline-PEM configuration is static, so no
-/// generation can ever be published for it). This is exactly those three, kept
-/// in one place so `modes::startup_security::proxy_frontend_handshake_scope`
+/// generation can ever be published for it). Both this predicate and
+/// `prepare_proxy_frontend_tls` read those three from the one classifier,
+/// `frontend_live_reload_sources`, so
+/// `modes::startup_security::proxy_frontend_handshake_scope`
 /// cannot install the live handshake wrapper — and with it empty
 /// CertificateRequest CA-name hints for TLS 1.2 clients — on a listener where
 /// nothing will ever be armed.
@@ -339,78 +311,116 @@ fn build_proxy_rebuild_fn(
 /// at all, so there are no CA-name hints to lose and no mTLS resumption to
 /// suppress.
 pub fn proxy_frontend_live_reload_can_arm(env_config: &EnvConfig) -> bool {
-    if !env_config.frontend_tls_live_reload_enabled {
-        return false;
-    }
-    let (Some(cert_path), Some(key_path)) = (
-        env_config.frontend_tls_cert_path.clone(),
-        env_config.frontend_tls_key_path.clone(),
-    ) else {
-        return false;
-    };
-    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
-    let key_source = CertSource::parse(key_path, MaterialKind::Key);
-    let client_ca_source = env_config
-        .frontend_tls_client_ca_bundle_path
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::CaBundle));
-    let ocsp_source = env_config
-        .frontend_tls_ocsp_response_source
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::Ocsp));
-    let crl_source = env_config
-        .tls_crl_file_path
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::Crl));
-    frontend_watched_sources(
-        &cert_source,
-        &key_source,
-        client_ca_source.as_ref(),
-        ocsp_source.as_ref(),
-        crl_source.as_ref(),
+    matches!(
+        frontend_live_reload_sources(env_config, FrontendTlsListener::Proxy),
+        FrontendLiveReloadSources::Refreshable(_)
     )
-    .iter()
-    .any(|source| source_is_refreshable(&source.source))
 }
 
 /// [`proxy_frontend_live_reload_can_arm`] for the admin HTTPS listener. Same
-/// three configuration predicates over the `FERRUM_ADMIN_TLS_*` sources, so
+/// three configuration predicates over the `FERRUM_ADMIN_TLS_*` sources, from
+/// the same shared classifier, so
 /// `modes::startup_security::admin_https_handshake_scope` and
 /// [`prepare_admin_frontend_tls`] cannot disagree about whether the `AdminHttps`
 /// scope can ever be armed.
 pub fn admin_frontend_live_reload_can_arm(env_config: &EnvConfig) -> bool {
+    matches!(
+        frontend_live_reload_sources(env_config, FrontendTlsListener::Admin),
+        FrontendLiveReloadSources::Refreshable(_)
+    )
+}
+
+/// The frontend listener whose `EnvConfig` fields a live-reload source set is
+/// read from. The proxy (`FERRUM_FRONTEND_TLS_*`) and admin
+/// (`FERRUM_ADMIN_TLS_*`) listeners own separate cert/key/client-CA/OCSP
+/// settings; they share only the process-wide CRL source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontendTlsListener {
+    Proxy,
+    Admin,
+}
+
+/// One listener's live-reload sources, each parsed with the [`MaterialKind`]
+/// of the field it came from (issue #5959: a CA field parsed as `Cert`
+/// refuses a valid `#ca` reference).
+struct FrontendTlsSources {
+    cert: CertSource,
+    key: CertSource,
+    client_ca: Option<CertSource>,
+    ocsp: Option<CertSource>,
+    /// Every source the watcher polls, CRL included, in watch order.
+    watched: Vec<WatchedMaterialSource>,
+}
+
+/// Whether a listener's frontend TLS live reload can arm, decided from
+/// configuration alone. [`prepare_proxy_frontend_tls`] /
+/// [`prepare_admin_frontend_tls`] and the `*_live_reload_can_arm` predicates
+/// that `modes::startup_security` builds the handshake scope from all classify
+/// through [`frontend_live_reload_sources`], so they cannot disagree about
+/// whether a listener can ever publish a client-trust generation.
+enum FrontendLiveReloadSources {
+    /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` is off.
+    Disabled,
+    /// The listener has no cert/key pair configured.
+    NoCertificate,
+    /// Every watched source is static inline PEM, so nothing can ever change.
+    StaticInline,
+    /// At least one watched source is refreshable. Boxed so the dataless
+    /// verdicts stay small (`clippy::large_enum_variant`).
+    Refreshable(Box<FrontendTlsSources>),
+}
+
+fn frontend_live_reload_sources(
+    env_config: &EnvConfig,
+    listener: FrontendTlsListener,
+) -> FrontendLiveReloadSources {
     if !env_config.frontend_tls_live_reload_enabled {
-        return false;
+        return FrontendLiveReloadSources::Disabled;
     }
-    let (Some(cert_path), Some(key_path)) = (
-        env_config.admin_tls_cert_path.clone(),
-        env_config.admin_tls_key_path.clone(),
-    ) else {
-        return false;
+    let (cert_path, key_path, client_ca_path, ocsp_source) = match listener {
+        FrontendTlsListener::Proxy => (
+            &env_config.frontend_tls_cert_path,
+            &env_config.frontend_tls_key_path,
+            &env_config.frontend_tls_client_ca_bundle_path,
+            &env_config.frontend_tls_ocsp_response_source,
+        ),
+        FrontendTlsListener::Admin => (
+            &env_config.admin_tls_cert_path,
+            &env_config.admin_tls_key_path,
+            &env_config.admin_tls_client_ca_bundle_path,
+            &env_config.admin_tls_ocsp_response_source,
+        ),
     };
-    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
-    let key_source = CertSource::parse(key_path, MaterialKind::Key);
-    let client_ca_source = env_config
-        .admin_tls_client_ca_bundle_path
+    let (Some(cert_path), Some(key_path)) = (cert_path.clone(), key_path.clone()) else {
+        return FrontendLiveReloadSources::NoCertificate;
+    };
+    let cert = CertSource::parse(cert_path, MaterialKind::Cert);
+    let key = CertSource::parse(key_path, MaterialKind::Key);
+    let client_ca = client_ca_path
         .clone()
         .map(|source| CertSource::parse(source, MaterialKind::CaBundle));
-    let ocsp_source = env_config
-        .admin_tls_ocsp_response_source
+    let ocsp = ocsp_source
         .clone()
         .map(|source| CertSource::parse(source, MaterialKind::Ocsp));
-    let crl_source = env_config
+    let crl = env_config
         .tls_crl_file_path
         .clone()
         .map(|source| CertSource::parse(source, MaterialKind::Crl));
-    frontend_watched_sources(
-        &cert_source,
-        &key_source,
-        client_ca_source.as_ref(),
-        ocsp_source.as_ref(),
-        crl_source.as_ref(),
-    )
-    .iter()
-    .any(|source| source_is_refreshable(&source.source))
+    let watched =
+        frontend_watched_sources(&cert, &key, client_ca.as_ref(), ocsp.as_ref(), crl.as_ref());
+    if !watched
+        .iter()
+        .any(|source| source_is_refreshable(&source.source))
+    {
+        return FrontendLiveReloadSources::StaticInline;
+    }
+    FrontendLiveReloadSources::Refreshable(Box::new(FrontendTlsSources {
+        cert,
+        key,
+        client_ca,
+        ocsp,
+        watched,
+    }))
 }
 
 fn frontend_watched_sources(
@@ -474,54 +484,29 @@ pub fn prepare_admin_frontend_tls(
     crls: &CrlList,
     shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> AdminFrontendTlsReloadHandles {
-    if !env_config.frontend_tls_live_reload_enabled {
-        return AdminFrontendTlsReloadHandles {
-            slot: None,
-            watcher_handle: None,
-        };
-    }
-
-    let (Some(cert_path), Some(key_path)) = (
-        env_config.admin_tls_cert_path.clone(),
-        env_config.admin_tls_key_path.clone(),
-    ) else {
-        return AdminFrontendTlsReloadHandles {
-            slot: None,
-            watcher_handle: None,
-        };
+    let unarmed = || AdminFrontendTlsReloadHandles {
+        slot: None,
+        watcher_handle: None,
     };
-    let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
-    let key_source = CertSource::parse(key_path, MaterialKind::Key);
-    let client_ca_source = env_config
-        .admin_tls_client_ca_bundle_path
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::CaBundle));
-    let ocsp_source = env_config
-        .admin_tls_ocsp_response_source
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::Ocsp));
-    let crl_source = env_config
-        .tls_crl_file_path
-        .clone()
-        .map(|source| CertSource::parse(source, MaterialKind::Crl));
-    let watched_sources = frontend_watched_sources(
-        &cert_source,
-        &key_source,
-        client_ca_source.as_ref(),
-        ocsp_source.as_ref(),
-        crl_source.as_ref(),
-    );
-    if !watched_sources
-        .iter()
-        .any(|source| source_is_refreshable(&source.source))
-    {
-        info!(
-            "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but admin TLS sources are static inline material; live reload disabled for admin HTTPS"
-        );
-        return AdminFrontendTlsReloadHandles {
-            slot: None,
-            watcher_handle: None,
-        };
+    let FrontendTlsSources {
+        cert: cert_source,
+        key: key_source,
+        client_ca: client_ca_source,
+        ocsp: ocsp_source,
+        watched: watched_sources,
+    } = match frontend_live_reload_sources(env_config, FrontendTlsListener::Admin) {
+        // Unlike the proxy surface, a missing admin cert/key pair is silent:
+        // admin HTTPS is simply not configured.
+        FrontendLiveReloadSources::Disabled | FrontendLiveReloadSources::NoCertificate => {
+            return unarmed();
+        }
+        FrontendLiveReloadSources::StaticInline => {
+            info!(
+                "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true but admin TLS sources are static inline material; live reload disabled for admin HTTPS"
+            );
+            return unarmed();
+        }
+        FrontendLiveReloadSources::Refreshable(sources) => *sources,
     };
 
     // Same arming contract as the proxy surface, on the admin trust domain
