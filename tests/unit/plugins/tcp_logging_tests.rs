@@ -858,3 +858,56 @@ fn tls_source_diagnostics_distinguish_io_invalid_source_and_size() {
         }
     }
 }
+
+/// `tls_no_verify` must use the shared `crate::tls::NoVerifier`, whose
+/// advertised signature schemes are the active crypto provider's (the FIPS
+/// provider on a FIPS build), and must warn that verification is disabled, as
+/// `ws_logging` and `ldap_auth` do. A private verifier with a hard-coded scheme
+/// list advertised schemes (ED448, ECDSA P-521) the provider cannot verify.
+#[test]
+fn tls_no_verify_advertises_provider_schemes_and_warns() {
+    let provider = ferrum_edge::fips::base_crypto_provider();
+    let _ = rustls::crypto::CryptoProvider::install_default(provider.clone());
+    let (logs, _guard) = super::plugin_utils::capture_logs();
+
+    let config = ferrum_edge::_test_support::crl_enforcing_outbound_client_config_for_test(
+        "tcp_logging",
+        true,
+        None,
+        &[],
+    )
+    .expect("no-verify TCP logging client config");
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut client = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+        .expect("client connection");
+    let mut client_hello = Vec::new();
+    client.write_tls(&mut client_hello).expect("ClientHello");
+
+    let mut acceptor = rustls::server::Acceptor::default();
+    acceptor
+        .read_tls(&mut client_hello.as_slice())
+        .expect("read ClientHello");
+    let accepted = acceptor
+        .accept()
+        .map_err(|_| "ClientHello must parse")
+        .unwrap()
+        .expect("complete ClientHello");
+    let mut advertised = accepted.client_hello().signature_schemes().to_vec();
+    let mut expected = provider
+        .signature_verification_algorithms
+        .supported_schemes();
+    advertised.sort_by_key(|scheme| u16::from(*scheme));
+    expected.sort_by_key(|scheme| u16::from(*scheme));
+    assert_eq!(
+        advertised, expected,
+        "no-verify must advertise exactly the provider's verification schemes"
+    );
+
+    assert!(
+        logs.contents()
+            .contains("TCP logging TLS certificate verification DISABLED"),
+        "no-verify must warn: {}",
+        logs.contents()
+    );
+}
