@@ -445,14 +445,13 @@ plugin_configs: []
     )
 }
 
-/// Issue #6022: a native gRPC upload the request-buffer budget cannot admit,
+/// Issue #6022: a native gRPC upload the request-buffer budget cannot cover,
 /// refused at a backend-dispatch seam (here the Unix-socket body preparation),
 /// is a Trailers-Only `RESOURCE_EXHAUSTED`, not a bare `503` its client would
-/// read as `UNAVAILABLE`. The upload's retained ceiling
-/// (`max_grpc_recv_size_bytes`, 1 GiB) is larger than the whole request-buffer
-/// budget (256 MiB by default; the in-process gateway never resizes it), so the
-/// refusal is deterministic and comes before any byte is read or the socket is
-/// dialed.
+/// read as `UNAVAILABLE`. The budget is charged by the bytes an upload
+/// retains, so the test holds every free block of the in-process gateway's
+/// process-global budget: the upload's first growth is refused, before the
+/// socket is dialed.
 #[test]
 #[ignore]
 fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
@@ -557,6 +556,8 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
         .header("te", "trailers")
         .body(())
         .expect("request");
+    let held_budget = ferrum_edge::_test_support::exhaust_process_request_buffer_budget_for_test()
+        .expect("hold the free request-buffer budget");
     let (response, mut upload) = client.send_request(request, false).expect("open RPC");
     let message = Bytes::from_static(&[0, 0, 0, 0, 4, b'p', b'i', b'n', b'g']);
     upload.send_data(message, true).expect("unary message");
@@ -564,6 +565,7 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
         .await
         .expect("response timeout")
         .expect("response");
+    drop(held_budget);
     // gRPC errors ride HTTP 200.
     assert_eq!(response.status(), http::StatusCode::OK);
     let header = |name: &str| {

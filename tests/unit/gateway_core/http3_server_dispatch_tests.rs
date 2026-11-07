@@ -207,23 +207,23 @@ fn h3_plain_mesh_upload_collection_releases_half_open_probe_before_terminal_writ
     );
 
     let oversize = mesh_collection
-        .split("Ok(None)")
+        .split("RetainRejection::TooLarge")
         .nth(1)
-        .expect("missing mesh collection branch: Ok(None)")
+        .expect("missing mesh collection branch: TooLarge")
         .split("H3RequestBodyReadError::DeadlineExceeded")
         .next()
-        .expect("bounded mesh collection Ok(None) branch");
+        .expect("bounded mesh collection TooLarge branch");
     let oversize_release = oversize
         .find("cb_probe.release_neutral()")
-        .expect("Ok(None) must release HALF_OPEN probe");
+        .expect("TooLarge must release HALF_OPEN probe");
     // The oversize refusal commits through the shared reject path, so the
     // reject hooks and the transaction log run (issue #6022).
     let oversize_write = oversize
         .find("write_bridge_upload_refusal(")
-        .expect("Ok(None) must refuse through the shared bridge reject path");
+        .expect("TooLarge must refuse through the shared bridge reject path");
     assert!(
         oversize_release < oversize_write,
-        "Ok(None) must release probe before terminal write"
+        "TooLarge must release probe before terminal write"
     );
 
     // Bind the exact force-buffer DeadlineExceeded arm, including the typed
@@ -496,15 +496,15 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .expect("H3 terminal provider dispatch must remain bounded");
     assert!(terminal_dispatch.contains("collect_h3_request_body_under_authorization("));
     assert!(terminal_dispatch.contains("drain_h3_request_body("));
-    // Ok(None): idle recv after a completed oversize drain — the flavor-aware
+    // TooLarge: idle recv after a completed oversize drain — the flavor-aware
     // writer already halts after HEADERS; do not duplicate STOP_SENDING.
     // Read: client gone — halt, finalize cleanup, no response write.
     // TimedOut: mid-recv_data cancel — write under post-deadline grace with
     // halt_recv=false, then let the wrapper halt through the vendored transport.
     let oversize = terminal_dispatch
-        .split("Ok(None)")
+        .split("RetainRejection::TooLarge")
         .nth(1)
-        .expect("missing terminal upload branch: Ok(None)")
+        .expect("missing terminal upload branch: TooLarge")
         .split("H3RequestBodyReadError::Read(error)")
         .next()
         .expect("bounded terminal upload branch");
@@ -1544,8 +1544,15 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
     );
     assert_eq!(
         buffering.matches(".collect()").count(),
+        0,
+        "an HTTP/3 upload buffering collect bypassed the charged collector"
+    );
+    assert_eq!(
+        buffering
+            .matches("collect_charged_request_body(gated, collector)")
+            .count(),
         deadline_aware,
-        "an HTTP/3 upload buffering collect bypassed the deadline-aware collector"
+        "an HTTP/3 upload buffering collect bypassed the charged collector"
     );
     assert!(
         !buffering.contains("collect_request_body_with_deadline("),
@@ -1553,9 +1560,9 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
          authorization bound, not only the client deadline"
     );
     // And the surviving branch is never run unbounded: the retained ceiling is
-    // fail-closed and the collect is wrapped in `Limited`.
+    // fail-closed and the collect is charged by what it retains under it.
     assert!(buffering.contains("buffered_request_body_ceiling("));
-    assert!(buffering.contains("http_body_util::Limited::new("));
+    assert!(buffering.contains("ChargedRequestCollector::new(retained_ceiling)"));
     // Each terminal the deadline-aware collect can yield, once per collect site.
     assert_eq!(
         buffering

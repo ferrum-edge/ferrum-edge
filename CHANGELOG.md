@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **Stalled uploads can no longer hold the whole request-buffer budget.**
+  Every buffered client request body used to charge its full retained
+  ceiling (10 MiB by default) against `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES`
+  before a byte arrived, including the collect that runs before
+  authentication. An anonymous client that opened a few dozen buffered
+  uploads and sent no body could therefore hold the whole 256 MiB budget for
+  a read timeout and get every other principal's buffered upload refused with
+  `503`. The charge now grows with the bytes an upload actually retains,
+  taken before each growth of the buffer as the response-side budget already
+  does, on HTTP/1.1, HTTP/2, native HTTP/3 and the HTTP/3 bridges. An upload
+  that has sent nothing holds no budget. When the budget cannot cover a
+  growth, the upload is refused with the same `503` / gRPC
+  `RESOURCE_EXHAUSTED` as before, now after reading part of the body rather
+  than before reading any. A request-body plugin that grows the body is
+  charged for the larger body when the budget has room.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,

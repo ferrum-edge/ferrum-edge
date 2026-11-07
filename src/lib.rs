@@ -17120,13 +17120,116 @@ pub mod _test_support {
             self.0.buffered_request_body_ceiling(effective_limit)
         }
 
-        /// The PRODUCTION admission a buffered request path takes before it
-        /// allocates. `None` when the aggregate budget refuses, which is what
-        /// makes the refusal happen BEFORE the collect rather than after it.
+        /// A buffered-request charge of `bytes`, taken up front: the same
+        /// permit type the production collectors grow and publish. `None` when
+        /// the aggregate budget refuses.
         pub fn try_reserve(&self, bytes: usize) -> Option<RequestBufferPermitProbe> {
             self.0
                 .try_reserve_request_permit(bytes)
                 .map(RequestBufferPermitProbe)
+        }
+
+        /// The PRODUCTION buffered-request collector every H1/H2 collect and
+        /// native-H3 drain uses, bound to this budget. Charges nothing until
+        /// bytes are appended.
+        pub fn collector(&self, effective_limit: usize) -> RequestBufferCollectorProbe {
+            RequestBufferCollectorProbe(self.0.request_collector(effective_limit))
+        }
+    }
+
+    /// Hold every block currently free in the PROCESS-GLOBAL buffered-request
+    /// budget until the returned claim drops, so an in-process gateway's next
+    /// buffered collect is refused on its first growth. The budget charges
+    /// retained bytes, so this is how a functional test reaches the capacity
+    /// refusal without uploading the whole budget. Process-global: only for a
+    /// test that owns its process (nextest runs each test in its own).
+    pub fn exhaust_process_request_buffer_budget_for_test() -> Option<RequestBufferPermitProbe> {
+        use crate::proxy::response_buffer_budget::{
+            BudgetRef, RequestBufferPermit, request_buffer_snapshot,
+        };
+        let available = request_buffer_snapshot().available_bytes;
+        RequestBufferPermit::reserve_in(BudgetRef::request_buffer(), available)
+            .map(RequestBufferPermitProbe)
+    }
+
+    /// The PRODUCTION buffered-request collector (`ChargedRequestCollector`),
+    /// bound to a [`RequestBufferBudgetProbe`].
+    pub struct RequestBufferCollectorProbe(
+        crate::proxy::response_buffer_budget::ChargedRequestCollector,
+    );
+
+    impl RequestBufferCollectorProbe {
+        /// Append one body chunk under the per-request ceiling and the
+        /// aggregate budget, exactly as every buffered collect does per frame.
+        pub fn append(&mut self, chunk: &[u8]) -> Result<(), ResponseBufferRetainRejection> {
+            self.0
+                .append(chunk)
+                .map_err(ResponseBufferRetainRejection::from_internal)
+        }
+
+        /// Bytes collected so far.
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.len() == 0
+        }
+
+        /// Capacity the charge currently covers, in whole blocks.
+        pub fn reserved_bytes(&self) -> usize {
+            self.0.reserved_bytes()
+        }
+
+        /// The collected body and its narrowed charge.
+        pub fn finish(self) -> (Vec<u8>, RequestBufferPermitProbe) {
+            let (body, permit) = self.0.finish();
+            (body, RequestBufferPermitProbe(permit))
+        }
+    }
+
+    /// Terminal outcome of the PRODUCTION H1/H2 charged request-body collect
+    /// (`collect_charged_request_body`), projected from the crate-private
+    /// types.
+    pub enum ChargedRequestCollectOutcomeForTest {
+        Collected {
+            body: Vec<u8>,
+            trailers: Option<hyper::HeaderMap>,
+            permit: RequestBufferPermitProbe,
+        },
+        TooLarge,
+        BufferCapacityExceeded,
+        ClientDisconnected,
+    }
+
+    /// Run the PRODUCTION H1/H2 charged request-body collect over `body`
+    /// against an isolated budget, so a test can hold collects open and
+    /// observe what they charge.
+    pub async fn collect_charged_request_body_for_test<B>(
+        body: B,
+        budget: &RequestBufferBudgetProbe,
+        effective_limit: usize,
+    ) -> ChargedRequestCollectOutcomeForTest
+    where
+        B: http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>,
+    {
+        use crate::proxy::ChargedRequestCollectError;
+        let collector = budget.0.request_collector(effective_limit);
+        match crate::proxy::collect_charged_request_body(body, collector).await {
+            Ok(collected) => ChargedRequestCollectOutcomeForTest::Collected {
+                body: collected.body,
+                trailers: collected.trailers,
+                permit: RequestBufferPermitProbe(collected.permit),
+            },
+            Err(ChargedRequestCollectError::TooLarge) => {
+                ChargedRequestCollectOutcomeForTest::TooLarge
+            }
+            Err(ChargedRequestCollectError::BufferCapacityExceeded) => {
+                ChargedRequestCollectOutcomeForTest::BufferCapacityExceeded
+            }
+            Err(ChargedRequestCollectError::Body(_)) => {
+                ChargedRequestCollectOutcomeForTest::ClientDisconnected
+            }
         }
     }
 
@@ -17298,17 +17401,22 @@ pub mod _test_support {
     pub struct H3RetainedUploadProbe(crate::http3::server::H3RetainedUpload);
 
     impl H3RetainedUploadProbe {
-        /// Admit one upload exactly as every native-H3 drain site does: fold
-        /// the effective limit to the retained ceiling, then charge that
-        /// ceiling before a byte is allocated. `None` is the `503` refusal.
-        pub fn admit(budget: &RequestBufferBudgetProbe, effective_limit: usize) -> Option<Self> {
+        /// Open one upload exactly as every native-H3 drain site does: fold
+        /// the effective limit to the retained ceiling. Nothing is charged
+        /// until a DATA chunk is retained.
+        pub fn admit(budget: &RequestBufferBudgetProbe, effective_limit: usize) -> Self {
             let ceiling = budget.0.buffered_request_body_ceiling(effective_limit);
-            crate::http3::server::H3RetainedUpload::admit_in(budget.0.handle(), ceiling).map(Self)
+            let upload =
+                crate::http3::server::H3RetainedUpload::admit_in(budget.0.handle(), ceiling);
+            Self(upload)
         }
 
-        /// Append one DATA chunk; `false` is the `413` (drop the probe).
-        pub fn push(&mut self, chunk: &[u8]) -> bool {
-            self.0.push(chunk)
+        /// Append one DATA chunk. `TooLarge` is the `413` and
+        /// `BudgetExhausted` the `503` (drop the probe either way).
+        pub fn push(&mut self, chunk: &[u8]) -> Result<(), ResponseBufferRetainRejection> {
+            self.0
+                .push(chunk)
+                .map_err(ResponseBufferRetainRejection::from_internal)
         }
 
         pub fn collected_len(&self) -> usize {

@@ -409,17 +409,24 @@ pub(crate) const REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE: &str =
 // [`buffered_request_body_ceiling`] folds `0` to a finite fail-closed fallback
 // on the BUFFERED path only — streaming enforcement keeps `0 = unlimited`,
 // which stays defensible precisely because nothing is retained — and
-// [`RequestBufferPermit`] charges that ceiling against a process-wide semaphore
-// before the collect starts.
+// [`ChargedRequestCollector`] charges what the collect actually retains
+// against a process-wide semaphore.
 //
-// The charge is taken BEFORE the collect and sized to the CEILING, not to the
-// collected length: the ceiling is the most the collect can retain, and
-// admission has to precede the allocation rather than chase it. Early exits
-// (`413`, `499`, read timeout, RPC deadline, authorization expiry, task
-// cancellation, panic) return it by `Drop`. On the success path
-// [`RequestBufferPermit::into_charged_bytes`] moves the charge onto the
-// published `Bytes`, so the backend write and retry replay stay charged until
-// the last clone drops (issue #4231) and no path can leak it.
+// The charge GROWS with the retained buffer, exactly as the response-side
+// [`ChargedBodyCollector`] does: every growth is charged before it is
+// allocated, so admission still precedes the allocation instead of chasing it,
+// but a collect is charged for the capacity it holds rather than for the most
+// it could ever hold. An earlier design charged the whole ceiling before the
+// first byte, which let an anonymous client that opened stalled uploads and
+// sent no body at all hold the entire budget for a whole read timeout, and so
+// refuse every other principal's buffered upload in the process. Charging
+// retained bytes makes holding the budget cost the client the bytes it holds.
+// A growth the budget refuses ends the collect with the `503` capacity
+// terminal. Early exits (`413`, `499`, read timeout, RPC deadline,
+// authorization expiry, task cancellation, panic) return the charge by `Drop`.
+// On the success path [`RequestBufferPermit::into_charged_bytes`] moves the
+// charge onto the published `Bytes`, so the backend write and retry replay stay
+// charged until the last clone drops (issue #4231) and no path can leak it.
 //
 // A third semaphore, not a share of the retained-response or request-decode
 // ones, for exactly the reason those two are already separate: they bound
@@ -672,22 +679,23 @@ pub(crate) fn init_request_buffer(fallback_per_request_bytes: usize, total_bytes
 /// honor safely. Streaming enforcement is untouched and keeps `0 = unlimited`.
 ///
 /// A configured ceiling larger than the aggregate budget is honored as a
-/// *ceiling* but is not thereby admissible: [`RequestBufferPermit::reserve`]
-/// still refuses what will not fit. See [`Budget::new`].
+/// *ceiling* but is not thereby admissible: [`ChargedRequestCollector`] still
+/// refuses growth that will not fit. See [`Budget::new`].
 pub(crate) fn buffered_request_body_ceiling(effective_limit: usize) -> usize {
     request_buffer_budget().ceiling(effective_limit)
 }
 
 /// An RAII claim on the aggregate buffered-request budget.
 ///
-/// Taken BEFORE the collect and sized to the per-request retained ceiling, so
-/// admission precedes the allocation instead of chasing it. Early exits return
-/// it by `Drop`. On the success path [`Self::into_charged_bytes`] moves it onto
-/// the published `Bytes` so the charge is released when the last clone of those
-/// bytes drops — not when the collector's stack frame ends (issue #4231).
-/// Success, `413`, `499`, read timeout, RPC deadline, authorization expiry, and
-/// task cancellation are all just drops, so none of them can leak the budget
-/// and none of them can release early while the bytes are resident.
+/// Grown by [`ChargedRequestCollector`] as the retained buffer grows, so it
+/// covers the capacity a collect actually holds — never a ceiling-sized claim
+/// for bytes that have not arrived. Early exits return it by `Drop`. On the
+/// success path [`Self::into_charged_bytes`] moves it onto the published
+/// `Bytes` so the charge is released when the last clone of those bytes drops
+/// — not when the collector's stack frame ends (issue #4231). Success, `413`,
+/// `499`, read timeout, RPC deadline, authorization expiry, and task
+/// cancellation are all just drops, so none of them can leak the budget and
+/// none of them can release early while the bytes are resident.
 #[must_use = "dropping the permit immediately returns the capacity it reserved"]
 pub(crate) struct RequestBufferPermit {
     /// Moved into the published `Bytes` by [`Self::into_charged_bytes`], or
@@ -695,27 +703,44 @@ pub(crate) struct RequestBufferPermit {
     /// [`Self::reserved_bytes`] is an external-test seam and therefore dead in
     /// the separately compiled binary unit.
     reservation: ResponseBufferReservation,
+    /// The budget every growth of this charge is taken from, held so a growth
+    /// can never merge blocks from a different semaphore.
+    permits: Arc<Semaphore>,
 }
 
 impl RequestBufferPermit {
-    /// Charge `retained_bytes` against the process-global buffered-request
-    /// budget. `None` means the budget refused and the caller must surface
-    /// [`REQUEST_BUFFER_OVERLOAD_STATUS`] instead of collecting.
-    pub(crate) fn reserve(retained_bytes: usize) -> Option<Self> {
-        Self::reserve_in(BudgetRef::request_buffer(), retained_bytes)
+    /// An empty claim on `budget`: nothing is charged until bytes are retained.
+    fn unreserved_in(budget: BudgetRef<'_>) -> Self {
+        Self {
+            reservation: ResponseBufferReservation::new(),
+            permits: Arc::clone(&budget.resolve().permits),
+        }
     }
 
-    /// The same admission against an explicitly chosen budget. Production
-    /// passes [`BudgetRef::request_buffer`]; external tests bind an
-    /// [`IsolatedBudget`] so a parallel test binary can observe admission and
-    /// release deterministically.
+    /// Charge `retained_bytes` up front against an explicitly chosen budget.
+    /// External tests bind an [`IsolatedBudget`] so a parallel test binary can
+    /// observe admission and release deterministically; production collects
+    /// through [`ChargedRequestCollector`], which charges as bytes arrive.
+    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserve_in(budget: BudgetRef<'_>, retained_bytes: usize) -> Option<Self> {
-        let mut reservation = ResponseBufferReservation::new();
-        if reservation.reserve_in(budget, retained_bytes) {
-            Some(Self { reservation })
+        let mut permit = Self::unreserved_in(budget);
+        if permit.grow_to(retained_bytes) {
+            Some(permit)
+        } else {
+            None
+        }
+    }
+
+    /// Grow the charge to cover `retained_bytes`. Already-held blocks are
+    /// reused, so a growth inside the current block costs no semaphore
+    /// operation. `false` is a capacity refusal, counted once here; the caller
+    /// must surface [`REQUEST_BUFFER_OVERLOAD_STATUS`] and drop the collect.
+    fn grow_to(&mut self, retained_bytes: usize) -> bool {
+        if self.reservation.reserve_on(&self.permits, retained_bytes) {
+            true
         } else {
             REQUEST_BUFFER_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            None
+            false
         }
     }
 
@@ -738,19 +763,21 @@ impl RequestBufferPermit {
     ///
     /// Empty `data` returns [`Bytes::new()`] and drops the charge immediately,
     /// because nothing is retained. A surviving allocation smaller than the
-    /// pre-collect ceiling releases surplus blocks so a small body does not
-    /// keep a ceiling-sized claim for the whole backend/retry lifetime. A
-    /// plugin transform that grew past that ceiling keeps the original charge
-    /// rather than refusing to publish — transform growth is outside this
-    /// budget's collect bound, and dropping the bytes here would be a new
-    /// failure mode on a path that already forwarded them.
+    /// charge releases surplus blocks. A plugin transform that grew the body
+    /// past what the collect retained is topped up when the budget has room;
+    /// when it has none the existing charge is kept and the bytes are still
+    /// published — transform growth is outside this budget's collect bound, and
+    /// dropping the bytes here would be a new failure mode on a path that
+    /// already accepted them.
     pub(crate) fn into_charged_bytes(mut self, data: Vec<u8>) -> Bytes {
         if data.is_empty() {
             return Bytes::new();
         }
-        // Narrowing only releases. `false` means a plugin transform grew past
-        // the pre-collect ceiling: keep that original charge and still publish,
-        // rather than dropping bytes a path that already accepted them.
+        // Best effort, and deliberately not counted as a refusal: nothing is
+        // refused here.
+        let _: bool = self.reservation.reserve_on(&self.permits, data.capacity());
+        // Narrowing only releases. `false` means the top-up above was refused:
+        // keep the existing charge and still publish.
         let _: bool = self.reservation.narrow_to_covered(data.capacity());
         Bytes::from_owner(ChargedBuffer {
             data,
@@ -759,14 +786,105 @@ impl RequestBufferPermit {
     }
 
     /// Narrow the charge to the allocation that stays resident after a
-    /// finished collect, for a holder that keeps its own `Vec` rather than
-    /// publishing [`Bytes`] (native H3, issue #6009). The same narrowing
-    /// [`Self::into_charged_bytes`] applies at publication, so a small body
-    /// does not hold a ceiling-sized claim for the rest of the request.
-    pub(crate) fn narrow_to_retained(&mut self, retained_capacity: usize) {
+    /// finished collect, so a body whose last growth over-reserved does not
+    /// keep the surplus for the rest of the request.
+    fn narrow_to_retained(&mut self, retained_capacity: usize) {
         // Narrowing only releases. `false` means the allocation outgrew the
-        // charge, which the capped collector excludes; keep the whole charge.
+        // charge, which the charged collector excludes; keep the whole charge.
         let _: bool = self.reservation.narrow_to_covered(retained_capacity);
+    }
+}
+
+/// A buffered client REQUEST body collected under the aggregate
+/// buffered-request budget and charged by the bytes it actually retains.
+///
+/// The request-side counterpart of [`ChargedBodyCollector`], shared by the
+/// H1/H2 collectors (`collect_charged_request_body`) and the native-H3 and H3
+/// bridge drains (`H3RetainedUpload`), so the accounting rule cannot drift per
+/// protocol. Constructing one charges nothing: a stalled upload that has sent no
+/// body holds no budget, so it cannot refuse other principals' uploads. Each
+/// growth of the buffer is charged BEFORE it is allocated and the buffer grows
+/// geometrically, so a collect takes `O(log n)` semaphore operations rather
+/// than one per chunk. The invariant is the response collector's:
+///
+/// > `permit.reserved_bytes() >= data.capacity()`, established before each
+/// > allocation and re-checked after it.
+///
+/// [`RetainRejection::TooLarge`] is the per-request ceiling (`413`);
+/// [`RetainRejection::BudgetExhausted`] is the aggregate budget refusing a
+/// growth (`503` / gRPC `RESOURCE_EXHAUSTED`). Dropping the collector releases
+/// the partial buffer and its charge together.
+pub(crate) struct ChargedRequestCollector {
+    /// The folded retained ceiling ([`buffered_request_body_ceiling`]), so
+    /// `0 = unlimited` cannot reach a retained buffer.
+    ceiling: usize,
+    data: Vec<u8>,
+    permit: RequestBufferPermit,
+}
+
+impl ChargedRequestCollector {
+    /// A collector against the process-global buffered-request budget.
+    /// `ceiling` must already be the folded retained ceiling.
+    pub(crate) fn new(ceiling: usize) -> Self {
+        Self::new_in(BudgetRef::request_buffer(), ceiling)
+    }
+
+    /// The same collector against an explicitly chosen budget; external tests
+    /// bind an [`IsolatedBudget`].
+    pub(crate) fn new_in(budget: BudgetRef<'_>, ceiling: usize) -> Self {
+        Self {
+            ceiling,
+            data: Vec::new(),
+            permit: RequestBufferPermit::unreserved_in(budget),
+        }
+    }
+
+    /// Append one body chunk under the per-request ceiling and the aggregate
+    /// budget. Declared lengths are never used to preallocate: a client could
+    /// otherwise declare the ceiling, send nothing, and hold the charge.
+    pub(crate) fn append(&mut self, chunk: &[u8]) -> Result<(), RetainRejection> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let prospective = prospective_retained_len(self.data.len(), chunk.len());
+        if prospective > self.ceiling {
+            return Err(RetainRejection::TooLarge);
+        }
+        if prospective > self.data.capacity() {
+            let target = growth_target(self.data.capacity(), prospective, self.ceiling);
+            // Charge first, so an exhausted budget refuses INSTEAD of
+            // allocating.
+            if !self.permit.grow_to(target) {
+                return Err(RetainRejection::BudgetExhausted);
+            }
+            self.data.reserve_exact(target - self.data.len());
+            // The allocator may hand back more than it was asked for; top up
+            // before any byte lands in the surplus.
+            if !self.permit.grow_to(self.data.capacity()) {
+                return Err(RetainRejection::BudgetExhausted);
+            }
+        }
+        self.data.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Bytes collected so far.
+    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Capacity the charge currently covers. External-test seam.
+    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.permit.reserved_bytes()
+    }
+
+    /// The collected body plus its charge, narrowed to the allocation that
+    /// stays resident.
+    pub(crate) fn finish(mut self) -> (Vec<u8>, RequestBufferPermit) {
+        self.permit.narrow_to_retained(self.data.capacity());
+        (self.data, self.permit)
     }
 }
 
@@ -917,6 +1035,14 @@ impl ResponseBufferReservation {
     /// [`RESPONSE_BUFFER_OVERLOAD_STATUS`]. Already-held blocks stay held until
     /// this value drops.
     fn reserve_against(&mut self, budget: &Budget, retained_bytes: usize) -> bool {
+        self.reserve_on(&budget.permits, retained_bytes)
+    }
+
+    /// [`Self::reserve_against`] on the budget's semaphore itself, for a holder
+    /// that keeps the semaphore rather than a [`BudgetRef`]. Every growth of one
+    /// reservation must come from the same semaphore, or merging the permits
+    /// would mix two budgets.
+    fn reserve_on(&mut self, permits: &Arc<Semaphore>, retained_bytes: usize) -> bool {
         // Nothing retained, nothing charged. A zero-length body occupies no
         // memory, so rounding it up to a block would both over-charge the
         // budget and let memory pressure refuse a bodyless response that costs
@@ -929,7 +1055,7 @@ impl ResponseBufferReservation {
             return true;
         }
         let additional = wanted - self.blocks;
-        match Arc::clone(&budget.permits).try_acquire_many_owned(additional) {
+        match Arc::clone(permits).try_acquire_many_owned(additional) {
             Ok(acquired) => {
                 match self.permit.as_mut() {
                     Some(held) => held.merge(acquired),
@@ -1750,10 +1876,18 @@ impl IsolatedBudget {
         self.0.ceiling(effective_limit)
     }
 
-    /// The PRODUCTION buffered-request admission, bound to this isolated
-    /// budget: reserve the ceiling before the collect, release on drop.
+    /// A buffered-request charge of `bytes`, bound to this isolated budget:
+    /// the same permit type the production collectors grow and publish,
+    /// released on drop.
     pub(crate) fn try_reserve_request_permit(&self, bytes: usize) -> Option<RequestBufferPermit> {
         RequestBufferPermit::reserve_in(self.handle(), bytes)
+    }
+
+    /// The PRODUCTION buffered-request collector, bound to this isolated
+    /// budget: same ceiling folding, same charge-as-retained growth, same
+    /// publication.
+    pub(crate) fn request_collector(&self, effective_limit: usize) -> ChargedRequestCollector {
+        ChargedRequestCollector::new_in(self.handle(), self.0.ceiling(effective_limit))
     }
 
     /// Reserve `bytes` before allocating them, exactly as the H3 / gRPC

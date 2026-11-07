@@ -4499,6 +4499,84 @@ pub(crate) fn http_flavor_allows_request_body_buffering(flavor: HttpFlavor) -> b
     !matches!(flavor, HttpFlavor::WebSocket)
 }
 
+/// A buffered client request body collected by [`collect_charged_request_body`],
+/// with the request-buffer charge that covers it.
+pub(crate) struct ChargedRequestCollect {
+    pub(crate) body: Vec<u8>,
+    pub(crate) trailers: Option<hyper::HeaderMap>,
+    pub(crate) permit: response_buffer_budget::RequestBufferPermit,
+}
+
+/// Why [`collect_charged_request_body`] ended without a complete body.
+pub(crate) enum ChargedRequestCollectError {
+    /// The body exceeded the retained ceiling: `413`.
+    TooLarge,
+    /// The aggregate buffered-request budget refused to grow the buffer: the
+    /// gateway-local `503` / gRPC `RESOURCE_EXHAUSTED` capacity terminal.
+    BufferCapacityExceeded,
+    /// The client body failed, for example a disconnect mid-upload: `499`.
+    Body(body::BoxError),
+}
+
+impl From<response_buffer_budget::RetainRejection> for ChargedRequestCollectError {
+    fn from(rejection: response_buffer_budget::RetainRejection) -> Self {
+        match rejection {
+            response_buffer_budget::RetainRejection::TooLarge => Self::TooLarge,
+            response_buffer_budget::RetainRejection::BudgetExhausted => {
+                Self::BufferCapacityExceeded
+            }
+        }
+    }
+}
+
+impl From<ChargedRequestCollectError> for RequestBodyBufferError {
+    fn from(error: ChargedRequestCollectError) -> Self {
+        match error {
+            ChargedRequestCollectError::TooLarge => Self::TooLarge,
+            ChargedRequestCollectError::BufferCapacityExceeded => Self::BufferCapacityExceeded,
+            ChargedRequestCollectError::Body(error) => Self::ClientDisconnected(error.to_string()),
+        }
+    }
+}
+
+/// Collect a buffered H1/H2 client request body into `collector`, which charges
+/// the shared buffered-request budget as the buffer grows rather than charging
+/// the whole ceiling before the first byte. A stalled upload therefore holds
+/// only what it has sent, and cannot hold the budget other principals' buffered
+/// uploads need. Trailers are kept the way `http_body_util::Collected` keeps
+/// them. Dropping the future (timeout, deadline, authorization expiry,
+/// cancellation) drops the partial buffer and its charge together.
+pub(crate) async fn collect_charged_request_body<B>(
+    body: B,
+    mut collector: response_buffer_budget::ChargedRequestCollector,
+) -> Result<ChargedRequestCollect, ChargedRequestCollectError>
+where
+    B: http_body::Body<Data = Bytes, Error = body::BoxError>,
+{
+    let mut body = std::pin::pin!(body);
+    let mut trailers: Option<hyper::HeaderMap> = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(ChargedRequestCollectError::Body)?;
+        match frame.into_data() {
+            Ok(data) => collector.append(&data)?,
+            Err(frame) => {
+                if let Ok(frame_trailers) = frame.into_trailers() {
+                    match trailers.as_mut() {
+                        Some(existing) => existing.extend(frame_trailers),
+                        None => trailers = Some(frame_trailers),
+                    }
+                }
+            }
+        }
+    }
+    let (body, permit) = collector.finish();
+    Ok(ChargedRequestCollect {
+        body,
+        trailers,
+        permit,
+    })
+}
+
 pub(crate) async fn buffer_request_body_for_before_proxy(
     request: Request<Incoming>,
     method: &str,
@@ -4537,23 +4615,24 @@ pub(crate) async fn buffer_request_body_for_before_proxy(
     }
 
     let (parts, body) = request.into_parts();
-    // Aggregate admission BEFORE the buffer is allocated. Sized to the ceiling,
-    // because the ceiling is the most this collect can retain and admission has
-    // to precede the allocation rather than chase it. The permit travels into
-    // the returned `BufferedClientRequestBody`, so it is returned by drop on
-    // every exit path — success, `413`, `499`, timeout, deadline, and task
-    // cancellation alike.
-    let budget_permit = response_buffer_budget::RequestBufferPermit::reserve(ceiling)
-        .ok_or(RequestBodyBufferError::BufferCapacityExceeded)?;
+    // The aggregate buffered-request budget is charged as bytes are retained,
+    // never ceiling-sized before the first byte: this collect runs before
+    // authentication, so a ceiling-sized up-front charge let an anonymous client
+    // hold the whole budget with stalled uploads that sent nothing. A growth
+    // the budget refuses is the `503` capacity terminal. The charge travels into
+    // the returned `BufferedClientRequestBody`, and every other exit path —
+    // `413`, `499`, timeout, deadline, and task cancellation alike — returns it
+    // by drop.
+    let collector = response_buffer_budget::ChargedRequestCollector::new(ceiling);
     // An HTTP/2 client's masked reset is a client disconnect here, never a
     // complete body (issue #6022).
     let require_end_stream = parts.version == hyper::Version::HTTP_2;
     let body = body::H2EndStreamGated::new(body, require_end_stream);
-    let limited = http_body_util::Limited::new(body, ceiling);
+    let collect = collect_charged_request_body(body, collector);
     let collected = match route_deadline_at {
         None => {
             collect_request_body_with_deadline(
-                limited.collect(),
+                collect,
                 grpc_deadline_at,
                 request_body_read_timeout_ms,
             )
@@ -4561,40 +4640,28 @@ pub(crate) async fn buffer_request_body_for_before_proxy(
         }
         // An early collect under a previewed route total (issue #6008). The
         // wait is deadline-first, so an elapsed bound never polls a ready
-        // body, and the partial buffer and admission permit drop with the
-        // collect before any rejection hook runs.
+        // body, and the partial buffer and its charge drop with the collect
+        // before any rejection hook runs.
         Some(route_at) => {
             let (at, expiry) =
                 early_route_bound(grpc_deadline_at, route_at, request_body_read_timeout_ms);
-            crate::plugins::await_deadline_first(Some(at), limited.collect())
+            crate::plugins::await_deadline_first(Some(at), collect)
                 .await
                 .map_err(|()| expiry)?
         }
     };
-    // Limited::collect() returns either a LengthLimitError (the body actually
-    // exceeded the cap -> 413) or the underlying transport error (the client
-    // dropped the connection mid-upload -> 499). Distinguish them so a client
-    // disconnect is not misreported and logged as "Request body exceeds
-    // maximum size".
-    let collected = collected.map_err(|e| {
-        if e.downcast_ref::<http_body_util::LengthLimitError>()
-            .is_some()
-        {
-            RequestBodyBufferError::TooLarge
-        } else {
-            RequestBodyBufferError::ClientDisconnected(e.to_string())
-        }
-    })?;
-    let trailers = collected.trailers().cloned();
-    let body_bytes = collected.to_bytes().to_vec();
+    // A body over the ceiling is `413`, a refused growth is `503`, and a
+    // client that dropped the connection mid-upload is `499`, so a disconnect
+    // is not misreported and logged as "Request body exceeds maximum size".
+    let collected = collected?;
 
     Ok(ClientRequestBody::Buffered(Box::new(
         BufferedClientRequestBody {
             method: parts.method,
             headers: parts.headers,
-            body: body_bytes,
-            trailers,
-            budget: Some(budget_permit),
+            body: collected.body,
+            trailers: collected.trailers,
+            budget: Some(collected.permit),
         },
     )))
 }
@@ -52410,78 +52477,73 @@ async fn proxy_to_backend(
                     Some(request_ctx),
                     state.env_config.authenticated_stream_max_lifetime_seconds,
                 );
-                // Fail-closed retained ceiling + aggregate admission taken
-                // BEFORE the buffer is allocated (issue #4153). `0` on
+                // Fail-closed retained ceiling (issue #4153). `0` on
                 // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` stays "unlimited" for
                 // STREAMING — nothing is retained there — but a buffered
                 // collect is never run unbounded.
                 let retained_ceiling = response_buffer_budget::buffered_request_body_ceiling(
                     effective_max_request_body_size_bytes,
                 );
-                // Held through collect + plugin transforms below; early exits
-                // (413, 499, timeout, deadline, authorization expiry, plugin
-                // reject, cancellation) return it by DROP. On the success path
-                // it is published onto the `Bytes` that stay resident for the
-                // backend write and retry replay (issue #4231).
-                let request_buffer_permit =
-                    match response_buffer_budget::RequestBufferPermit::reserve(retained_ceiling) {
-                        Some(permit) => permit,
-                        None => {
-                            return backend_dispatch_response(
-                                request_buffer_capacity_backend_response(
-                                    Some(request_ctx),
-                                    resolved_ip.clone(),
-                                ),
-                                None,
-                                None,
-                            );
-                        }
-                    };
+                // The aggregate budget is charged as the buffer grows, never
+                // ceiling-sized before the first byte, so a stalled upload holds
+                // only what it has sent. The charge is held through collect +
+                // plugin transforms below; early exits (413, 499, 503, timeout,
+                // deadline, authorization expiry, plugin reject, cancellation)
+                // return it by DROP. On the success path it is published onto
+                // the `Bytes` that stay resident for the backend write and
+                // retry replay (issue #4231).
+                let collector =
+                    response_buffer_budget::ChargedRequestCollector::new(retained_ceiling);
                 // A masked HTTP/2 client reset is a disconnect, not a complete
                 // body (issue #6022); see `body::H2EndStreamGated`.
                 let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
                 let gated =
                     body::H2EndStreamGated::new((*original_req).into_body(), require_end_stream);
-                let limited = http_body_util::Limited::new(gated, retained_ceiling);
-                let body_bytes = match collect_request_body_under_authorization(
-                    limited.collect(),
+                let collected = match collect_request_body_under_authorization(
+                    collect_charged_request_body(gated, collector),
                     request_ctx.grpc_deadline_at(),
                     proxy.backend_read_timeout_ms,
                     buffered_upload_auth_deadline.as_ref(),
                 )
                 .await
                 {
-                    Ok(Ok(collected)) => collected.to_bytes().to_vec(),
-                    // `Limited::collect()` yields either a `LengthLimitError`
-                    // (the body really exceeded the ceiling -> 413) or the
-                    // underlying transport error (the client dropped the
-                    // connection mid-upload -> 499). Distinguishing them keeps
-                    // a disconnect from being reported as an oversize body,
+                    Ok(Ok(collected)) => collected,
+                    // The body really exceeded the ceiling -> 413; the budget
+                    // refused to grow the buffer -> 503; the client dropped the
+                    // connection mid-upload -> 499. Distinguishing them keeps a
+                    // disconnect from being reported as an oversize body,
                     // matching `buffer_request_body_for_before_proxy`.
-                    Ok(Err(e)) => {
-                        if e.downcast_ref::<http_body_util::LengthLimitError>()
-                            .is_some()
-                        {
-                            return backend_dispatch_response(
-                                retry::BackendResponse {
-                                    status_code: 413,
-                                    body:
-                                        ResponseBody::buffered(
-                                            r#"{"error":"Request body exceeds maximum size"}"#
-                                                .as_bytes()
-                                                .to_vec(),
-                                        ),
-                                    headers: HashMap::new(),
-                                    connection_error: false,
-                                    backend_resolved_ip: resolved_ip.clone(),
-                                    error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
-                                    request_on_wire: false,
-                                    buffered_trailers: None,
-                                },
-                                None,
-                                None,
-                            );
-                        }
+                    Ok(Err(ChargedRequestCollectError::TooLarge)) => {
+                        return backend_dispatch_response(
+                            retry::BackendResponse {
+                                status_code: 413,
+                                body: ResponseBody::buffered(
+                                    r#"{"error":"Request body exceeds maximum size"}"#
+                                        .as_bytes()
+                                        .to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: false,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                                request_on_wire: false,
+                                buffered_trailers: None,
+                            },
+                            None,
+                            None,
+                        );
+                    }
+                    Ok(Err(ChargedRequestCollectError::BufferCapacityExceeded)) => {
+                        return backend_dispatch_response(
+                            request_buffer_capacity_backend_response(
+                                Some(request_ctx),
+                                resolved_ip.clone(),
+                            ),
+                            None,
+                            None,
+                        );
+                    }
+                    Ok(Err(ChargedRequestCollectError::Body(e))) => {
                         error!(
                             proxy_id = %proxy.id,
                             backend_url = %strip_query_params(backend_url),
@@ -52532,6 +52594,8 @@ async fn proxy_to_backend(
                         );
                     }
                 };
+                let body_bytes = collected.body;
+                let request_buffer_permit = collected.permit;
 
                 // Record pre-transform body length (bytes actually received
                 // from the client) for summary. Use fetch_max so retries that
@@ -66042,64 +66106,56 @@ async fn proxy_to_backend_http3(
                     None,
                 );
             }
+            // Charged as the buffer grows, never ceiling-sized before the
+            // first byte, so a stalled upload holds only what it has sent.
             // Held through collect below; early exits return it by DROP. On
             // the success path it is published onto the resident `Bytes`
             // after plugin transforms (issue #4231).
-            let request_buffer_permit =
-                match response_buffer_budget::RequestBufferPermit::reserve(retained_ceiling) {
-                    Some(permit) => permit,
-                    None => {
-                        return (
-                            request_buffer_capacity_backend_response(
-                                Some(request_ctx),
-                                resolved_ip,
-                            ),
-                            None,
-                        );
-                    }
-                };
+            let collector = response_buffer_budget::ChargedRequestCollector::new(retained_ceiling);
             // A masked HTTP/2 client reset is a disconnect, not a complete body
             // (issue #6022): the gated EOF takes the 499 client-disconnect arm
             // below, so the H3 backend is never dialed. See
             // `body::H2EndStreamGated`.
             let gated = body::H2EndStreamGated::new(client_body, require_end_stream);
-            let limited = http_body_util::Limited::new(gated, retained_ceiling);
-            let body = match collect_request_body_under_authorization(
-                limited.collect(),
+            let collected = match collect_request_body_under_authorization(
+                collect_charged_request_body(gated, collector),
                 grpc_deadline_at,
                 proxy.backend_read_timeout_ms,
                 buffered_upload_auth_deadline.as_ref(),
             )
             .await
             {
-                Ok(Ok(collected)) => collected.to_bytes().to_vec(),
-                // `Limited::collect()` yields either a `LengthLimitError` (the
-                // body really exceeded the ceiling -> 413) or the underlying
-                // transport error (the client dropped the stream mid-upload ->
-                // 499). Distinguishing them keeps a disconnect from being
-                // reported as an oversize body.
-                Ok(Err(e)) => {
-                    if e.downcast_ref::<http_body_util::LengthLimitError>()
-                        .is_some()
-                    {
-                        return (
-                            retry::BackendResponse {
-                                status_code: 413,
-                                body: ResponseBody::buffered(
-                                    r#"{"error":"Request body exceeds maximum size"}"#
-                                        .as_bytes()
-                                        .to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                connection_error: false,
-                                backend_resolved_ip: resolved_ip,
-                                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
-                                request_on_wire: false,
-                                buffered_trailers: None,
-                            },
-                            None,
-                        );
-                    }
+                Ok(Ok(collected)) => collected,
+                // The body really exceeded the ceiling -> 413; the budget
+                // refused to grow the buffer -> 503; the client dropped the
+                // stream mid-upload -> 499. Distinguishing them keeps a
+                // disconnect from being reported as an oversize body.
+                Ok(Err(ChargedRequestCollectError::TooLarge)) => {
+                    return (
+                        retry::BackendResponse {
+                            status_code: 413,
+                            body: ResponseBody::buffered(
+                                r#"{"error":"Request body exceeds maximum size"}"#
+                                    .as_bytes()
+                                    .to_vec(),
+                            ),
+                            headers: HashMap::new(),
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip,
+                            error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                            request_on_wire: false,
+                            buffered_trailers: None,
+                        },
+                        None,
+                    );
+                }
+                Ok(Err(ChargedRequestCollectError::BufferCapacityExceeded)) => {
+                    return (
+                        request_buffer_capacity_backend_response(Some(request_ctx), resolved_ip),
+                        None,
+                    );
+                }
+                Ok(Err(ChargedRequestCollectError::Body(e))) => {
                     error!(
                         proxy_id = %proxy.id,
                         backend_url = %strip_query_params(backend_url),
@@ -66145,6 +66201,8 @@ async fn proxy_to_backend_http3(
                     );
                 }
             };
+            let body = collected.body;
+            let request_buffer_permit = collected.permit;
             (body, Some(request_buffer_permit))
         }
     };

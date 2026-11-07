@@ -4361,8 +4361,13 @@ fn test_buffered_h2_request_collectors_require_h2_end_stream() {
             .find(gated)
             .unwrap_or_else(|| panic!("{signature}: the collected body must be gated"));
         // Every buffered collect in the function reads the gated body: no
-        // `Limited` or raw `collect` may be built before the gate.
-        for collect in ["Limited::new(", "BodyExt::collect("] {
+        // `Limited`, charged collect, or raw `collect` may be built before the
+        // gate.
+        for collect in [
+            "Limited::new(",
+            "BodyExt::collect(",
+            "collect_charged_request_body(",
+        ] {
             if let Some(first) = collector.find(collect) {
                 assert!(
                     gate < first,

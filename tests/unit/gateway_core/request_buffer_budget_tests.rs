@@ -18,12 +18,14 @@
 //! a parallel implementation of the rules, and they do not race the
 //! process-global budget under a parallel test binary.
 
+use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES, DEFAULT_REQUEST_BUFFER_TOTAL_BYTES,
-    REQUEST_BUFFER_OVERLOAD_BODY, REQUEST_BUFFER_OVERLOAD_ERROR_CLASS,
-    REQUEST_BUFFER_OVERLOAD_GRPC_STATUS, REQUEST_BUFFER_OVERLOAD_STATUS,
-    RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
-    buffered_request_body_ceiling_for_test, effective_request_body_limit_for_test,
+    ChargedRequestCollectOutcomeForTest as Outcome, DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
+    DEFAULT_REQUEST_BUFFER_TOTAL_BYTES, REQUEST_BUFFER_OVERLOAD_BODY,
+    REQUEST_BUFFER_OVERLOAD_ERROR_CLASS, REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
+    REQUEST_BUFFER_OVERLOAD_STATUS, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
+    RequestBufferBudgetProbe, ResponseBufferRetainRejection, buffered_request_body_ceiling_for_test,
+    collect_charged_request_body_for_test, effective_request_body_limit_for_test,
     error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
     normalize_reject_response, request_buffer_capacity_backend_response_for_test,
     request_buffer_capacity_reject_headers_for_test, set_request_grpc_web_upload_for_test,
@@ -31,7 +33,10 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::types::HttpFlavor;
 use ferrum_edge::plugins::RequestContext;
+use ferrum_edge::proxy::body::ProxyBodyError;
 use ferrum_edge::retry::ErrorClass;
+use http_body_util::StreamBody;
+use hyper::body::Frame;
 
 /// `total_blocks` blocks of budget with a one-block fallback ceiling, so the
 /// floor (`Budget::new` raises the total to at least the fallback) does not
@@ -504,9 +509,9 @@ fn publishing_an_empty_body_releases_the_charge() {
 
 #[test]
 fn publishing_a_body_smaller_than_the_ceiling_releases_surplus() {
-    // The permit is reserved at the collect ceiling. Holding that ceiling for
-    // the whole backend/retry lifetime of a much smaller body would over-hold
-    // the aggregate. Publication narrows to the surviving allocation.
+    // A charge larger than the surviving allocation (here taken up front)
+    // must not be held for the whole backend/retry lifetime of a much smaller
+    // body. Publication narrows to the surviving allocation.
     let budget = probe(4);
     let body = budget
         .try_reserve(4 * UNIT)
@@ -592,4 +597,236 @@ fn in_dispatch_collectors_publish_the_permit_onto_the_resident_bytes() {
         !h3.contains("(buffered.body, None)"),
         "the H3 Buffered arm must not drop the pre-auth permit at Vec extraction"
     );
+}
+
+#[test]
+fn publishing_a_transform_grown_body_tops_the_charge_up_when_the_budget_has_room() {
+    // A request-body plugin can replace the collected body with a larger one.
+    // Publication charges the larger allocation when the budget has room.
+    let budget = probe(4);
+    let body = budget
+        .try_reserve(UNIT)
+        .expect("admits the collected body")
+        .into_charged_bytes(vec![0u8; 3 * UNIT]);
+    assert_eq!(budget.available_bytes(), UNIT);
+    drop(body);
+    assert_eq!(budget.available_bytes(), 4 * UNIT);
+
+    // Without room, the bytes are still published under the existing charge:
+    // transform growth is outside the collect bound, and dropping bytes a path
+    // already accepted would be a new failure mode.
+    let budget = probe(2);
+    let other = budget.try_reserve(UNIT).expect("another upload");
+    let body = budget
+        .try_reserve(UNIT)
+        .expect("admits the collected body")
+        .into_charged_bytes(vec![0u8; 3 * UNIT]);
+    assert_eq!(body.len(), 3 * UNIT);
+    assert_eq!(budget.available_bytes(), 0);
+    drop(body);
+    drop(other);
+    assert_eq!(budget.available_bytes(), 2 * UNIT);
+}
+
+// ---------------------------------------------------------------------------
+// 7. The charge tracks retained bytes, not the ceiling.
+// ---------------------------------------------------------------------------
+//
+// Audit finding (request-buffer budget): every buffered collect used to
+// reserve its whole retained ceiling before the first byte, including the
+// collect that runs before authentication. An anonymous client could open as
+// many stalled uploads as the budget holds ceilings, send no body, and refuse
+// every other principal's buffered upload with `503` for a whole read
+// timeout. The charge now grows with the bytes the collect retains.
+
+/// Two fallback ceilings of budget, the shape the audit record uses.
+fn two_ceiling_budget() -> RequestBufferBudgetProbe {
+    RequestBufferBudgetProbe::new(2 * UNIT, 4 * UNIT)
+}
+
+type FrameResult = Result<Frame<Bytes>, ProxyBodyError>;
+type CompleteBody = StreamBody<futures::stream::Iter<std::vec::IntoIter<FrameResult>>>;
+
+fn data_frame(bytes: Vec<u8>) -> FrameResult {
+    Ok(Frame::data(Bytes::from(bytes)))
+}
+
+/// A client body whose every frame has already arrived.
+fn complete_body(frames: Vec<FrameResult>) -> CompleteBody {
+    StreamBody::new(futures::stream::iter(frames))
+}
+
+#[test]
+fn zero_byte_collects_do_not_exhaust_an_isolated_budget() {
+    let budget = two_ceiling_budget();
+    let total = budget.available_bytes();
+    // Before the fix, two of these held the whole budget and the third was
+    // refused. Many of them now hold nothing at all.
+    let stalled: Vec<_> = (0..16).map(|_| budget.collector(0)).collect();
+    assert!(stalled.iter().all(|c| c.reserved_bytes() == 0));
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "a collect that has retained nothing must hold none of the shared budget"
+    );
+
+    // Two complete ceiling-sized uploads still collect beside them.
+    let mut first = budget.collector(0);
+    assert_eq!(first.append(&vec![1u8; 2 * UNIT]), Ok(()));
+    let mut second = budget.collector(0);
+    assert_eq!(second.append(&vec![2u8; 2 * UNIT]), Ok(()));
+    assert_eq!(budget.available_bytes(), 0);
+
+    // Only retained bytes exhaust it, and a growth it cannot cover is the
+    // capacity refusal (503), never the per-request 413.
+    let mut third = budget.collector(0);
+    assert_eq!(
+        third.append(b"x"),
+        Err(ResponseBufferRetainRejection::BudgetExhausted)
+    );
+    drop(third);
+    drop((first, second, stalled));
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[test]
+fn the_charge_covers_the_retained_capacity_and_grows_geometrically() {
+    let budget = probe(8);
+    let total = budget.available_bytes();
+    let ceiling = 4 * UNIT;
+    let mut collector = budget.collector(ceiling);
+    let mut previous_reserved = 0;
+    let mut growths = 0;
+    for _ in 0..(3 * UNIT + 5) {
+        assert_eq!(collector.append(&[9u8]), Ok(()));
+        let reserved = collector.reserved_bytes();
+        assert!(reserved >= collector.len(), "retained bytes are charged");
+        assert!(
+            reserved <= (2 * collector.len()).div_ceil(UNIT) * UNIT,
+            "the charge must track retained bytes, not the ceiling"
+        );
+        if reserved != previous_reserved {
+            growths += 1;
+            previous_reserved = reserved;
+        }
+    }
+    assert!(
+        growths <= 4,
+        "one-byte chunks must not take a semaphore operation per chunk: {growths} growths"
+    );
+    let (body, permit) = collector.finish();
+    assert_eq!(body.len(), 3 * UNIT + 5);
+    assert!(permit.reserved_bytes() >= body.capacity());
+    assert_eq!(budget.available_bytes(), total - permit.reserved_bytes());
+    drop((body, permit));
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[tokio::test]
+async fn stalled_h1_h2_collects_hold_no_budget_and_complete_uploads_still_succeed() {
+    let budget = two_ceiling_budget();
+    let total = budget.available_bytes();
+
+    // Uploads whose headers arrived but whose body never does, held open
+    // inside the PRODUCTION H1/H2 collector.
+    let mut stalled = Vec::new();
+    for _ in 0..8 {
+        let (tx, rx) = tokio::sync::mpsc::channel::<FrameResult>(1);
+        let body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let mut collect = Box::pin(collect_charged_request_body_for_test(body, &budget, 0));
+        assert!(futures::poll!(collect.as_mut()).is_pending());
+        stalled.push((tx, collect));
+    }
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "stalled buffered uploads must not hold the shared budget"
+    );
+
+    // Another principal's complete, ceiling-sized upload is admitted.
+    let victim = complete_body(vec![data_frame(vec![3u8; 2 * UNIT])]);
+    let outcome = collect_charged_request_body_for_test(victim, &budget, 0).await;
+    let Outcome::Collected { body, permit, .. } = outcome else {
+        panic!("a complete upload must be collected while stalled uploads are open");
+    };
+    assert_eq!(body.len(), 2 * UNIT);
+    assert_eq!(permit.reserved_bytes(), 2 * UNIT);
+    let published = permit.into_charged_bytes(body);
+    assert_eq!(budget.available_bytes(), total - 2 * UNIT);
+    drop(published);
+
+    // A stalled upload is still a live collect: its body completes it.
+    let (tx, collect) = stalled.pop().expect("a stalled collect");
+    tx.send(data_frame(b"late body".to_vec()))
+        .await
+        .expect("collect still reading");
+    drop(tx);
+    let Outcome::Collected { body, permit, .. } = collect.await else {
+        panic!("a stalled upload that finishes must be collected");
+    };
+    assert_eq!(body, b"late body");
+    assert_eq!(permit.reserved_bytes(), UNIT);
+    drop((body, permit));
+
+    drop(stalled);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[tokio::test]
+async fn h1_h2_collect_terminals_stay_distinct_and_release_their_charge() {
+    let budget = RequestBufferBudgetProbe::new(2 * UNIT, 2 * UNIT);
+    let mut holder = budget.collector(0);
+    assert_eq!(holder.append(&vec![0u8; UNIT]), Ok(()));
+    assert_eq!(budget.available_bytes(), UNIT);
+
+    // Within the ceiling, but the budget cannot cover it: 503.
+    let body = complete_body(vec![
+        data_frame(b"head".to_vec()),
+        data_frame(vec![1u8; 2 * UNIT - 4]),
+    ]);
+    let outcome = collect_charged_request_body_for_test(body, &budget, 0).await;
+    assert!(matches!(outcome, Outcome::BufferCapacityExceeded));
+    assert_eq!(
+        budget.available_bytes(),
+        UNIT,
+        "a refused collect must release what it had charged"
+    );
+
+    // Over the ceiling: 413, before any charge for the oversized chunk.
+    let body = complete_body(vec![data_frame(vec![1u8; 2 * UNIT + 1])]);
+    let outcome = collect_charged_request_body_for_test(body, &budget, 0).await;
+    assert!(matches!(outcome, Outcome::TooLarge));
+
+    // A client failure mid-upload: 499.
+    let body = complete_body(vec![data_frame(b"partial".to_vec()), Err("reset".into())]);
+    let outcome = collect_charged_request_body_for_test(body, &budget, 0).await;
+    assert!(matches!(outcome, Outcome::ClientDisconnected));
+    assert_eq!(budget.available_bytes(), UNIT);
+
+    // Trailers survive the collect exactly as `Collected` kept them.
+    let mut trailers = hyper::HeaderMap::new();
+    trailers.insert("x-checksum", hyper::header::HeaderValue::from_static("abc"));
+    let body = complete_body(vec![
+        data_frame(b"payload".to_vec()),
+        Ok(Frame::trailers(trailers)),
+    ]);
+    let outcome = collect_charged_request_body_for_test(body, &budget, 0).await;
+    let Outcome::Collected {
+        body,
+        trailers,
+        permit,
+    } = outcome
+    else {
+        panic!("a body with trailers must be collected");
+    };
+    assert_eq!(body, b"payload");
+    assert_eq!(
+        trailers
+            .as_ref()
+            .and_then(|trailers| trailers.get("x-checksum"))
+            .map(|value| value.as_bytes()),
+        Some(&b"abc"[..])
+    );
+    drop((body, permit, holder));
+    assert_eq!(budget.available_bytes(), 2 * UNIT);
 }

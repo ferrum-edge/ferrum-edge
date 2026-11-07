@@ -1,19 +1,24 @@
 //! Issue #6009 — native-H3 buffered uploads join the shared retained-request
 //! contract H1/H2 already enforce: a finite ceiling when the effective limit is
-//! `0`, admission against `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` before a byte
-//! is allocated, growth capped at that ceiling, and release exactly once on
-//! every exit.
+//! `0`, a charge against `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` taken before
+//! each growth of the buffer is allocated, growth capped at that ceiling, and
+//! release exactly once on every exit.
+//!
+//! The charge tracks the bytes an upload actually retains, never its whole
+//! ceiling before the first byte: a stalled upload that has sent nothing holds
+//! no budget, so a client cannot refuse every other principal's buffered upload
+//! by opening uploads and sending no body.
 //!
 //! Every test drives the PRODUCTION collector (`H3RetainedUpload`, the value
 //! every native-H3 drain site and the H3 bridge own) against an isolated
-//! budget, so admission and release are observable under a parallel binary.
+//! budget, so charging and release are observable under a parallel binary.
 
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
     H3RetainedUploadProbe, H3UploadWaitOutcomeForTest,
     RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT, RequestBufferBudgetProbe,
-    collect_h3_upload_under_authorization_for_test,
+    ResponseBufferRetainRejection, collect_h3_upload_under_authorization_for_test,
 };
 use ferrum_edge::proxy::auth_lifetime::ComposedAuthBound;
 
@@ -23,16 +28,20 @@ fn budget() -> RequestBufferBudgetProbe {
 }
 
 #[test]
-fn a_zero_limit_is_admitted_at_the_finite_fallback_before_any_byte() {
+fn a_zero_limit_upload_charges_nothing_before_its_first_byte() {
     let budget = budget();
     let total = budget.available_bytes();
-    let upload = H3RetainedUploadProbe::admit(&budget, 0).expect("admitted");
+    let mut upload = H3RetainedUploadProbe::admit(&budget, 0);
     assert_eq!(upload.collected_len(), 0);
     assert_eq!(
         upload.reserved_bytes(),
-        2 * UNIT,
-        "a `0` limit must charge the finite fallback ceiling, not run unbounded"
+        0,
+        "an upload that has sent nothing must not hold any of the shared budget"
     );
+    assert_eq!(budget.available_bytes(), total);
+    // The `0` limit still folds to the finite fallback ceiling.
+    assert_eq!(upload.push(&vec![1u8; 2 * UNIT]), Ok(()));
+    assert_eq!(upload.reserved_bytes(), 2 * UNIT);
     assert_eq!(budget.available_bytes(), total - 2 * UNIT);
     drop(upload);
     assert_eq!(budget.available_bytes(), total);
@@ -42,10 +51,11 @@ fn a_zero_limit_is_admitted_at_the_finite_fallback_before_any_byte() {
 fn a_zero_limit_upload_is_refused_past_the_fallback_ceiling() {
     let budget = budget();
     let total = budget.available_bytes();
-    let mut upload = H3RetainedUploadProbe::admit(&budget, 0).expect("admitted");
-    assert!(upload.push(&vec![1u8; 2 * UNIT]));
-    assert!(
-        !upload.push(&[1u8]),
+    let mut upload = H3RetainedUploadProbe::admit(&budget, 0);
+    assert_eq!(upload.push(&vec![1u8; 2 * UNIT]), Ok(()));
+    assert_eq!(
+        upload.push(&[1u8]),
+        Err(ResponseBufferRetainRejection::TooLarge),
         "one byte past the fallback ceiling is the 413, never an unbounded Vec"
     );
     drop(upload);
@@ -57,43 +67,106 @@ fn a_zero_limit_upload_is_refused_past_the_fallback_ceiling() {
 }
 
 #[test]
-fn an_exhausted_budget_refuses_admission_before_collection() {
+fn stalled_uploads_hold_no_budget_and_cannot_starve_a_complete_one() {
+    // The audit finding: each buffered upload used to reserve its whole
+    // ceiling before a byte arrived, so four stalled uploads held this whole
+    // eight-block budget and every other upload got the 503.
     let budget = budget();
-    let held: Vec<_> = (0..4)
-        .map(|_| H3RetainedUploadProbe::admit(&budget, 2 * UNIT).expect("admitted"))
+    let total = budget.available_bytes();
+    let stalled: Vec<_> = (0..64)
+        .map(|_| H3RetainedUploadProbe::admit(&budget, 2 * UNIT))
         .collect();
-    assert_eq!(budget.available_bytes(), 0);
-    assert!(
-        H3RetainedUploadProbe::admit(&budget, 2 * UNIT).is_none(),
-        "a fifth concurrent upload must get the 503 / RESOURCE_EXHAUSTED refusal"
+    assert!(stalled.iter().all(|upload| upload.reserved_bytes() == 0));
+    assert_eq!(
+        budget.available_bytes(),
+        total,
+        "uploads that have sent no body must not hold any of the shared budget"
     );
-    drop(held);
-    assert!(H3RetainedUploadProbe::admit(&budget, 2 * UNIT).is_some());
+
+    // A complete, ceiling-sized upload from someone else still collects.
+    let mut honest = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
+    assert_eq!(honest.push(&vec![7u8; 2 * UNIT]), Ok(()));
+    let (body, permit) = honest.finish();
+    assert_eq!(body.len(), 2 * UNIT);
+    assert_eq!(permit.reserved_bytes(), 2 * UNIT);
+    assert_eq!(budget.available_bytes(), total - 2 * UNIT);
+    drop((body, permit));
+    drop(stalled);
+    assert_eq!(budget.available_bytes(), total);
 }
 
 #[test]
-fn a_configured_limit_above_the_aggregate_is_never_admissible() {
+fn an_exhausted_budget_refuses_growth_with_the_capacity_refusal() {
     let budget = budget();
-    assert!(
-        H3RetainedUploadProbe::admit(&budget, 64 * UNIT).is_none(),
-        "the ceiling is honored as a ceiling, but must still fit the aggregate"
+    let total = budget.available_bytes();
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let mut upload = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
+        assert_eq!(upload.push(&vec![1u8; 2 * UNIT]), Ok(()));
+        held.push(upload);
+    }
+    assert_eq!(budget.available_bytes(), 0);
+
+    // Opening a fifth upload is free; growing it is what the budget refuses,
+    // and that refusal is the 503, never the 413.
+    let mut fifth = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
+    assert_eq!(
+        fifth.push(b"x"),
+        Err(ResponseBufferRetainRejection::BudgetExhausted),
+        "a growth the shared budget cannot cover must get the 503 / RESOURCE_EXHAUSTED refusal"
     );
-    assert_eq!(budget.available_bytes(), 8 * UNIT);
+    drop(fifth);
+    assert_eq!(budget.available_bytes(), 0);
+
+    drop(held.pop());
+    let mut readmitted = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
+    assert_eq!(readmitted.push(&vec![1u8; 2 * UNIT]), Ok(()));
+    drop(readmitted);
+    drop(held);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[test]
+fn a_configured_limit_above_the_aggregate_is_refused_when_growth_outruns_it() {
+    let budget = budget();
+    let total = budget.available_bytes();
+    let mut upload = H3RetainedUploadProbe::admit(&budget, 64 * UNIT);
+    assert_eq!(upload.reserved_bytes(), 0);
+    // The ceiling is honored as a ceiling, but the retained bytes must still
+    // fit the aggregate: growth past it is the capacity refusal.
+    let mut outcome = Ok(());
+    for _ in 0..16 {
+        outcome = upload.push(&vec![2u8; UNIT]);
+        if outcome.is_err() {
+            break;
+        }
+        assert!(upload.reserved_bytes() <= total);
+    }
+    assert_eq!(
+        outcome,
+        Err(ResponseBufferRetainRejection::BudgetExhausted),
+        "growth past the aggregate budget is the capacity refusal, not a 413"
+    );
+    drop(upload);
+    assert_eq!(budget.available_bytes(), total);
 }
 
 #[test]
 fn growth_never_outruns_the_charged_ceiling() {
     let budget = budget();
     let ceiling = UNIT + 17;
-    let mut upload = H3RetainedUploadProbe::admit(&budget, ceiling).expect("admitted");
+    let mut upload = H3RetainedUploadProbe::admit(&budget, ceiling);
     for _ in 0..ceiling {
-        assert!(upload.push(&[3u8]));
+        assert_eq!(upload.push(&[3u8]), Ok(()));
     }
-    assert!(!upload.push(&[3u8]));
-    let mut upload = H3RetainedUploadProbe::admit(&budget, ceiling).expect("admitted");
+    assert_eq!(
+        upload.push(&[3u8]),
+        Err(ResponseBufferRetainRejection::TooLarge)
+    );
+    let mut upload = H3RetainedUploadProbe::admit(&budget, ceiling);
     let mut pushed = 0;
     while pushed + 100 <= ceiling {
-        assert!(upload.push(&[5u8; 100]));
+        assert_eq!(upload.push(&[5u8; 100]), Ok(()));
         pushed += 100;
     }
     let (body, permit) = upload.finish();
@@ -109,8 +182,8 @@ fn growth_never_outruns_the_charged_ceiling() {
 fn a_finished_body_keeps_only_its_resident_charge() {
     let budget = budget();
     let total = budget.available_bytes();
-    let mut upload = H3RetainedUploadProbe::admit(&budget, 4 * UNIT).expect("admitted");
-    assert!(upload.push(b"small soap envelope"));
+    let mut upload = H3RetainedUploadProbe::admit(&budget, 4 * UNIT);
+    assert_eq!(upload.push(b"small soap envelope"), Ok(()));
     let (body, permit) = upload.finish();
     assert_eq!(body, b"small soap envelope");
     assert_eq!(
@@ -128,8 +201,8 @@ fn a_finished_body_keeps_only_its_resident_charge() {
 fn a_published_body_is_released_when_its_last_dispatch_copy_drops() {
     let budget = budget();
     let total = budget.available_bytes();
-    let mut upload = H3RetainedUploadProbe::admit(&budget, 4 * UNIT).expect("admitted");
-    assert!(upload.push(b"small soap envelope"));
+    let mut upload = H3RetainedUploadProbe::admit(&budget, 4 * UNIT);
+    assert_eq!(upload.push(b"small soap envelope"), Ok(()));
     // The production publication native-H3 dispatch and both bridges use: the
     // charge moves onto the body, so no handler-held charge outlives it.
     let body = upload.finish_and_publish();
@@ -157,7 +230,7 @@ fn a_published_body_is_released_when_its_last_dispatch_copy_drops() {
 fn an_empty_body_retains_no_charge_after_finish() {
     let budget = budget();
     let total = budget.available_bytes();
-    let upload = H3RetainedUploadProbe::admit(&budget, 0).expect("admitted");
+    let upload = H3RetainedUploadProbe::admit(&budget, 0);
     let (body, permit) = upload.finish();
     assert!(body.is_empty());
     assert_eq!(permit.reserved_bytes(), 0);
@@ -168,9 +241,13 @@ fn an_empty_body_retains_no_charge_after_finish() {
 async fn a_drain_cancelled_by_its_bound_releases_admission_before_the_wait_returns() {
     let budget = budget();
     let total = budget.available_bytes();
-    let mut upload = H3RetainedUploadProbe::admit(&budget, 2 * UNIT).expect("admitted");
-    assert!(upload.push(&[9u8; 1024]));
-    assert_eq!(budget.available_bytes(), total - 2 * UNIT);
+    let mut upload = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
+    assert_eq!(upload.push(&[9u8; 1024]), Ok(()));
+    assert_eq!(
+        budget.available_bytes(),
+        total - UNIT,
+        "the partial upload is charged for what it retains, not for its ceiling"
+    );
 
     // The partial buffer and its charge live inside the drain future, exactly
     // as `drain_h3_request_body` owns them; a trickling client never finishes.
@@ -198,7 +275,7 @@ async fn a_drain_cancelled_by_its_bound_releases_admission_before_the_wait_retur
 async fn an_already_elapsed_bound_never_polls_the_admitted_drain() {
     let budget = budget();
     let total = budget.available_bytes();
-    let upload = H3RetainedUploadProbe::admit(&budget, 2 * UNIT).expect("admitted");
+    let upload = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
     let deadline = tokio::time::Instant::now();
     tokio::time::advance(Duration::from_millis(1)).await;
     let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -233,12 +310,32 @@ fn every_native_h3_drain_site_admits_before_it_drains() {
     assert_eq!(
         server.matches("H3RetainedUpload::admit(").count(),
         7,
-        "each native-H3 drain site must take admission before its drain"
+        "each native-H3 drain site must open a charged upload before its drain"
     );
     assert_eq!(
         bridge.matches("H3RetainedUpload::admit(").count(),
         2,
-        "both H3 bridge drains must take admission before draining"
+        "both H3 bridge drains must open a charged upload before draining"
+    );
+    // A growth the shared budget refuses is answered by every drain site, and
+    // an upload is never charged its ceiling before the first byte again.
+    assert_eq!(
+        server
+            .matches("Ok(Err(RetainRejection::BudgetExhausted)) => {")
+            .count(),
+        7,
+        "every native-H3 drain must answer a refused growth with the capacity refusal"
+    );
+    assert_eq!(
+        bridge
+            .matches("RetainRejection::BudgetExhausted)) => {")
+            .count(),
+        2,
+        "both H3 bridge drains must answer a refused growth with the capacity refusal"
+    );
+    assert!(
+        !server.contains("let Some(upload) = H3RetainedUpload::admit("),
+        "opening a native-H3 upload must not take a ceiling-sized charge"
     );
     assert!(
         !server.contains("max_bytes > 0 && body.len()"),
@@ -362,7 +459,7 @@ fn every_dispatch_stage_h3_drain_refusal_runs_the_reject_hooks_and_the_log() {
     assert_eq!(sites.len(), 4, "four dispatch-stage drains refuse capacity");
     for (index, site) in sites.into_iter().enumerate() {
         let oversize = site
-            .split("Ok(None) => {")
+            .split("Ok(Err(RetainRejection::TooLarge)) => {")
             .nth(1)
             .unwrap_or_else(|| panic!("drain {index} must have an oversize arm"))
             .split("Err(H3RequestBodyReadError::Read(")

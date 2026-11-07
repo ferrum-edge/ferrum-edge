@@ -196,6 +196,113 @@ async fn streaming_request_is_unaffected_by_the_buffered_ceiling() {
     backend_task.abort();
 }
 
+/// Stalled uploads that would hold every block of a two-ceiling budget if each
+/// one were still charged its whole ceiling before its first byte.
+const STALLED_UPLOADS: usize = 4;
+
+#[ignore]
+#[tokio::test]
+async fn stalled_buffered_uploads_do_not_hold_the_budget_against_other_clients() {
+    // Audit finding: every buffered upload used to reserve its whole retained
+    // ceiling before a byte arrived, so a client that opened as many uploads
+    // as the budget holds ceilings and sent no body got every other client's
+    // buffered upload refused with `503` for a whole read timeout. The budget
+    // here holds exactly two ceilings.
+    let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
+    let mut gateway = budget_gateway_builder(backend_port)
+        .env(
+            "FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES",
+            (2 * FALLBACK_BYTES).to_string(),
+        )
+        .spawn()
+        .await
+        .expect("start request-buffer-budget gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    // Each stalled upload sends its request head and a declared length within
+    // the ceiling, then no body.
+    let stalled_body = json_body(1_024);
+    let mut stalled = Vec::with_capacity(STALLED_UPLOADS);
+    for _ in 0..STALLED_UPLOADS {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+            .await
+            .expect("connect stalled upload");
+        let head = format!(
+            "POST /buffered HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            stalled_body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("write stalled request head");
+        stalled.push(stream);
+    }
+    // Give the gateway time to route the stalled requests into their buffered
+    // collects. The assertions below do not depend on this: they hold whether
+    // or not the collects have started.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("http1 client");
+    let response = client
+        .post(gateway.proxy_url("/buffered"))
+        .header("content-type", "application/json")
+        .body(json_body(1_024))
+        .send()
+        .await
+        .expect("complete buffered upload");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "stalled uploads that sent no body must not refuse another client's buffered \
+         upload; got {status} {body}"
+    );
+    assert_eq!(buffered_hits(&backend_hits), 1);
+
+    // The stalled uploads were live buffered collects all along: one that
+    // finally sends its body is forwarded.
+    let mut late = stalled.pop().expect("a stalled upload");
+    late.write_all(stalled_body.as_bytes())
+        .await
+        .expect("write late body");
+    let head = tokio::time::timeout(Duration::from_secs(10), read_response_head(&mut late))
+        .await
+        .expect("late upload answered");
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "a stalled upload that completes must be forwarded; got {head:?}"
+    );
+    assert_eq!(buffered_hits(&backend_hits), 2);
+
+    drop(stalled);
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// Read one HTTP/1.1 response head from `stream`.
+async fn read_response_head(stream: &mut tokio::net::TcpStream) -> String {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if let Some(end) = find_header_end(&buf) {
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return String::from_utf8_lossy(&buf).into_owned(),
+            Ok(read) => buf.extend_from_slice(&chunk[..read]),
+        }
+    }
+}
+
 fn budget_gateway_builder(backend_port: u16) -> TestGatewayBuilder {
     TestGateway::builder()
         .mode_file(budget_config(backend_port))

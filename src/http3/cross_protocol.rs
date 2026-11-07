@@ -3681,20 +3681,7 @@ where
     let (prebuffered_body, raw_prebuffered_body_bytes) = if prebuffered_body.is_none()
         && upstream_target.is_some_and(crate::proxy::target_requires_http_mesh_egress)
     {
-        let Some(upload) = H3RetainedUpload::admit(effective_max_request_body_size_bytes) else {
-            cb_probe.release_neutral();
-            return Box::pin(write_bridge_upload_refusal(
-                stream,
-                HttpFlavor::Plain,
-                plugins,
-                ctx,
-                BridgeUploadRefusal::BufferCapacity,
-                response_committed_plugins,
-                initial_response_header_policy_plugins,
-                backend_start,
-            ))
-            .await;
-        };
+        let upload = H3RetainedUpload::admit(effective_max_request_body_size_bytes);
         match super::server::collect_h3_request_body_under_authorization(
             drain_h3_body(stream, upload, &mut mesh_upload_charge),
             plain_local_bound,
@@ -3702,14 +3689,28 @@ where
         )
         .await
         {
-            Ok(Some(body)) => {
+            Ok(Ok(body)) => {
                 let len = body.len() as u64;
                 // No request body hook runs on this drain, so the client's
                 // bytes are the backend-visible body (#5819).
                 crate::plugins::grpc_web::record_request_grpc_message_count(ctx, &body);
                 (Some(body), len)
             }
-            Ok(None) => {
+            Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::BudgetExhausted)) => {
+                cb_probe.release_neutral();
+                return Box::pin(write_bridge_upload_refusal(
+                    stream,
+                    HttpFlavor::Plain,
+                    plugins,
+                    ctx,
+                    BridgeUploadRefusal::BufferCapacity,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins,
+                    backend_start,
+                ))
+                .await;
+            }
+            Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::TooLarge)) => {
                 cb_probe.release_neutral();
                 return Box::pin(write_bridge_upload_refusal(
                     stream,
@@ -8759,20 +8760,7 @@ where
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
-        let Some(upload) = H3RetainedUpload::admit(effective_max_grpc_recv_size_bytes) else {
-            cb_probe.release_neutral();
-            return Box::pin(write_bridge_upload_refusal(
-                stream,
-                HttpFlavor::Grpc,
-                plugins,
-                ctx,
-                BridgeUploadRefusal::BufferCapacity,
-                response_committed_plugins,
-                initial_response_header_policy_plugins,
-                backend_start,
-            ))
-            .await;
-        };
+        let upload = H3RetainedUpload::admit(effective_max_grpc_recv_size_bytes);
         match super::server::collect_h3_request_body_under_authorization(
             drain_h3_body(stream, upload, &mut bridge_upload_charge),
             upload_bound,
@@ -8780,8 +8768,22 @@ where
         )
         .await
         {
-            Ok(Some(b)) => b,
-            Ok(None) => {
+            Ok(Ok(b)) => b,
+            Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::BudgetExhausted)) => {
+                cb_probe.release_neutral();
+                return Box::pin(write_bridge_upload_refusal(
+                    stream,
+                    HttpFlavor::Grpc,
+                    plugins,
+                    ctx,
+                    BridgeUploadRefusal::BufferCapacity,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins,
+                    backend_start,
+                ))
+                .await;
+            }
+            Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::TooLarge)) => {
                 // The reject writer emits HEADERS then STOP_SENDING; do not reverse
                 // that order with a pre-write halt (would duplicate STOP_SENDING).
                 cb_probe.release_neutral();
@@ -12796,14 +12798,16 @@ pub(crate) fn collect_reqwest_response_headers(
 // H3 body drain + response writers
 // ---------------------------------------------------------------------------
 
-/// Drain the H3 stream body into an admitted, capped `Vec<u8>` (#6009).
-/// Returns `Ok(None)` when the retained ceiling is exceeded (caller emits
-/// 413); on success the shared request-buffer charge moves into `charge`.
+/// Drain the H3 stream body into a charged, capped `Vec<u8>` (#6009).
+/// Returns `Ok(Err(TooLarge))` when the retained ceiling is exceeded (caller
+/// emits 413) and `Ok(Err(BudgetExhausted))` when the shared request-buffer
+/// budget refuses a growth (caller emits 503); on success the charge moves into
+/// `charge`.
 async fn drain_h3_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     upload: H3RetainedUpload,
     charge: &mut Option<crate::proxy::response_buffer_budget::RequestBufferPermit>,
-) -> Result<Option<Vec<u8>>, super::server::H3UploadReadError>
+) -> super::server::H3RetainedUploadResult
 where
     S: RecvStream,
 {
