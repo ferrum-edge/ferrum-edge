@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, which the H1/H2 handshake already stripped. Both frontends now use
   one shared predicate; H3 still replaces `Early-Data` itself and drops
   pseudo-headers.
+- **Admin restore keeps its mTLS DNS fence on a half-restored namespace**
+  (#7032). The restore's "multi-phase restore is incomplete" hold shared one
+  state with per-mutation tracking, so a completed import that returned
+  errors settled it; if the compensating rollback was then never polled (for
+  example namespace admission failing before it started) or the request was
+  cancelled, guard Drop released the fence over a cleared, partially imported
+  namespace on SQL backends. The restore phase is now tracked separately
+  (cleared, imported, rolled back) and Drop retains the fence until the import
+  succeeds or the rollback completes; a nested mutation restores the prior
+  uncertain state instead of settling it.
 - **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch

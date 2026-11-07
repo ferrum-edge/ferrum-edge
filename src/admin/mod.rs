@@ -6735,12 +6735,168 @@ impl MtlsDnsAdmissionMutationState {
     }
 }
 
+/// Phase of a multi-phase restore (clear → import → compensating rollback)
+/// held under one mTLS DNS admission guard.
+///
+/// This is deliberately separate from [`MtlsDnsAdmissionMutationState`]: that
+/// state answers "has a single dispatched mutation returned?", and every
+/// nested `run_mutation` (the import, the rollback) settles it. The restore
+/// phase answers "is the namespace in a half-restored state?", which no
+/// single mutation's completion can resolve on its own (issue #7032).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum MtlsDnsRestorePhase {
+    /// No multi-phase restore is in progress; Drop follows the single-mutation
+    /// state alone.
+    Idle = 0,
+    /// The namespace clear committed (or its atomic outcome is ambiguous) and
+    /// no import or rollback has reached a definitive result yet.
+    Cleared = 1,
+    /// The import completed without errors.
+    ImportedOk = 2,
+    /// The import returned errors; the namespace is cleared and partially
+    /// imported until a compensating rollback completes.
+    ImportedWithErrors = 3,
+    /// A compensating rollback completed and the prior config was replayed.
+    RolledBack = 4,
+}
+
+impl MtlsDnsRestorePhase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Cleared,
+            2 => Self::ImportedOk,
+            3 => Self::ImportedWithErrors,
+            4 => Self::RolledBack,
+            // Unknown values fail closed: treat them as an incomplete restore.
+            _ => Self::Cleared,
+        }
+    }
+
+    fn release_on_drop(self) -> bool {
+        matches!(self, Self::Idle | Self::ImportedOk | Self::RolledBack)
+    }
+}
+
+/// Shared hold state for one mTLS DNS admission guard, cloned into every
+/// [`MtlsDnsAdmissionOperation`]. Drop releases the durable fence only when
+/// both the single-mutation state and the restore phase allow it.
+#[derive(Debug)]
+pub(crate) struct MtlsDnsAdmissionHoldState {
+    mutation_state: AtomicU8,
+    restore_phase: AtomicU8,
+}
+
+impl MtlsDnsAdmissionHoldState {
+    pub(crate) fn new() -> Self {
+        Self {
+            mutation_state: AtomicU8::new(MtlsDnsAdmissionMutationState::NotStarted as u8),
+            restore_phase: AtomicU8::new(MtlsDnsRestorePhase::Idle as u8),
+        }
+    }
+
+    fn restore_phase(&self) -> MtlsDnsRestorePhase {
+        MtlsDnsRestorePhase::from_u8(self.restore_phase.load(Ordering::Acquire))
+    }
+
+    fn set_restore_phase(&self, phase: MtlsDnsRestorePhase) {
+        self.restore_phase.store(phase as u8, Ordering::Release);
+    }
+
+    pub(crate) fn release_on_drop(&self) -> bool {
+        MtlsDnsAdmissionMutationState::from_u8(self.mutation_state.load(Ordering::Acquire))
+            .release_on_drop()
+            && self.restore_phase().release_on_drop()
+    }
+
+    /// Track one dispatched mutation. On exit the prior state is restored
+    /// when it was already uncertain (a nested mutation must not settle an
+    /// outer uncertain one); otherwise the mutation is recorded as settled,
+    /// which preserves single-mutation behaviour.
+    pub(crate) async fn run_mutation<T, F>(&self, mutation: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let prior = MtlsDnsAdmissionMutationState::from_u8(self.mutation_state.swap(
+            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
+            Ordering::AcqRel,
+        ));
+        let result = mutation.await;
+        let exit = match prior {
+            MtlsDnsAdmissionMutationState::InFlightOrUncertain => prior,
+            MtlsDnsAdmissionMutationState::NotStarted | MtlsDnsAdmissionMutationState::Settled => {
+                MtlsDnsAdmissionMutationState::Settled
+            }
+        };
+        self.mutation_state.store(exit as u8, Ordering::Release);
+        result
+    }
+
+    /// Run the restore's namespace clear. A successful clear enters
+    /// [`MtlsDnsRestorePhase::Cleared`] before the future returns, so request
+    /// cancellation at any later await point retains the fence.
+    pub(crate) async fn run_restore_clear<T, E, F>(&self, clear: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let result = self.run_mutation(clear).await;
+        if result.is_ok() {
+            self.set_restore_phase(MtlsDnsRestorePhase::Cleared);
+        }
+        result
+    }
+
+    /// Run the restore import and record whether it completed cleanly.
+    pub(crate) async fn run_restore_import<T, F>(
+        &self,
+        import: F,
+        succeeded: impl FnOnce(&T) -> bool,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let result = self.run_mutation(import).await;
+        self.set_restore_phase(if succeeded(&result) {
+            MtlsDnsRestorePhase::ImportedOk
+        } else {
+            MtlsDnsRestorePhase::ImportedWithErrors
+        });
+        result
+    }
+
+    /// Run a compensating rollback. Only a completed rollback leaves the
+    /// incomplete-restore phase; a failed one keeps the fence retained.
+    pub(crate) async fn run_restore_rollback<T, E, F>(&self, rollback: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let result = self.run_mutation(rollback).await;
+        if result.is_ok() {
+            self.set_restore_phase(MtlsDnsRestorePhase::RolledBack);
+        }
+        result
+    }
+
+    // External tests reach these through the lib target's `_test_support`
+    // shim; the bin target recompiles this module without that caller.
+    #[allow(dead_code)]
+    pub(crate) fn mark_restore_cleared_for_test(&self) {
+        self.set_restore_phase(MtlsDnsRestorePhase::Cleared);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mark_restore_import_failed_for_test(&self) {
+        self.set_restore_phase(MtlsDnsRestorePhase::ImportedWithErrors);
+    }
+}
+
 #[derive(Clone)]
 struct MtlsDnsAdmissionOperation {
     db: Arc<dyn DatabaseBackend>,
     namespace: String,
     guard_owner: String,
-    mutation_state: Arc<AtomicU8>,
+    hold: Arc<MtlsDnsAdmissionHoldState>,
     released: Arc<AtomicBool>,
 }
 
@@ -6764,16 +6920,28 @@ impl MtlsDnsAdmissionOperation {
     where
         F: std::future::Future<Output = T>,
     {
-        self.mutation_state.store(
-            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
-            Ordering::Release,
-        );
-        let result = mutation.await;
-        self.mutation_state.store(
-            MtlsDnsAdmissionMutationState::Settled as u8,
-            Ordering::Release,
-        );
-        result
+        self.hold.run_mutation(mutation).await
+    }
+
+    async fn run_restore_clear<T, E, F>(&self, clear: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        self.hold.run_restore_clear(clear).await
+    }
+
+    async fn run_restore_import<T, F>(&self, import: F, succeeded: impl FnOnce(&T) -> bool) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.hold.run_restore_import(import, succeeded).await
+    }
+
+    async fn run_restore_rollback<T, E, F>(&self, rollback: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        self.hold.run_restore_rollback(rollback).await
     }
 }
 
@@ -6781,7 +6949,7 @@ struct MtlsDnsAdmissionGuardLifecycle {
     db: Arc<dyn DatabaseBackend>,
     namespace: String,
     guard_owner: String,
-    mutation_state: Arc<AtomicU8>,
+    hold: Arc<MtlsDnsAdmissionHoldState>,
     released: Arc<AtomicBool>,
     armed: bool,
 }
@@ -6811,9 +6979,7 @@ impl MtlsDnsAdmissionGuardLifecycle {
             db,
             namespace: namespace.to_string(),
             guard_owner,
-            mutation_state: Arc::new(AtomicU8::new(
-                MtlsDnsAdmissionMutationState::NotStarted as u8,
-            )),
+            hold: Arc::new(MtlsDnsAdmissionHoldState::new()),
             released: Arc::new(AtomicBool::new(false)),
             armed: true,
         }
@@ -6824,7 +6990,7 @@ impl MtlsDnsAdmissionGuardLifecycle {
             db: self.db.clone(),
             namespace: self.namespace.clone(),
             guard_owner: self.guard_owner.clone(),
-            mutation_state: self.mutation_state.clone(),
+            hold: self.hold.clone(),
             released: self.released.clone(),
         }
     }
@@ -6833,11 +6999,29 @@ impl MtlsDnsAdmissionGuardLifecycle {
         &self.guard_owner
     }
 
-    fn retain_uncertain(&self) {
-        self.mutation_state.store(
-            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
-            Ordering::Release,
-        );
+    /// Enter the incomplete-restore phase: the namespace clear committed (or
+    /// its atomic outcome is ambiguous), so Drop must retain the durable fence
+    /// until an import or compensating rollback reaches a definitive result.
+    /// Nested `run_mutation` calls cannot settle this phase.
+    fn retain_restore_cleared(&self) {
+        self.hold.set_restore_phase(MtlsDnsRestorePhase::Cleared);
+    }
+
+    /// Record that the import failed (including a lost admission lease during
+    /// import), so the namespace is cleared and partially imported.
+    fn retain_restore_import_failed(&self) {
+        self.hold
+            .set_restore_phase(MtlsDnsRestorePhase::ImportedWithErrors);
+    }
+
+    fn restore_phase(&self) -> MtlsDnsRestorePhase {
+        self.hold.restore_phase()
+    }
+
+    /// Carry an incomplete restore phase onto a reacquired guard so the new
+    /// owner keeps the same Drop retention as the released one.
+    fn inherit_restore_phase(&self, phase: MtlsDnsRestorePhase) {
+        self.hold.set_restore_phase(phase);
     }
 
     async fn release(&mut self) -> Result<(), anyhow::Error> {
@@ -6862,12 +7046,10 @@ impl Drop for MtlsDnsAdmissionGuardLifecycle {
         if !self.armed || self.released.load(Ordering::Acquire) {
             return;
         }
-        let state =
-            MtlsDnsAdmissionMutationState::from_u8(self.mutation_state.load(Ordering::Acquire));
-        if !state.release_on_drop() {
+        if !self.hold.release_on_drop() {
             warn!(
                 namespace = %self.namespace,
-                "mTLS DNS admission guard retained because a dispatched mutation has an uncertain outcome"
+                "mTLS DNS admission guard retained because a dispatched mutation or multi-phase restore has an uncertain outcome"
             );
             return;
         }
@@ -6927,7 +7109,7 @@ pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
     } else {
         MtlsDnsAdmissionMutationState::NotStarted
     };
-    state.release_on_drop()
+    state.release_on_drop() && MtlsDnsRestorePhase::Idle.release_on_drop()
 }
 
 /// Hold the datastore namespace guard across an admin read/modify/write
@@ -7869,7 +8051,7 @@ async fn finish_failed_restore(
     let guard_owner = guard.guard_owner().to_string();
     let operation = guard.operation();
     let (mut rollback_status, mut rollback_errors) = match operation
-        .run_mutation(rollback_failed_restore(
+        .run_restore_rollback(rollback_failed_restore(
             db.as_ref(),
             namespace,
             snapshot,
@@ -7962,7 +8144,7 @@ async fn finish_failed_restore_after_intervening_clear(
     let guard_owner = guard.guard_owner().to_string();
     let operation = guard.operation();
     let (mut rollback_status, mut rollback_errors) = match operation
-        .run_mutation(restore_snapshot_after_intervening_clear(
+        .run_restore_rollback(restore_snapshot_after_intervening_clear(
             state,
             db.as_ref(),
             namespace,
@@ -8072,7 +8254,7 @@ async fn finish_unknown_atomic_delete_failure(
     clear_error: String,
     guard: &MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
-    guard.retain_uncertain();
+    guard.retain_restore_cleared();
     let event = audit::AuditEvent::new(
         actor,
         "restore",
@@ -11204,7 +11386,10 @@ async fn handle_restore(
     let delete_operation = restore_guard.operation();
     let delete_completion = match namespace_config_admission_guard
         .run_to_completion_while_held(
-            delete_operation.run_mutation(db.delete_all_resources(namespace, &restore_mode)),
+            // A successful clear enters the incomplete-restore phase inside
+            // the dispatched future, so cancellation at any later await point
+            // (including inside the admission wrapper) retains the fence.
+            delete_operation.run_restore_clear(db.delete_all_resources(namespace, &restore_mode)),
         )
         .await
     {
@@ -11221,15 +11406,15 @@ async fn handle_restore(
         crud::NamespaceConfigAdmissionCompletion::Held(result) => (result, None),
         crud::NamespaceConfigAdmissionCompletion::Lost { result, error } => (result, Some(error)),
     };
-    if delete_result.is_ok() {
-        // A cancelled restore after a successful clear is still an incomplete
-        // multi-phase mutation. Retain the durable fence until import or
-        // compensating rollback reaches a definitive result.
-        restore_guard.retain_uncertain();
-    }
+    // A successful clear already entered `MtlsDnsRestorePhase::Cleared`
+    // (inside `run_restore_clear`): a cancelled restore after the clear is
+    // still an incomplete multi-phase mutation, and the durable fence stays
+    // retained until import or compensating rollback reaches a definitive
+    // result. Nested `run_mutation` calls cannot settle that phase.
     if let Some(_error) = delete_admission_error {
         error_persistence_failure_redacted("restore_namespace_admission_lost_during_clear");
         let lost_generation = namespace_config_admission_guard.generation();
+        let carried_restore_phase = restore_guard.restore_phase();
         if let Err(release_error) = restore_guard.release().await {
             let response_error = redacted_recovery_error_message(
                 "restore_guard_release_before_clear_recovery",
@@ -11270,7 +11455,12 @@ async fn handle_restore(
         let intervening_write =
             !namespace_config_admission_guard.immediately_succeeds_generation(lost_generation);
         restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
-            Ok(guard) => guard,
+            Ok(guard) => {
+                // The reacquired owner inherits the incomplete-restore phase
+                // so an unpolled or cancelled recovery still retains it.
+                guard.inherit_restore_phase(carried_restore_phase);
+                guard
+            }
             Err(recovery_error) => {
                 let response_error = redacted_recovery_error_message(
                     "restore_guard_reacquire_after_clear",
@@ -11365,7 +11555,7 @@ async fn handle_restore(
                 // receive an acknowledgement. Retain the fence across
                 // cancellation until an owner-qualified verification resolves
                 // that ambiguity.
-                restore_guard.retain_uncertain();
+                restore_guard.retain_restore_cleared();
                 let verification = db.count_namespace_resources(namespace).await;
                 if verification.is_err() {
                     error_persistence_failure_redacted(
@@ -11431,13 +11621,10 @@ async fn handle_restore(
     // transactions to keep WAL/redo size bounded.
     let import_operation = restore_guard.operation();
     let import_completion = match namespace_config_admission_guard
-        .run_to_completion_while_held(import_operation.run_mutation(persist_payload_resources(
-            db.as_ref(),
-            &payload,
-            namespace,
-            false,
-            &restore_mode,
-        )))
+        .run_to_completion_while_held(import_operation.run_restore_import(
+            persist_payload_resources(db.as_ref(), &payload, namespace, false, &restore_mode),
+            |(_, errors, _): &(PersistCounts, Vec<String>, bool)| errors.is_empty(),
+        ))
         .await
     {
         Ok(result) => result,
@@ -11457,6 +11644,7 @@ async fn handle_restore(
         } => {
             error_persistence_failure_redacted("restore_namespace_admission_lost_during_import");
             errors.insert(0, NAMESPACE_ADMISSION_LOST_MESSAGE.to_string());
+            restore_guard.retain_restore_import_failed();
             let lost_generation = namespace_config_admission_guard.generation();
             if let Err(release_error) = restore_guard.release().await {
                 let response_error = redacted_recovery_error_message(
@@ -11505,7 +11693,12 @@ async fn handle_restore(
             restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
                 .await
             {
-                Ok(guard) => guard,
+                Ok(guard) => {
+                    // The reacquired owner inherits the failed-import phase
+                    // so an unpolled or cancelled rollback still retains it.
+                    guard.retain_restore_import_failed();
+                    guard
+                }
                 Err(rollback_error) => {
                     let response_error = redacted_recovery_error_message(
                         "restore_guard_reacquire_for_import_rollback",
