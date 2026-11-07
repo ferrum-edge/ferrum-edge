@@ -27,12 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `request_termination` `trigger.header_value`
   - `transaction_debugger` `capture_request_header_value`
   - `ai_semantic_firewall` `privacy.snippet_hash_salt`
+  - inline PEM private keys in `mesh_route_dispatch`
+    `rules[].destination.backend_tls.client_key_path` and `udp_logging`
+    `dtls_key_path` (key references stay visible)
+  - the `header` / `query` / `cookie` operands of every plugin config's
+    resource-level `trigger` (a sibling of `config`, previously never
+    projected), at any depth of its `all` / `any` / `not` tree
 
   They are now withheld (`[REDACTED]`, or a keyed fingerprint in the export).
   Header names, match kinds (`exact` / `prefix` / `regex`) and routing metadata
   stay visible, and a `null` presence-only `waf` condition stays `null`. An
   `operator` write that echoes the placeholder back at one of these fields is
-  refused with `400`. `admin` reads and `GET /backup` stay raw.
+  refused with `400`. `admin` reads and `GET /backup` stay raw. The collector,
+  JWKS, control-plane and federation URLs in a `mesh_authz` `mesh_slice` now
+  get the same structural endpoint projection as other collector URLs.
 - **HTTP/3 WebSocket handshakes strip the same request headers as H1/H2.**
   The H3 frontend's backend WebSocket handshake kept its own hop-by-hop list
   and forwarded a client's `Content-Length` and `Expect` and the internal

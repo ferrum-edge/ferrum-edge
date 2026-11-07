@@ -9,7 +9,8 @@ use ferrum_edge::admin::plugin_config_projection::{
     KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS, PlaceholderSiteRecorder,
     is_credential_bearing_url_config_key, is_redaction_placeholder,
     is_safe_kafka_producer_property, is_sensitive_plugin_config_key, normalize_config_key,
-    project_plugin_config, project_plugin_config_with, redact_endpoint_url, sensitivity_rules_for,
+    project_plugin_config, project_plugin_config_with, project_plugin_trigger_with,
+    redact_endpoint_url, sensitivity_rules_for,
 };
 use ferrum_edge::plugins::builtin_parity::BUILTIN_PLUGIN_PARITY_META;
 use serde_json::{Value, json};
@@ -540,35 +541,69 @@ fn assert_mesh_policy_operands_redacted(policy: &Value) {
 /// `mesh_authz` header and condition operands are withheld in the flat
 /// `mesh_policies` shape and in both policy lists of the mesh-mode
 /// `mesh_slice`, as are the ext-authz check headers, ProxyConfig environment
-/// values and extension payloads the slice carries.
+/// values and extension payloads the slice carries. Its collector, JWKS,
+/// control-plane and federation URLs get the structural endpoint projection.
 #[test]
 fn mesh_authz_match_operands_and_check_headers_are_projected() {
-    let projected = project(
-        "mesh_authz",
-        json!({
-            "mesh_policies": [mesh_policy("mat-flat-canary")],
-            "mesh_slice": {
-                "node_id": "node-a",
-                "mesh_policies": [mesh_policy("mat-slice-canary")],
-                "node_waypoint_capture_mesh_policies": [mesh_policy("mat-capture-canary")],
-                "ext_authz_providers": [{
-                    "name": "ext-check",
-                    "include_additional_headers_in_check": [
-                        {"name": "x-check-gate", "value": "mat-ext-header-canary"}
-                    ]
-                }],
-                "proxy_configs": [{
-                    "name": "defaults",
-                    "environment": {"VENDOR_LICENSE": "mat-env-canary"}
-                }],
-                "extension_configs": [{
-                    "name": "wasm-filter",
-                    "type_url": "type.example/filter",
-                    "value": "mat-extension-canary"
+    let raw = json!({
+        "mesh_policies": [mesh_policy("mat-flat-canary")],
+        "mesh_slice": {
+            "node_id": "node-a",
+            "mesh_policies": [mesh_policy("mat-slice-canary")],
+            "node_waypoint_capture_mesh_policies": [mesh_policy("mat-capture-canary")],
+            "ext_authz_providers": [{
+                "name": "ext-check",
+                "include_additional_headers_in_check": [
+                    {"name": "x-check-gate", "value": "mat-ext-header-canary"}
+                ]
+            }],
+            "proxy_configs": [{
+                "name": "defaults",
+                "environment": {"VENDOR_LICENSE": "mat-env-canary"}
+            }],
+            "extension_configs": [{
+                "name": "wasm-filter",
+                "type_url": "type.example/filter",
+                "value": "mat-extension-canary"
+            }],
+            "telemetry_resources": [{
+                "name": "tracing",
+                "namespace": "shop",
+                "config": {"tracing": {"providers": [
+                    {"kind": "zipkin",
+                     "config": {"url": "https://zipkin.example.com/mat-zipkin-canary"}},
+                    {"kind": "datadog",
+                     "config": {"agent_url": "https://dd.example.com/?token=mat-dd-canary"}},
+                    {"kind": "lightstep",
+                     "config": {"collector_url": "https://ls.example.com/mat-ls-canary"}},
+                    {"kind": "opentelemetry",
+                     "config": {"endpoint": "https://otel.example.com/v1/mat-otel-canary"}}
+                ]}}
+            }],
+            "request_authentications": [{
+                "name": "jwt",
+                "namespace": "shop",
+                "jwt_rules": [{
+                    "issuer": "https://issuer.example.com",
+                    "jwks_uri": "https://issuer.example.com/keys?tenant=mat-jwks-canary"
+                }]
+            }],
+            "multi_cluster": {
+                "federation_endpoint": "https://fed.example.com/mat-fed-canary",
+                "remote_clusters": [{
+                    "name": "east",
+                    "control_plane_url": "https://cp.east.example.com/mat-cp-canary",
+                    "federation_endpoint": "https://fed.east.example.com/mat-remote-fed-canary"
                 }]
             }
-        }),
+        }
+    });
+    assert!(
+        placeholder_sites("mesh_authz", &raw).is_empty(),
+        "the stored config carries no placeholder"
     );
+
+    let projected = project("mesh_authz", raw);
     assert_mesh_policy_operands_redacted(&projected["mesh_policies"][0]);
     let slice = &projected["mesh_slice"];
     assert_mesh_policy_operands_redacted(&slice["mesh_policies"][0]);
@@ -584,6 +619,38 @@ fn mesh_authz_match_operands_and_check_headers_are_projected() {
     assert_eq!(extension["value"], REDACTED);
     assert_eq!(extension["type_url"], "type.example/filter");
     assert_eq!(slice["node_id"], "node-a");
+
+    let providers = &slice["telemetry_resources"][0]["config"]["tracing"]["providers"];
+    for (index, field, url) in [
+        (0_usize, "url", "https://zipkin.example.com/[REDACTED_PATH]"),
+        (1, "agent_url", "https://dd.example.com?[REDACTED_QUERY]"),
+        (2, "collector_url", "https://ls.example.com/[REDACTED_PATH]"),
+        (3, "endpoint", "https://otel.example.com/[REDACTED_PATH]"),
+    ] {
+        assert_eq!(providers[index]["config"][field], url);
+    }
+    assert_eq!(providers[1]["kind"], "datadog");
+    let jwt_rule = &slice["request_authentications"][0]["jwt_rules"][0];
+    assert_eq!(
+        jwt_rule["jwks_uri"],
+        "https://issuer.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(jwt_rule["issuer"], "https://issuer.example.com");
+    let multi_cluster = &slice["multi_cluster"];
+    assert_eq!(
+        multi_cluster["federation_endpoint"],
+        "https://fed.example.com/[REDACTED_PATH]"
+    );
+    let remote = &multi_cluster["remote_clusters"][0];
+    assert_eq!(
+        remote["control_plane_url"],
+        "https://cp.east.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(
+        remote["federation_endpoint"],
+        "https://fed.east.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(remote["name"], "east");
     assert_no_canaries(
         &projected,
         &[
@@ -593,7 +660,170 @@ fn mesh_authz_match_operands_and_check_headers_are_projected() {
             "mat-ext-header-canary",
             "mat-env-canary",
             "mat-extension-canary",
+            "mat-zipkin-canary",
+            "mat-dd-canary",
+            "mat-ls-canary",
+            "mat-otel-canary",
+            "mat-jwks-canary",
+            "mat-fed-canary",
+            "mat-cp-canary",
+            "mat-remote-fed-canary",
         ],
+    );
+
+    // Echoing the projection back is detected at every masked site, including
+    // the condition `key` the name heuristic already masks and the
+    // `values` / `not_values` lists that project to a single placeholder.
+    let mut expected = Vec::new();
+    for policy in [
+        "/config/mesh_policies/0",
+        "/config/mesh_slice/mesh_policies/0",
+        "/config/mesh_slice/node_waypoint_capture_mesh_policies/0",
+    ] {
+        for site in [
+            "to/0/headers/x-tenant",
+            "when/0/key",
+            "when/0/values",
+            "when/0/not_values",
+        ] {
+            expected.push(format!("{policy}/rules/0/{site}"));
+        }
+    }
+    let telemetry = "/config/mesh_slice/telemetry_resources/0/config/tracing/providers";
+    let fields = ["url", "agent_url", "collector_url", "endpoint"];
+    for (index, field) in fields.iter().enumerate() {
+        expected.push(format!("{telemetry}/{index}/config/{field}"));
+    }
+    for site in [
+        "ext_authz_providers/0/include_additional_headers_in_check/0/value",
+        "proxy_configs/0/environment/VENDOR_LICENSE",
+        "extension_configs/0/value",
+        "request_authentications/0/jwt_rules/0/jwks_uri",
+        "multi_cluster/federation_endpoint",
+        "multi_cluster/remote_clusters/0/control_plane_url",
+        "multi_cluster/remote_clusters/0/federation_endpoint",
+    ] {
+        expected.push(format!("/config/mesh_slice/{site}"));
+    }
+    expected.sort();
+    let mut sites = placeholder_sites("mesh_authz", &projected);
+    sites.sort();
+    assert_eq!(sites, expected);
+}
+
+fn tracing_provider_endpoint_fields(plugin: &str, prefix: &[&'static str]) -> Vec<&'static str> {
+    let mut fields: Vec<&'static str> = sensitivity_rules_for(plugin)
+        .iter()
+        .filter(|rule| rule.path.starts_with(prefix))
+        .filter_map(|rule| rule.path.last().copied())
+        .collect();
+    fields.sort_unstable();
+    fields
+}
+
+/// The mesh slice's Telemetry tracing providers are the same `TracingProvider`
+/// envelope `workload_metrics` carries, so both copies must project the same
+/// collector fields.
+#[test]
+fn mesh_slice_tracing_providers_follow_the_workload_metrics_rules() {
+    let workload = tracing_provider_endpoint_fields("workload_metrics", &["tracing_providers"]);
+    let slice =
+        tracing_provider_endpoint_fields("mesh_authz", &["mesh_slice", "telemetry_resources"]);
+    assert_eq!(workload, ["agent_url", "collector_url", "endpoint", "url"]);
+    assert_eq!(slice, workload);
+}
+
+/// TLS private-key sources accept inline PEM. Inline key material is withheld,
+/// a reference (path, `k8s://`, …) stays visible, and an echoed placeholder is
+/// detected.
+#[test]
+fn inline_private_key_sources_are_projected() {
+    let pem = "-----BEGIN PRIVATE KEY-----\npk-inline-canary\n-----END PRIVATE KEY-----\n";
+    let raw = json!({
+        "rules": [
+            {"match": {"methods": ["GET"]}, "destination": {"backend_tls": {
+                "client_cert_path": "/etc/ferrum/route.crt",
+                "client_key_path": pem
+            }}},
+            {"match": {"methods": ["POST"]}, "destination": {"backend_tls": {
+                "client_key_path": "k8s://shop/tls#tls.key"
+            }}}
+        ]
+    });
+    assert!(
+        placeholder_sites("mesh_route_dispatch", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("mesh_route_dispatch", raw);
+    let inline = &projected["rules"][0]["destination"]["backend_tls"];
+    assert_eq!(inline["client_key_path"], REDACTED);
+    assert_eq!(inline["client_cert_path"], "/etc/ferrum/route.crt");
+    let reference = &projected["rules"][1]["destination"]["backend_tls"];
+    assert_eq!(reference["client_key_path"], "k8s://shop/tls#tls.key");
+    assert_no_canaries(&projected, &["pk-inline-canary"]);
+    let key_site = "/config/rules/0/destination/backend_tls/client_key_path";
+    assert_eq!(
+        placeholder_sites("mesh_route_dispatch", &projected),
+        [key_site]
+    );
+
+    let udp = project(
+        "udp_logging",
+        json!({"host": "logs.internal", "dtls": true, "dtls_key_path": pem}),
+    );
+    assert_eq!(udp["dtls_key_path"], REDACTED);
+    assert_eq!(udp["host"], "logs.internal");
+    assert_no_canaries(&udp, &["pk-inline-canary"]);
+}
+
+/// A resource-level plugin `trigger` withholds every header, query and cookie
+/// operand at any depth of the `all` / `any` / `not` tree; names, match kinds,
+/// flags, structure, and non-client predicates stay visible.
+#[test]
+fn trigger_operands_are_withheld_at_every_depth() {
+    let mut trigger = json!({"when": {"not": {"any": [
+        {"match": {"header": {
+            "name": "x-skip",
+            "value": {"exact": ["trigger-a-canary", "trigger-b-canary"]}
+        }}},
+        {"all": [{"match": {"cookie": {
+            "name": "tier",
+            "value": {"regex": "trigger-c-canary", "case_insensitive": true}
+        }}}]},
+        {"match": {"path": {"prefix": ["/visible"]}}}
+    ]}}});
+    let recorder = PlaceholderSiteRecorder::default();
+    project_plugin_trigger_with(&mut trigger, "/trigger", &recorder);
+    assert!(
+        recorder.into_sites().is_empty(),
+        "the stored trigger carries no placeholder"
+    );
+
+    let any = &trigger["when"]["not"]["any"];
+    let header = &any[0]["match"]["header"];
+    assert_eq!(header["name"], "x-skip");
+    assert_eq!(header["value"]["exact"], json!([REDACTED, REDACTED]));
+    let cookie = &any[1]["all"][0]["match"]["cookie"];
+    assert_eq!(cookie["name"], "tier");
+    assert_eq!(cookie["value"]["regex"], REDACTED);
+    assert_eq!(cookie["value"]["case_insensitive"], true);
+    assert_eq!(any[2]["match"]["path"]["prefix"], json!(["/visible"]));
+    assert_no_canaries(
+        &trigger,
+        &["trigger-a-canary", "trigger-b-canary", "trigger-c-canary"],
+    );
+
+    let recorder = PlaceholderSiteRecorder::default();
+    let mut echoed = trigger.clone();
+    project_plugin_trigger_with(&mut echoed, "/trigger", &recorder);
+    assert_eq!(
+        recorder.into_sites(),
+        vec![
+            "/trigger/when/not/any/0/match/header/value/exact/0".to_string(),
+            "/trigger/when/not/any/0/match/header/value/exact/1".to_string(),
+            "/trigger/when/not/any/1/all/0/match/cookie/value/regex".to_string(),
+        ]
     );
 }
 
