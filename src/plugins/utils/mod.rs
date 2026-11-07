@@ -24,6 +24,7 @@ pub mod content_encoding;
 pub mod dpop;
 pub mod fault_delay;
 pub mod fault_roll;
+pub mod grpc_method;
 pub mod header_extract;
 pub mod http_client;
 pub mod introspection_cache;

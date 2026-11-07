@@ -46,6 +46,7 @@ use tracing::debug;
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use super::utils::body_transform::is_json_content_type;
+use super::utils::grpc_method::resolve_grpc_method_path;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
     AnthropicEvent, MAX_OPENAI_STREAM_ACCUMULATORS, SseEventName, SseReassembler, SseTextKind,
@@ -2805,31 +2806,23 @@ impl AiResponseGuard {
 
     // ───────────────────────── native gRPC inspection ─────────────────────────
 
-    /// Resolve the gRPC method path used for enrollment lookup.
+    /// Resolve the canonical gRPC method key used for enrollment lookup.
     ///
-    /// Prefers the finalized `grpc_full_method` published by
-    /// `grpc_method_router` (which reflects a method rewrite applied before
-    /// dispatch), then the backend-effective path the proxy bound at the
-    /// backend-path boundary (`RequestContext::authorized_backend_path`, bound
-    /// for every request on a `grpc`-enrolled instance because it opts into
-    /// `requires_backend_path_resolution`), and only then the request path.
-    /// Without the bound path, a guard-only route with `strip_listen_path` or a
+    /// The backend-effective path the proxy bound at the backend-path boundary
+    /// (`RequestContext::authorized_backend_path`, bound for every request on a
+    /// `grpc`-enrolled instance because it opts into
+    /// `requires_backend_path_resolution`) is authoritative and is never
+    /// outranked by plugin-writable `grpc_full_method` metadata. Without the
+    /// bound path, a guard-only route with `strip_listen_path` or a
     /// `backend_path` would decide enrollment on the client path, which the
     /// backend never receives, and skip an enrolled method entirely. Backends
     /// never echo `:path` in a response, so the request is the only correct
     /// source. A pre-dispatch synthetic reply has no bound path and keeps the
-    /// client path.
+    /// provisional metadata / client path. The key is the trailing
+    /// `/Service/Method`, the same resolution `body_validator` uses
+    /// ([`resolve_grpc_method_path`]).
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
-        match ctx.metadata.get("grpc_full_method") {
-            Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
-            Some(method) => {
-                let mut path = String::with_capacity(method.len() + 1);
-                path.push('/');
-                path.push_str(method);
-                Cow::Owned(path)
-            }
-            None => Cow::Borrowed(ctx.authorized_backend_path().unwrap_or(ctx.path.as_str())),
-        }
+        resolve_grpc_method_path(ctx)
     }
 
     /// Whether a configured gRPC contract governs this request's response.

@@ -69,6 +69,7 @@ use crate::proxy::response_buffer_budget::{
 };
 use crate::util::json_dup_keys::{self, JsonScanMemo};
 
+use super::utils::grpc_method::{canonical_grpc_method, resolve_grpc_method_path};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -1420,25 +1421,7 @@ impl BodyValidator {
     /// backend-path resolution and the bound path wins. Backends never echo
     /// `:path` in responses.
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
-        if let Some(path) = ctx.authorized_backend_path() {
-            return Cow::Borrowed(canonical_grpc_method(path));
-        }
-        match ctx.metadata.get("grpc_full_method") {
-            Some(method) if method.starts_with('/') => {
-                Cow::Borrowed(canonical_grpc_method(method.as_str()))
-            }
-            Some(method) => {
-                let mut path = String::with_capacity(method.len() + 1);
-                path.push('/');
-                path.push_str(method);
-                if canonical_grpc_method(&path).len() == path.len() {
-                    Cow::Owned(path)
-                } else {
-                    Cow::Owned(canonical_grpc_method(&path).to_string())
-                }
-            }
-            None => Cow::Borrowed(canonical_grpc_method(ctx.path.as_str())),
-        }
+        resolve_grpc_method_path(ctx)
     }
 
     /// Whether protobuf response validation applies to this request/response.
@@ -1650,23 +1633,6 @@ fn request_grpc_method_path<'a>(
     match ctx {
         Some(ctx) => BodyValidator::grpc_method_path(ctx),
         None => Cow::Borrowed(""),
-    }
-}
-
-/// The canonical gRPC method key of a request path: its trailing
-/// `/Service/Method` (query and fragment excluded). A gRPC method is always the
-/// last two path segments, so a listen-path prefix, a stripped prefix, or a
-/// backend base path cannot make the same method select a different
-/// `protobuf_method_messages` entry.
-fn canonical_grpc_method(path: &str) -> &str {
-    let end = path.find(['?', '#']).unwrap_or(path.len());
-    let path = &path[..end];
-    let Some(last) = path.rfind('/') else {
-        return path;
-    };
-    match path[..last].rfind('/') {
-        Some(start) => &path[start..],
-        None => path,
     }
 }
 
