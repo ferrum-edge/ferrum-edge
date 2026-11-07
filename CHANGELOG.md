@@ -17,6 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **Non-admin admin-API reads no longer return inline backend TLS private
+  keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
+  inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,
+  `GET /upstreams[/{id}]`), admin audit diffs and `GET /config/export`
+  returned it verbatim, as they did inline keys that a mesh DestinationRule
+  placed in an upstream's `port_overrides.<port>.tls.client_key_path` or
+  `subsets[].traffic_policy.tls.private_key`. Every non-admin projection now
+  withholds stored private-key material in every TLS slot (and a private-key
+  block anywhere else in the resource, such as a certificate-plus-key bundle
+  in a certificate or CA field) as `[REDACTED]`, or a keyed fingerprint in the
+  export; paths and `k8s://`, `vault://`, `managed://`, `system://` and other
+  references stay visible, and `admin` reads stay raw. An `operator` write that
+  echoes the placeholder back is refused with `400`, so it cannot replace the
+  stored key; send the real key or a reference with the change.
 - **HTTP/3 WebSocket handshakes strip the same request headers as H1/H2.**
   The H3 frontend's backend WebSocket handshake kept its own hop-by-hop list
   and forwarded a client's `Content-Length` and `Expect` and the internal
