@@ -42,6 +42,11 @@ use crate::config::namespace_registry::{
     protected_namespaces_contains, require_namespace_registry_admission_leases,
 };
 use crate::config::policy_graph_scope::PolicyGraphScope;
+use crate::config::store_policy::{
+    access_control_plugin_allows_consumer, consumer_identity_values,
+    mesh_route_dispatch_referenced_upstream, mesh_route_dispatch_references_upstream_id,
+    store_canonical_resource_hash,
+};
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -52,7 +57,6 @@ use crate::config::validation_pipeline::{
     collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
 };
 use crate::fips::approved::Sha256;
-use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use crate::proxy::stream_match::StreamMatchCriteria;
 use crate::util::deserialization as config_decode;
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -543,22 +547,6 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
     entries
 }
 
-/// Deduped set of identity values a consumer claims within its namespace:
-/// id, username, and custom_id (when present). Deduped because
-/// self-collisions — a consumer whose own custom_id equals its own id or
-/// username — are explicitly allowed (matching
-/// `GatewayConfig::validate_unique_consumer_identities`); only cross-consumer
-/// collisions must trip the `consumer_identity_index` primary key.
-fn consumer_identity_values(consumer: &Consumer) -> Vec<&str> {
-    let mut values = vec![consumer.id.as_str(), consumer.username.as_str()];
-    if let Some(custom_id) = consumer.custom_id.as_deref() {
-        values.push(custom_id);
-    }
-    values.sort_unstable();
-    values.dedup();
-    values
-}
-
 fn consumer_identity_probe_fields<'a>(
     consumer_id: &'a str,
     username: &'a str,
@@ -613,45 +601,6 @@ pub(crate) fn format_consumer_identity_conflict(
     }
 }
 
-fn mesh_route_dispatch_references_upstream_id(plugin: &PluginConfig, upstream_id: &str) -> bool {
-    if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-        return false;
-    }
-    MeshRouteDispatchConfig::from_value(&plugin.config)
-        .is_ok_and(|config| config.references_upstream_id(upstream_id))
-}
-
-fn mesh_route_dispatch_referenced_upstream(
-    plugin: &PluginConfig,
-    upstream_ids: &HashSet<String>,
-) -> Option<String> {
-    if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-        return None;
-    }
-    let config = MeshRouteDispatchConfig::from_value(&plugin.config).ok()?;
-    config
-        .rules
-        .iter()
-        .filter_map(|rule| rule.destination.upstream_id.as_deref())
-        .find(|upstream_id| upstream_ids.contains(*upstream_id))
-        .map(ToOwned::to_owned)
-}
-
-/// `access_control.allowed_consumers` names gateway Consumer usernames
-/// (byte-for-byte). A delete must refuse while any plugin config in the
-/// namespace still authorizes that username; the operator's policy is not
-/// rewritten.
-fn access_control_plugin_allows_consumer(config: &serde_json::Value, username: &str) -> bool {
-    config
-        .get("allowed_consumers")
-        .and_then(|value| value.as_array())
-        .is_some_and(|consumers| {
-            consumers
-                .iter()
-                .any(|entry| entry.as_str() == Some(username))
-        })
-}
-
 fn upstream_backend_tls_san_allow_list_json(
     upstream: &Upstream,
 ) -> Result<Option<String>, anyhow::Error> {
@@ -662,26 +611,6 @@ fn upstream_backend_tls_san_allow_list_json(
             .map(Some)
             .map_err(Into::into)
     }
-}
-
-fn store_canonical_resource_hash(
-    bundle: &crate::admin::api_specs::ExtractedBundle,
-) -> Result<String, anyhow::Error> {
-    let mut proxy = bundle.proxy.clone();
-    proxy.normalize_fields();
-    let upstream = bundle.upstream.clone().map(|mut upstream| {
-        upstream.normalize_fields();
-        upstream
-    });
-    let mut plugins = bundle.plugins.clone();
-    for plugin in &mut plugins {
-        plugin.normalize_fields();
-    }
-    crate::admin::api_specs::hash_resource_bundle(&crate::admin::api_specs::ExtractedBundle {
-        proxy,
-        upstream,
-        plugins,
-    })
 }
 
 #[derive(Debug)]

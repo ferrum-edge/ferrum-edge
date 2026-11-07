@@ -4,6 +4,7 @@ paths:
   - "src/config/db_backend.rs"
   - "src/config/db_loader.rs"
   - "src/config/mongo_store.rs"
+  - "src/config/store_policy.rs"
   - "openapi.yaml"
   - "docs/admin_api.md"
   - "docs/admin_batch_api.md"
@@ -77,7 +78,7 @@ paths:
 - `replace_api_spec_bundle` compares `resource_hash`, excluding `api_spec_id`, `created_at`, and `updated_at`.
 - If the resource hash matches on PUT, update only the `api_specs` row. Do not advance `updated_at` on proxies/upstreams/plugin configs.
 - Matching resource hash must not trigger router/plugin cache rebuild, pool warmup, capability refresh, or DP broadcast.
-- When changing the hash function, update SQL `db_loader.rs` and `mongo_store.rs` together.
+- The store-side resource hash is `config::store_policy::store_canonical_resource_hash` (normalize, then `hash_resource_bundle`), shared by SQL `db_loader.rs` and `mongo_store.rs`; change it there, never in one backend.
 
 ## Storage Caps
 
