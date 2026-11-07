@@ -72,7 +72,8 @@ enum Listener {
     Admin,
 }
 
-/// Material shapes for one listener's cert/key (and optionally its client CA).
+/// Material shapes for one listener's cert/key (and optionally its client CA
+/// or OCSP response).
 #[derive(Clone, Copy, Debug)]
 enum Shape {
     /// No cert/key configured for this listener.
@@ -83,6 +84,8 @@ enum Shape {
     FileBacked,
     /// Inline cert/key, but a file-backed client-CA bundle.
     InlineWithFileClientCa,
+    /// Inline cert/key, but a file-backed OCSP response.
+    InlineWithFileOcsp,
 }
 
 struct Fixture {
@@ -91,6 +94,7 @@ struct Fixture {
     cert_path: String,
     key_path: String,
     ca_path: String,
+    ocsp_path: String,
     crl_path: String,
 }
 
@@ -98,10 +102,11 @@ fn fixture() -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let material = self_signed();
     let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
-    let (cert_path, key_path, ca_path, crl_path) = (
+    let (cert_path, key_path, ca_path, ocsp_path, crl_path) = (
         path("cert.pem"),
         path("key.pem"),
         path("ca.pem"),
+        path("ocsp.der"),
         path("crl.pem"),
     );
     // The watcher only fingerprints files until a change is observed; the
@@ -109,6 +114,7 @@ fn fixture() -> Fixture {
     std::fs::write(&cert_path, &material.cert_pem).expect("write cert");
     std::fs::write(&key_path, &material.key_pem).expect("write key");
     std::fs::write(&ca_path, &material.cert_pem).expect("write ca");
+    std::fs::write(&ocsp_path, b"placeholder ocsp").expect("write ocsp");
     std::fs::write(&crl_path, b"placeholder crl").expect("write crl");
     Fixture {
         _dir: dir,
@@ -116,23 +122,31 @@ fn fixture() -> Fixture {
         cert_path,
         key_path,
         ca_path,
+        ocsp_path,
         crl_path,
     }
 }
 
 fn apply_shape(env: &mut EnvConfig, fx: &Fixture, listener: Listener, shape: Shape) {
-    let (cert, key, client_ca) = match shape {
-        Shape::Absent => (None, None, None),
-        Shape::InlineOnly => (
-            Some(fx.material.cert_pem.clone()),
-            Some(fx.material.key_pem.clone()),
+    let inline_cert = || Some(fx.material.cert_pem.clone());
+    let inline_key = || Some(fx.material.key_pem.clone());
+    let (cert, key, client_ca, ocsp) = match shape {
+        Shape::Absent => (None, None, None, None),
+        Shape::InlineOnly => (inline_cert(), inline_key(), None, None),
+        Shape::FileBacked => (
+            Some(fx.cert_path.clone()),
+            Some(fx.key_path.clone()),
+            None,
             None,
         ),
-        Shape::FileBacked => (Some(fx.cert_path.clone()), Some(fx.key_path.clone()), None),
-        Shape::InlineWithFileClientCa => (
-            Some(fx.material.cert_pem.clone()),
-            Some(fx.material.key_pem.clone()),
-            Some(fx.ca_path.clone()),
+        Shape::InlineWithFileClientCa => {
+            (inline_cert(), inline_key(), Some(fx.ca_path.clone()), None)
+        }
+        Shape::InlineWithFileOcsp => (
+            inline_cert(),
+            inline_key(),
+            None,
+            Some(fx.ocsp_path.clone()),
         ),
     };
     match listener {
@@ -140,11 +154,13 @@ fn apply_shape(env: &mut EnvConfig, fx: &Fixture, listener: Listener, shape: Sha
             env.frontend_tls_cert_path = cert;
             env.frontend_tls_key_path = key;
             env.frontend_tls_client_ca_bundle_path = client_ca;
+            env.frontend_tls_ocsp_response_source = ocsp;
         }
         Listener::Admin => {
             env.admin_tls_cert_path = cert;
             env.admin_tls_key_path = key;
             env.admin_tls_client_ca_bundle_path = client_ca;
+            env.admin_tls_ocsp_response_source = ocsp;
         }
     }
 }
@@ -193,6 +209,7 @@ async fn can_arm_matches_prepare_across_the_configuration_matrix() {
                 Shape::InlineOnly,
                 Shape::FileBacked,
                 Shape::InlineWithFileClientCa,
+                Shape::InlineWithFileOcsp,
             ] {
                 for shared_crl in [false, true] {
                     let mut env = EnvConfig {
@@ -209,7 +226,9 @@ async fn can_arm_matches_prepare_across_the_configuration_matrix() {
                             // All-inline material is static unless the shared
                             // CRL source is file-backed.
                             Shape::InlineOnly => shared_crl,
-                            Shape::FileBacked | Shape::InlineWithFileClientCa => true,
+                            Shape::FileBacked
+                            | Shape::InlineWithFileClientCa
+                            | Shape::InlineWithFileOcsp => true,
                         };
                     let case = format!(
                         "{listener:?} live_reload={live_reload} shape={shape:?} \
@@ -277,4 +296,38 @@ async fn client_ca_field_is_watched_as_listener_owned_material() {
     assert!(!prepare_arms(Listener::Proxy, &env, &fx));
     assert!(can_arm(Listener::Admin, &env));
     assert!(prepare_arms(Listener::Admin, &env, &fx));
+}
+
+#[tokio::test]
+async fn ocsp_field_is_watched_as_listener_owned_material() {
+    // The OCSP response source is listener-owned: with inline certificates on
+    // both listeners and no shared CRL, a file-backed OCSP response makes only
+    // its own listener refreshable. Run in both directions so swapping the
+    // proxy/admin OCSP fields in the classifier fails here, and with live
+    // reload off nothing arms at all.
+    let fx = fixture();
+    for (owner, other) in [
+        (Listener::Proxy, Listener::Admin),
+        (Listener::Admin, Listener::Proxy),
+    ] {
+        for live_reload in [false, true] {
+            let mut env = EnvConfig {
+                frontend_tls_live_reload_enabled: live_reload,
+                frontend_tls_watch_interval_seconds: 60,
+                ..EnvConfig::default()
+            };
+            apply_shape(&mut env, &fx, owner, Shape::InlineWithFileOcsp);
+            apply_shape(&mut env, &fx, other, Shape::InlineOnly);
+
+            let case = format!("ocsp owner={owner:?} live_reload={live_reload}");
+            assert_eq!(can_arm(owner, &env), live_reload, "owner can_arm: {case}");
+            assert_eq!(
+                prepare_arms(owner, &env, &fx),
+                live_reload,
+                "owner prepare: {case}"
+            );
+            assert!(!can_arm(other, &env), "other can_arm: {case}");
+            assert!(!prepare_arms(other, &env, &fx), "other prepare: {case}");
+        }
+    }
 }
