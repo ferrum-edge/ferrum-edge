@@ -477,6 +477,44 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
                 "allow_insecure_loopback": true
             }
         }),
+        // A name never proves the collector is on this machine: DNS overrides
+        // and the resolver decide where `localhost` connects (#6659).
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://collector.localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        // The URL parser ignores surrounding whitespace and embedded
+        // tabs/newlines, so the scheme is judged on the parsed URL, not on the
+        // configured spelling.
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": " http://collector.example.com/audit"
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": " http://localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "ht\ttp://collector.example.com/audit"
+            }
+        }),
     ] {
         let err = AiTranscriptAudit::new(&config, loopback_http_client())
             .err()
@@ -498,6 +536,22 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
         AiTranscriptAudit::new(&loopback, loopback_http_client()).is_ok(),
         "explicit IPv6 loopback cleartext should remain available for local development"
     );
+    for endpoint in [
+        "http://127.1:9001/audit",
+        "http://[0:0:0:0:0:0:0:1]:9001/audit",
+    ] {
+        let config = json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "allow_insecure_loopback": true
+            }
+        });
+        assert!(
+            AiTranscriptAudit::new(&config, loopback_http_client()).is_ok(),
+            "URL-normalized loopback IP literal {endpoint} stays admitted"
+        );
+    }
 }
 
 #[tokio::test]

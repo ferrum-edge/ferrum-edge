@@ -19102,7 +19102,6 @@ fn jwks_auth_schema_matches_runtime_admission() {
         local(json!({})),
         json!({"providers": [{"discovery_url": DISCOVERY_URL}]}),
         json!({"providers": [{"jwks_uri": "http://127.0.0.1:9000/jwks"}]}),
-        json!({"providers": [{"jwks_uri": "http://localhost:9000/jwks"}]}),
         local(json!({
             "issuer": ISSUER,
             "require_dpop": true,
@@ -19126,6 +19125,8 @@ fn jwks_auth_schema_matches_runtime_admission() {
         remote(json!({"jwks": inline()})),
         json!({"providers": [{"jwks_uri": "not a url"}]}),
         json!({"providers": [{"jwks_uri": "http://idp.example.com/jwks"}]}),
+        json!({"providers": [{"jwks_uri": "http://localhost:9000/jwks"}]}),
+        json!({"providers": [{"discovery_url": "http://localhost:9000/.well-known/openid-configuration"}]}),
         json!({"providers": [{"jwks_uri": "https://u:p@idp.example.com/jwks"}]}),
         local(json!({"jwks_max_stale_seconds": 600})),
         local(json!({"require_dpop": true})),

@@ -17,6 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **Cleartext auth endpoints are admitted only for loopback IP literals,
+  never the name `localhost`.** `oauth2_introspection` (credentialed
+  `http://` endpoints and `client_auth.method: none`), `jwks_auth`
+  (`jwks_uri` / `discovery_url`), `oidc_relying_party` (`discovery_url`,
+  `token_endpoint`, `userinfo_endpoint`, `jwks_uri`, discovered endpoints and
+  `client_auth.method: none`) and `ai_transcript_audit`
+  (`sink.allow_insecure_loopback`) accepted the name `localhost` as
+  loopback, so a DNS override or resolver mapping could carry client secrets,
+  authorization codes, audit transcripts, or an attacker-chosen key set over
+  cleartext to another host. They now follow the #6659 rule: only
+  `127.0.0.0/8` and `::1` literals qualify. Under `client_auth.method: none`,
+  an OIDC token endpoint learned from discovery must meet the same rule (a
+  named discovered revocation endpoint is ignored, so logout skips
+  revocation), and
+  `ai_transcript_audit` judges the sink scheme on the parsed URL (a leading
+  space or embedded tab no longer skips the cleartext guard). **Upgrade:**
+  replace `http://localhost` with `http://127.0.0.1` (or `[::1]`) in these
+  fields. Configured browser-followed OIDC URLs (`authorization_endpoint`,
+  `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) and the
+  `issuer` identifier keep `localhost`; a discovered plaintext endpoint must
+  share the loopback IP-literal discovery origin.
 - **`tcp_logging` no-verify TLS advertises the crypto provider's signature
   schemes and warns.** Under `FERRUM_TLS_NO_VERIFY` the plugin used a private
   verifier with a hard-coded scheme list that did not follow the build's
