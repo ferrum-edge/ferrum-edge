@@ -415,6 +415,7 @@ impl ClientSubscriptionState {
         }
     }
 
+    #[cfg(test)]
     fn required_types_have_initial_response(&self) -> bool {
         REQUIRED_MESH_SLICE_TYPE_URLS.iter().all(|type_url| {
             self.subscriptions
@@ -1289,11 +1290,6 @@ fn flush_pending_xds_slice_before_error(
 struct PendingXdsSlice {
     slice: MeshSlice,
     type_url: String,
-    all_types_ready: bool,
-    /// True when this slice was built from a partial per-type update (required
-    /// versions not all identical). Drives the `ferrum_xds_warming_partial_
-    /// applies_total` counter at apply time.
-    version_skew: bool,
 }
 
 async fn handle_ads_response(
@@ -1357,12 +1353,7 @@ async fn handle_ads_response(
             subscriptions.mark_acked(&type_url);
             subscriptions.mark_processed(&type_url);
             nack_circuit_breaker.record_ack(&type_url);
-            Ok(Some(PendingXdsSlice {
-                slice,
-                type_url,
-                all_types_ready: subscriptions.required_types_have_initial_response(),
-                version_skew: accumulator.required_versions_skewed(),
-            }))
+            Ok(Some(PendingXdsSlice { slice, type_url }))
         }
         Ok(None) => {
             send_ads_request(tx, subscriptions.build_ack(&type_url), XDS_OUTBOUND_BOUND).await?;
@@ -1473,20 +1464,12 @@ fn apply_pending_xds_slice(
     pending: PendingXdsSlice,
 ) -> Result<(), XdsAttemptError> {
     let version = pending.slice.version.clone();
-    let version_skew = pending.version_skew;
     consumer.apply_slice(pending.slice)?;
-    if version_skew {
-        crate::plugins::mesh::prometheus_helpers::increment_xds_warming_partial_apply(
-            &config.namespace,
-        );
-    }
     info!(
         node_id = %sanitize_startup_scalar(config.node_id.as_str()),
         namespace = %sanitize_startup_scalar(config.namespace.as_str()),
         version = %sanitize_startup_scalar(version.to_string()),
         type_url = %pending.type_url,
-        all_types_ready = pending.all_types_ready,
-        version_skew = version_skew,
         "Applied debounced xDS ADS update"
     );
     Ok(())
@@ -3834,7 +3817,7 @@ mod tests {
                 assert_eq!(pending.slice.version, "v2");
                 assert_eq!(pending.slice.services.len(), 1);
                 assert_eq!(pending.slice.services[0].name, "api");
-                assert!(!pending.version_skew);
+                assert!(!accumulator.required_versions_skewed());
             }
         }
     }
@@ -3925,20 +3908,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_increments_partial_metric_only_when_marked_skewed() {
-        use crate::plugins::mesh::prometheus_helpers::xds_warming_partial_apply_count;
-
-        // Unique namespace so the namespaced counter is isolated from parallel
-        // tests touching the same metric.
-        let namespace = format!("warm-apply-{}-{}", std::process::id(), line!());
-        let config = XdsClientConfig {
-            namespace: namespace.clone(),
-            ..test_config()
-        };
+    fn apply_installs_pending_slice() {
+        let config = test_config();
         let state = MeshRuntimeState::new();
-        let consumer = XdsConfigConsumer::new(config.clone(), state);
+        let consumer = XdsConfigConsumer::new(config.clone(), state.clone());
 
-        assert_eq!(xds_warming_partial_apply_count(&namespace), 0);
         apply_pending_xds_slice(
             &consumer,
             &config,
@@ -3948,49 +3922,24 @@ mod tests {
                     ..MeshSlice::default()
                 },
                 type_url: ECDS_TYPE_URL.to_string(),
-                all_types_ready: true,
-                version_skew: true,
-            },
-        )
-        .expect("the skewed slice applies");
-        assert_eq!(
-            xds_warming_partial_apply_count(&namespace),
-            1,
-            "a defensive skewed apply marker must increment the partial-apply counter"
-        );
-
-        // A coherent (non-skewed) apply must NOT increment the counter.
-        apply_pending_xds_slice(
-            &consumer,
-            &config,
-            PendingXdsSlice {
-                slice: MeshSlice {
-                    version: "v3".to_string(),
-                    ..MeshSlice::default()
-                },
-                type_url: CDS_TYPE_URL.to_string(),
-                all_types_ready: true,
-                version_skew: false,
             },
         )
         .expect("the coherent slice applies");
         assert_eq!(
-            xds_warming_partial_apply_count(&namespace),
-            1,
-            "a coherent apply must not increment the partial-apply counter"
+            state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .map(|slice| slice.version.as_str()),
+            Some("v2")
         );
     }
 
     #[test]
-    fn stale_pending_slice_is_stream_terminal_and_not_counted_as_applied() {
+    fn stale_pending_slice_is_stream_terminal_and_not_applied() {
         use crate::modes::mesh::revision::MeshConfigRevision;
-        use crate::plugins::mesh::prometheus_helpers::xds_warming_partial_apply_count;
 
-        let namespace = format!("stale-apply-{}-{}", std::process::id(), line!());
-        let config = XdsClientConfig {
-            namespace: namespace.clone(),
-            ..test_config()
-        };
+        let config = test_config();
         let state = MeshRuntimeState::new();
         let consumer = XdsConfigConsumer::new(config.clone(), state.clone());
         consumer
@@ -4001,7 +3950,6 @@ mod tests {
             })
             .expect("the fresh baseline applies");
 
-        let before = xds_warming_partial_apply_count(&namespace);
         let error = apply_pending_xds_slice(
             &consumer,
             &config,
@@ -4012,18 +3960,11 @@ mod tests {
                     ..MeshSlice::default()
                 },
                 type_url: ECDS_TYPE_URL.to_string(),
-                all_types_ready: true,
-                version_skew: true,
             },
         )
         .expect_err("a stale xDS slice closes ADS so the client can fail over");
 
         assert!(error.to_string().contains("stale_revision"));
-        assert_eq!(
-            xds_warming_partial_apply_count(&namespace),
-            before,
-            "a quarantined slice was never applied"
-        );
         assert_eq!(
             state
                 .snapshot()
@@ -4115,8 +4056,6 @@ mod tests {
                     ..MeshSlice::default()
                 },
                 type_url: CDS_TYPE_URL.to_string(),
-                all_types_ready: true,
-                version_skew: false,
             },
             now: tokio::time::Instant::now(),
         });
@@ -4720,8 +4659,6 @@ mod tests {
                     ..MeshSlice::default()
                 },
                 type_url: CDS_TYPE_URL.to_string(),
-                all_types_ready: true,
-                version_skew: false,
             },
             now: tokio::time::Instant::now(),
         });
