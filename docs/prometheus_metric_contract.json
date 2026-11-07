@@ -5600,18 +5600,5 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
-  },
-  {
-    "name": "ferrum_xds_warming_partial_applies_total",
-    "type": "counter",
-    "help": "Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this.",
-    "labels": [
-      "namespace",
-      "gateway_namespace"
-    ],
-    "subsystem": "mesh",
-    "export_surface": "/metrics",
-    "bundled": "documented_only",
-    "emission": "conditional"
   }
 ]

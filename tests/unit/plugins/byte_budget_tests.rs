@@ -859,3 +859,63 @@ fn trace_batch_body_is_refused_rather_than_materialized_under_a_saturated_ceilin
     assert!(rejections > 0);
     assert_eq!(after_release, 0);
 }
+
+// ---------------------------------------------------------------------------
+// BoundedJsonWriter — the single bounded JSON sink shared by the summary
+// loggers, loki_logging, ws_logging, kafka_logging, and ai_federation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bounded_json_writer_admits_exactly_the_limit_and_refuses_one_byte_more() {
+    use ferrum_edge::plugins::utils::byte_budget::BoundedJsonWriter;
+
+    let value = json!({"k": "value", "n": [1, 2, 3]});
+    let expected = serde_json::to_vec(&value).unwrap();
+
+    let mut exact = BoundedJsonWriter::new(expected.len());
+    serde_json::to_writer(&mut exact, &value).expect("a value of exactly the limit fits");
+    assert!(!exact.limit_exceeded);
+    assert_eq!(exact.bytes, expected, "bytes are serde_json's own output");
+
+    let mut short = BoundedJsonWriter::new(expected.len() - 1);
+    assert!(serde_json::to_writer(&mut short, &value).is_err());
+    assert!(short.limit_exceeded, "over-limit is reported on the flag");
+    assert!(
+        short.bytes.len() < expected.len(),
+        "a refused write appends nothing past the limit"
+    );
+}
+
+#[test]
+fn bounded_json_writer_refused_write_appends_nothing_and_latches() {
+    use ferrum_edge::plugins::utils::byte_budget::BoundedJsonWriter;
+
+    let mut writer = BoundedJsonWriter::new(4);
+    assert_eq!(writer.write(b"ab").unwrap(), 2);
+    assert!(writer.write(b"cde").is_err());
+    assert!(writer.limit_exceeded);
+    assert_eq!(
+        writer.bytes, b"ab",
+        "the refused chunk is not partially copied"
+    );
+    // An empty write never crosses the limit.
+    assert_eq!(writer.write(b"").unwrap(), 0);
+    assert!(writer.flush().is_ok());
+}
+
+#[test]
+fn bounded_json_writer_distinguishes_serializer_errors_from_the_limit() {
+    use ferrum_edge::plugins::utils::byte_budget::BoundedJsonWriter;
+    use std::collections::BTreeMap;
+
+    // A non-string map key is a serde_json error, not a size refusal: every
+    // caller routes this to its SinkError / Serialization branch.
+    let mut map = BTreeMap::new();
+    map.insert((1u8, 2u8), 3u8);
+    let mut writer = BoundedJsonWriter::new(1_024);
+    assert!(serde_json::to_writer(&mut writer, &map).is_err());
+    assert!(
+        !writer.limit_exceeded,
+        "a serializer error must not be reported as an over-limit entry"
+    );
+}

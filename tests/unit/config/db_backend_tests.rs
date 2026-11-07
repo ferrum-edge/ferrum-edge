@@ -705,7 +705,10 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
     assert!(!status.allow_writes);
 
     // Failback remains allowed when no Admin mutation was admitted.
-    state.mark_primary("sqlite:///tmp/primary.db");
+    let permit = state
+        .ensure_primary_failback_allowed()
+        .expect("failback is not fenced without an admitted write");
+    state.mark_primary(permit, "sqlite:///tmp/primary.db");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
 
@@ -746,10 +749,64 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
 fn failover_topology_mark_primary_emits_clear_window() {
     let state = DbFailoverTopologyState::new();
     state.mark_failover("postgres://***/***/ferrum");
-    state.mark_primary("postgres://***/***/ferrum");
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    state.mark_primary(permit, "postgres://***/***/ferrum");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
     assert!(state.status().failover_since_unix_ms.is_none());
+}
+
+/// Issue #7033: `mark_primary` consumes the permit only a passing
+/// `ensure_primary_failback_allowed` returns. A permit issued before a later
+/// failover write is refused by `revalidate_primary_failback`, and even a
+/// broken caller that finalizes with it cannot erase the fence: it holds
+/// until operator reconciliation and restart.
+#[test]
+fn failover_topology_stale_failback_permit_is_refused_and_never_clears_fence() {
+    use ferrum_edge::config::db_backend::primary_failback_fenced;
+
+    let state = DbFailoverTopologyState::new();
+    // A permit taken while failover writes are still unfenced is fresh.
+    state.mark_failover("sqlite:///tmp/failover.db");
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    assert!(state.revalidate_primary_failback(&permit).is_ok());
+
+    // Once a failover write is admitted, no new permit can be obtained and
+    // the earlier one is stale.
+    state.note_admin_write();
+    assert!(state.status().primary_failback_fenced);
+    let fenced = state
+        .ensure_primary_failback_allowed()
+        .expect_err("an admitted failover write must fence failback");
+    assert!(primary_failback_fenced(&fenced));
+    let stale = state
+        .revalidate_primary_failback(&permit)
+        .expect_err("a permit issued before the failover write must be refused");
+    assert!(primary_failback_fenced(&stale));
+
+    // Publishers abort on the revalidation above; if a broken caller
+    // finalizes anyway, the fence must stay set and visible.
+    state.mark_primary(permit, "sqlite:///tmp/primary.db");
+    let status = state.status();
+    assert!(status.primary_active);
+    assert!(
+        status.primary_failback_fenced,
+        "mark_primary must never clear the failover-write fence"
+    );
+}
+
+/// The permit's generation only moves for writes admitted on failover, so a
+/// permit taken while the primary is active stays fresh across primary-side
+/// writes.
+#[test]
+fn failover_topology_permit_stays_fresh_across_primary_writes() {
+    let state = DbFailoverTopologyState::new();
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    state.note_admin_write();
+    assert!(state.revalidate_primary_failback(&permit).is_ok());
+    state.mark_primary(permit, "sqlite:///tmp/primary.db");
+    assert!(state.primary_active());
+    assert!(!state.status().primary_failback_fenced);
 }
 
 #[test]

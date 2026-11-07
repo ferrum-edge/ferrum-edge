@@ -813,7 +813,6 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_xds_first_slice_nacks_total` | counter | `namespace`, `type_url`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | xDS NACKs counted while the consumer's accumulator is incomplete, by protocol-specific predicate: xds counts a required mesh-slice type while a required type is absent (recorded before the NACK is enqueued); stock_xds counts any supported type while CDS or a subscribed EDS is missing (recorded after the NACK is enqueued). Not runtime first-slice state: a control-plane reset can re-arm it after a slice exists, and version skew among present types is not counted. |
 | `ferrum_xds_stream_admission_rejections_total` | counter | `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected at admission, by bounded reason. |
 | `ferrum_xds_streams_rejected_total` | counter | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected at admission by any scope (total, namespace, principal, node, node cardinality, invalid Node.id, or initial-request deadline). |
-| `ferrum_xds_warming_partial_applies_total` | counter | `namespace`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this. |
 
 ## Bundled observability surfaces
 

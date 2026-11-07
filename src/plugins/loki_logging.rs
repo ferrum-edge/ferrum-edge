@@ -35,10 +35,10 @@ use tracing::warn;
 use crate::config::types::MAX_ID_LENGTH;
 
 use super::utils::byte_budget::{
-    BoundedPayloadWriter, JSON_REEMBEDDED_WORST_CASE_EXPANSION, JSON_STRING_WORST_CASE_EXPANSION,
-    PayloadMaterializationError, ProcessByteReservation, ReservedPayload, RetainedByteCeiling,
-    materialize_reserved_payload, process_ceiling, record_batch_materialization_fallback,
-    record_batch_materialization_loss,
+    BoundedJsonWriter, BoundedPayloadWriter, JSON_REEMBEDDED_WORST_CASE_EXPANSION,
+    JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError, ProcessByteReservation,
+    ReservedPayload, RetainedByteCeiling, materialize_reserved_payload, process_ceiling,
+    record_batch_materialization_fallback, record_batch_materialization_loss,
 };
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::sink_loss::{self, SinkLossReason};
@@ -251,12 +251,6 @@ impl LokiByteBudget {
     }
 }
 
-struct BoundedJsonWriter {
-    bytes: Vec<u8>,
-    max_bytes: usize,
-    limit_exceeded: bool,
-}
-
 #[derive(Default)]
 struct CountingJsonWriter {
     bytes: usize,
@@ -268,33 +262,6 @@ impl Write for CountingJsonWriter {
             .bytes
             .checked_add(buf.len())
             .ok_or_else(|| std::io::Error::other("serialized Loki entry size overflowed"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl BoundedJsonWriter {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(max_bytes.min(4096)),
-            max_bytes,
-            limit_exceeded: false,
-        }
-    }
-}
-
-impl Write for BoundedJsonWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
-            self.limit_exceeded = true;
-            return Err(std::io::Error::other(
-                "serialized Loki entry exceeded its byte limit",
-            ));
-        }
-        self.bytes.extend_from_slice(buf);
         Ok(buf.len())
     }
 
