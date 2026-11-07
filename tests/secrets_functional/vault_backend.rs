@@ -1130,6 +1130,9 @@ async fn vault_https_trusts_the_configured_ca_bundle() {
         .await;
     guard.set("VAULT_ADDR", fake.uri());
     guard.set("VAULT_TOKEN", "root");
+    // The ambient vaultrs `VAULT_SKIP_VERIFY` default is not honoured:
+    // verification stays on.
+    guard.set("VAULT_SKIP_VERIFY", "1");
 
     let untrusted = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
         .await
@@ -1246,5 +1249,39 @@ async fn vault_direct_lookup_reads_a_non_utf8_ca_bundle_path() {
     assert!(
         err.contains("FERRUM_TLS_CA_BUNDLE_PATH") && err.contains("regular file"),
         "the non-UTF-8 path must be read, got: {err}"
+    );
+}
+
+/// The ambient vaultrs `VAULT_CLIENT_CERT` / `VAULT_CLIENT_KEY` defaults are
+/// never read: vaultrs read them with a blocking `std::fs::read` inside its
+/// settings `build()`, so a FIFO there hung construction before any timeout
+/// could fire.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_ignores_ambient_vaultrs_client_identity() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fifo = dir.path().join("vault-client-cert-fifo");
+    let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("fifo path");
+    // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed");
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    guard.set("VAULT_CLIENT_CERT", fifo.to_string_lossy());
+    guard.set("VAULT_CLIENT_KEY", fifo.to_string_lossy());
+
+    let outcome = vault_reference_outcome_off_thread(Duration::from_secs(5));
+    if outcome.is_none() {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    let err = outcome
+        .expect("an ambient client identity must not block Vault construction")
+        .err()
+        .expect("the reference is invalid");
+    assert!(
+        err.contains("Invalid Vault KV v2 reference"),
+        "construction must succeed without reading VAULT_CLIENT_CERT, got: {err}"
     );
 }

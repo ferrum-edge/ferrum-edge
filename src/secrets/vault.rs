@@ -281,15 +281,21 @@ impl VaultClientWrapper {
             .address(parsed_addr.as_str())
             .token(&vault_token);
 
-        // vaultrs must never read a CA file itself (its `identity` default
-        // still reads `VAULT_CLIENT_CERT` / `VAULT_CLIENT_KEY`, a tracked
-        // follow-up): its `VaultClient::new`
-        // reads every `ca_certs` path with a blocking `std::fs::read`, and an
-        // unset list defaults to the ambient `VAULT_CACERT` / `VAULT_CAPATH`.
-        // `FERRUM_TLS_CA_BUNDLE_PATH` is the one trust input, read below
-        // through the hardened shared reader and installed on the replacement
-        // transport.
-        settings_builder.ca_certs(Vec::new());
+        // vaultrs must never read a file or an ambient TLS default itself.
+        // Its `VaultClient::new` reads every `ca_certs` path with a blocking
+        // `std::fs::read`, and the builder's unset fields default to ambient
+        // variables: `VAULT_CACERT` / `VAULT_CAPATH` (CA paths),
+        // `VAULT_CLIENT_CERT` / `VAULT_CLIENT_KEY` (read with a blocking
+        // `std::fs::read` inside `build()`, before any timeout can fire), and
+        // `VAULT_SKIP_VERIFY` (silently disables verification). Ferrum's Vault
+        // TLS inputs are its own: `FERRUM_TLS_CA_BUNDLE_PATH` is the one trust
+        // input, read below through the hardened shared reader and installed
+        // on the replacement transport; verification is always on; no ambient
+        // client identity is loaded.
+        settings_builder
+            .ca_certs(Vec::new())
+            .identity(None)
+            .verify(true);
 
         let settings = settings_builder
             .build()

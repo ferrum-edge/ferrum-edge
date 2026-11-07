@@ -27,8 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Direct Vault lookups read a non-UTF-8 `FERRUM_TLS_CA_BUNDLE_PATH` like
   Azure's instead of silently skipping it (startup still rejects non-UTF-8
   `FERRUM_*` values), and construction no longer needs system CA roots when
-  the bundle supplies the trust anchor. **Upgrade:** the vaultrs `VAULT_CACERT` / `VAULT_CAPATH` fallbacks
-  are no longer consulted; set `FERRUM_TLS_CA_BUNDLE_PATH` instead.
+  the bundle supplies the trust anchor. **Upgrade:** the undocumented vaultrs
+  ambient defaults are no longer consulted: `VAULT_CACERT` / `VAULT_CAPATH`
+  (set `FERRUM_TLS_CA_BUNDLE_PATH` instead), `VAULT_CLIENT_CERT` /
+  `VAULT_CLIENT_KEY` (blocking reads; no Vault client identity is loaded), and
+  `VAULT_SKIP_VERIFY` (Vault TLS verification is always on).
 - **`tcp_logging` no-verify TLS advertises the crypto provider's signature
   schemes and warns.** Under `FERRUM_TLS_NO_VERIFY` the plugin used a private
   verifier with a hard-coded scheme list that did not follow the build's
