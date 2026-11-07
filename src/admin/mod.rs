@@ -6712,6 +6712,11 @@ async fn recover_late_credential_update(
 
 const MTLS_DNS_ADMISSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `rollback_errors` entry reported when a failed compensating rollback
+/// retains the restore's namespace admission guard for operator recovery.
+const RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE: &str =
+    "namespace admission guard retained; manual recovery required";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum MtlsDnsAdmissionMutationState {
@@ -6759,6 +6764,10 @@ enum MtlsDnsRestorePhase {
     ImportedWithErrors = 3,
     /// A compensating rollback completed and the prior config was replayed.
     RolledBack = 4,
+    /// A compensating rollback ran but failed: the namespace may be cleared,
+    /// partially imported, or partially replayed. The fence stays retained
+    /// for operator recovery.
+    RollbackIncomplete = 5,
 }
 
 impl MtlsDnsRestorePhase {
@@ -6769,6 +6778,7 @@ impl MtlsDnsRestorePhase {
             2 => Self::ImportedOk,
             3 => Self::ImportedWithErrors,
             4 => Self::RolledBack,
+            5 => Self::RollbackIncomplete,
             // Unknown values fail closed: treat them as an incomplete restore.
             _ => Self::Cleared,
         }
@@ -6866,15 +6876,19 @@ impl MtlsDnsAdmissionHoldState {
     }
 
     /// Run a compensating rollback. Only a completed rollback leaves the
-    /// incomplete-restore phase; a failed one keeps the fence retained.
+    /// incomplete-restore phase; a failed one enters
+    /// [`MtlsDnsRestorePhase::RollbackIncomplete`] and keeps the fence
+    /// retained, whatever phase the restore was in before.
     pub(crate) async fn run_restore_rollback<T, E, F>(&self, rollback: F) -> Result<T, E>
     where
         F: std::future::Future<Output = Result<T, E>>,
     {
         let result = self.run_mutation(rollback).await;
-        if result.is_ok() {
-            self.set_restore_phase(MtlsDnsRestorePhase::RolledBack);
-        }
+        self.set_restore_phase(if result.is_ok() {
+            MtlsDnsRestorePhase::RolledBack
+        } else {
+            MtlsDnsRestorePhase::RollbackIncomplete
+        });
         result
     }
 
@@ -6956,6 +6970,21 @@ struct MtlsDnsAdmissionGuardLifecycle {
 
 impl MtlsDnsAdmissionGuardLifecycle {
     async fn acquire(db: Arc<dyn DatabaseBackend>, namespace: &str) -> Result<Self, anyhow::Error> {
+        Self::acquire_with_restore_phase(db, namespace, MtlsDnsRestorePhase::Idle).await
+    }
+
+    /// Acquire a guard whose lifecycle starts in `restore_phase`. Recovery
+    /// paths that reacquire the fence over a half-restored namespace pass the
+    /// inherited incomplete phase here so it is applied inside the detached
+    /// acquisition task, before the lifecycle is delivered: if the request is
+    /// cancelled while acquisition is pending, the undelivered lifecycle is
+    /// dropped in that task and its Drop retains the new durable owner
+    /// instead of releasing it (issue #7032).
+    async fn acquire_with_restore_phase(
+        db: Arc<dyn DatabaseBackend>,
+        namespace: &str,
+        restore_phase: MtlsDnsRestorePhase,
+    ) -> Result<Self, anyhow::Error> {
         let namespace = namespace.to_string();
         let acquire_db = db.clone();
         let acquire_namespace = namespace.clone();
@@ -6964,9 +6993,14 @@ impl MtlsDnsAdmissionGuardLifecycle {
             let result = acquire_db
                 .acquire_mtls_dns_admission_guard(&acquire_namespace)
                 .await
-                .map(|guard_owner| Self::new(acquire_db, &acquire_namespace, guard_owner));
+                .map(|guard_owner| {
+                    let lifecycle = Self::new(acquire_db, &acquire_namespace, guard_owner);
+                    lifecycle.hold.set_restore_phase(restore_phase);
+                    lifecycle
+                });
             // If the request disappeared while acquisition was in flight, the
-            // undelivered lifecycle is dropped here and starts bounded cleanup.
+            // undelivered lifecycle is dropped here. Its Drop starts bounded
+            // cleanup only when its restore phase and mutation state allow it.
             let _ = result_tx.send(result);
         });
         result_rx.await.map_err(|_| {
@@ -7018,10 +7052,11 @@ impl MtlsDnsAdmissionGuardLifecycle {
         self.hold.restore_phase()
     }
 
-    /// Carry an incomplete restore phase onto a reacquired guard so the new
-    /// owner keeps the same Drop retention as the released one.
-    fn inherit_restore_phase(&self, phase: MtlsDnsRestorePhase) {
-        self.hold.set_restore_phase(phase);
+    /// Whether the restore phase allows an explicit release: no multi-phase
+    /// restore is in progress, the import succeeded, or the compensating
+    /// rollback completed. A half-restored namespace keeps its fence.
+    fn restore_phase_allows_release(&self) -> bool {
+        self.hold.restore_phase().release_on_drop()
     }
 
     async fn release(&mut self) -> Result<(), anyhow::Error> {
@@ -7109,7 +7144,37 @@ pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
     } else {
         MtlsDnsAdmissionMutationState::NotStarted
     };
-    state.release_on_drop() && MtlsDnsRestorePhase::Idle.release_on_drop()
+    state.release_on_drop()
+}
+
+/// Start a recovery reacquisition of the restore guard and cancel the
+/// request-side future after its first poll, before the detached acquisition
+/// task can deliver the lifecycle. With `inherit_incomplete_restore`, the
+/// reacquisition carries the failed-import phase the restore flow passes, so
+/// the undelivered lifecycle must retain the new durable owner.
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this module without that caller.
+#[allow(dead_code)]
+pub(crate) async fn cancel_restore_guard_reacquisition_for_test(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    inherit_incomplete_restore: bool,
+) {
+    let phase = if inherit_incomplete_restore {
+        MtlsDnsRestorePhase::ImportedWithErrors
+    } else {
+        MtlsDnsRestorePhase::Idle
+    };
+    let reacquire =
+        MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase(db, namespace, phase);
+    tokio::pin!(reacquire);
+    std::future::poll_fn(|context| {
+        // Any lifecycle delivered on this first poll is dropped here, which
+        // exercises the same Drop decision as the undelivered one.
+        let _ = std::future::Future::poll(reacquire.as_mut(), context);
+        std::task::Poll::Ready(())
+    })
+    .await;
 }
 
 /// Hold the datastore namespace guard across an admin read/modify/write
@@ -8070,7 +8135,20 @@ async fn finish_failed_restore(
             ("incomplete", Some(errors))
         }
     };
-    if let Err(_error) = guard.release().await {
+    // A failed rollback leaves a cleared, partially imported, or partially
+    // replayed namespace: retain the durable fence (as the unknown-outcome
+    // clear path does) instead of admitting writes over it (issue #7032).
+    let fence_retained = !guard.restore_phase_allows_release();
+    if fence_retained {
+        error!(
+            namespace = %namespace,
+            "Restore: rollback incomplete; namespace admission guard retained for manual recovery"
+        );
+        rollback_status = "incomplete";
+        rollback_errors
+            .get_or_insert_with(Vec::new)
+            .push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+    } else if let Err(_error) = guard.release().await {
         error_persistence_failure_redacted("restore_rollback_guard_release");
         rollback_status = "incomplete";
         rollback_errors
@@ -8096,6 +8174,9 @@ async fn finish_failed_restore(
     let error_message = match rollback_status {
         "completed" => "Restore failed; restore rolled back and prior config retained",
         // "incomplete"
+        _ if fence_retained => {
+            "Restore failed and rollback of prior config was incomplete; the namespace admission guard was retained and manual recovery is required."
+        }
         _ => "Restore failed and rollback of prior config was incomplete; manual recovery required",
     };
 
@@ -8164,7 +8245,19 @@ async fn finish_failed_restore_after_intervening_clear(
             ("incomplete", Some(errors))
         }
     };
-    if let Err(_error) = guard.release().await {
+    // As in `finish_failed_restore`: a failed additive rollback retains the
+    // durable fence for operator recovery (issue #7032).
+    let fence_retained = !guard.restore_phase_allows_release();
+    if fence_retained {
+        error!(
+            namespace = %namespace,
+            "Restore: additive rollback incomplete; namespace admission guard retained for manual recovery"
+        );
+        rollback_status = "incomplete";
+        rollback_errors
+            .get_or_insert_with(Vec::new)
+            .push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+    } else if let Err(_error) = guard.release().await {
         error_persistence_failure_redacted("restore_additive_rollback_guard_release");
         rollback_status = "incomplete";
         rollback_errors
@@ -8190,6 +8283,8 @@ async fn finish_failed_restore_after_intervening_clear(
     let mut response = json!({
         "error": if rollback_status == "completed" {
             "Restore lost namespace admission during clear; prior and intervening config resources were preserved"
+        } else if fence_retained {
+            "Restore lost namespace admission during clear and additive rollback was incomplete; the namespace admission guard was retained and manual recovery is required."
         } else {
             "Restore lost namespace admission during clear and additive rollback was incomplete; manual recovery required"
         },
@@ -11454,13 +11549,17 @@ async fn handle_restore(
         };
         let intervening_write =
             !namespace_config_admission_guard.immediately_succeeds_generation(lost_generation);
-        restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
-            Ok(guard) => {
-                // The reacquired owner inherits the incomplete-restore phase
-                // so an unpolled or cancelled recovery still retains it.
-                guard.inherit_restore_phase(carried_restore_phase);
-                guard
-            }
+        // The reacquired owner inherits the incomplete-restore phase inside
+        // acquisition, so a cancelled acquisition or an unpolled/cancelled
+        // recovery still retains it.
+        restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase(
+            db.clone(),
+            namespace,
+            carried_restore_phase,
+        )
+        .await
+        {
+            Ok(guard) => guard,
             Err(recovery_error) => {
                 let response_error = redacted_recovery_error_message(
                     "restore_guard_reacquire_after_clear",
@@ -11690,15 +11789,17 @@ async fn handle_restore(
                     }),
                 ));
             }
-            restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
-                .await
+            // The reacquired owner inherits the failed-import phase inside
+            // acquisition, so a cancelled acquisition or an unpolled/cancelled
+            // rollback still retains it.
+            restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase(
+                db.clone(),
+                namespace,
+                MtlsDnsRestorePhase::ImportedWithErrors,
+            )
+            .await
             {
-                Ok(guard) => {
-                    // The reacquired owner inherits the failed-import phase
-                    // so an unpolled or cancelled rollback still retains it.
-                    guard.retain_restore_import_failed();
-                    guard
-                }
+                Ok(guard) => guard,
                 Err(rollback_error) => {
                     let response_error = redacted_recovery_error_message(
                         "restore_guard_reacquire_for_import_rollback",
@@ -11809,6 +11910,23 @@ async fn handle_restore(
                 }
             },
         );
+    }
+
+    // Releases are driven by the recorded restore phase, so a successful
+    // import must have entered `ImportedOk`. Any other phase means the
+    // namespace may be half-restored: fail closed and keep the fence.
+    if !restore_guard.restore_phase_allows_release() {
+        error!(
+            namespace = %namespace,
+            "Restore: import outcome was not recorded as successful; namespace admission guard retained for manual recovery"
+        );
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "error": "Restore outcome requires manual verification; the namespace admission guard was retained",
+                "restore_errors": [RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE],
+            }),
+        ));
     }
 
     if let Err(_error) = restore_guard.release().await {

@@ -8410,6 +8410,21 @@ pub mod _test_support {
         }
     }
 
+    /// Cancel a restore-guard recovery reacquisition after its first poll
+    /// (issue #7032). See `admin::cancel_restore_guard_reacquisition_for_test`.
+    pub async fn admin_cancel_restore_guard_reacquisition_for_test(
+        db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        namespace: &str,
+        inherit_incomplete_restore: bool,
+    ) {
+        crate::admin::cancel_restore_guard_reacquisition_for_test(
+            db,
+            namespace,
+            inherit_incomplete_restore,
+        )
+        .await
+    }
+
     pub fn admin_mtls_dns_admission_contention_response(
         raw_backend_detail: &str,
     ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {

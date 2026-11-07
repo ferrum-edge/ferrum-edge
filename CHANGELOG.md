@@ -22,9 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example namespace admission failing before it started) or the request was
   cancelled, guard Drop released the fence over a cleared, partially imported
   namespace on SQL backends. The restore phase is now tracked separately
-  (cleared, imported, rolled back) and Drop retains the fence until the import
-  succeeds or the rollback completes; a nested mutation restores the prior
-  uncertain state instead of settling it.
+  (cleared, imported, rolled back, rollback incomplete), and both the explicit
+  release and Drop keep the fence until the import succeeds or the rollback
+  completes. A rollback that runs but fails now retains the fence too: the
+  `500` response keeps `rollback: "incomplete"` and says the guard was
+  retained, and recovery follows the `unknown_outcome` procedure. A guard
+  reacquired for recovery gets the incomplete phase inside its acquisition
+  task, so cancelling during reacquisition no longer releases it. A nested
+  mutation restores the prior uncertain state instead of settling it.
 - **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch

@@ -192,24 +192,43 @@ async fn mtls_dns_restore_cancellation_after_clear_retains_fence() {
     assert!(!rolling_back.drop_releases());
 }
 
+// The production finalizer path (`finish_failed_restore` through
+// `/restore`) is covered by
+// `tests/integration/admin_cached_config_tests.rs::mtls_dns_restore_failed_rollback_retains_fence`.
 #[tokio::test]
-async fn mtls_dns_restore_failed_rollback_retains_fence() {
-    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
-    probe
+async fn mtls_dns_restore_failed_rollback_phase_retains_from_any_prior_phase() {
+    let after_import = AdminMtlsDnsAdmissionHoldProbe::new();
+    after_import
         .run_restore_clear(async { Ok::<(), ()>(()) })
         .await
         .unwrap();
-    probe
+    after_import
         .run_restore_import(
             async { (0, vec!["chunk failed".to_string()]) },
             restore_import_succeeded,
         )
         .await;
-    let rollback = probe
+    let rollback = after_import
         .run_restore_rollback(async { Err::<(), _>(vec!["replay failed".to_string()]) })
         .await;
     assert!(rollback.is_err());
-    assert!(!probe.drop_releases());
+    assert!(!after_import.drop_releases());
+
+    // A non-atomic clear failure reaches the rollback without a recorded
+    // clear; a failed replay must still retain the fence.
+    let after_partial_clear = AdminMtlsDnsAdmissionHoldProbe::new();
+    assert!(
+        after_partial_clear
+            .run_restore_clear(async { Err::<(), _>("partial clear") })
+            .await
+            .is_err()
+    );
+    assert!(after_partial_clear.drop_releases());
+    let rollback = after_partial_clear
+        .run_restore_rollback(async { Err::<(), _>(vec!["replay failed".to_string()]) })
+        .await;
+    assert!(rollback.is_err());
+    assert!(!after_partial_clear.drop_releases());
 }
 
 #[tokio::test]
