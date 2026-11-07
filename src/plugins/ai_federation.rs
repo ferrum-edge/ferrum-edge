@@ -122,6 +122,7 @@ use super::utils::ambient_cloud_credentials::{
 };
 use super::utils::aws_sigv4;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::byte_budget::BoundedJsonWriter;
 use super::utils::openai_error::openai_error_body;
 use super::utils::plugin_secret_env::resolve_plugin_secret_env;
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
@@ -586,46 +587,13 @@ enum BoundedJsonSerializationError {
     Serialization,
 }
 
-struct BoundedJsonWriter {
-    bytes: Vec<u8>,
-    limit: usize,
-    exceeded: bool,
-}
-
-impl BoundedJsonWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(limit.min(8192)),
-            limit,
-            exceeded: false,
-        }
-    }
-}
-
-impl std::io::Write for BoundedJsonWriter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
-            self.exceeded = true;
-            return Err(std::io::Error::other(
-                "normalized provider response exceeded configured limit",
-            ));
-        }
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn serialize_json_bounded(
     value: &Value,
     limit: usize,
 ) -> Result<Vec<u8>, BoundedJsonSerializationError> {
     let mut writer = BoundedJsonWriter::new(limit);
     if serde_json::to_writer(&mut writer, value).is_err() {
-        return if writer.exceeded {
+        return if writer.limit_exceeded {
             Err(BoundedJsonSerializationError::LimitExceeded)
         } else {
             Err(BoundedJsonSerializationError::Serialization)

@@ -98,8 +98,6 @@ static XDS_ACTIVE_NODE_IDS: AtomicU64 = AtomicU64::new(0);
 /// absent everywhere else.
 static XDS_ADMISSION_OBSERVED: AtomicU64 = AtomicU64::new(0);
 static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
-static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
-    LazyLock::new(DashMap::new);
 static XDS_FIRST_SLICE_NACKS: LazyLock<DashMap<XdsFirstSliceNackKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
 /// `1` once a Workload API listener has stood up in this process. Gates the
@@ -1432,20 +1430,6 @@ pub fn increment_xds_first_slice_nack(namespace: impl AsRef<str>, type_url: impl
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Count any defensive mesh-slice apply that is explicitly marked as version
-/// skewed. Normal xDS apply now requires coherent required-type versions before
-/// installing a slice, so this counter should remain zero unless a future caller
-/// deliberately opts into applying a skewed warmed slice. Keyed by `namespace` only
-/// (matching `ferrum_xds_first_slice_nacks_total`) — low, operator-bounded
-/// cardinality; the per-type version strings live behind JWT on
-/// `/mesh/config-drift` because they embed config timestamps + content digests.
-pub fn increment_xds_warming_partial_apply(namespace: impl AsRef<str>) {
-    XDS_WARMING_PARTIAL_APPLIES
-        .entry(Arc::from(namespace.as_ref()))
-        .or_insert_with(|| AtomicU64::new(0))
-        .fetch_add(1, Ordering::Relaxed);
-}
-
 /// Arm the SPIFFE Workload API transport-admission gauges.
 ///
 /// Called once when a Workload API listener binds. Until then the gauges are
@@ -1968,21 +1952,6 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
             XDS_ACTIVE_NODE_IDS.load(Ordering::Relaxed),
             gateway_ns_label,
         );
-    }
-
-    if !XDS_WARMING_PARTIAL_APPLIES.is_empty() {
-        output.push_str(
-            "# HELP ferrum_xds_warming_partial_applies_total Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this.\n",
-        );
-        output.push_str("# TYPE ferrum_xds_warming_partial_applies_total counter\n");
-        for entry in XDS_WARMING_PARTIAL_APPLIES.iter() {
-            output.push_str(&format!(
-                "ferrum_xds_warming_partial_applies_total{{namespace=\"{}\"{}}} {}\n",
-                escape_label_value(entry.key()),
-                gateway_ns_label,
-                entry.value().load(Ordering::Relaxed)
-            ));
-        }
     }
 
     if !XDS_FIRST_SLICE_NACKS.is_empty() {
@@ -3350,16 +3319,6 @@ pub fn xds_streams_rejected_count() -> u64 {
     XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
 }
 
-/// Current value of the warming partial-apply counter for a `namespace`.
-/// Test-only accessor.
-#[cfg(test)]
-pub fn xds_warming_partial_apply_count(namespace: &str) -> u64 {
-    XDS_WARMING_PARTIAL_APPLIES
-        .get(namespace)
-        .map(|entry| entry.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
-
 /// Current value of the first-slice NACK counter for a `(namespace, type_url)`
 /// pair. Test-only accessor.
 #[cfg(test)]
@@ -3611,12 +3570,9 @@ mod tests {
         increment_xds_stream_rejected();
         increment_xds_stream_rejected();
         increment_xds_first_slice_nack(&namespace, type_url);
-        increment_xds_warming_partial_apply(&namespace);
 
         assert_eq!(xds_streams_rejected_count() - before, 2);
         assert_eq!(xds_first_slice_nack_count(&namespace, type_url), 1);
-        // Unique namespace → this test is the only writer for that series.
-        assert_eq!(xds_warming_partial_apply_count(&namespace), 1);
 
         let total = xds_streams_rejected_count();
         let mut output = String::new();
@@ -3640,15 +3596,11 @@ mod tests {
             )),
             "first-slice NACK counter series missing: {output}"
         );
+        // Removed in #7027: the coherent-version gate means no slice is ever
+        // applied under version skew, so the family could never increment.
         assert!(
-            output.contains("# TYPE ferrum_xds_warming_partial_applies_total counter"),
-            "warming partial-apply counter TYPE line missing: {output}"
-        );
-        assert!(
-            output.contains(&format!(
-                "ferrum_xds_warming_partial_applies_total{{namespace=\"{namespace}\"}} 1"
-            )),
-            "warming partial-apply counter series missing: {output}"
+            !output.contains("ferrum_xds_warming_partial_applies_total"),
+            "retired warming partial-apply family must not be rendered: {output}"
         );
     }
 

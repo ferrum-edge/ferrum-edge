@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
@@ -41,6 +41,7 @@ use super::utils::jwks_cache::{
 use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, JwksKeyStore};
 use super::utils::jwt_verifier::{JwtVerifyParams, verify_jwt_with_jwks};
 use super::utils::log_helpers::redacted_endpoint_url_str;
+use super::utils::oauth_client_auth::{self, PrivateKeyDecodeError};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::session_cookie::reject_published_session_secret;
@@ -1728,16 +1729,17 @@ impl OidcRelyingParty {
                 alg,
                 kid,
             } => {
-                let assertion = build_client_assertion(
+                let assertion = oauth_client_auth::build_client_assertion(
                     &self.provider.client_id,
                     token_endpoint,
                     encoding_key,
                     *alg,
-                    kid,
-                )?;
+                    kid.as_deref(),
+                )
+                .map_err(|e| format!("oidc_relying_party: client assertion failed: {e}"))?;
                 params.push((
                     "client_assertion_type".to_string(),
-                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+                    oauth_client_auth::CLIENT_ASSERTION_TYPE_JWT_BEARER.to_string(),
                 ));
                 params.push(("client_assertion".to_string(), assertion));
             }
@@ -3830,32 +3832,28 @@ fn parse_client_auth(
                 .get("private_key_jwt_alg")
                 .and_then(Value::as_str)
                 .unwrap_or("RS256");
-            let alg = match alg_name {
-                "RS256" => Algorithm::RS256,
-                "RS384" => Algorithm::RS384,
-                "RS512" => Algorithm::RS512,
-                "ES256" => Algorithm::ES256,
-                "ES384" => Algorithm::ES384,
-                "EdDSA" => Algorithm::EdDSA,
-                _ => {
-                    return Err("oidc_relying_party: unsupported `private_key_jwt_alg`".to_string());
-                }
-            };
-            let encoding_key = match alg {
-                Algorithm::ES256 | Algorithm::ES384 => EncodingKey::from_ec_pem(pem.as_bytes())
-                    .map_err(|_| {
-                        "oidc_relying_party: `client_auth.private_key_pem` is invalid EC PEM"
-                            .to_string()
-                    })?,
-                Algorithm::EdDSA => EncodingKey::from_ed_pem(pem.as_bytes()).map_err(|_| {
-                    "oidc_relying_party: `client_auth.private_key_pem` is invalid EdDSA PEM"
-                        .to_string()
-                })?,
-                _ => EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| {
-                    "oidc_relying_party: `client_auth.private_key_pem` is invalid RSA PEM"
-                        .to_string()
-                })?,
-            };
+            let alg = oauth_client_auth::private_key_jwt_algorithm(alg_name).ok_or_else(|| {
+                "oidc_relying_party: unsupported `private_key_jwt_alg`".to_string()
+            })?;
+            let encoding_key =
+                oauth_client_auth::decode_private_key(alg, &pem).map_err(|error| {
+                    match error {
+                        PrivateKeyDecodeError::InvalidRsaPem => {
+                            "oidc_relying_party: `client_auth.private_key_pem` is invalid RSA PEM"
+                        }
+                        PrivateKeyDecodeError::InvalidEcPem => {
+                            "oidc_relying_party: `client_auth.private_key_pem` is invalid EC PEM"
+                        }
+                        PrivateKeyDecodeError::InvalidEdDsaPem => {
+                            "oidc_relying_party: `client_auth.private_key_pem` is invalid EdDSA PEM"
+                        }
+                        // Unreachable: `alg` came from the same shared table.
+                        PrivateKeyDecodeError::UnsupportedAlgorithm => {
+                            "oidc_relying_party: unsupported `private_key_jwt_alg`"
+                        }
+                    }
+                    .to_string()
+                })?;
             // Parsing the PEM only proves it is a well-formed key of that
             // family, not that it supports the selected algorithm: an ES256
             // client with a P-384 key parsed cleanly and then failed to sign
@@ -3863,7 +3861,7 @@ fn parse_client_auth(
             // authorization code had already been consumed and with the token
             // endpoint never contacted (issue #5032). Signing a throwaway
             // assertion here proves the pairing with no external I/O.
-            build_client_assertion("ferrum-edge", "ferrum-edge", &encoding_key, alg, &None)
+            oauth_client_auth::probe_client_assertion_signing(&encoding_key, alg)
                 .map_err(|_| {
                     format!(
                         "oidc_relying_party: `client_auth.private_key_pem` cannot sign `private_key_jwt_alg` {alg_name:?}"
@@ -3899,71 +3897,15 @@ fn parse_client_auth(
     }
 }
 
-fn build_client_assertion(
-    client_id: &str,
-    audience: &str,
-    key: &EncodingKey,
-    alg: Algorithm,
-    kid: &Option<String>,
-) -> Result<String, String> {
-    let now = chrono::Utc::now().timestamp();
-    let mut header = Header::new(alg);
-    header.kid = kid.clone();
-    encode(
-        &header,
-        &json!({
-            "iss": client_id,
-            "sub": client_id,
-            "aud": audience,
-            "iat": now,
-            "exp": now + 300,
-            "jti": uuid::Uuid::new_v4().to_string()
-        }),
-        key,
-    )
-    .map_err(|e| format!("oidc_relying_party: client assertion failed: {e}"))
-}
-
-/// Build the RFC 6749 §2.3.1 `client_secret_basic` `Authorization` header.
-///
-/// The client identifier and secret are `application/x-www-form-urlencoded` FIRST
-/// and only then joined with `:` and base64-encoded. Feeding the raw values to a
-/// generic HTTP Basic encoder makes a legitimate credential containing `:`, `+`,
-/// a space, or a non-ASCII character decode to the wrong pair at a conforming
-/// provider, so every token, refresh, and revocation POST failed (issue #5026).
+/// RFC 6749 §2.3.1 `client_secret_basic` header (shared encoder in
+/// `utils::oauth_client_auth`, issue #5026). Runtime path: any failure maps to
+/// the fixed token-endpoint JSON error body.
 fn oauth_basic_authorization_header(
     client_id: &str,
     client_secret: &str,
 ) -> Result<reqwest::header::HeaderValue, String> {
-    let encoded_client_id = oauth_form_encode_component(client_id)?;
-    let encoded_client_secret = oauth_form_encode_component(client_secret)?;
-    let mut credential = String::with_capacity(
-        encoded_client_id
-            .len()
-            .saturating_add(encoded_client_secret.len())
-            .saturating_add(1),
-    );
-    credential.push_str(&encoded_client_id);
-    credential.push(':');
-    credential.push_str(&encoded_client_secret);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(credential.as_bytes());
-    let mut value = String::with_capacity("Basic ".len().saturating_add(encoded.len()));
-    value.push_str("Basic ");
-    value.push_str(&encoded);
-    let mut header = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
-        .map_err(|_| r#"{"error":"Token endpoint request failed"}"#.to_string())?;
-    header.set_sensitive(true);
-    Ok(header)
-}
-
-fn oauth_form_encode_component(value: &str) -> Result<String, String> {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("value", value);
-    serializer
-        .finish()
-        .strip_prefix("value=")
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| r#"{"error":"Token endpoint request failed"}"#.to_string())
+    oauth_client_auth::basic_authorization_header(client_id, client_secret)
+        .map_err(|_| r#"{"error":"Token endpoint request failed"}"#.to_string())
 }
 
 fn with_form_body(

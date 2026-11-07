@@ -4219,3 +4219,116 @@ async fn row_decode_diagnostics_withhold_ids_in_outer_and_inner_reasons() {
         assert!(!rendered.contains(token), "{table}: {rendered}");
     }
 }
+
+/// Overwrite the stored core V001 checksum in a migrated SQLite file and
+/// return the previous value, so the next migration run on that file fails
+/// closed with `checksum_mismatch` until the original is written back.
+async fn set_sqlite_core_migration_checksum(db_url: &str, checksum: &str) -> String {
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(db_url)
+        .await
+        .unwrap();
+    let previous: String =
+        sqlx::query_scalar("SELECT checksum FROM _ferrum_migrations WHERE version = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind(checksum)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    previous
+}
+
+/// Issue #7033: deferred (offline-bootstrap) migrations used to run after the
+/// primary pool was swapped in, so a migration failure returned `Err` with the
+/// primary pool live while topology still reported failover. Migrations now
+/// run against the staged pool first: a failure must leave the failover pool
+/// and topology fully intact, and a later successful failback must apply the
+/// deferred migrations and mark primary.
+#[tokio::test]
+async fn failback_deferred_migration_failure_keeps_failover_pool_and_topology() {
+    use ferrum_edge::_test_support::database_store_set_migrations_pending_for_test;
+    use ferrum_edge::config::db_backend::primary_failback_fenced;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.set_failover_allow_writes(true);
+    seed_sqlite_namespace(&failover_url, "failover-ns").await;
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    let original_checksum =
+        set_sqlite_core_migration_checksum(&primary_create_url, "tampered-7033").await;
+    database_store_set_migrations_pending_for_test(&store, true);
+
+    let before = store.failover_topology_status();
+    assert!(!before.primary_active, "startup must land on failover");
+    assert!(before.allow_writes);
+    assert!(!before.primary_failback_fenced);
+
+    let error = store
+        .reconnect(&primary_rw_url)
+        .await
+        .expect_err("failback must fail when the deferred migrations fail");
+    assert!(
+        format!("{error:#}").contains("checksum_mismatch"),
+        "failback must surface the migration failure: {error:#}"
+    );
+    assert!(
+        !primary_failback_fenced(&error),
+        "a migration failure is not the failback fence: {error:#}"
+    );
+
+    let after = store.failover_topology_status();
+    assert!(
+        !after.primary_active,
+        "a failed failback must leave topology on failover"
+    );
+    assert_eq!(after.active_url_redacted, before.active_url_redacted);
+    assert_eq!(after.failover_since_unix_ms, before.failover_since_unix_ms);
+    assert!(!after.primary_failback_fenced);
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert!(
+        namespaces.contains(&"failover-ns".to_string())
+            && !namespaces.contains(&"primary-ns".to_string()),
+        "the failover pool must stay the active pool after a failed failback: {namespaces:?}"
+    );
+
+    // Once the primary's migration history is repaired, failback succeeds,
+    // applies the still-pending deferred migrations and marks primary.
+    set_sqlite_core_migration_checksum(&primary_create_url, &original_checksum).await;
+    store
+        .reconnect(&primary_rw_url)
+        .await
+        .expect("failback must succeed once the deferred migrations succeed");
+    let status = store.failover_topology_status();
+    assert!(status.primary_active);
+    assert!(status.failover_since_unix_ms.is_none());
+    assert!(!status.primary_failback_fenced);
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert!(
+        namespaces.contains(&"primary-ns".to_string())
+            && !namespaces.contains(&"failover-ns".to_string()),
+        "the primary pool must be active after the successful failback: {namespaces:?}"
+    );
+    assert!(
+        !store.maybe_apply_deferred_migrations().await.unwrap(),
+        "the successful failback must have consumed the deferred migrations"
+    );
+}

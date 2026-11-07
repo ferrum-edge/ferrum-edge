@@ -5,6 +5,11 @@
 //! Valid-without-material order does not block retries, and material-without-
 //! Valid uses the published certificate's exact `order_url` as durable
 //! completion evidence for [`has_active_renewal_order`].
+//!
+//! The order write is a compare-and-set on the order the renewal drove (issue
+//! #7028): an order an operator deleted, rewrote, or superseded mid-renewal is
+//! left as it is — never recreated — while the issued certificate still
+//! publishes.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -146,8 +151,9 @@ async fn final_publication_commits_order_then_certificate_under_one_lease_fence(
     let (cert_pem, key_pem) = generated_cert_and_key();
     let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
-    orders
-        .upsert_order(order.clone(), false)
+    // The renewal commits against the order exactly as it was stored.
+    let order = orders
+        .upsert_order(order, false)
         .expect("seed processing order");
 
     let leases = Arc::new(
@@ -203,8 +209,9 @@ async fn final_publication_runs_neither_write_when_lease_is_lost() {
     let (cert_pem, key_pem) = generated_cert_and_key();
     let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
-    orders
-        .upsert_order(order.clone(), false)
+    // The renewal commits against the order exactly as it was stored.
+    let order = orders
+        .upsert_order(order, false)
         .expect("seed processing order");
 
     let leases = Arc::new(
@@ -264,8 +271,9 @@ async fn order_failure_certificate_success_publishes_reloads_and_clears_active_o
     let (cert_pem, key_pem) = generated_cert_and_key();
     let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
-    orders
-        .upsert_order(order.clone(), false)
+    // The renewal commits against the order exactly as it was stored.
+    let order = orders
+        .upsert_order(order, false)
         .expect("seed processing order");
 
     let leases = Arc::new(
@@ -348,8 +356,9 @@ fn order_success_certificate_failure_retains_prior_material_without_reload() {
     let (new_cert_pem, new_key_pem) = generated_cert_and_key();
     let issued = sample_certificate("edge-cert", &new_cert_pem, &new_key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
-    orders
-        .upsert_order(order.clone(), false)
+    // The renewal commits against the order exactly as it was stored.
+    let order = orders
+        .upsert_order(order, false)
         .expect("seed processing order");
 
     let _fault =
@@ -407,8 +416,9 @@ fn both_final_writes_fail_without_reload_or_material_disclosure() {
     let (cert_pem, key_pem) = generated_cert_and_key();
     let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
-    orders
-        .upsert_order(order.clone(), false)
+    // The renewal commits against the order exactly as it was stored.
+    let order = orders
+        .upsert_order(order, false)
         .expect("seed processing order");
 
     let _order_fault =
@@ -661,8 +671,9 @@ fn commit_final_renewal_publication_attempts_certificate_after_order_failure() {
     let (cert_pem, key_pem) = generated_cert_and_key();
     let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
     let order = processing_order("edge-order", "edge-cert");
-    orders
-        .upsert_order(order.clone(), false)
+    // The renewal commits against the order exactly as it was stored.
+    let order = orders
+        .upsert_order(order, false)
         .expect("seed processing order");
 
     let _fault = inject_final_publication_order_write_fault_for_tests(PrivateFileFault::Rename);
@@ -703,8 +714,9 @@ fn finalization_material_is_cleared_only_when_the_order_becomes_terminal() {
     let order = processing_order("edge-order", "edge-cert");
     let seeded = order.finalization.clone().expect("seeded material");
     let persisted_key = seeded.key_pem().to_string();
-    orders
-        .upsert_order(order.clone(), false)
+    // The renewal commits against the order exactly as it was stored.
+    let order = orders
+        .upsert_order(order, false)
         .expect("seed processing order");
     let seeded_back = orders.get_order("edge-order").expect("order");
     assert!(
@@ -986,4 +998,221 @@ fn complete_publication_with_a_registered_surface_does_not_take_the_warn_path() 
         RenewalReloadReach::Accepted,
         "a non-empty surface list must not be reported as an unserved renewal"
     );
+}
+
+/// Issue #7028: an operator deletes the order while the renewal is in flight.
+/// The `Valid` write must not recreate it; the CA has already issued, so the
+/// certificate still publishes, reload is requested, and the renewal counts as
+/// renewed.
+#[test]
+fn order_deleted_mid_renewal_is_not_recreated_and_material_still_publishes() {
+    let dir = TempDir::new().expect("tempdir");
+    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let (cert_pem, key_pem) = generated_cert_and_key();
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
+    let order = orders
+        .upsert_order(processing_order("edge-order", "edge-cert"), false)
+        .expect("seed processing order");
+
+    orders.delete_order("edge-order").expect("operator delete");
+    let version = orders.store_version().expect("order store version");
+
+    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
+    assert!(
+        matches!(
+            outcome,
+            FinalRenewalPublication::MaterialPublishedOrderNotCurrent
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        matches!(
+            orders.get_order("edge-order"),
+            Err(AcmeError::OrderNotFound(_))
+        ),
+        "a deleted order must not be recreated by the renewal's Valid write"
+    );
+    assert_eq!(
+        orders.store_version().expect("order store version"),
+        version,
+        "the refused order write must not touch the order store"
+    );
+    assert_eq!(
+        certificates
+            .get_certificate("edge-cert")
+            .expect("issued certificate published")
+            .cert_pem,
+        cert_pem
+    );
+
+    let (reload_requested, result) = track_reload_request(outcome);
+    assert_eq!(
+        result.expect("material published next to a vanished order is a renewal"),
+        vec![TEST_RELOAD_SURFACE]
+    );
+    assert!(reload_requested, "published material must request reload");
+    assert!(
+        !has_active_renewal_order(&orders, &certificates, "edge-cert").expect("scan"),
+        "nothing is left blocking a later renewal"
+    );
+}
+
+/// An operator overwrite of the in-flight order (same active status, freshly
+/// prepared content) wins: the renewal's stale snapshot is not written over it,
+/// and the replacement keeps its own finalization material.
+#[test]
+fn order_rewritten_mid_renewal_keeps_the_operator_write() {
+    let dir = TempDir::new().expect("tempdir");
+    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let (cert_pem, key_pem) = generated_cert_and_key();
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
+    let order = orders
+        .upsert_order(processing_order("edge-order", "edge-cert"), false)
+        .expect("seed processing order");
+
+    let replacement = order_with(
+        "edge-order",
+        "edge-cert",
+        AcmeOrderStatus::Processing,
+        Some(OTHER_ORDER_URL),
+    );
+    let replaced = orders
+        .upsert_order(replacement, true)
+        .expect("same-state operator overwrite");
+
+    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
+    assert!(
+        matches!(
+            outcome,
+            FinalRenewalPublication::MaterialPublishedOrderNotCurrent
+        ),
+        "{outcome:?}"
+    );
+    let stored = orders.get_order("edge-order").expect("order");
+    assert_eq!(stored.status, AcmeOrderStatus::Processing);
+    assert_eq!(stored.order_url.as_deref(), Some(OTHER_ORDER_URL));
+    assert_eq!(stored.updated_at, replaced.updated_at);
+    assert!(
+        stored.finalization.is_some(),
+        "the operator's still-active order keeps the material it needs"
+    );
+    // The published certificate names the renewal's CA order, not the
+    // replacement's, so the replacement stays active and resumable.
+    assert!(
+        has_active_renewal_order(&orders, &certificates, "edge-cert").expect("scan"),
+        "the replacement order is a different CA order and stays active"
+    );
+}
+
+/// A newer active order for the same certificate appeared mid-renewal (for
+/// example through the Admin API). Stamping the renewal's order `Valid` would
+/// make it the latest and hide the newer order from the planner, so the order
+/// write is refused; the certificate still publishes.
+#[test]
+fn order_superseded_mid_renewal_does_not_hide_the_newer_active_order() {
+    let dir = TempDir::new().expect("tempdir");
+    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let (cert_pem, key_pem) = generated_cert_and_key();
+    let issued = sample_certificate("edge-cert", &cert_pem, &key_pem, Some(ORDER_URL));
+    let order = orders
+        .upsert_order(processing_order("edge-order", "edge-cert"), false)
+        .expect("seed processing order");
+    let mut newer = order_with(
+        "newer-order",
+        "edge-cert",
+        AcmeOrderStatus::PendingChallenges,
+        Some(OTHER_ORDER_URL),
+    );
+    newer.http01_challenges[0].token = "tok_newer".to_string();
+    newer.http01_challenges[0].key_authorization = "tok_newer.thumbprint".to_string();
+    orders
+        .upsert_order(newer, false)
+        .expect("newer active order");
+
+    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
+    assert!(
+        matches!(
+            outcome,
+            FinalRenewalPublication::MaterialPublishedOrderNotCurrent
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        orders
+            .latest_order_for_certificate("edge-cert")
+            .expect("latest")
+            .expect("an order")
+            .id,
+        "newer-order"
+    );
+    assert_eq!(
+        orders.get_order("edge-order").expect("order").status,
+        AcmeOrderStatus::Processing,
+        "the superseded order is left as it was"
+    );
+}
+
+/// The order is gone and the certificate write fails: nothing landed, so no
+/// reload and an explicit failure; the prior material stays due.
+#[test]
+fn order_not_current_and_certificate_failure_is_an_explicit_failure_without_reload() {
+    let dir = TempDir::new().expect("tempdir");
+    let certificates = AcmeCertificateStore::open(dir.path()).expect("open cert store");
+    let orders = AcmeOrderStore::open(dir.path()).expect("open order store");
+    let (old_cert_pem, old_key_pem) = generated_cert_and_key();
+    certificates
+        .upsert_certificate(
+            sample_certificate(
+                "edge-cert",
+                &old_cert_pem,
+                &old_key_pem,
+                Some(OTHER_ORDER_URL),
+            ),
+            false,
+        )
+        .expect("seed prior certificate");
+    let (new_cert_pem, new_key_pem) = generated_cert_and_key();
+    let issued = sample_certificate("edge-cert", &new_cert_pem, &new_key_pem, Some(ORDER_URL));
+    let order = orders
+        .upsert_order(processing_order("edge-order", "edge-cert"), false)
+        .expect("seed processing order");
+    orders.delete_order("edge-order").expect("operator delete");
+
+    let _fault =
+        inject_final_publication_certificate_write_fault_for_tests(PrivateFileFault::Rename);
+    let outcome = commit_final_renewal_publication(&certificates, &orders, issued, order);
+    assert!(
+        matches!(
+            outcome,
+            FinalRenewalPublication::OrderNotCurrentMaterialNotPublished(_)
+        ),
+        "{outcome:?}"
+    );
+
+    let (reload_requested, result) = track_reload_request(outcome);
+    let message = result.expect_err("certificate write failed").to_string();
+    assert!(
+        message.contains("was left unchanged")
+            && message.contains("renewed certificate material failed to publish"),
+        "error must state both halves: {message}"
+    );
+    assert_no_material_disclosure(
+        &message,
+        &[&new_cert_pem, &new_key_pem, &old_cert_pem, &old_key_pem],
+    );
+    assert!(!reload_requested, "nothing published, so no reload");
+    assert_eq!(
+        certificates
+            .get_certificate("edge-cert")
+            .expect("prior certificate remains")
+            .cert_pem,
+        old_cert_pem
+    );
+    assert!(matches!(
+        orders.get_order("edge-order"),
+        Err(AcmeError::OrderNotFound(_))
+    ));
 }
