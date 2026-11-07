@@ -2055,7 +2055,16 @@ async fn wait_for_gateway_identity(
     timeout: Duration,
     mut child: Option<&mut Child>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+    // No idle pooling: every probe opens a fresh connection, so it observes
+    // whichever listener owns the admin port *now*. A pooled keep-alive
+    // connection stays attached to the responder that accepted it, so a
+    // foreign process that answered an early probe and then released the port
+    // could otherwise keep answering every later probe until the deadline.
+    // (The bespoke spawners this replaced renewed their client every 1 s.)
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .pool_max_idle_per_host(0)
+        .build()?;
     let deadline = Instant::now() + timeout;
     let mut last_observation = String::from("no response yet");
     loop {
@@ -3052,6 +3061,87 @@ mod ownership_proof_tests {
 
         let _ = child.wait();
         listener.abort();
+    }
+
+    /// Read one HTTP/1 request head. `false` on EOF or error.
+    async fn read_request_head(stream: &mut TcpStream) -> bool {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => {
+                    request.extend_from_slice(&chunk[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first accepted connection is a stale foreign responder: it answers
+    /// every request on it with unauthenticated-tier `/health` and keeps the
+    /// connection alive. Every later connection reaches the current owner of
+    /// the port, which answers ready detail and closes.
+    async fn spawn_stale_keepalive_then_ready_admin() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind fake admin");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            let mut accepted = 0usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted += 1;
+                let stale = accepted == 1;
+                tokio::spawn(async move {
+                    while read_request_head(&mut stream).await {
+                        let (body, connection) = if stale {
+                            (r#"{"status":"ok","ready":true}"#, "keep-alive")
+                        } else {
+                            (
+                                r#"{"status":"ok","ready":true,"cached_config":{"available":true}}"#,
+                                "close",
+                            )
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: {connection}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                        if !stale {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    /// Characterization of the replaced per-site loops, which renewed their
+    /// HTTP client every 1 s: a keep-alive connection held by a foreign
+    /// responder must not pin readiness to it. A fresh connection reaches the
+    /// listener that owns the port now, so the wait recovers within budget.
+    #[tokio::test]
+    async fn child_readiness_is_not_pinned_to_a_stale_keepalive_connection() {
+        let (port, admin) = spawn_stale_keepalive_then_ready_admin().await;
+        let mut child = live_child();
+
+        wait_for_child_gateway_readiness(&mut child, port, "fresh-token", Duration::from_secs(5))
+            .await
+            .expect("a fresh connection must reach the ready responder within the budget");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        admin.abort();
     }
 
     /// Intentional difference from `wait_for_owned_gateway_identity`: the
