@@ -3866,7 +3866,7 @@ pub(crate) fn upstream_audit_body_with(
 }
 
 /// The `operator` Upstream read projection: the Consul ACL token and stored
-/// backend TLS private-key material ([`withhold_backend_tls_private_keys`])
+/// backend TLS private-key material ([`withhold_tls_private_key_material`])
 /// are withheld; everything else, URL userinfo included, stays verbatim.
 fn upstream_operator_projection(resource: &Upstream, rendering: &dyn RedactionRendering) -> Value {
     let mut body = json!(resource);
@@ -3880,7 +3880,7 @@ fn upstream_operator_projection(resource: &Upstream, rendering: &dyn RedactionRe
         let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
         *token = rendering.render(UPSTREAM_CONSUL_TOKEN_POINTER, &stored, marker);
     }
-    withhold_backend_tls_private_keys(&mut body, rendering);
+    withhold_tls_private_key_material(&mut body, rendering);
     body
 }
 
@@ -3901,66 +3901,117 @@ pub(crate) fn proxy_audit_body_with(resource: &Proxy, rendering: &dyn RedactionR
 }
 
 /// The `operator` Proxy read projection: only stored backend TLS private-key
-/// material ([`withhold_backend_tls_private_keys`]) is withheld; everything
+/// material ([`withhold_tls_private_key_material`]) is withheld; everything
 /// else, URL userinfo included, stays verbatim.
 fn proxy_operator_projection(resource: &Proxy, rendering: &dyn RedactionRendering) -> Value {
     let mut body = json!(resource);
-    withhold_backend_tls_private_keys(&mut body, rendering);
+    withhold_tls_private_key_material(&mut body, rendering);
     body
 }
 
-/// The backend TLS material source fields shared by Proxy and Upstream bodies,
-/// paired with whether the field names a private key.
-const BACKEND_TLS_SOURCE_FIELDS: [(&str, bool); 3] = [
-    ("backend_tls_client_key_path", true),
-    ("backend_tls_client_cert_path", false),
-    ("backend_tls_server_ca_cert_path", false),
-];
+/// How a field name in a serialized Proxy or Upstream body classifies the TLS
+/// material source it holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TlsMaterialField {
+    /// Names a private key: withheld unless it is plainly a reference.
+    PrivateKey,
+    /// Names a certificate or CA bundle: public unless it carries a PEM
+    /// private-key block.
+    Public,
+}
 
-/// Withhold stored private-key material from the backend TLS source fields of
-/// a Proxy or Upstream body, for every non-admin projection.
-///
-/// These fields accept inline PEM as well as references. A reference (a path,
-/// or a `k8s://`, `vault://`, `managed://`, `pkcs11://`, or `system://` source)
-/// names material without disclosing it and stays visible; a stored value
-/// that is or may be key material is replaced through `rendering` (see
-/// [`backend_tls_source_is_withheld`]). Routing the exact placeholder through
-/// the renderer too lets an `operator` write that echoes it back be refused
-/// (issue #5925) instead of storing `[REDACTED]` as the key source.
-fn withhold_backend_tls_private_keys(body: &mut Value, rendering: &dyn RedactionRendering) {
-    let Some(object) = body.as_object_mut() else {
-        return;
-    };
-    for (field, names_private_key) in BACKEND_TLS_SOURCE_FIELDS {
-        let Some(value) = object.get_mut(field) else {
-            continue;
-        };
-        let Some(text) = value.as_str() else {
-            continue;
-        };
-        if !backend_tls_source_is_withheld(text, names_private_key) {
-            continue;
+/// The TLS material slot a field name denotes, for every slot reachable from a
+/// serialized Proxy or Upstream: the top-level `backend_tls_*` fields, a
+/// [`crate::config::types::BackendTlsConfig`] (`port_overrides.<port>.tls`),
+/// and a [`crate::modes::mesh::config::MeshTrafficPolicyTls`]
+/// (`subsets[].traffic_policy.tls`). Matched by name wherever it occurs, so a
+/// slot nested somewhere new is classified without a code change.
+fn tls_material_field(name: &str) -> Option<TlsMaterialField> {
+    match name {
+        "backend_tls_client_key_path" | "client_key_path" | "private_key" => {
+            Some(TlsMaterialField::PrivateKey)
         }
-        let stored = std::mem::take(value);
-        let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
-        *value = rendering.render(&format!("/{field}"), &stored, marker);
+        "backend_tls_client_cert_path"
+        | "backend_tls_server_ca_cert_path"
+        | "client_cert_path"
+        | "server_ca_cert_path"
+        | "client_certificate"
+        | "ca_certificates" => Some(TlsMaterialField::Public),
+        _ => None,
     }
 }
 
-/// Whether a stored backend TLS source value is withheld from non-admin reads.
+/// Withhold stored private-key material anywhere in a Proxy or Upstream body,
+/// for every non-admin projection.
 ///
-/// Any field carrying a PEM private-key block (a cert-plus-key bundle pasted
-/// into the certificate field, say) is withheld. The private-key field fails
+/// TLS material fields accept inline PEM as well as references. A reference
+/// (a path, or a `k8s://`, `vault://`, `managed://`, `pkcs11://`, or
+/// `system://` source) names material without disclosing it and stays
+/// visible; a value that is or may be key material is replaced through
+/// `rendering` at its exact JSON pointer (see [`private_key_material_withheld`]).
+/// Routing the exact placeholder at a TLS material field through the renderer
+/// too lets an `operator` write that echoes it back be refused (issue #5925)
+/// instead of storing `[REDACTED]` as the source.
+fn withhold_tls_private_key_material(body: &mut Value, rendering: &dyn RedactionRendering) {
+    let mut pointer = String::new();
+    withhold_private_key_material_at(body, None, &mut pointer, rendering);
+}
+
+fn withhold_private_key_material_at(
+    value: &mut Value,
+    field: Option<TlsMaterialField>,
+    pointer: &mut String,
+    rendering: &dyn RedactionRendering,
+) {
+    if let Some(text) = value.as_str() {
+        if private_key_material_withheld(text, field) {
+            let stored = std::mem::take(value);
+            let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+            *value = rendering.render(pointer, &stored, marker);
+        }
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let mark = pointer.len();
+                crate::config::types::push_json_pointer_segment(pointer, key);
+                let child_field = tls_material_field(key);
+                withhold_private_key_material_at(child, child_field, pointer, rendering);
+                pointer.truncate(mark);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                let mark = pointer.len();
+                crate::config::types::push_json_pointer_segment(pointer, &index.to_string());
+                withhold_private_key_material_at(item, field, pointer, rendering);
+                pointer.truncate(mark);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a stored string in a Proxy or Upstream body is withheld from
+/// non-admin reads.
+///
+/// A PEM private-key block is withheld wherever it appears (a cert-plus-key
+/// bundle pasted into a certificate field, say). A private-key field fails
 /// closed further: any PEM armour, or a line break or other control character
 /// (never part of a path or typed URI), is treated as inline material.
 /// Certificates and CA bundles are public and otherwise stay visible.
-fn backend_tls_source_is_withheld(value: &str, names_private_key: bool) -> bool {
-    if value == crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER
-        || crate::plugins::kafka_logging::contains_inline_private_key(value)
-    {
+fn private_key_material_withheld(value: &str, field: Option<TlsMaterialField>) -> bool {
+    if crate::plugins::kafka_logging::contains_inline_private_key(value) {
         return true;
     }
-    if !names_private_key {
+    let Some(field) = field else {
+        return false;
+    };
+    if value == crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER {
+        return true;
+    }
+    if field == TlsMaterialField::Public {
         return false;
     }
     let upper = value.to_ascii_uppercase();

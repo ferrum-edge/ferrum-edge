@@ -633,6 +633,33 @@ fn backend_tls_fixture() -> GatewayConfig {
                 "backend_tls_client_key_path": "/etc/ferrum/backend/client.key",
                 "created_at": STAMP,
                 "updated_at": STAMP
+            },
+            {
+                "id": "upstream-mesh",
+                "name": "mesh",
+                "targets": [],
+                "subsets": [{
+                    "name": "v1",
+                    "labels": {"version": "v1"},
+                    "traffic_policy": {"tls": {
+                        "mode": "mutual",
+                        "client_certificate": INLINE_CLIENT_CERT,
+                        "private_key": INLINE_CLIENT_KEY,
+                        "ca_certificates": "k8s://ferrum/v1-mtls#ca.crt"
+                    }}
+                }],
+                "port_overrides": {
+                    "443": {"tls": {
+                        "client_cert_path": INLINE_CLIENT_CERT,
+                        "client_key_path": INLINE_CLIENT_KEY
+                    }},
+                    "8443": {"tls": {
+                        "client_cert_path": "k8s://ferrum/p8443#tls.crt",
+                        "client_key_path": "k8s://ferrum/p8443#tls.key"
+                    }}
+                },
+                "created_at": STAMP,
+                "updated_at": STAMP
             }
         ]
     }))
@@ -686,5 +713,34 @@ fn export_fingerprints_inline_backend_tls_private_keys_and_keeps_references() {
     assert_eq!(
         upstream["backend_tls_client_key_path"],
         "/etc/ferrum/backend/client.key"
+    );
+
+    // Nested subset and per-port TLS slots are fingerprinted at their exact
+    // pointers; references and certificates beside them stay verbatim.
+    let mesh = exported(&export, "upstreams", "upstream-mesh");
+    let rendering = FingerprintRendering::new(&key, "upstream", "ferrum", "upstream-mesh");
+    for pointer in [
+        "/subsets/0/traffic_policy/tls/private_key",
+        "/port_overrides/443/tls/client_key_path",
+    ] {
+        let expected = rendering.fingerprint(pointer, &json!(INLINE_CLIENT_KEY));
+        assert_eq!(mesh.pointer(pointer), Some(&json!(expected)), "{pointer}");
+    }
+    let at = |pointer: &str| mesh.pointer(pointer).cloned().unwrap_or_default();
+    assert_eq!(
+        at("/subsets/0/traffic_policy/tls/client_certificate"),
+        INLINE_CLIENT_CERT
+    );
+    assert_eq!(
+        at("/subsets/0/traffic_policy/tls/ca_certificates"),
+        "k8s://ferrum/v1-mtls#ca.crt"
+    );
+    assert_eq!(
+        at("/port_overrides/443/tls/client_cert_path"),
+        INLINE_CLIENT_CERT
+    );
+    assert_eq!(
+        at("/port_overrides/8443/tls/client_key_path"),
+        "k8s://ferrum/p8443#tls.key"
     );
 }

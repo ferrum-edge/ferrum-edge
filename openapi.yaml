@@ -7146,12 +7146,13 @@ paths:
         omit it to clear it: the full replace does not keep the stored token.
         `admin` reads are raw, so an admin round trip is unaffected.
 
-        Stored backend TLS private-key material (an inline PEM key in
-        `backend_tls_client_key_path`, or a private-key block in the
-        certificate or CA field) is likewise returned to `operator` and
-        `viewer` reads as `[REDACTED]`, and an `operator` body that echoes
-        that placeholder in those fields is rejected with `400`. Send the real
-        key or a reference with the change.
+        Stored TLS private-key material is likewise returned to `operator` and
+        `viewer` reads as `[REDACTED]`: an inline PEM key in
+        `backend_tls_client_key_path`, `port_overrides.<port>.tls.client_key_path`
+        or `subsets[].traffic_policy.tls.private_key`, or a private-key block in
+        any certificate or CA field. An `operator` body that echoes that
+        placeholder in those fields is rejected with `400`. Send the real key or
+        a reference with the change.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -15383,7 +15384,11 @@ components:
           description: Client-certificate path required by `mutual` mode.
         private_key:
           type: [string, "null"]
-          description: Private-key path required by `mutual` mode.
+          description: >-
+            Private-key source required by `mutual` mode. Inline PEM key
+            material is withheld from every non-admin Upstream read
+            (`[REDACTED]`; a fingerprint in `GET /config/export`); references
+            stay visible.
         subject_alt_names:
           type: array
           items:
@@ -15459,6 +15464,10 @@ components:
         client_key_path:
           type: [string, "null"]
           minLength: 1
+          description: >-
+            Private-key source. Inline PEM key material is withheld from every
+            non-admin Upstream read (`[REDACTED]`; a fingerprint in
+            `GET /config/export`); references stay visible.
         server_ca_cert_path:
           type: [string, "null"]
           minLength: 1
@@ -20428,9 +20437,10 @@ components:
         upstreams:
           type: array
           description: >-
-            Upstreams with `service_discovery.consul.token`, and stored backend
-            TLS private-key material, rendered as a `CredentialFingerprint`
-            when set.
+            Upstreams with `service_discovery.consul.token`, and stored TLS
+            private-key material in the top-level, `port_overrides.<port>.tls`
+            and `subsets[].traffic_policy.tls` slots, rendered as a
+            `CredentialFingerprint` when set.
           items:
             $ref: "#/components/schemas/Upstream"
 

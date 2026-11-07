@@ -1516,19 +1516,30 @@ rule: a `[REDACTED]` credential entry is restored from the stored entry (see
 
 ### Backend TLS private keys in reads
 
-`backend_tls_client_key_path` on proxies and upstreams accepts inline PEM as
-well as a reference. Non-admin projections never return stored private-key
-material: `viewer` and `operator` reads (single and list), write responses to
-an `operator`, admin audit diffs, and `GET /config/export` (as a fingerprint)
-all withhold it. `admin` reads and `/backup` stay raw.
+Proxies and upstreams name TLS material in several places, and each accepts
+inline PEM as well as a reference:
 
-- **Withheld.** In `backend_tls_client_key_path`, any value that is or may be
-  inline material: PEM armour (`-----BEGIN`, in any case) anywhere in the
-  value, or a line break or other control character, neither of which a path
-  or typed URI contains. In `backend_tls_client_cert_path` and
-  `backend_tls_server_ca_cert_path`, a value that carries a PEM private-key
-  block (for example a certificate-plus-key bundle pasted into the
-  certificate field).
+| Slot | Private-key field | Certificate / CA fields |
+| --- | --- | --- |
+| Proxy and Upstream top level | `backend_tls_client_key_path` | `backend_tls_client_cert_path`, `backend_tls_server_ca_cert_path` |
+| Upstream `port_overrides.<port>.tls` (DestinationRule `portLevelSettings[].tls`) | `client_key_path` | `client_cert_path`, `server_ca_cert_path` |
+| Upstream `subsets[].traffic_policy.tls` (DestinationRule subset `trafficPolicy.tls`) | `private_key` | `client_certificate`, `ca_certificates` |
+
+Non-admin projections never return stored private-key material: `viewer` and
+`operator` reads (single and list, from the database or a cached snapshot),
+write responses to an `operator`, admin audit diffs, and `GET /config/export`
+(as a fingerprint at the field's exact JSON pointer, for example
+`/port_overrides/443/tls/client_key_path`) all withhold it. `admin` reads and
+`/backup` stay raw.
+
+- **Withheld.** In a private-key field, any value that is or may be inline
+  material: PEM armour (`-----BEGIN`, in any case) anywhere in the value, or a
+  line break or other control character, neither of which a path or typed URI
+  contains. In a certificate or CA field, and in any other string of the
+  resource, a value that carries a PEM private-key block (for example a
+  certificate-plus-key bundle pasted into the certificate field). The field
+  names are matched wherever they occur in the body, so a TLS slot nested
+  somewhere new is covered the same way.
 - **Visible.** References name the material without disclosing it and are
   returned verbatim: a filesystem path, `k8s://`, `vault://`, `aws://`,
   `azure://`, `gcp://`, `managed://`, `acme://`, `pkcs11://` and `system://`

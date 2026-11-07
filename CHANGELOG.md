@@ -12,9 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,
   `GET /upstreams[/{id}]`), admin audit diffs and `GET /config/export`
-  returned it verbatim. Every non-admin projection now withholds stored
-  private-key material in that field (and a private-key block pasted into the
-  certificate or CA field) as `[REDACTED]`, or a keyed fingerprint in the
+  returned it verbatim, as they did inline keys that a mesh DestinationRule
+  placed in an upstream's `port_overrides.<port>.tls.client_key_path` or
+  `subsets[].traffic_policy.tls.private_key`. Every non-admin projection now
+  withholds stored private-key material in every TLS slot (and a private-key
+  block anywhere else in the resource, such as a certificate-plus-key bundle
+  in a certificate or CA field) as `[REDACTED]`, or a keyed fingerprint in the
   export; paths and `k8s://`, `vault://`, `managed://`, `system://` and other
   references stay visible, and `admin` reads stay raw. An `operator` write that
   echoes the placeholder back is refused with `400`, so it cannot replace the
