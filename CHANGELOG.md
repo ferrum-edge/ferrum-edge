@@ -60,6 +60,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `admin` reads and `GET /backup` stay raw. The collector,
   JWKS, control-plane and federation URLs in a `mesh_authz` `mesh_slice` now
   get the same structural endpoint projection as other collector URLs.
+- **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
+  from the next-higher tier instead of becoming `PERMISSIVE`.** The
+  Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`
+  block, and an omitted or `UNSET` `portLevelMtls` mode to a concrete
+  `PERMISSIVE`, and the resolver used the most specific tier's mode outright.
+  A workload policy that set only `portLevelMtls` therefore left every other
+  port of that workload `PERMISSIVE` under a namespace or mesh-wide `STRICT`,
+  and a namespace policy with `mtls: {}` voided a mesh-wide `STRICT`, so peers
+  without a mesh identity were admitted. These modes now translate to a new
+  `unset` mode, and each app port and the listener fallback resolve by walking
+  workload port override -> workload mode -> namespace -> mesh-wide ->
+  `PERMISSIVE`. An explicit lower-tier mode still overrides the tiers above
+  it. Native, file and xDS `PeerAuthentication` documents accept
+  `mtls_mode: unset` (and `unset` port overrides); an omitted native
+  `mtls_mode` still means `permissive`. The `FerrumAccepted` status message for
+  an `UNSET` policy now reports the inheritance.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,

@@ -204,7 +204,8 @@ this Istio config supported by Ferrum Edge?".
   `ISTIO_MUTUAL`), `portLevelSettings`, and subset overrides.
 - **`istio_peer_authentication`** — single-winner precedence
   (`WorkloadSelector > Namespace > MeshWide`), `mtls.mode` translation
-  (`STRICT` / `PERMISSIVE` / `DISABLE`), per-port overrides.
+  (`STRICT` / `PERMISSIVE` / `DISABLE`), `UNSET` / omitted-mode inheritance
+  from the next-higher tier, per-port overrides.
 - **`istio_request_authentication`** — `jwtRules[]` translation (issuer,
   inline `jwks` vs `jwksUri`, audiences, header/param extraction,
   `forwardOriginalToken`, scope resolution).

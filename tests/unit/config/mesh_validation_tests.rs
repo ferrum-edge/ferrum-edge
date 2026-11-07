@@ -1017,6 +1017,25 @@ fn peer_authentication_rejects_client_side_mtls_mode() {
     );
 }
 
+/// `unset` (Istio `UNSET`: inherit from the next-higher tier) is a valid
+/// server-side PeerAuthentication mode on the policy and on a port override.
+#[test]
+fn peer_authentication_accepts_unset_inherit_mode() {
+    let pa = PeerAuthentication {
+        name: "pa".into(),
+        namespace: "default".into(),
+        scope: None,
+        selector: None,
+        mtls_mode: MtlsMode::Unset,
+        port_overrides: HashMap::from([(8080, MtlsMode::Unset)]),
+    };
+    let errors = validate_mesh_config(&[], &[], &[], &[pa], &[], &[], None);
+    assert!(
+        errors.is_empty(),
+        "unset is a valid PeerAuthentication mode: {errors:?}"
+    );
+}
+
 #[test]
 fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
     let mut port_overrides = HashMap::new();

@@ -13,7 +13,8 @@
 //!   compiles to a synthetic never-match rule (Istio allow-nothing
 //!   semantics), or that the policy was rejected with a translator error.
 //! - `PeerAuthentication` — status confirms the resolved mTLS mode
-//!   (UNSET → PERMISSIVE in Istio) and surfaces port-level overrides.
+//!   (UNSET inherits the next-higher tier, PERMISSIVE when none applies)
+//!   and surfaces port-level overrides.
 //! - `DestinationRule` — status reports whether the rule's host could be
 //!   matched and which `connectionPool` knobs landed vs. were deferred.
 //! - `VirtualService` — status reports host/HTTP-route counts. `tcp`/`tls` L4
@@ -968,7 +969,7 @@ fn peer_authentication_status(
             // resolved mode so operators can confirm without grepping
             // Ferrum-side state.
             let effective_mode = if resolved_mode == "UNSET" {
-                "PERMISSIVE (Istio default for UNSET)"
+                "UNSET (inherits the next-higher tier's mode; PERMISSIVE when none applies)"
             } else {
                 resolved_mode.as_str()
             };
@@ -2696,8 +2697,8 @@ mod tests {
 
     #[test]
     fn peer_auth_unset_mode_reports_permissive() {
-        // Istio: UNSET mode resolves to PERMISSIVE — operators often
-        // miss this and end up with surprise non-mTLS traffic.
+        // Istio: UNSET inherits from the next-higher tier and falls back to
+        // PERMISSIVE only when no tier sets a mode — surface both.
         let obj = object(
             "security.istio.io/v1",
             "PeerAuthentication",
@@ -2714,6 +2715,11 @@ mod tests {
         assert!(
             c["message"].as_str().unwrap().contains("PERMISSIVE"),
             "message should surface PERMISSIVE default: {}",
+            c["message"]
+        );
+        assert!(
+            c["message"].as_str().unwrap().contains("inherits"),
+            "message should surface UNSET inheritance: {}",
             c["message"]
         );
         let detail = update.ferrum_detail.as_ref().unwrap();
