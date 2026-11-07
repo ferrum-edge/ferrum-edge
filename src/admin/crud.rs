@@ -3847,9 +3847,7 @@ pub(crate) fn plugin_config_audit_body_with(
     // or off, so they are withheld like any config secret.
     if let Some(trigger) = body.get_mut("trigger") {
         crate::admin::plugin_config_projection::project_plugin_trigger_with(
-            trigger,
-            "/trigger",
-            rendering,
+            trigger, "/trigger", rendering,
         );
     }
     body
