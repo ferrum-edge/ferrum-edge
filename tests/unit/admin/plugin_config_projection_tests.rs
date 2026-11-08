@@ -9,7 +9,8 @@ use ferrum_edge::admin::plugin_config_projection::{
     KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS, PlaceholderSiteRecorder,
     is_credential_bearing_url_config_key, is_redaction_placeholder,
     is_safe_kafka_producer_property, is_sensitive_plugin_config_key, normalize_config_key,
-    project_plugin_config, project_plugin_config_with, redact_endpoint_url, sensitivity_rules_for,
+    project_plugin_config, project_plugin_config_with, project_plugin_trigger_with,
+    redact_endpoint_url, sensitivity_rules_for,
 };
 use ferrum_edge::plugins::builtin_parity::BUILTIN_PLUGIN_PARITY_META;
 use serde_json::{Value, json};
@@ -99,15 +100,11 @@ fn unknown_custom_plugins_get_no_schema_rules_but_still_project() {
             "batch_size": 50
         }),
     );
-    // Heuristic layer still fires for custom plugins.
+    // A custom plugin cannot be classified, so every scalar leaf is withheld
+    // and only the keys stay visible.
     assert_eq!(projected["api_key"], REDACTED);
-    // Structural URL sweep still strips userinfo on a path no rule names.
-    assert_eq!(
-        projected["sink_url"],
-        "https://redacted@sink.example.com/ingest"
-    );
-    // Safe-value control: ordinary tuning survives.
-    assert_eq!(projected["batch_size"], 50);
+    assert_eq!(projected["sink_url"], REDACTED);
+    assert_eq!(projected["batch_size"], REDACTED);
     assert_no_canaries(
         &projected,
         &[
@@ -289,6 +286,858 @@ fn waf_header_present_secret_values_are_projected() {
     assert_eq!(projected["global_exemptions"]["paths"], json!(["/health"]));
     assert_eq!(projected["mode"], "enforce");
     assert_no_canaries(&projected, &["waf-exemption-secret-canary"]);
+}
+
+/// `custom_rules[].conditions.headers` and
+/// `rule_overrides.<id>.conditions.headers` scope a rule to a header value an
+/// operator may set to a shared secret or a credential, under a vendor name no
+/// heuristic matches. A `null` (presence-only) condition discloses nothing and
+/// stays `null`.
+#[test]
+fn waf_condition_header_values_are_projected() {
+    let raw = json!({
+        "mode": "enforce",
+        "custom_rules": [{
+            "id": "custom-1",
+            "category": "custom",
+            "pattern": "drop table",
+            "action": "block",
+            "conditions": {
+                "paths": ["/api"],
+                "headers": {
+                    "Ocp-Apim-Subscription-Key": "waf-custom-condition-canary",
+                    "x-debug": null
+                }
+            }
+        }],
+        "rule_overrides": {
+            "942100": {
+                "action": "log",
+                "conditions": {
+                    "headers": {
+                        "Ocp-Apim-Subscription-Key": "waf-override-condition-canary",
+                        "x-debug": null
+                    }
+                }
+            }
+        }
+    });
+    assert!(
+        placeholder_sites("waf", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("waf", raw);
+    let custom = &projected["custom_rules"][0];
+    let custom_headers = &custom["conditions"]["headers"];
+    assert_eq!(custom_headers["Ocp-Apim-Subscription-Key"], REDACTED);
+    assert_eq!(custom_headers["x-debug"], Value::Null);
+    let override_headers = &projected["rule_overrides"]["942100"]["conditions"]["headers"];
+    assert_eq!(override_headers["Ocp-Apim-Subscription-Key"], REDACTED);
+    assert_eq!(override_headers["x-debug"], Value::Null);
+    // Header names and rule metadata stay visible.
+    assert_eq!(custom["id"], "custom-1");
+    assert_eq!(custom["action"], "block");
+    assert_eq!(custom["pattern"], "drop table");
+    assert_eq!(custom["conditions"]["paths"], json!(["/api"]));
+    assert_eq!(projected["rule_overrides"]["942100"]["action"], "log");
+    assert_eq!(projected["mode"], "enforce");
+    assert_no_canaries(
+        &projected,
+        &[
+            "waf-custom-condition-canary",
+            "waf-override-condition-canary",
+        ],
+    );
+
+    // Echoing the masked values back is detected at both sites.
+    let mut sites = placeholder_sites("waf", &projected);
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            "/config/custom_rules/0/conditions/headers/Ocp-Apim-Subscription-Key".to_string(),
+            "/config/rule_overrides/942100/conditions/headers/Ocp-Apim-Subscription-Key"
+                .to_string(),
+        ]
+    );
+}
+
+/// `mesh_route_dispatch` match operands select a route by a value the client
+/// presents. Each operand is a bare string or a one-key `{exact|prefix|regex}`
+/// object: the bare string is masked whole, and the object keeps its match kind
+/// while its value is masked.
+#[test]
+fn mesh_route_dispatch_match_operands_are_projected() {
+    let raw = json!({
+        "reject_unmatched": true,
+        "rules": [{
+            "name": "canary",
+            "match": {
+                "methods": ["GET"],
+                "headers": {
+                    "Ocp-Apim-Subscription-Key": "mrd-bare-header-canary",
+                    "x-tenant": {"prefix": "mrd-tagged-header-canary"}
+                },
+                "without_headers": {"x-debug": {"exact": "mrd-without-canary"}},
+                "query_params": {
+                    "access": "mrd-bare-query-canary",
+                    "sig": {"regex": "mrd-tagged-query-canary.*"}
+                }
+            },
+            "destination": {"upstream_id": "canary-pool"}
+        }]
+    });
+    assert!(
+        placeholder_sites("mesh_route_dispatch", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("mesh_route_dispatch", raw);
+    let rule = &projected["rules"][0];
+    let headers = &rule["match"]["headers"];
+    assert_eq!(headers["Ocp-Apim-Subscription-Key"], REDACTED);
+    assert_eq!(headers["x-tenant"], json!({"prefix": REDACTED}));
+    let without = &rule["match"]["without_headers"];
+    assert_eq!(without["x-debug"], json!({"exact": REDACTED}));
+    let query = &rule["match"]["query_params"];
+    assert_eq!(query["access"], REDACTED);
+    assert_eq!(query["sig"], json!({"regex": REDACTED}));
+    // Names, match kinds and routing metadata stay visible.
+    assert_eq!(rule["match"]["methods"], json!(["GET"]));
+    assert_eq!(rule["name"], "canary");
+    assert_eq!(rule["destination"]["upstream_id"], "canary-pool");
+    assert_eq!(projected["reject_unmatched"], true);
+    assert_no_canaries(
+        &projected,
+        &[
+            "mrd-bare-header-canary",
+            "mrd-tagged-header-canary",
+            "mrd-without-canary",
+            "mrd-bare-query-canary",
+            "mrd-tagged-query-canary",
+        ],
+    );
+
+    // Echoing the masked operands back is detected at every site.
+    let mut sites = placeholder_sites("mesh_route_dispatch", &projected);
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            "/config/rules/0/match/headers/Ocp-Apim-Subscription-Key".to_string(),
+            "/config/rules/0/match/headers/x-tenant/prefix".to_string(),
+            "/config/rules/0/match/query_params/access".to_string(),
+            "/config/rules/0/match/query_params/sig/regex".to_string(),
+            "/config/rules/0/match/without_headers/x-debug/exact".to_string(),
+        ]
+    );
+}
+
+/// `trigger.header_value` is the value a request must carry to be terminated:
+/// an operator-chosen token. The header name and the response stay visible.
+#[test]
+fn request_termination_trigger_header_value_is_projected() {
+    let raw = json!({
+        "status_code": 503,
+        "message": "maintenance",
+        "trigger": {"header": "x-maintenance-bypass", "header_value": "rt-trigger-canary"}
+    });
+    assert!(
+        placeholder_sites("request_termination", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("request_termination", raw);
+    assert_eq!(projected["trigger"]["header_value"], REDACTED);
+    assert_eq!(projected["trigger"]["header"], "x-maintenance-bypass");
+    assert_eq!(projected["status_code"], 503);
+    assert_eq!(projected["message"], "maintenance");
+    assert_no_canaries(&projected, &["rt-trigger-canary"]);
+    assert_eq!(
+        placeholder_sites("request_termination", &projected),
+        vec!["/config/trigger/header_value".to_string()]
+    );
+}
+
+/// The `transaction_debugger` capture selector value is an operator-chosen
+/// token a request must carry to be captured.
+#[test]
+fn transaction_debugger_capture_selector_value_is_projected() {
+    let raw = json!({
+        "log_request_body": true,
+        "capture_request_header": "x-debug-session",
+        "capture_request_header_value": "td-selector-canary"
+    });
+    assert!(
+        placeholder_sites("transaction_debugger", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("transaction_debugger", raw);
+    assert_eq!(projected["capture_request_header_value"], REDACTED);
+    assert_eq!(projected["capture_request_header"], "x-debug-session");
+    assert_eq!(projected["log_request_body"], true);
+    assert_no_canaries(&projected, &["td-selector-canary"]);
+    assert_eq!(
+        placeholder_sites("transaction_debugger", &projected),
+        vec!["/config/capture_request_header_value".to_string()]
+    );
+}
+
+/// The `ai_semantic_firewall` snippet-hash salt keys the logged snippet
+/// hashes; a reader holding it could confirm guessed snippets.
+#[test]
+fn ai_semantic_firewall_snippet_hash_salt_is_projected() {
+    let raw = json!({
+        "provider": {"endpoint": "https://guard.example.com"},
+        "privacy": {"include_snippet_hash": true, "snippet_hash_salt": "asf-salt-canary"}
+    });
+    assert!(
+        placeholder_sites("ai_semantic_firewall", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("ai_semantic_firewall", raw);
+    assert_eq!(projected["privacy"]["snippet_hash_salt"], REDACTED);
+    assert_eq!(projected["privacy"]["include_snippet_hash"], true);
+    assert_no_canaries(&projected, &["asf-salt-canary"]);
+    assert_eq!(
+        placeholder_sites("ai_semantic_firewall", &projected),
+        vec!["/config/privacy/snippet_hash_salt".to_string()]
+    );
+}
+
+fn mesh_policy(canary: &str) -> Value {
+    json!({
+        "name": "payments",
+        "namespace": "shop",
+        "rules": [{
+            "to": [{"headers": {"x-tenant": format!("{canary}-to")}}],
+            "when": [{
+                "key": "request.headers[x-gate]",
+                "values": [format!("{canary}-when")],
+                "not_values": [format!("{canary}-not")]
+            }],
+            "action": "allow"
+        }]
+    })
+}
+
+fn assert_mesh_policy_operands_redacted(policy: &Value) {
+    let rule = &policy["rules"][0];
+    assert_eq!(rule["to"][0]["headers"]["x-tenant"], REDACTED);
+    assert_eq!(rule["when"][0]["values"], json!([REDACTED]));
+    assert_eq!(rule["when"][0]["not_values"], json!([REDACTED]));
+    assert_eq!(rule["action"], "allow");
+    assert_eq!(policy["name"], "payments");
+    assert_eq!(policy["namespace"], "shop");
+}
+
+/// `mesh_authz` header and condition operands are withheld in the flat
+/// `mesh_policies` shape and in both policy lists of the mesh-mode
+/// `mesh_slice`, as are the ext-authz check headers, ProxyConfig environment
+/// values and extension payloads the slice carries, and the inline backend
+/// client keys of its embedded VirtualService L4 proxies and upstreams. Its
+/// collector, JWKS, control-plane and federation URLs get the structural
+/// endpoint projection.
+#[test]
+fn mesh_authz_match_operands_and_check_headers_are_projected() {
+    let inline_key = "-----BEGIN PRIVATE KEY-----\nmat-l4-key-canary\n-----END PRIVATE KEY-----\n";
+    let raw = json!({
+        "mesh_policies": [mesh_policy("mat-flat-canary")],
+        "mesh_slice": {
+            "node_id": "node-a",
+            "mesh_policies": [mesh_policy("mat-slice-canary")],
+            "node_waypoint_capture_mesh_policies": [mesh_policy("mat-capture-canary")],
+            "ext_authz_providers": [{
+                "name": "ext-check",
+                "service": "authz.shop.svc.cluster.local",
+                "port": 9000,
+                "path_prefix": "/check/mat-prefix-canary",
+                "include_additional_headers_in_check": [
+                    {"name": "x-check-gate", "value": "mat-ext-header-canary"}
+                ]
+            }],
+            "proxy_configs": [{
+                "name": "defaults",
+                "environment": {"VENDOR_LICENSE": "mat-env-canary"}
+            }],
+            "extension_configs": [{
+                "name": "wasm-filter",
+                "type_url": "type.example/filter",
+                "value": "mat-extension-canary"
+            }],
+            "telemetry_resources": [{
+                "name": "tracing",
+                "namespace": "shop",
+                "config": {"tracing": {"providers": [
+                    {"kind": "zipkin",
+                     "config": {"url": "https://zipkin.example.com/mat-zipkin-canary"}},
+                    {"kind": "datadog",
+                     "config": {"agent_url": "https://dd.example.com/?token=mat-dd-canary"}},
+                    {"kind": "lightstep",
+                     "config": {"collector_url": "https://ls.example.com/mat-ls-canary"}},
+                    {"kind": "opentelemetry",
+                     "config": {"endpoint": "https://otel.example.com/v1/mat-otel-canary"}}
+                ]}}
+            }],
+            "request_authentications": [{
+                "name": "jwt",
+                "namespace": "shop",
+                "jwt_rules": [{
+                    "issuer": "https://issuer.example.com",
+                    "jwks_uri": "https://issuer.example.com/keys?tenant=mat-jwks-canary"
+                }]
+            }],
+            "virtual_service_l4_proxies": [{
+                "id": "istio-vs-l4_shop_db",
+                "backend_host": "db.shop.svc",
+                "backend_port": 5432,
+                "backend_tls_client_cert_path": "k8s://shop/db-client#tls.crt",
+                "backend_tls_client_key_path": inline_key
+            }],
+            "virtual_service_l4_upstreams": [{
+                "id": "istio-vs-l4-upstream-db",
+                "backend_tls_client_key_path": "k8s://shop/db#tls.key",
+                "port_overrides": {"5432": {"tls": {
+                    "client_cert_path": "k8s://shop/db#tls.crt",
+                    "client_key_path": inline_key
+                }}}
+            }],
+            "multi_cluster": {
+                "federation_endpoint": "https://fed.example.com/mat-fed-canary",
+                "remote_clusters": [{
+                    "name": "east",
+                    "control_plane_url": "https://cp.east.example.com/mat-cp-canary",
+                    "federation_endpoint": "https://fed.east.example.com/mat-remote-fed-canary"
+                }]
+            }
+        }
+    });
+    assert!(
+        placeholder_sites("mesh_authz", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("mesh_authz", raw);
+    assert_mesh_policy_operands_redacted(&projected["mesh_policies"][0]);
+    let slice = &projected["mesh_slice"];
+    assert_mesh_policy_operands_redacted(&slice["mesh_policies"][0]);
+    assert_mesh_policy_operands_redacted(&slice["node_waypoint_capture_mesh_policies"][0]);
+    let provider = &slice["ext_authz_providers"][0];
+    let check_header = &provider["include_additional_headers_in_check"][0];
+    assert_eq!(check_header["value"], REDACTED);
+    assert_eq!(check_header["name"], "x-check-gate");
+    assert_eq!(provider["name"], "ext-check");
+    assert_eq!(provider["path_prefix"], REDACTED);
+    assert_eq!(provider["service"], "authz.shop.svc.cluster.local");
+    assert_eq!(provider["port"], 9000);
+    let l4_proxy = &slice["virtual_service_l4_proxies"][0];
+    assert_eq!(l4_proxy["backend_tls_client_key_path"], REDACTED);
+    assert_eq!(l4_proxy["backend_host"], "db.shop.svc");
+    let l4_upstream = &slice["virtual_service_l4_upstreams"][0];
+    assert_eq!(
+        l4_upstream["backend_tls_client_key_path"],
+        "k8s://shop/db#tls.key"
+    );
+    let port_tls = &l4_upstream["port_overrides"]["5432"]["tls"];
+    assert_eq!(port_tls["client_key_path"], REDACTED);
+    assert_eq!(port_tls["client_cert_path"], "k8s://shop/db#tls.crt");
+    let proxy_config = &slice["proxy_configs"][0];
+    assert_eq!(proxy_config["environment"]["VENDOR_LICENSE"], REDACTED);
+    let extension = &slice["extension_configs"][0];
+    assert_eq!(extension["value"], REDACTED);
+    assert_eq!(extension["type_url"], "type.example/filter");
+    assert_eq!(slice["node_id"], "node-a");
+
+    let providers = &slice["telemetry_resources"][0]["config"]["tracing"]["providers"];
+    let fields = ["url", "agent_url", "collector_url", "endpoint"];
+    let expected_urls = [
+        "https://zipkin.example.com/[REDACTED_PATH]",
+        "https://dd.example.com?[REDACTED_QUERY]",
+        "https://ls.example.com/[REDACTED_PATH]",
+        "https://otel.example.com/[REDACTED_PATH]",
+    ];
+    for (index, (field, url)) in fields.iter().zip(expected_urls).enumerate() {
+        assert_eq!(providers[index]["config"][*field], url);
+    }
+    assert_eq!(providers[1]["kind"], "datadog");
+    let jwt_rule = &slice["request_authentications"][0]["jwt_rules"][0];
+    assert_eq!(
+        jwt_rule["jwks_uri"],
+        "https://issuer.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(jwt_rule["issuer"], "https://issuer.example.com");
+    let multi_cluster = &slice["multi_cluster"];
+    assert_eq!(
+        multi_cluster["federation_endpoint"],
+        "https://fed.example.com/[REDACTED_PATH]"
+    );
+    let remote = &multi_cluster["remote_clusters"][0];
+    assert_eq!(
+        remote["control_plane_url"],
+        "https://cp.east.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(
+        remote["federation_endpoint"],
+        "https://fed.east.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(remote["name"], "east");
+    assert_no_canaries(
+        &projected,
+        &[
+            "mat-flat-canary",
+            "mat-slice-canary",
+            "mat-capture-canary",
+            "mat-ext-header-canary",
+            "mat-env-canary",
+            "mat-extension-canary",
+            "mat-zipkin-canary",
+            "mat-dd-canary",
+            "mat-ls-canary",
+            "mat-otel-canary",
+            "mat-jwks-canary",
+            "mat-fed-canary",
+            "mat-cp-canary",
+            "mat-remote-fed-canary",
+            "mat-prefix-canary",
+            "mat-l4-key-canary",
+        ],
+    );
+
+    // Echoing the projection back is detected at every masked site, including
+    // the condition `key` the name heuristic already masks and each entry of
+    // the `values` / `not_values` lists.
+    let mut expected = Vec::new();
+    for policy in [
+        "/config/mesh_policies/0",
+        "/config/mesh_slice/mesh_policies/0",
+        "/config/mesh_slice/node_waypoint_capture_mesh_policies/0",
+    ] {
+        for site in [
+            "to/0/headers/x-tenant",
+            "when/0/key",
+            "when/0/values/0",
+            "when/0/not_values/0",
+        ] {
+            expected.push(format!("{policy}/rules/0/{site}"));
+        }
+    }
+    let telemetry = "/config/mesh_slice/telemetry_resources/0/config/tracing/providers";
+    for (index, field) in fields.iter().enumerate() {
+        expected.push(format!("{telemetry}/{index}/config/{field}"));
+    }
+    for site in [
+        "ext_authz_providers/0/include_additional_headers_in_check/0/value",
+        "ext_authz_providers/0/path_prefix",
+        "virtual_service_l4_proxies/0/backend_tls_client_key_path",
+        "virtual_service_l4_upstreams/0/port_overrides/5432/tls/client_key_path",
+        "proxy_configs/0/environment/VENDOR_LICENSE",
+        "extension_configs/0/value",
+        "request_authentications/0/jwt_rules/0/jwks_uri",
+        "multi_cluster/federation_endpoint",
+        "multi_cluster/remote_clusters/0/control_plane_url",
+        "multi_cluster/remote_clusters/0/federation_endpoint",
+    ] {
+        expected.push(format!("/config/mesh_slice/{site}"));
+    }
+    expected.sort();
+    let mut sites = placeholder_sites("mesh_authz", &projected);
+    sites.sort();
+    assert_eq!(sites, expected);
+}
+
+fn tracing_provider_endpoint_fields(plugin: &str, prefix: &[&'static str]) -> Vec<&'static str> {
+    let mut fields: Vec<&'static str> = sensitivity_rules_for(plugin)
+        .iter()
+        .filter(|rule| rule.path.starts_with(prefix))
+        .filter_map(|rule| rule.path.last().copied())
+        .collect();
+    fields.sort_unstable();
+    fields
+}
+
+/// The mesh slice's Telemetry tracing providers are the same `TracingProvider`
+/// envelope `workload_metrics` carries, so both copies must project the same
+/// collector fields.
+#[test]
+fn mesh_slice_tracing_providers_follow_the_workload_metrics_rules() {
+    let workload = tracing_provider_endpoint_fields("workload_metrics", &["tracing_providers"]);
+    let slice =
+        tracing_provider_endpoint_fields("mesh_authz", &["mesh_slice", "telemetry_resources"]);
+    assert_eq!(workload, ["agent_url", "collector_url", "endpoint", "url"]);
+    assert_eq!(slice, workload);
+}
+
+/// TLS private-key sources accept inline PEM. Inline key material is withheld,
+/// a reference (path, `k8s://`, …) stays visible, and an echoed placeholder is
+/// detected.
+#[test]
+fn inline_private_key_sources_are_projected() {
+    let pem = "-----BEGIN PRIVATE KEY-----\npk-inline-canary\n-----END PRIVATE KEY-----\n";
+    let raw = json!({
+        "rules": [
+            {"match": {"methods": ["GET"]}, "destination": {"backend_tls": {
+                "client_cert_path": "/etc/ferrum/route.crt",
+                "client_key_path": pem
+            }}},
+            {"match": {"methods": ["POST"]}, "destination": {"backend_tls": {
+                "client_key_path": "k8s://shop/tls#tls.key"
+            }}}
+        ]
+    });
+    assert!(
+        placeholder_sites("mesh_route_dispatch", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("mesh_route_dispatch", raw);
+    let inline = &projected["rules"][0]["destination"]["backend_tls"];
+    assert_eq!(inline["client_key_path"], REDACTED);
+    assert_eq!(inline["client_cert_path"], "/etc/ferrum/route.crt");
+    let reference = &projected["rules"][1]["destination"]["backend_tls"];
+    assert_eq!(reference["client_key_path"], "k8s://shop/tls#tls.key");
+    assert_no_canaries(&projected, &["pk-inline-canary"]);
+    let key_site = "/config/rules/0/destination/backend_tls/client_key_path";
+    assert_eq!(
+        placeholder_sites("mesh_route_dispatch", &projected),
+        [key_site]
+    );
+
+    let udp = project(
+        "udp_logging",
+        json!({"host": "logs.internal", "dtls": true, "dtls_key_path": pem}),
+    );
+    assert_eq!(udp["dtls_key_path"], REDACTED);
+    assert_eq!(udp["host"], "logs.internal");
+    assert_no_canaries(&udp, &["pk-inline-canary"]);
+}
+
+/// A certificate or CA source keeps certificate-only PEM and references
+/// visible but withholds a pasted certificate-plus-key bundle, through the same
+/// classification the Proxy and Upstream projections use. A PEM private-key
+/// block is withheld on any other path too, including a custom plugin's.
+#[test]
+fn certificate_plus_key_bundles_are_withheld_in_certificate_sources() {
+    let cert = "-----BEGIN CERTIFICATE-----\ncert-only-visible\n-----END CERTIFICATE-----\n";
+    let key = "-----BEGIN PRIVATE KEY-----\nbundle-key-canary\n-----END PRIVATE KEY-----\n";
+    let bundle = format!("{cert}{key}");
+
+    let route = json!({"rules": [
+        {"match": {"methods": ["GET"]}, "destination": {"backend_tls": {
+            "client_cert_path": bundle,
+            "server_ca_cert_path": cert
+        }}},
+        {"match": {"methods": ["POST"]}, "destination": {"backend_tls": {
+            "client_cert_path": "k8s://shop/tls#tls.crt"
+        }}}
+    ]});
+    let udp = json!({
+        "host": "logs.internal",
+        "dtls": true,
+        "dtls_cert_path": bundle,
+        "dtls_ca_cert_path": cert
+    });
+    let soap = json!({
+        "x509_signature": {"enabled": true, "trusted_certs": [cert, bundle]},
+        "saml": {"enabled": true, "trusted_signing_certs": [bundle]}
+    });
+    let mtls = json!({"allowed_issuers": [{"cn": "Edge CA", "ca_certificate_pem": bundle}]});
+    let custom = json!({"anything": {"nested": [bundle]}});
+    let l4 = json!({"mesh_slice": {"virtual_service_l4_proxies": [{
+        "id": "istio-vs-l4_shop_db",
+        "backend_tls_server_ca_cert_path": bundle,
+        "backend_tls_client_cert_path": cert
+    }]}});
+
+    for (plugin, raw, sites) in [
+        (
+            "mesh_route_dispatch",
+            route,
+            vec!["/config/rules/0/destination/backend_tls/client_cert_path"],
+        ),
+        ("udp_logging", udp, vec!["/config/dtls_cert_path"]),
+        (
+            "soap_ws_security",
+            soap,
+            vec![
+                "/config/saml/trusted_signing_certs/0",
+                "/config/x509_signature/trusted_certs/1",
+            ],
+        ),
+        (
+            "mtls_auth",
+            mtls,
+            vec!["/config/allowed_issuers/0/ca_certificate_pem"],
+        ),
+        ("custom_thing", custom, vec!["/config/anything/nested/0"]),
+        (
+            "mesh_authz",
+            l4,
+            vec!["/config/mesh_slice/virtual_service_l4_proxies/0/backend_tls_server_ca_cert_path"],
+        ),
+    ] {
+        assert!(
+            placeholder_sites(plugin, &raw).is_empty(),
+            "{plugin}: the stored config carries no placeholder"
+        );
+        let projected = project(plugin, raw);
+        for site in &sites {
+            let pointer = site.strip_prefix("/config").expect("config pointer");
+            assert_eq!(
+                projected.pointer(pointer),
+                Some(&json!(REDACTED)),
+                "{plugin}: {projected}"
+            );
+        }
+        assert_no_canaries(&projected, &["bundle-key-canary"]);
+        assert!(
+            projected.to_string().contains("cert-only-visible")
+                || plugin == "mtls_auth"
+                || plugin == "custom_thing",
+            "{plugin}: certificate-only PEM was withheld: {projected}"
+        );
+        let mut found = placeholder_sites(plugin, &projected);
+        found.sort();
+        assert_eq!(found, sites, "{plugin}");
+    }
+}
+
+/// `opa_host` may carry a base path that is kept in every decision URL, so it
+/// is projected structurally; the origin and `policy_path` stay visible.
+#[test]
+fn opa_host_base_path_is_projected() {
+    let raw = json!({
+        "opa_host": "https://opa.example.com/opa-base-canary",
+        "policy_path": "/v1/data/authz/allow",
+        "timeout_ms": 500
+    });
+    assert!(
+        placeholder_sites("opa", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("opa", raw);
+    assert_eq!(
+        projected["opa_host"],
+        "https://opa.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(projected["policy_path"], "/v1/data/authz/allow");
+    assert_eq!(projected["timeout_ms"], 500);
+    assert_no_canaries(&projected, &["opa-base-canary"]);
+    assert_eq!(
+        placeholder_sites("opa", &projected),
+        vec!["/config/opa_host".to_string()]
+    );
+
+    // A bare origin has nothing to withhold and stays verbatim.
+    let origin = project("opa", json!({"opa_host": "http://opa:8181"}));
+    assert_eq!(origin["opa_host"], "http://opa:8181");
+}
+
+/// A custom plugin has no schema, so its config fails closed: every scalar
+/// leaf (string, number, boolean) is withheld wherever it sits, under any key
+/// spelling or list shape, while object keys, array shapes, and `null` values
+/// stay visible. Built-ins keep their declared projection.
+#[test]
+fn custom_plugin_configs_fail_closed_at_every_scalar_leaf() {
+    let raw = json!({
+        "headers": {"x-honeycomb-team": "cfc-header-canary", "x-null": null},
+        "auth_headers": [{"name": "X-Vendor-Token", "value": "cfc-pair-canary"}],
+        "account": {"id": 987654321, "enabled": true},
+        "sinks": [{"target": "cfc-sink-canary", "weights": [1, 2]}],
+        "empty": {}
+    });
+    assert!(
+        placeholder_sites("some_custom_plugin", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("some_custom_plugin", raw);
+    assert_eq!(
+        projected,
+        json!({
+            "headers": {"x-honeycomb-team": REDACTED, "x-null": null},
+            "auth_headers": [{"name": REDACTED, "value": REDACTED}],
+            "account": {"id": REDACTED, "enabled": REDACTED},
+            "sinks": [{"target": REDACTED, "weights": [REDACTED, REDACTED]}],
+            "empty": {}
+        })
+    );
+    let mut sites = placeholder_sites("some_custom_plugin", &projected);
+    sites.sort();
+    assert_eq!(
+        sites,
+        [
+            "/config/account/enabled",
+            "/config/account/id",
+            "/config/auth_headers/0/name",
+            "/config/auth_headers/0/value",
+            "/config/headers/x-honeycomb-team",
+            "/config/sinks/0/target",
+            "/config/sinks/0/weights/0",
+            "/config/sinks/0/weights/1",
+        ]
+    );
+
+    // Built-ins keep their declared projection: response headers they show on
+    // purpose stay visible.
+    let termination = project(
+        "request_termination",
+        json!({"status_code": 503, "headers": {"Retry-After": "120"}}),
+    );
+    assert_eq!(termination["headers"]["Retry-After"], "120");
+    assert_eq!(termination["status_code"], 503);
+    let mock = project(
+        "response_mock",
+        json!({"rules": [{"path": "/v1", "headers": {"x-mock": "static-value"}}]}),
+    );
+    assert_eq!(mock["rules"][0]["headers"]["x-mock"], "static-value");
+}
+
+/// Outbound destination paths configured apart from their host and port are
+/// projected like an endpoint URL's path: a non-trivial path is withheld,
+/// while `/` and the host, port, and protocol stay visible.
+#[test]
+fn outbound_destination_paths_are_projected() {
+    let raw = json!({
+        "mirror_host": "shadow.internal",
+        "mirror_port": 8443,
+        "mirror_protocol": "https",
+        "mirror_path": "/ingest/path-token-canary",
+        "percentage": 10.0
+    });
+    assert!(
+        placeholder_sites("request_mirror", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+    let mirror = project("request_mirror", raw);
+    assert_eq!(mirror["mirror_path"], REDACTED);
+    assert_eq!(mirror["mirror_host"], "shadow.internal");
+    assert_eq!(mirror["mirror_port"], 8443);
+    assert_eq!(mirror["mirror_protocol"], "https");
+    assert_no_canaries(&mirror, &["path-token-canary"]);
+    assert_eq!(
+        placeholder_sites("request_mirror", &mirror),
+        ["/config/mirror_path"]
+    );
+    let root = project(
+        "request_mirror",
+        json!({"mirror_host": "shadow.internal", "mirror_path": "/"}),
+    );
+    assert_eq!(root["mirror_path"], "/");
+
+    let raw = json!({"rules": [
+        {"match": {"methods": ["GET"]}, "rewrite": {
+            "uri": "/v2/rewrite-token-canary",
+            "authority": "backend.internal"
+        }},
+        {"match": {"methods": ["POST"]}, "rewrite": {"uri": "/"}, "redirect": {"uri": "/moved"}}
+    ]});
+    assert!(
+        placeholder_sites("mesh_route_dispatch", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+    let route = project("mesh_route_dispatch", raw);
+    assert_eq!(route["rules"][0]["rewrite"]["uri"], REDACTED);
+    let rewrite = &route["rules"][0]["rewrite"];
+    assert_eq!(rewrite["authority"], "backend.internal");
+    assert_eq!(route["rules"][1]["rewrite"]["uri"], "/");
+    assert_eq!(route["rules"][1]["redirect"]["uri"], "/moved");
+    assert_no_canaries(&route, &["rewrite-token-canary"]);
+    assert_eq!(
+        placeholder_sites("mesh_route_dispatch", &route),
+        ["/config/rules/0/rewrite/uri"]
+    );
+}
+
+/// A resource-level plugin `trigger` withholds every header, query and cookie
+/// operand at any depth of the `all` / `any` / `not` tree; names, match kinds,
+/// flags, structure, and non-client predicates stay visible.
+#[test]
+fn trigger_operands_are_withheld_at_every_depth() {
+    let mut trigger = json!({"when": {"not": {"any": [
+        {"match": {"header": {
+            "name": "x-skip",
+            "value": {"exact": ["trigger-a-canary", "trigger-b-canary"]}
+        }}},
+        {"all": [{"match": {"cookie": {
+            "name": "tier",
+            "value": {"regex": "trigger-c-canary", "case_insensitive": true}
+        }}}]},
+        {"match": {"path": {"prefix": ["/visible"]}}}
+    ]}}});
+    let recorder = PlaceholderSiteRecorder::default();
+    project_plugin_trigger_with(&mut trigger, "/trigger", &recorder);
+    assert!(
+        recorder.into_sites().is_empty(),
+        "the stored trigger carries no placeholder"
+    );
+
+    let any = &trigger["when"]["not"]["any"];
+    let header = &any[0]["match"]["header"];
+    assert_eq!(header["name"], "x-skip");
+    assert_eq!(header["value"]["exact"], json!([REDACTED, REDACTED]));
+    let cookie = &any[1]["all"][0]["match"]["cookie"];
+    assert_eq!(cookie["name"], "tier");
+    assert_eq!(cookie["value"]["regex"], REDACTED);
+    assert_eq!(cookie["value"]["case_insensitive"], true);
+    assert_eq!(any[2]["match"]["path"]["prefix"], json!(["/visible"]));
+    assert_no_canaries(
+        &trigger,
+        &["trigger-a-canary", "trigger-b-canary", "trigger-c-canary"],
+    );
+
+    let recorder = PlaceholderSiteRecorder::default();
+    let mut echoed = trigger.clone();
+    project_plugin_trigger_with(&mut echoed, "/trigger", &recorder);
+    assert_eq!(
+        recorder.into_sites(),
+        vec![
+            "/trigger/when/not/any/0/match/header/value/exact/0".to_string(),
+            "/trigger/when/not/any/0/match/header/value/exact/1".to_string(),
+            "/trigger/when/not/any/1/all/0/match/cookie/value/regex".to_string(),
+        ]
+    );
+}
+
+/// A trigger shape `PluginTrigger` cannot have is withheld wholesale instead of
+/// being walked, so hostile or legacy data never discloses an operand.
+#[test]
+fn malformed_trigger_shapes_fail_closed() {
+    for case in [
+        json!({"at": "", "trigger": "tfc-scalar-canary"}),
+        json!({"at": "", "trigger": {"if": {"match": {"header": {"name": "tfc-if-canary"}}}}}),
+        json!({"at": "/when", "trigger": {"when": "tfc-node-canary"}}),
+        json!({"at": "/when/all", "trigger": {"when": {"all": {"match": "tfc-all-canary"}}}}),
+        json!({"at": "/when/x", "trigger": {"when": {"match": {}, "x": "tfc-key-canary"}}}),
+        json!({"at": "/when/match", "trigger": {"when": {"match": "tfc-leaf-canary"}}}),
+        json!({"at": "/when/match/weird", "trigger": {"when": {"match": {"weird": "tfc-a"}}}}),
+        json!({"at": "/when/match/header", "trigger": {"when": {"match": {"header": "tfc-b"}}}}),
+        json!({
+            "at": "/when/match/header/value",
+            "trigger": {"when": {"match": {"header": {"name": "x", "value": "tfc-c"}}}}
+        }),
+        json!({
+            "at": "/when/match/header/extra",
+            "trigger": {"when": {"match": {"header": {"name": "x", "extra": "tfc-d"}}}}
+        }),
+    ] {
+        let at = case["at"].as_str().expect("case pointer");
+        let mut projected = case["trigger"].clone();
+        let recorder = PlaceholderSiteRecorder::default();
+        project_plugin_trigger_with(&mut projected, "/trigger", &recorder);
+        assert_eq!(
+            projected.pointer(at),
+            Some(&json!(REDACTED)),
+            "{case} -> {projected}"
+        );
+        assert!(
+            !projected.to_string().contains("tfc-"),
+            "{case} leaked: {projected}"
+        );
+    }
 }
 
 #[test]
@@ -724,9 +1573,12 @@ fn heuristic_and_redis_url_callers_match_compact_normalized_spellings() {
     assert!(!is_credential_bearing_url_config_key("redis_url_template"));
     assert!(!is_credential_bearing_url_config_key("url"));
 
-    // End-to-end through the heuristic layer on a custom plugin (no schema).
+    // End-to-end through the heuristic and Redis URL layers on a built-in
+    // whose schema declares no rules (`stdout_logging`), so only those layers
+    // decide. A custom plugin would fail closed instead and withhold every
+    // leaf (see `custom_plugin_configs_fail_closed_at_every_scalar_leaf`).
     let projected = project(
-        "some_custom_plugin",
+        "stdout_logging",
         json!({
             "apiKey": "custom-apikey-canary",
             "redisUrl": "redis://cacheuser:custom-redis-canary@cache.internal:6379/2",
@@ -1241,6 +2093,137 @@ fn mcp_gateway_per_server_upstream_urls_are_projected() {
     assert_no_canaries(&projected, &["mcp-token-canary"]);
 }
 
+/// `mcp_gateway` `servers.<id>.headers`, `ai_tool_governor` `approval.headers`
+/// and `openapi_validator` `bypass.header_present` accept literal values under
+/// arbitrary header names. Vendor credential names such as
+/// `Ocp-Apim-Subscription-Key` or `x-functions-key` match no name heuristic, so
+/// the schema must withhold every value regardless of its header name.
+#[test]
+fn upstream_and_approval_header_values_are_secret_regardless_of_name() {
+    let mcp = project(
+        "mcp_gateway",
+        json!({
+            "servers": {
+                "github": {
+                    "upstream_url": "https://mcp.example.com/mcp",
+                    "namespace": "gh",
+                    "headers": {
+                        "Ocp-Apim-Subscription-Key": "mcp-apim-canary",
+                        "x-functions-key": "mcp-functions-canary",
+                        "x-honeycomb-team": "mcp-honeycomb-canary"
+                    }
+                }
+            }
+        }),
+    );
+    let headers = &mcp["servers"]["github"]["headers"];
+    for name in [
+        "Ocp-Apim-Subscription-Key",
+        "x-functions-key",
+        "x-honeycomb-team",
+    ] {
+        assert_eq!(headers[name], REDACTED, "mcp_gateway header {name}");
+    }
+    // Header names and routing metadata stay visible.
+    assert_eq!(mcp["servers"]["github"]["namespace"], "gh");
+    assert_no_canaries(
+        &mcp,
+        &[
+            "mcp-apim-canary",
+            "mcp-functions-canary",
+            "mcp-honeycomb-canary",
+        ],
+    );
+
+    let governor = project(
+        "ai_tool_governor",
+        json!({
+            "mode": "enforce",
+            "approval": {
+                "endpoint_url": "https://approvals.example.com",
+                "timeout_ms": 1500,
+                "headers": {
+                    "Ocp-Apim-Subscription-Key": "governor-apim-canary",
+                    "x-tenant": "governor-tenant-canary"
+                }
+            }
+        }),
+    );
+    let headers = &governor["approval"]["headers"];
+    for name in ["Ocp-Apim-Subscription-Key", "x-tenant"] {
+        assert_eq!(headers[name], REDACTED, "ai_tool_governor header {name}");
+    }
+    assert_eq!(governor["approval"]["timeout_ms"], 1500);
+    assert_eq!(governor["mode"], "enforce");
+    assert_no_canaries(
+        &governor,
+        &["governor-apim-canary", "governor-tenant-canary"],
+    );
+
+    let validator = project(
+        "openapi_validator",
+        json!({
+            "bypass": {
+                "paths": ["/health"],
+                "header_present": {"x-skip-validation": "openapi-bypass-secret-canary"}
+            }
+        }),
+    );
+    assert_eq!(
+        validator["bypass"]["header_present"]["x-skip-validation"],
+        REDACTED
+    );
+    assert_eq!(validator["bypass"]["paths"], json!(["/health"]));
+    assert_no_canaries(&validator, &["openapi-bypass-secret-canary"]);
+}
+
+/// An `operator` write that echoes the masked header value back is refused
+/// rather than overwriting the stored credential with the placeholder.
+#[test]
+fn masked_upstream_and_approval_header_values_are_placeholder_sites() {
+    let mcp = project(
+        "mcp_gateway",
+        json!({
+            "servers": {
+                "gh": {
+                    "upstream_url": "https://mcp.example.com",
+                    "namespace": "gh",
+                    "headers": {"x-functions-key": "mcp-functions-canary"}
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        placeholder_sites("mcp_gateway", &mcp),
+        vec!["/config/servers/gh/headers/x-functions-key".to_string()]
+    );
+
+    let governor = project(
+        "ai_tool_governor",
+        json!({
+            "approval": {
+                "endpoint_url": "https://approvals.example.com",
+                "headers": {"x-tenant": "governor-tenant-canary"}
+            }
+        }),
+    );
+    assert_eq!(
+        placeholder_sites("ai_tool_governor", &governor),
+        vec!["/config/approval/headers/x-tenant".to_string()]
+    );
+
+    let validator = project(
+        "openapi_validator",
+        json!({
+            "bypass": {"header_present": {"x-skip": "openapi-bypass-secret-canary"}}
+        }),
+    );
+    assert_eq!(
+        placeholder_sites("openapi_validator", &validator),
+        vec!["/config/bypass/header_present/x-skip".to_string()]
+    );
+}
+
 #[test]
 fn chargeback_clickhouse_endpoint_and_insert_params_are_projected() {
     let projected = project(
@@ -1380,12 +2363,29 @@ fn placeholder_sites_ignore_a_later_layer_rendering_an_earlier_layers_output() {
     );
 }
 
-/// A placeholder only matters where the projection masks: the same string in a
-/// field the read shows verbatim was put there by the caller, not the read.
+/// A structural URL marker only matters where the projection masks: the same
+/// string in a field the read shows verbatim was put there by the caller, not
+/// the read.
 #[test]
-fn placeholder_outside_a_masked_site_is_not_reported() {
-    let config = json!({"service": "[REDACTED]", "batch_size": 50});
+fn url_marker_outside_a_masked_site_is_not_reported() {
+    let config = json!({
+        "service": "https://collector.example.com/[REDACTED_PATH]",
+        "batch_size": 50
+    });
     assert!(placeholder_sites("http_logging", &config).is_empty());
+}
+
+/// The exact `[REDACTED]` placeholder is reported at every string site: the
+/// TLS-material layer withholds a PEM private-key block by content in any
+/// field, so an echoed marker in an unclassified field cannot be told apart
+/// from a masked key, and the placeholder is reserved instead.
+#[test]
+fn exact_placeholder_is_reported_at_any_string_site() {
+    let config = json!({"service": "[REDACTED]", "batch_size": 50});
+    assert_eq!(
+        placeholder_sites("http_logging", &config),
+        ["/config/service"]
+    );
 }
 
 #[test]

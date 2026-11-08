@@ -1506,6 +1506,15 @@ written as sent. One real value looks exactly like a placeholder: a URL whose
 userinfo is the username `redacted` with no password, at a masked field. An
 operator cannot write that value, but an admin can.
 
+The exact string `[REDACTED]` is the exception: in a proxy, upstream, or
+plugin config it is refused at **any** string field, not only at fields the
+read masks. Stored TLS private-key material is withheld by its content
+wherever it occurs (see
+[Backend TLS private keys in reads](#backend-tls-private-keys-in-reads)), so a
+masked key in a field with no TLS name looks, once echoed back, exactly like
+`[REDACTED]` typed into an ordinary field. An operator cannot store the literal
+string `[REDACTED]` in these resources; an admin can.
+
 To change a resource that holds a masked secret, an operator must do one of these:
 
 - **Send the real value.** A new token or header value is an ordinary write, so
@@ -1758,13 +1767,14 @@ Disabled plugin configs are stored without plugin-specific construction, so oper
 
 Global-scope requirements for `transaction_log_schema` and `prometheus_metrics` still apply while disabled.
 
-Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. An `operator` write that sends one of the projection's placeholders back at a masked field is refused with `400`; see [Masked secrets on write](#masked-secrets-on-write-redaction-placeholders).
+Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. The projection covers the plugin `config` and its resource-level execution `trigger`. An `operator` write that sends one of the projection's placeholders back at a masked field is refused with `400`; see [Masked secrets on write](#masked-secrets-on-write-redaction-placeholders).
 
-That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Three layers run in order, and each can only add redaction:
+That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Four layers run in order, and each can only add redaction:
 
 1. **Schema rules** — exact per-plugin paths, with `*` wildcards for arbitrary maps and arrays and case/delimiter-insensitive segment matching that also equates compact spellings (`customHeaders`, `custom-headers`, `custom.headers`, `custom_headers`, and `customheaders` are one path). Rules classify a value as a wholesale secret, a structural endpoint URL, a Redis URL, or a librdkafka producer-property map.
-2. **Name heuristics** — the historical substring matcher (`api_key`, `client_secret`, `private_key`, `*_integrity_key`, `*function_key*`, `webhook`, plus the shared log-redaction key list). It still covers custom plugins, which have no built-in schema.
+2. **Name heuristics** — the historical substring matcher (`api_key`, `client_secret`, `private_key`, `*_integrity_key`, `*function_key*`, `webhook`, plus the shared log-redaction key list). It is a floor beneath the built-in schemas; a custom plugin, which has no schema, has every scalar leaf withheld instead (see below).
 3. **Structural URL sweep** — any remaining string anywhere in the config that parses as a URL carrying userinfo has that userinfo replaced by `redacted`, so `https://user:pass@host/x` cannot survive a projection even on a path no rule names.
+4. **TLS-material sweep** — the same classification as [Backend TLS private keys in reads](#backend-tls-private-keys-in-reads), applied to the whole config: a string carrying a PEM private-key block is withheld wherever it occurs, and a field named as a TLS private-key, certificate, or CA source (`client_key_path`, `client_cert_path`, `server_ca_cert_path`, `backend_tls_*`, `private_key`, `client_certificate`, `ca_certificates`) is classified exactly as in a Proxy or Upstream, which also covers the `mesh_route_dispatch` route-local `destination.backend_tls` and the Proxy / Upstream objects a `mesh_authz` `mesh_slice` embeds.
 
 A structurally projected endpoint URL keeps `scheme://host[:port]`, replaces userinfo with `redacted@` when present, and emits `[REDACTED_PATH]`, `[REDACTED_QUERY]`, and `[REDACTED_FRAGMENT]` markers for the components that were present. A value that does not parse as a URL, or that has no host, fails closed to `[REDACTED]`. A plugin `config` that is not an object (and not `null`) is replaced wholesale — no built-in accepts a scalar or array config, so its interior cannot be classified. Explicit JSON `null` values on sensitive fields stay `null` (they disclose nothing) rather than becoming `[REDACTED]`.
 
@@ -1780,6 +1790,8 @@ Fields covered by the schema include:
 | `otel_tracing` | `endpoint` | structural URL |
 | `otel_tracing` | `authorization`, `headers.*` | `[REDACTED]` |
 | `opa`, `ai_transcript_audit` | `headers.*`, `custom_headers.*` | `[REDACTED]` |
+| `opa` | `opa_host` | structural URL (a base path is kept in every decision URL; `policy_path` stays visible) |
+| `request_mirror`, `mesh_route_dispatch` | `mirror_path`, `rules.*.rewrite.uri` | `[REDACTED]` unless empty or `/`: an outbound destination path configured apart from its host and port is treated like an endpoint URL's path (the host, port, protocol, and `rewrite.authority` stay visible; the client-facing `redirect.uri` is not outbound and stays visible) |
 | `ai_transcript_audit` | `sink.endpoint_url` | structural URL |
 | `ai_transcript_audit` | `sink.custom_headers.*` | `[REDACTED]` |
 | `api_chargeback_sink` | `clickhouse.insert_query_params.*` | `[REDACTED]` (credential-*named* keys are already rejected at admission; the values stay arbitrary) |
@@ -1787,14 +1799,32 @@ Fields covered by the schema include:
 | `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
 | `request_transformer` | `rules.*.value` | `[REDACTED]` (header, query and body values are written into the upstream request and may carry a backend credential; `operation`, `target` and `new_key` stay visible, while `key` is already masked by the name heuristic) |
 | `mesh_route_dispatch` | `rules.*.request_transform.*.value` | `[REDACTED]` (same reason as `request_transformer`) |
+| `mesh_route_dispatch` | `rules.*.match.headers.*`, `rules.*.match.without_headers.*`, `rules.*.match.query_params.*` | `[REDACTED]` for a bare-string operand; an `{exact\|prefix\|regex}` operand keeps its match kind and masks the value |
+| `mesh_authz` | `rules.*.to.*.headers.*`, `rules.*.when.*.values`, `rules.*.when.*.not_values` of every policy in `mesh_policies`, `mesh_slice.mesh_policies` and `mesh_slice.node_waypoint_capture_mesh_policies` | `[REDACTED]` per entry, so the lists keep their length (every condition value is withheld, because the condition `key` decides whether it is a header value) |
+| `mesh_authz` | `mesh_slice.ext_authz_providers.*.include_additional_headers_in_check.*.value`, `mesh_slice.ext_authz_providers.*.path_prefix`, `mesh_slice.proxy_configs.*.environment.*`, `mesh_slice.extension_configs.*.value` | `[REDACTED]` (the provider's `name`, `service`, and `port` stay visible) |
+| `mesh_authz` | the TLS key, certificate, and CA sources of every `mesh_slice.virtual_service_l4_proxies.*` / `virtual_service_l4_upstreams.*` object (`backend_tls_*`, `port_overrides.*.tls.*`, `subsets.*.traffic_policy.tls.*`) | TLS-material sweep: inline key material, or a certificate-plus-key bundle in a certificate or CA field, is `[REDACTED]`; references and certificate-only PEM stay visible |
+| `mesh_authz` | `mesh_slice.telemetry_resources.*.config.tracing.providers.*.config.{url,agent_url,collector_url,endpoint}`, `mesh_slice.request_authentications.*.jwt_rules.*.jwks_uri`, `mesh_slice.multi_cluster.federation_endpoint`, `mesh_slice.multi_cluster.remote_clusters.*.{control_plane_url,federation_endpoint}` | structural URL |
+| every plugin (resource-level `trigger`, a sibling of `config`) | `header` / `query` / `cookie` `value.exact[*]`, `value.prefix[*]`, `value.regex` anywhere in the `all` / `any` / `not` tree | `[REDACTED]` (field names, `presence`, `multi_value`, `case_insensitive`, match kinds, and the other predicates stay visible; a shape the trigger schema does not define is withheld wholesale) |
+| `request_termination` | `trigger.header_value` | `[REDACTED]` (`trigger.header` stays visible) |
+| `mesh_route_dispatch`, `udp_logging` | `rules.*.destination.backend_tls.client_key_path` (TLS-material sweep), `dtls_key_path` | `[REDACTED]` when the value is or may be inline key material; a path or `k8s://` / `vault://` / `managed://` reference stays visible |
+| `mesh_route_dispatch`, `udp_logging`, `soap_ws_security`, `mtls_auth` | `rules.*.destination.backend_tls.{client_cert_path,server_ca_cert_path}` (TLS-material sweep), `dtls_cert_path`, `dtls_ca_cert_path`, `x509_signature.trusted_certs.*`, `saml.trusted_signing_certs.*`, `allowed_issuers.*.ca_certificate_pem` | `[REDACTED]` only when the value carries a PEM private-key block (a certificate-plus-key bundle); certificate-only PEM and references stay visible |
+| `transaction_debugger` | `capture_request_header_value` | `[REDACTED]` (`capture_request_header` stays visible) |
+| `ai_semantic_firewall` | `privacy.snippet_hash_salt` | `[REDACTED]` |
 | `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |
 | `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
 | `oidc_relying_party` | `providers.*.{token_endpoint,authorization_endpoint}` | `[REDACTED]` after structural projection because the additive name heuristic treats `token` and `authorization` as sensitive |
 | `mcp_gateway` | `servers.*.upstream_url` | structural URL |
+| `mcp_gateway` | `servers.*.headers.*` | `[REDACTED]` |
+| `ai_tool_governor` | `approval.headers.*` | `[REDACTED]` |
+| `openapi_validator` | `bypass.header_present.*` | `[REDACTED]` (shared secrets that skip validation) |
+| `waf` | `global_exemptions.header_present.*` | `[REDACTED]` (shared secrets that suppress every rule) |
+| `waf` | `custom_rules.*.conditions.headers.*`, `rule_overrides.*.conditions.headers.*` | `[REDACTED]` (a `null` presence-only condition stays `null`) |
 | `ldap_auth`, `spec_expose`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/base/endpoint URLs | structural URL |
 | `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |
 
 Header **values** are secret by default wherever a plugin accepts an arbitrary header map, because vendor authentication header names (`x-honeycomb-team`, `dd-api-key`, `lightstep-access-token`) match no substring pattern. Header **names** stay visible as routing diagnostics. Configuration keys that hold header *name lists* rather than values (`expose_headers`, `claim_headers`, `vary_by_headers`, `forward_headers`, `redact_headers`, …) are deliberately not redacted — distinguishing them from value maps is exactly what the schema exists to do.
+
+A custom plugin (a plugin name with no built-in schema entry) cannot be classified: the projection cannot tell which of its values are credentials, whether a header map under an unexpected key, a list of name/value pairs, or a numeric account id. Its config therefore fails closed. `viewer` and `operator` reads, audit diffs, and the configuration export withhold **every scalar leaf** (string, number, and boolean), showing `[REDACTED]` (a fingerprint in the export). Object keys, array shapes, and `null` values stay visible, so the structure is still readable. Because keys stay visible, a custom plugin must not put a secret in an object key (for example a map keyed by token); only values are withheld. An `operator` write that echoes those placeholders is refused like any other masked secret. To change a custom plugin's config, an operator must send real values, or an `admin` must make the change. `admin` reads stay raw. Built-ins keep their declared projection.
 
 `kafka_logging.producer_config` is an open escape hatch forwarded verbatim to librdkafka, several of whose properties are marked sensitive upstream (`ssl.key.pem`, `ssl.key.password`, `ssl.keystore.password`, `sasl.password`, `sasl.oauthbearer.config`, …). The projection therefore allow-lists the known non-credential tuning properties and redacts everything else, so a newly added upstream sensitive property is redacted by default. Separately, `producer_config` values carrying inline PEM private-key material are **rejected at admission** — use the top-level `ssl_key_location` field or an external secret reference. The rejection message names only the property, never the rejected material.
 
