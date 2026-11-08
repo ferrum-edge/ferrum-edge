@@ -1824,7 +1824,13 @@ honoured, each at one fixed point of the plugin chain:
   instead of the provider's value; the provider's value is then installed when
   it returned one. A `failOpen` allow (the provider could not decide) installs
   nothing and still strips the client's copies — nothing vouched for them. A
-  request no CUSTOM rule matched is untouched. The names the instance can
+  request no CUSTOM rule matched is untouched. When another plugin on the
+  route owns a listed name as a gateway assertion (a `claim_headers`
+  destination, say), the allowed check's decision becomes that header's
+  current authorized value — the provider's value, or absent when it returned
+  none — so the gateway's final assertion pass forwards it rather than
+  removing it; `mesh_authz` does not itself own the name, and a request it did
+  not CUSTOM-check changes nothing. The names the instance can
   change are declared as `modified_request_header_names` — in every `_` / `-`
   spelling the removal folds — so replay/cache ordering and the early
   route-total preview account for them. Each `mesh_authz` instance stages and

@@ -56,7 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list, and a trigger-skipped `opa` instance now also strips client copies of
   those names from the initial header block (keeping only a value an admitted
   sibling installed for the request). `mesh_authz` ext_authz
-  `headersToUpstreamOnAllow` names keep Istio semantics and are unchanged.
+  `headersToUpstreamOnAllow` names keep Istio semantics and are unchanged;
+  when one of them is also a header another plugin owns, an allowed CUSTOM
+  check's value (or its removal) is that header's current authorized value.
   Plugin-cache publication now refuses a `request_transformer` header rule or
   `mesh_route_dispatch` `request_transform` (a VirtualService
   `headers.request.set`/`add`) that writes a header another plugin on the

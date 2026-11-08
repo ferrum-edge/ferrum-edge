@@ -4506,8 +4506,26 @@ impl Plugin for MeshAuthz {
             })
         });
         for (name, value) in staged {
-            if let Some(value) = value {
-                headers.insert(name, value);
+            // Not an owner (Istio ext_authz semantics: only a CUSTOM-checked
+            // request carries provider-owned names), but when another plugin
+            // on the route owns this name as a gateway assertion, the
+            // provider's verified decision IS its current authorized state:
+            // record the install (or the removal) so the final
+            // gateway-assertion pass keeps exactly this value.
+            let route_owned = ctx.route_owned_request_assertion_headers().is_some_and(|owned| {
+                owned.iter().any(|owned| {
+                    crate::proxy::headers::field_names_equivalent_for_backends(owned, &name)
+                })
+            });
+            match value {
+                Some(value) => {
+                    if route_owned {
+                        ctx.record_installed_request_assertion(&name, &value);
+                    }
+                    headers.insert(name, value);
+                }
+                None if route_owned => ctx.record_cleared_request_assertion(&name),
+                None => {}
             }
         }
         PluginResult::Continue
