@@ -437,7 +437,8 @@ fn timeout_error(key: &str, backend_name: &str, timeout: Duration) -> String {
 #[cfg(any(
     feature = "secrets-aws",
     feature = "secrets-gcp",
-    feature = "secrets-azure"
+    feature = "secrets-azure",
+    feature = "secrets-vault"
 ))]
 fn client_init_timeout_error(backend_name: &str, timeout: Duration) -> String {
     format!(
@@ -1106,7 +1107,11 @@ impl SecretBackend for VaultBackend {
         secrets: &[PendingSecret],
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
-        let client = vault::VaultClientWrapper::new()?;
+        // Client construction reads `FERRUM_TLS_CA_BUNDLE_PATH`; bound it
+        // with the same timeout as the fetches (once per provider batch).
+        let client = tokio::time::timeout(timeout, vault::VaultClientWrapper::new())
+            .await
+            .map_err(|_| client_init_timeout_error(self.display_name(), timeout))??;
         resolve_many_concurrent(
             secrets,
             timeout,

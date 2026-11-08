@@ -1218,7 +1218,9 @@ impl MeshSlice {
     ///      which is already pre-filtered by `from_gateway_config`)
     ///
     /// Within the winning policy, a port-level override for `port` takes
-    /// precedence over the policy's top-level `mtls_mode`.
+    /// precedence over the policy's top-level `mtls_mode`. An `Unset` (Istio
+    /// `UNSET` / omitted) mode inherits from the next tier down: workload port
+    /// override -> workload mode -> namespace -> mesh-wide -> `Permissive`.
     ///
     /// When no PeerAuthentication applies, returns `MtlsMode::Permissive`
     /// (Istio default).
@@ -1273,12 +1275,13 @@ impl MeshSlice {
         &self,
         mode_for: impl Fn(&PeerAuthentication) -> MtlsMode + Copy,
     ) -> MtlsMode {
-        let resolved = resolve_peer_auth_mtls_mode(
+        let resolution = resolve_peer_auth_tiers(
             &self.peer_authentications,
             &self.namespace,
             &self.labels,
             mode_for,
         );
+        let resolved = resolution.effective;
         if !self.labels_ambiguous {
             return resolved;
         }
@@ -1308,7 +1311,12 @@ impl MeshSlice {
             if !peer_auth_selector_namespace_matches(pa, &self.namespace) {
                 continue;
             }
-            let candidate = mode_for(pa);
+            // An `Unset` candidate would inherit the namespace/mesh-wide mode,
+            // which resolves against the authoritative namespace.
+            let candidate = match mode_for(pa) {
+                MtlsMode::Unset => resolution.inherited_by_workload_tier,
+                mode => mode,
+            };
             if peer_auth_mtls_restrictiveness(candidate) < peer_auth_mtls_restrictiveness(effective)
             {
                 effective = candidate;
@@ -4680,9 +4688,10 @@ fn host_matches_pattern(pattern: &str, candidate: &str) -> bool {
 
 /// Scope tier used for PeerAuthentication precedence ranking.
 ///
-/// Discriminant order is load-bearing: `Ord` derive uses it, and the
-/// resolution loop picks the highest-valued tier. Istio semantics:
-/// WorkloadSelector > Namespace > MeshWide.
+/// Discriminant order is load-bearing: the `Ord` derive uses it, and
+/// [`resolve_peer_auth_tiers`] indexes its per-tier state by it and folds the
+/// tiers from the lowest value up. Istio semantics: WorkloadSelector >
+/// Namespace > MeshWide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PeerAuthScope {
     MeshWide = 0,
@@ -4777,12 +4786,17 @@ fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
 /// per-port override on a selector-scoped policy takes precedence over the
 /// policy's top-level `mtls_mode`. Selector-less namespace/mesh-wide policies
 /// ignore `port_overrides`, matching Istio's `portLevelMtls` contract.
+///
+/// An `Unset` port override inherits the policy's top-level mode, and an
+/// `Unset` result means the policy itself inherits: the tier walk in
+/// [`resolve_peer_auth_tiers`] substitutes the mode resolved from the tiers
+/// below.
 fn peer_auth_effective_mode(pa: &PeerAuthentication, port: u16) -> MtlsMode {
     if pa.has_workload_selector() {
-        pa.port_overrides
-            .get(&port)
-            .copied()
-            .unwrap_or(pa.mtls_mode)
+        match pa.port_overrides.get(&port) {
+            Some(&mode) if mode != MtlsMode::Unset => mode,
+            _ => pa.mtls_mode,
+        }
     } else {
         pa.mtls_mode
     }
@@ -4796,7 +4810,9 @@ fn peer_auth_effective_mode(pa: &PeerAuthentication, port: u16) -> MtlsMode {
 /// outrank — and thereby downgrade — a trusted `Strict`.
 fn peer_auth_mtls_restrictiveness(mode: MtlsMode) -> u8 {
     match mode {
-        MtlsMode::Strict => 0,
+        // `Unset` is folded into the inherited concrete mode before any
+        // comparison; rank a stray one as `Strict` so it can only tighten.
+        MtlsMode::Strict | MtlsMode::Unset => 0,
         MtlsMode::Permissive => 1,
         MtlsMode::Disable => 2,
         MtlsMode::Simple | MtlsMode::Mutual | MtlsMode::IstioMutual => 3,
@@ -4825,54 +4841,89 @@ fn resolve_peer_auth_mtls_mode<'a, L: WorkloadLabels + ?Sized>(
     labels: &L,
     mode_for: impl Fn(&'a PeerAuthentication) -> MtlsMode,
 ) -> MtlsMode {
-    let mut best: Option<(PeerAuthScope, &PeerAuthentication)> = None;
+    let resolution = resolve_peer_auth_tiers(peer_auths, namespace, labels, mode_for);
+    resolution.effective
+}
+
+/// Result of the PeerAuthentication tier walk for one workload and port.
+#[derive(Debug, Clone, Copy)]
+struct PeerAuthTierResolution {
+    /// Mode inherited from the namespace and mesh-wide tiers (or the
+    /// `Permissive` default): what an `Unset` workload-selector policy yields.
+    inherited_by_workload_tier: MtlsMode,
+    /// Final effective mode after the workload-selector tier.
+    effective: MtlsMode,
+}
+
+/// Walk the PeerAuthentication tiers for one workload, from the `Permissive`
+/// default up through MeshWide, Namespace, and WorkloadSelector.
+///
+/// A tier with an applicable policy whose effective mode (from `mode_for`) is
+/// concrete replaces the inherited mode, so a more specific tier still wins
+/// over a less specific one (WorkloadSelector > Namespace > MeshWide). An
+/// `Unset` (Istio "inherit") policy contributes the mode resolved from the
+/// tiers below it instead of a concrete posture, so a lower-tier policy that
+/// omits its mode, or only sets `portLevelMtls`, can no longer downgrade an
+/// inherited `Strict`. Within the SAME tier, two equally-applicable policies
+/// are an operator misconfiguration and resolve FAIL-SECURE: the more
+/// restrictive effective mode wins (`Strict` > `Permissive` > `Disable`),
+/// with each `Unset` policy counted at the mode it inherits. Because the
+/// winner is decided by mode rather than by the policy's namespace string or
+/// name, a tenant-controlled policy cannot downgrade inbound mTLS below a
+/// trusted same-tier policy by choosing a low-sorting namespace or policy
+/// name. Equal-mode ties need no further ordering: only the mode is returned.
+fn resolve_peer_auth_tiers<'a, L: WorkloadLabels + ?Sized>(
+    peer_auths: &'a [PeerAuthentication],
+    namespace: &str,
+    labels: &L,
+    mode_for: impl Fn(&'a PeerAuthentication) -> MtlsMode,
+) -> PeerAuthTierResolution {
+    // Per tier (indexed by the `PeerAuthScope` discriminant): the most
+    // restrictive concrete mode, and whether any applicable policy inherits.
+    let mut concrete: [Option<MtlsMode>; 3] = [None; 3];
+    let mut inherits = [false; 3];
 
     for pa in peer_auths {
         if !peer_auth_applies_to_workload(pa, namespace, labels) {
             continue;
         }
-
-        let scope = classify_peer_auth_scope(pa);
-        // Higher tier wins (WorkloadSelector > Namespace > MeshWide). Within the
-        // SAME tier, two equally-applicable PeerAuthentications are an operator
-        // misconfiguration, so resolve the tie FAIL-SECURE: prefer the more-
-        // restrictive effective mTLS mode for this port (Strict > Permissive >
-        // Disable). This is both deterministic AND a real trust boundary —
-        // because the winner is decided by mode, not by the policy's namespace
-        // string or name, a tenant-controlled policy cannot downgrade inbound
-        // mTLS below a trusted same-tier policy by choosing a low-sorting
-        // namespace or policy name (and a customized root namespace that sorts
-        // after tenants is equally safe). Only when the effective modes are
-        // identical do we fall back to the value-neutral `(namespace, name)`
-        // ordering, purely to pick a canonical winner deterministically across
-        // pods/reconciles.
-        let dominated = best.as_ref().is_none_or(|&(current_scope, current_pa)| {
-            use std::cmp::Ordering;
-            match scope.cmp(&current_scope) {
-                Ordering::Greater => true,
-                Ordering::Less => false,
-                Ordering::Equal => {
-                    let candidate = peer_auth_mtls_restrictiveness(mode_for(pa));
-                    let current = peer_auth_mtls_restrictiveness(mode_for(current_pa));
-                    match candidate.cmp(&current) {
-                        Ordering::Less => true,
-                        Ordering::Greater => false,
-                        Ordering::Equal => {
-                            (pa.namespace.as_str(), pa.name.as_str())
-                                < (current_pa.namespace.as_str(), current_pa.name.as_str())
-                        }
-                    }
-                }
+        let tier = classify_peer_auth_scope(pa) as usize;
+        match mode_for(pa) {
+            MtlsMode::Unset => inherits[tier] = true,
+            mode => {
+                concrete[tier] = Some(match concrete[tier] {
+                    Some(current) => more_restrictive_peer_auth_mode(current, mode),
+                    None => mode,
+                });
             }
-        });
-        if dominated {
-            best = Some((scope, pa));
         }
     }
 
-    match best {
-        Some((_, pa)) => mode_for(pa),
-        None => MtlsMode::Permissive,
+    // Fold one tier over the mode inherited from the tiers below it.
+    let fold_tier = |tier: PeerAuthScope, inherited: MtlsMode| {
+        let index = tier as usize;
+        match (concrete[index], inherits[index]) {
+            (Some(mode), false) => mode,
+            (Some(mode), true) => more_restrictive_peer_auth_mode(mode, inherited),
+            (None, _) => inherited,
+        }
+    };
+    let mesh_wide = fold_tier(PeerAuthScope::MeshWide, MtlsMode::Permissive);
+    let inherited_by_workload_tier = fold_tier(PeerAuthScope::Namespace, mesh_wide);
+    let effective = fold_tier(PeerAuthScope::WorkloadSelector, inherited_by_workload_tier);
+
+    PeerAuthTierResolution {
+        inherited_by_workload_tier,
+        effective,
+    }
+}
+
+/// The more restrictive of two PeerAuthentication modes; `current` wins ties.
+fn more_restrictive_peer_auth_mode(current: MtlsMode, candidate: MtlsMode) -> MtlsMode {
+    if peer_auth_mtls_restrictiveness(candidate) < peer_auth_mtls_restrictiveness(current) {
+        candidate
+    } else {
+        current
     }
 }
 
