@@ -1453,7 +1453,11 @@ fn both_native_grpc_collects_answer_a_capacity_refusal_before_dispatch() {
         .split("Err(grpc_proxy::GrpcRequestBodyCollectError::BufferCapacityExceeded) => {")
         .skip(1)
         .collect();
-    assert_eq!(arms.len(), 2, "the split and the mixed native-gRPC collects");
+    assert_eq!(
+        arms.len(),
+        2,
+        "the split and the mixed native-gRPC collects"
+    );
     for arm in arms {
         let arm = &arm[..arm.find("return Ok(response);").expect("bounded arm")];
         assert!(arm.contains("build_request_buffer_capacity_response("));
