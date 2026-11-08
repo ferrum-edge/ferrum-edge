@@ -2372,10 +2372,9 @@ fn spec_content_response(
                 })
         });
     if etag_matches {
-        return Response::builder()
+        return crate::admin::with_admin_security_headers(Response::builder())
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", &etag)
-            .header("Cache-Control", "no-store")
             .header("Vary", "Accept")
             .body(Full::new(Bytes::new()))
             .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
@@ -2431,22 +2430,14 @@ fn spec_content_response(
     };
 
     let len = body_bytes.len();
-    Response::builder()
+    crate::admin::with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", ct)
         .header("Content-Length", len.to_string())
         .header("ETag", &etag)
-        .header("Cache-Control", "no-store")
         .header("Vary", "Accept")
-        .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap_or_else(|_| {
-            let mut resp = Response::new(Full::new(Bytes::from_static(
-                b"{\"error\":\"Internal server error\"}",
-            )));
-            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            resp
-        })
+        .unwrap_or_else(|_| crate::admin::admin_builder_failure_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -3792,9 +3783,8 @@ pub async fn handle_delete_api_spec(
         Err(error) => return Ok(error_response(error)),
     };
     if persistence {
-        let response = Response::builder()
+        let response = crate::admin::with_admin_security_headers(Response::builder())
             .status(StatusCode::NO_CONTENT)
-            .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::new()))
             .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
         Ok(state
