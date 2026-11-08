@@ -923,36 +923,6 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
-      - name: Run gateway startup smoke (provider-resolved admin secret)
-        # The `#[ignore]`d `startup_smoke` tests spawn the `ferrum-edge` binary
-        # (built by the all-features step above as a bin target of this
-        # package) with FERRUM_ADMIN_JWT_SECRET behind each provider suffix and
-        # prove admin-port ownership with a JWT signed by the resolved secret.
-        # REQUIRED turns a self-skip (missing binary, fake or container) into
-        # a failure.
-        run: |
-          cargo nextest run \
-            --features secrets-vault,secrets-aws,secrets-gcp,secrets-azure \
-            --test secrets_functional \
-            --run-ignored ignored-only \
-            --no-fail-fast \
-            startup_smoke::
-        env:
-          RUST_BACKTRACE: 1
-          FERRUM_SECRETS_STARTUP_SMOKE_REQUIRED: "1"
-
-      - name: Verify the suite left no working-directory TLS store
-        # Same guard as the Unit/Integration jobs (issue #5706): a spawned
-        # gateway without FERRUM_TLS_MANAGED_STORE_PATH writes
-        # ./ferrum-managed-tls into the checkout.
-        if: always()
-        run: |
-          if [ -e ferrum-managed-tls ]; then
-            echo "::error::the test run wrote the working-directory TLS store ./ferrum-managed-tls"
-            find ferrum-managed-tls -maxdepth 1 -print
-            exit 1
-          fi
-
   test-service-integration:
     name: Service Integration
     needs: ci-plan

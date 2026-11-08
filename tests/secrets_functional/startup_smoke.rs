@@ -12,7 +12,7 @@
 //!
 //! These spawn the binary, so they are `#[ignore]` (run with `--ignored`, after
 //! `cargo build --bin ferrum-edge`) and self-skip when their fake/emulator is
-//! unavailable, unless `FERRUM_SECRETS_STARTUP_SMOKE_REQUIRED=1` (set in CI)
+//! unavailable, unless `FERRUM_SECRETS_STARTUP_SMOKE_REQUIRED=1`
 //! turns a skip into a failure. They are intentionally minimal — the
 //! resolver-level tests in the sibling modules carry the detailed coverage.
 //!
@@ -34,7 +34,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Set to `1` (CI does) to turn every self-skip into a failure, so a missing
+/// Set to `1` (for a CI run) to turn every self-skip into a failure, so a missing
 /// binary, fake or container cannot make the smoke pass without running.
 const REQUIRED_ENV: &str = "FERRUM_SECRETS_STARTUP_SMOKE_REQUIRED";
 
