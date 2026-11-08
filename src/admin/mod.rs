@@ -3137,12 +3137,10 @@ fn metrics_unauthorized_response() -> Response<Full<Bytes>> {
     or the client must be in FERRUM_METRICS_ALLOWED_CIDRS"
     }))
     .unwrap_or_default();
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(StatusCode::UNAUTHORIZED)
         .header("Content-Type", "application/json")
         .header("WWW-Authenticate", "Bearer")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
         .body(Full::new(Bytes::from(body)))
         .unwrap_or_else(|_| admin_builder_failure_response())
 }
@@ -3199,6 +3197,12 @@ pub async fn handle_admin_request(
         .map(|response| response.status().as_u16())
         .unwrap_or(500);
     audit::finalize_unconsumed_intent(&slot, status).await;
+    // Every dispatched admin response carries the admin security headers
+    // (issue #7074), including one a handler built by hand. Fields a handler
+    // set explicitly are kept.
+    if let Ok(response) = result.as_mut() {
+        insert_missing_admin_security_headers(response.headers_mut());
+    }
     // Mark the accepted-but-unrouted namespace on the way out (issue #5447).
     // Scoped to `2xx` mutations: a rejected write never reached the store so it
     // is not the silent-success condition, and a read has `GET /status` as its
@@ -4021,11 +4025,9 @@ async fn handle_admin_request_inner(
         {
             metrics_output.push_str(&exporter.render_prometheus());
         }
-        let resp = Response::builder()
+        let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::from(metrics_output)))
             .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
@@ -4140,11 +4142,9 @@ async fn handle_admin_request_inner(
                                 "text/plain; version=0.0.4; charset=utf-8"
                             }
                         };
-                        let resp = match Response::builder()
+                        let resp = match with_admin_security_headers(Response::builder())
                             .status(StatusCode::OK)
                             .header("Content-Type", content_type)
-                            .header("X-Content-Type-Options", "nosniff")
-                            .header("Cache-Control", "no-store")
                             .body(Full::new(Bytes::from(output)))
                         {
                             Ok(mut resp) => {
@@ -4177,11 +4177,9 @@ async fn handle_admin_request_inner(
 
     if path == "/charges/sink/status" && method == Method::GET {
         let status_output = crate::plugins::api_chargeback_sink::render_status_json();
-        let resp = Response::builder()
+        let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::from(status_output)))
             .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
@@ -9133,13 +9131,10 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
     if let Some((cached_at, ref bytes)) = **cached
         && cached_at.elapsed() < METRICS_CACHE_TTL
     {
-        let resp = Response::builder()
+        let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("X-Cache", "hit")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-store")
-            .header("X-Frame-Options", "DENY")
             .body(Full::new(bytes.clone()))
             .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
@@ -9151,13 +9146,10 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
 
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
 
-    let resp = Response::builder()
+    let resp = with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header("X-Cache", "miss")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(body_bytes))
         .unwrap_or_else(|_| admin_builder_failure_response());
     Ok(resp)
@@ -9196,13 +9188,10 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
     if let Some((cached_at, ref bytes)) = **cached
         && cached_at.elapsed() < Duration::from_millis(ttl_ms)
     {
-        let resp = Response::builder()
+        let resp = with_admin_security_headers(Response::builder())
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("X-Cache", "hit")
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-store")
-            .header("X-Frame-Options", "DENY")
             .body(Full::new(bytes.clone()))
             .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
@@ -9213,13 +9202,10 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
     let body_bytes = Bytes::from(body_str);
     cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
 
-    let resp = Response::builder()
+    let resp = with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header("X-Cache", "miss")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(body_bytes))
         .unwrap_or_else(|_| admin_builder_failure_response());
     Ok(resp)
@@ -10499,7 +10485,7 @@ fn serialize_backup_payload(
 }
 
 fn backup_attachment_response(body_bytes: Vec<u8>, source: &'static str) -> Response<Full<Bytes>> {
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header(
@@ -10507,9 +10493,6 @@ fn backup_attachment_response(body_bytes: Vec<u8>, source: &'static str) -> Resp
             "attachment; filename=\"ferrum-backup.json\"",
         )
         .header("X-Data-Source", source)
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_bytes)))
         .unwrap_or_else(|_| admin_builder_failure_response())
 }
@@ -13023,24 +13006,54 @@ async fn handle_config_apply_status(
     ))
 }
 
+/// The response security headers every admin API response carries (issue
+/// #7074): `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+/// `X-Frame-Options: DENY`.
+///
+/// The policy is uniform on purpose, including Prometheus text, `401`, `304`
+/// and bodiless responses: the admin API is never meant to be framed, sniffed
+/// or cached, and a per-endpoint exception is how copies drift. A response
+/// builder sets them with [`with_admin_security_headers`]; whatever the
+/// dispatcher returns is then completed by
+/// [`insert_missing_admin_security_headers`] in [`handle_admin_request`], so a
+/// new endpoint that builds its own response still inherits the policy. A
+/// handler that needs a different `Cache-Control` sets it explicitly; the
+/// final pass only fills absent fields.
+pub(crate) fn with_admin_security_headers(
+    builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+    builder
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .header(hyper::header::X_FRAME_OPTIONS, "DENY")
+}
+
+/// Insert each admin security header ([`with_admin_security_headers`]) that a
+/// response does not already carry. Existing values are left untouched.
+pub(crate) fn insert_missing_admin_security_headers(headers: &mut hyper::HeaderMap) {
+    headers
+        .entry(hyper::header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(hyper::header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    headers
+        .entry(hyper::header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+}
+
 pub(in crate::admin) fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(status)
         .header("Content-Type", "application/json")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_str)))
         .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 pub(in crate::admin) fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(status)
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::new()))
         .unwrap_or_else(|_| admin_builder_failure_response())
 }
@@ -13059,27 +13072,17 @@ pub(crate) fn admin_builder_failure_response() -> Response<Full<Bytes>> {
         hyper::header::CONTENT_TYPE,
         hyper::header::HeaderValue::from_static("application/json"),
     );
-    headers.insert(
-        hyper::header::CACHE_CONTROL,
-        hyper::header::HeaderValue::from_static("no-store"),
-    );
-    headers.insert(
-        hyper::header::X_CONTENT_TYPE_OPTIONS,
-        hyper::header::HeaderValue::from_static("nosniff"),
-    );
+    insert_missing_admin_security_headers(headers);
     response
 }
 
 /// JSON response with X-Data-Source: cached header to indicate stale/cached data.
 fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
-    Response::builder()
+    with_admin_security_headers(Response::builder())
         .status(status)
         .header("Content-Type", "application/json")
         .header("X-Data-Source", "cached")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_str)))
         .unwrap_or_else(|_| admin_builder_failure_response())
 }

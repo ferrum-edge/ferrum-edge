@@ -1103,7 +1103,13 @@ Dict: component, resolved, hardFail, probes.
 {{- if and $cidrs (or $computedLive $computedReady) -}}
 {{- $probeHost := $resolved.probeHost | default (include "ferrum-mesh.adminProbeHost" $resolved.bind) -}}
 {{- $probeSource := include "ferrum-mesh.probeSource" $probeHost -}}
-{{- if not (include "ferrum-mesh.adminAllowlistContainsIp" (dict "ip" $probeSource "allowedCidrs" $cidrs)) -}}
+{{- /* A mapped bind is served by an IPv6 socket, so the listener sees the probe
+     as the mapped peer (`::ffff:127.0.0.1`) and the runtime matches it against
+     IPv4 rules and ordinary IPv6 rules alike. Check that form; the dotted
+     source stays the diagnostic. */ -}}
+{{- $probePeer := $probeSource -}}
+{{- if include "ferrum-mesh.ipv4MappedToInt" ($probeHost | toString | trimPrefix "[" | trimSuffix "]") -}}{{- $probePeer = printf "::ffff:%s" $probeSource -}}{{- end -}}
+{{- if not (include "ferrum-mesh.adminAllowlistContainsIp" (dict "ip" $probePeer "allowedCidrs" $cidrs)) -}}
 {{- $probeCidr := ternary (printf "%s/128" $probeSource) (printf "%s/32" $probeSource) (contains ":" $probeSource) -}}
 {{- fail (printf "%s.admin.allowedCidrs must include %s (or bare %s) while the computed exec probes are enabled; they dial admin host %s from source %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR), or override/disable every computed probe handler." $component $probeCidr $probeSource $probeHost $probeSource) -}}
 {{- end -}}

@@ -93,6 +93,10 @@ for `status`, dry-run and operator-controlled `up` / `config` workflows.
   entry containing `::1` (such as `::/127`, `::1/128`, or bare `::1`) — an
   unspecified IPv6 bind is not guaranteed to accept v4-mapped `127.0.0.1`.
   A concrete IPv6 bind is dialed directly and its concrete source must be allowed.
+  An IPv4-mapped bind (`::ffff:a.b.c.d`) is treated as its IPv4 address, as
+  the runtime does: `::ffff:127.0.0.2` is a 127/8 dial whose probes arrive from
+  `127.0.0.1`. A bare mapped allowlist entry (`::ffff:10.0.0.1`) is one IPv4
+  host (`/32`); a mapped CIDR's prefix length counts the 96-bit mapped prefix.
   IPv6 allowlist entries use bare address syntax (`fd00::/8`, `::1/128`), not
   URL-style brackets (`[fd00::]/8`), matching the runtime's strict CIDR parser.
   `admin.bindAddress` must be an IP literal — any hostname (`localhost`,
