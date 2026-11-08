@@ -2880,9 +2880,10 @@ pub struct RequestContext {
     /// credential locations above plus every owned gateway-assertion header
     /// (`claim_headers` destinations), precomputed by the plugin cache.
     request_trailer_strip_headers: Option<Arc<Vec<String>>>,
-    /// Whether a plugin on the matched route owns any gateway-assertion request
-    /// header, whatever any trigger decides (plugin cache view).
-    route_owns_request_assertion_headers: bool,
+    /// Every gateway-assertion request header a plugin on the matched route
+    /// owns, whatever any trigger decides (plugin cache view). `None` when the
+    /// route owns none.
+    route_owned_request_assertion_headers: Option<Arc<Vec<String>>>,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains
@@ -3881,17 +3882,16 @@ pub(crate) struct PluginRequestState {
     /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
     /// configured.
     pub(crate) sanitized_claim_header_destinations: HashSet<String>,
-    /// Set when a `spiffe_identity` `forward_identity` instance's own
-    /// `before_proxy` installed `x-ferrum-peer-spiffe-id` for this request.
-    /// A trigger-skipped sibling keeps that header only on this provenance
-    /// marker, never because a value equals the admitted peer identity.
-    pub(crate) peer_spiffe_identity_forwarded: bool,
-    /// Exact names an admitted policy instance installed on the backend
-    /// request for this request (`opa` `decision_request_headers`). A
-    /// trigger-skipped sibling that owns the same name keeps only these
-    /// entries and strips every other spelling
-    /// ([`strip_uninstalled_policy_request_headers`]).
-    pub(crate) policy_installed_request_headers: HashSet<String>,
+    /// `(name, value)` pairs an admitted owning instance installed on the
+    /// backend request for this request: verified claim headers, OPA decision
+    /// headers, the forwarded peer SPIFFE ID. The final gateway-assertion pass
+    /// over the outbound map keeps an owned header only when its pair is here,
+    /// so a value that merely equals a gateway fact is never proof.
+    pub(crate) installed_request_assertions: Vec<(String, String)>,
+    /// Set by the `grpc_web` translation owner's own `before_proxy` once it
+    /// rewrote this request to native gRPC. A request whose final outbound
+    /// `content-type` is gRPC-Web without this marker was not translated.
+    pub(crate) grpc_web_translated: bool,
     /// Digests of credential-bearing query parameters that were present before
     /// authentication and request transformation. Kept outside public metadata
     /// so neither reusable credentials nor correlatable digests enter logs.
@@ -4736,7 +4736,7 @@ impl RequestContext {
             plugin_state: None,
             request_headers_to_redact: None,
             request_trailer_strip_headers: None,
-            route_owns_request_assertion_headers: false,
+            route_owned_request_assertion_headers: None,
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
@@ -6393,7 +6393,9 @@ impl RequestContext {
             cors_state: cors::CorsRequestState::default(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             request_trailer_strip_headers: self.request_trailer_strip_headers.clone(),
-            route_owns_request_assertion_headers: self.route_owns_request_assertion_headers,
+            route_owned_request_assertion_headers: self
+                .route_owned_request_assertion_headers
+                .clone(),
             // Per-plugin working state. The split into `PluginRequestState`
             // did not change any family's lifecycle here: most are CLONED, the
             // claim-header staging and the `response_caching` header delta stay
@@ -6685,14 +6687,16 @@ impl RequestContext {
     }
 
     /// Install the route's request-trailer strip list (credential locations
-    /// plus owned gateway-assertion headers) and whether the route owns any
-    /// gateway-assertion header, from the plugin cache view.
+    /// plus owned gateway-assertion headers) and the route's owned
+    /// gateway-assertion headers, from the plugin cache view.
     pub(crate) fn set_request_trailer_strip_headers(
         &mut self,
         headers: Arc<Vec<String>>,
-        owns_assertion_headers: bool,
+        owned_assertion_headers: Arc<Vec<String>>,
     ) {
-        self.route_owns_request_assertion_headers = owns_assertion_headers;
+        if !owned_assertion_headers.is_empty() {
+            self.route_owned_request_assertion_headers = Some(owned_assertion_headers);
+        }
         if !headers.is_empty() {
             self.request_trailer_strip_headers = Some(headers);
         }
@@ -6701,17 +6705,44 @@ impl RequestContext {
     /// Whether a plugin on the matched route owns any gateway-assertion
     /// request header (`Plugin::owned_request_assertion_header_names`).
     pub(crate) fn route_owns_request_assertion_headers(&self) -> bool {
-        self.route_owns_request_assertion_headers
+        self.route_owned_request_assertion_headers.is_some()
     }
 
-    /// Record that an admitted policy instance installed `name` on the
-    /// backend request for this request, so a sibling instance owning the same
-    /// name keeps that value ([`strip_uninstalled_policy_request_headers`]).
-    pub(crate) fn mark_policy_request_header_installed(&mut self, name: &str) {
-        let installed = &mut self.plugin_state_mut().policy_installed_request_headers;
-        if !installed.contains(name) {
-            installed.insert(name.to_string());
+    /// Every gateway-assertion request header a plugin on the matched route
+    /// owns, or `None` when it owns none.
+    pub(crate) fn route_owned_request_assertion_headers(&self) -> Option<&[String]> {
+        self.route_owned_request_assertion_headers
+            .as_deref()
+            .map(Vec::as_slice)
+    }
+
+    /// Record that an admitted owning instance installed `name: value` on the
+    /// backend request for this request: a verified claim header, an OPA
+    /// decision header, the forwarded peer SPIFFE ID. The final gateway
+    /// assertion pass (`proxy::enforce_route_owned_request_assertions`) and the
+    /// trigger-skip sanitizers keep only recorded pairs.
+    pub(crate) fn record_installed_request_assertion(&mut self, name: &str, value: &str) {
+        if self.request_assertion_installed(name, value) {
+            return;
         }
+        self.plugin_state_mut()
+            .installed_request_assertions
+            .push((name.to_string(), value.to_string()));
+    }
+
+    /// Whether an admitted owning instance installed exactly `value` under a
+    /// name a backend reads as `name` (ASCII case-insensitive, `_` read as
+    /// `-`) for this request.
+    pub(crate) fn request_assertion_installed(&self, name: &str, value: &str) -> bool {
+        use crate::proxy::headers::field_names_equivalent_for_backends;
+
+        let Some(state) = self.plugin_state() else {
+            return false;
+        };
+        let installed = &state.installed_request_assertions;
+        installed.iter().any(|(owned, owned_value)| {
+            owned_value == value && field_names_equivalent_for_backends(owned, name)
+        })
     }
 
     /// Shared handle to the route's request-trailer strip list, for the late
@@ -11435,14 +11466,16 @@ impl std::ops::BitOr for PluginHooks {
     }
 }
 
-/// Remove every client spelling (ASCII case-insensitive, `_` read as `-`) of
-/// the policy-owned request header `names` from `headers`, keeping only an
-/// exact entry an admitted policy instance installed for this request
-/// ([`RequestContext::mark_policy_request_header_installed`]).
+/// Remove every spelling (ASCII case-insensitive, `_` read as `-`) of the
+/// owned request header `names` from `headers`, keeping only an entry whose
+/// `(name, value)` an admitted owning instance installed for this request
+/// ([`RequestContext::record_installed_request_assertion`]).
 ///
-/// Used by `opa`'s trigger-skip sanitizer
-/// (`Plugin::sanitize_owned_request_headers`).
-pub(crate) fn strip_uninstalled_policy_request_headers(
+/// The final gateway-assertion pass over the outbound map
+/// (`proxy::enforce_route_owned_request_assertions`) applies it to the
+/// route's whole owned set; `opa` and `spiffe_identity` apply it to their own
+/// names when their trigger skips a request.
+pub(crate) fn strip_uninstalled_request_assertions(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
     names: &[String],
@@ -11452,14 +11485,11 @@ pub(crate) fn strip_uninstalled_policy_request_headers(
     if names.is_empty() {
         return;
     }
-    let installed = ctx
-        .plugin_state()
-        .map(|state| &state.policy_installed_request_headers);
-    headers.retain(|header, _| {
+    headers.retain(|header, value| {
         let owned = names
             .iter()
             .any(|name| field_names_equivalent_for_backends(header, name));
-        !owned || installed.is_some_and(|installed| installed.contains(header))
+        !owned || ctx.request_assertion_installed(header, value)
     });
 }
 

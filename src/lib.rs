@@ -131,7 +131,8 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         headers: Vec<String>,
     ) {
-        ctx.set_request_trailer_strip_headers(std::sync::Arc::new(headers), true);
+        let owned = std::sync::Arc::new(headers.clone());
+        ctx.set_request_trailer_strip_headers(std::sync::Arc::new(headers), owned);
     }
 
     /// Install the request-trailer policy a plugin cache view carries, exactly
@@ -143,7 +144,7 @@ pub mod _test_support {
         ctx.set_request_headers_to_redact(view.request_headers_to_redact());
         ctx.set_request_trailer_strip_headers(
             view.request_trailer_strip_headers(),
-            view.owns_request_assertion_headers(),
+            view.owned_request_assertion_headers(),
         );
     }
 

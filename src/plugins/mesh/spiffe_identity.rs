@@ -719,14 +719,15 @@ impl Plugin for SpiffeIdentity {
                 FORWARDED_IDENTITY_HEADER,
             )
         });
-        if let Some(id) = ctx.peer_spiffe_id.as_ref() {
-            headers.insert(
-                FORWARDED_IDENTITY_HEADER.to_string(),
-                id.as_str().to_string(),
-            );
-            // Provenance for a trigger-skipped sibling instance, which must
-            // not undo this installation (`sanitize_owned_request_headers`).
-            ctx.plugin_state_mut().peer_spiffe_identity_forwarded = true;
+        let peer_id = ctx
+            .peer_spiffe_id
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+        if let Some(id) = peer_id {
+            // Provenance for the final gateway-assertion pass and a
+            // trigger-skipped sibling: only this exact pair survives them.
+            ctx.record_installed_request_assertion(FORWARDED_IDENTITY_HEADER, &id);
+            headers.insert(FORWARDED_IDENTITY_HEADER.to_string(), id);
         }
         PluginResult::Continue
     }
@@ -734,28 +735,21 @@ impl Plugin for SpiffeIdentity {
     /// A trigger-skipped `forward_identity` instance forwards no identity, but
     /// still removes every client-supplied [`FORWARDED_IDENTITY_HEADER`] copy,
     /// so a trigger can never turn a client-chosen value into the gateway's
-    /// assertion. The one copy kept is the canonical name, and only when an
-    /// admitted sibling instance's own `before_proxy` installed it for this
-    /// request (a typed provenance marker). A value that merely equals the
-    /// request's peer identity is no proof: the peer identity can be
-    /// pre-stamped by the accept path, and a client can send the same string.
+    /// assertion. The only copy kept is the exact `(name, value)` pair an
+    /// admitted sibling instance's own `before_proxy` installed for this
+    /// request (typed provenance). A value that merely equals the request's
+    /// peer identity is no proof: the peer identity can be pre-stamped by the
+    /// accept path, and a client can send the same string.
     fn sanitize_owned_request_headers(
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) {
-        use crate::proxy::headers::field_names_equivalent_for_backends;
-
         if !self.forward_identity {
             return;
         }
-        let installed = ctx
-            .plugin_state()
-            .is_some_and(|state| state.peer_spiffe_identity_forwarded);
-        headers.retain(|name, _| {
-            let owned = field_names_equivalent_for_backends(name, FORWARDED_IDENTITY_HEADER);
-            !owned || (installed && name == FORWARDED_IDENTITY_HEADER)
-        });
+        let owned = [FORWARDED_IDENTITY_HEADER.to_string()];
+        crate::plugins::strip_uninstalled_request_assertions(ctx, headers, &owned);
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {

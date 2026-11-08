@@ -7279,6 +7279,11 @@ async fn run_finalized_request_egress_hooks_inner(
 /// where the bitset is already in scope; the internal scan keeps the rarely
 /// reached call sites correct without threading the capability set to them.
 ///
+/// After the plugin hooks, the gateway-assertion boundary
+/// ([`enforce_route_owned_request_assertions`]) runs over the same map for a
+/// route that owns asserted request headers; the plugin cache sets the
+/// capability bit for such a route, so every caller reaches it.
+///
 /// These hooks are the last plugin code that can write the outbound map, so
 /// when any of them ran the gateway-owned `X-Ferrum-Hops` count (issue #6109)
 /// is re-asserted after them: a built-in or custom implementation cannot reset
@@ -7296,6 +7301,7 @@ pub(crate) fn run_final_backend_header_policy_hooks(
             ran = true;
         }
     }
+    enforce_route_owned_request_assertions(ctx, headers);
     if ran {
         headers_mod::canonicalize_request_header_map(headers);
         hop_limit::reassert_outbound_proxy_hops_in_map(
@@ -33625,6 +33631,12 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
             }
         }
     }
+    // A hook in this pass may have relabelled the request as gRPC-Web after
+    // the intake refusal above (a `request_transformer` `content-type` rule, a
+    // correlation or routing header writer): refuse it before any body leaves.
+    if let Some(refusal) = refuse_relabelled_grpc_web_on_assertion_route(ctx, headers) {
+        return refusal;
+    }
     // All transports and deferred passes converge here before rebasing or
     // evaluating the backend path. Provider overrides share the same path
     // contract as mesh rewrites; retain the client path for policy/logging.
@@ -33758,11 +33770,78 @@ fn refuse_untranslated_grpc_web_on_assertion_route(ctx: &RequestContext) -> Opti
     {
         return None;
     }
-    Some(PluginResult::Reject {
+    Some(untranslated_grpc_web_refusal())
+}
+
+/// Refuse, at the end of a `before_proxy` pass, a request on a route owning
+/// gateway-asserted request headers whose outbound `content-type` (any
+/// spelling a backend folds onto it) now names a gRPC-Web media type although
+/// the `grpc_web` translator did not translate THIS request. Only the
+/// translator's own marker (`grpc_web::request_was_translated`, set when it
+/// rewrote the request) counts; a translator merely configured on the route
+/// that declined the request does not.
+fn refuse_relabelled_grpc_web_on_assertion_route(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> Option<PluginResult> {
+    if !ctx.route_owns_request_assertion_headers()
+        || crate::plugins::grpc_web::request_was_translated(ctx)
+        || !outbound_content_type_is_grpc_web(headers)
+    {
+        return None;
+    }
+    Some(untranslated_grpc_web_refusal())
+}
+
+/// Whether any outbound header a backend reads as `content-type` names a
+/// gRPC-Web media type.
+fn outbound_content_type_is_grpc_web(headers: &HashMap<String, String>) -> bool {
+    headers.iter().any(|(name, value)| {
+        headers_mod::field_names_equivalent_for_backends(name, "content-type")
+            && crate::plugins::grpc_web::is_grpc_web_content_type(value)
+    })
+}
+
+fn untranslated_grpc_web_refusal() -> PluginResult {
+    PluginResult::Reject {
         status_code: 415,
         body: UNTRANSLATED_GRPC_WEB_ASSERTION_ROUTE_BODY.to_string(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
-    })
+    }
+}
+
+/// The authoritative gateway-assertion boundary over the finalized outbound
+/// request header map.
+///
+/// Every header a plugin on the matched route owns as a gateway assertion
+/// (`Plugin::owned_request_assertion_header_names`: `claim_headers` /
+/// `output_claim_headers` destinations, OPA decision headers,
+/// `x-ferrum-peer-spiffe-id`) survives only as the exact `(name, value)` pair
+/// an admitted owning instance installed for this request
+/// (`RequestContext::record_installed_request_assertion`); every other copy and
+/// spelling is removed. Runs inside [`run_final_backend_header_policy_hooks`],
+/// so after every `before_proxy` pass, every deferred pass and any
+/// finalized-egress header overlay, on the H1/H2 and H3 ladders alike, and
+/// whatever any trigger decided: no later writer (a `request_transformer`
+/// template, a correlation header, a routing transform, an egress overlay) can
+/// restore a client value under an owned name. A gRPC-Web `content-type` the
+/// `grpc_web` translator did not set for this request is removed too, which
+/// covers an egress overlay (the `before_proxy` passes refuse such a relabel
+/// with `415` instead).
+pub(crate) fn enforce_route_owned_request_assertions(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let Some(owned) = ctx.route_owned_request_assertion_headers() else {
+        return;
+    };
+    crate::plugins::strip_uninstalled_request_assertions(ctx, headers, owned);
+    if !crate::plugins::grpc_web::request_was_translated(ctx) {
+        headers.retain(|name, value| {
+            !(headers_mod::field_names_equivalent_for_backends(name, "content-type")
+                && crate::plugins::grpc_web::is_grpc_web_content_type(value))
+        });
+    }
 }
 
 /// Fixed refusal body for [`refuse_untranslated_grpc_web_on_assertion_route`].
@@ -36935,7 +37014,7 @@ async fn handle_proxy_request_inner(
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     ctx.set_request_trailer_strip_headers(
         plugin_cache_view.request_trailer_strip_headers(),
-        plugin_cache_view.owns_request_assertion_headers(),
+        plugin_cache_view.owned_request_assertion_headers(),
     );
     // Bind this request to the same cache generation's static response-side
     // presentation policy that the plugin list above will execute, so a plugin

@@ -394,6 +394,9 @@ pub fn apply_claim_headers_from_context(
             .plugin_state_opt_mut()
             .and_then(|state| state.pending_claim_headers.remove(metadata_key))
         {
+            // Provenance for the final gateway-assertion pass over the
+            // outbound map: only an installed `(name, value)` pair survives it.
+            ctx.record_installed_request_assertion(header_name, &value);
             headers.insert(header_name.to_string(), value);
         }
     }

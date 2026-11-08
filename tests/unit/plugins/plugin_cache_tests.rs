@@ -16379,7 +16379,8 @@ async fn trigger_skipped_sibling_never_erases_an_admitted_instance_verified_clai
                 vec![admitted, skipped],
             ))
             .unwrap_or_else(|error| panic!("{label}: {error}"));
-            let plugins = cache.get_plugins("ferrum", "p1");
+            let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+            let plugins = view.plugins();
             let mut ctx = RequestContext::new(
                 "127.0.0.1".to_string(),
                 "GET".to_string(),
@@ -16387,6 +16388,7 @@ async fn trigger_skipped_sibling_never_erases_an_admitted_instance_verified_clai
             );
             ctx.headers
                 .insert("authorization".to_string(), format!("Bearer {token}"));
+            ferrum_edge::_test_support::apply_request_view_trailer_policy_for_test(&mut ctx, &view);
             for plugin in plugins.iter() {
                 plugin.on_request_received(&mut ctx).await;
             }
@@ -16424,6 +16426,18 @@ async fn trigger_skipped_sibling_never_erases_an_admitted_instance_verified_clai
                 "{label}: the verified claim must survive"
             );
             assert!(!headers.contains_key("X_User_Email"), "{label}");
+
+            // The authoritative final pass keeps the installed pair too.
+            ferrum_edge::_test_support::run_final_backend_header_policy_hooks_for_test(
+                plugins.as_slice(),
+                &ctx,
+                &mut headers,
+            );
+            assert_eq!(
+                headers.get("x-user-email").map(String::as_str),
+                Some("verified@example.test"),
+                "{label}: the final assertion pass keeps an installed claim"
+            );
         }
     }
 }
@@ -16746,5 +16760,159 @@ fn content_type_relabel_to_grpc_web_is_refused_on_untranslated_assertion_chains(
         if let Some(error) = error {
             assert!(error.contains("`content-type`"), "{label}: {error}");
         }
+    }
+}
+
+/// The final gateway-assertion pass is authoritative over the outbound map:
+/// a later writer that restores a client value under an owned destination (a
+/// `correlation_id` preserving the client's `x-user-role` after the
+/// trigger-skipped owner sanitized it, or a template re-inserting a client
+/// value) loses it, whatever the owner's trigger decided.
+#[tokio::test]
+async fn final_assertion_pass_strips_an_owned_header_a_later_writer_restored() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        run_final_backend_header_policy_hooks_for_test,
+    };
+
+    let mut auth_config = minimal_plugin_config("jwks_auth");
+    auth_config["providers"][0]["claim_headers"] = json!({"role": "X-User-Role"});
+    let mut auth = make_plugin_config_with_json(
+        "auth",
+        "jwks_auth",
+        auth_config,
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    auth.trigger = Some(post_only_trigger());
+    let mut correlation = make_plugin_config_with_json(
+        "corr",
+        "correlation_id",
+        json!({"header_name": "x-user-role", "inbound_policy": "preserve"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    correlation.priority_override = Some(1500);
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/", vec!["auth", "corr"])],
+        vec![auth, correlation],
+    ))
+    .unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY),
+        "a route owning asserted headers runs the final pass on every ladder"
+    );
+    let plugins = view.plugins();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/orders".to_string(),
+    );
+    ctx.headers.insert("x-user-role".into(), "admin".into());
+    apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+    for plugin in plugins.iter() {
+        plugin.on_request_received(&mut ctx).await;
+    }
+    let mut headers = ctx.headers.clone();
+    let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        headers.get("x-user-role").map(String::as_str),
+        Some("admin"),
+        "the later correlation writer restored the client value"
+    );
+
+    run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+    assert!(!headers.contains_key("x-user-role"), "{headers:?}");
+
+    // A template-style re-insert under a folded spelling goes the same way.
+    headers.insert("X_User_Role".into(), "admin".into());
+    headers.insert("x-unrelated".into(), "kept".into());
+    run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+    assert!(!headers.contains_key("X_User_Role"), "{headers:?}");
+    assert_eq!(headers.get("x-unrelated").map(String::as_str), Some("kept"));
+}
+
+/// The relabel refusal trusts only the translator's own marker for THIS
+/// request: with `grpc_web` configured but declining a plain request, a
+/// `request_transformer` that sets a gRPC-Web `content-type` is refused with
+/// `415` at the end of the pass. A request the translator actually translated
+/// is admitted.
+#[tokio::test]
+async fn relabel_to_grpc_web_is_refused_unless_this_request_was_translated() {
+    let relabel = transformer_header_rule(
+        "update",
+        "content-type",
+        "value",
+        "application/grpc-web+proto",
+    );
+    for (content_type, expected) in [("application/json", Some(415)), (GRPC_WEB_BINARY, None)] {
+        let plugin_configs = vec![
+            claim_owning_jwks(true),
+            grpc_web_translator(),
+            header_transformer(relabel.clone()),
+        ];
+        let status = before_proxy_funnel_status(plugin_configs, content_type).await;
+        assert_eq!(status, expected, "{content_type}");
+    }
+}
+
+/// Candidate admission reads `owned_request_assertion_header_names()` and
+/// `configured_request_header_writes()`, so every built-in that overrides
+/// either must be fully constructed there (`SECURITY_COMPOSITION_PLUGIN_NAMES`):
+/// otherwise an admin write could persist a composition every later cache
+/// rebuild refuses.
+#[test]
+fn every_owned_assertion_and_header_write_publisher_is_candidate_visible() {
+    let cache_source = include_str!("../../../src/plugin_cache.rs");
+    let full_names_start = cache_source
+        .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
+        .expect("security-composition allowlist must exist");
+    let full_names_end = cache_source[full_names_start..]
+        .find("];")
+        .map(|offset| full_names_start + offset)
+        .expect("security-composition allowlist must terminate");
+    let full_names = &cache_source[full_names_start..full_names_end];
+
+    let plugins_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+    let mut sources = Vec::new();
+    collect_plugin_sources(&plugins_dir, &mut sources);
+    let mut publishers: Vec<String> = Vec::new();
+    for signature in [
+        "fn owned_request_assertion_header_names(&self)",
+        "fn configured_request_header_writes(&self)",
+    ] {
+        for (path, source) in &sources {
+            let mut offset = 0;
+            while let Some(found) = source[offset..].find(signature) {
+                let at = offset + found;
+                offset = at + signature.len();
+                let body = squeezed_fn_body(source, at)
+                    .unwrap_or_else(|| panic!("{}: {signature} body", path.display()));
+                // The `Plugin` trait default publishes nothing.
+                if body == "Vec::new()" {
+                    continue;
+                }
+                let name = reported_plugin_name(&source[..at])
+                    .unwrap_or_else(|| panic!("{}: {signature} owner", path.display()));
+                publishers.push(name);
+            }
+        }
+    }
+    publishers.sort();
+    publishers.dedup();
+    assert!(
+        publishers.iter().any(|name| name == "jwks_auth")
+            && publishers.iter().any(|name| name == "request_transformer"),
+        "the scan must find the known publishers: {publishers:?}"
+    );
+    for name in &publishers {
+        assert!(
+            full_names.contains(&format!("\"{name}\"")),
+            "{name} publishes owned assertions or header writes but candidate admission \
+             cannot see it: add it to SECURITY_COMPOSITION_PLUGIN_NAMES"
+        );
     }
 }

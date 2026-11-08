@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route owns as a gateway assertion, or, on such a route without a `grpc_web`
   translator, could set `content-type` to a gRPC-Web media type; a config or
   mesh slice with such a rule is rejected (the last good one keeps serving).
+  The gateway now enforces these assertions once more over the finalized
+  outbound header map on every protocol path: an owned header reaches the
+  backend only as the exact name and value an admitted owner installed for
+  the request, so a later writer (for example a `correlation_id` preserving a
+  client value under the same name) can no longer restore a client copy, and
+  a request relabelled to a gRPC-Web `content-type` that the `grpc_web`
+  translator did not translate is refused with `415`.
   Untranslated gRPC-Web, whose request
   trailers ride inside the body where only the `grpc_web` translator parses
   them, is now refused with `415` on a route that owns any of these

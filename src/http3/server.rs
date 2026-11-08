@@ -4549,7 +4549,7 @@ async fn handle_h3_request(
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     ctx.set_request_trailer_strip_headers(
         plugin_cache_view.request_trailer_strip_headers(),
-        plugin_cache_view.owns_request_assertion_headers(),
+        plugin_cache_view.owned_request_assertion_headers(),
     );
     // Same cache generation as `plugins` above: replay provenance must describe
     // exactly the response-side rules this request will run.

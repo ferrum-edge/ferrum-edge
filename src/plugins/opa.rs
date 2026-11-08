@@ -811,10 +811,10 @@ impl Opa {
                 .any(|destination| field_names_equivalent_for_backends(destination, name))
         });
         for (name, value) in staged {
-            // Provenance for a trigger-skipped sibling instance that owns the
-            // same name (`sanitize_owned_request_headers`): it keeps this
-            // value and strips every other spelling.
-            ctx.mark_policy_request_header_installed(&name);
+            // Provenance for the final gateway-assertion pass over the
+            // outbound map and for a trigger-skipped sibling owning the same
+            // name: only this exact pair survives them.
+            ctx.record_installed_request_assertion(&name, &value);
             ctx.headers.insert(name, value);
         }
     }
@@ -1169,7 +1169,7 @@ impl Plugin for Opa {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) {
-        crate::plugins::strip_uninstalled_policy_request_headers(
+        crate::plugins::strip_uninstalled_request_assertions(
             ctx,
             headers,
             &self.decision_request_headers,

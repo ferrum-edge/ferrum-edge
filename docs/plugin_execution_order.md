@@ -1642,11 +1642,24 @@ because gating them could only add disclosure or forgery, never remove work:
   Istio semantics instead: they are provider-owned only on a request the
   instance CUSTOM-checked, so a skipped instance does not touch them.
 
-Publication also refuses a configured request-header write that would undo
-either guarantee: a `request_transformer` header rule or `mesh_route_dispatch`
-`request_transform` whose destination is a header another plugin on the route
-owns as a gateway assertion, and, on such a route without a `grpc_web`
-translator, one that could set `content-type` to a gRPC-Web media type.
+The authoritative check runs once more over the finalized outbound header
+map, inside the backend-boundary header policy pass every H1/H2 and H3 ladder
+runs after each `before_proxy` pass and after any finalized-egress header
+overlay: on a route that owns asserted headers, each owned name survives only
+as the exact `(name, value)` pair an admitted owner installed for the request
+(typed per-request provenance), and every other copy or spelling is removed,
+whatever any trigger decided or any later plugin wrote. A request whose
+outbound `content-type` became a gRPC-Web media type during a `before_proxy`
+pass without the `grpc_web` translator having translated that request is
+refused with `415` (a `grpc_web` instance configured on the route but declining
+the request does not count); one set by an egress overlay is removed.
+
+Publication also refuses, as defence in depth, a configured request-header
+write that would undo either guarantee: a `request_transformer` header rule or
+`mesh_route_dispatch` `request_transform` whose destination is a header another
+plugin on the route owns as a gateway assertion, and, on such a route without a
+`grpc_web` translator, one that could set `content-type` to a gRPC-Web media
+type.
   Without it a client that misses the trigger could forward a forged value the
   backend reads as a gateway assertion. Sanitization is claimed per
   destination per request, so a trigger-admitted sibling instance that shares
