@@ -333,7 +333,8 @@ fn dr_connection_pool_http_http2_max_requests() {
 
 /// `trafficPolicy.connectionPool.http.maxConcurrentStreams` — issue #3775.
 /// Istio's per-HTTP/2-connection stream control, and the only field that
-/// programs the direct-H2 / native-gRPC hyper builder.
+/// programs the shared hyper H2 builder (direct H2, native gRPC pooled and
+/// nested-HBONE, Sidecar mesh mTLS).
 #[test]
 fn dr_connection_pool_http_max_concurrent_streams() {
     register_feature!(
@@ -498,7 +499,7 @@ fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_supported() {
         category = CATEGORY,
         feature = "subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}",
         status = Status::Supported,
-        notes = "Projected into ResolvedSubsetTrafficPolicy and overlaid onto the selected proxy's inherited dispatch fallback with field-level precedence portLevelSettings > selected subset > top-level. idleTimeout → pool_idle_timeout_seconds (reqwest rcfg). http2MaxRequests → the destination-wide active-request breaker (issue #3775), whose admission lane key carries the selected subset so sibling subsets keep independent budgets; the separate maxConcurrentStreams field is what programs the direct-H2/native-gRPC builders and those pools' keys. Pool keys also carry upstream_subset so same-endpoint sibling subsets stay isolated.",
+        notes = "Projected into ResolvedSubsetTrafficPolicy and overlaid onto the selected proxy's inherited dispatch fallback with field-level precedence portLevelSettings > selected subset > top-level. idleTimeout → pool_idle_timeout_seconds (reqwest rcfg). http2MaxRequests → the destination-wide active-request breaker (issue #3775), whose admission lane key carries the selected subset so sibling subsets keep independent budgets; the separate maxConcurrentStreams field is what programs the hyper H2 builders (direct H2, native gRPC pooled and nested-HBONE, Sidecar mesh mTLS) and those pools' keys. Pool keys also carry upstream_subset so same-endpoint sibling subsets stay isolated.",
     );
     let result = translate_k8s_objects(
         &[destination_rule(json!({

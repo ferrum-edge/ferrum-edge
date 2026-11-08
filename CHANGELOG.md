@@ -22,9 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Sidecar mesh-mTLS connections and the nested HTTP/2 connection a native
     gRPC call opens inside an HBONE tunnel now seed hyper's initial outbound
     stream bound from the DestinationRule `connectionPool.http.maxConcurrentStreams`
-    cap (or the global pool cap). A new connection no longer opens up to 100
-    streams before the peer's SETTINGS frame arrives; the peer's advertised
-    limit still replaces the cap once it does.
+    cap, or the global pool cap (`FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS`,
+    1000 by default), instead of hyper's fixed pre-SETTINGS default of 100,
+    as the direct-H2 and gRPC pools already did. A DestinationRule cap below
+    100 now holds from the first stream; with the default, a new connection
+    may open up to 1000 streams before the peer's SETTINGS frame arrives. The
+    peer's advertised limit replaces the cap once it does.
   - The nested-HBONE gRPC connection now applies the pool HTTP/2 PING
     keepalive (`FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` /
     `_TIMEOUT_SECONDS`, only while an RPC is in flight) and the 4096

@@ -323,9 +323,12 @@ pub fn remaining_connect_timeout(
 /// constructs: direct H2 (`http2_pool`), gRPC (`grpc_proxy`), mesh mTLS
 /// (`mesh_mtls_pool`) and the nested-HBONE gRPC dial.
 ///
-/// Every site gets the same wire settings (issue #7071), so a pool key built
-/// from the same `PoolConfig` (`write_pool_config_key`, the direct-H2/gRPC
-/// keys) describes exactly what was dialed:
+/// Every site gets the same wire settings (issue #7071). The mesh-mTLS and
+/// nested-HBONE keys (`hbone_pool::write_pool_config_key`) carry every
+/// `PoolConfig` field below, so their key and wire settings agree. The
+/// direct-H2/gRPC keys carry the effective stream cap but not the keepalive,
+/// window or frame-size knobs (a documented first-materializer tradeoff).
+/// The builder applies:
 ///
 /// - the Tokio timer, which drives keepalive PINGs and hyper's H2 timeouts;
 /// - when `enable_http2` is set, `http2_keep_alive_interval_seconds` /
