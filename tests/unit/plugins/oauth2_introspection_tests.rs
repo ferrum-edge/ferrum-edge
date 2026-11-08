@@ -2120,8 +2120,9 @@ fn oauth2_private_key_jwt_rejects_a_key_the_selected_algorithm_cannot_sign_with(
 /// Introspection type-checks every `client_auth` field: a non-string (numeric
 /// or `null`) `private_key_jwt_alg` / `private_key_jwt_kid` is refused with a
 /// field-specific error, while omitting either selects the default (`RS256`,
-/// no `kid`). `oidc_relying_party` intentionally differs today (it defaults
-/// non-string values); this pins that only the algorithm TABLE is shared.
+/// no `kid`). `oidc_relying_party` refuses the same non-string values but
+/// admits `null` as the default, as its own schema allows (issue #7069); only
+/// the algorithm TABLE is shared.
 #[test]
 fn oauth2_private_key_jwt_rejects_non_string_alg_and_kid() {
     const RSA_PEM: &str = include_str!("../../fixtures/test_rsa_private.pem");

@@ -1348,6 +1348,109 @@ async fn get_with_matching_if_none_match_returns_304() {
     );
 }
 
+/// Every admin response carries `X-Content-Type-Options: nosniff`,
+/// `Cache-Control: no-store` and `X-Frame-Options: DENY` (issue #7074).
+fn assert_admin_security_headers(label: &str, headers: &reqwest::header::HeaderMap) {
+    for (name, expected) in [
+        ("x-content-type-options", "nosniff"),
+        ("cache-control", "no-store"),
+        ("x-frame-options", "DENY"),
+    ] {
+        let values: Vec<&str> = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert_eq!(values, vec![expected], "{label}: {name}");
+    }
+}
+
+/// The raw API-spec GET (200 and 304) and DELETE (204) used to be built by
+/// hand and omitted `X-Frame-Options` (and `nosniff` on 304/204). Pin all
+/// three security headers on each, exactly once (issue #7074).
+#[tokio::test]
+async fn api_spec_get_304_and_delete_carry_admin_security_headers() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED);
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+    let path = format!("/api-specs/{spec_id}");
+
+    let (status, _, headers) = client.get_raw(&path, None, None).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_admin_security_headers("raw spec GET 200", &headers);
+    let etag = headers
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("ETag header must be present")
+        .to_string();
+
+    let (status, _, headers) = client.get_raw(&path, None, Some(&etag)).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_MODIFIED);
+    assert_admin_security_headers("raw spec GET 304", &headers);
+
+    let resp = client
+        .client
+        .delete(client.url(&path))
+        .header("authorization", format!("Bearer {}", client.token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_admin_security_headers("spec DELETE 204", resp.headers());
+}
+
+/// Characterization of the admin security-header policy on responses outside
+/// the JSON helpers (issue #7074): the policy is uniform, so the `/metrics`
+/// `401`, Prometheus text, `/charges/sink/status`, the unauthenticated `/live`
+/// probe and an unknown-route `404` all carry the three headers exactly once.
+#[tokio::test]
+async fn admin_security_headers_cover_metrics_charges_and_unrouted_responses() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let cases: [(&str, &str, bool, reqwest::StatusCode); 5] = [
+        (
+            "metrics 401",
+            "/metrics",
+            false,
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        ("metrics 200", "/metrics", true, reqwest::StatusCode::OK),
+        (
+            "charges sink status",
+            "/charges/sink/status",
+            true,
+            reqwest::StatusCode::OK,
+        ),
+        ("live", "/live", false, reqwest::StatusCode::OK),
+        (
+            "unknown route",
+            "/no-such-admin-route",
+            true,
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (label, path, authenticated, expected_status) in cases {
+        let mut request = client.client.get(client.url(path));
+        if authenticated {
+            request = request.header("authorization", format!("Bearer {}", client.token));
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), expected_status, "{label}");
+        assert_admin_security_headers(label, resp.headers());
+    }
+}
+
 // ============================================================================
 // GET /api-specs/by-proxy/{proxy_id}
 // ============================================================================

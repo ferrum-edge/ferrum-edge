@@ -28,6 +28,16 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `oidc_relying_party`: non-string `private_key_jwt_alg` / `private_key_jwt_kid` are refused (#7069)
+
+`providers[].client_auth.private_key_jwt_alg` and `private_key_jwt_kid` must be
+a string, `null`, or absent, for every `client_auth.method`, as the OpenAPI
+schema already required. A number, boolean, array or object used to fall back
+silently to `RS256` / no `kid`; it now fails config load with
+``oidc_relying_party: `client_auth.<field>` must be a string``. Replace such a
+value with the intended string (for example `"ES384"` instead of `["ES384"]`)
+or remove it before upgrading.
+
 ### Repeated `Content-Type` and gateway-asserted request headers (#7064)
 
 - **Repeated or list-valued `Content-Type` is refused.** `Content-Type` is a

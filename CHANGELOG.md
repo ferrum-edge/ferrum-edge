@@ -41,6 +41,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **Admin API responses always carry the admin security headers** (issue
+  #7074). `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+  `X-Frame-Options: DENY` were set by hand per response, and the raw API-spec
+  `GET` (`200`/`304`), API-spec `DELETE` (`204`), Prometheus `/metrics` and its
+  `401`, `/charges`, `/charges/sink/status` and the builder-failure `500`
+  omitted some of them. One shared helper now sets them, and the admin
+  dispatcher fills any a response still lacks. The raw API-spec `GET`'s
+  builder-failure fallback is now the shared JSON `500` instead of a bare `500`
+  with no `Content-Type`.
+- **BREAKING — `oidc_relying_party` refuses a non-string
+  `client_auth.private_key_jwt_alg` / `client_auth.private_key_jwt_kid`**
+  (issue #7069). The constructor read both with a lenient string accessor, so a
+  number, boolean, array, or object silently became `RS256` / no `kid`: a typo
+  such as `["ES384"]` signed client assertions with an algorithm the provider
+  was never registered for, and `42` dropped the `kid` header that
+  kid-selecting providers need. Both now fail config load with
+  ``oidc_relying_party: `client_auth.<field>` must be a string``, whatever the
+  `method`, matching the OpenAPI schema (`string | null`). Absent or `null`
+  still selects the defaults. **Operator action:** replace any non-string value
+  with the intended string, or remove it.
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while
