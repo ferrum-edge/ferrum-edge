@@ -4660,6 +4660,11 @@ jobs:
             --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
             --set-string 'controlPlane.admin.allowedCidrs=127.0.0.1/32' \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe-ok.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string 'controlPlane.admin.allowedCidrs=::/80' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe-ipv6-rule.yaml"
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set ambient.enabled=true \
@@ -5295,6 +5300,12 @@ jobs:
             exit 1
           fi
           grep -F 'dial admin host ::ffff:127.0.0.2 from source 127.0.0.1' "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-loopback-wrong-source.err"
+          # The mapped bind's IPv6 socket sees the probe as ::ffff:127.0.0.1, which
+          # the runtime also matches against ordinary IPv6 rules such as ::/80.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set-string admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string admin.allowedCidrs=::/80 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-loopback-ipv6-rule.yaml"
           # A bare mapped entry is one IPv4 host (/32), never a family-wide
           # allowlist, so it still protects a plaintext non-loopback admin bind.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \

@@ -969,7 +969,13 @@ Validation: fail render on missing/unsafe configuration.
 {{- $probeHost := include "ferrum-gateway.probeHost" . -}}
 {{- $probeSource := include "ferrum-gateway.probeSource" . -}}
 {{- $probeIsV6 := contains ":" $probeSource -}}
-{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probeSource "allowedCidrs" $adminAllowedCidrs) -}}
+{{- /* A mapped bind is served by an IPv6 socket, so the listener sees the probe
+     as the mapped peer (`::ffff:127.0.0.1`) and the runtime matches it against
+     IPv4 rules and ordinary IPv6 rules alike. Check that form; the dotted
+     source stays the diagnostic. */ -}}
+{{- $probePeer := $probeSource -}}
+{{- if include "ferrum-gateway.ipv4MappedToInt" $probeHost -}}{{- $probePeer = printf "::ffff:%s" $probeSource -}}{{- end -}}
+{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probePeer "allowedCidrs" $adminAllowedCidrs) -}}
 {{- if not $hasProbeSource -}}
 {{- $probeCidr := ternary (printf "%s/128" $probeSource) (printf "%s/32" $probeSource) $probeIsV6 -}}
 {{- fail (printf "admin.allowedCidrs must include %s (or bare %s) while the default exec probes are enabled; the computed exec probes dial admin host %s from source %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR) or override/disable every computed probe handler." $probeCidr $probeSource $probeHost $probeSource) -}}

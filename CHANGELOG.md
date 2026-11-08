@@ -48,7 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `::ffff:127.0.0.2/128` and refused `127.0.0.1/32`, but the runtime observes
   the probes from `127.0.0.1` and canonicalizes that mapped CIDR to
   `127.0.0.2/32`, so a release that rendered cleanly dropped its own probes and
-  restart-looped. The probe source is now canonicalized to IPv4 first. A bare
+  restart-looped. The probe source is now canonicalized to IPv4 first, and
+  the allowlist check uses the mapped peer the IPv6 listener actually sees
+  (`::ffff:127.0.0.1`), so an ordinary IPv6 rule that covers it (for example
+  `::/80`) still admits the probes in both charts. A bare
   mapped allowlist entry (`::ffff:a.b.c.d` with no prefix) is now a `/32` in the
   permits-all check instead of a negative prefix that only happened to work. A
   new unit test fails when a helper shared by both charts' `_helpers.tpl`
