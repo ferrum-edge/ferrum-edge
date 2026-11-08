@@ -2766,8 +2766,8 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `providers[].client_auth.method` | String | `client_secret_basic` (default), `client_secret_post`, `private_key_jwt`, or `none` |
 | `providers[].client_auth.client_secret` | String | Required for `client_secret_basic` and `client_secret_post` |
 | `providers[].client_auth.private_key_pem` | String | Required for `private_key_jwt`; must support the selected algorithm |
-| `providers[].client_auth.private_key_jwt_alg` | String | `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
-| `providers[].client_auth.private_key_jwt_kid` | String (optional) | `kid` header placed on the signed client assertion |
+| `providers[].client_auth.private_key_jwt_alg` | String | `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA`. Absent or `null` selects `RS256`; any other non-string value is rejected at config load |
+| `providers[].client_auth.private_key_jwt_kid` | String (optional) | `kid` header placed on the signed client assertion. Absent or `null` sends no `kid`; any other non-string value is rejected at config load |
 | `providers[].redirect_uri` | String | Absolute callback URI registered with the provider, with no fragment; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
 | `providers[].callback_path` | String | Callback path Ferrum handles (default: `/oauth/callback`); must equal the path in `redirect_uri` and be a canonical request path (no percent-escapes, empty or dot segments, or backslashes) |
 | `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`); must not resolve to the same path as `callback_path` and must be canonical. `GET`/`HEAD` require `Sec-Fetch-Site: same-origin` or `none`; a `POST` is refused only when the browser reports `cross-site` or `same-site`; other methods answer `405` |
