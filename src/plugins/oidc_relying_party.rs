@@ -45,6 +45,7 @@ use super::utils::oauth_client_auth::{self, PrivateKeyDecodeError};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::session_cookie::reject_published_session_secret;
+use super::utils::socket_host::is_loopback_ip_literal_host;
 use super::{PluginResult, RequestContext};
 
 const CLAIM_HEADER_METADATA_PREFIX: &str = "oidc_rp.claim_header.";
@@ -984,6 +985,7 @@ impl OidcRelyingParty {
         let issuer = validate_url_string(
             &required_string(provider_obj, "issuer", "provider[0]")?,
             "provider[0].issuer",
+            UrlAudience::Identifier,
         )?;
         let discovery_url = optional_string(provider_obj, "discovery_url", "provider[0]")?;
         let authorization_endpoint =
@@ -1010,22 +1012,38 @@ impl OidcRelyingParty {
             );
         }
         let discovery_url = discovery_url
-            .map(|url| validate_url_string(&url, "provider[0].discovery_url"))
+            .map(|url| validate_url_string(&url, "provider[0].discovery_url", UrlAudience::Gateway))
             .transpose()?;
         let authorization_endpoint = authorization_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].authorization_endpoint"))
+            .map(|url| {
+                validate_url_string(
+                    &url,
+                    "provider[0].authorization_endpoint",
+                    UrlAudience::Browser,
+                )
+            })
             .transpose()?;
         let token_endpoint = token_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].token_endpoint"))
+            .map(|url| {
+                validate_url_string(&url, "provider[0].token_endpoint", UrlAudience::Gateway)
+            })
             .transpose()?;
         let userinfo_endpoint = userinfo_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].userinfo_endpoint"))
+            .map(|url| {
+                validate_url_string(&url, "provider[0].userinfo_endpoint", UrlAudience::Gateway)
+            })
             .transpose()?;
         let jwks_uri = jwks_uri
-            .map(|url| validate_url_string(&url, "provider[0].jwks_uri"))
+            .map(|url| validate_url_string(&url, "provider[0].jwks_uri", UrlAudience::Gateway))
             .transpose()?;
         let end_session_endpoint = end_session_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].end_session_endpoint"))
+            .map(|url| {
+                validate_url_string(
+                    &url,
+                    "provider[0].end_session_endpoint",
+                    UrlAudience::Browser,
+                )
+            })
             .transpose()?;
 
         let client_id = required_string(provider_obj, "client_id", "provider[0]")?;
@@ -1362,7 +1380,13 @@ impl OidcRelyingParty {
         // rejected plugin configs have no background side effects.
         let post_logout_redirect_uri =
             optional_string(provider_obj, "post_logout_redirect_uri", "provider[0]")?
-                .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
+                .map(|url| {
+                    validate_url_string(
+                        &url,
+                        "provider[0].post_logout_redirect_uri",
+                        UrlAudience::Browser,
+                    )
+                })
                 .transpose()?;
         let initial_jwks_store = if start_background_tasks {
             jwks_uri
@@ -1379,6 +1403,7 @@ impl OidcRelyingParty {
         let jwks_publication_gate = Arc::new(Mutex::new(()));
         let explicit_userinfo_endpoint = userinfo_endpoint.clone();
         let explicit_end_session_endpoint = end_session_endpoint.clone();
+        let none_auth_requires_loopback_endpoints = matches!(client_auth, OidcClientAuth::None);
         let discovery_task = if start_background_tasks {
             discovery_url.clone().map(|url| {
                 spawn_oidc_discovery(
@@ -1393,6 +1418,7 @@ impl OidcRelyingParty {
                     issuer.clone(),
                     explicit_userinfo_endpoint,
                     explicit_end_session_endpoint,
+                    none_auth_requires_loopback_endpoints,
                 )
             })
         } else {
@@ -2985,6 +3011,25 @@ impl OidcRelyingParty {
         ))
     }
 
+    /// Whether the discovery task published a document within `wait`, without
+    /// consuming the plugin. A refused document is retried with backoff, so
+    /// the task itself never ends on refusal.
+    // Reached only through the lib target's `_test_support` shim by external
+    // unit tests; the bin target recompiles this module without that caller.
+    #[allow(dead_code)]
+    pub(crate) async fn discovery_published_within_for_tests(&self, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if self.provider.discovery.load().as_ref().is_some() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     // Reached only through the lib target's `_test_support` shim by external
     // unit tests; the bin target recompiles this module without that caller.
     #[allow(dead_code)]
@@ -3899,10 +3944,10 @@ fn parse_client_auth(
                 Url::parse(url)
                     .ok()
                     .and_then(|parsed| parsed.host_str().map(ToOwned::to_owned))
-                    .is_none_or(|host| !is_local_auth_host(&host))
+                    .is_none_or(|host| !is_loopback_ip_literal_host(&host))
             }) {
                 return Err(
-                    "oidc_relying_party: `client_auth.method`=`none` is only allowed for localhost or loopback token endpoints"
+                    "oidc_relying_party: `client_auth.method`=`none` is only allowed for loopback IP-literal token endpoints"
                         .to_string(),
                 );
             }
@@ -4377,15 +4422,40 @@ fn correlation_cookie_host_from_request(ctx: &RequestContext) -> Option<Correlat
     Some(CorrelationCookieHost::Domain(host.to_ascii_lowercase()))
 }
 
-fn validate_url_string(raw: &str, field: &str) -> Result<String, String> {
+/// Who dereferences a configured provider URL, which decides whether the name
+/// `localhost` may stand in for a loopback address on plain `http://`.
+#[derive(Clone, Copy)]
+enum UrlAudience {
+    /// The gateway itself dials it (discovery, token, UserInfo, JWKS): client
+    /// credentials, tokens, and signing keys cross it, so plain `http://` is
+    /// admitted only for a loopback IP literal. DNS overrides and the resolver
+    /// decide where a name connects (the #6659 rule).
+    Gateway,
+    /// Only the user agent follows it (authorization, end-session, and
+    /// post-logout redirects); the gateway never resolves it.
+    Browser,
+    /// A compared identifier (`issuer`), never dereferenced.
+    Identifier,
+}
+
+fn validate_url_string(raw: &str, field: &str, audience: UrlAudience) -> Result<String, String> {
     let parsed =
         Url::parse(raw).map_err(|e| format!("oidc_relying_party: `{field}` invalid: {e}"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("oidc_relying_party: `{field}` must include a hostname"))?;
+    let local_http = match audience {
+        UrlAudience::Gateway => is_loopback_ip_literal_host(host),
+        UrlAudience::Browser | UrlAudience::Identifier => is_local_auth_host(host),
+    };
     match parsed.scheme() {
         "https" => {}
-        "http" if is_local_auth_host(host) => {}
+        "http" if local_http => {}
+        "http" if matches!(audience, UrlAudience::Gateway) => {
+            return Err(format!(
+                "oidc_relying_party: `{field}` must use https except for a loopback IP literal"
+            ));
+        }
         "http" => {
             return Err(format!(
                 "oidc_relying_party: `{field}` must use https except for literal loopback or localhost"
@@ -4428,7 +4498,7 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
     }
     match parsed.scheme() {
         "https" => Ok(raw.trim().to_string()),
-        "http" if is_local_auth_host(endpoint_host) => {
+        "http" if is_loopback_ip_literal_host(endpoint_host) => {
             let discovery_host = discovery.host_str().ok_or_else(|| {
                 "oidc_relying_party: discovery_url must include a hostname".to_string()
             })?;
@@ -4443,7 +4513,7 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
             Ok(raw.trim().to_string())
         }
         "http" => Err(format!(
-            "oidc_relying_party: discovery {field} must use https except for literal loopback or localhost"
+            "oidc_relying_party: discovery {field} must use https except for a loopback IP literal"
         )),
         scheme => Err(format!(
             "oidc_relying_party: discovery {field} must use http or https, got {scheme:?}"
@@ -4521,6 +4591,9 @@ fn parse_authorization_params(
     Ok(params)
 }
 
+/// Browser-facing redirect URLs additionally accept `localhost`: the user
+/// agent, not the gateway, resolves them, and browsers treat `localhost` as a
+/// potentially trustworthy origin.
 fn is_local_auth_host(hostname: &str) -> bool {
     let literal = hostname
         .strip_prefix('[')
@@ -5145,6 +5218,7 @@ fn spawn_oidc_discovery(
     expected_issuer: String,
     explicit_userinfo_endpoint: Option<String>,
     explicit_end_session_endpoint: Option<String>,
+    none_auth_requires_loopback_endpoints: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
@@ -5165,6 +5239,7 @@ fn spawn_oidc_discovery(
                 &expected_issuer,
                 explicit_userinfo_endpoint.is_some(),
                 explicit_end_session_endpoint.is_some(),
+                none_auth_requires_loopback_endpoints,
             )
             .await
             {
@@ -5236,12 +5311,17 @@ fn spawn_oidc_discovery(
 /// copy-paste error pairing one tenant's issuer with another tenant's
 /// discovery URL sent users — and the client credential — to the wrong
 /// tenant's endpoints before ID-token validation failed (MUSE-3).
+/// `none_auth_requires_loopback_endpoints` carries `client_auth.method: none`: an
+/// unauthenticated token exchange is admitted only against a loopback
+/// IP-literal token endpoint, and a discovered one must satisfy the same rule
+/// as a configured one (construction can only check the discovery URL).
 async fn fetch_discovery(
     http_client: &PluginHttpClient,
     discovery_url: &str,
     expected_issuer: &str,
     userinfo_overridden: bool,
     end_session_overridden: bool,
+    none_auth_requires_loopback_endpoints: bool,
 ) -> Result<DiscoveryDoc, String> {
     let client = http_client
         .get()
@@ -5277,6 +5357,17 @@ async fn fetch_discovery(
         .and_then(Value::as_str)
         .ok_or_else(|| "missing token_endpoint".to_string())
         .and_then(|url| validate_discovered_url(discovery_url, url, "token_endpoint"))?;
+    if none_auth_requires_loopback_endpoints
+        && !Url::parse(&token_endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(is_loopback_ip_literal_host))
+            .unwrap_or(false)
+    {
+        return Err(
+            "discovered token_endpoint must be a loopback IP literal when client_auth.method is none"
+                .to_string(),
+        );
+    }
     let userinfo_endpoint = if userinfo_overridden {
         None
     } else {
@@ -5298,11 +5389,30 @@ async fn fetch_discovery(
             .map(|url| validate_discovered_url(discovery_url, url, "end_session_endpoint"))
             .transpose()?
     };
-    let revocation_endpoint = body
+    let mut revocation_endpoint = body
         .get("revocation_endpoint")
         .and_then(Value::as_str)
         .map(|url| validate_discovered_url(discovery_url, url, "revocation_endpoint"))
         .transpose()?;
+    // Logout revocation POSTs the session refresh token through the same
+    // unauthenticated `none` exchange, so it obeys the token endpoint's rule.
+    // Revocation is optional and best-effort, so a named endpoint is dropped
+    // (logout then skips revocation) rather than refusing the whole document,
+    // which would take login offline too.
+    if none_auth_requires_loopback_endpoints
+        && revocation_endpoint.as_deref().is_some_and(|endpoint| {
+            !Url::parse(endpoint)
+                .ok()
+                .and_then(|url| url.host_str().map(is_loopback_ip_literal_host))
+                .unwrap_or(false)
+        })
+    {
+        warn!(
+            plugin = "oidc_relying_party",
+            "Ignoring a discovered revocation_endpoint that is not a loopback IP literal under client_auth.method none; logout will not revoke refresh tokens"
+        );
+        revocation_endpoint = None;
+    }
     Ok(DiscoveryDoc {
         authorization_endpoint,
         token_endpoint,
@@ -5351,7 +5461,9 @@ pub(crate) mod discovery_test_seams {
     }
 
     /// Fetch a live discovery document and apply operator-supplied endpoint
-    /// overrides, mirroring the resolution `spawn_oidc_discovery` performs.
+    /// overrides, mirroring the resolution `spawn_oidc_discovery` performs for
+    /// a credentialed client (no `client_auth.method: none` token-endpoint
+    /// rule; that wiring is pinned through `discovery_published_within_for_tests`).
     pub(crate) async fn resolve_discovery_for_test(
         http_client: &PluginHttpClient,
         discovery_url: &str,
@@ -5365,6 +5477,7 @@ pub(crate) mod discovery_test_seams {
             expected_issuer,
             explicit_userinfo_endpoint.is_some(),
             explicit_end_session_endpoint.is_some(),
+            false,
         )
         .await?;
         let doc = apply_discovery_endpoint_overrides(
@@ -5662,6 +5775,25 @@ mod tests {
         ] {
             assert!(validate_discovered_url(discovery, endpoint, "token_endpoint").is_err());
         }
+        // A discovered plaintext endpoint must share the loopback IP-literal
+        // discovery origin, so even a browser-followed one can never name
+        // `localhost`; HTTPS browser endpoints stay unrestricted.
+        assert!(
+            validate_discovered_url(
+                discovery,
+                "http://localhost:8080/authorize",
+                "authorization_endpoint"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_discovered_url(
+                discovery,
+                "https://localhost:8443/authorize",
+                "authorization_endpoint"
+            )
+            .is_ok()
+        );
         // An HTTPS discovery document cannot downgrade to a loopback HTTP
         // endpoint either.
         assert!(
@@ -5674,23 +5806,143 @@ mod tests {
         );
     }
 
+    /// `client_auth.method: none` admits an unauthenticated token exchange
+    /// only against a loopback IP-literal token endpoint. Construction can
+    /// only check the discovery URL, so a discovered token endpoint must meet
+    /// the same rule before the document is published.
+    #[tokio::test]
+    async fn discovered_token_endpoint_honors_none_client_auth_loopback_rule() {
+        async fn serve(token_endpoint: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "issuer": server.uri(),
+                    "authorization_endpoint": format!("{}/authorize", server.uri()),
+                    "token_endpoint": token_endpoint.replace("{origin}", &server.uri()),
+                    "jwks_uri": format!("{}/jwks", server.uri()),
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+        let fetch = |server: &MockServer, none: bool| {
+            let discovery_url = format!("{}/.well-known/openid-configuration", server.uri());
+            let issuer = server.uri();
+            async move {
+                fetch_discovery(
+                    &PluginHttpClient::default(),
+                    &discovery_url,
+                    &issuer,
+                    false,
+                    false,
+                    none,
+                )
+                .await
+            }
+        };
+
+        let named = serve("https://localhost:8443/token").await;
+        let error = fetch(&named, true)
+            .await
+            .err()
+            .expect("none must refuse a named discovered token endpoint");
+        assert!(error.contains("loopback IP literal"), "{error}");
+        assert!(
+            fetch(&named, false).await.is_ok(),
+            "a credentialed provider keeps cross-origin HTTPS discovery"
+        );
+
+        let literal = serve("{origin}/token").await;
+        assert!(fetch(&literal, true).await.is_ok());
+
+        // Logout revocation carries the refresh token through the same
+        // unauthenticated exchange. Under `none` a named revocation endpoint is
+        // dropped (revocation is best-effort) while the document still
+        // publishes; a credentialed provider keeps it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": server.uri(),
+                "authorization_endpoint": format!("{}/authorize", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "revocation_endpoint": "https://revoke.example.com/revoke",
+                "jwks_uri": format!("{}/jwks", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        let Ok(doc) = fetch(&server, true).await else {
+            panic!("a named revocation endpoint must not refuse the document");
+        };
+        assert!(doc.revocation_endpoint.is_none());
+        let Ok(doc) = fetch(&server, false).await else {
+            panic!("a credentialed provider keeps cross-origin HTTPS revocation");
+        };
+        assert_eq!(
+            doc.revocation_endpoint.as_deref(),
+            Some("https://revoke.example.com/revoke")
+        );
+
+        // A loopback IP-literal revocation endpoint on the discovery origin
+        // stays admitted under `none`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": server.uri(),
+                "authorization_endpoint": format!("{}/authorize", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "revocation_endpoint": format!("{}/revoke", server.uri()),
+                "jwks_uri": format!("{}/jwks", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        let Ok(doc) = fetch(&server, true).await else {
+            panic!("a loopback IP-literal revocation endpoint is admitted under none");
+        };
+        assert_eq!(
+            doc.revocation_endpoint.as_deref(),
+            Some(format!("{}/revoke", server.uri()).as_str())
+        );
+    }
+
     #[test]
-    fn direct_provider_urls_allow_http_only_for_literal_loopback_or_localhost() {
+    fn gateway_urls_allow_http_only_for_loopback_ip_literals_and_browser_urls_keep_localhost() {
         for allowed in [
-            "http://localhost:8080/token",
             "http://127.0.0.1:8080/token",
             "http://[::1]:8080/token",
             "https://idp.example.com/token",
         ] {
-            assert!(validate_url_string(allowed, "token_endpoint").is_ok());
+            assert!(validate_url_string(allowed, "token_endpoint", UrlAudience::Gateway).is_ok());
         }
         for denied in [
+            "http://localhost:8080/token",
+            "http://api.localhost:8080/token",
             "http://idp.example.com/token",
             "http://127.0.0.1.example.com/token",
             "ftp://localhost/token",
         ] {
-            assert!(validate_url_string(denied, "token_endpoint").is_err());
+            assert!(validate_url_string(denied, "token_endpoint", UrlAudience::Gateway).is_err());
         }
+        // Browser-followed redirects keep the `localhost` development case.
+        for allowed in [
+            "http://localhost:8080/authorize",
+            "http://127.0.0.1:8080/authorize",
+        ] {
+            assert!(
+                validate_url_string(allowed, "authorization_endpoint", UrlAudience::Browser)
+                    .is_ok()
+            );
+        }
+        assert!(
+            validate_url_string(
+                "http://idp.example.com/authorize",
+                "authorization_endpoint",
+                UrlAudience::Browser
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -6666,6 +6918,7 @@ mod tests {
                 &PluginHttpClient::default(),
                 &format!("{}/.well-known/openid-configuration", server.uri()),
                 "https://idp.example.com",
+                false,
                 false,
                 false,
             )

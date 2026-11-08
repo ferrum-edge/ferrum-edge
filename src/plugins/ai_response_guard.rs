@@ -46,6 +46,7 @@ use tracing::debug;
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use super::utils::body_transform::is_json_content_type;
+use super::utils::grpc_method::resolve_grpc_method_path;
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
     AnthropicEvent, MAX_OPENAI_STREAM_ACCUMULATORS, SseEventName, SseReassembler, SseTextKind,
@@ -131,6 +132,25 @@ const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 1_048_576;
 /// response may carry. Server-streaming responses above this are uninspectable
 /// rather than silently partially inspected.
 const DEFAULT_GRPC_MAX_MESSAGES: usize = 64;
+
+/// Deployment hard maximum for `grpc.max_message_bytes` (64 MiB), equal to the
+/// `max_scan_bytes` ceiling.
+///
+/// The aggregate decoded-payload budget (`max_scan_bytes`, itself capped at
+/// [`MAX_SCAN_BYTES_CEILING`]) already refuses any response whose decoded bytes
+/// exceed it, so a per-message ceiling above that can never produce an
+/// inspection; it could only authorize a larger declared frame length.
+pub const HARD_MAX_GRPC_MAX_MESSAGE_BYTES: usize = MAX_SCAN_BYTES_CEILING;
+
+/// Deployment hard maximum for `grpc.max_messages` (1024 frames), 16x the
+/// default of 64 — the same bound `ai_transcript_audit` enforces.
+///
+/// The decoded-byte scan budget bounds decoded PAYLOAD, not frame COUNT: a body
+/// of legal zero-length 5-byte frames consumes no decoded-byte budget at all, so
+/// an operator-configured `max_messages` in the millions would let a response
+/// drive an equally large `Vec` of frames and per-frame walk. 1024 frames keeps
+/// real server-streaming inspection practical while bounding that vector.
+pub const HARD_MAX_GRPC_MAX_MESSAGES: usize = 1_024;
 
 /// Recursion depth ceiling for the protobuf message walk.
 const GRPC_MAX_MESSAGE_DEPTH: usize = 32;
@@ -2805,31 +2825,23 @@ impl AiResponseGuard {
 
     // ───────────────────────── native gRPC inspection ─────────────────────────
 
-    /// Resolve the gRPC method path used for enrollment lookup.
+    /// Resolve the canonical gRPC method key used for enrollment lookup.
     ///
-    /// Prefers the finalized `grpc_full_method` published by
-    /// `grpc_method_router` (which reflects a method rewrite applied before
-    /// dispatch), then the backend-effective path the proxy bound at the
-    /// backend-path boundary (`RequestContext::authorized_backend_path`, bound
-    /// for every request on a `grpc`-enrolled instance because it opts into
-    /// `requires_backend_path_resolution`), and only then the request path.
-    /// Without the bound path, a guard-only route with `strip_listen_path` or a
+    /// The backend-effective path the proxy bound at the backend-path boundary
+    /// (`RequestContext::authorized_backend_path`, bound for every request on a
+    /// `grpc`-enrolled instance because it opts into
+    /// `requires_backend_path_resolution`) is authoritative and is never
+    /// outranked by plugin-writable `grpc_full_method` metadata. Without the
+    /// bound path, a guard-only route with `strip_listen_path` or a
     /// `backend_path` would decide enrollment on the client path, which the
     /// backend never receives, and skip an enrolled method entirely. Backends
     /// never echo `:path` in a response, so the request is the only correct
     /// source. A pre-dispatch synthetic reply has no bound path and keeps the
-    /// client path.
+    /// provisional metadata / client path. The key is the trailing
+    /// `/Service/Method`, the same resolution `body_validator` uses
+    /// ([`resolve_grpc_method_path`]).
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
-        match ctx.metadata.get("grpc_full_method") {
-            Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
-            Some(method) => {
-                let mut path = String::with_capacity(method.len() + 1);
-                path.push('/');
-                path.push_str(method);
-                Cow::Owned(path)
-            }
-            None => Cow::Borrowed(ctx.authorized_backend_path().unwrap_or(ctx.path.as_str())),
-        }
+        resolve_grpc_method_path(ctx)
     }
 
     /// Whether a configured gRPC contract governs this request's response.
@@ -3974,8 +3986,20 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
 
     let max_message_bytes = optional_positive_usize(grpc, "max_message_bytes")?
         .unwrap_or(DEFAULT_GRPC_MAX_MESSAGE_BYTES);
+    if max_message_bytes > HARD_MAX_GRPC_MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "ai_response_guard: `grpc.max_message_bytes` must be at most \
+             {HARD_MAX_GRPC_MAX_MESSAGE_BYTES} (deployment hard maximum)"
+        ));
+    }
     let max_messages =
         optional_positive_usize(grpc, "max_messages")?.unwrap_or(DEFAULT_GRPC_MAX_MESSAGES);
+    if max_messages > HARD_MAX_GRPC_MAX_MESSAGES {
+        return Err(format!(
+            "ai_response_guard: `grpc.max_messages` must be at most \
+             {HARD_MAX_GRPC_MAX_MESSAGES} (deployment hard maximum)"
+        ));
+    }
 
     let Some(method_configs) = grpc.get("methods").and_then(Value::as_object) else {
         return Err(
@@ -4320,8 +4344,8 @@ impl Plugin for AiResponseGuard {
 
     /// A `grpc`-enrolled instance joins the backend-path boundary so the proxy
     /// binds the backend-effective path for every request on its route. That
-    /// bound path is this instance's own enrollment witness when no
-    /// `grpc_full_method` was published, so enrollment never depends on a
+    /// bound path is this instance's authoritative enrollment witness, never
+    /// outranked by `grpc_full_method`, so enrollment never depends on a
     /// companion `grpc_method_router` (see [`Self::grpc_method_path`]). The
     /// buffering vote is cast after the bind on every dispatcher.
     fn requires_backend_path_resolution(&self) -> bool {

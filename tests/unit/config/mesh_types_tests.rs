@@ -271,6 +271,35 @@ fn peer_authentication_default_mtls_mode_is_permissive() {
     assert_eq!(pa.mtls_mode, MtlsMode::Permissive);
 }
 
+/// Native/file/xDS PeerAuthentication keeps `permissive` as the default for an
+/// omitted `mtls_mode`, accepts an explicit `unset` (inherit) on the policy and
+/// its port overrides, and round-trips `unset` so a K8s-translated inherit
+/// marker survives the CP -> DP carrier.
+#[test]
+fn peer_authentication_unset_mode_is_explicit_and_round_trips() {
+    let omitted = serde_json::json!({"name": "omitted", "namespace": "default"});
+    let omitted: PeerAuthentication = serde_json::from_value(omitted).unwrap();
+    assert_eq!(omitted.mtls_mode, MtlsMode::Permissive);
+
+    let unset = serde_json::json!({
+        "name": "inherit",
+        "namespace": "default",
+        "mtls_mode": "unset",
+        "port_overrides": {"8080": "unset"}
+    });
+    let unset: PeerAuthentication = serde_json::from_value(unset).unwrap();
+    assert_eq!(unset.mtls_mode, MtlsMode::Unset);
+    assert_eq!(
+        unset.port_overrides.get(&8080).copied(),
+        Some(MtlsMode::Unset)
+    );
+    assert!(unset.mtls_mode.is_peer_auth_mode());
+
+    let encoded = serde_json::to_string(&unset).unwrap();
+    let back: PeerAuthentication = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(back, unset);
+}
+
 #[test]
 fn service_entry_static_resolution_with_endpoints() {
     let entry = ServiceEntry {

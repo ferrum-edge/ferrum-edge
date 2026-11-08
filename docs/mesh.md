@@ -2724,6 +2724,22 @@ mTLS modes:
 | `strict` | Require mTLS on all connections. Reject plaintext. |
 | `permissive` (default) | Accept both mTLS and plaintext. |
 | `disable` | Disable mTLS. Accept plaintext only. |
+| `unset` | Inherit from the next-higher tier (see below). |
+
+**`UNSET` and omitted modes inherit.** Istio `mtls.mode: UNSET`, an omitted
+`mtls.mode`, an empty or omitted `mtls` block, and an omitted or `UNSET`
+`portLevelMtls.<port>.mode` all translate to `unset`, not to `permissive`.
+Each app port resolves by walking the tiers until a concrete mode is found:
+workload-selector port override, then the workload-selector policy's mode,
+then the namespace policy, then the mesh-wide (root-namespace) policy, then
+the `permissive` default. So a workload policy that sets only
+`portLevelMtls: {8080: DISABLE}` under a namespace or mesh-wide `STRICT` keeps
+every other port `STRICT`, and a namespace policy with `mtls: {}` does not
+override a mesh-wide `STRICT`. An explicit lower-tier mode still overrides the
+tiers above it. In native, file, and xDS configuration an omitted `mtls_mode`
+still defaults to `permissive`; write `mtls_mode: unset` (or an `unset`
+`port_overrides` value) to inherit. `unset` is invalid as a DestinationRule
+client TLS mode.
 
 `portLevelMtls` applies only to a `PeerAuthentication` whose workload selector
 contains at least one `matchLabels` entry. Omitted, `null`, and explicitly empty
@@ -2785,7 +2801,7 @@ are ignored.
 
 ### Resolution and listener wiring
 
-The listener fallback is resolved at startup from the initial mesh slice using only the winning policy's workload-level `mtls_mode`; mesh transport ports (`15006`, `15008`, and `15090`) are never treated as app-port override keys. Each app port is resolved separately via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`. Among same-tier matches the tie is resolved **fail-secure**: the more-restrictive effective mode for the app port wins (`Strict` > `Permissive` > `Disable`). This is both deterministic (so the posture cannot flap across pods or reconciles) and a genuine trust boundary — because the winner is decided by mode rather than by the policy's namespace string or name, a tenant-controlled policy cannot downgrade inbound mTLS below a trusted same-tier policy by choosing a low-sorting namespace or policy name, and a customized `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` that sorts after tenant namespaces is equally safe. Two conflicting same-tier `PeerAuthentication`s are still an operator misconfiguration; only when their effective modes are identical does the resolver fall back to the value-neutral `(namespace, name)` ordering to pick a canonical winner (this differs from the sibling `ProxyConfig` resolver, which has no security posture to protect and tiebreaks by `name`). Port-level overrides within a policy are applied before the per-app-port comparison, so each app port gets the posture that the winning policy yields for that port.
+The listener fallback is resolved at startup from the initial mesh slice using only the winning policy's workload-level `mtls_mode`; mesh transport ports (`15006`, `15008`, and `15090`) are never treated as app-port override keys. Each app port is resolved separately via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`; a tier whose applicable policies are all `unset` passes the next-lower tier's mode through, and the listener fallback inherits the same way. Among same-tier matches the tie is resolved **fail-secure**: the more-restrictive effective mode for the app port wins (`Strict` > `Permissive` > `Disable`), with an `unset` policy counted at the mode it inherits. This is both deterministic (so the posture cannot flap across pods or reconciles) and a genuine trust boundary — because the winner is decided by mode rather than by the policy's namespace string or name, a tenant-controlled policy cannot downgrade inbound mTLS below a trusted same-tier policy by choosing a low-sorting namespace or policy name, and a customized `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` that sorts after tenant namespaces is equally safe. Two conflicting same-tier `PeerAuthentication`s are still an operator misconfiguration; only when their effective modes are identical does the resolver fall back to the value-neutral `(namespace, name)` ordering to pick a canonical winner (this differs from the sibling `ProxyConfig` resolver, which has no security posture to protect and tiebreaks by `name`). Port-level overrides within a policy are applied before the per-app-port comparison, so each app port gets the posture that the winning policy yields for that port.
 
 The resulting `MeshClientAuth` is plumbed into the inbound TLS acceptor:
 

@@ -151,6 +151,24 @@ pub fn is_loopback_ip_literal_endpoint(endpoint: &str, parsed_host: Option<Host<
         })
 }
 
+/// `true` when a parsed URL host is a loopback IP literal (`127.0.0.0/8` or
+/// `::1`, optionally bracketed). Every name — `localhost` and `*.localhost`
+/// included — is `false`: DNS overrides and the resolver decide where a name
+/// connects, so only an address literal proves a credentialed cleartext
+/// request stays on this machine (the #6659 rule).
+///
+/// Callers pass the host the `url` crate parsed, so an IP literal is already
+/// normalized to the address it connects to. Plugins whose published OpenAPI
+/// `pattern` pins the configured spelling use
+/// [`is_loopback_ip_literal_endpoint`] instead.
+pub fn is_loopback_ip_literal_host(host: &str) -> bool {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
 pub fn socket_addr_lookup_input(host: &str, port: u16) -> String {
     if host.parse::<Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")

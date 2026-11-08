@@ -2324,7 +2324,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         }),
         "ai_transcript_audit" => json!({
             "sink": {
-                "endpoint_url": "http://localhost:9200/audit",
+                "endpoint_url": "http://127.0.0.1:9200/audit",
                 "allow_insecure_loopback": true
             }
         }),

@@ -477,6 +477,44 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
                 "allow_insecure_loopback": true
             }
         }),
+        // A name never proves the collector is on this machine: DNS overrides
+        // and the resolver decide where `localhost` connects (#6659).
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://collector.localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        // The URL parser ignores surrounding whitespace and embedded
+        // tabs/newlines, so the scheme is judged on the parsed URL, not on the
+        // configured spelling.
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": " http://collector.example.com/audit"
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": " http://localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "ht\ttp://collector.example.com/audit"
+            }
+        }),
     ] {
         let err = AiTranscriptAudit::new(&config, loopback_http_client())
             .err()
@@ -498,6 +536,22 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
         AiTranscriptAudit::new(&loopback, loopback_http_client()).is_ok(),
         "explicit IPv6 loopback cleartext should remain available for local development"
     );
+    for endpoint in [
+        "http://127.1:9001/audit",
+        "http://[0:0:0:0:0:0:0:1]:9001/audit",
+    ] {
+        let config = json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "allow_insecure_loopback": true
+            }
+        });
+        assert!(
+            AiTranscriptAudit::new(&config, loopback_http_client()).is_ok(),
+            "URL-normalized loopback IP literal {endpoint} stays admitted"
+        );
+    }
 }
 
 #[tokio::test]
@@ -11396,8 +11450,8 @@ async fn grpc_full_method_metadata_without_leading_slash_still_enrolls() {
 ///
 /// `should_buffer_request_body` and `before_proxy` both run before
 /// `on_backend_path_resolved`, so they only see the client path. A client path
-/// like `/prefix/test.Greeter/SayHello` does not even parse as a gRPC method,
-/// yet listen-path stripping makes the backend-effective method the enrolled
+/// like `/prefix/SayHello` names no enrolled method, yet listen-path stripping
+/// plus `backend_path` assembly makes the backend-effective method the enrolled
 /// `/test.Greeter/SayHello`. If the buffer gate answered `false` there, the
 /// request would ride the native-gRPC streaming fast path and no final
 /// request-body hook would ever run — a silent, total capture loss.
@@ -11413,7 +11467,7 @@ async fn grpc_backend_effective_method_enrolls_after_unenrolled_client_path() {
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
-    let mut ctx = grpc_ctx("/prefix/test.Greeter/SayHello");
+    let mut ctx = grpc_ctx("/prefix/SayHello");
     // The provisional publication from `grpc_method_router::on_request_received`
     // is absent, because the client path does not parse as `/service/method`.
     assert!(
@@ -11473,6 +11527,155 @@ async fn grpc_backend_effective_method_enrolls_after_unenrolled_client_path() {
     assert!(
         !request_body.contains("agent@example.com"),
         "captured excerpt leaked an email: {request_body}"
+    );
+}
+
+/// Before routing, the audit's provisional view is EXACT, not canonicalized:
+/// a provisional enrollment reaches rejecting request admission in
+/// `before_proxy`, so a prefixed client path such as
+/// `/api/test.Greeter/SayHello` must not provisionally enroll (and, under a
+/// fail-closed sink policy, refuse) a call whose backend method may be
+/// unenrolled. The bound backend path stays authoritative once it exists.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_pre_bind_prefixed_client_path_does_not_stage_or_refuse_provisionally() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let mut config = config_with_sink(&endpoint, grpc_audit_overrides());
+    config["sink"]["on_sink_error"] = json!("reject");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    let early = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(early, PluginResult::Continue),
+        "no provisional admission may refuse an unbound prefixed path"
+    );
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a prefixed client path does not provisionally enroll"
+    );
+
+    // The backend-effective method is a different, unenrolled one.
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/other.Service/SayHello",
+    );
+    let resolved = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+/// Plugin-writable `grpc_full_method` metadata never outranks the private bound
+/// backend path, and the bound path selects on its canonical trailing
+/// `/Service/Method` (the `body_validator` #6845 rule).
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_bound_backend_path_outranks_plugin_writable_method_metadata() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+
+    // Metadata naming an unenrolled method cannot hide the enrolled method the
+    // backend actually serves from capture.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/SayHello",
+    );
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/Other".to_string(),
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the bound enrolled method must be captured whatever the metadata says"
+    );
+
+    // Nor can metadata enroll a backend method that is not enrolled.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/Other",
+    );
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "metadata must not enroll an unenrolled backend method"
+    );
+
+    // An upstream base path in front of the method does not hide it, at the
+    // backend-path boundary or in the final hook.
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/base/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a base-path prefix must not un-enroll the backend method at the boundary"
+    );
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/base/test.Greeter/SayHello",
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a base-path prefix must not un-enroll the backend method"
     );
 }
 

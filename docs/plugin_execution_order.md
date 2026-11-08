@@ -257,8 +257,9 @@ length, the canonical policy path, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
 backend wire. A `grpc`-enrolled `ai_transcript_audit` joins it too, so the
-proxy binds the backend-effective path its enrollment decision reads when no
-`grpc_full_method` was published. The selected target remains pinned across deferred external hooks,
+proxy binds the backend-effective path its enrollment decision reads; that
+bound path is authoritative, and the plugin-writable `grpc_full_method` only
+stands in before it is bound. The selected target remains pinned across deferred external hooks,
 so routing-header mutations cannot steer the request onto a different method.
 The gateway enforces the selected path, including stateful per-method rate
 limits, exactly once before invoking those hooks or a terminal final-request-
@@ -273,9 +274,9 @@ fallback when a target has no explicit path. A candidate with a different path
 aborts the retry instead of redialing the failed target or silently changing
 the authorized method. This applies to HTTP, native and bridged gRPC/H3, and
 WebSocket retry loops. A `grpc`-enrolled `ai_response_guard` joins this
-boundary as well: when no `grpc_full_method` was published, the bound
-backend-effective path is the method its enrollment, buffering vote, inspection,
-and redaction read, so a guard-only route with `strip_listen_path` or a
+boundary as well: the bound backend-effective path (its trailing
+`/Service/Method`) is the method its enrollment, buffering vote, inspection,
+and redaction read, never outranked by the plugin-writable `grpc_full_method`, so a guard-only route with `strip_listen_path` or a
 `backend_path` still governs the method the backend serves.
 
 When backend-path policy is active, `before_proxy` hooks that can dispatch

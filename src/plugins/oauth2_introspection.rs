@@ -2,7 +2,6 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1905,7 +1904,7 @@ fn parse_client_auth(
     ) && endpoint.is_some_and(is_insecure_credentialed_endpoint)
     {
         return Err(format!(
-            "oauth2_introspection: `provider[{provider_idx}].client_auth.method`={method:?} requires an https introspection_endpoint/discovery_url (http is only allowed for localhost or loopback endpoints)"
+            "oauth2_introspection: `provider[{provider_idx}].client_auth.method`={method:?} requires an https introspection_endpoint/discovery_url (http is only allowed for a loopback IP-literal host)"
         ));
     }
 
@@ -1997,7 +1996,7 @@ fn parse_client_auth(
         "none" => {
             if endpoint.is_some_and(|endpoint| !is_local_introspection_host(&endpoint.hostname)) {
                 return Err(format!(
-                    "oauth2_introspection: `provider[{provider_idx}].client_auth.method`=`none` is only allowed for localhost or loopback endpoints"
+                    "oauth2_introspection: `provider[{provider_idx}].client_auth.method`=`none` is only allowed for loopback IP-literal endpoints"
                 ));
             }
             Ok(ClientAuth::None)
@@ -2398,11 +2397,13 @@ fn hostname_from_url(url: &str) -> Option<String> {
         .and_then(|parsed| hostname_from_parsed_url(&parsed))
 }
 
+/// `true` only for a loopback IP literal (`127.0.0.0/8`, `::1`). `hostname` is
+/// the parsed URL host, so an IP literal is already normalized. A name —
+/// `localhost` included — never qualifies: DNS overrides and the resolver
+/// decide where a name connects, so it does not prove the client credential
+/// stays on this machine (the #6659 rule for credentialed cleartext endpoints).
 fn is_local_introspection_host(hostname: &str) -> bool {
-    hostname.eq_ignore_ascii_case("localhost")
-        || hostname
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    super::utils::socket_host::is_loopback_ip_literal_host(hostname)
 }
 
 /// True when the endpoint would transmit client credentials over plaintext to a
@@ -2792,8 +2793,9 @@ mod tests {
     }
 
     #[test]
-    fn local_introspection_host_accepts_loopback_and_localhost_only() {
-        assert!(is_local_introspection_host("localhost"));
+    fn local_introspection_host_accepts_loopback_ip_literals_only() {
+        assert!(!is_local_introspection_host("localhost"));
+        assert!(!is_local_introspection_host("api.localhost"));
         assert!(is_local_introspection_host("127.42.0.9"));
         assert!(is_local_introspection_host("::1"));
         assert!(!is_local_introspection_host("idp.local"));
@@ -2859,8 +2861,8 @@ mod tests {
         // Loopback http remains acceptable for local development.
         assert!(
             validate_discovered_endpoint(
-                "http://localhost:9000/.well-known/openid-configuration",
-                "http://localhost:9000/introspect",
+                "http://127.0.0.1:9000/.well-known/openid-configuration",
+                "http://127.0.0.1:9000/introspect",
                 "introspection_endpoint",
             )
             .is_ok()
