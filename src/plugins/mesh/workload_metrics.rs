@@ -42,8 +42,8 @@ use crate::plugins::otel_tracing::{
 };
 use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::utils::metadata_redaction::{
-    REDACTED_PLACEHOLDER, is_credential_class_metadata_key, is_operator_sensitive_metadata_key,
-    is_sensitive_header_name, is_sensitive_metadata_key,
+    REDACTED_PLACEHOLDER, is_builtin_safe_metadata_name, is_credential_class_metadata_key,
+    is_operator_sensitive_metadata_key, is_sensitive_header_name, is_sensitive_metadata_key,
 };
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
@@ -2915,18 +2915,29 @@ fn validate_custom_tag_name(name: &str) -> Result<(), String> {
                 | "grpc_method"
                 | "grpc_full_method"
         )
-        // A built-in plugin's own metadata namespace (`<plugin>.<key>`, for
-        // example `ai_transcript_audit.record_id` or `waf.action`) carries that
-        // plugin's coordination and decision state; a tag there could alias it.
-        || name
-            .split_once('.')
-            .is_some_and(|(namespace, _)| crate::plugins::is_builtin_plugin_name(namespace));
+        // A custom tag is written into transaction metadata, so it must never
+        // overwrite a key the gateway itself publishes there: other plugins
+        // read those keys as coordination and decision state (for example
+        // `ai_stream_router_pass_through` gates `ai_federation` admission).
+        || is_builtin_safe_metadata_name(name)
+        || names_builtin_plugin_namespace(name);
     if reserved || is_sensitive_metadata_key(name) {
         return Err(format!(
             "workload_metrics: custom tag name {name:?} is reserved or sensitive"
         ));
     }
     Ok(())
+}
+
+/// Whether `name` sits in a built-in plugin's own metadata namespace: the
+/// plugin's name followed by `.` or `_` (`ai_transcript_audit.record_id`,
+/// `waf.action`, `ai_stream_router_claimed`). Plugins publish their
+/// coordination state there, including keys outside the reviewed safe-name
+/// list, so a tag in that namespace could alias it.
+fn names_builtin_plugin_namespace(name: &str) -> bool {
+    name.bytes().enumerate().any(|(index, byte)| {
+        matches!(byte, b'.' | b'_') && crate::plugins::is_builtin_plugin_name(&name[..index])
+    })
 }
 
 fn first_label<'a>(labels: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {

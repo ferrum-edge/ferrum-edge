@@ -111,11 +111,22 @@ fn grpc_method_metadata_keys_are_reserved_custom_tag_names() {
     // A built-in plugin's metadata namespace is reserved too: a literal
     // `ai_transcript_audit.record_id` tag would make overlapping transactions
     // share one audit staging entry.
+    // So is every other key the gateway publishes into metadata, and a
+    // built-in plugin's `<plugin>_` namespace: a literal
+    // `ai_stream_router_pass_through` tag would make `ai_federation` skip its
+    // model/provider admission.
     for name in [
         "ai_transcript_audit.record_id",
         "ai_transcript_audit.anything",
         "waf.action",
         "grpc_method_router.rule",
+        "ai_stream_router_pass_through",
+        "ai_stream_router_claimed",
+        "ai_federation_status",
+        "suppress_backend_consumer_identity_headers",
+        "consumer_username",
+        "fault_injected",
+        "namespace",
     ] {
         for config in [
             json!({"custom_tags": {name: "shared"}}),

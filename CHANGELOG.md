@@ -41,20 +41,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
-- **BREAKING — `workload_metrics` reserves the gRPC method metadata keys and
-  built-in plugin metadata namespaces as custom tag names** (issue #7092;
-  GHSA-9mmx-ghcv-x25q, follow-up to #7081). A `custom_tags`,
-  `custom_header_tags` or `custom_env_tags` entry (in mesh mode, an Istio
-  `Telemetry.tracing[].customTags` entry) named `grpc_service`, `grpc_method`
-  or `grpc_full_method` overwrote the method key that `grpc_method_router`
-  publishes and per-method plugin policy reads, so a Telemetry author or, for a
-  header tag, the request sender chose it. A tag under a built-in plugin's
-  namespace (`<plugin>.<key>`) could likewise alias that plugin's state; for
-  example a literal `ai_transcript_audit.record_id` tag made overlapping
-  transactions share one audit staging entry, losing or misattributing
-  transcripts. Such a tag now fails `workload_metrics` construction (and Istio
-  Telemetry translation) as reserved, like `trace_id`. **Operator action:**
-  rename any such tag.
+- **BREAKING — `workload_metrics` custom tags can no longer overwrite
+  gateway-published metadata** (issue #7092; GHSA-9mmx-ghcv-x25q, follow-up to
+  #7081). A `custom_tags`, `custom_header_tags` or `custom_env_tags` entry (in
+  mesh mode, an Istio `Telemetry.tracing[].customTags` entry) is written into
+  transaction metadata under its own name, so a Telemetry author or, for a
+  header tag, the request sender could set keys other plugins decide on:
+  `grpc_full_method` (the method key per-method policy reads before the backend
+  path is bound), `ai_stream_router_pass_through` (which makes `ai_federation`
+  skip model/provider admission), or `ai_transcript_audit.record_id` (which
+  made overlapping transactions share one audit staging entry). A tag name that
+  is any metadata key the gateway publishes, or that sits in a built-in
+  plugin's namespace (`<plugin>.<key>` or `<plugin>_<key>`), now fails
+  `workload_metrics` construction (and Istio Telemetry translation) as
+  reserved, like `trace_id`. **Operator action:** rename any such tag (for
+  example `namespace` → `k8s_namespace`).
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while

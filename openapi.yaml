@@ -28563,9 +28563,10 @@ components:
             Custom tags injected into transaction metadata and exported spans.
             Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
             and cannot collide with reserved, sensitive, `mesh.*`, trace,
-            gRPC method (`grpc_service`, `grpc_method`, `grpc_full_method`),
-            built-in plugin metadata namespace (`<plugin>.<key>`, for example
-            `ai_transcript_audit.record_id`), or authorization keys. This map, `custom_header_tags`, and
+            authorization keys, any metadata key the gateway publishes (for
+            example `grpc_full_method`, `consumer_username`, `namespace`), or a
+            built-in plugin's metadata namespace (`<plugin>.<key>` or
+            `<plugin>_<key>`, for example `ai_transcript_audit.record_id`). This map, `custom_header_tags`, and
             `custom_env_tags` may contain at most 32 distinct tag names combined.
             For Istio environment tags, values here are `defaultValue`
             fallbacks only — live data-plane resolution uses `custom_env_tags`.
