@@ -72,6 +72,7 @@ use crate::proxy::response_buffer_budget::{
 use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
+    boxed_apply_buffered_request_body_normalization_before_before_proxy,
     log_pre_backend_rejected_request, log_rejected_request, log_rejected_request_with_path,
     plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase_with_envelope,
 };
@@ -5602,8 +5603,10 @@ async fn handle_h3_request(
             .has(crate::plugin_cache::PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
         {
             let mut tmp_headers = std::mem::take(&mut ctx.headers);
+            // Boxed out of line: the normalizer chain must not widen this
+            // handler's frame (see `h3_request_handler_boxes_its_largest_dispatch_relays`).
             let normalize_result =
-                crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+                boxed_apply_buffered_request_body_normalization_before_before_proxy(
                     &plugins,
                     &mut ctx,
                     &mut tmp_headers,
@@ -6881,7 +6884,7 @@ async fn handle_h3_request(
         let grpc_deadline_at = ctx.grpc_deadline_at();
         // Each replacement is charged before it is installed; an uncovered one
         // is dropped with the body and its charge released inside the chain.
-        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+        let transformed = crate::proxy::boxed_apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,
@@ -7464,7 +7467,7 @@ async fn handle_h3_request(
         let grpc_deadline_at = ctx.grpc_deadline_at();
         // Each replacement is charged before it is installed; an uncovered one
         // is dropped with the body and its charge released inside the chain.
-        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+        let transformed = crate::proxy::boxed_apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,
@@ -10138,7 +10141,7 @@ async fn handle_h3_request(
         let grpc_deadline_at = ctx.grpc_deadline_at();
         // Each replacement is charged before it is installed; an uncovered one
         // is dropped with the body and its charge released inside the chain.
-        crate::proxy::apply_request_body_plugins_with_context(
+        crate::proxy::boxed_apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,

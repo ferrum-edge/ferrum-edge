@@ -5042,6 +5042,44 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
     Ok(PluginResult::Continue)
 }
 
+/// The result of a request-body phase that charges its replacements.
+pub(crate) type RequestBodyPhaseResult<T> = Result<T, RequestBodyCapacityExceeded>;
+
+/// A request-body phase future, constructed out of line and returned boxed.
+pub(crate) type BoxedRequestBodyPhaseFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = RequestBodyPhaseResult<T>> + Send + 'a>>;
+
+/// [`apply_buffered_request_body_normalization_before_before_proxy`],
+/// constructed out of line and returned boxed for a caller with a hard stack
+/// budget (`handle_h3_request`): the normalizer chain, with its decode-charge
+/// handoff scope, is then never an inline frame slot of the caller. The thin
+/// `async move` trampoline builds the chain only when its heap-resident frame
+/// is polled; `Box::pin(..)` of the concrete future would still materialize
+/// it on this factory's stack.
+#[inline(never)]
+pub(crate) fn boxed_apply_buffered_request_body_normalization_before_before_proxy<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    headers: &'a mut HashMap<String, String>,
+    body: &'a mut Vec<u8>,
+    charge: Option<&'a mut response_buffer_budget::RequestBufferPermit>,
+    needs_body_text: bool,
+    needs_body_bytes: bool,
+) -> BoxedRequestBodyPhaseFuture<'a, PluginResult> {
+    Box::pin(async move {
+        apply_buffered_request_body_normalization_before_before_proxy(
+            plugins,
+            ctx,
+            headers,
+            body,
+            charge,
+            needs_body_text,
+            needs_body_bytes,
+        )
+        .await
+    })
+}
+
 /// Reject-log phase label for the client-request-contract phase. Distinct from
 /// `normalize_buffered_request_body` so a contract rejection is never attributed
 /// to gateway-owned body normalization.
@@ -6990,6 +7028,34 @@ pub(crate) async fn apply_request_body_plugins_with_context(
         }
     }
     Ok(body)
+}
+
+/// [`apply_request_body_plugins_with_context`], constructed out of line and
+/// returned boxed for a caller with a hard stack budget (`handle_h3_request`
+/// and the H3 bridge): the transform chain, with its decode-charge handoff
+/// scope and deadline timer, is then never an inline frame slot of the caller.
+/// Same thin `async move` trampoline as
+/// [`boxed_apply_buffered_request_body_normalization_before_before_proxy`].
+#[inline(never)]
+pub(crate) fn boxed_apply_request_body_plugins_with_context<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: Option<&'a mut RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    headers: &'a HashMap<String, String>,
+    body_bytes: Vec<u8>,
+    charge: Option<&'a mut response_buffer_budget::RequestBufferPermit>,
+) -> BoxedRequestBodyPhaseFuture<'a, Vec<u8>> {
+    Box::pin(async move {
+        apply_request_body_plugins_with_context(
+            plugins,
+            ctx,
+            grpc_deadline_at,
+            headers,
+            body_bytes,
+            charge,
+        )
+        .await
+    })
 }
 
 pub(crate) async fn run_final_request_body_hooks(

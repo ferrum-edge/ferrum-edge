@@ -1170,7 +1170,7 @@ where
             // Each replacement is charged before it is installed; an uncovered
             // one is dropped with the body and its charge released inside the
             // chain.
-            let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            let transformed = crate::proxy::boxed_apply_request_body_plugins_with_context(
                 plugins,
                 Some(&mut *ctx),
                 grpc_deadline_at,
@@ -1183,7 +1183,7 @@ where
                 // Nothing of the refused body may outlive the refusal's writes.
                 drop(prebuffered_body_charge.take());
                 cb_probe.release_neutral();
-                return Box::pin(write_bridge_upload_refusal(
+                return boxed_write_bridge_upload_refusal(
                     stream,
                     flavor,
                     plugins,
@@ -1192,7 +1192,7 @@ where
                     response_committed_plugins,
                     initial_response_header_policy_plugins.as_ref(),
                     backend_start,
-                ))
+                )
                 .await;
             };
             // Run validators. Reject = emit a trailers-only native gRPC error,
@@ -3560,7 +3560,7 @@ async fn dispatch_plain<S>(
     request_authority: Option<&str>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes> + SendStreamStopped,
+    S: RecvStream + SendStream<Bytes> + SendStreamStopped + Send,
 {
     // Effective client-facing ceilings for this request: each global knob
     // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
@@ -3718,7 +3718,7 @@ where
             }
             Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::BudgetExhausted)) => {
                 cb_probe.release_neutral();
-                return Box::pin(write_bridge_upload_refusal(
+                return boxed_write_bridge_upload_refusal(
                     stream,
                     HttpFlavor::Plain,
                     plugins,
@@ -3727,12 +3727,12 @@ where
                     response_committed_plugins,
                     initial_response_header_policy_plugins,
                     backend_start,
-                ))
+                )
                 .await;
             }
             Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::TooLarge)) => {
                 cb_probe.release_neutral();
-                return Box::pin(write_bridge_upload_refusal(
+                return boxed_write_bridge_upload_refusal(
                     stream,
                     HttpFlavor::Plain,
                     plugins,
@@ -3741,7 +3741,7 @@ where
                     response_committed_plugins,
                     initial_response_header_policy_plugins,
                     backend_start,
-                ))
+                )
                 .await;
             }
             // The winner was captured where BOTH instants were known, so a late
@@ -3842,7 +3842,7 @@ where
                     prebuffered_body_charge.or(mesh_upload_charge.take()),
                 ) else {
                     cb_probe.release_neutral();
-                    return Box::pin(write_bridge_upload_refusal(
+                    return boxed_write_bridge_upload_refusal(
                         stream,
                         HttpFlavor::Plain,
                         plugins,
@@ -3851,7 +3851,7 @@ where
                         response_committed_plugins,
                         initial_response_header_policy_plugins,
                         backend_start,
-                    ))
+                    )
                     .await;
                 };
                 let bytes_sent = raw_prebuffered_body_bytes;
@@ -8700,7 +8700,7 @@ async fn dispatch_grpc<S>(
     response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream + SendStream<Bytes> + Send,
 {
     // Effective client-facing ceilings for this request: each global knob
     // narrowed by any active route ceiling, `0` still meaning unlimited. The H3
@@ -8806,7 +8806,7 @@ where
             Ok(Ok(b)) => b,
             Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::BudgetExhausted)) => {
                 cb_probe.release_neutral();
-                return Box::pin(write_bridge_upload_refusal(
+                return boxed_write_bridge_upload_refusal(
                     stream,
                     HttpFlavor::Grpc,
                     plugins,
@@ -8815,14 +8815,14 @@ where
                     response_committed_plugins,
                     initial_response_header_policy_plugins,
                     backend_start,
-                ))
+                )
                 .await;
             }
             Ok(Err(crate::proxy::response_buffer_budget::RetainRejection::TooLarge)) => {
                 // The reject writer emits HEADERS then STOP_SENDING; do not reverse
                 // that order with a pre-write halt (would duplicate STOP_SENDING).
                 cb_probe.release_neutral();
-                return Box::pin(write_bridge_upload_refusal(
+                return boxed_write_bridge_upload_refusal(
                     stream,
                     HttpFlavor::Grpc,
                     plugins,
@@ -8831,7 +8831,7 @@ where
                     response_committed_plugins,
                     initial_response_header_policy_plugins,
                     backend_start,
-                ))
+                )
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::Read(e)) => {
@@ -9022,7 +9022,7 @@ where
     // refused rather than retained uncharged.
     let Some(body_bytes) = publish_h3_retained_body(body, bridge_upload_charge.take()) else {
         cb_probe.release_neutral();
-        return Box::pin(write_bridge_upload_refusal(
+        return boxed_write_bridge_upload_refusal(
             stream,
             HttpFlavor::Grpc,
             plugins,
@@ -9031,7 +9031,7 @@ where
             response_committed_plugins,
             initial_response_header_policy_plugins,
             backend_start,
-        ))
+        )
         .await;
     };
     let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry {
@@ -13783,6 +13783,42 @@ enum BridgeUploadRefusal {
     BufferCapacity,
     /// The upload exceeded the drain's retained ceiling.
     TooLarge,
+}
+
+/// [`write_bridge_upload_refusal`], constructed out of line and returned boxed
+/// so no bridge dispatcher carries the reject pipeline as a frame slot: each
+/// refusal arm then holds a pointer, not the concrete future. The thin `async
+/// move` trampoline is intentional, as in [`boxed_dispatch_plain`]: boxing
+/// the concrete refusal future at the call site still materializes it as a
+/// stack temporary in the caller's poll frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_write_bridge_upload_refusal<'a, S>(
+    stream: &'a mut RequestStream<S, Bytes>,
+    flavor: HttpFlavor,
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    refusal: BridgeUploadRefusal,
+    response_committed_plugins: &'a [Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
+    backend_start: Instant,
+) -> BoxedPlainDispatchFuture<'a>
+where
+    S: RecvStream + SendStream<Bytes> + Send + 'a,
+{
+    Box::pin(async move {
+        write_bridge_upload_refusal(
+            stream,
+            flavor,
+            plugins,
+            ctx,
+            refusal,
+            response_committed_plugins,
+            initial_response_header_policy_plugins,
+            backend_start,
+        )
+        .await
+    })
 }
 
 /// Refuse the bridge's own request-body drain through the shared reject path

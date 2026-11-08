@@ -5992,6 +5992,71 @@ fn h3_request_handler_boxes_its_largest_dispatch_relays() {
         streaming_factory.contains("Box::pin(async move {"),
         "boxed_dispatch_grpc_streaming must box an async trampoline"
     );
+
+    // The charged request-body phases (the normalizer chain and the transform
+    // chain, each with its decode-charge handoff scope) are entered through
+    // boxing factories from the handler and the bridge, never inline.
+    const NORMALIZE: &str = "apply_buffered_request_body_normalization_before_before_proxy(";
+    const TRANSFORM: &str = "apply_request_body_plugins_with_context(";
+    for (relay, source) in [
+        (NORMALIZE, handler),
+        (TRANSFORM, handler),
+        (TRANSFORM, bridge),
+    ] {
+        let factory_call = format!("boxed_{relay}");
+        assert!(
+            source.contains(factory_call.as_str()),
+            "{relay} must be entered through its boxing factory"
+        );
+        assert_eq!(
+            source.matches(relay).count(),
+            source.matches(factory_call.as_str()).count(),
+            "{relay} must not be awaited inline on an H3 request path"
+        );
+    }
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    for relay in [NORMALIZE, TRANSFORM] {
+        let name = relay.trim_end_matches('(');
+        let attributed = format!("#[inline(never)]\npub(crate) fn boxed_{name}<");
+        assert!(
+            proxy.contains(attributed.as_str()),
+            "boxed_{name} must stay an out-of-line boxing factory"
+        );
+        let signature = format!("fn boxed_{name}<");
+        let body = proxy
+            .split(signature.as_str())
+            .nth(1)
+            .expect("request-body phase factory")
+            .split("\n}\n")
+            .next()
+            .expect("bounded request-body phase factory");
+        assert!(
+            body.contains("Box::pin(async move {"),
+            "boxed_{name} must box an async trampoline"
+        );
+    }
+
+    // Every bridge upload refusal goes through its boxing factory, so no
+    // bridge dispatcher carries the reject pipeline as a frame slot.
+    assert!(
+        !bridge.contains("Box::pin(write_bridge_upload_refusal("),
+        "a call-site Box::pin still materializes the refusal on the caller's stack"
+    );
+    assert!(
+        bridge.contains("#[inline(never)]\nfn boxed_write_bridge_upload_refusal<"),
+        "boxed_write_bridge_upload_refusal must stay an out-of-line boxing factory"
+    );
+    let refusal_factory = bridge
+        .split("fn boxed_write_bridge_upload_refusal<")
+        .nth(1)
+        .expect("bridge refusal boxing factory")
+        .split("\n}\n")
+        .next()
+        .expect("bounded bridge refusal boxing factory");
+    assert!(
+        refusal_factory.contains("Box::pin(async move {"),
+        "boxed_write_bridge_upload_refusal must box an async trampoline"
+    );
 }
 
 /// Issue #5819: the HTTP/3 cross-protocol plain bridge counts gRPC request

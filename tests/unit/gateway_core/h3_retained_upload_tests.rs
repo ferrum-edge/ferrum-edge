@@ -550,7 +550,7 @@ fn both_h3_bridge_drain_refusals_run_the_reject_hooks_and_the_log() {
             .unwrap_or_else(|| panic!("bridge drain {index} must be bounded"));
         assert_eq!(
             refusals
-                .matches("Box::pin(write_bridge_upload_refusal(")
+                .matches("boxed_write_bridge_upload_refusal(")
                 .count(),
             2,
             "bridge drain {index}: the capacity and oversize refusals take the shared path"
