@@ -50,6 +50,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parser and rounds `u`/`n` values up to the next millisecond instead of down,
   matching the receipt-anchored request deadline: `1500u` is 2 ms on every
   path (that reader used to see 1 ms).
+- **BREAKING — `workload_metrics` custom tags can no longer overwrite
+  gateway-published metadata** (issue #7092; GHSA-9mmx-ghcv-x25q, follow-up to
+  #7081). A `custom_tags`, `custom_header_tags` or `custom_env_tags` entry (in
+  mesh mode, an Istio `Telemetry.tracing[].customTags` entry) is written into
+  transaction metadata under its own name, so a Telemetry author or, for a
+  header tag, the request sender could set keys other plugins decide on:
+  `grpc_full_method` (the method key per-method policy reads before the
+  backend path is bound), `ai_stream_router_pass_through` (which makes
+  `ai_federation` skip model/provider admission), `request_body` (the
+  buffered-body view `ai_request_guard` inspects),
+  `auth.strip_query_param.<name>` (which tells egress to strip a query
+  credential under `hide_credentials`), or `ai_transcript_audit.record_id`
+  (which made overlapping transactions share one audit staging entry). A tag
+  name that is a reviewed gateway metadata key or family, sits in a shared
+  gateway metadata namespace (`auth.`, `mcp.`, `geo.`, `ferrum.`, `oidc_rp.`,
+  ...), or sits in a built-in plugin's namespace (`<plugin>.<key>` or
+  `<plugin>_<key>`), now fails `workload_metrics` construction (and Istio
+  Telemetry translation) as reserved, like `trace_id`. **Operator action:**
+  rename any such tag (for example `namespace` → `k8s_namespace`).
 - **Admin API responses always carry the admin security headers** (issue
   #7074). `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
   `X-Frame-Options: DENY` were set by hand per response, and the raw API-spec
