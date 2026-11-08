@@ -15086,6 +15086,16 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
         provider["properties"]["client_auth"]["additionalProperties"],
         false
     );
+    // The constructor admits only a string, `null`, or an absent value for
+    // both fields, for every `method` (issue #7069;
+    // `oidc_relying_party_tests::private_key_jwt_non_string_alg_and_kid_are_refused_and_null_is_admitted`).
+    for field in ["private_key_jwt_alg", "private_key_jwt_kid"] {
+        assert_eq!(
+            provider["properties"]["client_auth"]["properties"][field]["type"],
+            json!(["string", "null"]),
+            "{field}"
+        );
+    }
 
     let session = &schema["properties"]["session"];
     assert_eq!(session["additionalProperties"], false);
