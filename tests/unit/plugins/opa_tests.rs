@@ -2250,6 +2250,98 @@ async fn opa_allow_obligation_installs_listed_upstream_headers() {
     );
 }
 
+/// An admitted OPA instance and a trigger-skipped claim-fanout instance can
+/// own the same header (`decision_request_headers: X-Tenant` beside
+/// `claim_headers: {tenant: X-Tenant}`). The skipped instance still removes
+/// every unverified copy, but keeps the exact value OPA installed for the
+/// request, for each claim-fanout plugin and in either priority order.
+#[tokio::test]
+async fn trigger_skipped_claim_owner_keeps_the_value_an_admitted_opa_installed() {
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::plugin_trigger::PluginTrigger;
+    use ferrum_edge::config::types::{GatewayConfig, PluginScope};
+
+    use super::plugin_utils::{make_plugin_config_with_json, make_proxy, minimal_plugin_config};
+
+    let server = MockServer::start().await;
+    mount_opa(
+        &server,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-tenant": "blue"}}}),
+    )
+    .await;
+    let post_only: PluginTrigger =
+        serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap();
+    for claim_plugin in ["jwks_auth", "oauth2_introspection", "oidc_relying_party"] {
+        for claim_priority in [1000, 2100] {
+            let label = format!("{claim_plugin} priority={claim_priority}");
+            let mut opa_config = base_config(&server.uri());
+            opa_config["decision_request_headers"] = json!(["x-tenant"]);
+            let opa = make_plugin_config_with_json(
+                "opa",
+                "opa",
+                opa_config,
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            let mut claim_config = minimal_plugin_config(claim_plugin);
+            claim_config["providers"][0]["claim_headers"] = json!({"tenant": "X-Tenant"});
+            let mut claims = make_plugin_config_with_json(
+                "claims",
+                claim_plugin,
+                claim_config,
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            claims.priority_override = Some(claim_priority);
+            claims.trigger = Some(post_only.clone());
+            let config = GatewayConfig {
+                version: "1".to_string(),
+                proxies: vec![make_proxy("p1", "/", vec!["opa", "claims"])],
+                plugin_configs: vec![opa, claims],
+                ..Default::default()
+            };
+            let cache =
+                PluginCache::new(&config).unwrap_or_else(|error| panic!("{label}: {error}"));
+            let plugins = cache.get_plugins("ferrum", "p1");
+
+            let mut ctx = make_ctx();
+            ctx.headers.insert("X_Tenant".into(), "forged".into());
+            for plugin in plugins.iter() {
+                plugin.on_request_received(&mut ctx).await;
+            }
+            for plugin in plugins.iter() {
+                assert_continue(plugin.authorize(&mut ctx).await);
+            }
+            let mut headers = ctx.headers.clone();
+            headers.insert("x_tenant".into(), "forged-late".into());
+            let result = ferrum_edge::_test_support::run_before_proxy_hooks_for_test(
+                plugins.as_slice(),
+                &mut ctx,
+                &mut headers,
+            )
+            .await;
+            assert_continue(result);
+
+            assert_eq!(
+                ctx.metadata
+                    .get("plugin_trigger.claims.skipped")
+                    .map(String::as_str),
+                Some("true"),
+                "{label}"
+            );
+            assert_eq!(
+                headers.get("x-tenant").map(String::as_str),
+                Some("blue"),
+                "{label}: the value OPA installed survives the skipped claim owner"
+            );
+            for forged in ["X_Tenant", "x_tenant"] {
+                assert!(!headers.contains_key(forged), "{label}: {forged}");
+            }
+        }
+    }
+}
+
 /// A trigger-skipped OPA instance decides nothing and installs nothing, but
 /// its `decision_request_headers` stay policy-owned: every client spelling is
 /// removed. A value an admitted sibling installed for this request survives,

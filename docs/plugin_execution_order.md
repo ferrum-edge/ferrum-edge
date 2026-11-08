@@ -1635,10 +1635,12 @@ because gating them could only add disclosure or forgery, never remove work:
   installs nothing. Today that is every `claim_headers` / `output_claim_headers`
   destination of `jwks_auth`, `oauth2_introspection`, and `oidc_relying_party`,
   `opa` `decision_request_headers`, and `spiffe_identity`'s
-  `x-ferrum-peer-spiffe-id` with `forward_identity`. A skipped `opa` /
-  `spiffe_identity` keeps one of its names only when an admitted sibling
-  installed it for this request (a typed provenance marker), never because of
-  the value. `mesh_authz` ext_authz `headersToUpstreamOnAllow` names follow
+  `x-ferrum-peer-spiffe-id` with `forward_identity`. A skipped instance keeps
+  one of its names only as the exact name and value an admitted owner, of any
+  of these plugins, installed for this request (one shared typed provenance
+  record), never because of the value alone: a skipped `jwks_auth` sharing
+  `X-Tenant` with an admitted OPA keeps OPA's value and drops every other
+  copy. `mesh_authz` ext_authz `headersToUpstreamOnAllow` names follow
   Istio semantics instead: they are provider-owned only on a request the
   instance CUSTOM-checked, so a skipped instance does not touch them. The
   owned names are also on the route's request-trailer strip list (see

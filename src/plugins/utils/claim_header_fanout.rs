@@ -402,22 +402,30 @@ pub fn apply_claim_headers_from_context(
     }
 }
 
-/// Strip every gateway-owned destination this instance still has to claim,
-/// without installing anything.
+/// Strip every copy and spelling of the destinations this instance owns,
+/// without installing anything, except an exact `(name, value)` pair an
+/// admitted owner already installed for this request.
 ///
 /// Used through [`crate::plugins::Plugin::sanitize_owned_request_headers`]
 /// when the owning instance's execution trigger skips the request: it
 /// authenticated nothing and installs nothing, but a client copy of a
 /// destination it owns must still never reach the backend as a gateway claim
-/// assertion. Sanitization is claimed exactly as in
-/// [`apply_claim_headers_from_context`], so an admitted instance sharing a
-/// destination keeps the value it installs in either order.
+/// assertion. Provenance is the shared per-request install record
+/// (`RequestContext::record_installed_request_assertion`) every owner writes
+/// (a claim sibling, an OPA decision header, the forwarded SPIFFE ID), so a
+/// value another admitted owner of the same name installed survives, while
+/// every unverified copy goes. An admitted claim sibling that runs later
+/// still sanitizes and installs as usual.
 pub fn sanitize_claim_header_destinations(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
     destinations: &ClaimHeaderDestinations,
 ) {
-    sanitize_owned_claim_header_destinations(ctx, headers, destinations);
+    if destinations.is_empty() {
+        return;
+    }
+    let owned: Vec<String> = destinations.names().map(str::to_string).collect();
+    crate::plugins::strip_uninstalled_request_assertions(ctx, headers, &owned);
 }
 
 /// Remove every gateway-owned destination this instance still has to claim.
