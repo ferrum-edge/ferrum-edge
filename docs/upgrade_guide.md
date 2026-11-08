@@ -32,7 +32,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
 entry whose name is a metadata key the gateway publishes (for example
-`grpc_full_method`, `consumer_username`, `namespace`,
+`grpc_full_method`, `consumer_username`, `namespace`, `request_body`,
 `ai_stream_router_pass_through`), or that sits in a built-in plugin's metadata
 namespace (`<plugin>.<key>` or `<plugin>_<key>`, for example
 `ai_transcript_audit.record_id` or `waf.action`), is now refused as reserved,

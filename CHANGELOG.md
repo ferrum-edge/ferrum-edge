@@ -49,9 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header tag, the request sender could set keys other plugins decide on:
   `grpc_full_method` (the method key per-method policy reads before the backend
   path is bound), `ai_stream_router_pass_through` (which makes `ai_federation`
-  skip model/provider admission), or `ai_transcript_audit.record_id` (which
-  made overlapping transactions share one audit staging entry). A tag name that
-  is any metadata key the gateway publishes, or that sits in a built-in
+  skip model/provider admission), `request_body` (the buffered-body view
+  `ai_request_guard` inspects), or `ai_transcript_audit.record_id` (which made
+  overlapping transactions share one audit staging entry). A tag name that is
+  any metadata key the gateway publishes, or that sits in a built-in
   plugin's namespace (`<plugin>.<key>` or `<plugin>_<key>`), now fails
   `workload_metrics` construction (and Istio Telemetry translation) as
   reserved, like `trace_id`. **Operator action:** rename any such tag (for

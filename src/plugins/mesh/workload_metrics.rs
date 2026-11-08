@@ -42,7 +42,7 @@ use crate::plugins::otel_tracing::{
 };
 use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::utils::metadata_redaction::{
-    REDACTED_PLACEHOLDER, is_builtin_safe_metadata_name, is_credential_class_metadata_key,
+    REDACTED_PLACEHOLDER, is_credential_class_metadata_key, is_gateway_published_metadata_name,
     is_operator_sensitive_metadata_key, is_sensitive_header_name, is_sensitive_metadata_key,
 };
 use crate::plugins::{
@@ -2918,8 +2918,9 @@ fn validate_custom_tag_name(name: &str) -> Result<(), String> {
         // A custom tag is written into transaction metadata, so it must never
         // overwrite a key the gateway itself publishes there: other plugins
         // read those keys as coordination and decision state (for example
-        // `ai_stream_router_pass_through` gates `ai_federation` admission).
-        || is_builtin_safe_metadata_name(name)
+        // `ai_stream_router_pass_through` gates `ai_federation` admission, and
+        // `request_body` is the buffered-body view request guards inspect).
+        || is_gateway_published_metadata_name(name)
         || names_builtin_plugin_namespace(name);
     if reserved || is_sensitive_metadata_key(name) {
         return Err(format!(

@@ -114,7 +114,8 @@ fn grpc_method_metadata_keys_are_reserved_custom_tag_names() {
     // So is every other key the gateway publishes into metadata, and a
     // built-in plugin's `<plugin>_` namespace: a literal
     // `ai_stream_router_pass_through` tag would make `ai_federation` skip its
-    // model/provider admission.
+    // model/provider admission, and a `request_body` tag would replace the
+    // buffered-body view `ai_request_guard` inspects.
     for name in [
         "ai_transcript_audit.record_id",
         "ai_transcript_audit.anything",
@@ -127,6 +128,8 @@ fn grpc_method_metadata_keys_are_reserved_custom_tag_names() {
         "consumer_username",
         "fault_injected",
         "namespace",
+        "request_body",
+        "response_body",
     ] {
         for config in [
             json!({"custom_tags": {name: "shared"}}),
