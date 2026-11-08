@@ -516,3 +516,78 @@ fn claim_headers_refuse_the_whole_consumer_assertion_namespace() {
         "Istio outputClaimToHeaders shares the reserved namespace"
     );
 }
+
+/// Claim destinations must be application-specific headers. Every standard
+/// HTTP request field is refused, because a transport, client library or the
+/// gateway may write it after the final gateway-assertion pass (reqwest's
+/// `Accept: */*` and `User-Agent`, tungstenite's `Sec-WebSocket-*`, the
+/// per-attempt `traceparent`, the remaining `grpc-timeout`, ...), so an absent
+/// claim would not stay absent on the wire. One shared predicate refuses them
+/// for `claim_headers`, `output_claim_headers`, OPA `decision_request_headers`,
+/// and mesh `outputClaimToHeaders`; an ordinary destination is still admitted.
+#[test]
+fn owned_destinations_refuse_standard_http_request_fields() {
+    for header in [
+        "Accept",
+        "Sec-WebSocket-Key",
+        "User-Agent",
+        "Origin",
+        "traceparent",
+        "TraceState",
+        "grpc-timeout",
+        "X_Geo_Country",
+        "x-b3-traceid",
+        "If_None_Match",
+    ] {
+        let config = json!({"claim_headers": {"sub": header}});
+        let error = parse_claim_headers(
+            config.as_object().expect("object"),
+            "claim_headers",
+            "test_auth",
+            PREFIX,
+        )
+        .expect_err("a standard request field must fail claim_headers admission");
+        assert!(error.contains("gateway-reserved"), "{header}: {error}");
+
+        let config = json!({"output_claim_headers": [{"claim": "sub", "header": header}]});
+        let error = ferrum_edge::plugins::utils::claim_header_fanout::parse_claim_header_list(
+            config.as_object().expect("object"),
+            "output_claim_headers",
+            "test_auth",
+            PREFIX,
+        )
+        .expect_err("a standard request field must fail output_claim_headers admission");
+        assert!(error.contains("gateway-reserved"), "{header}: {error}");
+
+        assert!(
+            ferrum_edge::plugins::utils::claim_header_fanout::is_output_claim_reserved_header(
+                header
+            ),
+            "{header}: mesh outputClaimToHeaders shares the predicate"
+        );
+        let opa = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": "ferrum/authz/allow",
+            "decision_request_headers": [header],
+        });
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("opa", &opa).is_err(),
+            "{header}"
+        );
+    }
+    let config = json!({"claim_headers": {"email": "X-User-Email"}});
+    let admitted = parse_claim_headers(
+        config.as_object().expect("object"),
+        "claim_headers",
+        "test_auth",
+        PREFIX,
+    )
+    .expect("an ordinary destination is admitted");
+    assert_eq!(admitted.len(), 1);
+    let opa = json!({
+        "opa_host": "http://127.0.0.1:8181",
+        "policy_path": "ferrum/authz/allow",
+        "decision_request_headers": ["X-User-Email"],
+    });
+    assert!(ferrum_edge::plugins::validate_plugin_config("opa", &opa).is_ok());
+}

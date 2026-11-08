@@ -1696,3 +1696,91 @@ fn a_request_without_authorization_is_unaffected() {
         assert_eq!(check_protocol(&headers, version), None, "{version:?}");
     }
 }
+
+// ============================================================================
+// One Content-Type media type per request (gRPC-Web reinterpretation)
+// ============================================================================
+//
+// `Content-Type` is a singleton field (RFC 9110 §8.3). The gateway classifies
+// the first field line, while a backend may resolve to the last: two lines
+// `application/json` + `application/grpc-web+proto` let a backend parse a body
+// the gateway forwarded as JSON as gRPC-Web, body-embedded trailer frame
+// included. The guard refuses every such shape before routing, on every HTTP
+// version.
+
+const MULTIPLE_CONTENT_TYPE: &str = r#"{"error":"Request contains multiple Content-Type headers"}"#;
+const LISTED_CONTENT_TYPE: &str =
+    r#"{"error":"Content-Type header contains more than one media type"}"#;
+
+fn headers_with_content_type(values: &[&str]) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
+    for value in values {
+        headers.append(
+            hyper::header::CONTENT_TYPE,
+            HeaderValue::from_str(value).expect("content-type value"),
+        );
+    }
+    headers
+}
+
+#[test]
+fn repeated_content_type_field_lines_are_refused_on_every_version() {
+    for version in ALL_VERSIONS {
+        for values in [
+            ["application/json", "application/grpc-web+proto"],
+            ["application/grpc-web+proto", "application/json"],
+            ["application/json", "application/json"],
+        ] {
+            let headers = headers_with_content_type(&values);
+            assert_eq!(
+                check_protocol(&headers, version),
+                Some(MULTIPLE_CONTENT_TYPE),
+                "{version:?} {values:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn listed_content_type_media_types_are_refused() {
+    for version in ALL_VERSIONS {
+        for value in [
+            "application/json, application/grpc-web+proto",
+            "application/json,application/grpc-web-text",
+            r#"text/plain; a="x", application/grpc-web"#,
+            // An unterminated quoted string that swallowed a comma.
+            r#"text/plain; a="x, application/grpc-web"#,
+        ] {
+            let headers = headers_with_content_type(&[value]);
+            assert_eq!(
+                check_protocol(&headers, version),
+                Some(LISTED_CONTENT_TYPE),
+                "{version:?} {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_content_type_media_types_are_still_accepted() {
+    for version in ALL_VERSIONS {
+        for value in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/grpc-web+proto",
+            "application/grpc",
+            // A comma inside a quoted parameter value separates nothing.
+            r#"multipart/form-data; boundary="a,b""#,
+            r#"multipart/form-data; boundary="a,application/grpc-web,b""#,
+            r#"text/plain; a="esc \" , b""#,
+        ] {
+            let headers = headers_with_content_type(&[value]);
+            assert_eq!(
+                check_protocol(&headers, version),
+                None,
+                "{version:?} {value:?}"
+            );
+        }
+    }
+}

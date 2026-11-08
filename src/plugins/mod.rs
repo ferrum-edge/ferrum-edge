@@ -2876,6 +2876,14 @@ pub struct RequestContext {
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
     request_headers_to_redact: Option<Arc<Vec<String>>>,
+    /// Names every late request-trailer boundary strips for this route: the
+    /// credential locations above plus every owned gateway-assertion header
+    /// (`claim_headers` destinations), precomputed by the plugin cache.
+    request_trailer_strip_headers: Option<Arc<Vec<String>>>,
+    /// Every gateway-assertion request header a plugin on the matched route
+    /// owns, whatever any trigger decides (plugin cache view). `None` when the
+    /// route owns none.
+    route_owned_request_assertion_headers: Option<Arc<Vec<String>>>,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains
@@ -3877,6 +3885,22 @@ pub(crate) struct PluginRequestState {
     /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
     /// configured.
     pub(crate) sanitized_claim_header_destinations: HashSet<String>,
+    /// CURRENT authorized state of every gateway-asserted request header an
+    /// admitted owner decided on for this request, keyed by its
+    /// backend-equivalent name (ASCII lowercase, `_` folded to `-`):
+    /// `Some((wire_name, value))` when the latest admitted owner installed
+    /// `value` under the header-map key `wire_name`, `None` when it cleared the
+    /// destination (a missing claim, an OPA allow without that obligation, a
+    /// forwarding identity with no peer identity). A later decision replaces
+    /// an earlier one, so a withdrawn value can never be resurrected on stale
+    /// provenance. The final gateway-assertion pass reduces each owned
+    /// backend-equivalence class to at most the one `wire_name: value` entry;
+    /// a trigger-skipped owner never writes here.
+    pub(crate) request_assertion_state: Vec<(String, Option<(String, String)>)>,
+    /// Set by the `grpc_web` translation owner's own `before_proxy` once it
+    /// rewrote this request to native gRPC. A request whose final outbound
+    /// `content-type` is gRPC-Web without this marker was not translated.
+    pub(crate) grpc_web_translated: bool,
     /// Digests of credential-bearing query parameters that were present before
     /// authentication and request transformation. Kept outside public metadata
     /// so neither reusable credentials nor correlatable digests enter logs.
@@ -4720,6 +4744,8 @@ impl RequestContext {
             cors_state: cors::CorsRequestState::default(),
             plugin_state: None,
             request_headers_to_redact: None,
+            request_trailer_strip_headers: None,
+            route_owned_request_assertion_headers: None,
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
@@ -6389,6 +6415,10 @@ impl RequestContext {
             // back from this compatibility context.
             cors_state: cors::CorsRequestState::default(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
+            request_trailer_strip_headers: self.request_trailer_strip_headers.clone(),
+            route_owned_request_assertion_headers: self
+                .route_owned_request_assertion_headers
+                .clone(),
             // Per-plugin working state. The split into `PluginRequestState`
             // did not change any family's lifecycle here: most are CLONED, the
             // claim-header staging and the `response_caching` header delta stay
@@ -6682,13 +6712,101 @@ impl RequestContext {
             .unwrap_or(&[])
     }
 
-    /// Shared handle to the same configured credential header list, for the
-    /// late request-trailer boundaries that outlive this context (streaming
-    /// request-body adapters and HTTP/3 upload pumps). One reference-count
-    /// increment, and `None` when the route configures no credential header,
-    /// so an unauthenticated route carries nothing into its body adapter.
+    /// Install the route's request-trailer strip list (credential locations
+    /// plus owned gateway-assertion headers) and the route's owned
+    /// gateway-assertion headers, from the plugin cache view.
+    pub(crate) fn set_request_trailer_strip_headers(
+        &mut self,
+        headers: Arc<Vec<String>>,
+        owned_assertion_headers: Arc<Vec<String>>,
+    ) {
+        if !owned_assertion_headers.is_empty() {
+            self.route_owned_request_assertion_headers = Some(owned_assertion_headers);
+        }
+        if !headers.is_empty() {
+            self.request_trailer_strip_headers = Some(headers);
+        }
+    }
+
+    /// Whether a plugin on the matched route owns any gateway-assertion
+    /// request header (`Plugin::owned_request_assertion_header_names`).
+    pub(crate) fn route_owns_request_assertion_headers(&self) -> bool {
+        self.route_owned_request_assertion_headers.is_some()
+    }
+
+    /// Every gateway-assertion request header a plugin on the matched route
+    /// owns, or `None` when it owns none.
+    pub(crate) fn route_owned_request_assertion_headers(&self) -> Option<&[String]> {
+        self.route_owned_request_assertion_headers
+            .as_deref()
+            .map(Vec::as_slice)
+    }
+
+    /// Replace the current authorized state of the gateway-asserted header a
+    /// backend reads as `name`: `Some(value)` for an install under the
+    /// header-map key `name`, `None` for a clear. The final gateway-assertion
+    /// pass (`proxy::enforce_route_owned_request_assertions`) and the
+    /// trigger-skip sanitizers keep, per backend-equivalence class, only the
+    /// one entry `name: value` of the current install.
+    ///
+    /// Gated by its callers: only an admitted owner's own decision reaches it
+    /// (a claim install, an OPA allow, a forwarded SPIFFE identity), so a route
+    /// that owns no asserted header (and the plugin-free request path) never
+    /// materializes per-plugin state here.
+    fn set_request_assertion_state(&mut self, name: &str, value: Option<&str>) {
+        let folded = name.to_ascii_lowercase().replace('_', "-");
+        let value = value.map(|value| (name.to_string(), value.to_string()));
+        let state = &mut self.plugin_state_mut().request_assertion_state;
+        match state.iter_mut().find(|(owned, _)| *owned == folded) {
+            Some((_, current)) => *current = value,
+            None => state.push((folded, value)),
+        }
+    }
+
+    /// An admitted owner installed `name: value` for this request; it replaces
+    /// any earlier decision for that destination.
+    pub(crate) fn record_installed_request_assertion(&mut self, name: &str, value: &str) {
+        self.set_request_assertion_state(name, Some(value));
+    }
+
+    /// An admitted owner cleared `name` for this request (it sanitized the
+    /// destination and installed nothing); any earlier owner's value is
+    /// retired, so nothing can bring it back.
+    pub(crate) fn record_cleared_request_assertion(&mut self, name: &str) {
+        self.set_request_assertion_state(name, None);
+    }
+
+    /// Shared handle to the route's request-trailer strip list, for the late
+    /// request-trailer boundaries that outlive this context (streaming
+    /// request-body adapters and HTTP/3 upload pumps): every configured
+    /// credential header location plus every header a plugin on the route
+    /// owns as a gateway assertion (`claim_headers` / `output_claim_headers`
+    /// destinations, whatever any trigger decides). One reference-count
+    /// increment, and `None` when the route configures neither, so an
+    /// unauthenticated route carries nothing into its body adapter. A context
+    /// that never received the strip list falls back to the credential list.
     pub(crate) fn request_trailer_credential_header_names(&self) -> Option<Arc<Vec<String>>> {
-        self.request_headers_to_redact.clone()
+        self.request_trailer_strip_headers
+            .clone()
+            .or_else(|| self.request_headers_to_redact.clone())
+    }
+
+    /// Whether a request trailer named `name` must be dropped at a late
+    /// request-trailer boundary on this route (gRPC-Web trailer staging).
+    /// Matched as a CGI-style backend reads names (ASCII case-insensitive,
+    /// `_` read as `-`), like
+    /// [`crate::proxy::headers::strip_configured_credential_request_trailers`].
+    pub(crate) fn request_trailer_must_be_stripped(&self, name: &str) -> bool {
+        use crate::proxy::headers::field_names_equivalent_for_backends;
+
+        self.request_trailer_strip_headers
+            .as_ref()
+            .or(self.request_headers_to_redact.as_ref())
+            .is_some_and(|headers| {
+                headers
+                    .iter()
+                    .any(|header| field_names_equivalent_for_backends(name, header))
+            })
     }
 
     /// Retain one credential-query digest outside public metadata.
@@ -7409,6 +7527,32 @@ impl RequestContext {
     #[inline]
     pub(crate) fn raw_headers_snapshot(&self) -> Option<Arc<HeaderMap>> {
         self.raw_headers.clone()
+    }
+
+    /// Drop every retained client field line for the route's owned
+    /// gateway-assertion headers from the pristine wire view, after the final
+    /// assertion pass. Every later consumer that rebuilds a backend or mirror
+    /// request from it (the secured-mesh retry replay through
+    /// [`Self::raw_headers_snapshot`], request mirroring) then inherits the
+    /// strip, so a retry can never restore the client's lines for an owned
+    /// name. Copies the map only when a line actually matches.
+    pub(crate) fn strip_route_owned_assertion_raw_lines(&mut self) {
+        use crate::proxy::headers::field_names_equivalent_for_backends;
+
+        let Some(owned) = self.route_owned_request_assertion_headers.clone() else {
+            return;
+        };
+        let Some(raw) = self.raw_headers.as_mut() else {
+            return;
+        };
+        let matches = raw.keys().any(|name| {
+            owned
+                .iter()
+                .any(|owned| field_names_equivalent_for_backends(name.as_str(), owned))
+        });
+        if matches {
+            crate::proxy::remove_owned_assertion_field_lines(Arc::make_mut(raw), &owned);
+        }
     }
 
     /// Look up a single header from the raw `HeaderMap` without materializing
@@ -11379,6 +11523,54 @@ impl std::ops::BitOr for PluginHooks {
     }
 }
 
+/// Reduce every backend-equivalence class (ASCII case-insensitive, `_` read
+/// as `-`) of the owned request header `names` in `headers` to at most ONE
+/// entry: the current install of an admitted owning instance
+/// ([`RequestContext::record_installed_request_assertion`]), under the exact
+/// header-map key that owner wrote. Every other entry of the class is removed,
+/// including an equal-valued copy under another spelling (a later writer such
+/// as `correlation_id` preserving a client `x_app_user`), because the backend
+/// boundaries would emit each spelling as its own field line. A class whose
+/// owner's entry was dropped or rewritten, or that was cleared or never
+/// decided for this request, is removed entirely.
+///
+/// The final gateway-assertion pass over the outbound map
+/// (`proxy::enforce_route_owned_request_assertions`) applies it to the
+/// route's whole owned set; the claim plugins, `opa` and `spiffe_identity`
+/// apply it to their own names when their trigger skips a request. It never
+/// allocates.
+pub(crate) fn strip_uninstalled_request_assertions<N: AsRef<str>>(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+    names: &[N],
+) {
+    use crate::proxy::headers::field_names_equivalent_for_backends;
+
+    let is_owned = |header: &str| {
+        let mut owned = names.iter().map(|name| name.as_ref());
+        owned.any(|name| field_names_equivalent_for_backends(header, name))
+    };
+    if !headers.keys().any(|header| is_owned(header.as_str())) {
+        return;
+    }
+    let state = ctx
+        .plugin_state()
+        .map(|state| state.request_assertion_state.as_slice())
+        .unwrap_or_default();
+    // Header-map keys are unique, so keeping only the owner's exact key leaves
+    // at most one entry per class.
+    headers.retain(|header, value| {
+        if !is_owned(header.as_str()) {
+            return true;
+        }
+        state
+            .iter()
+            .find(|(folded, _)| field_names_equivalent_for_backends(folded, header))
+            .and_then(|(_, current)| current.as_ref())
+            .is_some_and(|(wire_name, installed)| header == wire_name && *value == *installed)
+    });
+}
+
 /// Plugin lifecycle hooks.
 ///
 /// `Any` is a supertrait so built-in trust can be keyed on the concrete type a
@@ -12093,6 +12285,54 @@ pub trait Plugin: Any + Send + Sync {
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Remove client-supplied copies of the request headers this instance owns
+    /// as gateway assertions, without installing anything.
+    ///
+    /// The per-instance execution-trigger wrapper calls this in place of
+    /// [`Plugin::before_proxy`] when the instance's trigger skips the request.
+    /// It is deliberately outside the trigger boundary, like credential-redaction
+    /// discovery: a skipped instance installs no assertion, but a header it
+    /// documents as always sanitized must still never reach the backend carrying
+    /// a client-chosen value. Implementations must strip exactly what
+    /// `before_proxy` strips unconditionally, must not undo a value a sibling
+    /// instance already installed, must be synchronous and allocation-light, and
+    /// must never log header values. The default owns nothing.
+    fn sanitize_owned_request_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &mut HashMap<String, String>,
+    ) {
+    }
+
+    /// Request header names this instance owns as gateway assertions on every
+    /// request, whatever its trigger decides (`claim_headers` and
+    /// `output_claim_headers` destinations). Collected once when the plugin
+    /// cache is built and folded into the route's request-trailer strip list,
+    /// so a client can never restate one of them in request trailers, which
+    /// are read after the initial header block was sanitized. The default owns
+    /// nothing.
+    ///
+    /// Built-in only for now: the final gateway-assertion pass keeps an owned
+    /// header only as a value recorded through the crate-private
+    /// `RequestContext::record_installed_request_assertion`, which an
+    /// out-of-tree plugin cannot call. A custom plugin that declares names here
+    /// therefore has its own installs of them removed before dispatch; leave
+    /// this at the default.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Request headers this instance's static configuration writes, as
+    /// `(lowercase destination name, literal value)` pairs. The value is
+    /// `None` when it is request-derived at runtime (a `$(...)` template, or a
+    /// rename that moves a client value). Removals are not writes. Collected
+    /// only at plugin-cache publication, to refuse a write that would
+    /// re-author a header another plugin on the route owns as a gateway
+    /// assertion. The default writes nothing.
+    fn configured_request_header_writes(&self) -> Vec<(String, Option<String>)> {
+        Vec::new()
     }
 
     /// Returns `true` when `before_proxy` can dispatch external work or

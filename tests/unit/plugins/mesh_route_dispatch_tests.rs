@@ -1419,6 +1419,32 @@ fn mesh_route_dispatch_rejects_protocol_managed_response_transform_destinations(
     MeshRouteDispatch::new(&ordinary).expect("ordinary response_transform must still admit");
 }
 
+/// Every route `request_transform` add/update is published as a configured
+/// request-header write, so plugin-cache publication can refuse one that
+/// re-authors a gateway-asserted header another plugin on the route owns.
+/// Removals write nothing.
+#[test]
+fn mesh_route_dispatch_reports_request_transform_writes() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "svc.internal", "backend_port": 8080},
+            "request_transform": [
+                {"operation": "update", "key": "X-User-Email", "value": "ceo@corp.example"},
+                {"operation": "remove", "key": "x-drop"}
+            ]
+        }]
+    }))
+    .expect("valid route transforms");
+    assert_eq!(
+        plugin.configured_request_header_writes(),
+        vec![(
+            "x-user-email".to_string(),
+            Some("ceo@corp.example".to_string()),
+        )]
+    );
+}
+
 /// The whole `x-consumer-*` namespace is gateway-owned consumer assertion
 /// metadata, so a VirtualService `headers.request.{set,add}` modifier may not
 /// target it, matching `request_transformer` admission. The error names the

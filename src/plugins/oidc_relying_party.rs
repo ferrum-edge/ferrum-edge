@@ -31,7 +31,7 @@ use super::utils::auth_flow::{
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
-    emit_claim_headers_to_attempt, parse_claim_headers,
+    emit_claim_headers_to_attempt, parse_claim_headers, sanitize_claim_header_destinations,
 };
 use super::utils::claim_resolver::{extract_claim_string, extract_claim_string_exact};
 use super::utils::jwks_cache::{
@@ -3383,6 +3383,25 @@ impl super::Plugin for OidcRelyingParty {
         }
         Some(names)
     }
+    /// A trigger-skipped instance still strips its owned claim destinations,
+    /// so a client copy is never forwarded as a gateway claim assertion. It
+    /// leaves `Authorization` alone: the relayed access token is a credential
+    /// the backend verifies, owned only on requests this instance runs for, so
+    /// a request its trigger hands to another authenticator keeps that
+    /// mechanism's `Authorization`.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        sanitize_claim_header_destinations(ctx, headers, &self.provider.claim_header_destinations);
+    }
+    /// Every owned claim destination, for the route's request-trailer strip
+    /// list: a trailer can never restate a gateway claim assertion.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        let destinations = &self.provider.claim_header_destinations;
+        destinations.names().map(str::to_string).collect()
+    }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -3396,8 +3415,9 @@ impl super::Plugin for OidcRelyingParty {
         }
         apply_claim_headers_from_context(ctx, headers, &self.provider.claim_header_destinations);
         if self.provider.forward_access_token {
-            // The backend `Authorization` header is gateway-owned on this
-            // route: every client copy (any case) is removed first, so a
+            // The backend `Authorization` header is gateway-owned on every
+            // request this instance runs for: every client copy (any case) is
+            // removed first, so a
             // request whose accepted principal is not this session — or a
             // session without a relayable token — never forwards
             // client-supplied credentials in its place.

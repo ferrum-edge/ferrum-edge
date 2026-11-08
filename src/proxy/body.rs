@@ -2790,13 +2790,15 @@ pub(crate) fn sanitize_backend_request_trailer_frame(frame: Frame<Bytes>) -> Fra
     }
 }
 
-/// Remove the route's configured credential header locations from a request
+/// Remove the route's configured credential header locations and owned
+/// gateway-assertion headers (`claim_headers` destinations) from a request
 /// TRAILERS frame, after [`sanitize_backend_request_trailer_frame`] has
 /// applied the static boundary.
 ///
-/// The static predicate knows only the fixed credential names. A custom
-/// `key_auth` `header:<name>` (or JWT / JWKS / OAuth token header) is per-route
-/// configuration, so the streaming adapters carry the route's precomputed list
+/// The static predicate knows only the fixed names. A custom `key_auth`
+/// `header:<name>` (or JWT / JWKS / OAuth token header) or a claim destination
+/// is per-route configuration, so the streaming adapters carry the route's
+/// precomputed list
 /// (`RequestContext::request_trailer_credential_header_names`) and apply it
 /// here ([`crate::proxy::headers::strip_configured_credential_request_trailers`]).
 /// Nothing runs for a DATA frame or a route without configured names.

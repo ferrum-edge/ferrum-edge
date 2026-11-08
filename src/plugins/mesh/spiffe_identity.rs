@@ -616,6 +616,19 @@ impl Plugin for SpiffeIdentity {
         self.forward_identity
     }
 
+    /// With `forward_identity`, the fixed [`FORWARDED_IDENTITY_HEADER`] is a
+    /// gateway assertion on every request: it joins the route's
+    /// request-trailer strip list and marks the route as owning an asserted
+    /// header (so untranslated gRPC-Web, whose trailers ride in the body, is
+    /// refused there).
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        if self.forward_identity {
+            vec![FORWARDED_IDENTITY_HEADER.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Audited (issue #6793): this plugin reads only the peer certificate and
     /// writes only the peer identity; it never reads, iterates or forwards the
     /// `mesh.*` workload labels in either metadata map.
@@ -706,13 +719,40 @@ impl Plugin for SpiffeIdentity {
                 FORWARDED_IDENTITY_HEADER,
             )
         });
-        if let Some(id) = ctx.peer_spiffe_id.as_ref() {
-            headers.insert(
-                FORWARDED_IDENTITY_HEADER.to_string(),
-                id.as_str().to_string(),
-            );
+        let peer_id = ctx
+            .peer_spiffe_id
+            .as_ref()
+            .map(|id| id.as_str().to_string());
+        // Current authorized state for the final gateway-assertion pass and a
+        // trigger-skipped sibling: exactly this identity, or none at all.
+        match peer_id {
+            Some(id) => {
+                ctx.record_installed_request_assertion(FORWARDED_IDENTITY_HEADER, &id);
+                headers.insert(FORWARDED_IDENTITY_HEADER.to_string(), id);
+            }
+            None => ctx.record_cleared_request_assertion(FORWARDED_IDENTITY_HEADER),
         }
         PluginResult::Continue
+    }
+
+    /// A trigger-skipped `forward_identity` instance forwards no identity, but
+    /// still removes every client-supplied [`FORWARDED_IDENTITY_HEADER`] copy,
+    /// so a trigger can never turn a client-chosen value into the gateway's
+    /// assertion. The only copy kept is the exact `(name, value)` pair an
+    /// admitted sibling instance's own `before_proxy` installed for this
+    /// request (typed provenance). A value that merely equals the request's
+    /// peer identity is no proof: the peer identity can be pre-stamped by the
+    /// accept path, and a client can send the same string.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        if !self.forward_identity {
+            return;
+        }
+        let owned = [FORWARDED_IDENTITY_HEADER];
+        crate::plugins::strip_uninstalled_request_assertions(ctx, headers, &owned);
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {

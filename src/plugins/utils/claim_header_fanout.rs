@@ -388,15 +388,59 @@ pub fn apply_claim_headers_from_context(
     if destinations.is_empty() {
         return;
     }
-    sanitize_owned_claim_header_destinations(ctx, headers, destinations);
-    for (metadata_key, header_name) in destinations.entries() {
+    let newly_claimed = sanitize_owned_claim_header_destinations(ctx, headers, destinations);
+    let mut installed_keys: Vec<&str> = Vec::new();
+    for (index, (metadata_key, header_name)) in destinations.entries().enumerate() {
         if let Some(value) = ctx
             .plugin_state_opt_mut()
             .and_then(|state| state.pending_claim_headers.remove(metadata_key))
         {
+            // Current authorized state for the final gateway-assertion pass:
+            // only this exact value survives it.
+            ctx.record_installed_request_assertion(header_name, &value);
             headers.insert(header_name.to_string(), value);
+            installed_keys.push(destinations.sanitization_keys[index].as_str());
         }
     }
+    // A destination this instance sanitized for this request and filled with
+    // nothing is cleared: any earlier owner's value (an OPA decision header of
+    // the same name, say) is retired rather than left as stale provenance. A
+    // destination an earlier claim instance already claimed keeps that
+    // instance's decision.
+    for (index, (_, header_name)) in destinations.entries().enumerate() {
+        let key = destinations.sanitization_keys[index].as_str();
+        if newly_claimed[index] && !installed_keys.contains(&key) {
+            ctx.record_cleared_request_assertion(header_name);
+        }
+    }
+}
+
+/// Strip every copy and spelling of the destinations this instance owns,
+/// without installing anything, except an exact `(name, value)` pair an
+/// admitted owner already installed for this request.
+///
+/// Used through [`crate::plugins::Plugin::sanitize_owned_request_headers`]
+/// when the owning instance's execution trigger skips the request: it
+/// authenticated nothing and installs nothing, but a client copy of a
+/// destination it owns must still never reach the backend as a gateway claim
+/// assertion. Provenance is the shared per-request install record
+/// (`RequestContext::record_installed_request_assertion`) every owner writes
+/// (a claim sibling, an OPA decision header, the forwarded SPIFFE ID), so a
+/// value another admitted owner of the same name installed survives, while
+/// every unverified copy goes. An admitted claim sibling that runs later
+/// still sanitizes and installs as usual.
+pub fn sanitize_claim_header_destinations(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    destinations: &ClaimHeaderDestinations,
+) {
+    if destinations.is_empty() {
+        return;
+    }
+    // The precomputed backend-equivalence keys name the same classes as the
+    // destinations, so the skip path allocates nothing.
+    let owned = destinations.sanitization_keys.as_slice();
+    crate::plugins::strip_uninstalled_request_assertions(ctx, headers, owned);
 }
 
 /// Remove every gateway-owned destination this instance still has to claim.
@@ -410,15 +454,23 @@ pub fn apply_claim_headers_from_context(
 /// `_` as `-` ([`crate::proxy::headers::field_names_equivalent_for_backends`]):
 /// a client `X_Authenticated_Email` reaches a CGI-style backend as the same
 /// variable as the gateway's `x-authenticated-email`.
+///
+/// Returns, per destination entry, whether THIS call claimed its sanitization
+/// (no earlier instance had).
 fn sanitize_owned_claim_header_destinations(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
     destinations: &ClaimHeaderDestinations,
-) {
+) -> Vec<bool> {
     if destinations.is_empty() {
-        return;
+        return Vec::new();
     }
     let sanitized = ctx.plugin_state_mut();
+    let newly_claimed: Vec<bool> = destinations
+        .sanitization_keys
+        .iter()
+        .map(|key| !sanitized.sanitized_claim_header_destinations.contains(key))
+        .collect();
     headers.retain(|name, _| {
         !destinations
             .names()
@@ -435,6 +487,7 @@ fn sanitize_owned_claim_header_destinations(
                 .insert(key.clone());
         }
     }
+    newly_claimed
 }
 
 /// A destination name as a CGI-style backend reads it: ASCII-lowercased with
@@ -593,6 +646,11 @@ pub fn is_output_claim_reserved_header(name: &str) -> bool {
         )
         || lowercase.starts_with("x-ferrum-")
         || lowercase.starts_with("x-forwarded-")
+        // Claim destinations must be application-specific headers: every
+        // standard HTTP request field a transport, client library or the
+        // gateway may write after the final gateway-assertion pass is refused
+        // (the one shared list, used by every owned-name validator).
+        || crate::proxy::headers::is_reserved_assertion_destination(&lowercase)
 }
 
 #[cfg(test)]

@@ -17,6 +17,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **BREAKING — requests with more than one `Content-Type` are refused**
+  (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
+  gateway classified a request by its first `Content-Type` field line while
+  forwarding every line, so a request sent with `application/json` and
+  `application/grpc-web+proto` passed the gRPC-Web checks as JSON, and a
+  backend reading the last line parsed its body as gRPC-Web, including a
+  body-embedded trailer frame that could restate a gateway-asserted header.
+  The ingress protocol guard now refuses, before routing and on HTTP/1.x,
+  HTTP/2 and HTTP/3 alike, repeated `Content-Type` field lines (`Request
+  contains multiple Content-Type headers`) and a single value listing more
+  than one media type after a comma outside a quoted string (`Content-Type
+  header contains more than one media type`). Ordinary requests get `400`;
+  native gRPC and gRPC-Web keep the existing protocol-error framing. On a
+  route that owns gateway-asserted headers, an untranslated request whose
+  outbound `content-type` lists more than one media type, or whose single
+  media type has a gRPC-Web essence (parameters ignored), is also refused with
+  `415`.
+- **A trigger-skipped instance still strips the gateway-owned request headers
+  it owns.** `claim_headers` / `output_claim_headers` destinations on
+  `jwks_auth`, `oauth2_introspection` and `oidc_relying_party` are documented
+  as always sanitized, and `spiffe_identity` with `forward_identity` owns
+  `x-ferrum-peer-spiffe-id` on every request. When such an instance carried an
+  execution trigger that a request missed, its whole `before_proxy` hook was
+  skipped, so a client-supplied copy (for example `X-User-Email` sent by a
+  `key_auth` consumer on a multi-auth route) reached the backend as if it were
+  a gateway assertion. A skipped instance now removes those client copies
+  through a new ungated `Plugin::sanitize_owned_request_headers` hook (no-op by
+  default) and installs nothing; a trigger-admitted sibling that installs a
+  verified value for the same header is unaffected (a skipped
+  `spiffe_identity` keeps the header only when an admitted sibling installed
+  it, not because a client value equals the peer identity). Every claim
+  destination on a route is also removed from client request trailers on
+  every protocol path (HTTP/1.1, HTTP/2, HTTP/3, native gRPC, gRPC-Web),
+  whatever any trigger decides, and route-configured trailer names (claim
+  destinations and custom credential locations alike) now match `_` spellings
+  as well as ASCII case. `opa` `decision_request_headers` join that trailer
+  list, and a trigger-skipped `opa` instance now also strips client copies of
+  those names from the initial header block (keeping only a value an admitted
+  sibling installed for the request). `mesh_authz` ext_authz
+  `headersToUpstreamOnAllow` names keep Istio semantics and are unchanged;
+  when one of them is also a header another plugin owns, an allowed CUSTOM
+  check's value (or its removal) is that header's current authorized value.
+  Plugin-cache publication now refuses a `request_transformer` header rule or
+  `mesh_route_dispatch` `request_transform` (a VirtualService
+  `headers.request.set`/`add`) that writes a header another plugin on the
+  route owns as a gateway assertion, or, on such a route without a `grpc_web`
+  translator, could set `content-type` to a gRPC-Web media type; a config or
+  mesh slice with such a rule is rejected (the last good one keeps serving).
+  Owned assertion destinations (`claim_headers`, `output_claim_headers`, OPA
+  `decision_request_headers`, mesh `outputClaimToHeaders`) must now be
+  application-specific headers: every standard HTTP request field (`Accept`,
+  `User-Agent`, `Origin`, `Cache-Control`, `If-*`, `Content-*`, `Sec-*`,
+  `Proxy-*`, `Access-Control-*`, the trace context, `grpc-*`, framing and
+  forwarding fields, ...) is refused at config load, because a transport or
+  client library may write it after the gateway's final check. A plugin config
+  or a mesh RequestAuthentication `outputClaimToHeaders` naming one is now
+  rejected (the mesh slice fails closed and the last good one keeps serving).
+  The gateway now enforces these assertions once more over the finalized
+  outbound header map on every protocol path (and drops the client's own
+  field lines for owned names from the dispatch body and the retained wire
+  view, so native gRPC, HBONE, mesh-mTLS, Unix and WebSocket dispatch, the
+  secured-mesh retry replay and `request_mirror` cannot restore them as
+  separate lines): an owned header reaches the
+  backend only as its current authorized value, as one field under the name
+  the owner wrote (the latest admitted owner's install or clear replaces any
+  earlier decision), so a later writer (for example a `correlation_id` preserving a
+  client value under the same name) can no longer restore a client copy, and
+  a request relabelled to a gRPC-Web `content-type` that the `grpc_web`
+  translator did not translate is refused with `415`.
+  Untranslated gRPC-Web, whose request
+  trailers ride inside the body where only the `grpc_web` translator parses
+  them, is now refused with `415` on a route that owns any of these
+  gateway-asserted headers (including `x-ferrum-peer-spiffe-id` from
+  `spiffe_identity` with `forward_identity`); add `grpc_web` to such a route to serve gRPC-Web
+  clients. A route that relied on a client value under one of those names
+  reaching the backend, in headers on trigger-excluded requests or in
+  trailers, no longer receives it. `oidc_relying_party`
+  `forward_access_token` owns the backend `Authorization` header on every
+  request the instance runs for; a request its trigger skips keeps the
+  `Authorization` the route's other mechanisms supply (documented).
 - **Stalled uploads can no longer hold the whole request-buffer budget.**
   Every buffered client request body used to charge its full retained
   ceiling (10 MiB by default) against `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES`

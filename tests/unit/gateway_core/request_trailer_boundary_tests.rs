@@ -352,7 +352,7 @@ fn every_late_request_trailer_boundary_strips_route_configured_credentials() {
     // route-configured credential names before validation.
     assert!(
         GRPC_WEB_SRC
-            .contains("trailers.retain(|(name, _)| !ctx.request_header_requires_redaction(name));"),
+            .contains("trailers.retain(|(name, _)| !ctx.request_trailer_must_be_stripped(name));"),
         "staged gRPC-Web request trailers must drop route-configured credential names"
     );
 }

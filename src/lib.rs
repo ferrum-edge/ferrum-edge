@@ -124,6 +124,56 @@ pub mod _test_support {
         ctx.set_request_headers_to_redact(std::sync::Arc::new(headers));
     }
 
+    /// Install a route's request-trailer strip list (credential locations plus
+    /// owned claim destinations) on a request context, as the H1/H2/H3
+    /// handlers do from `PluginCacheRequestView::request_trailer_strip_headers`.
+    pub fn set_request_trailer_strip_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        let owned = std::sync::Arc::new(headers.clone());
+        ctx.set_request_trailer_strip_headers(std::sync::Arc::new(headers), owned);
+    }
+
+    /// Install the request-trailer policy a plugin cache view carries, exactly
+    /// as the H1/H2 and H3 handlers do at request setup.
+    pub fn apply_request_view_trailer_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        view: &crate::plugin_cache::PluginCacheRequestView,
+    ) {
+        ctx.set_request_headers_to_redact(view.request_headers_to_redact());
+        ctx.set_request_trailer_strip_headers(
+            view.request_trailer_strip_headers(),
+            view.owned_request_assertion_headers(),
+        );
+    }
+
+    /// Drop the pristine client field lines for the route's owned
+    /// gateway-assertion headers, exactly as the H1/H2 ladder does after the
+    /// final assertion pass and before any raw-line reconstruction boundary.
+    pub fn strip_route_owned_assertion_field_lines_for_test(
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut hyper::HeaderMap,
+    ) {
+        crate::proxy::strip_route_owned_assertion_field_lines(ctx, headers);
+    }
+
+    /// Drop the retained wire view's client lines for the route's owned
+    /// assertion headers, as both ladders do after the final assertion pass.
+    pub fn strip_route_owned_assertion_raw_lines_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.strip_route_owned_assertion_raw_lines();
+    }
+
+    /// The retained wire view the secured-mesh retry replay and request
+    /// mirroring rebuild from (`RequestContext::raw_headers_snapshot`).
+    pub fn raw_headers_snapshot_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<hyper::HeaderMap> {
+        ctx.raw_headers_snapshot().map(|raw| raw.as_ref().clone())
+    }
+
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =

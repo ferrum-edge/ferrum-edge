@@ -24,7 +24,7 @@ use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
     emit_claim_headers_to_attempt, emit_output_claim_headers_to_attempt, parse_claim_header_list,
-    parse_claim_headers, parse_separator,
+    parse_claim_headers, parse_separator, sanitize_claim_header_destinations,
 };
 use super::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
@@ -2265,6 +2265,23 @@ impl super::Plugin for JwksAuth {
         }
         apply_claim_headers_from_context(ctx, headers, &self.claim_header_destinations);
         PluginResult::Continue
+    }
+
+    /// A trigger-skipped instance still strips its owned claim destinations,
+    /// so a client copy is never forwarded as a gateway claim assertion.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        sanitize_claim_header_destinations(ctx, headers, &self.claim_header_destinations);
+    }
+
+    /// Every owned claim destination, for the route's request-trailer strip
+    /// list: a trailer can never restate a gateway claim assertion.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        let destinations = &self.claim_header_destinations;
+        destinations.names().map(str::to_string).collect()
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

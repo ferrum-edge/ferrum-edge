@@ -810,7 +810,20 @@ impl Opa {
                 .iter()
                 .any(|destination| field_names_equivalent_for_backends(destination, name))
         });
+        // Current authorized state for the final gateway-assertion pass and a
+        // trigger-skipped sibling: every destination this decision did not
+        // fill is cleared (retiring an earlier instance's value), and every
+        // filled one carries exactly the policy's value.
+        for destination in destinations {
+            if !staged
+                .iter()
+                .any(|(name, _)| field_names_equivalent_for_backends(name, destination))
+            {
+                ctx.record_cleared_request_assertion(destination);
+            }
+        }
         for (name, value) in staged {
+            ctx.record_installed_request_assertion(&name, &value);
             ctx.headers.insert(name, value);
         }
     }
@@ -1147,6 +1160,29 @@ impl Plugin for Opa {
     /// `modified_request_header_names` keeps its conservative default.
     fn modifies_request_headers(&self) -> bool {
         !self.decision_request_headers.is_empty()
+    }
+
+    /// The policy-owned `decision_request_headers`: folded into the route's
+    /// request-trailer strip list, so a client can never restate one in
+    /// request trailers.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        self.decision_request_headers.clone()
+    }
+
+    /// A trigger-skipped instance decides nothing and installs nothing, but
+    /// its `decision_request_headers` stay policy-owned: every client spelling
+    /// is removed, and only a value an admitted OPA instance installed for
+    /// this request survives.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::plugins::strip_uninstalled_request_assertions(
+            ctx,
+            headers,
+            &self.decision_request_headers,
+        );
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

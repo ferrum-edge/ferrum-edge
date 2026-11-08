@@ -4054,6 +4054,60 @@ pub(crate) enum ClientRequestBody {
     Buffered(Box<BufferedClientRequestBody>),
 }
 
+impl ClientRequestBody {
+    /// The pristine client header block every raw-line reconstruction
+    /// boundary (native-gRPC, HBONE, mesh-mTLS and Unix merges, the WebSocket
+    /// collector) rebuilds the backend request from.
+    fn raw_headers_mut(&mut self) -> &mut hyper::HeaderMap {
+        match self {
+            Self::Streaming(request) => request.headers_mut(),
+            Self::Buffered(buffered) => &mut buffered.headers,
+        }
+    }
+}
+
+/// Drop every pristine client field line whose name a backend reads as one of
+/// the route's owned gateway-assertion headers (ASCII case-insensitive, `_`
+/// read as `-`).
+///
+/// The raw-line reconstruction boundaries
+/// ([`headers_mod::merge_proxy_headers_preserving_repeated`] for native gRPC,
+/// HBONE, mesh-mTLS and Unix dispatch, and the WebSocket handshake collector)
+/// keep the client's original field lines whenever their joined form equals
+/// the sanitized materialized value. For an owned assertion that equality is
+/// never permission: a verified `alice, admin` installed once must not reach
+/// the backend as the client's two separate lines. With the client's lines
+/// gone, every boundary emits only the provenance-approved value from the
+/// sanitized map, exactly once; unrelated repeated headers keep their raw
+/// field lines.
+pub(crate) fn strip_route_owned_assertion_field_lines(
+    ctx: &RequestContext,
+    headers: &mut hyper::HeaderMap,
+) {
+    let Some(owned) = ctx.route_owned_request_assertion_headers() else {
+        return;
+    };
+    remove_owned_assertion_field_lines(headers, owned);
+}
+
+/// Remove every field line of `headers` whose name a backend reads as one of
+/// `owned` (ASCII case-insensitive, `_` read as `-`). Allocates nothing when
+/// no line matches.
+pub(crate) fn remove_owned_assertion_field_lines(headers: &mut hyper::HeaderMap, owned: &[String]) {
+    let names: Vec<hyper::header::HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            owned
+                .iter()
+                .any(|owned| headers_mod::field_names_equivalent_for_backends(name.as_str(), owned))
+        })
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
+    }
+}
+
 /// Request body representation accepted by the secured mesh transports.
 ///
 /// The ordinary fast path keeps streaming the frontend body. Retry-enabled or
@@ -7474,6 +7528,11 @@ async fn run_finalized_request_egress_hooks_inner(
 /// where the bitset is already in scope; the internal scan keeps the rarely
 /// reached call sites correct without threading the capability set to them.
 ///
+/// After the plugin hooks, the gateway-assertion boundary
+/// ([`enforce_route_owned_request_assertions`]) runs over the same map for a
+/// route that owns asserted request headers; the plugin cache sets the
+/// capability bit for such a route, so every caller reaches it.
+///
 /// These hooks are the last plugin code that can write the outbound map, so
 /// when any of them ran the gateway-owned `X-Ferrum-Hops` count (issue #6109)
 /// is re-asserted after them: a built-in or custom implementation cannot reset
@@ -7491,6 +7550,7 @@ pub(crate) fn run_final_backend_header_policy_hooks(
             ran = true;
         }
     }
+    enforce_route_owned_request_assertions(ctx, headers);
     if ran {
         headers_mod::canonicalize_request_header_map(headers);
         hop_limit::reassert_outbound_proxy_hops_in_map(
@@ -33854,6 +33914,11 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     backend_path_is_policy_bound: bool,
     pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
+    if matches!(pass, BackendPathBeforeProxyPass::Initial)
+        && let Some(refusal) = refuse_untranslated_grpc_web_on_assertion_route(ctx)
+    {
+        return refusal;
+    }
     let last_route_request_finalizer = route_request_header_finalization_index(plugins);
     for (index, plugin) in plugins.iter().enumerate() {
         let deferred =
@@ -33905,6 +33970,12 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
                 return reject;
             }
         }
+    }
+    // A hook in this pass may have relabelled the request as gRPC-Web after
+    // the intake refusal above (a `request_transformer` `content-type` rule, a
+    // correlation or routing header writer): refuse it before any body leaves.
+    if let Some(refusal) = refuse_relabelled_grpc_web_on_assertion_route(ctx, headers) {
+        return refusal;
     }
     // All transports and deferred passes converge here before rebasing or
     // evaluating the backend path. Provider overrides share the same path
@@ -34016,6 +34087,127 @@ pub(crate) fn check_routed_path_parameters(
         }
     }
 }
+
+/// Refuse a recognized gRPC-Web request that no `grpc_web` translator claimed
+/// (none is on the route; publication refuses a trigger on the translator)
+/// when a plugin on the route owns gateway-assertion request headers.
+///
+/// Untranslated gRPC-Web is forwarded byte-for-byte, so a body-embedded `0x80`
+/// trailer frame reaches a gRPC-Web backend that may read it as request
+/// metadata. Only the translator parses that frame (and drops the route's
+/// owned names from it, `grpc_web::split_request_trailer_frame` staging); no
+/// gateway boundary sees it otherwise. On a route whose backend may treat
+/// `claim_headers` destinations, OPA `decision_request_headers` or
+/// `x-ferrum-peer-spiffe-id` as gateway assertions, forwarding a
+/// client-controlled trailer block would let the client restate one, so the
+/// request is refused before any `before_proxy` hook runs. The decision is
+/// taken from the frontend's own gRPC-Web classification and the
+/// translator's ownership marker, never from the request body.
+fn refuse_untranslated_grpc_web_on_assertion_route(ctx: &RequestContext) -> Option<PluginResult> {
+    if !ctx.request_is_grpc_web()
+        || !ctx.route_owns_request_assertion_headers()
+        || crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+    {
+        return None;
+    }
+    Some(untranslated_grpc_web_refusal())
+}
+
+/// Refuse, at the end of a `before_proxy` pass, a request on a route owning
+/// gateway-asserted request headers whose outbound `content-type` (any
+/// spelling a backend folds onto it) now names a gRPC-Web media type although
+/// the `grpc_web` translator did not translate THIS request. Only the
+/// translator's own marker (`grpc_web::request_was_translated`, set when it
+/// rewrote the request) counts; a translator merely configured on the route
+/// that declined the request does not.
+fn refuse_relabelled_grpc_web_on_assertion_route(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> Option<PluginResult> {
+    if !ctx.route_owns_request_assertion_headers()
+        || crate::plugins::grpc_web::request_was_translated(ctx)
+        || !outbound_content_type_is_grpc_web(headers)
+    {
+        return None;
+    }
+    Some(untranslated_grpc_web_refusal())
+}
+
+/// Whether any outbound header a backend reads as `content-type` may be read
+/// as gRPC-Web.
+fn outbound_content_type_is_grpc_web(headers: &HashMap<String, String>) -> bool {
+    headers.iter().any(|(name, value)| {
+        headers_mod::field_names_equivalent_for_backends(name, "content-type")
+            && content_type_may_be_grpc_web(value)
+    })
+}
+
+/// Whether a backend may read the `content-type` value as gRPC-Web.
+///
+/// A value listing more than one media type (a comma outside a properly closed
+/// quoted string, the same tokenizer as the ingress guard; a materialized pair
+/// of client field lines is `", "`-joined) always may, since a backend can
+/// resolve the singleton field to any member. Otherwise only the single media
+/// type's essence (the `type/subtype` before any `;`, trimmed, ASCII
+/// case-insensitive) is compared with the gRPC-Web media types: parameter
+/// values are never inspected, so a quoted `boundary` that merely contains a
+/// gRPC-Web-looking token is not gRPC-Web, and a gRPC-Web essence is gRPC-Web
+/// whatever its parameters.
+fn content_type_may_be_grpc_web(value: &str) -> bool {
+    if media_type_value_is_list(value.as_bytes()) {
+        return true;
+    }
+    let essence = value.split_once(';').map_or(value, |(essence, _)| essence);
+    crate::plugins::grpc_web::is_grpc_web_content_type(essence.trim())
+}
+
+fn untranslated_grpc_web_refusal() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 415,
+        body: UNTRANSLATED_GRPC_WEB_ASSERTION_ROUTE_BODY.to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
+}
+
+/// The authoritative gateway-assertion boundary over the finalized outbound
+/// request header map.
+///
+/// Every header a plugin on the matched route owns as a gateway assertion
+/// (`Plugin::owned_request_assertion_header_names`: `claim_headers` /
+/// `output_claim_headers` destinations, OPA decision headers,
+/// `x-ferrum-peer-spiffe-id`) survives as at most ONE entry: the current
+/// `(name, value)` install of an admitted owning instance for this request
+/// (`RequestContext::record_installed_request_assertion`), under the exact
+/// name it wrote. Every other copy and spelling is removed, even one whose
+/// value equals the install, because each spelling would reach the backend as
+/// its own field line. Runs inside [`run_final_backend_header_policy_hooks`],
+/// so after every `before_proxy` pass, every deferred pass and any
+/// finalized-egress header overlay, on the H1/H2 and H3 ladders alike, and
+/// whatever any trigger decided: no later writer (a `request_transformer`
+/// template, a correlation header, a routing transform, an egress overlay) can
+/// restore a client value under an owned name. A gRPC-Web `content-type` the
+/// `grpc_web` translator did not set for this request is removed too, which
+/// covers an egress overlay (the `before_proxy` passes refuse such a relabel
+/// with `415` instead).
+pub(crate) fn enforce_route_owned_request_assertions(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let Some(owned) = ctx.route_owned_request_assertion_headers() else {
+        return;
+    };
+    crate::plugins::strip_uninstalled_request_assertions(ctx, headers, owned);
+    if !crate::plugins::grpc_web::request_was_translated(ctx) {
+        headers.retain(|name, value| {
+            !(headers_mod::field_names_equivalent_for_backends(name, "content-type")
+                && content_type_may_be_grpc_web(value))
+        });
+    }
+}
+
+/// Fixed refusal body for [`refuse_untranslated_grpc_web_on_assertion_route`].
+const UNTRANSLATED_GRPC_WEB_ASSERTION_ROUTE_BODY: &str =
+    r#"{"error":"gRPC-Web must be translated on a route with gateway-asserted headers"}"#;
 
 pub(crate) fn reject_route_override_path(
     rejection: crate::policy_path::PolicyPathRejection,
@@ -37181,6 +37373,10 @@ async fn handle_proxy_request_inner(
     // From here a client abort is logged through this chain (issue #6768).
     client_abort_record.observe_plugins(&plugins);
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    ctx.set_request_trailer_strip_headers(
+        plugin_cache_view.request_trailer_strip_headers(),
+        plugin_cache_view.owned_request_assertion_headers(),
+    );
     // Bind this request to the same cache generation's static response-side
     // presentation policy that the plugin list above will execute, so a plugin
     // persisting a finalized representation can prove which rules produced it.
@@ -38593,6 +38789,14 @@ async fn handle_proxy_request_inner(
             &mut owned_proxy_headers,
         );
     }
+    // The pass above judged the plugin-facing map; the raw-line boundaries
+    // rebuild from the client's own field lines. Drop those lines for every
+    // owned assertion name once, here, from BOTH raw stores: the dispatch body
+    // (native gRPC, HBONE, mesh-mTLS, Unix, WebSocket) and the context's
+    // retained wire view that the secured-mesh retry replay and request
+    // mirroring rebuild from, so no boundary or retry can restore them.
+    strip_route_owned_assertion_field_lines(&ctx, client_request_body.raw_headers_mut());
+    ctx.strip_route_owned_assertion_raw_lines();
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();
@@ -56744,7 +56948,65 @@ fn check_protocol_headers_with_wire_framing(
     }
 
     // 6. Exactly one Authorization credential (all HTTP versions).
-    check_single_authorization_credential(headers)
+    if let Some(error) = check_single_authorization_credential(headers) {
+        return Some(error);
+    }
+
+    // 7. Exactly one Content-Type media type (all HTTP versions).
+    check_single_content_type(headers)
+}
+
+/// Check 7 of [`check_protocol_headers`]: the request carries at most one
+/// `Content-Type` field line, and that line names one media type.
+///
+/// `Content-Type` is a singleton field (RFC 9110 §8.3). With two field lines,
+/// or one comma-joined list, the gateway's own classification (the first
+/// media type) and a backend that resolves to another member can disagree
+/// about the body framing: a backend that picks a trailing
+/// `application/grpc-web+proto` parses a body the gateway forwarded as JSON as
+/// gRPC-Web, body-embedded trailer frame included, so a client could restate a
+/// gateway-asserted header past every gateway boundary. A comma inside a
+/// properly quoted parameter value (`boundary="a,b"`) separates nothing.
+/// Allocation-free: one `get_all` walk plus, only when the value holds a comma,
+/// one bounded byte scan of it.
+fn check_single_content_type(headers: &hyper::HeaderMap) -> Option<&'static str> {
+    let mut values = headers.get_all(hyper::header::CONTENT_TYPE).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return Some(r#"{"error":"Request contains multiple Content-Type headers"}"#);
+    }
+    if media_type_value_is_list(first.as_bytes()) {
+        return Some(r#"{"error":"Content-Type header contains more than one media type"}"#);
+    }
+    None
+}
+
+/// Whether a `Content-Type` value holds a comma outside a properly closed
+/// quoted string, i.e. more than one media type. An unterminated quoted string
+/// that swallowed a comma counts as a list too, since a lenient backend parser
+/// may split there.
+fn media_type_value_is_list(value: &[u8]) -> bool {
+    if !value.contains(&b',') {
+        return false;
+    }
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for &byte in value {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+        } else if byte == b'"' {
+            in_quotes = true;
+        } else if byte == b',' {
+            return true;
+        }
+    }
+    in_quotes
 }
 
 /// Check 6 of [`check_protocol_headers`]: the request carries at most one

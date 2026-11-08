@@ -85,6 +85,12 @@ use async_trait::async_trait;
 /// no-contribution answer in the proxy's `all(...)` fold: a skipped instance may
 /// neither need the body retained nor pin the response to the buffered path.
 ///
+/// Fail-safe work is NOT suppressed: credential-redaction discovery, and the
+/// removal of client copies of request headers the instance owns as gateway
+/// assertions (`sanitize_owned_request_headers`, run where `before_proxy` would
+/// have been). A trigger may only remove work, never add disclosure or let a
+/// client forge a gateway assertion.
+///
 /// Static chain-shape declarations (`supported_protocols`,
 /// `requires_*_body_buffering`, `modifies_request_*`) are deliberately NOT
 /// gated: they describe the published generation, not one request, and gating
@@ -809,6 +815,75 @@ fn validate_opa_obligations_against_credential_owners(
     Ok(())
 }
 
+/// Refuse a configured request-header write (a `request_transformer` header
+/// rule, a `mesh_route_dispatch` `request_transform`) that could re-author a
+/// header another plugin on the same chain owns as a gateway assertion
+/// (`Plugin::owned_request_assertion_header_names`): a `claim_headers`
+/// destination, an OPA decision header, `x-ferrum-peer-spiffe-id`.
+///
+/// Those writes run in `before_proxy`, after the owner's sanitization, so a
+/// template such as `$(header.x-user-email)` would copy the client's value
+/// straight back into the destination the owner just stripped, and a literal
+/// would assert a fixed identity no principal earned. On a chain that owns such
+/// a header but carries no `grpc_web` translator, a write that could label the
+/// request gRPC-Web (`content-type` with a request-derived value or a gRPC-Web
+/// literal) is refused too: it would run after the untranslated gRPC-Web
+/// refusal and send the client's body-embedded trailer frame to a gRPC-Web
+/// backend. Removing an owned header stays legal.
+fn validate_request_header_writes_against_owned_assertions(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    use crate::proxy::headers::field_names_equivalent_for_backends;
+
+    let owners: Vec<(&Arc<dyn Plugin>, Vec<String>)> = plugins
+        .iter()
+        .map(|plugin| (plugin, plugin.owned_request_assertion_header_names()))
+        .filter(|(_, owned)| !owned.is_empty())
+        .collect();
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let translator_present = plugins
+        .iter()
+        .any(|plugin| is_builtin_named(plugin, "grpc_web"));
+    for writer in plugins {
+        for (name, literal) in writer.configured_request_header_writes() {
+            for (owner, owned) in &owners {
+                if Arc::ptr_eq(owner, writer) {
+                    continue;
+                }
+                if owned
+                    .iter()
+                    .any(|owned| field_names_equivalent_for_backends(owned, &name))
+                {
+                    return Err(format!(
+                        "plugin {:?} writes request header {name:?}, which plugin {:?} on the \
+                         same effective plugin chain owns as a gateway assertion; a configured \
+                         rule must never re-author a gateway-asserted header",
+                        writer.name(),
+                        owner.name()
+                    ));
+                }
+            }
+            if !translator_present
+                && field_names_equivalent_for_backends(&name, "content-type")
+                && literal
+                    .as_deref()
+                    .is_none_or(crate::plugins::grpc_web::is_grpc_web_content_type)
+            {
+                return Err(format!(
+                    "plugin {:?} may set `content-type` to a gRPC-Web media type on a plugin \
+                     chain that owns gateway-asserted request headers but has no `grpc_web` \
+                     translator; untranslated gRPC-Web is refused there, and relabelling a \
+                     request after that refusal would forward its body-embedded trailers",
+                    writer.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
 pub(crate) fn validate_plugin_security_composition(
@@ -835,6 +910,7 @@ pub(crate) fn validate_plugin_security_composition(
     }
 
     validate_opa_obligations_against_credential_owners(plugins)?;
+    validate_request_header_writes_against_owned_assertions(plugins)?;
 
     for protocol in ALL_PROXY_PROTOCOLS {
         let identity_soap_count = plugins
@@ -1754,9 +1830,33 @@ impl Plugin for PluginInstanceWrapper {
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
         if !self.runs(ctx, TriggerPhase::PostAuth) {
+            // A skipped instance installs nothing, but it still owns the
+            // headers it documents as always sanitized (`claim_headers`
+            // destinations, `x-ferrum-peer-spiffe-id`, OPA decision headers).
+            // Leaving their client
+            // copies would let a trigger forward a client-chosen value the
+            // backend reads as a gateway assertion; like credential-redaction
+            // discovery, this fail-safe work is never gated.
+            self.inner.sanitize_owned_request_headers(ctx, headers);
             return PluginResult::Continue;
         }
         self.inner.before_proxy(ctx, headers).await
+    }
+    /// Deliberately UNGATED: see `before_proxy` above, its only caller.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner.sanitize_owned_request_headers(ctx, headers);
+    }
+    /// Static chain shape, never gated: the trailer strip list is per route.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        self.inner.owned_request_assertion_header_names()
+    }
+    /// Static chain shape, never gated: refused at publication.
+    fn configured_request_header_writes(&self) -> Vec<(String, Option<String>)> {
+        self.inner.configured_request_header_writes()
     }
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
         self.inner.defer_before_proxy_until_backend_path_resolved()
@@ -5244,6 +5344,10 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "request_transformer",
     "serverless_function",
     "soap_ws_security",
+    // `spiffe_identity` with `forward_identity` owns `x-ferrum-peer-spiffe-id`
+    // as a gateway assertion, which the request-header-write refusal reads.
+    // Construction is pure config parsing.
+    "spiffe_identity",
     "sse",
     "workload_metrics",
 ];
@@ -5786,11 +5890,12 @@ impl PluginCapabilities {
     /// entirely — no extra scan, clone, or hook pass on the ordinary hot path.
     pub const DISPATCHES_FINALIZED_REQUEST_EGRESS: u32 = 1 << 16;
     /// At least one plugin declared `enforces_final_backend_header_policy()`,
-    /// so the dispatch ladders must re-assert that plugin's backend-boundary
-    /// header policy over the finalized outbound header map after every generic
-    /// `before_proxy` header transform (`GHSA-xhp5-hqj8-3mwg`). Chains without
-    /// such a plugin skip the pass entirely — no extra scan or hook call on the
-    /// ordinary hot path.
+    /// or the chain owns gateway-asserted request headers, so the dispatch
+    /// ladders must re-assert the backend-boundary header policy (and the
+    /// gateway-assertion boundary) over the finalized outbound header map after
+    /// every generic `before_proxy` header transform (`GHSA-xhp5-hqj8-3mwg`).
+    /// Chains without either skip the pass entirely — no extra scan or hook
+    /// call on the ordinary hot path.
     pub const ENFORCES_FINAL_BACKEND_HEADER_POLICY: u32 = 1 << 17;
     /// This client-selected flavor view omits a request-admission instance
     /// (`Plugin::gates_request_admission`) that another view of the same
@@ -5877,6 +5982,19 @@ pub struct PluginPhaseData {
     pub backend_path_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Credential-bearing request header names used by safe downstream views.
     pub request_headers_to_redact: Arc<Vec<String>>,
+    /// Route-configured names every late request-trailer boundary strips:
+    /// the credential locations above plus every request header a plugin on
+    /// the route owns as a gateway assertion
+    /// (`Plugin::owned_request_assertion_header_names`), whatever any trigger
+    /// decides.
+    pub request_trailer_strip_headers: Arc<Vec<String>>,
+    /// Every gateway-assertion request header a plugin on the route owns
+    /// (`Plugin::owned_request_assertion_header_names`), whatever any trigger
+    /// decides. Non-empty sets `ENFORCES_FINAL_BACKEND_HEADER_POLICY`, so the
+    /// final assertion pass (`proxy::enforce_route_owned_request_assertions`)
+    /// runs on every dispatch ladder, and gates the untranslated gRPC-Web
+    /// refusal.
+    pub owned_request_assertion_headers: Arc<Vec<String>>,
     /// Deterministic initial-response header policy plugins, already filtered
     /// and kept in configured priority order for protocol boundary paths.
     pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -5958,6 +6076,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut backend_admission = Vec::new();
     let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
+    let mut owned_request_assertion_headers: Vec<String> = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
     let mut response_trailer_policy_names: Vec<String> = Vec::new();
@@ -6069,6 +6188,14 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
                 request_headers_to_redact.push(header.clone());
             }
         }
+        for header in p.owned_request_assertion_header_names() {
+            if !owned_request_assertion_headers
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&header))
+            {
+                owned_request_assertion_headers.push(header);
+            }
+        }
         if p.modifies_request_headers() {
             caps |= PluginCapabilities::MODIFIES_REQUEST_HEADERS;
         }
@@ -6131,6 +6258,21 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     if mesh_label_projection_deferrable {
         caps |= PluginCapabilities::MESH_LABEL_PROJECTION_DEFERRABLE;
     }
+    if !owned_request_assertion_headers.is_empty() {
+        // The final gateway-assertion pass rides the backend-boundary header
+        // policy pass, which every H1/H2 and H3 ladder runs at each point the
+        // outbound map is complete.
+        caps |= PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY;
+    }
+    let mut request_trailer_strip_headers = request_headers_to_redact.clone();
+    for header in &owned_request_assertion_headers {
+        if !request_trailer_strip_headers
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(header))
+        {
+            request_trailer_strip_headers.push(header.clone());
+        }
+    }
     PluginPhaseData {
         enforced_request_body_limit,
         enforced_response_body_limit,
@@ -6140,6 +6282,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         backend_admission_plugins: Arc::new(backend_admission),
         backend_path_plugins: Arc::new(backend_path),
         request_headers_to_redact: Arc::new(request_headers_to_redact),
+        request_trailer_strip_headers: Arc::new(request_trailer_strip_headers),
+        owned_request_assertion_headers: Arc::new(owned_request_assertion_headers),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
         response_trailer_policy_names: Arc::new(response_trailer_policy_names),
@@ -7349,6 +7493,10 @@ impl PluginCacheInner {
             backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
             backend_path_plugins,
             request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
+            request_trailer_strip_headers: Arc::clone(&entry.phase.request_trailer_strip_headers),
+            owned_request_assertion_headers: Arc::clone(
+                &entry.phase.owned_request_assertion_headers,
+            ),
             initial_response_header_policy_plugins: Arc::clone(
                 &entry.phase.initial_response_header_policy_plugins,
             ),
@@ -7386,6 +7534,8 @@ impl PluginCacheInner {
             backend_admission_plugins: Arc::new(Vec::new()),
             backend_path_plugins: None,
             request_headers_to_redact: Arc::new(Vec::new()),
+            request_trailer_strip_headers: Arc::new(Vec::new()),
+            owned_request_assertion_headers: Arc::new(Vec::new()),
             initial_response_header_policy_plugins: Arc::new(Vec::new()),
             initial_response_header_policy_names: Arc::new(Vec::new()),
             response_trailer_policy_names: Arc::new(Vec::new()),
@@ -7437,6 +7587,8 @@ pub struct PluginCacheRequestView {
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_path_plugins: Option<Arc<Vec<Arc<dyn Plugin>>>>,
     request_headers_to_redact: Arc<Vec<String>>,
+    request_trailer_strip_headers: Arc<Vec<String>>,
+    owned_request_assertion_headers: Arc<Vec<String>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
     response_trailer_policy_names: Arc<Vec<String>>,
@@ -7535,6 +7687,24 @@ impl PluginCacheRequestView {
     /// Get credential-bearing request headers precomputed for safe downstream views.
     pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.request_headers_to_redact)
+    }
+
+    /// Get the names every late request-trailer boundary strips on this route:
+    /// the credential locations plus every owned gateway-assertion header.
+    pub fn request_trailer_strip_headers(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.request_trailer_strip_headers)
+    }
+
+    /// Whether a plugin on this route owns any gateway-assertion request header
+    /// (`claim_headers` destinations, OPA decision headers,
+    /// `x-ferrum-peer-spiffe-id`).
+    pub fn owns_request_assertion_headers(&self) -> bool {
+        !self.owned_request_assertion_headers.is_empty()
+    }
+
+    /// Every gateway-assertion request header a plugin on this route owns.
+    pub fn owned_request_assertion_headers(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.owned_request_assertion_headers)
     }
 
     /// Get the pre-filtered deterministic initial-response header policy chain.

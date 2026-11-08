@@ -943,6 +943,14 @@ namespace and `x-geo-country`, matched with the same ASCII-case-insensitive,
 configure — a `key_auth` `header:<name>`, a custom `jwt_auth` / `jwks_auth` /
 `oauth2_introspection` token header — removed whether or not
 `hide_credentials` is set, because trailers are never a credential location);
+every gateway-asserted request header a plugin on the route owns, whatever
+that instance's execution trigger decides (`claim_headers` /
+`output_claim_headers` destinations of `jwks_auth`, `oauth2_introspection`,
+and `oidc_relying_party`, `opa` `decision_request_headers`, and
+`spiffe_identity` `x-ferrum-peer-spiffe-id`; route-configured names are matched
+ASCII-case-insensitively with `_` read as `-`). Untranslated gRPC-Web carries
+its trailers inside the body, where only the `grpc_web` translator parses
+them, so it is refused with `415` on a route that owns such a header;
 forwarding identity the gateway regenerates (`x-forwarded-*`, `forwarded`);
 initial-only gRPC call parameters (`grpc-*`); the gateway-owned `early-data`
 marker; the initial-section-only `via` intermediary chain; and header-section
@@ -1613,6 +1621,81 @@ chain for the request. If every auth instance is skipped, the excluded request
 is intentionally unauthenticated; if another instance applies, that instance's
 ordinary credential requirement and `WWW-Authenticate` challenge remain in
 force.
+
+Two pieces of fail-safe request work stay **outside** the trigger boundary,
+because gating them could only add disclosure or forgery, never remove work:
+
+- **Credential-redaction discovery** (`mark_query_credentials_for_redaction`,
+  `request_headers_to_redact`): a skipped auth instance still marks the query
+  parameters and headers that carry its credentials, so a trigger never leaks
+  a token into a log line.
+- **Owned request-header sanitization** (`sanitize_owned_request_headers`):
+  where `before_proxy` would have run, a skipped instance still removes the
+  client copies of the request headers it owns as gateway assertions and
+  installs nothing. Today that is every `claim_headers` / `output_claim_headers`
+  destination of `jwks_auth`, `oauth2_introspection`, and `oidc_relying_party`,
+  `opa` `decision_request_headers`, and `spiffe_identity`'s
+  `x-ferrum-peer-spiffe-id` with `forward_identity`. A skipped instance keeps
+  one of its names only as the current authorized value an admitted owner, of
+  any of these plugins, set for this request (one shared typed per-request
+  state, which a skipped instance never changes), never because of the value
+  alone: a skipped `jwks_auth` sharing
+  `X-Tenant` with an admitted OPA keeps OPA's value and drops every other
+  copy. `mesh_authz` ext_authz `headersToUpstreamOnAllow` names follow
+  Istio semantics instead: they are provider-owned only on a request the
+  instance CUSTOM-checked, so a skipped instance does not touch them. The
+  owned names are also on the route's request-trailer strip list (see
+  [Backend Request Trailers](#backend-request-trailers)), which no trigger
+  affects.
+
+The authoritative check runs once more over the finalized outbound header
+map, inside the backend-boundary header policy pass every H1/H2 and H3 ladder
+runs after each `before_proxy` pass and after any finalized-egress header
+overlay: on a route that owns asserted headers, each owned name survives only
+as its CURRENT authorized value for the request (typed per-request state: the
+latest admitted owner's install replaces, and its clear retires, any earlier
+decision), as ONE entry under the exact name that owner wrote, and every other
+copy or spelling is removed (an equal-valued `x_app_user` beside an installed
+`x-app-user` too, since each spelling would reach the backend as its own field
+line),
+whatever any trigger decided or any later plugin wrote. The client's own
+field lines for those names are then dropped from every pristine header
+store — the dispatch body and the request context's retained wire view — so
+the boundaries that rebuild a backend request from raw field lines (the
+native-gRPC, HBONE, mesh-mTLS and Unix merges, the WebSocket handshake
+collector, the secured-mesh retry replay and `request_mirror`) emit only the
+approved value, once, instead of restoring the client's lines because their
+joined form equals it. A request whose
+outbound `content-type` became a gRPC-Web media type during a `before_proxy`
+pass without the `grpc_web` translator having translated that request is
+refused with `415` (a `grpc_web` instance configured on the route but declining
+the request does not count); one set by an egress overlay is removed. A value
+listing more than one media type counts as gRPC-Web here, since a backend may
+resolve the singleton field to any member; a single media type counts when its
+essence (`type/subtype`, ignoring parameters) is a gRPC-Web type, and its
+parameter values are never inspected;
+the ingress protocol guard already refuses a client request with repeated or
+list-valued `Content-Type` with `400`.
+
+Publication also refuses, as defence in depth, a configured request-header
+write that would undo either guarantee: a `request_transformer` header rule or
+`mesh_route_dispatch` `request_transform` whose destination is a header another
+plugin on the route owns as a gateway assertion, and, on such a route without a
+`grpc_web` translator, one that could set `content-type` to a gRPC-Web media
+type.
+
+The final pass is the last point a plugin's outbound map is judged; some
+request fields are written after it by the gateway (per-attempt
+`traceparent`, the remaining `grpc-timeout`, `early-data`, the WebSocket
+handshake's gateway assertions, forwarding fields) or by a client library
+(`Accept: */*` and `User-Agent` from reqwest, `Host` and framing from hyper,
+the `Sec-WebSocket-*` handshake from tungstenite). Configuration admission
+therefore requires every owned assertion destination (`claim_headers`,
+`output_claim_headers`, OPA `decision_request_headers`, mesh
+`outputClaimToHeaders`) to be an application-specific header and refuses every
+standard HTTP request field (one shared list,
+`proxy::headers::is_reserved_assertion_destination`), so an absent claim stays
+absent on the wire.
 
 `response_caching` has one configuration-specific restriction: its default
 `add_cache_status_header: true` publishes named response-trailer ownership, a

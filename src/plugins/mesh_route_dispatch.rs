@@ -88,7 +88,8 @@ use crate::plugins::mesh::diagnostics::{self, Schema};
 use crate::plugins::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
 use crate::plugins::utils::query::{CanonicalQuery, canonical_query_for_policy};
 use crate::plugins::utils::route_header_transform::{
-    RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
+    RawRouteHeaderTransformRule, RouteHeaderTransformOp, RouteHeaderTransformRule,
+    parse_route_header_transforms,
 };
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
@@ -2518,6 +2519,19 @@ impl Plugin for MeshRouteDispatch {
 
     fn publishes_route_request_header_transforms(&self) -> bool {
         self.publishes_request_transforms
+    }
+
+    /// Every `request_transform` add/update any rule can publish (literal
+    /// values; a route transform has no templates).
+    fn configured_request_header_writes(&self) -> Vec<(String, Option<String>)> {
+        self.config
+            .rules
+            .iter()
+            .filter_map(|rule| rule.request_transform_compiled.as_deref())
+            .flatten()
+            .filter(|transform| transform.operation != RouteHeaderTransformOp::Remove)
+            .map(|transform| (transform.key.clone(), transform.value.clone()))
+            .collect()
     }
 
     /// Every instance: a matching rule replaces the staged request list,

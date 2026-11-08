@@ -26,6 +26,39 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+## Upgrading to the next release (unreleased)
+
+### Repeated `Content-Type` and gateway-asserted request headers (#7064)
+
+- **Repeated or list-valued `Content-Type` is refused.** `Content-Type` is a
+  singleton field (RFC 9110 §8.3). Ferrum now refuses, on every route and
+  before routing, a request that sends `Content-Type` as more than one field
+  line, or whose value lists more than one media type after a comma outside a
+  quoted string (`application/json, application/grpc-web+proto`). Ordinary
+  HTTP/1.x, HTTP/2 and HTTP/3 requests get `400` (`Request contains multiple
+  Content-Type headers` / `Content-Type header contains more than one media
+  type`). Native gRPC and gRPC-Web receive the protocol-error framing for their
+  flavor. A comma inside a quoted parameter (`boundary="a,b"`) is unaffected.
+  Clients or intermediaries that duplicate `Content-Type` must send one.
+- **Gateway-asserted request headers.** On a route where `jwks_auth`,
+  `oauth2_introspection` or `oidc_relying_party` configure `claim_headers` /
+  `output_claim_headers`, OPA sets `decision_request_headers`, or
+  `spiffe_identity` forwards `x-ferrum-peer-spiffe-id`, a client value under
+  one of those names never reaches the backend, including on requests an
+  instance's execution trigger skips and in request trailers. Backends that
+  relied on a client value under such a name must read it from another header.
+- **Untranslated gRPC-Web on such a route gets `415`.** Add `grpc_web` to the
+  route to serve gRPC-Web clients there.
+- **Configuration refused at load or publication.** These destinations must be
+  application-specific headers: a standard HTTP request field (`Accept`,
+  `User-Agent`, `Origin`, `Content-*`, `Sec-*`, the trace context, `grpc-*`,
+  ...) is rejected, including a mesh RequestAuthentication
+  `outputClaimToHeaders` (the slice fails closed and the last good one keeps
+  serving). A `request_transformer` rule or `mesh_route_dispatch`
+  `request_transform` that writes one of a route's owned headers, or that could
+  set a gRPC-Web `content-type` on such a route without `grpc_web`, is refused
+  at publication. Rename the destination or remove the rule before upgrading.
+
 Per-release sections below are written when a release is cut. Changes already
 on `main` but not yet released, including breaking ones, are listed under
 `[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before

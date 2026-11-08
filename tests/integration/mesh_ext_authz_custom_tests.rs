@@ -26,6 +26,10 @@ use ferrum_edge::plugins::mesh::ext_authz::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[allow(dead_code)]
+#[path = "../unit/plugins/jwks_auth_support.rs"]
+mod jwks_auth_support;
+
 /// How the stub authorizer answers one check.
 #[derive(Clone, Copy)]
 enum StubBehavior {
@@ -2487,4 +2491,182 @@ async fn a_scrape_racing_live_checks_keeps_the_histogram_consistent() {
         worker.await.expect("worker completes");
     }
     assert!(scrapes > 0, "at least one scrape observed the histogram");
+}
+
+/// A claim owner (`jwks_auth`) and a CUSTOM-checked `mesh_authz` naming the
+/// same upstream header, published through the real plugin cache and run
+/// through the final gateway-assertion pass.
+///
+/// Kept in this binary, beside the other live CUSTOM round trips: every check
+/// bumps the process-static `ferrum_mesh_ext_authz_*` counters, which each
+/// metrics render in the same test process then includes.
+mod route_owned_assertion_state {
+    use super::*;
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::types::{AuthMode, GatewayConfig, PluginConfig, Proxy};
+    use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
+    use serde_json::{Value, json};
+
+    use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+
+    /// A proxy-scoped plugin on `p1`; `skipped` adds a trigger admitting only
+    /// `POST`, so the `GET` below skips the instance.
+    fn plugin_config(id: &str, plugin_name: &str, config: Value, skipped: bool) -> PluginConfig {
+        let mut value = json!({
+            "id": id,
+            "plugin_name": plugin_name,
+            "scope": "proxy",
+            "proxy_id": "p1",
+            "config": config,
+        });
+        if skipped {
+            value["trigger"] = json!({"when": {"match": {"method": ["POST"]}}});
+        }
+        serde_json::from_value(value).expect("plugin config fixture")
+    }
+
+    /// Publishes `jwks_auth` owning `x-auth-request-user` as a claim
+    /// destination (trigger-skipped unless `jwks_user` names the verified user)
+    /// beside `mesh_authz` delegating `/admin/*` to a CUSTOM provider that
+    /// lists the same name in `headersToUpstreamOnAllow`, runs a request
+    /// forging the header, and returns the value that reaches the backend.
+    async fn owned_header_at_backend(
+        provider_port: u16,
+        path: &str,
+        mesh_skipped: bool,
+        jwks_user: Option<&str>,
+    ) -> Option<String> {
+        use ferrum_edge::_test_support::{
+            apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+            run_final_backend_header_policy_hooks_for_test,
+        };
+
+        let private_key_pem = include_bytes!("../fixtures/test_rsa_private.pem");
+        let public_key_pem = include_bytes!("../fixtures/test_rsa_public.pem");
+        let auth = plugin_config(
+            "auth",
+            "jwks_auth",
+            json!({"providers": [{
+                "jwks": build_rsa_jwks_from_pem(public_key_pem),
+                "claim_headers": {"user": "x-auth-request-user"}
+            }]}),
+            jwks_user.is_none(),
+        );
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": {"kind": "mesh_wide"},
+                "rules": [{
+                    "to": [{"paths": ["/admin/*"]}],
+                    "action": {"custom": {"provider": "user-ext-authz"}}
+                }]
+            }],
+            "ext_authz_providers": [{
+                "name": "user-ext-authz",
+                "service": "127.0.0.1",
+                "port": provider_port,
+                "timeout_ms": 500,
+                "fail_open": false,
+                "status_on_error": 403,
+                "headers_to_upstream_on_allow": ["x-auth-request-user"]
+            }]
+        });
+        let mesh = plugin_config(
+            "mesh",
+            "mesh_authz",
+            json!({"mesh_slice": slice}),
+            mesh_skipped,
+        );
+        let proxy: Proxy = serde_json::from_value(json!({
+            "id": "p1",
+            "listen_path": "/",
+            "backend_host": "localhost",
+            "backend_port": 3000,
+            "backend_scheme": "http",
+            "plugins": [{"plugin_config_id": "auth"}, {"plugin_config_id": "mesh"}],
+        }))
+        .expect("proxy fixture");
+        let mut config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy],
+            plugin_configs: vec![auth, mesh],
+            ..GatewayConfig::default()
+        };
+        config.normalize_fields();
+        let cache = PluginCache::new(&config).expect("the route publishes");
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+        let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+        ctx.headers
+            .insert("host".to_string(), "api.example.com".to_string());
+        ctx.headers
+            .insert("x-auth-request-user".to_string(), "mallory".to_string());
+        if let Some(user) = jwks_user {
+            let token = create_rs256_token(&json!({"sub": user, "user": user}), private_key_pem);
+            ctx.headers
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+        }
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let rejection = ferrum_edge::proxy::run_authentication_phase(
+            AuthMode::Multi,
+            plugins.as_slice(),
+            &mut ctx,
+            &consumer_index,
+        )
+        .await;
+        assert!(rejection.is_none(), "{path}");
+        for plugin in plugins.iter() {
+            let result = plugin.authorize(&mut ctx).await;
+            assert!(matches!(result, PluginResult::Continue), "{path}");
+        }
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue), "{path}");
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        headers.get("x-auth-request-user").cloned()
+    }
+
+    /// `mesh_authz` keeps Istio ext_authz semantics and owns nothing, but when
+    /// a CUSTOM check it actually ran allows the request, the provider's
+    /// decision on a header another plugin owns as a gateway assertion is that
+    /// header's current authorized value: the final pass forwards the
+    /// provider's value (replacing a verified claim too), and a provider that
+    /// returned none leaves the header absent. A request no CUSTOM rule
+    /// matched, or a trigger-skipped `mesh_authz`, changes nothing: the
+    /// owner's own decision stands.
+    #[tokio::test]
+    async fn a_custom_checked_value_is_the_current_state_of_an_owned_header() {
+        let allowing = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
+        let omitting = start_stub(StubBehavior::Allow).await;
+        let admin = "/admin/reports";
+        let public = "/public";
+
+        let value = owned_header_at_backend(allowing.port, admin, false, None).await;
+        assert_eq!(value.as_deref(), Some("alice"), "skipped owner");
+        let value = owned_header_at_backend(allowing.port, admin, false, Some("bob")).await;
+        assert_eq!(value.as_deref(), Some("alice"), "replaced claim");
+        let value = owned_header_at_backend(omitting.port, admin, false, None).await;
+        assert_eq!(value.as_deref(), None, "provider omitted, skipped owner");
+        let value = owned_header_at_backend(omitting.port, admin, false, Some("bob")).await;
+        assert_eq!(value.as_deref(), None, "provider omitted, admitted owner");
+
+        let value = owned_header_at_backend(allowing.port, public, false, None).await;
+        assert_eq!(value.as_deref(), None, "unmatched CUSTOM, skipped owner");
+        let value = owned_header_at_backend(allowing.port, public, false, Some("bob")).await;
+        assert_eq!(value.as_deref(), Some("bob"), "unmatched CUSTOM");
+        let value = owned_header_at_backend(allowing.port, admin, true, None).await;
+        assert_eq!(value.as_deref(), None, "skipped mesh_authz and owner");
+        let value = owned_header_at_backend(allowing.port, admin, true, Some("bob")).await;
+        assert_eq!(value.as_deref(), Some("bob"), "skipped mesh_authz");
+    }
 }

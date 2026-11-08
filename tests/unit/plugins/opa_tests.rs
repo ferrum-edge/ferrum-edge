@@ -2250,6 +2250,295 @@ async fn opa_allow_obligation_installs_listed_upstream_headers() {
     );
 }
 
+/// Provenance is the CURRENT authorized state, not history. When a later
+/// admitted OPA instance withdraws a decision header an earlier one installed
+/// (a bare-`true` allow), a later writer restoring the client's same value
+/// (`correlation_id` preserving `x-user-role`) is stripped by the final pass,
+/// so the header is absent at the backend. A legitimate value from the last
+/// admitted owner survives.
+#[tokio::test]
+async fn a_withdrawn_decision_header_cannot_be_resurrected_on_stale_provenance() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        run_final_backend_header_policy_hooks_for_test,
+    };
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::types::{GatewayConfig, PluginScope};
+
+    use super::plugin_utils::{make_plugin_config_with_json, make_proxy};
+
+    let first = MockServer::start().await;
+    mount_opa(
+        &first,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-user-role": "admin"}}}),
+    )
+    .await;
+    let withdrawing = MockServer::start().await;
+    mount_opa(&withdrawing, 200, json!({"result": true})).await;
+    let replacing = MockServer::start().await;
+    mount_opa(
+        &replacing,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-user-role": "auditor"}}}),
+    )
+    .await;
+    let opa = |id: &str, server: &MockServer, priority: u16| {
+        let mut config = base_config(&server.uri());
+        config["decision_request_headers"] = json!(["x-user-role"]);
+        let mut opa =
+            make_plugin_config_with_json(id, "opa", config, PluginScope::Proxy, Some("p1"));
+        opa.priority_override = Some(priority);
+        opa
+    };
+    // (second owner, correlation header, value at the backend)
+    let cases = [
+        (&withdrawing, "x-user-role", None),
+        (&replacing, "x-correlation-ref", Some("auditor")),
+    ];
+    for (second, correlation_header, expected) in cases {
+        let label = format!("{correlation_header} -> {expected:?}");
+        let mut correlation = make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": correlation_header, "inbound_policy": "preserve"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        correlation.priority_override = Some(1500);
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![make_proxy("p1", "/", vec!["first", "second", "corr"])],
+            plugin_configs: vec![
+                opa("first", &first, 2050),
+                opa("second", second, 2060),
+                correlation,
+            ],
+            ..Default::default()
+        };
+        let cache = PluginCache::new(&config).unwrap_or_else(|error| panic!("{label}: {error}"));
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+
+        let mut ctx = make_ctx();
+        ctx.headers.insert("x-user-role".into(), "admin".into());
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        for plugin in plugins.iter() {
+            assert_continue(plugin.authorize(&mut ctx).await);
+        }
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert_continue(result);
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        assert_eq!(
+            headers.get("x-user-role").map(String::as_str),
+            expected,
+            "{label}"
+        );
+    }
+}
+
+/// An admitted OPA instance and a trigger-skipped claim-fanout instance can
+/// own the same header (`decision_request_headers: X-Tenant` beside
+/// `claim_headers: {tenant: X-Tenant}`). The skipped instance still removes
+/// every unverified copy, but keeps the exact value OPA installed for the
+/// request, for each claim-fanout plugin and in either priority order.
+#[tokio::test]
+async fn trigger_skipped_claim_owner_keeps_the_value_an_admitted_opa_installed() {
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::plugin_trigger::PluginTrigger;
+    use ferrum_edge::config::types::{GatewayConfig, PluginScope};
+
+    use super::plugin_utils::{make_plugin_config_with_json, make_proxy, minimal_plugin_config};
+
+    let server = MockServer::start().await;
+    mount_opa(
+        &server,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-tenant": "blue"}}}),
+    )
+    .await;
+    let post_only: PluginTrigger =
+        serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap();
+    for claim_plugin in ["jwks_auth", "oauth2_introspection", "oidc_relying_party"] {
+        for claim_priority in [1000, 2100] {
+            let label = format!("{claim_plugin} priority={claim_priority}");
+            let mut opa_config = base_config(&server.uri());
+            opa_config["decision_request_headers"] = json!(["x-tenant"]);
+            let opa = make_plugin_config_with_json(
+                "opa",
+                "opa",
+                opa_config,
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            let mut claim_config = minimal_plugin_config(claim_plugin);
+            claim_config["providers"][0]["claim_headers"] = json!({"tenant": "X-Tenant"});
+            let mut claims = make_plugin_config_with_json(
+                "claims",
+                claim_plugin,
+                claim_config,
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            claims.priority_override = Some(claim_priority);
+            claims.trigger = Some(post_only.clone());
+            let config = GatewayConfig {
+                version: "1".to_string(),
+                proxies: vec![make_proxy("p1", "/", vec!["opa", "claims"])],
+                plugin_configs: vec![opa, claims],
+                ..Default::default()
+            };
+            let cache =
+                PluginCache::new(&config).unwrap_or_else(|error| panic!("{label}: {error}"));
+            let plugins = cache.get_plugins("ferrum", "p1");
+
+            let mut ctx = make_ctx();
+            ctx.headers.insert("X_Tenant".into(), "forged".into());
+            for plugin in plugins.iter() {
+                plugin.on_request_received(&mut ctx).await;
+            }
+            for plugin in plugins.iter() {
+                assert_continue(plugin.authorize(&mut ctx).await);
+            }
+            let mut headers = ctx.headers.clone();
+            headers.insert("x_tenant".into(), "forged-late".into());
+            let result = ferrum_edge::_test_support::run_before_proxy_hooks_for_test(
+                plugins.as_slice(),
+                &mut ctx,
+                &mut headers,
+            )
+            .await;
+            assert_continue(result);
+
+            assert_eq!(
+                ctx.metadata
+                    .get("plugin_trigger.claims.skipped")
+                    .map(String::as_str),
+                Some("true"),
+                "{label}"
+            );
+            assert_eq!(
+                headers.get("x-tenant").map(String::as_str),
+                Some("blue"),
+                "{label}: the value OPA installed survives the skipped claim owner"
+            );
+            for forged in ["X_Tenant", "x_tenant"] {
+                assert!(!headers.contains_key(forged), "{label}: {forged}");
+            }
+        }
+    }
+}
+
+/// A trigger-skipped OPA instance decides nothing and installs nothing, but
+/// its `decision_request_headers` stay policy-owned: every client spelling is
+/// removed. A value an admitted sibling installed for this request survives,
+/// in either priority order.
+#[tokio::test]
+async fn trigger_skipped_opa_strips_client_copies_but_keeps_an_admitted_value() {
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::plugin_trigger::PluginTrigger;
+    use ferrum_edge::config::types::{GatewayConfig, PluginScope};
+
+    use super::plugin_utils::{make_plugin_config_with_json, make_proxy};
+
+    let server = MockServer::start().await;
+    mount_opa(
+        &server,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-tenant": "blue"}}}),
+    )
+    .await;
+    let opa_config = |headers: Value| {
+        let mut config = base_config(&server.uri());
+        config["decision_request_headers"] = headers;
+        config
+    };
+    let post_only: PluginTrigger =
+        serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap();
+    // (admitted priority, skipped priority); `None` runs the skipped instance alone.
+    for priorities in [Some((2050, 2060)), Some((2060, 2050)), None] {
+        let label = format!("{priorities:?}");
+        let mut skipped = make_plugin_config_with_json(
+            "skipped",
+            "opa",
+            opa_config(json!(["x-tenant", "x-user"])),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        skipped.trigger = Some(post_only.clone());
+        let mut plugin_configs = vec![skipped];
+        if let Some((admitted_priority, skipped_priority)) = priorities {
+            plugin_configs[0].priority_override = Some(skipped_priority);
+            let mut admitted = make_plugin_config_with_json(
+                "admitted",
+                "opa",
+                opa_config(json!(["x-tenant"])),
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            admitted.priority_override = Some(admitted_priority);
+            plugin_configs.push(admitted);
+        }
+        let ids = if priorities.is_some() {
+            vec!["skipped", "admitted"]
+        } else {
+            vec!["skipped"]
+        };
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![make_proxy("p1", "/", ids)],
+            plugin_configs,
+            ..Default::default()
+        };
+        let cache = PluginCache::new(&config).unwrap_or_else(|error| panic!("{label}: {error}"));
+        let plugins = cache.get_plugins("ferrum", "p1");
+
+        let mut ctx = make_ctx();
+        ctx.headers.insert("X_Tenant".into(), "forged".into());
+        ctx.headers.insert("x-user".into(), "forged".into());
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        for plugin in plugins.iter() {
+            assert_continue(plugin.authorize(&mut ctx).await);
+        }
+        let mut headers = ctx.headers.clone();
+        headers.insert("X_User".into(), "forged".into());
+        let result = ferrum_edge::_test_support::run_before_proxy_hooks_for_test(
+            plugins.as_slice(),
+            &mut ctx,
+            &mut headers,
+        )
+        .await;
+        assert_continue(result);
+
+        assert_eq!(
+            ctx.metadata
+                .get("plugin_trigger.skipped.skipped")
+                .map(String::as_str),
+            Some("true"),
+            "{label}"
+        );
+        assert_eq!(
+            headers.get("x-tenant").map(String::as_str),
+            priorities.map(|_| "blue"),
+            "{label}: only an admitted instance's installed value survives"
+        );
+        for forged in ["X_Tenant", "x-user", "X_User"] {
+            assert!(!headers.contains_key(forged), "{label}: {forged}");
+        }
+        assert_eq!(
+            headers.get("x-request-id").map(String::as_str),
+            Some("req-123"),
+            "{label}"
+        );
+    }
+}
+
 /// A bare `true` decision carries no obligation, but a listed destination is
 /// still gateway-owned and the client copy is removed.
 #[tokio::test]

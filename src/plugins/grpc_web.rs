@@ -2036,6 +2036,16 @@ pub fn request_is_grpc_web_translated(ctx: &RequestContext) -> bool {
     ctx.metadata.contains_key(META_GRPC_WEB_MODE)
 }
 
+/// Whether the translation owner's own `before_proxy` rewrote THIS request to
+/// native gRPC. Typed request state, never metadata: the gateway-assertion
+/// boundary (`proxy::enforce_route_owned_request_assertions`) and the
+/// relabel refusal trust only this, not the mere presence of a translator on
+/// the route.
+pub(crate) fn request_was_translated(ctx: &RequestContext) -> bool {
+    ctx.plugin_state()
+        .is_some_and(|state| state.grpc_web_translated)
+}
+
 /// Retain a recognized client representation for gateway-generated errors
 /// without claiming that request translation occurred. H3 uses this for
 /// pass-through deployments that intentionally omit the `grpc_web` plugin:
@@ -4717,6 +4727,7 @@ impl Plugin for GrpcWebPlugin {
             .unwrap_or("application/grpc")
             .to_string();
         headers.insert("content-type".to_string(), native_ct);
+        ctx.plugin_state_mut().grpc_web_translated = true;
 
         // Compatibility marker for the legacy no-context transform path.
         // Production uses `transform_request_body_with_context` + metadata.
@@ -4876,12 +4887,13 @@ impl Plugin for GrpcWebPlugin {
                     mut trailers,
                 } = frame;
                 // A route-configured credential header location (a `key_auth`
-                // `header:<name>`, a custom JWT header) is per-route, so the
-                // static trailer predicate cannot know it. Drop it here, the
-                // same late-boundary rule every native trailer relay applies
+                // `header:<name>`, a custom JWT header) or an owned claim
+                // destination (`claim_headers`) is per-route, so the static
+                // trailer predicate cannot know it. Drop it here, the same
+                // late-boundary rule every native trailer relay applies
                 // (`strip_configured_credential_request_trailers`).
                 let received_entries = trailers.len();
-                trailers.retain(|(name, _)| !ctx.request_header_requires_redaction(name));
+                trailers.retain(|(name, _)| !ctx.request_trailer_must_be_stripped(name));
                 let carried_only_credentials = received_entries > 0 && trailers.is_empty();
                 // The trailer frame is about to leave the body for good, so the
                 // validated block goes into request-private TYPED state that

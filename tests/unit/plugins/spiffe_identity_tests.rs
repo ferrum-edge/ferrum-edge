@@ -1157,6 +1157,50 @@ async fn test_default_config_forwards_nothing() {
     assert!(!headers.contains_key(FORWARDED));
 }
 
+/// The trigger-skip sanitizer strips every client spelling. It keeps the
+/// canonical header only when an admitted instance's own `before_proxy`
+/// installed it: a client copy that merely equals the request's peer identity
+/// (pre-stamped, for example) is still client input. Without
+/// `forward_identity` the instance owns nothing.
+#[tokio::test]
+async fn test_skip_sanitizer_keeps_only_an_identity_an_admitted_instance_installed() {
+    let plugin = SpiffeIdentity::new(&json!({"forward_identity": true})).unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.peer_spiffe_id = Some(SpiffeId::new(LIFETIME_SVID).unwrap());
+    let client_copies = || {
+        HashMap::from([
+            (FORWARDED.to_string(), LIFETIME_SVID.to_string()),
+            (
+                "X_Ferrum_Peer_Spiffe_Id".to_string(),
+                LIFETIME_SVID.to_string(),
+            ),
+            ("accept".to_string(), "*/*".to_string()),
+        ])
+    };
+
+    let mut headers = client_copies();
+    plugin.sanitize_owned_request_headers(&mut ctx, &mut headers);
+    let only_accept = HashMap::from([("accept".to_string(), "*/*".to_string())]);
+    assert_eq!(headers, only_accept, "equality is not provenance");
+
+    let mut headers = client_copies();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    plugin.sanitize_owned_request_headers(&mut ctx, &mut headers);
+    assert_eq!(
+        headers.get(FORWARDED).map(String::as_str),
+        Some(LIFETIME_SVID)
+    );
+    assert_eq!(headers.len(), 2, "{headers:?}");
+
+    let passive = SpiffeIdentity::new(&json!({})).unwrap();
+    let mut headers = client_copies();
+    passive.sanitize_owned_request_headers(&mut ctx, &mut headers);
+    assert_eq!(headers, client_copies());
+}
+
 #[test]
 fn test_forward_identity_must_be_a_boolean() {
     for invalid in [json!("x-spiffe-id"), json!(1), json!(null), json!([])] {

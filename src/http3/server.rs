@@ -4552,6 +4552,10 @@ async fn handle_h3_request(
         route_response_body_limit,
     );
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    ctx.set_request_trailer_strip_headers(
+        plugin_cache_view.request_trailer_strip_headers(),
+        plugin_cache_view.owned_request_assertion_headers(),
+    );
     // Same cache generation as `plugins` above: replay provenance must describe
     // exactly the response-side rules this request will run.
     ctx.set_response_presentation_policy_digest(
@@ -6181,6 +6185,10 @@ async fn handle_h3_request(
     {
         crate::proxy::run_final_backend_header_policy_hooks(&plugins, &ctx, &mut proxy_headers);
     }
+    // Retained wire view used by retry replay and request mirroring: drop the
+    // client's lines for the route's owned assertion names after the final
+    // pass, as the H1/H2 ladder does.
+    ctx.strip_route_owned_assertion_raw_lines();
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,

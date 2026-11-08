@@ -234,6 +234,81 @@ fn fold_field_name_byte(byte: u8) -> u8 {
     }
 }
 
+/// Returns `true` for a request header name a plugin-owned gateway assertion
+/// (`claim_headers`, `output_claim_headers`, OPA `decision_request_headers`,
+/// mesh `outputClaimToHeaders`) may never use as its destination.
+///
+/// The rule: an owned assertion destination must be an application-specific
+/// header that nothing but its owner ever writes. The final gateway-assertion
+/// pass (`proxy::enforce_route_owned_request_assertions`) removes every copy an
+/// owner did not install, but some request fields are written again AFTER it,
+/// by the gateway or by a client library: reqwest adds `Accept: */*`,
+/// `User-Agent` and `Proxy-Authorization`, hyper and the request builders add
+/// `Host` and framing (`Content-Length`, `Transfer-Encoding`, `TE`),
+/// tungstenite synthesizes the WebSocket handshake (`Connection`, `Upgrade`,
+/// `Sec-WebSocket-*`), the gateway writes per-attempt `traceparent`, the
+/// remaining `grpc-timeout`, `early-data` and forwarding headers, and it
+/// re-injects its own assertions on the WebSocket handshake. On such a name
+/// an absent claim would not stay absent on the wire, or the owner's final
+/// pass would strip a value the transport needs. So every standard HTTP
+/// request field (and every family a client, proxy or browser may
+/// synthesize or interpret) is refused, not just the names known to be
+/// written today. Names are folded the way CGI-style backends read them
+/// (ASCII case-insensitive, `_` read as `-`). Configuration-time only.
+pub fn is_reserved_assertion_destination(name: &str) -> bool {
+    let folded = name.to_ascii_lowercase().replace('_', "-");
+    is_gateway_assertion_header(&folded)
+        || is_path_param_assertion_header(&folded)
+        || folded.starts_with("accept-")
+        || folded.starts_with("access-control-")
+        || folded.starts_with("content-")
+        || folded.starts_with("grpc-")
+        || folded.starts_with("if-")
+        || folded.starts_with("proxy-")
+        || folded.starts_with("sec-")
+        || folded.starts_with("x-b3-")
+        || folded.starts_with("x-ferrum-")
+        || folded.starts_with("x-forwarded-")
+        || matches!(
+            folded.as_str(),
+            "a-im"
+                | "accept"
+                | "authorization"
+                | "b3"
+                | "baggage"
+                | "cache-control"
+                | "cdn-loop"
+                | "connection"
+                | "cookie"
+                | "date"
+                | "dnt"
+                | "early-data"
+                | "expect"
+                | "forwarded"
+                | "from"
+                | "host"
+                | "http2-settings"
+                | "keep-alive"
+                | "max-forwards"
+                | "origin"
+                | "pragma"
+                | "prefer"
+                | "priority"
+                | "range"
+                | "referer"
+                | "te"
+                | "traceparent"
+                | "tracestate"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "upgrade-insecure-requests"
+                | "user-agent"
+                | "via"
+                | "x-real-ip"
+        )
+}
+
 /// Returns `true` for every backend-visible gateway assertion: the
 /// [`is_consumer_assertion_header`] namespace plus the private GeoIP result
 /// (`x-geo-country`). ASCII case-insensitive with `_` equivalent to `-`
@@ -852,29 +927,45 @@ pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) 
 
 /// Remove request trailers that restate one of the route's configured
 /// credential header locations (a `key_auth` `header:<name>`, a custom
-/// `jwt_auth` / `jwks_auth` / `oauth2_introspection` token header, ...).
+/// `jwt_auth` / `jwks_auth` / `oauth2_introspection` token header, ...) or one
+/// of the route's owned gateway-assertion headers (a `jwks_auth` /
+/// `oauth2_introspection` / `oidc_relying_party` `claim_headers` or
+/// `output_claim_headers` destination).
 ///
 /// [`sanitize_backend_request_trailers`] knows only the fixed credential names
-/// (`authorization`, `cookie`, `x-api-key`). A custom credential location is
-/// per-route configuration, so every late request-trailer boundary applies
-/// this right after the static filter with the route's precomputed list
-/// (`RequestContext::request_headers_requiring_redaction`, built once with the
-/// plugin cache). Removal is unconditional: trailers are never a legitimate
-/// credential location, and `hide_credentials: false` governs only the
-/// initial header block the plugin authenticated.
+/// (`authorization`, `cookie`, `x-api-key`) and fixed gateway assertions. These
+/// names are per-route configuration, so every late request-trailer boundary
+/// applies this right after the static filter with the route's precomputed
+/// list (`RequestContext::request_trailer_credential_header_names`, built once
+/// with the plugin cache). Removal is unconditional, whatever any trigger
+/// decided: trailers are never a legitimate credential location or claim
+/// assertion, and `hide_credentials: false` governs only the initial header
+/// block the plugin authenticated.
 ///
-/// Allocation-free: one case-insensitive `HeaderMap::remove` per configured
-/// name, and nothing at all when the route configures none.
+/// Names match the way a CGI-style backend reads them (ASCII case-insensitive,
+/// `_` read as `-`, [`field_names_equivalent_for_backends`]), so a client
+/// `x_user_email` trailer cannot fold onto a gateway-owned `x-user-email`.
+/// Nothing allocates unless a trailer matches, and nothing runs at all when
+/// the trailer block or the route list is empty.
 #[inline]
 pub(crate) fn strip_configured_credential_request_trailers(
     trailers: &mut http::HeaderMap,
     credential_header_names: &[String],
 ) {
-    if trailers.is_empty() {
+    if trailers.is_empty() || credential_header_names.is_empty() {
         return;
     }
-    for name in credential_header_names {
-        trailers.remove(name.as_str());
+    let strip: Vec<http::HeaderName> = trailers
+        .keys()
+        .filter(|trailer| {
+            credential_header_names
+                .iter()
+                .any(|name| field_names_equivalent_for_backends(trailer.as_str(), name))
+        })
+        .cloned()
+        .collect();
+    for name in strip {
+        trailers.remove(name);
     }
 }
 
