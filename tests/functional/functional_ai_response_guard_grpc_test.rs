@@ -16,6 +16,7 @@
 //! Run with:
 //! `cargo test --test functional_tests functional_ai_response_guard_grpc -- --ignored --nocapture`
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -361,11 +362,17 @@ fn start_gateway(
     http_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        // Keep any managed-TLS/ACME/event store inside the config's temp dir.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
@@ -374,7 +381,7 @@ fn start_gateway(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    Ok(cmd.spawn()?)
+    Ok(GatewayChildGuard::new(cmd.spawn()?))
 }
 
 async fn wait_for_owned_gateway(
@@ -406,7 +413,7 @@ async fn wait_for_owned_gateway(
     Err("Gateway proxy port did not accept TCP connections".into())
 }
 
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+async fn start_gateway_with_retry(config_path: &str) -> (GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
@@ -425,15 +432,14 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
                 continue;
             }
         };
-        match wait_for_owned_gateway(&mut child, admin_port, gateway_port, &identity).await {
+        match wait_for_owned_gateway(child.child_mut(), admin_port, gateway_port, &identity).await {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(e) => {
                 eprintln!(
                     "Gateway health attempt {}/{} failed: {}",
                     attempt, MAX_ATTEMPTS, e
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                child.shutdown();
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_secs(1)).await;
                 }
@@ -621,7 +627,7 @@ plugin_configs:
 }
 
 struct Harness {
-    gateway: std::process::Child,
+    gateway: GatewayChildGuard,
     backend: tokio::task::JoinHandle<()>,
     addr: String,
     _temp: TempDir,
@@ -645,8 +651,7 @@ impl Harness {
     }
 
     fn shutdown(mut self) {
-        let _ = self.gateway.kill();
-        let _ = self.gateway.wait();
+        self.gateway.shutdown();
         self.backend.abort();
     }
 }

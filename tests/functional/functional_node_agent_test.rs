@@ -3,15 +3,11 @@
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::ports::{BIND_DROP_SPAWN_ATTEMPTS, reserve_port};
-
-fn terminate(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
 
 fn prepend_noop_shell(command: &mut Command, temp_dir: &Path) {
     let bin_dir = temp_dir.join("bin");
@@ -66,11 +62,16 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
         let log_file = fs::File::create(&log_path).expect("node_agent log file");
         let log_err = log_file.try_clone().expect("clone node_agent log file");
         let mut command = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut command);
         command.arg("run");
         prepend_noop_shell(&mut command, tmp.path());
         let metrics_token = uuid::Uuid::new_v4().to_string();
-        let mut child = command
+        command
             .env("FERRUM_MODE", "node_agent")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                tmp.path().join(format!("managed-tls-{attempt}")),
+            )
             .env("FERRUM_POOL_SHARD_AMOUNT", "1")
             .env("FERRUM_NODE_AGENT_NODE_NAME", "functional-node")
             .env("FERRUM_NODE_AGENT_PROXY_MODE", "node_waypoint")
@@ -89,15 +90,14 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
             .env("FERRUM_METRICS_BEARER_TOKEN", &metrics_token)
             .env("FERRUM_LOG_LEVEL", "debug")
             .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_err))
-            .spawn()
-            .expect("spawn node_agent");
+            .stderr(Stdio::from(log_err));
+        let mut child = GatewayChildGuard::new(command.spawn().expect("spawn node_agent"));
 
         let url = format!("http://127.0.0.1:{admin_port}/metrics");
         let mut last_body = String::new();
         let mut exited = None;
         for _ in 0..50 {
-            if let Some(status) = child.try_wait().expect("poll node_agent") {
+            if let Some(status) = child.child_mut().try_wait().expect("poll node_agent") {
                 exited = Some(status);
                 break;
             }
@@ -106,14 +106,14 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
             {
                 last_body = response.text().await.expect("metrics body");
                 if last_body.contains("ferrum_node_agent_pods_enrolled_total") {
-                    terminate(child);
+                    child.shutdown();
                     return;
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        terminate(child);
+        child.shutdown();
         let captured = fs::read_to_string(&log_path).unwrap_or_default();
         if let Some(status) = exited {
             last_error = format!(
