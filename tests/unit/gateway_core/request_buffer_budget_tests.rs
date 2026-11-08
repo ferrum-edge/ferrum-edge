@@ -1002,7 +1002,10 @@ async fn a_decompressed_body_the_budget_cannot_cover_is_refused_and_dropped() {
         ChargedNormalizationOutcomeForTest::BufferCapacityExceeded,
         "a decoded body the budget cannot cover must be refused, not kept uncharged"
     );
-    assert!(body.is_empty(), "the uncovered decoded body must be dropped");
+    assert!(
+        body.is_empty(),
+        "the uncovered decoded body must be dropped"
+    );
     assert_eq!(body.capacity(), 0);
     drop(charge);
     assert_eq!(budget.available_bytes(), collected_charge);
@@ -1199,7 +1202,10 @@ async fn a_refused_transform_releases_body_and_charge_before_the_refusal_is_writ
         &mut charge,
     )
     .await;
-    assert!(refused.is_none(), "an uncovered replacement must be refused");
+    assert!(
+        refused.is_none(),
+        "an uncovered replacement must be refused"
+    );
     // The caller still owns the emptied permit while it awaits the refusal
     // writer and its hooks; nothing of the refused body stays charged.
     assert_eq!(charge.reserved_bytes(), 0);
@@ -1213,4 +1219,35 @@ async fn a_refused_transform_releases_body_and_charge_before_the_refusal_is_writ
     assert_eq!(budget.available_bytes(), 2 * UNIT);
     drop((charge, other));
     assert_eq!(budget.available_bytes(), 4 * UNIT);
+}
+
+#[test]
+fn a_refused_pre_dispatch_transform_commits_through_the_reject_pipeline() {
+    // After `before_proxy`, a capacity refusal of a transformed body must run
+    // the reject-path hooks and log the rejection like the adjacent final-body
+    // rejection, after first dropping the refused body.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let refusal = proxy
+        .split("// Circuit breaker check")
+        .nth(1)
+        .expect("pre-dispatch preparation")
+        .split("let Ok(transformed) = transformed else {")
+        .nth(1)
+        .expect("pre-dispatch transform refusal")
+        .split("let mut final_body_result = run_final_request_body_hooks(")
+        .next()
+        .expect("bounded transform refusal");
+    for call in [
+        "drop(buffered);",
+        "boxed_finalize_reject_response(",
+        "request_buffer_capacity_reject_headers(is_grpc_request),",
+        "boxed_build_grpc_web_reject_response(",
+        "boxed_log_rejected_request_with_path(",
+        "ctx.terminal_record.mark_counted();",
+    ] {
+        assert!(refusal.contains(call), "the refusal must use `{call}`");
+    }
+    let dropped = refusal.find("drop(buffered);").expect("body dropped");
+    let first_await = refusal.find(".await").expect("reject pipeline awaits");
+    assert!(dropped < first_await);
 }

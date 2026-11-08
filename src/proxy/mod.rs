@@ -39529,18 +39529,49 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 let Ok(transformed) = transformed else {
+                    // The chain already dropped the body and released its
+                    // charge; nothing else of it may outlive the refusal's hooks
+                    // and writes. The refusal then commits through the same
+                    // reject pipeline as the final-body rejection below:
+                    // reject-path hooks, gRPC-Web framing, and the log.
+                    drop(buffered);
+                    drop(body_hook_ctx);
                     cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
-                    let response = build_request_buffer_capacity_response(
+                    let normalized = boxed_finalize_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Bytes::from(response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY),
+                        request_buffer_capacity_reject_headers(is_grpc_request),
                         is_grpc_request,
+                        grpc_web_response_content_type.is_none(),
+                    )
+                    .await;
+                    apply_grpc_reject_metadata(&mut ctx, &normalized);
+                    let grpc_web_response = boxed_build_grpc_web_reject_response(
+                        &plugins,
+                        &mut ctx,
                         grpc_web_response_content_type,
-                        plugin_cache_view
-                            .initial_response_header_policy_plugins()
-                            .as_ref(),
-                    );
+                        &normalized,
+                    )
+                    .await;
+                    boxed_log_rejected_request_with_path(
+                        &plugins,
+                        &ctx,
+                        normalized.http_status.as_u16(),
+                        start_time,
+                        finalized_request_rejection_phase(false),
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                    )
+                    .await;
                     ctx.terminal_record.mark_counted();
-                    record_request(&state, response.status().as_u16());
-                    return Ok(response);
+                    record_request(&state, normalized.http_status.as_u16());
+                    if let Some(response) = grpc_web_response {
+                        return Ok(response);
+                    }
+                    return Ok(build_response_from_normalized_reject(normalized));
                 };
                 let mut final_body_result = run_final_request_body_hooks(
                     &plugins,

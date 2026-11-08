@@ -467,8 +467,9 @@ type BoxedH3RejectFuture<'a> =
 
 /// The shared request-buffer budget could not admit a native-H3 buffered
 /// upload (issue #6009): the same `503` / gRPC `RESOURCE_EXHAUSTED` refusal
-/// H1/H2 return, before a byte is read. Boxed behind a thin trampoline so the
-/// cold arm does not widen `handle_h3_request`'s frame.
+/// H1/H2 return, when the shared budget refuses a growth of the retained
+/// buffer. Boxed behind a thin trampoline so the cold arm does not widen
+/// `handle_h3_request`'s frame.
 #[inline(never)]
 fn boxed_send_h3_request_buffer_capacity_rejection<'a>(
     stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
