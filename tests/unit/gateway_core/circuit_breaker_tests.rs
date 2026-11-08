@@ -848,6 +848,54 @@ fn a_stale_failure_increment_is_refused_after_a_reopen_and_recovery() {
 }
 
 #[test]
+fn a_stalled_closed_failure_cannot_reopen_a_recovered_cycle() {
+    // #7030 review: failure F counts in CLOSED(G), passes its threshold check,
+    // and stalls. A sibling opens the breaker (G+1), a probe closes it back to
+    // CLOSED(G+1), and that probe stalls between its close CAS and its counter
+    // clear, so the counter still holds G's streak. F's CLOSED→OPEN attempt is
+    // bound to G and must not open the recovered cycle.
+    let cb = CircuitBreaker::new(CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        ..straggler_config()
+    });
+    let entry_generation = cb.open_epoch();
+    assert!(cb.count_failure_in_cycle_for_test(entry_generation));
+    assert!(cb.count_failure_in_cycle_for_test(entry_generation));
+    // F has counted G's threshold-reaching failure and stalls here.
+
+    // A sibling's failure opens the breaker; a probe recovers it.
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    let (probe, recovered_generation) = cb.admit().expect("probe");
+    cb.settle(probe, BreakerOutcome::Success);
+    assert_eq!(cb.state_name(), "closed");
+    assert_ne!(recovered_generation, entry_generation);
+    // The recovering probe has not cleared the counter yet: G's streak is
+    // still in it.
+    cb.stage_failure_count_for_test(entry_generation, 3);
+
+    // F resumes.
+    assert!(
+        !cb.trip_after_closed_failure_for_test(entry_generation),
+        "a failure counted in CLOSED(G) must not open CLOSED(G+1)"
+    );
+    assert_eq!(cb.state_name(), "closed");
+    assert_eq!(cb.open_epoch(), recovered_generation);
+
+    // The recovered cycle's own streak still trips it.
+    cb.stage_failure_count_for_test(recovered_generation, 0);
+    assert!(
+        !cb.trip_after_closed_failure_for_test(recovered_generation),
+        "below the threshold nothing opens"
+    );
+    assert!(cb.count_failure_in_cycle_for_test(recovered_generation));
+    assert!(cb.count_failure_in_cycle_for_test(recovered_generation));
+    assert!(cb.trip_after_closed_failure_for_test(recovered_generation));
+    assert_eq!(cb.state_name(), "open");
+}
+
+#[test]
 fn test_cache_creates_and_reuses() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();

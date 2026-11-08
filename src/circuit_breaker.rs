@@ -111,6 +111,18 @@ impl CycleCounter {
         counter_value(self.0.load(Ordering::Acquire))
     }
 
+    /// The count of cycle `generation`: zero when the counter is tagged with
+    /// any other cycle.
+    #[inline]
+    fn count_in_cycle(&self, generation: u32) -> u32 {
+        let word = self.0.load(Ordering::Acquire);
+        if counter_generation(word) == generation {
+            counter_value(word)
+        } else {
+            0
+        }
+    }
+
     /// Count one event of open cycle `generation`. Returns the cycle's new
     /// count, or `None` when the counter already belongs to a newer cycle and
     /// the event is stale.
@@ -670,72 +682,12 @@ impl CircuitBreaker {
                 // Count the failure for the CLOSED cycle checked above. The
                 // counter refuses it if a sibling has since moved the breaker
                 // through a newer cycle that re-tagged the counter (#7030). The
-                // CLOSED→OPEN CAS below re-checks the cycle on the state word.
+                // CLOSED→OPEN transition is bound to the same cycle.
                 let Some(failures) = self.failure_count.increment(packed_generation(packed)) else {
                     return;
                 };
                 if failures >= self.config.failure_threshold {
-                    // Re-read the counter before and after the transition attempt.
-                    // A concurrent CLOSED-state success may reset failure_count
-                    // after our increment; opening on that stale `failures` value
-                    // would turn a broken consecutive-failure streak into an OPEN
-                    // circuit. CAS still ensures only one thread performs the
-                    // CLOSED→OPEN transition, while the counter checks keep the
-                    // transition tied to the current consecutive-failure count.
-                    if self.failure_count.count() < self.config.failure_threshold {
-                        return;
-                    }
-                    // CLOSED always carries count=0, so the expected/desired values
-                    // both hold count=0; the transition flips state and advances the
-                    // generation in the SAME CAS.
-                    //
-                    // Advancing the generation atomically with the OPEN transition is
-                    // what makes the streaming-outcome accounting correct (#1649 R5
-                    // finding 2 + R7): (1) only the CAS WINNER advances the
-                    // generation — a concurrent failure that loses the CAS leaves it
-                    // untouched, so it cannot stale a valid probe that already
-                    // captured the winner's generation; and (2) the new generation is
-                    // published WITH OPEN, so any observer that sees OPEN (and can
-                    // immediately re-enter HALF_OPEN when `timeout_seconds == 0`)
-                    // reads the new generation, never the pre-open value. The
-                    // generation comes from a fresh load of the CLOSED state; if it
-                    // changed under us the CAS simply fails (a sibling opened). On the
-                    // rare rollback path below the generation stays advanced — the
-                    // only effect is that a CLOSED-admitted (non-probe) deferred
-                    // outcome captured just before this point is dropped instead of
-                    // recorded, which is negligible and conservative.
-                    let current = self.packed.load(Ordering::Acquire);
-                    if !ticket.in_cycle_of(current) {
-                        return;
-                    }
-                    let generation = packed_generation(current);
-                    if self
-                        .packed
-                        .compare_exchange(
-                            pack_full(generation, STATE_CLOSED, 0),
-                            pack_full(generation.wrapping_add(1), STATE_OPEN, 0),
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        let current_failures = self.failure_count.count();
-                        if current_failures < self.config.failure_threshold {
-                            // Roll back OPEN→CLOSED, keeping the advanced generation
-                            // (see note above).
-                            let _ = self.packed.compare_exchange(
-                                pack_full(generation.wrapping_add(1), STATE_OPEN, 0),
-                                pack_full(generation.wrapping_add(1), STATE_CLOSED, 0),
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
-                            return;
-                        }
-                        warn!(
-                            "Circuit breaker opening after {} failures",
-                            current_failures
-                        );
-                    }
+                    self.trip_after_closed_failure(packed_generation(packed));
                 }
             }
             // A CLOSED-cycle straggler (#7030): only this cycle's own probes
@@ -754,6 +706,75 @@ impl CircuitBreaker {
             STATE_OPEN => self.release_slot(ticket),
             _ => {}
         }
+    }
+
+    /// CLOSED→OPEN after a counted failure brought CLOSED cycle
+    /// `entry_generation` to `failure_threshold`. Returns whether this call
+    /// opened the breaker.
+    ///
+    /// The transition is bound to the cycle the failure was checked and
+    /// counted in (#7030). Both counter rechecks read the count of THAT cycle
+    /// (`CycleCounter::count_in_cycle`), and the CAS expects
+    /// `CLOSED(entry_generation)`, so a failure that stalled while a sibling
+    /// opened the breaker and a probe recovered it into a newer CLOSED cycle
+    /// can never open the recovered cycle, whatever the counter holds at that
+    /// instant (for example between the recovery CAS and its counter clear).
+    ///
+    /// The counter rechecks keep the transition tied to the current
+    /// consecutive-failure streak: a concurrent CLOSED-state success may reset
+    /// the count after the increment, and opening on the stale value would turn
+    /// a broken streak into an OPEN circuit.
+    ///
+    /// CLOSED always carries count=0, so the expected and desired values both
+    /// hold count=0; the transition flips state and advances the generation in
+    /// the SAME CAS. Advancing the generation atomically with the OPEN
+    /// transition is what makes the streaming-outcome accounting correct
+    /// (#1649 R5 finding 2 + R7): (1) only the CAS WINNER advances the
+    /// generation — a concurrent failure that loses the CAS leaves it
+    /// untouched, so it cannot stale a valid probe that already captured the
+    /// winner's generation; and (2) the new generation is published WITH OPEN,
+    /// so any observer that sees OPEN (and can immediately re-enter HALF_OPEN
+    /// when `timeout_seconds == 0`) reads the new generation, never the
+    /// pre-open value. On the rare rollback path the generation stays
+    /// advanced — the only effect is that a CLOSED-admitted (non-probe)
+    /// deferred outcome captured just before this point is dropped instead of
+    /// recorded, which is negligible and conservative.
+    fn trip_after_closed_failure(&self, entry_generation: u32) -> bool {
+        if self.failure_count.count_in_cycle(entry_generation) < self.config.failure_threshold {
+            return false;
+        }
+        let opened_generation = entry_generation.wrapping_add(1);
+        if self
+            .packed
+            .compare_exchange(
+                pack_full(entry_generation, STATE_CLOSED, 0),
+                pack_full(opened_generation, STATE_OPEN, 0),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // A sibling already opened this cycle, or the breaker has moved to
+            // a newer cycle: this failure no longer decides anything.
+            return false;
+        }
+        let current_failures = self.failure_count.count_in_cycle(entry_generation);
+        if current_failures < self.config.failure_threshold {
+            // Roll back OPEN→CLOSED, keeping the advanced generation (see
+            // above).
+            let _ = self.packed.compare_exchange(
+                pack_full(opened_generation, STATE_OPEN, 0),
+                pack_full(opened_generation, STATE_CLOSED, 0),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return false;
+        }
+        warn!(
+            "Circuit breaker opening after {} failures",
+            current_failures
+        );
+        true
     }
 
     /// Reopen the breaker after a failure that was observed WHILE the breaker is
@@ -940,6 +961,29 @@ impl CircuitBreaker {
     #[allow(dead_code)]
     pub fn count_success_in_cycle_for_test(&self, generation: u64) -> bool {
         self.success_count.increment(generation as u32).is_some()
+    }
+
+    /// Test seam for the transition half of a CLOSED-state failure
+    /// settlement (#7030): attempt CLOSED→OPEN for a failure that was checked
+    /// and counted in CLOSED cycle `entry_generation`, exactly as
+    /// [`settle`](Self::settle) does once the count reached
+    /// `failure_threshold`. Returns whether the breaker opened.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn trip_after_closed_failure_for_test(&self, entry_generation: u64) -> bool {
+        self.trip_after_closed_failure(entry_generation as u32)
+    }
+
+    /// Test seam: overwrite the failure counter with `count` tagged for
+    /// `generation`, to stage a counter state a concurrent settlement can
+    /// leave for an instant (for example a recovery between its close CAS and
+    /// its counter clear). Never used by production code.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn stage_failure_count_for_test(&self, generation: u64, count: u32) {
+        self.failure_count
+            .0
+            .store(pack_counter(generation as u32, count), Ordering::Release);
     }
 
     /// Test seam for the counter half of a CLOSED-state failure settlement
