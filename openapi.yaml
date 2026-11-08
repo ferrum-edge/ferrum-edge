@@ -27,6 +27,11 @@ info:
     unset (default), tokens without `aud` are accepted, but tokens carrying an
     `aud` claim are rejected per RFC 7519 strict audience handling.
 
+    Every admin API response, whatever its status, content type or endpoint,
+    carries `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+    `X-Frame-Options: DENY`. Per-response declarations below list them where a
+    response documents its headers.
+
     ## Namespaces
 
     Resource endpoints that include the `X-Ferrum-Namespace` parameter are
@@ -8349,6 +8354,10 @@ paths:
               schema:
                 type: string
                 enum: [nosniff]
+            X-Frame-Options:
+              schema:
+                type: string
+                enum: [DENY]
           content:
             application/json:
               schema:
@@ -8359,7 +8368,7 @@ paths:
                 type: string
                 description: The raw spec document (YAML format)
         "304":
-          description: Spec unchanged — ETag matches `If-None-Match`
+          description: Spec unchanged — ETag matches `If-None-Match`. Carries the same `ETag`, `Vary`, `Cache-Control`, `X-Content-Type-Options` and `X-Frame-Options` as the `200`, and no body.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -8708,6 +8717,10 @@ paths:
               schema:
                 type: string
                 enum: [nosniff]
+            X-Frame-Options:
+              schema:
+                type: string
+                enum: [DENY]
           content:
             application/json:
               schema:
@@ -8718,7 +8731,7 @@ paths:
                 type: string
                 description: The raw spec document (YAML format)
         "304":
-          description: Spec unchanged — ETag matches `If-None-Match`
+          description: Spec unchanged — ETag matches `If-None-Match`. Carries the same `ETag`, `Vary`, `Cache-Control`, `X-Content-Type-Options` and `X-Frame-Options` as the `200`, and no body.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
