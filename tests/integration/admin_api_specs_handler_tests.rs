@@ -1816,6 +1816,100 @@ async fn post_with_failing_plugin_config_returns_422_via_real_validator() {
     );
 }
 
+fn public_egress_policy(allow_cidrs: &str) -> ferrum_edge::config::BackendEgressPolicy {
+    ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Public,
+        allow_cidrs,
+        "",
+        true,
+    )
+    .expect("valid backend egress policy")
+}
+
+fn load_testing_spec(proxy_id: &str, gateway_port: u16) -> Value {
+    json_spec_with_plugin(
+        proxy_id,
+        "backend.internal",
+        &uid("load-testing"),
+        "load_testing",
+        json!({
+            "key": "spec-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": gateway_port
+        }),
+    )
+}
+
+/// An admin for a database-mode node that serves traffic under `policy`.
+async fn serving_admin(
+    dir: &TempDir,
+    policy: ferrum_edge::config::BackendEgressPolicy,
+) -> (AdminClient, tokio::sync::watch::Sender<bool>) {
+    use ferrum_edge::config::{EnvConfig, OperatingMode};
+
+    let env_config = EnvConfig {
+        mode: OperatingMode::Database,
+        proxy_http_port: 18082,
+        backend_allow_ips: policy.clone(),
+        ..Default::default()
+    };
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (proxy_state, _health_checks) = ferrum_edge::proxy::ProxyState::new(
+        ferrum_edge::config::types::GatewayConfig::default(),
+        dns_cache,
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+    let mut state = make_admin_state(make_store(dir).await, 25);
+    state.proxy_state = Some(proxy_state);
+    state.backend_allow_ips = policy;
+    let (base, shutdown) = start_admin(state).await;
+    (AdminClient::new(base), shutdown)
+}
+
+// API-spec admission uses the same plugin validation client as direct admin
+// plugin writes: a serving database-mode node screens `load_testing`'s
+// loopback dial against its backend egress policy, while a control plane (no
+// `ProxyState`) checks shape only because that policy belongs to its DPs.
+#[tokio::test]
+async fn api_spec_load_testing_loopback_dial_follows_the_admin_serving_posture() {
+    let dir = TempDir::new().unwrap();
+
+    // Under `public`, even the node's own listener port is refused: which
+    // process owns 127.0.0.1:<port> cannot be proven at admission.
+    let (client, _shutdown) = serving_admin(&dir, public_egress_policy("")).await;
+    let listener_spec = load_testing_spec(&uid("proxy"), 18082);
+    let (status, body) = client.post_json("/api-specs", &listener_spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {body}"
+    );
+    assert!(
+        body.to_string().contains("backend egress policy"),
+        "body: {body}"
+    );
+
+    // Control: an explicit loopback allow CIDR admits the same spec.
+    let allow_loopback = public_egress_policy("127.0.0.1/32");
+    let (client, _shutdown) = serving_admin(&dir, allow_loopback).await;
+    let listener_spec = load_testing_spec(&uid("proxy"), 18082);
+    let (status, body) = client.post_json("/api-specs", &listener_spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+
+    // A control-plane-style admin has no local `ProxyState`.
+    let mut control_plane = make_admin_state(make_store(&dir).await, 25);
+    control_plane.backend_allow_ips = public_egress_policy("");
+    let (base, _shutdown) = start_admin(control_plane).await;
+    let client = AdminClient::new(base);
+    let dp_listener_spec = load_testing_spec(&uid("proxy"), 18082);
+    let (status, body) = client.post_json("/api-specs", &dp_listener_spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+}
+
 #[tokio::test]
 async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph() {
     let dir = TempDir::new().unwrap();

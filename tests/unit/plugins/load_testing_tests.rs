@@ -805,6 +805,109 @@ fn test_env_derived_enabled_http_port_is_accepted() {
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 }
 
+fn load_testing_egress_policy(
+    allow_ips: ferrum_edge::config::BackendAllowIps,
+    allow_cidrs: &str,
+    deny_cidrs: &str,
+) -> ferrum_edge::config::BackendEgressPolicy {
+    ferrum_edge::config::BackendEgressPolicy::from_env(allow_ips, allow_cidrs, deny_cidrs, true)
+        .expect("valid backend egress policy")
+}
+
+/// The plugin client a serving node builds its plugins with.
+fn serving_client(policy: &ferrum_edge::config::BackendEgressPolicy) -> PluginHttpClient {
+    PluginHttpClient::default_with_backend_allow_ips(policy.clone()).for_serving_node()
+}
+
+/// A validation client admitting config for other nodes (control plane).
+fn admission_client(policy: &ferrum_edge::config::BackendEgressPolicy) -> PluginHttpClient {
+    PluginHttpClient::default_with_backend_allow_ips(policy.clone())
+}
+
+fn load_test_config(gateway_tls: bool, gateway_port: Option<u16>) -> serde_json::Value {
+    let mut config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_tls": gateway_tls
+    });
+    if let Some(port) = gateway_port {
+        config["gateway_port"] = json!(port);
+    }
+    config
+}
+
+#[test]
+fn load_testing_loopback_dial_respects_backend_egress_policy() {
+    use ferrum_edge::config::BackendAllowIps;
+
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
+    env.set("FERRUM_PROXY_HTTP_PORT", "18082");
+    env.set("FERRUM_PROXY_HTTPS_PORT", "18443");
+    // The default (this node's listener), the listener named explicitly, a
+    // co-located loopback service, and the TLS default: every synthetic dial
+    // targets 127.0.0.1, and ownership of that port is not provable.
+    let targets = [
+        load_test_config(false, None),
+        load_test_config(false, Some(18082)),
+        load_test_config(false, Some(18090)),
+        load_test_config(true, None),
+    ];
+
+    // `public` denies loopback, so a serving node refuses every target.
+    let public = load_testing_egress_policy(BackendAllowIps::Public, "", "");
+    for config in &targets {
+        let err = LoadTesting::new(config, serving_client(&public))
+            .err()
+            .expect("a loopback dial must be denied under a public policy");
+        assert!(err.contains("`gateway_port`"), "got: {err}");
+        assert!(err.contains("backend egress policy"), "got: {err}");
+        assert!(err.contains("127.0.0.1/32"), "got: {err}");
+    }
+
+    // A deny CIDR covering loopback denies it under `both` mode too.
+    let deny_loopback = load_testing_egress_policy(BackendAllowIps::Both, "", "127.0.0.0/8");
+    for config in &targets {
+        let err = LoadTesting::new(config, serving_client(&deny_loopback))
+            .err()
+            .expect("a loopback dial must be denied by a loopback deny CIDR");
+        assert!(err.contains("FERRUM_BACKEND_DENY_CIDRS"), "got: {err}");
+    }
+
+    // Controls: the default `both` policy, and `public` with loopback
+    // explicitly re-permitted, admit every target.
+    let both = load_testing_egress_policy(BackendAllowIps::Both, "", "");
+    let allow_loopback = load_testing_egress_policy(BackendAllowIps::Public, "127.0.0.1/32", "");
+    for config in &targets {
+        assert!(LoadTesting::new(config, serving_client(&both)).is_ok());
+        assert!(LoadTesting::new(config, serving_client(&allow_loopback)).is_ok());
+    }
+}
+
+#[test]
+fn load_testing_gateway_port_is_shape_only_on_admission_clients() {
+    use ferrum_edge::config::BackendAllowIps;
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    let public = load_testing_egress_policy(BackendAllowIps::Public, "", "");
+    // A control plane admitting the row does not own the policy that governs
+    // the data plane's loopback dial.
+    let dp_config = load_test_config(false, Some(19000));
+    assert!(LoadTesting::new(&dp_config, admission_client(&public)).is_ok());
+    assert!(
+        validate_plugin_config_with_policy("load_testing", &dp_config, &public).is_ok(),
+        "control-plane admission must not apply the node-local egress screen"
+    );
+    // Shape checks still apply on the admission path.
+    let zero_port = load_test_config(false, Some(0));
+    assert!(LoadTesting::new(&zero_port, admission_client(&public)).is_err());
+    // The same row is refused when a serving node under `public` builds it.
+    let err = LoadTesting::new(&dp_config, serving_client(&public))
+        .err()
+        .expect("a serving node must refuse the loopback dial under public");
+    assert!(err.contains("backend egress policy"), "got: {err}");
+}
+
 #[test]
 fn test_should_buffer_only_when_trigger_key_matches() {
     let plugin = make_plugin();

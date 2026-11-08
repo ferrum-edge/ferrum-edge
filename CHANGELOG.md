@@ -39,6 +39,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written, and the request gets the same `503` / `RESOURCE_EXHAUSTED` (a
   normalizer that itself rejected keeps its own rejection), so no buffered
   request body is retained beyond what the budget admitted.
+- **`load_testing` synthetic requests now obey the backend egress policy.**
+  `gateway_port` was only range-checked, and replays dialled
+  `127.0.0.1:{gateway_port}` from a dedicated client that never consulted
+  `FERRUM_BACKEND_ALLOW_IPS` / `FERRUM_BACKEND_DENY_CIDRS`, so an Operator
+  could aim up to 10,000 concurrent replays at any co-located loopback
+  service even where the policy denied loopback. A serving node now screens
+  the `127.0.0.1` dial target when it builds the plugin, for every
+  `gateway_port` including its own listener port, because which process owns
+  a loopback port cannot be proven. **Behaviour change:** under a policy that
+  denies loopback (`FERRUM_BACKEND_ALLOW_IPS=public`, or a deny CIDR covering
+  `127.0.0.1`), `load_testing` now requires an explicit loopback allow such
+  as `FERRUM_BACKEND_ALLOW_CIDRS=127.0.0.1/32`, which re-permits every
+  loopback port for all egress on that node; `gateway_addresses` fan-out does
+  not avoid it, since the originating node still runs its own cohort over
+  loopback. The default `both` policy is unaffected. Control-plane admission
+  checks only the field's shape, since the egress policy is node-local, and
+  API-spec imports now validate plugins with the same client as admin plugin
+  writes.
 - **Cleartext auth endpoints are admitted only for loopback IP literals,
   never the name `localhost`.** `oauth2_introspection` (credentialed
   `http://` endpoints and `client_auth.method: none`), `jwks_auth`
