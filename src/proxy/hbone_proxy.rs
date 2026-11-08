@@ -499,24 +499,25 @@ pub(crate) fn backend_write_timeout(proxy: &Proxy) -> Option<Duration> {
     relay_timeout_millis(proxy.backend_write_timeout_ms)
 }
 
+/// `(body_completed, client_disconnected, body_error_class)` for a finished
+/// HBONE byte relay, read from the same typed relay ending the raw TCP proxy
+/// classifies its relays with ([`tcp_proxy::RelayEndReason`], #7030).
 fn hbone_relay_body_outcome(
     first_failure: Option<&tcp_proxy::StreamFirstFailure>,
 ) -> (bool, bool, Option<retry::ErrorClass>) {
-    let Some((direction, class, side, _message)) = first_failure else {
+    let end_reason = tcp_proxy::RelayEndReason::from_first_failure(first_failure);
+    if end_reason == tcp_proxy::RelayEndReason::Graceful {
         return (true, false, None);
-    };
-    let client_disconnected = matches!(
-        tcp_proxy::disconnect_cause_for_failure(*direction, class, *side),
-        DisconnectCause::RecvError
-    );
-    (false, client_disconnected, Some(*class))
+    }
+    let client_disconnected = matches!(end_reason.disconnect_cause(), DisconnectCause::RecvError);
+    (false, client_disconnected, end_reason.error_class())
 }
 
 /// Whether the byte-stream relay's first failure resets the CONNECT stream
 /// with `RST_STREAM(CONNECT_ERROR)` (issues #5781, #5858).
 ///
 /// Only the idle window ends the stream cleanly
-/// ([`tcp_proxy::relay_failure_is_idle_expiry`]): nothing moved in either
+/// ([`tcp_proxy::RelayEndReason::resets_hbone_stream`]): nothing moved in either
 /// direction for the whole window, so the tunnel went quiet rather than being
 /// cut. Every other failure cut the byte stream short, and a clean
 /// `END_STREAM` would read as a complete response: a socket error on either
@@ -529,7 +530,7 @@ fn hbone_relay_body_outcome(
 fn hbone_relay_failure_resets_stream(
     first_failure: Option<&tcp_proxy::StreamFirstFailure>,
 ) -> bool {
-    first_failure.is_some_and(|failure| !tcp_proxy::relay_failure_is_idle_expiry(failure))
+    tcp_proxy::RelayEndReason::from_first_failure(first_failure).resets_hbone_stream()
 }
 
 /// End an HBONE tunnel's upgraded CONNECT stream once its relay is over (issue

@@ -6125,10 +6125,12 @@ pub struct HalfOpenProbeGuard {
     /// settled concurrently, so `cb` and `slot` need not change as one unit.
     cb: arc_swap::ArcSwapOption<crate::circuit_breaker::CircuitBreaker>,
     /// The unsettled [`ProbeTicket`], encoded so taking it is ONE atomic swap:
-    /// `0` is "no slot held" (a CLOSED admission, or already settled), and
+    /// `0` is "no slot held" (a CLOSED admission, or already settled),
     /// `PROBE_SLOT_HELD | generation` is a slot of that open generation, as
-    /// returned by the admitting CAS itself. The flag and the generation can
-    /// therefore never be observed apart.
+    /// returned by the admitting CAS itself, and `PROBE_OUTCOME_PENDING |
+    /// generation` is a probe whose slot was already released at header time
+    /// while its outcome is deferred ([`Self::release_slot_deferring_outcome`]).
+    /// The flag and the generation can therefore never be observed apart.
     slot: AtomicU64,
 }
 
@@ -6136,23 +6138,33 @@ pub struct HalfOpenProbeGuard {
 /// carry the slot's open generation.
 const PROBE_SLOT_HELD: u64 = 1 << 32;
 
+/// Marks [`HalfOpenProbeGuard::slot`] as a probe whose slot is already
+/// returned but whose outcome still belongs to its open cycle (#7030); the low
+/// 32 bits carry that generation.
+const PROBE_OUTCOME_PENDING: u64 = 1 << 33;
+
 #[inline]
 const fn encode_probe_slot(ticket: ProbeTicket) -> u64 {
     match ticket {
         ProbeTicket::NonProbe => 0,
         ProbeTicket::Probe { generation } => PROBE_SLOT_HELD | generation as u64,
+        ProbeTicket::SlotlessProbe { generation } => PROBE_OUTCOME_PENDING | generation as u64,
     }
 }
 
 #[inline]
 const fn decode_probe_slot(slot: u64) -> ProbeTicket {
-    if slot & PROBE_SLOT_HELD == 0 {
-        ProbeTicket::NonProbe
-    } else {
-        // Truncation keeps exactly the low 32 bits `encode_probe_slot` wrote.
+    // Truncation keeps exactly the low 32 bits `encode_probe_slot` wrote.
+    if slot & PROBE_SLOT_HELD != 0 {
         ProbeTicket::Probe {
             generation: slot as u32,
         }
+    } else if slot & PROBE_OUTCOME_PENDING != 0 {
+        ProbeTicket::SlotlessProbe {
+            generation: slot as u32,
+        }
+    } else {
+        ProbeTicket::NonProbe
     }
 }
 
@@ -6268,11 +6280,43 @@ impl HalfOpenProbeGuard {
     }
 
     /// Like [`Self::settle`] but leaves the slot with the guard, for an outcome
-    /// recorded as a non-probe while the slot is released separately.
+    /// recorded while the slot is released separately (at header time by
+    /// [`Self::release_slot_deferring_outcome`], or later by the guard itself).
+    ///
+    /// A HALF_OPEN probe's outcome keeps its cycle as
+    /// [`ProbeTicket::SlotlessProbe`] (#7030): the breaker drops a plain
+    /// non-probe outcome in HALF_OPEN, so recording a probe's deferred outcome
+    /// as one would stop every streaming probe from closing or reopening the
+    /// cycle it probed. A CLOSED admission stays a non-probe.
     pub fn settlement_without_slot(&self) -> BreakerSettlement {
         BreakerSettlement {
             breaker: self.cb.load_full(),
-            ticket: ProbeTicket::NonProbe,
+            ticket: self.held_ticket().without_slot(),
+        }
+    }
+
+    /// Release the slot NEUTRALLY now while the outcome is recorded later
+    /// (the deferred streaming dispatch, #1649 item 2): a long-lived response
+    /// body must not pin the slot. The guard keeps the probe's cycle, so the
+    /// deferred [`Self::settlement_without_slot`] still settles as that
+    /// cycle's probe. A no-op for a CLOSED admission.
+    pub fn release_slot_deferring_outcome(&self) {
+        let ticket = self.held_ticket();
+        if !ticket.is_probe() {
+            return;
+        }
+        if self
+            .slot
+            .compare_exchange(
+                encode_probe_slot(ticket),
+                encode_probe_slot(ticket.without_slot()),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            && let Some(cb) = &*self.cb.load()
+        {
+            cb.settle(ticket, BreakerOutcome::Neutral);
         }
     }
 
@@ -6577,8 +6621,10 @@ fn h3_success_on_drop_after_response_bytes(
 /// [`grpc_proxy::GrpcUploadTerminationObserver`].
 struct GrpcStreamingProbeRecorder {
     cb: Arc<crate::circuit_breaker::CircuitBreaker>,
-    /// The admission's ticket. Only its probe slot is settled through it (the
-    /// health outcome settles as a non-probe, epoch-checked below).
+    /// The admission's ticket. Its probe slot is settled through it; the
+    /// health outcome settles through `ticket.without_slot()` (epoch-checked
+    /// below), so a HALF_OPEN probe's outcome still decides its own cycle
+    /// (#7030) while the slot is released exactly once, separately.
     ticket: ProbeTicket,
     /// Shared with `GrpcBody::Streaming.exceeded`: a late client-upload overflow.
     /// Re-read at every settle point so an overflow that trips after a clean
@@ -6702,7 +6748,7 @@ impl GrpcStreamingProbeRecorder {
             self.clean_response_status.load(Ordering::Acquire),
             false,
             None,
-            ProbeTicket::NonProbe,
+            self.ticket.without_slot(),
             self.admission_open_epoch,
         );
     }
@@ -6842,7 +6888,7 @@ impl crate::proxy::body::GrpcResponseTerminalObserver for GrpcStreamingProbeReco
                     response_status,
                     connection_error,
                     error_class,
-                    ProbeTicket::NonProbe,
+                    self.ticket.without_slot(),
                     self.admission_open_epoch,
                 );
             }
@@ -6875,7 +6921,7 @@ fn grpc_post_header_upload_guard_duration(timeout_ms: u64) -> Option<Duration> {
 ///
 /// #1649 item 3: the streaming probe's backend-health outcome is no longer
 /// recorded here — it is deferred to response-**body** completion via the
-/// streaming body's `with_deferred_backend_dispatch_outcome` (as a non-probe),
+/// streaming body's `with_deferred_backend_dispatch_outcome` (slotless, #7030),
 /// so a `2xx`-then-stall / mid-stream reset / non-OK grpc-status trailer is
 /// recorded as the failure it is instead of a phantom header-time success. This
 /// function only settles the HALF_OPEN **probe slot**: with a deferred `recorder`
@@ -42360,10 +42406,19 @@ async fn handle_proxy_request_inner(
                     &proxy.id,
                     grpc_final_cb_key.as_deref(),
                 ) {
+                    // The outcome of THIS admission, without its slot: the
+                    // recorder (when present) or the guard still owns the slot
+                    // and releases it NEUTRALLY. A HALF_OPEN probe keeps its
+                    // cycle (#7030) so the breaker does not drop it as a
+                    // CLOSED-cycle straggler.
+                    let eager_ticket = grpc_streaming_probe_recorder
+                        .as_ref()
+                        .map_or_else(|| cb_probe.held_ticket(), |recorder| recorder.ticket)
+                        .without_slot();
                     record_grpc_backend_status_outcome(
                         &cb,
                         grpc_backend_dispatch_status,
-                        ProbeTicket::NonProbe,
+                        eager_ticket,
                     );
                     if let Some(recorder) = &grpc_streaming_probe_recorder {
                         recorder.mark_health_recorded();
@@ -43002,7 +43057,7 @@ async fn handle_proxy_request_inner(
                         false, // connection_error: post-wire, derived at body completion
                         None,  // error_class: derived from the terminal body error
                         // The admitting breaker; the slot is released separately
-                        // by the recorder, so this records as a non-probe.
+                        // by the recorder, so this records slotless (#7030).
                         cb_probe.settlement_without_slot(),
                         grpc_dispatch_skip_cb,
                         grpc_backend_admission_elapsed,
@@ -45817,7 +45872,8 @@ async fn handle_proxy_request_inner(
     // no-body responses on the eager header-time record. The HALF_OPEN probe slot
     // is still RELEASED here (same timing as the eager record), only the health
     // *outcome* is deferred — so a long-lived stream never pins the slot, and the
-    // deferred record runs as a non-probe (`ProbeTicket::NonProbe`).
+    // deferred record runs as the same cycle's slotless probe
+    // (`ProbeTicket::SlotlessProbe`, #7030).
     //
     // HBONE (`current_dispatch_hbone`) and mesh-mTLS
     // (`current_dispatch_mesh_mtls`) flow through the same `StreamingH2` arm.
@@ -46097,12 +46153,15 @@ async fn handle_proxy_request_inner(
     if defer_streaming_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
-        // completion as a non-probe. Gated by `!skip_final_cb_record` because a
-        // rotated-retry break already recorded (and released) the breaker for
-        // the prior target. `cb_probe` was re-pointed at the rotated target on
-        // every re-admission, so it names the breaker that granted the slot.
+        // completion as the probe of its own cycle without a slot
+        // (`ProbeTicket::SlotlessProbe`, #7030), so a streaming probe can still
+        // close or reopen the HALF_OPEN cycle it probed. Gated by
+        // `!skip_final_cb_record` because a rotated-retry break already
+        // recorded (and released) the breaker for the prior target. `cb_probe`
+        // was re-pointed at the rotated target on every re-admission, so it
+        // names the breaker that granted the slot.
         if !skip_final_cb_record {
-            cb_probe.release_neutral();
+            cb_probe.release_slot_deferring_outcome();
         }
     } else {
         // A skipped breaker record must not swallow the probe slot: leave it
@@ -46263,7 +46322,7 @@ async fn handle_proxy_request_inner(
     // carry the deferred dispatch outcome. Record it synchronously now, using the
     // BACKEND's captured
     // status/error (NOT the plugin reject's, which says nothing about backend
-    // health) and as a non-probe (the slot was released at header time).
+    // health) and slotless (the slot was released at header time, #7030).
     let deferred_streaming_body_still_streaming = (defer_streaming_h2_dispatch
         && matches!(&response_body, ResponseBody::StreamingH2(_)))
         || (defer_streaming_h3_dispatch && matches!(&response_body, ResponseBody::StreamingH3(_)));
@@ -47781,7 +47840,7 @@ async fn handle_proxy_request_inner(
             // least-latency) to body completion so a 2xx-then-stall H2/HBONE body
             // trips the breaker and reports a passive-health failure instead of
             // banking a phantom header-time success. The probe slot was already
-            // released at header time, so this records as a non-probe.
+            // released at header time, so this records slotless (#7030).
             // `record_deferred_backend_dispatch` derives the post-wire
             // `connection_error` from the terminal body error class, so pass
             // `connection_error = false` / `error_class = None` here.
@@ -47798,7 +47857,7 @@ async fn handle_proxy_request_inner(
                         false,
                         None,
                         // The slot was released at header time; the deferred
-                        // record settles on the admitting breaker as a non-probe.
+                        // record settles on the admitting breaker slotless (#7030).
                         cb_probe.settlement_without_slot(),
                         skip_final_cb_record,
                         final_backend_dispatch_elapsed,
@@ -47938,7 +47997,7 @@ async fn handle_proxy_request_inner(
                         false,
                         None,
                         // The slot was released at header time; the deferred
-                        // record settles on the admitting breaker as a non-probe.
+                        // record settles on the admitting breaker slotless (#7030).
                         cb_probe.settlement_without_slot(),
                         skip_final_cb_record,
                         final_backend_dispatch_elapsed,
@@ -69318,7 +69377,7 @@ mod tests {
         fn clean_response_then_upload_termination_heals() {
             // A clean 2xx/grpc-status:0 response heals the breaker — but only once
             // the upload terminates (so the overflow flag is final). The slot is
-            // released NEUTRAL at the join; the success is recorded as a non-probe.
+            // released NEUTRAL at the join; the success is recorded slotless.
             let cb = Arc::new(breaker_with_admitted_half_open_probe());
             let recorder = recorder(Arc::clone(&cb), None);
 

@@ -1290,8 +1290,8 @@ pub(crate) fn deferred_circuit_breaker_is_stale(
 /// Synchronous replacement for a deferred streaming dispatch outcome whose
 /// response body an `after_proxy` reject replaced with a buffered one: the body
 /// will never carry the deferred record, so record it now — the BACKEND's
-/// captured status/error (never the plugin reject's), as a non-probe (the probe
-/// slot was released at header time), on the breaker that admitted the attempt
+/// captured status/error (never the plugin reject's), as the attempt's slotless
+/// outcome (the probe slot was released at header time, #7030), on the breaker that admitted the attempt
 /// (`cb_probe`, issue #6799). The breaker record is skipped when
 /// `skip_circuit_breaker_record` is set or when the breaker opened a new cycle
 /// since `admission_open_epoch` (#1649 R5); passive health and least-latency

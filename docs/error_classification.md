@@ -399,7 +399,7 @@ for the per-path behavior.
 | Field | Source | When populated |
 |---|---|---|
 | `error_class: Option<ErrorClass>` | `classify_stream_error` / `classify_boxed_error` | session-level failure |
-| `disconnect_cause: Option<DisconnectCause>` | `pre_copy_disconnect_cause` (TCP) / `dtls_disconnect_cause` (UDP) | typed `StreamSetupKind` first, class fallback otherwise |
+| `disconnect_cause: Option<DisconnectCause>` | `pre_copy_disconnect_cause` (TCP setup) / `RelayEndReason::disconnect_cause` (TCP relay) / `dtls_disconnect_cause` (UDP) | typed `StreamSetupKind` first, class fallback otherwise; a TCP relay end is read once as a typed `RelayEndReason` (graceful, idle expiry, half-close cap, authorization expiry, client or backend failure), which also decides the raw TCP breaker settlement |
 | `disconnect_direction: Option<Direction>` | `pre_copy_disconnect_direction` (TCP) / `dtls_disconnect_direction` (UDP) | typed `StreamSetupKind` first, class fallback otherwise — populated for UDP/DTLS sessions on the same terms as TCP, so operators can tell which side tore down a DTLS session |
 | `connection_error: Option<String>` | `error.to_string()` | preserves the original message text alongside the typed class |
 

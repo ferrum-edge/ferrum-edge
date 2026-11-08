@@ -12,8 +12,8 @@ use ferrum_edge::_test_support::{
     BufferedUploadPumpProbe, BufferedUploadWaitOutcomeForTest, DtlsAuthorizationExpiryForTest,
     EarlyUploadBoundKind, GrpcBufferedUploadPumpProbe, H3AuthorizedHeadersWrite,
     H3BackendOrPeerForTest, H3UploadWaitOutcomeForTest, PrecommitPhaseOutcomeForTest,
-    ProbePumpOutcome, ProbeReplayFrame, ProbeTransportPoll, ReplayableUploadPumpProbe,
-    ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
+    ProbePumpOutcome, ProbeReplayFrame, ProbeTransportPoll, RelayEndReason,
+    ReplayableUploadPumpProbe, ResponseCollectBoundForTest, StreamIoSide, UploadPumpProbe,
     attribute_dispatch_phase_bound_for_test, authorization_bounded_header_deadline_for_test,
     authorization_expired_dispatch_placeholder_for_test,
     authorization_expired_pre_commitment_response_for_test,
@@ -692,6 +692,22 @@ async fn a_stalled_backend_write_cannot_starve_the_tcp_authorization_deadline() 
     assert!(
         relay_failure_is_client_facing(result.first_failure.as_ref().expect("failure")),
         "authorization expiry must stay health-neutral as a client-facing failure"
+    );
+    // Issue #7030: the typed relay ending names the authorization expiry
+    // itself, and the summary no longer reports it as an idle timeout.
+    let end_reason = RelayEndReason::from_first_failure(result.first_failure.as_ref());
+    assert_eq!(end_reason, RelayEndReason::AuthorizationExpired);
+    assert_eq!(
+        end_reason.disconnect_cause(),
+        DisconnectCause::RecvError,
+        "an authorization-lifetime relay end is the client-side decision its \
+         setup-phase and UDP/DTLS siblings report, never `idle_timeout`"
+    );
+    assert_eq!(end_reason.error_class(), Some(ErrorClass::RequestError));
+    assert_eq!(
+        end_reason.breaker_outcome(),
+        ferrum_edge::circuit_breaker::BreakerOutcome::Neutral,
+        "authorization expiry must not move the backend breaker"
     );
     assert_eq!(
         result.bytes_client_to_backend, accepted,

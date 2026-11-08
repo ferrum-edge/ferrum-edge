@@ -16,6 +16,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is still visible as a waiting state through `convergence.version_skew` on
   the JWT-authenticated `GET /mesh/config-drift`.
 
+### Changed
+- **Circuit-breaker policy for TCP relay endings, HALF_OPEN stragglers, and
+  cycle counters** (issue #7030).
+  - A raw TCP relay that ends on its idle window (`tcp_idle_timeout_seconds`)
+    or on the half-close cap (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) now
+    settles the backend breaker as a success instead of a connection-error
+    failure, matching HBONE, which records a success once its backend connect
+    succeeds. Long-lived idle TCP sessions no longer trip or reopen a backend's
+    breaker, and a HALF_OPEN probe that ends that way counts toward recovery.
+    Backend-socket failures and backend read/write deadlines still trip.
+  - A TCP relay ended by the session's authorization lifetime is now logged as
+    `disconnect_cause=recv_error` / `error_class=request_error` (the
+    classification its setup-phase and UDP/DTLS siblings already use) instead
+    of `idle_timeout` / `read_write_timeout`. **Operator action:** retarget
+    alerts that counted authenticated-stream expiries under `idle_timeout`. No
+    label value was added.
+  - In HALF_OPEN only the cycle's own probes decide: a request admitted while
+    the breaker was CLOSED that completes during HALF_OPEN is dropped. It no
+    longer counts toward `success_threshold` and no longer reopens the cycle.
+  - `success_count` / `failure_count` are tagged with the open cycle they count
+    and incremented with a compare-exchange that refuses a stale cycle, so an
+    increment racing a reopen can no longer close the next cycle one success
+    early or extend its failure streak.
+
 ### Fixed
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The

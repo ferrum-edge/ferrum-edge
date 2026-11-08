@@ -636,39 +636,215 @@ fn a_tcp_relay_guard_that_outlives_a_reopen_cannot_over_admit_on_success() {
     );
 }
 
-#[test]
-fn record_success_without_probe_admission_still_advances_half_open() {
-    // F04 (PR #1408): the gRPC retry loop now gates a rotated retry through
-    // can_execute before dispatching (mirroring the HTTP path). This matters
-    // because record_success with is_half_open_probe = false STILL advances the
-    // half-open success counter — it only skips the in-flight decrement — and
-    // can close the breaker. A retry that bypassed admission would therefore
-    // wrongly drive recovery, which is exactly what the gate prevents. Pin that
-    // record_success(false) is NOT a no-op on a HALF_OPEN breaker.
-    let config = CircuitBreakerConfig {
+/// A breaker that opens on one failure, needs two successes to close, and
+/// admits one HALF_OPEN probe at a time.
+fn straggler_config() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
         failure_threshold: 1,
         success_threshold: 2,
         timeout_seconds: 0,
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
         trip_on_connection_errors: true,
-    };
-    let cb = CircuitBreaker::new(config);
+    }
+}
+
+#[test]
+fn closed_cycle_straggler_success_does_not_advance_half_open() {
+    // #7030: in HALF_OPEN only the cycle's own probes decide. A request admitted
+    // in an earlier CLOSED cycle (a `NonProbe` ticket) that completes while the
+    // breaker is HALF_OPEN is dropped: it neither counts toward
+    // `success_threshold` nor returns a slot it never held. (Before #7030 two
+    // such successes closed the breaker; PR #1408's F04 pinned that.)
+    let cb = CircuitBreaker::new(straggler_config());
+    let (straggler, _) = cb.admit().expect("CLOSED admission");
+    assert_eq!(straggler, ProbeTicket::NonProbe);
     cb.record_failure(500, false, false);
-    // Transition to half-open (reserves the single probe slot).
-    assert!(cb.can_execute().unwrap());
+    let (probe, _) = cb.admit().expect("timeout 0 admits a probe");
+    assert!(probe.is_probe());
     assert_eq!(cb.state_name(), "half_open");
 
-    // Two non-probe successes (e.g. unadmitted rotated retries) advance the
-    // half-open success_count to the threshold and close the breaker.
-    cb.record_success(false);
-    assert_eq!(cb.state_name(), "half_open");
+    cb.settle(straggler, BreakerOutcome::Success);
+    cb.settle(straggler, BreakerOutcome::Success);
     cb.record_success(false);
     assert_eq!(
         cb.state_name(),
-        "closed",
-        "record_success(is_half_open_probe = false) advances half-open recovery and can close the breaker"
+        "half_open",
+        "a CLOSED-cycle straggler's success must not help close a HALF_OPEN cycle"
     );
+    assert_eq!(cb.success_count(), 0, "the straggler earns no credit");
+    assert_eq!(cb.half_open_in_flight(), 1, "the probe's slot is untouched");
+
+    // The cycle's own probes still decide it.
+    cb.settle(probe, BreakerOutcome::Success);
+    assert_eq!(cb.success_count(), 1);
+    let (second, _) = cb.admit().expect("the freed slot admits");
+    cb.settle(second, BreakerOutcome::Success);
+    assert_eq!(cb.state_name(), "closed");
+}
+
+#[test]
+fn closed_cycle_straggler_failure_does_not_reopen_half_open() {
+    // #7030, failure side: a CLOSED-cycle straggler's counted failure that
+    // arrives during HALF_OPEN must not reopen the cycle, restart its recovery
+    // timeout, or advance the open generation.
+    let cb = CircuitBreaker::new(straggler_config());
+    let (straggler, _) = cb.admit().expect("CLOSED admission");
+    cb.record_failure_at_for_test(500, false, false, 1_000, 1_000);
+    let (probe, _) = cb.admit().expect("timeout 0 admits a probe");
+    assert!(probe.is_probe());
+    let generation = cb.open_epoch();
+    let opened_at = cb.last_failure_tick_ms_for_test();
+
+    for outcome in [
+        BreakerOutcome::Failure {
+            status_code: 500,
+            connection_error: false,
+        },
+        BreakerOutcome::Failure {
+            status_code: 502,
+            connection_error: true,
+        },
+    ] {
+        cb.settle(straggler, outcome);
+        assert_eq!(
+            cb.state_name(),
+            "half_open",
+            "a CLOSED-cycle straggler's {outcome:?} must not reopen HALF_OPEN"
+        );
+    }
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(
+        cb.open_epoch(),
+        generation,
+        "no reopen advanced the generation"
+    );
+    assert_eq!(cb.last_failure_tick_ms_for_test(), opened_at);
+    assert_eq!(cb.half_open_in_flight(), 1, "the probe's slot is untouched");
+
+    // The cycle's own probe still reopens it.
+    cb.settle(
+        probe,
+        BreakerOutcome::Failure {
+            status_code: 500,
+            connection_error: false,
+        },
+    );
+    assert_eq!(cb.state_name(), "open");
+}
+
+#[test]
+fn a_slotless_probe_outcome_still_decides_its_own_cycle() {
+    // #7030: a deferred streaming probe releases its slot at header time and
+    // records its outcome later. That outcome is the cycle's own probe
+    // (`ProbeTicket::SlotlessProbe`), so it still closes or reopens the cycle,
+    // while it returns no second slot.
+    for (outcome, expected) in [
+        (BreakerOutcome::Success, "closed"),
+        (
+            BreakerOutcome::Failure {
+                status_code: 500,
+                connection_error: false,
+            },
+            "open",
+        ),
+    ] {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            success_threshold: 1,
+            ..straggler_config()
+        });
+        cb.record_failure(500, false, false);
+        let (probe, _) = cb.admit().expect("probe");
+        cb.settle(probe, BreakerOutcome::Neutral);
+        assert_eq!(cb.half_open_in_flight(), 0, "header-time release");
+        let (_next, _) = cb.admit().expect("the released slot admits the next probe");
+        assert_eq!(cb.half_open_in_flight(), 1);
+
+        let deferred = probe.without_slot();
+        assert!(matches!(deferred, ProbeTicket::SlotlessProbe { .. }));
+        assert!(!deferred.is_probe(), "a slotless ticket holds no slot");
+        cb.settle(deferred, outcome);
+        assert_eq!(cb.state_name(), expected, "{outcome:?}");
+    }
+
+    // Stale slotless outcomes are dropped like stale probes, and never free a
+    // later cycle's slot.
+    let cb = CircuitBreaker::new(two_probe_config(1));
+    let b = stale_probe_beside_two_current_probes(&cb);
+    cb.settle(b.without_slot(), BreakerOutcome::Success);
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 2);
+    assert_eq!(ProbeTicket::NonProbe.without_slot(), ProbeTicket::NonProbe);
+}
+
+#[test]
+fn a_stale_success_increment_is_refused_after_a_reopen_restarts_the_cycle() {
+    // #7030 counter residual: a probe of cycle G checks HALF_OPEN(G), then a
+    // sibling reopens and (timeout 0) a new HALF_OPEN cycle G+1 starts before
+    // the first probe's increment runs. The increment carries G and is refused,
+    // so it cannot close G+1 one success early.
+    let cb = CircuitBreaker::new(CircuitBreakerConfig {
+        half_open_max_requests: 2,
+        ..straggler_config()
+    });
+    cb.record_failure(500, false, false);
+    let (_a, checked_generation) = cb.admit().expect("A admitted");
+    let (b, _) = cb.admit().expect("B admitted");
+    // A's state check observed HALF_OPEN(G) here.
+
+    cb.settle(b, PROBE_FAILURE);
+    assert_eq!(cb.state_name(), "open");
+    let (c, current_generation) = cb.admit().expect("C opens cycle G+1");
+    assert_ne!(current_generation, checked_generation);
+    assert_eq!(cb.state_name(), "half_open");
+
+    // A's increment, with the generation its check observed, lands now.
+    assert!(
+        !cb.count_success_in_cycle_for_test(checked_generation),
+        "an increment for a cycle older than the counter's must be refused"
+    );
+    assert_eq!(cb.success_count(), 0, "no stale credit in cycle G+1");
+
+    // Cycle G+1 still needs its own two successes.
+    cb.settle(c, BreakerOutcome::Success);
+    assert_eq!(cb.state_name(), "half_open", "one success must not close");
+    assert!(cb.count_success_in_cycle_for_test(current_generation));
+    assert_eq!(cb.success_count(), 2);
+}
+
+#[test]
+fn a_stale_failure_increment_is_refused_after_a_reopen_and_recovery() {
+    // #7030 counter residual, CLOSED side: a failure checks CLOSED(G), then the
+    // breaker opens, recovers, and the recovered CLOSED cycle zeroes the
+    // counter for its own generation. The stale increment is refused and does
+    // not count toward the new cycle's failure streak.
+    let cb = CircuitBreaker::new(CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        ..straggler_config()
+    });
+    let checked_generation = cb.open_epoch();
+    // The failure's state check observed CLOSED(G) here.
+
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    let (probe, recovered_generation) = cb.admit().expect("probe");
+    cb.settle(probe, BreakerOutcome::Success);
+    assert_eq!(cb.state_name(), "closed");
+    assert_eq!(cb.failure_count(), 0);
+
+    assert!(
+        !cb.count_failure_in_cycle_for_test(checked_generation),
+        "an increment for a closed cycle older than the counter's must be refused"
+    );
+    assert_eq!(cb.failure_count(), 0);
+
+    // One genuine failure of the recovered cycle still does not trip it.
+    assert!(cb.count_failure_in_cycle_for_test(recovered_generation));
+    assert_eq!(cb.failure_count(), 1);
+    assert_eq!(cb.state_name(), "closed");
 }
 
 #[test]
@@ -3831,8 +4007,11 @@ async fn replaced_streaming_response_heals_the_admitting_half_open_breaker() {
     let admission_epoch = cb.open_epoch();
 
     // Header time: the deferred streaming path releases the probe slot
-    // without a health outcome and defers the record to body completion.
-    cb_probe.release_neutral();
+    // without a health outcome and defers the record to body completion. The
+    // guard keeps the probe's cycle (#7030), so the deferred record still
+    // decides it.
+    cb_probe.release_slot_deferring_outcome();
+    assert!(!cb_probe.holds_slot());
     assert_eq!(cb.state_name(), "half_open");
     assert_eq!(cb.half_open_in_flight(), 0);
 

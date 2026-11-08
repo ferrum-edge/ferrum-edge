@@ -914,6 +914,101 @@ fn every_probe_outcome_kind_releases_the_half_open_slot() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// (a2) HALF_OPEN is decided only by its own cycle's probes (#7030)
+//
+// A `ProbeTicket::NonProbe` outcome reaching a HALF_OPEN breaker belongs to a
+// request admitted in an earlier CLOSED cycle and is dropped. Every protocol
+// path — H1/H2, WebSocket, gRPC, HTTP/3, the HBONE relay, raw TCP and UDP/DTLS
+// — settles through `CircuitBreaker::settle`, so the rule lives in the breaker
+// once; the runtime table pins it for every outcome kind. A probe whose slot
+// is released separately from its outcome (the deferred streaming records, the
+// gRPC streaming recorder, the eager gRPC header-time record) must therefore
+// carry its cycle as `ProbeTicket::SlotlessProbe`; the structural check below
+// fails if one of those sites goes back to a bare `NonProbe`, which would stop
+// every streaming probe from closing or reopening the cycle it probed.
+// ---------------------------------------------------------------------------
+
+/// Every outcome a CLOSED-cycle straggler can carry into a HALF_OPEN breaker.
+const STRAGGLER_OUTCOMES: &[(&str, BreakerOutcome)] = &[
+    ("success", BreakerOutcome::Success),
+    (
+        "tripping status failure",
+        BreakerOutcome::Failure {
+            status_code: 500,
+            connection_error: false,
+        },
+    ),
+    (
+        "connection failure",
+        BreakerOutcome::Failure {
+            status_code: 502,
+            connection_error: true,
+        },
+    ),
+    ("neutral", BreakerOutcome::Neutral),
+];
+
+#[test]
+fn a_closed_cycle_straggler_never_decides_a_half_open_cycle() {
+    for &(label, outcome) in STRAGGLER_OUTCOMES {
+        let cb = breaker_holding_one_probe();
+        let generation = cb.open_epoch();
+        cb.settle(ProbeTicket::NonProbe, outcome);
+        assert_eq!(
+            cb.state_name(),
+            "half_open",
+            "a straggler {label} must not move the HALF_OPEN cycle"
+        );
+        assert_eq!(cb.open_epoch(), generation, "a straggler {label} reopened");
+        assert_eq!(
+            cb.half_open_in_flight(),
+            1,
+            "a straggler {label} must not touch the probe's slot"
+        );
+        assert_eq!(cb.success_count(), 0, "a straggler {label} earned credit");
+    }
+}
+
+/// `src/proxy/mod.rs` calls that record a probe's outcome while its slot is
+/// released elsewhere. None may name a bare `ProbeTicket::NonProbe`.
+const SLOTLESS_OUTCOME_CALLS: &[&str] = &[
+    "backend_dispatch::apply_deferred_circuit_breaker_outcome(",
+    "record_grpc_backend_status_outcome(",
+];
+
+#[test]
+fn probe_outcomes_recorded_apart_from_their_slot_keep_their_cycle() {
+    let text = source("src/proxy/mod.rs");
+    for call in SLOTLESS_OUTCOME_CALLS {
+        let mut calls = 0;
+        for after in text.split(call).skip(1) {
+            let args = &after[..after.find(");").unwrap_or(after.len())];
+            calls += 1;
+            assert!(
+                !args.contains("ProbeTicket::NonProbe"),
+                "`{call}` must settle the admission's own ticket (`.without_slot()`), \
+                 not a bare `NonProbe` the HALF_OPEN breaker drops"
+            );
+        }
+        assert!(calls > 0, "`{call}` must still exist in src/proxy/mod.rs");
+    }
+    let without_slot = item_body(
+        &text,
+        "    pub fn settlement_without_slot(&self) -> BreakerSettlement {",
+        "\n    }\n",
+    );
+    assert!(
+        without_slot.contains("self.held_ticket().without_slot()"),
+        "`settlement_without_slot` must keep a probe's cycle"
+    );
+    assert!(
+        text.contains("cb_probe.release_slot_deferring_outcome();"),
+        "the H1/H2 deferred streaming release must keep the probe's cycle for the \
+         body-completion record"
+    );
+}
+
 /// Whether `byte` can continue an identifier (non-ASCII bytes count, so a
 /// multibyte identifier never looks like a literal prefix).
 fn is_ident_byte(byte: u8) -> bool {
