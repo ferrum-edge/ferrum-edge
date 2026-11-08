@@ -434,6 +434,142 @@ fn transform_plugins(id: &str, padding: String) -> [serde_json::Value; 2] {
     ]
 }
 
+/// A retried upload larger than the whole request-buffer budget.
+const RETRIED_UPLOAD_BYTES: usize = 100 * 1024;
+
+#[ignore]
+#[tokio::test]
+async fn a_dispatch_capacity_refusal_is_never_advertised_as_gzip() {
+    // Sol review (round 13): a dispatch-stage capacity refusal is a gateway
+    // terminal whose body transforms are skipped, so no header hook may commit
+    // a body coding for it. Retry replay buffers this PUT inside dispatch, the
+    // budget refuses it, and `compression` must not label the plaintext
+    // refusal `Content-Encoding: gzip` after `response_transformer` gave it a
+    // compressible media type.
+    let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
+    let mut gateway = TestGateway::builder()
+        .mode_file(retry_compression_config(backend_port))
+        .log_level("warn")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env(
+            "FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES",
+            FALLBACK_BYTES.to_string(),
+        )
+        .env(
+            "FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES",
+            FALLBACK_BYTES.to_string(),
+        )
+        .spawn()
+        .await
+        .expect("start retry-compression gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let upload = vec![b'u'; RETRIED_UPLOAD_BYTES];
+    let (head, body) = raw_gzip_put(gateway.proxy_port, &upload).await;
+    assert!(
+        head.starts_with("http/1.1 503"),
+        "the retried upload must get the capacity refusal: {head}"
+    );
+    assert!(
+        !head.contains("content-encoding"),
+        "a plaintext capacity refusal must not advertise a coding: {head}"
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("Request buffering capacity exceeded"),
+        "the refusal body must stay readable: {text}"
+    );
+    assert_eq!(buffered_hits(&backend_hits), 0);
+
+    // The refusal released its charge: an admissible upload through the same
+    // route still succeeds.
+    let (head, _) = raw_gzip_put(gateway.proxy_port, b"small").await;
+    assert!(head.starts_with("http/1.1 200"), "unexpected head: {head}");
+    assert_eq!(buffered_hits(&backend_hits), 1);
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+/// One raw HTTP/1.1 `PUT` that negotiates gzip, read until the gateway closes
+/// the connection, so the test sees the exact wire head and body with no
+/// client-side decoding. Returns the lowercased head and the body bytes.
+async fn raw_gzip_put(port: u16, body: &[u8]) -> (String, Vec<u8>) {
+    let head = format!(
+        "PUT /buffered-retry HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect gateway");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("request head");
+    // The gateway may answer before it has read the whole upload.
+    let _ = stream.write_all(body).await;
+    let mut response = Vec::new();
+    let read = stream.read_to_end(&mut response);
+    let _ = tokio::time::timeout(Duration::from_secs(10), read).await;
+    let end = find_header_end(&response).expect("complete response head");
+    let head = String::from_utf8_lossy(&response[..end]);
+    (head.to_ascii_lowercase(), response[end..].to_vec())
+}
+
+fn retry_compression_config(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "retry-route",
+            "listen_path": "/buffered-retry",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+                "retryable_methods": ["PUT"]
+            },
+            "plugins": [
+                {"plugin_config_id": "retry-content-type"},
+                {"plugin_config_id": "retry-gzip"}
+            ]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "retry-content-type",
+                "proxy_id": "retry-route",
+                "plugin_name": "response_transformer",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "content-type",
+                    "value": "application/json"
+                }]}
+            },
+            {
+                "id": "retry-gzip",
+                "proxy_id": "retry-route",
+                "plugin_name": "compression",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"algorithms": ["gzip"], "min_content_length": 1}
+            }
+        ]
+    });
+    serde_yaml::to_string(&config).expect("serialize retry-compression config")
+}
+
 /// Read one HTTP/1.1 response head from `stream`.
 async fn read_response_head(stream: &mut tokio::net::TcpStream) -> String {
     let mut buf = Vec::with_capacity(1024);

@@ -1555,3 +1555,43 @@ fn every_request_buffer_capacity_refusal_selects_the_gateway_capacity_terminal()
     let rejected = refusal.find("write_final_body_reject(").expect("reject");
     assert!(marked < rejected);
 }
+
+#[test]
+fn a_dispatch_stage_capacity_terminal_takes_the_gateway_terminal_hook_path() {
+    // Its body transforms are skipped, so its `after_proxy` hooks must run on
+    // the gateway-terminal reject path (replacers skipped, rejection marker
+    // set) rather than the ordinary backend-response chain, where
+    // `compression` could commit a coding the skipped encoder never applies.
+    // Behavioural proof: `functional_request_buffer_budget_test`.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let pipeline = proxy
+        .split("let capacity_class = Some(")
+        .nth(1)
+        .expect("dispatch-stage capacity mark");
+    let gate = "if ctx.gateway_capacity_response_selected()\n            \
+                && let ResponseBody::Buffered(capacity_body) = &mut response_body";
+    let gated = pipeline.find(gate).expect("capacity terminal gate");
+    let hooks = pipeline
+        .find("boxed_after_proxy_hooks_to_gateway_error_terminal(")
+        .expect("gateway-terminal hooks");
+    let ordinary = pipeline
+        .find("run_after_proxy_hooks(&plugins, &mut ctx, response_status")
+        .expect("ordinary hooks");
+    assert!(gated < hooks && hooks < ordinary);
+    let normalize = pipeline
+        .find("crate::plugins::normalize_response_body_for_inspection(")
+        .expect("response normalization");
+    let skipped = pipeline
+        .find("&& !ctx.gateway_capacity_response_selected()\n        && !plugins.is_empty()")
+        .expect("normalization skips a capacity terminal");
+    assert!(skipped < normalize);
+
+    let factory = proxy
+        .split("fn boxed_after_proxy_hooks_to_gateway_error_terminal<'a>(")
+        .nth(1)
+        .expect("boxing factory")
+        .split("\n}\n")
+        .next()
+        .expect("bounded factory");
+    assert!(factory.contains("Box::pin(async move {"));
+}

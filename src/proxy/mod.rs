@@ -26885,6 +26885,34 @@ pub(crate) async fn apply_after_proxy_hooks_to_gateway_error_terminal(
     .await;
 }
 
+/// A boxed reject-path `after_proxy` run over a gateway terminal.
+type BoxedGatewayTerminalHooksFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+/// [`apply_after_proxy_hooks_to_gateway_error_terminal`], constructed out of
+/// line and returned boxed so the generic request future does not carry the
+/// reject-path hook runner as a frame slot, for the reason documented on
+/// [`boxed_finalize_reject_response`].
+#[inline(never)]
+fn boxed_after_proxy_hooks_to_gateway_error_terminal<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    status_code: &'a mut u16,
+    response_body: &'a mut Bytes,
+    response_headers: &'a mut HashMap<String, String>,
+) -> BoxedGatewayTerminalHooksFuture<'a> {
+    Box::pin(async move {
+        apply_after_proxy_hooks_to_gateway_error_terminal(
+            plugins,
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        )
+        .await
+    })
+}
+
 /// Rebuild `response_status` / `response_headers` for a plugin rejection
 /// **without** running the `after_proxy` reject hooks, returning the rejection
 /// body. This is the header/body half of [`apply_plugin_rejection_response`],
@@ -45898,7 +45926,25 @@ async fn handle_proxy_request_inner(
     let mut after_proxy_rejected = false;
     if !plugins.is_empty() {
         let phase_start = Instant::now();
-        if let Some(reject) =
+        if ctx.gateway_capacity_response_selected()
+            && let ResponseBody::Buffered(capacity_body) = &mut response_body
+        {
+            // A dispatch-stage capacity refusal is a gateway terminal, not a
+            // backend response: its `after_proxy` hooks run on the same
+            // gateway-terminal reject path as every other capacity refusal. A
+            // replacer never rewrites it, decorators (CORS) still run, and the
+            // rejection marker keeps a header hook from committing a body
+            // coding (`compression`) that the skipped body transforms below
+            // would never apply.
+            boxed_after_proxy_hooks_to_gateway_error_terminal(
+                &plugins,
+                &mut ctx,
+                &mut response_status,
+                capacity_body,
+                &mut response_headers,
+            )
+            .await;
+        } else if let Some(reject) =
             run_after_proxy_hooks(&plugins, &mut ctx, response_status, &mut response_headers).await
         {
             let _ = ctx.take_buffered_initial_response_header_policy();
@@ -45976,8 +46022,11 @@ async fn handle_proxy_request_inner(
     // none may replace its `Backend deadline exceeded` wording. The transform
     // phase still runs so a translated gRPC-Web terminal gets its wire shape.
     let charged_backend_deadline_terminal = ctx.charged_backend_deadline_terminal();
+    // A capacity terminal selected before this phase (a dispatch-stage
+    // request-buffer refusal) is already final: no normalizer may reopen it.
     if !after_proxy_rejected
         && !charged_backend_deadline_terminal
+        && !ctx.gateway_capacity_response_selected()
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
