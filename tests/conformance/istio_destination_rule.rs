@@ -340,7 +340,7 @@ fn dr_connection_pool_http_max_concurrent_streams() {
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.maxConcurrentStreams",
         status = Status::Supported,
-        notes = "Issue #3775: per-HTTP/2-connection stream limit. Projects onto UpstreamPortOverride.h2_max_concurrent_streams and Proxy.pool_http2_max_concurrent_streams, threading into the direct-H2 and native-gRPC hyper builders (max_concurrent_streams advertises the local SETTINGS value; initial_max_send_streams seeds the outbound bound until the peer's SETTINGS arrive, which a peer may raise or lower). Direct-H2/gRPC pool keys carry the effective value so update/delete cannot reuse a connection built under a prior limit. Reqwest's H2 path exposes no equivalent builder knob. Zero rejected at translate time.",
+        notes = "Issue #3775: per-HTTP/2-connection stream limit. Projects onto UpstreamPortOverride.h2_max_concurrent_streams and Proxy.pool_http2_max_concurrent_streams, threading into every hyper H2 backend builder (direct H2, native gRPC pooled and nested-HBONE, Sidecar mesh mTLS) (max_concurrent_streams advertises the local SETTINGS value; initial_max_send_streams seeds the outbound bound until the peer's SETTINGS arrive, which a peer may raise or lower). Direct-H2/gRPC pool keys carry the effective value so update/delete cannot reuse a connection built under a prior limit. Reqwest's H2 path exposes no equivalent builder knob. Zero rejected at translate time.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",

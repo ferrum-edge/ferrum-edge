@@ -4660,15 +4660,19 @@ fn hbone_dispatch_authority<'a>(
 /// queued on. That cap is not sampled once: the load is created here BEFORE the
 /// connection driver is spawned and the driver refreshes it from
 /// `Connection::current_max_send_streams()` after every poll, because the value
-/// available immediately after `await_peer_settings` is still hyper's
-/// pre-settings default. The width ceiling is
+/// available immediately after `await_peer_settings` is still the pre-settings
+/// bound (the configured stream cap, else hyper's default). The width ceiling is
 /// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` clamped by
 /// `hbone_inner_pool::MAX_SHARED_H2_PER_KEY`; see `docs/mesh.md`.
 ///
-/// HTTP/2 PING keepalive is still deliberately NOT enabled on the inner
-/// connection. It is a stream on the outer pooled HBONE connection, which
-/// already carries the pool's keepalive; if that dies, this sender reports
-/// closed and is evicted on the next checkout.
+/// The inner connection is built by the shared `pool::hyper_h2_client_builder`
+/// (issue #7071), so when `enable_http2` is set it sends the pool's HTTP/2 PING
+/// keepalive while an RPC is in flight (never while idle) and is torn down when
+/// a PING goes unanswered for `http2_keep_alive_timeout_seconds`. The outer
+/// pooled HBONE connection runs its own keepalive, which proves only the tunnel
+/// to the destination relay; the inner PINGs also prove the destination app is
+/// still serving this connection. Either way a dead sender reports closed and
+/// is evicted on the next checkout.
 ///
 /// The inner connection is admitted only once the destination app's OWN HTTP/2
 /// connection preface has been observed (`h2c_preface::await_peer_settings`,

@@ -147,8 +147,9 @@
 //!   sampled once (issue #5042 step 2 re-review). hyper exposes
 //!   `current_max_send_streams()` on the `Connection`, never on the
 //!   `SendRequest` the pool holds, and the value it reports right after
-//!   `h2c_preface::await_peer_settings` is still hyper's
-//!   `DEFAULT_INITIAL_MAX_SEND_STREAMS` (100): observing the peer's SETTINGS
+//!   `h2c_preface::await_peer_settings` is still the pre-settings bound (the
+//!   configured stream cap, else hyper's `DEFAULT_INITIAL_MAX_SEND_STREAMS` of
+//!   100): observing the peer's SETTINGS
 //!   BYTES is not the same as `h2` having applied them, which it defers until
 //!   it writes the SETTINGS ACK. A single sample therefore recorded 100 for a
 //!   destination advertising 8, `is_saturated()` never fired, and RPCs 9..100
@@ -795,9 +796,10 @@ impl HboneInnerH2Load {
     /// hyper exposes that only on the `Connection`, never on the `SendRequest`
     /// the pool holds, so the driver is the only place the value stays
     /// current — and it has to stay current, because the value right after
-    /// `h2c_preface::await_peer_settings` is still hyper's pre-settings default
-    /// of 100 (`h2` defers applying the peer's SETTINGS until it writes the
-    /// ACK). A one-shot sample there recorded 100 for every destination and
+    /// `h2c_preface::await_peer_settings` is still the pre-settings bound (the
+    /// configured stream cap, else hyper's default of 100; `h2` defers applying
+    /// the peer's SETTINGS until it writes the ACK). A one-shot sample there
+    /// recorded 100 for every uncapped destination and
     /// silently disabled the widen decision; see the module doc.
     ///
     /// `Relaxed` is sufficient: the value only steers a widen heuristic, and a
