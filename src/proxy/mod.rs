@@ -40335,6 +40335,20 @@ async fn handle_proxy_request_inner(
                                 initial_response_header_policy_plugins.as_ref(),
                             ));
                         }
+                        // The shared request-buffer budget refused the upload:
+                        // the gateway-local capacity refusal, before dispatch.
+                        Err(grpc_proxy::GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
+                            cb_probe.release_neutral();
+                            drop(preacquired_backend_admission.take_if_acquired());
+                            let response = build_request_buffer_capacity_response(
+                                true,
+                                grpc_web_response_content_type,
+                                initial_response_header_policy_plugins.as_ref(),
+                            );
+                            ctx.terminal_record.mark_counted();
+                            record_request(&state, response.status().as_u16());
+                            return Ok(response);
+                        }
                         Err(grpc_proxy::GrpcRequestBodyCollectError::ClientDisconnected) => {
                             // The client reset or dropped its upload (issue
                             // #6022). No backend was dialed: release the
@@ -41042,6 +41056,21 @@ async fn handle_proxy_request_inner(
                         Err(GrpcProxyError::ResourceExhausted(message)),
                         Bytes::new(),
                     ),
+                    // The shared request-buffer budget refused the upload: the
+                    // gateway-local capacity refusal, before any dispatch, so
+                    // it is never retried or charged to the backend.
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
+                        cb_probe.release_neutral();
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        let response = build_request_buffer_capacity_response(
+                            true,
+                            grpc_web_response_content_type,
+                            initial_response_header_policy_plugins.as_ref(),
+                        );
+                        ctx.terminal_record.mark_counted();
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
                     // A client reset mid-upload is the client's CANCELLED, never
                     // a dispatch error charged through the retry loop (issue
                     // #6022). Same cleanup as the split-path arm.

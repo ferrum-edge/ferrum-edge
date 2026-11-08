@@ -1413,7 +1413,7 @@ async fn a_stalled_native_grpc_upload_holds_only_its_bytes() {
 }
 
 #[tokio::test]
-async fn a_native_grpc_upload_the_budget_cannot_cover_is_resource_exhausted() {
+async fn a_native_grpc_upload_the_budget_cannot_cover_is_a_capacity_refusal() {
     use ferrum_edge::_test_support::{
         GrpcChargedCollectOutcomeForTest, collect_grpc_upload_for_test,
     };
@@ -1423,17 +1423,41 @@ async fn a_native_grpc_upload_the_budget_cannot_cover_is_resource_exhausted() {
         .expect("other uploads hold the budget");
     let body = complete_body(vec![data_frame(vec![0u8; 64])]);
     let outcome = collect_grpc_upload_for_test(body, &budget, 4 * UNIT).await;
-    let expected = GrpcChargedCollectOutcomeForTest::ResourceExhausted(
-        "Request buffering capacity exceeded".to_string(),
+    // A distinct capacity refusal, not the oversize RESOURCE_EXHAUSTED: the
+    // handler answers it with the gateway-local capacity terminal before any
+    // dispatch, so it is never retried or charged to the backend.
+    assert_eq!(
+        outcome,
+        GrpcChargedCollectOutcomeForTest::BufferCapacityExceeded
     );
-    assert_eq!(outcome, expected);
     drop(held);
 
-    // Over the gRPC ceiling is RESOURCE_EXHAUSTED too, with its own message.
+    // Over the gRPC ceiling stays the oversize RESOURCE_EXHAUSTED, with its own
+    // message.
     let body = complete_body(vec![data_frame(vec![0u8; 101])]);
     let outcome = collect_grpc_upload_for_test(body, &budget, 100).await;
-    let expected = GrpcChargedCollectOutcomeForTest::ResourceExhausted(
-        String::from("gRPC request payload size exceeds maximum of 100 bytes"),
-    );
+    let expected = GrpcChargedCollectOutcomeForTest::ResourceExhausted(String::from(
+        "gRPC request payload size exceeds maximum of 100 bytes",
+    ));
     assert_eq!(outcome, expected);
+}
+
+#[test]
+fn both_native_grpc_collects_answer_a_capacity_refusal_before_dispatch() {
+    // The buffered native-gRPC collect's capacity refusal keeps its own type
+    // and is answered with the same gateway-local capacity terminal as every
+    // other buffered request, before dispatch: it never becomes a
+    // `GrpcProxyError` that the retry loop or the backend classifier sees.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let arms: Vec<&str> = proxy
+        .split("Err(grpc_proxy::GrpcRequestBodyCollectError::BufferCapacityExceeded) => {")
+        .skip(1)
+        .collect();
+    assert_eq!(arms.len(), 2, "the split and the mixed native-gRPC collects");
+    for arm in arms {
+        let arm = &arm[..arm.find("return Ok(response);").expect("bounded arm")];
+        assert!(arm.contains("build_request_buffer_capacity_response("));
+        assert!(arm.contains("cb_probe.release_neutral();"));
+        assert!(!arm.contains("GrpcProxyError"));
+    }
 }

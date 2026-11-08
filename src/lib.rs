@@ -17301,6 +17301,7 @@ pub mod _test_support {
     pub enum GrpcChargedCollectOutcomeForTest {
         Collected(usize),
         ResourceExhausted(String),
+        BufferCapacityExceeded,
         ClientDisconnected,
         Other,
     }
@@ -17317,12 +17318,17 @@ pub mod _test_support {
         B: http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>,
     {
         use crate::proxy::grpc_proxy::{GrpcRequestBodyCollectError, collect_grpc_upload};
-        let ceiling = budget.0.buffered_request_body_ceiling(max_grpc_recv_size_bytes);
+        let ceiling = budget
+            .0
+            .buffered_request_body_ceiling(max_grpc_recv_size_bytes);
         let collector = budget.0.request_collector(max_grpc_recv_size_bytes);
         match collect_grpc_upload(body, collector, ceiling, 0, None, None).await {
             Ok(collected) => GrpcChargedCollectOutcomeForTest::Collected(collected.body.len()),
             Err(GrpcRequestBodyCollectError::ResourceExhausted(message)) => {
                 GrpcChargedCollectOutcomeForTest::ResourceExhausted(message)
+            }
+            Err(GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
+                GrpcChargedCollectOutcomeForTest::BufferCapacityExceeded
             }
             Err(GrpcRequestBodyCollectError::ClientDisconnected) => {
                 GrpcChargedCollectOutcomeForTest::ClientDisconnected
@@ -17486,6 +17492,7 @@ pub mod _test_support {
     pub enum GrpcBufferedCollectOutcomeForTest {
         Collected(usize),
         ResourceExhausted,
+        BufferCapacityExceeded,
         ClientDisconnected,
         TimedOut,
         DeadlineExceeded,
@@ -17512,6 +17519,9 @@ pub mod _test_support {
             Ok((_, _, body)) => GrpcBufferedCollectOutcomeForTest::Collected(body.len()),
             Err(GrpcRequestBodyCollectError::ResourceExhausted(_)) => {
                 GrpcBufferedCollectOutcomeForTest::ResourceExhausted
+            }
+            Err(GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
+                GrpcBufferedCollectOutcomeForTest::BufferCapacityExceeded
             }
             Err(GrpcRequestBodyCollectError::TimedOut) => {
                 GrpcBufferedCollectOutcomeForTest::TimedOut

@@ -35,7 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that has sent nothing holds no budget. When the budget cannot cover a
   growth, the upload is refused with the same `503` / gRPC
   `RESOURCE_EXHAUSTED` as before, now after reading part of the body rather
-  than before reading any. A body that request decompression (`compression`
+  than before reading any. A buffered native gRPC upload gets that same
+  gateway-local capacity refusal before dispatch, never retried and never
+  counted against the circuit breaker; an upload over the gRPC receive limit
+  keeps its own `RESOURCE_EXHAUSTED` message. A body that request decompression (`compression`
   `decompress_request`) or a request-body plugin replaces with a larger one is
   charged for the larger body before it is installed and before the next
   normalizer, transform or hook awaits. When the budget cannot cover it, the

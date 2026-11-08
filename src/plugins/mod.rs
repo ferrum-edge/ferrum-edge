@@ -5721,7 +5721,10 @@ impl RequestContext {
     /// The staged plaintext together with the decode charge that covers it.
     pub(crate) fn take_compression_staged_request_plaintext(
         &mut self,
-    ) -> Option<(Vec<u8>, crate::proxy::response_buffer_budget::DecodeChargeHold)> {
+    ) -> Option<(
+        Vec<u8>,
+        crate::proxy::response_buffer_budget::DecodeChargeHold,
+    )> {
         let plaintext = self.compression_staged_request_plaintext.take()?;
         let decode_charge = std::mem::take(&mut self.compression_staged_decode_charge);
         Some((plaintext, decode_charge))
