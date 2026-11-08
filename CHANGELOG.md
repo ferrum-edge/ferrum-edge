@@ -17,10 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
-- **BREAKING — requests with more than one `Content-Type` are refused.**
-  `Content-Type` is a singleton field (RFC 9110 §8.3). The gateway classified
-  a request by its first `Content-Type` field line while forwarding every
-  line, so a request sent with `application/json` and
+- **BREAKING — requests with more than one `Content-Type` are refused**
+  (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
+  gateway classified a request by its first `Content-Type` field line while
+  forwarding every line, so a request sent with `application/json` and
   `application/grpc-web+proto` passed the gRPC-Web checks as JSON, and a
   backend reading the last line parsed its body as gRPC-Web, including a
   body-embedded trailer frame that could restate a gateway-asserted header.
