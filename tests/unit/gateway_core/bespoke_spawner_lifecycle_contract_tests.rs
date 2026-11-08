@@ -135,6 +135,7 @@ const SITES: &[Site] = &[
         "functional/functional_stream_listener_failure_test.rs",
         own(4)
     ),
+    site!("functional/functional_tcp_proxy_test.rs", own(1)),
     site!("functional/functional_tls_only_test.rs", own(2)),
     site!("functional/functional_websocket_limits_test.rs", own(1)),
     site!("functional/functional_websocket_test.rs", own(1)),
