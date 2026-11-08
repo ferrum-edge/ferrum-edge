@@ -136,6 +136,15 @@ pub enum FieldSensitivity {
     /// certificate-plus-key bundle) is replaced by [`REDACTED_PLACEHOLDER`]. A
     /// non-string fails closed.
     CertificateSource,
+    /// The path of an outbound destination configured apart from its host and
+    /// port (a shadow-traffic path, a backend path rewrite).
+    ///
+    /// Treated like the path component of an [`FieldSensitivity::EndpointUrl`]:
+    /// collector and ingest services document credentials in the path, so a
+    /// non-trivial path is replaced by [`REDACTED_PLACEHOLDER`]. An empty path
+    /// or `/` discloses nothing and stays visible, as do the host and port
+    /// fields beside it. A non-string fails closed.
+    EndpointPath,
 }
 
 /// One schema-declared sensitive path.
@@ -177,6 +186,13 @@ const fn private_key_source(path: &'static [&'static str]) -> SensitivityRule {
     SensitivityRule {
         path,
         sensitivity: FieldSensitivity::PrivateKeySource,
+    }
+}
+
+const fn endpoint_path(path: &'static [&'static str]) -> SensitivityRule {
+    SensitivityRule {
+        path,
+        sensitivity: FieldSensitivity::EndpointPath,
     }
 }
 
@@ -643,6 +659,10 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             secret(&["rules", "*", "match", "headers", "*", "*"]),
             secret(&["rules", "*", "match", "without_headers", "*", "*"]),
             secret(&["rules", "*", "match", "query_params", "*", "*"]),
+            // A backend path rewrite is the path of the outbound request, so
+            // it is projected like an endpoint URL path. (`redirect.uri` is
+            // sent to the client and stays visible.)
+            endpoint_path(&["rules", "*", "rewrite", "uri"]),
             // The route-local `destination.backend_tls` key, certificate, and
             // CA sources are classified by field name by the TLS-material
             // sweep.
@@ -692,7 +712,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ),
     ("grpc_deadline", NONE),
     ("load_testing", NONE),
-    ("request_mirror", NONE),
+    (
+        "request_mirror",
+        // The shadow destination is split into host / port / protocol / path;
+        // the path may carry an ingest token like any endpoint URL path.
+        &[endpoint_path(&["mirror_path"])],
+    ),
     ("response_size_limiting", NONE),
     ("response_caching", NONE),
     ("response_transformer", NONE),
@@ -1233,6 +1258,10 @@ impl<'r> Projector<'r> {
                 }
                 json!(REDACTED_PLACEHOLDER)
             }
+            FieldSensitivity::EndpointPath => match value.as_str() {
+                Some("" | "/") => return,
+                _ => json!(REDACTED_PLACEHOLDER),
+            },
             FieldSensitivity::CertificateSource => {
                 if !tls_source_withheld(value, TlsMaterialField::Public) {
                     return;

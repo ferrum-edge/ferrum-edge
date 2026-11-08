@@ -912,3 +912,34 @@ fn export_fingerprints_every_custom_plugin_scalar_leaf() {
     assert_eq!(custom["note"], Value::Null);
     assert!(!export.to_string().contains("custom-pair-must-not-leak"));
 }
+
+/// A `request_mirror` shadow path is fingerprinted in the export like an
+/// endpoint URL path; the host, port, and protocol stay verbatim.
+#[test]
+fn export_fingerprints_request_mirror_path() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let mirror: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "mirror",
+        "plugin_name": "request_mirror",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "mirror_host": "shadow.internal",
+            "mirror_port": 8443,
+            "mirror_protocol": "https",
+            "mirror_path": "/ingest/mirror-path-must-not-leak"
+        },
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("request_mirror fixture");
+    config.plugin_configs.push(mirror);
+
+    let export = export(config, ADMIN_SECRET);
+    let mirror = &plugin(&export, "mirror")["config"];
+    assert!(is_fingerprint(&mirror["mirror_path"]), "{mirror}");
+    assert_eq!(mirror["mirror_host"], "shadow.internal");
+    assert_eq!(mirror["mirror_port"], 8443);
+    assert_eq!(mirror["mirror_protocol"], "https");
+    assert!(!export.to_string().contains("mirror-path-must-not-leak"));
+}

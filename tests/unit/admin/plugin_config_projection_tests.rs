@@ -996,6 +996,62 @@ fn custom_plugin_configs_fail_closed_at_every_scalar_leaf() {
     assert_eq!(mock["rules"][0]["headers"]["x-mock"], "static-value");
 }
 
+/// Outbound destination paths configured apart from their host and port are
+/// projected like an endpoint URL's path: a non-trivial path is withheld,
+/// while `/` and the host, port, and protocol stay visible.
+#[test]
+fn outbound_destination_paths_are_projected() {
+    let raw = json!({
+        "mirror_host": "shadow.internal",
+        "mirror_port": 8443,
+        "mirror_protocol": "https",
+        "mirror_path": "/ingest/path-token-canary",
+        "percentage": 10.0
+    });
+    assert!(
+        placeholder_sites("request_mirror", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+    let mirror = project("request_mirror", raw);
+    assert_eq!(mirror["mirror_path"], REDACTED);
+    assert_eq!(mirror["mirror_host"], "shadow.internal");
+    assert_eq!(mirror["mirror_port"], 8443);
+    assert_eq!(mirror["mirror_protocol"], "https");
+    assert_no_canaries(&mirror, &["path-token-canary"]);
+    assert_eq!(
+        placeholder_sites("request_mirror", &mirror),
+        ["/config/mirror_path"]
+    );
+    let root = project(
+        "request_mirror",
+        json!({"mirror_host": "shadow.internal", "mirror_path": "/"}),
+    );
+    assert_eq!(root["mirror_path"], "/");
+
+    let raw = json!({"rules": [
+        {"match": {"methods": ["GET"]}, "rewrite": {
+            "uri": "/v2/rewrite-token-canary",
+            "authority": "backend.internal"
+        }},
+        {"match": {"methods": ["POST"]}, "rewrite": {"uri": "/"}, "redirect": {"uri": "/moved"}}
+    ]});
+    assert!(
+        placeholder_sites("mesh_route_dispatch", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+    let route = project("mesh_route_dispatch", raw);
+    assert_eq!(route["rules"][0]["rewrite"]["uri"], REDACTED);
+    let rewrite = &route["rules"][0]["rewrite"];
+    assert_eq!(rewrite["authority"], "backend.internal");
+    assert_eq!(route["rules"][1]["rewrite"]["uri"], "/");
+    assert_eq!(route["rules"][1]["redirect"]["uri"], "/moved");
+    assert_no_canaries(&route, &["rewrite-token-canary"]);
+    assert_eq!(
+        placeholder_sites("mesh_route_dispatch", &route),
+        ["/config/rules/0/rewrite/uri"]
+    );
+}
+
 /// A resource-level plugin `trigger` withholds every header, query and cookie
 /// operand at any depth of the `all` / `any` / `not` tree; names, match kinds,
 /// flags, structure, and non-client predicates stay visible.

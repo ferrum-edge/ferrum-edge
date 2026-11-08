@@ -3667,3 +3667,83 @@ async fn custom_plugin_configs_fail_closed_for_non_admins() {
     let (_, _, stored) = send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
     assert_eq!(stored["config"], stored_config);
 }
+
+/// A `request_mirror` shadow path may carry an ingest token like any endpoint
+/// URL path: viewer and operator reads and the audit diff withhold it while
+/// the host, port, and protocol stay visible; admin reads stay raw; an
+/// operator write that echoes the placeholder is refused.
+#[tokio::test]
+async fn request_mirror_path_is_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/mirror-path";
+    let write_path = "/plugins/config/mirror-path?expected_proxy_ids=";
+    let mirror_path = "/ingest/mirror-path-token-canary";
+
+    // Disabled configs are stored without plugin construction.
+    let plugin = json!({
+        "id": "mirror-path",
+        "plugin_name": "request_mirror",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "mirror_host": "shadow.internal",
+            "mirror_port": 8443,
+            "mirror_protocol": "https",
+            "mirror_path": mirror_path
+        }
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "request_mirror create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=mirror-path",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_items = audit_body["items"].as_array().expect("audit items");
+    let mut projections = vec![audit_items[0]["diff"]["after"]["config"].clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["config"].clone());
+    }
+    for projection in &projections {
+        assert_eq!(projection["mirror_path"], "[REDACTED]", "{projection}");
+        assert_eq!(projection["mirror_host"], "shadow.internal");
+        assert_eq!(projection["mirror_port"], 8443);
+        assert_eq!(projection["mirror_protocol"], "https");
+    }
+
+    let (status, raw) = get_json(&base, path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    assert_eq!(raw["config"]["mirror_path"], mirror_path);
+
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "mirror_path echo accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/mirror_path"),
+        "unexpected refusal: {error}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["config"]["mirror_path"], mirror_path);
+}

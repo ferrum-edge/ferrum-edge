@@ -1791,6 +1791,7 @@ Fields covered by the schema include:
 | `otel_tracing` | `authorization`, `headers.*` | `[REDACTED]` |
 | `opa`, `ai_transcript_audit` | `headers.*`, `custom_headers.*` | `[REDACTED]` |
 | `opa` | `opa_host` | structural URL (a base path is kept in every decision URL; `policy_path` stays visible) |
+| `request_mirror`, `mesh_route_dispatch` | `mirror_path`, `rules.*.rewrite.uri` | `[REDACTED]` unless empty or `/`: an outbound destination path configured apart from its host and port is treated like an endpoint URL's path (the host, port, protocol, and `rewrite.authority` stay visible; the client-facing `redirect.uri` is not outbound and stays visible) |
 | `ai_transcript_audit` | `sink.endpoint_url` | structural URL |
 | `ai_transcript_audit` | `sink.custom_headers.*` | `[REDACTED]` |
 | `api_chargeback_sink` | `clickhouse.insert_query_params.*` | `[REDACTED]` (credential-*named* keys are already rejected at admission; the values stay arbitrary) |

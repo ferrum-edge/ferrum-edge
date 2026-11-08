@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `transaction_debugger` `capture_request_header_value`
   - `ai_semantic_firewall` `privacy.snippet_hash_salt`
   - the `opa` `opa_host` base path (now projected as a structural URL)
+  - outbound destination paths configured apart from their host and port:
+    `request_mirror` `mirror_path` and `mesh_route_dispatch`
+    `rules[].rewrite.uri` (`/` stays visible)
   - every scalar leaf of a custom plugin's config. A plugin with no built-in
     sensitivity schema cannot be classified, so its config now fails closed
     for `viewer` and `operator` reads, audit diffs, and the export. Strings,
