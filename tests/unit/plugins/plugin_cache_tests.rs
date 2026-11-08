@@ -16650,8 +16650,15 @@ fn transformer_header_rule(
     rule
 }
 
+/// A `jwks_auth` instance with an inline (static) JWKS, so runtime cache
+/// construction needs no Tokio runtime (a `jwks_uri` provider starts a live
+/// JWKS refresher) and the synchronous admission tests exercise both
+/// boundaries.
 fn claim_owning_jwks(claims: bool) -> PluginConfig {
-    let mut config = minimal_plugin_config("jwks_auth");
+    use super::jwks_auth_support::build_rsa_jwks_from_pem;
+
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let mut config = json!({"providers": [{"jwks": build_rsa_jwks_from_pem(public_key_pem)}]});
     if claims {
         config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
     }
