@@ -12293,6 +12293,13 @@ pub trait Plugin: Any + Send + Sync {
     /// so a client can never restate one of them in request trailers, which
     /// are read after the initial header block was sanitized. The default owns
     /// nothing.
+    ///
+    /// Built-in only for now: the final gateway-assertion pass keeps an owned
+    /// header only as a value recorded through the crate-private
+    /// `RequestContext::record_installed_request_assertion`, which an
+    /// out-of-tree plugin cannot call. A custom plugin that declares names here
+    /// therefore has its own installs of them removed before dispatch; leave
+    /// this at the default.
     fn owned_request_assertion_header_names(&self) -> Vec<String> {
         Vec::new()
     }

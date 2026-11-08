@@ -16872,6 +16872,32 @@ async fn relabel_to_grpc_web_is_refused_unless_this_request_was_translated() {
     }
 }
 
+/// Two client `Content-Type` field lines materialize as one `", "`-joined
+/// value (`application/json, application/grpc-web+proto`), which a backend
+/// resolving the singleton field to its last member reads as gRPC-Web. The
+/// ingress protocol guard refuses the two lines with `400`; behind it, the
+/// end-of-pass check treats any gRPC-Web member (or any list) as a gRPC-Web
+/// relabel and refuses it with `415` on an untranslated assertion route. A
+/// single JSON type, a route owning no assertion, and translated gRPC-Web pass.
+#[tokio::test]
+async fn a_joined_content_type_with_a_grpc_web_member_is_refused_on_assertion_routes() {
+    let joined = "application/json, application/grpc-web+proto";
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], joined).await;
+    assert_eq!(status, Some(415), "joined gRPC-Web member");
+    let listed = "application/json, text/plain";
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], listed).await;
+    assert_eq!(status, Some(415), "non-singleton media type");
+
+    let json = "application/json";
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], json).await;
+    assert_eq!(status, None, "single JSON type");
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(false)], joined).await;
+    assert_eq!(status, None, "route owning no assertion");
+    let translated = vec![claim_owning_jwks(true), grpc_web_translator()];
+    let status = before_proxy_funnel_status(translated, GRPC_WEB_BINARY).await;
+    assert_eq!(status, None, "translated gRPC-Web");
+}
+
 /// Candidate admission reads `owned_request_assertion_header_names()` and
 /// `configured_request_header_writes()`, so every built-in that overrides
 /// either must be fully constructed there (`SECURITY_COMPOSITION_PLUGIN_NAMES`):

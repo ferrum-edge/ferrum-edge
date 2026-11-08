@@ -33848,13 +33848,24 @@ fn refuse_relabelled_grpc_web_on_assertion_route(
     Some(untranslated_grpc_web_refusal())
 }
 
-/// Whether any outbound header a backend reads as `content-type` names a
-/// gRPC-Web media type.
+/// Whether any outbound header a backend reads as `content-type` may be read
+/// as gRPC-Web.
 fn outbound_content_type_is_grpc_web(headers: &HashMap<String, String>) -> bool {
     headers.iter().any(|(name, value)| {
         headers_mod::field_names_equivalent_for_backends(name, "content-type")
-            && crate::plugins::grpc_web::is_grpc_web_content_type(value)
+            && content_type_may_be_grpc_web(value)
     })
+}
+
+/// Whether a backend may read the `content-type` value as gRPC-Web: it names a
+/// gRPC-Web media type, any comma-separated member does (a materialized pair
+/// of client field lines is `", "`-joined, and a backend may resolve the
+/// singleton field to any member), or it is not a single media type at all.
+fn content_type_may_be_grpc_web(value: &str) -> bool {
+    media_type_value_is_list(value.as_bytes())
+        || value
+            .split(',')
+            .any(|member| crate::plugins::grpc_web::is_grpc_web_content_type(member.trim()))
 }
 
 fn untranslated_grpc_web_refusal() -> PluginResult {
@@ -33896,7 +33907,7 @@ pub(crate) fn enforce_route_owned_request_assertions(
     if !crate::plugins::grpc_web::request_was_translated(ctx) {
         headers.retain(|name, value| {
             !(headers_mod::field_names_equivalent_for_backends(name, "content-type")
-                && crate::plugins::grpc_web::is_grpc_web_content_type(value))
+                && content_type_may_be_grpc_web(value))
         });
     }
 }
@@ -56378,7 +56389,65 @@ fn check_protocol_headers_with_wire_framing(
     }
 
     // 6. Exactly one Authorization credential (all HTTP versions).
-    check_single_authorization_credential(headers)
+    if let Some(error) = check_single_authorization_credential(headers) {
+        return Some(error);
+    }
+
+    // 7. Exactly one Content-Type media type (all HTTP versions).
+    check_single_content_type(headers)
+}
+
+/// Check 7 of [`check_protocol_headers`]: the request carries at most one
+/// `Content-Type` field line, and that line names one media type.
+///
+/// `Content-Type` is a singleton field (RFC 9110 §8.3). With two field lines,
+/// or one comma-joined list, the gateway's own classification (the first
+/// media type) and a backend that resolves to another member can disagree
+/// about the body framing: a backend that picks a trailing
+/// `application/grpc-web+proto` parses a body the gateway forwarded as JSON as
+/// gRPC-Web, body-embedded trailer frame included, so a client could restate a
+/// gateway-asserted header past every gateway boundary. A comma inside a
+/// properly quoted parameter value (`boundary="a,b"`) separates nothing.
+/// Allocation-free: one `get_all` walk plus, only when the value holds a comma,
+/// one bounded byte scan of it.
+fn check_single_content_type(headers: &hyper::HeaderMap) -> Option<&'static str> {
+    let mut values = headers.get_all(hyper::header::CONTENT_TYPE).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return Some(r#"{"error":"Request contains multiple Content-Type headers"}"#);
+    }
+    if media_type_value_is_list(first.as_bytes()) {
+        return Some(r#"{"error":"Content-Type header contains more than one media type"}"#);
+    }
+    None
+}
+
+/// Whether a `Content-Type` value holds a comma outside a properly closed
+/// quoted string, i.e. more than one media type. An unterminated quoted string
+/// that swallowed a comma counts as a list too, since a lenient backend parser
+/// may split there.
+fn media_type_value_is_list(value: &[u8]) -> bool {
+    if !value.contains(&b',') {
+        return false;
+    }
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for &byte in value {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+        } else if byte == b'"' {
+            in_quotes = true;
+        } else if byte == b',' {
+            return true;
+        }
+    }
+    in_quotes
 }
 
 /// Check 6 of [`check_protocol_headers`]: the request carries at most one

@@ -1669,7 +1669,11 @@ joined form equals it. A request whose
 outbound `content-type` became a gRPC-Web media type during a `before_proxy`
 pass without the `grpc_web` translator having translated that request is
 refused with `415` (a `grpc_web` instance configured on the route but declining
-the request does not count); one set by an egress overlay is removed.
+the request does not count); one set by an egress overlay is removed. A value
+with any gRPC-Web member, or listing more than one media type, counts as
+gRPC-Web here, since a backend may resolve the singleton field to any member;
+the ingress protocol guard already refuses a client request with repeated or
+list-valued `Content-Type` with `400`.
 
 Publication also refuses, as defence in depth, a configured request-header
 write that would undo either guarantee: a `request_transformer` header rule or

@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **BREAKING — requests with more than one `Content-Type` are refused.**
+  `Content-Type` is a singleton field (RFC 9110 §8.3). The gateway classified
+  a request by its first `Content-Type` field line while forwarding every
+  line, so a request sent with `application/json` and
+  `application/grpc-web+proto` passed the gRPC-Web checks as JSON, and a
+  backend reading the last line parsed its body as gRPC-Web, including a
+  body-embedded trailer frame that could restate a gateway-asserted header.
+  The ingress protocol guard now refuses, before routing and on HTTP/1.x,
+  HTTP/2 and HTTP/3 alike, repeated `Content-Type` field lines (`Request
+  contains multiple Content-Type headers`) and a single value listing more
+  than one media type after a comma outside a quoted string (`Content-Type
+  header contains more than one media type`). Ordinary requests get `400`;
+  native gRPC and gRPC-Web keep the existing protocol-error framing. On a
+  route that owns gateway-asserted headers, an untranslated request whose
+  outbound `content-type` has any gRPC-Web member, or lists more than one
+  media type, is also refused with `415`.
 - **A trigger-skipped instance still strips the gateway-owned request headers
   it owns.** `claim_headers` / `output_claim_headers` destinations on
   `jwks_auth`, `oauth2_introspection` and `oidc_relying_party` are documented
