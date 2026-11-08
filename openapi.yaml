@@ -25467,8 +25467,10 @@ components:
                     type: [string, "null"]
                     enum: [RS256, RS384, RS512, ES256, ES384, EdDSA, null]
                     default: RS256
+                    description: Null or absent selects RS256. A non-string value is rejected for every method.
                   private_key_jwt_kid:
                     type: [string, "null"]
+                    description: Null or absent sends no kid header. A non-string value is rejected for every method.
               redirect_uri:
                 type: string
                 minLength: 1
