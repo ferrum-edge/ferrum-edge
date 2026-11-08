@@ -4086,6 +4086,13 @@ pub(crate) fn strip_route_owned_assertion_field_lines(
     let Some(owned) = ctx.route_owned_request_assertion_headers() else {
         return;
     };
+    remove_owned_assertion_field_lines(headers, owned);
+}
+
+/// Remove every field line of `headers` whose name a backend reads as one of
+/// `owned` (ASCII case-insensitive, `_` read as `-`). Allocates nothing when
+/// no line matches.
+pub(crate) fn remove_owned_assertion_field_lines(headers: &mut hyper::HeaderMap, owned: &[String]) {
     let names: Vec<hyper::header::HeaderName> = headers
         .keys()
         .filter(|name| {
@@ -38462,8 +38469,12 @@ async fn handle_proxy_request_inner(
     }
     // The pass above judged the plugin-facing map; the raw-line boundaries
     // rebuild from the client's own field lines. Drop those lines for every
-    // owned assertion name once, here, so no boundary can restore them.
+    // owned assertion name once, here, from BOTH raw stores: the dispatch body
+    // (native gRPC, HBONE, mesh-mTLS, Unix, WebSocket) and the context's
+    // retained wire view that the secured-mesh retry replay and request
+    // mirroring rebuild from, so no boundary or retry can restore them.
     strip_route_owned_assertion_field_lines(&ctx, client_request_body.raw_headers_mut());
+    ctx.strip_route_owned_assertion_raw_lines();
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();

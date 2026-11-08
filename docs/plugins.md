@@ -2783,7 +2783,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `providers[].id_token_clock_skew_secs` | u64 | ID token expiry leeway (default: `60`; `0`–`3600`) |
 | `providers[].max_age_secs` | u64 (optional) | OIDC `max_age` (`0`–`31536000`): sent on the authorization request; the callback requires an ID token `auth_time` within it, and a session whose login is older re-challenges |
 | `providers[].authorization_params` | Object (optional) | Static extra authorization-request parameters such as `prompt` or `acr_values` (at most 16); plugin-owned names are rejected |
-| `providers[].forward_access_token` | Boolean | Default `false`; relay the session's current access token upstream as `Authorization: Bearer`, removing any client-supplied `Authorization` |
+| `providers[].forward_access_token` | Boolean | Default `false`; relay the session's current access token upstream as `Authorization: Bearer`, removing any client-supplied `Authorization` on every request the instance runs for (a trigger-skipped request keeps its `Authorization`) |
 | `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies. Published or placeholder values are rejected at admission |
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation; the same published/placeholder rejection applies |
 | `session.store` | String | Session backend; only `cookie` is implemented |

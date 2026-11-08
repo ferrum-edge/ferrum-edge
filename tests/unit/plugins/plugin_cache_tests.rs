@@ -17050,3 +17050,118 @@ async fn raw_reconstruction_never_restores_client_lines_for_an_owned_assertion()
         assert_eq!(unrelated, 2, "skipped={skipped}: websocket metadata");
     }
 }
+
+/// The secured-mesh retry replay (and request mirroring) rebuild the backend
+/// request from the context's retained wire view, not from the dispatch body.
+/// After the final assertion pass that view drops the client's lines for the
+/// route's owned assertion names too, so a replay merges in only the approved
+/// value, once; unrelated repeated metadata keeps its lines. Both ladders run
+/// the strip right after the final pass.
+#[test]
+fn mesh_retry_replay_wire_view_drops_client_lines_for_owned_assertions() {
+    use ferrum_edge::_test_support::{
+        raw_headers_snapshot_for_test, set_request_trailer_strip_headers_for_test,
+        strip_route_owned_assertion_raw_lines_for_test,
+    };
+    use ferrum_edge::proxy::headers::merge_proxy_headers_preserving_repeated;
+
+    let mut raw = hyper::HeaderMap::new();
+    raw.append("x-app-user", "alice".parse().unwrap());
+    raw.append("x_app_user", "admin".parse().unwrap());
+    raw.append("x-md", "a".parse().unwrap());
+    raw.append("x-md", "b".parse().unwrap());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/orders".to_string(),
+    );
+    ctx.set_raw_headers(raw);
+    set_request_trailer_strip_headers_for_test(&mut ctx, vec!["x-app-user".to_string()]);
+    strip_route_owned_assertion_raw_lines_for_test(&mut ctx);
+
+    let mut replay = raw_headers_snapshot_for_test(&ctx).expect("retained wire view");
+    assert!(replay.get("x-app-user").is_none());
+    assert!(replay.get("x_app_user").is_none());
+    let approved = HashMap::from([
+        ("x-app-user".to_string(), "alice, admin".to_string()),
+        ("x-md".to_string(), "a, b".to_string()),
+    ]);
+    merge_proxy_headers_preserving_repeated(&mut replay, &approved);
+    let owned_lines: Vec<&str> = replay
+        .get_all("x-app-user")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(owned_lines, vec!["alice, admin"]);
+    assert_eq!(replay.get_all("x-md").iter().count(), 2);
+
+    let proxy_source = include_str!("../../../src/proxy/mod.rs");
+    let raw_strip = proxy_source
+        .find("ctx.strip_route_owned_assertion_raw_lines();")
+        .expect("the H1/H2 ladder strips the retained wire view");
+    assert!(
+        proxy_source[..raw_strip].ends_with("client_request_body.raw_headers_mut());\n    "),
+        "the H1/H2 ladder strips the wire view right after the dispatch body"
+    );
+    assert!(
+        include_str!("../../../src/http3/server.rs")
+            .contains("ctx.strip_route_owned_assertion_raw_lines();"),
+        "the H3 ladder must strip the retained wire view after its final pass"
+    );
+}
+
+/// `oidc_relying_party` `forward_access_token` owns the backend
+/// `Authorization` only on the requests the instance runs for. A
+/// trigger-skipped instance leaves a sibling mechanism's forwarded bearer
+/// token in place (the relayed header is a credential the backend verifies,
+/// not a gateway identity assertion), while an admitted instance with no
+/// relayable session token still removes the client's copy.
+#[tokio::test]
+async fn oidc_forward_access_token_owns_authorization_only_when_the_instance_runs() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        run_final_backend_header_policy_hooks_for_test,
+    };
+
+    for (skipped, expected) in [(true, Some("Bearer client-token")), (false, None)] {
+        let mut config = minimal_plugin_config("oidc_relying_party");
+        config["providers"][0]["forward_access_token"] = json!(true);
+        let mut oidc = make_plugin_config_with_json(
+            "oidc",
+            "oidc_relying_party",
+            config,
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        if skipped {
+            oidc.trigger = Some(post_only_trigger());
+        }
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["oidc"])],
+            vec![oidc],
+        ))
+        .unwrap();
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/orders".to_string(),
+        );
+        ctx.headers
+            .insert("authorization".into(), "Bearer client-token".into());
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue), "skipped={skipped}");
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            expected,
+            "skipped={skipped}"
+        );
+    }
+}

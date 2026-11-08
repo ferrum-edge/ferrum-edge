@@ -7522,6 +7522,32 @@ impl RequestContext {
         self.raw_headers.clone()
     }
 
+    /// Drop every retained client field line for the route's owned
+    /// gateway-assertion headers from the pristine wire view, after the final
+    /// assertion pass. Every later consumer that rebuilds a backend or mirror
+    /// request from it (the secured-mesh retry replay through
+    /// [`Self::raw_headers_snapshot`], request mirroring) then inherits the
+    /// strip, so a retry can never restore the client's lines for an owned
+    /// name. Copies the map only when a line actually matches.
+    pub(crate) fn strip_route_owned_assertion_raw_lines(&mut self) {
+        use crate::proxy::headers::field_names_equivalent_for_backends;
+
+        let Some(owned) = self.route_owned_request_assertion_headers.clone() else {
+            return;
+        };
+        let Some(raw) = self.raw_headers.as_mut() else {
+            return;
+        };
+        let matches = raw.keys().any(|name| {
+            owned
+                .iter()
+                .any(|owned| field_names_equivalent_for_backends(name.as_str(), owned))
+        });
+        if matches {
+            crate::proxy::remove_owned_assertion_field_lines(Arc::make_mut(raw), &owned);
+        }
+    }
+
     /// Look up a single header from the raw `HeaderMap` without materializing
     /// the full `HashMap<String, String>`. Returns `None` when no raw headers
     /// were stored.

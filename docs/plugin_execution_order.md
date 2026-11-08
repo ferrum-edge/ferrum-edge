@@ -1656,11 +1656,13 @@ as its CURRENT authorized value for the request (typed per-request state: the
 latest admitted owner's install replaces, and its clear retires, any earlier
 decision), and every other copy or spelling is removed,
 whatever any trigger decided or any later plugin wrote. The client's own
-field lines for those names are then dropped from the pristine header block,
-so the boundaries that rebuild a backend request from raw field lines (the
-native-gRPC, HBONE, mesh-mTLS and Unix merges and the WebSocket handshake
-collector) emit only the approved value, once, instead of restoring the
-client's lines because their joined form equals it. A request whose
+field lines for those names are then dropped from every pristine header
+store — the dispatch body and the request context's retained wire view — so
+the boundaries that rebuild a backend request from raw field lines (the
+native-gRPC, HBONE, mesh-mTLS and Unix merges, the WebSocket handshake
+collector, the secured-mesh retry replay and `request_mirror`) emit only the
+approved value, once, instead of restoring the client's lines because their
+joined form equals it. A request whose
 outbound `content-type` became a gRPC-Web media type during a `before_proxy`
 pass without the `grpc_web` translator having translated that request is
 refused with `415` (a `grpc_web` instance configured on the route but declining

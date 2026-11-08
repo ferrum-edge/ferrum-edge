@@ -158,6 +158,22 @@ pub mod _test_support {
         crate::proxy::strip_route_owned_assertion_field_lines(ctx, headers);
     }
 
+    /// Drop the retained wire view's client lines for the route's owned
+    /// assertion headers, as both ladders do after the final assertion pass.
+    pub fn strip_route_owned_assertion_raw_lines_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.strip_route_owned_assertion_raw_lines();
+    }
+
+    /// The retained wire view the secured-mesh retry replay and request
+    /// mirroring rebuild from (`RequestContext::raw_headers_snapshot`).
+    pub fn raw_headers_snapshot_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<hyper::HeaderMap> {
+        ctx.raw_headers_snapshot().map(|raw| raw.as_ref().clone())
+    }
+
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =

@@ -2258,11 +2258,11 @@ async fn opa_allow_obligation_installs_listed_upstream_headers() {
 /// admitted owner survives.
 #[tokio::test]
 async fn a_withdrawn_decision_header_cannot_be_resurrected_on_stale_provenance() {
-    use ferrum_edge::PluginCache;
     use ferrum_edge::_test_support::{
         apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
         run_final_backend_header_policy_hooks_for_test,
     };
+    use ferrum_edge::PluginCache;
     use ferrum_edge::config::types::{GatewayConfig, PluginScope};
 
     use super::plugin_utils::{make_plugin_config_with_json, make_proxy};

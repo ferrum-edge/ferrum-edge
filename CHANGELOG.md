@@ -57,8 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected (the mesh slice fails closed and the last good one keeps serving).
   The gateway now enforces these assertions once more over the finalized
   outbound header map on every protocol path (and drops the client's own
-  field lines for owned names, so native gRPC, HBONE, mesh-mTLS, Unix and
-  WebSocket dispatch cannot restore them as separate lines): an owned header reaches the
+  field lines for owned names from the dispatch body and the retained wire
+  view, so native gRPC, HBONE, mesh-mTLS, Unix and WebSocket dispatch, the
+  secured-mesh retry replay and `request_mirror` cannot restore them as
+  separate lines): an owned header reaches the
   backend only as its current authorized value (the latest admitted owner's
   install or clear replaces any earlier decision), so a later writer (for example a `correlation_id` preserving a
   client value under the same name) can no longer restore a client copy, and
@@ -71,7 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spiffe_identity` with `forward_identity`); add `grpc_web` to such a route to serve gRPC-Web
   clients. A route that relied on a client value under one of those names
   reaching the backend, in headers on trigger-excluded requests or in
-  trailers, no longer receives it.
+  trailers, no longer receives it. `oidc_relying_party`
+  `forward_access_token` owns the backend `Authorization` header on every
+  request the instance runs for; a request its trigger skips keeps the
+  `Authorization` the route's other mechanisms supply (documented).
 - **Non-admin plugin-config reads withhold header values, match operands and
   selector tokens.** `viewer` and `operator` reads of plugin configs
   (`GET /plugins/config`, `GET /plugins/config/{id}`, `GET /config/export`)
