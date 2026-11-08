@@ -20206,14 +20206,17 @@ mod inner {
             let old_lease_client =
                 mongodb::Client::with_options(old_opts).expect("old lease client");
             let old_db = old_client.database("old_with_temp");
-            store
-                .connection
-                .store(std::sync::Arc::new(MongoConnectionBundle::new(
+            // Publish through the topology state; the replaced handle is a
+            // temporary dropped at the end of the statement.
+            store.failover_topology.publish_failover(
+                std::sync::Arc::new(MongoConnectionBundle::new(
                     old_client,
                     old_db,
                     old_lease_client,
                     vec![temp_path],
-                )));
+                )),
+                "mongodb://localhost/test",
+            );
 
             let old_cursor_collection_guard = store.proxies();
             let new_opts = mongodb::options::ClientOptions::builder()
@@ -20223,14 +20226,17 @@ mod inner {
             let new_lease_client =
                 mongodb::Client::with_options(new_opts).expect("new lease client");
             let new_db = new_client.database("new_without_temp");
-            store
-                .connection
-                .store(std::sync::Arc::new(MongoConnectionBundle::new(
+            // Publish through the topology state; the replaced handle is a
+            // temporary dropped at the end of the statement.
+            store.failover_topology.publish_failover(
+                std::sync::Arc::new(MongoConnectionBundle::new(
                     new_client,
                     new_db,
                     new_lease_client,
                     Vec::new(),
-                )));
+                )),
+                "mongodb://localhost/test",
+            );
 
             assert!(
                 path.exists(),

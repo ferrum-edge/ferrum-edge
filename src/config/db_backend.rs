@@ -730,6 +730,8 @@ struct DbTopologyTransition {
     /// Start of the failover window the update left published (0 on primary).
     window_since_unix_ms: u64,
     allow_writes: bool,
+    /// The redacted URL the update left published.
+    active_url_redacted: Option<String>,
 }
 
 impl DbTopologyTransition {
@@ -757,6 +759,7 @@ impl DbTopologyTransition {
                 DbTopologyPhase::Primary => 0,
             },
             allow_writes: next.allow_writes,
+            active_url_redacted: next.active_url_redacted.clone(),
         }
     }
 }
@@ -832,14 +835,11 @@ impl<H: Clone> DbFailoverTopologyState<H> {
     }
 
     fn log_transition(&self, transition: &DbTopologyTransition) {
-        let url = self
-            .current
-            .load()
-            .view
+        let url = transition
             .active_url_redacted
-            .clone()
-            .unwrap_or_else(|| "<unknown>".to_string());
-        log_topology_transition(transition, &url);
+            .as_deref()
+            .unwrap_or("<unknown>");
+        log_topology_transition(transition, url);
     }
 
     pub fn allow_writes(&self) -> bool {

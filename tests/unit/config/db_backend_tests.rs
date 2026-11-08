@@ -857,7 +857,7 @@ fn failover_topology_publication_replaces_handle_and_topology_together() {
 /// Issue #7061: a concurrent observer never sees a primary handle next to
 /// failover topology (or the reverse), nor a primary status that still
 /// carries the failover URL or window start, however publications and
-/// Admin-write notes interleave.
+/// opt-in policy updates interleave.
 #[test]
 fn failover_topology_publication_is_one_consistent_cut_under_concurrency() {
     use std::sync::Arc;
@@ -907,7 +907,7 @@ fn failover_topology_publication_is_one_consistent_cut_under_concurrency() {
             })
         })
         .collect();
-    let noter = {
+    let toggler = {
         let state = Arc::clone(&state);
         let done = Arc::clone(&done);
         let start = Arc::clone(&start);
@@ -928,7 +928,7 @@ fn failover_topology_publication_is_one_consistent_cut_under_concurrency() {
         state.publish_primary(true, permit, "db://primary");
     }
     done.store(true, Ordering::Release);
-    noter.join().expect("noter thread");
+    toggler.join().expect("toggler thread");
     for observer in observers {
         assert!(observer.join().expect("observer thread") > 0);
     }
