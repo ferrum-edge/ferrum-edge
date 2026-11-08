@@ -513,9 +513,24 @@ fn blocks_for(retained_bytes: usize) -> u32 {
     u32::try_from(retained_bytes.div_ceil(RESERVATION_UNIT_BYTES)).unwrap_or(u32::MAX)
 }
 
+/// Granularity of the buffered-REQUEST budget: one byte.
+///
+/// The retained-response and request-decode budgets charge whole
+/// [`RESERVATION_UNIT_BYTES`] blocks, which suits bodies the gateway itself
+/// fetches. A client upload is different: rounding a one-byte stalled upload
+/// up to a 64 KiB block would let a client hold 64 KiB of budget for every byte
+/// it sends, so a few thousand one-byte streams could hold the whole budget.
+/// Request charges are therefore byte-granular and track the retained
+/// capacity exactly.
+pub(crate) const REQUEST_RESERVATION_UNIT_BYTES: usize = 1;
+
 struct Budget {
     fallback_per_response_bytes: usize,
-    /// Blocks the semaphore was constructed with. Diagnostics only — the live
+    /// Bytes one semaphore permit stands for: [`RESERVATION_UNIT_BYTES`] for
+    /// the retained-response and request-decode budgets,
+    /// [`REQUEST_RESERVATION_UNIT_BYTES`] for the buffered-request budget.
+    unit_bytes: usize,
+    /// Permits the semaphore was constructed with. Diagnostics only — the live
     /// permit count is the authority for admission.
     total_blocks: usize,
     permits: Arc<Semaphore>,
@@ -645,7 +660,7 @@ pub(crate) fn init_request_decode(total_bytes: usize) {
 
 fn request_buffer_budget() -> &'static Budget {
     REQUEST_BUFFER_BUDGET.get_or_init(|| {
-        Budget::new(
+        Budget::for_requests(
             DEFAULT_BUFFERED_REQUEST_FALLBACK_BYTES,
             DEFAULT_REQUEST_BUFFER_TOTAL_BYTES,
         )
@@ -662,7 +677,7 @@ fn request_buffer_budget() -> &'static Budget {
 #[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
 pub(crate) fn init_request_buffer(fallback_per_request_bytes: usize, total_bytes: usize) {
     if REQUEST_BUFFER_BUDGET
-        .set(Budget::new(fallback_per_request_bytes, total_bytes))
+        .set(Budget::for_requests(fallback_per_request_bytes, total_bytes))
         .is_err()
     {
         tracing::warn!(
@@ -704,22 +719,29 @@ pub(crate) fn buffered_request_body_ceiling(effective_limit: usize) -> usize {
 /// none of them can release early while the bytes are resident.
 #[must_use = "dropping the permit immediately returns the capacity it reserved"]
 pub(crate) struct RequestBufferPermit {
-    /// Moved into the published `Bytes` by [`Self::into_charged_bytes`], or
-    /// returned to the semaphore when this permit drops on an early exit.
-    /// [`Self::reserved_bytes`] is an external-test seam and therefore dead in
-    /// the separately compiled binary unit.
-    reservation: ResponseBufferReservation,
+    /// The held permits, moved into the published `Bytes` by
+    /// [`Self::into_charged_bytes`] or returned to the semaphore when this
+    /// permit drops on an early exit. `None` while nothing is held.
+    permit: Option<OwnedSemaphorePermit>,
+    /// Permits held, in units of `unit_bytes`.
+    units: usize,
+    /// Bytes one permit of this budget stands for
+    /// ([`REQUEST_RESERVATION_UNIT_BYTES`] in production).
+    unit_bytes: usize,
     /// The budget every growth of this charge is taken from, held so a growth
-    /// can never merge blocks from a different semaphore.
+    /// can never merge permits from a different semaphore.
     permits: Arc<Semaphore>,
 }
 
 impl RequestBufferPermit {
     /// An empty claim on `budget`: nothing is charged until bytes are retained.
     fn unreserved_in(budget: BudgetRef<'_>) -> Self {
+        let budget = budget.resolve();
         Self {
-            reservation: ResponseBufferReservation::new(),
-            permits: Arc::clone(&budget.resolve().permits),
+            permit: None,
+            units: 0,
+            unit_bytes: budget.unit_bytes,
+            permits: Arc::clone(&budget.permits),
         }
     }
 
@@ -737,30 +759,88 @@ impl RequestBufferPermit {
         }
     }
 
-    /// Grow the charge to cover `retained_bytes`. Already-held blocks are
-    /// reused, so a growth inside the current block costs no semaphore
-    /// operation. `false` is a capacity refusal, counted once here; the caller
-    /// must surface [`REQUEST_BUFFER_OVERLOAD_STATUS`] and drop the collect.
+    fn units_for(&self, retained_bytes: usize) -> usize {
+        retained_bytes.div_ceil(self.unit_bytes)
+    }
+
+    /// Grow the charge to cover `retained_bytes` without counting a refusal.
+    /// Already-held permits are reused, so a growth the charge already covers
+    /// costs no semaphore operation. A growth larger than one acquisition can
+    /// take (`u32::MAX` permits) is acquired in parts, all or nothing.
+    fn try_grow(&mut self, retained_bytes: usize) -> bool {
+        let wanted = self.units_for(retained_bytes);
+        if wanted <= self.units {
+            return true;
+        }
+        let mut missing = wanted - self.units;
+        let mut acquired: Option<OwnedSemaphorePermit> = None;
+        while missing > 0 {
+            let part = u32::try_from(missing).unwrap_or(u32::MAX);
+            // A refused part drops `acquired`, returning every earlier part.
+            let Ok(permit) = Arc::clone(&self.permits).try_acquire_many_owned(part) else {
+                return false;
+            };
+            match acquired.as_mut() {
+                Some(held) => held.merge(permit),
+                None => acquired = Some(permit),
+            }
+            missing -= part as usize;
+        }
+        if let Some(acquired) = acquired {
+            match self.permit.as_mut() {
+                Some(held) => held.merge(acquired),
+                None => self.permit = Some(acquired),
+            }
+        }
+        self.units = wanted;
+        true
+    }
+
+    /// Grow the charge to cover `retained_bytes`. `false` is a capacity
+    /// refusal, counted once here; the caller must surface
+    /// [`REQUEST_BUFFER_OVERLOAD_STATUS`] and drop the collect.
     fn grow_to(&mut self, retained_bytes: usize) -> bool {
-        if self.reservation.reserve_on(&self.permits, retained_bytes) {
+        if self.try_grow(retained_bytes) {
             true
         } else {
-            REQUEST_BUFFER_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+            note_request_buffer_refusal();
             false
         }
     }
 
-    /// Bytes currently reserved (whole blocks). Diagnostics and tests only.
+    /// Release every held permit beyond what `retained_bytes` needs. `false`
+    /// means the charge does not cover `retained_bytes`; nothing changes.
+    fn narrow_to(&mut self, retained_bytes: usize) -> bool {
+        let wanted = self.units_for(retained_bytes);
+        if wanted > self.units {
+            return false;
+        }
+        if wanted == 0 {
+            self.permit = None;
+            self.units = 0;
+            return true;
+        }
+        let surplus = self.units - wanted;
+        if surplus > 0
+            && let Some(held) = self.permit.as_mut()
+            && held.split(surplus).is_some()
+        {
+            self.units = wanted;
+        }
+        true
+    }
+
+    /// Bytes currently charged. Diagnostics and tests only.
     #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserved_bytes(&self) -> usize {
-        self.reservation.reserved_bytes()
+        self.units * self.unit_bytes
     }
 
     /// Grow the charge to cover an allocation that replaced the collected one,
-    /// such as a request-body plugin's transformed output. `false` is a
-    /// capacity refusal, counted once: the caller must drop the allocation and
-    /// answer [`REQUEST_BUFFER_OVERLOAD_STATUS`] instead of keeping bytes the
-    /// budget does not cover.
+    /// such as decoded plaintext or a request-body plugin's transformed output.
+    /// `false` is a capacity refusal, NOT counted here: the caller counts it
+    /// when it surfaces the capacity terminal ([`charge_covers`]), drops the
+    /// allocation, and never keeps bytes the budget does not cover.
     ///
     /// A refusal also releases the whole existing charge at once. The refused
     /// request keeps no body, so nothing this charge paid for stays resident,
@@ -768,10 +848,11 @@ impl RequestBufferPermit {
     /// writer or hook rather than whenever the emptied permit finally drops.
     #[must_use]
     pub(crate) fn cover(&mut self, retained_capacity: usize) -> bool {
-        if self.grow_to(retained_capacity) {
+        if self.try_grow(retained_capacity) {
             return true;
         }
-        self.reservation = ResponseBufferReservation::new();
+        self.permit = None;
+        self.units = 0;
         false
     }
 
@@ -794,8 +875,8 @@ impl RequestBufferPermit {
     /// `RESOURCE_EXHAUSTED` capacity terminal, so no published body is ever
     /// retained beyond what the budget admitted. Empty `data` returns
     /// [`Bytes::new()`] and drops the charge immediately, because nothing is
-    /// retained. A surviving allocation smaller than the charge releases
-    /// surplus blocks.
+    /// retained. A surviving allocation smaller than the charge releases the
+    /// surplus, so the published charge is exactly the allocation's capacity.
     #[must_use]
     pub(crate) fn into_charged_bytes(mut self, data: Vec<u8>) -> Option<Bytes> {
         if data.is_empty() {
@@ -806,12 +887,12 @@ impl RequestBufferPermit {
         }
         // The charge now covers the capacity, so narrowing only releases the
         // surplus; `false` would mean it does not, and nothing is published.
-        if !self.reservation.narrow_to_covered(data.capacity()) {
+        if !self.narrow_to(data.capacity()) {
             return None;
         }
         Some(Bytes::from_owner(ChargedBuffer {
             data,
-            _permit: self.reservation.into_permit(),
+            _permit: self.permit,
         }))
     }
 
@@ -821,19 +902,71 @@ impl RequestBufferPermit {
     fn narrow_to_retained(&mut self, retained_capacity: usize) {
         // Narrowing only releases. `false` means the allocation outgrew the
         // charge, which the charged collector excludes; keep the whole charge.
-        let _: bool = self.reservation.narrow_to_covered(retained_capacity);
+        let _: bool = self.narrow_to(retained_capacity);
     }
+}
+
+/// Count one buffered-request capacity refusal the client is answered with
+/// (`request_buffer.rejections` on the authenticated `/overload` snapshot).
+pub(crate) fn note_request_buffer_refusal() {
+    REQUEST_BUFFER_REJECTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Grow a buffered request body's charge to cover the allocation a normalizer
 /// or request-body plugin replaced it with, before the replacement is kept
-/// across any further await. `false` is the capacity refusal: the charge has
-/// already been released ([`RequestBufferPermit::cover`]), and the caller drops
-/// the replacement and the body and answers [`REQUEST_BUFFER_OVERLOAD_STATUS`].
-/// A body no governed collect charged (`None`) has no charge to grow.
+/// across any further await. `false` is the capacity refusal, counted here: the
+/// charge has already been released ([`RequestBufferPermit::cover`]), and the
+/// caller drops the replacement and the body and answers
+/// [`REQUEST_BUFFER_OVERLOAD_STATUS`]. A body no governed collect charged
+/// (`None`) has no charge to grow.
 #[must_use]
 pub(crate) fn charge_covers(charge: Option<&mut RequestBufferPermit>, capacity: usize) -> bool {
-    charge.is_none_or(|charge| charge.cover(capacity))
+    let covered = charge.is_none_or(|charge| charge.cover(capacity));
+    if !covered {
+        note_request_buffer_refusal();
+    }
+    covered
+}
+
+tokio::task_local! {
+    /// The decode working-set charge of a body a plugin just replaced with
+    /// decoded plaintext, held until the buffered-request charge covers the
+    /// replacement.
+    static REPLACEMENT_DECODE_CHARGE: std::cell::RefCell<Option<ResponseBufferReservation>>;
+}
+
+/// Run one normalizer or request-body transform so that a decode working-set
+/// charge it hands off ([`hand_off_replacement_decode_charge`]) outlives it.
+///
+/// A decoder charges its output against the request-decode budget while it
+/// decodes. Without this handoff that charge is released the moment the
+/// plugin returns its plaintext, and the buffered-request charge only covers
+/// the replacement afterwards, so the plaintext would be held under neither.
+/// The caller covers the replacement with its buffered-request charge first
+/// and drops the returned decode charge second.
+pub(crate) async fn with_replacement_decode_charge<F>(
+    future: F,
+) -> (F::Output, Option<ResponseBufferReservation>)
+where
+    F: std::future::Future,
+{
+    REPLACEMENT_DECODE_CHARGE
+        .scope(std::cell::RefCell::new(None), async move {
+            let output = future.await;
+            let charge = REPLACEMENT_DECODE_CHARGE.with(|slot| slot.take());
+            (output, charge)
+        })
+        .await
+}
+
+/// Hand a decoded replacement's working-set charge to the enclosing
+/// [`with_replacement_decode_charge`], which keeps it until the buffered-request
+/// charge covers the replacement. Outside such a scope it is simply released,
+/// exactly as before.
+pub(crate) fn hand_off_replacement_decode_charge(charge: ResponseBufferReservation) {
+    let _ = REPLACEMENT_DECODE_CHARGE.try_with(move |slot| {
+        *slot.borrow_mut() = Some(charge);
+    });
 }
 
 /// A buffered client REQUEST body collected under the aggregate
@@ -954,16 +1087,16 @@ pub(crate) struct RequestBufferBudgetSnapshot {
 /// no allocation on the reading path.
 pub(crate) fn request_buffer_snapshot() -> RequestBufferBudgetSnapshot {
     let budget = request_buffer_budget();
-    let total_bytes = budget.total_blocks.saturating_mul(RESERVATION_UNIT_BYTES);
+    let total_bytes = budget.total_blocks.saturating_mul(budget.unit_bytes);
     let available_bytes = budget
         .permits
         .available_permits()
-        .saturating_mul(RESERVATION_UNIT_BYTES);
+        .saturating_mul(budget.unit_bytes);
     RequestBufferBudgetSnapshot {
         total_bytes,
         available_bytes,
         reserved_bytes: total_bytes.saturating_sub(available_bytes),
-        reservation_unit_bytes: RESERVATION_UNIT_BYTES,
+        reservation_unit_bytes: budget.unit_bytes,
         fallback_max_bytes: budget.fallback_per_response_bytes,
         rejections: REQUEST_BUFFER_REJECTIONS.load(Ordering::Relaxed),
     }
@@ -971,6 +1104,28 @@ pub(crate) fn request_buffer_snapshot() -> RequestBufferBudgetSnapshot {
 
 impl Budget {
     fn new(fallback_per_response_bytes: usize, total_bytes: usize) -> Self {
+        Self::with_unit(
+            fallback_per_response_bytes,
+            total_bytes,
+            RESERVATION_UNIT_BYTES,
+        )
+    }
+
+    /// The buffered-request budget, charged per byte
+    /// ([`REQUEST_RESERVATION_UNIT_BYTES`]).
+    fn for_requests(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
+        Self::with_unit(
+            fallback_per_request_bytes,
+            total_bytes,
+            REQUEST_RESERVATION_UNIT_BYTES,
+        )
+    }
+
+    fn with_unit(
+        fallback_per_response_bytes: usize,
+        total_bytes: usize,
+        unit_bytes: usize,
+    ) -> Self {
         // A zero/short fallback would not cover even one reservation block, and
         // an enormous one would make the fallback arithmetic needlessly close
         // to `usize` overflow, so normalize it to the documented range first. A
@@ -990,11 +1145,11 @@ impl Budget {
         let fallback_per_response_bytes =
             fallback_per_response_bytes.clamp(RESERVATION_UNIT_BYTES, usize::MAX / 2);
         let total_bytes = total_bytes.max(fallback_per_response_bytes);
-        let blocks = total_bytes
-            .div_ceil(RESERVATION_UNIT_BYTES)
-            .min(Semaphore::MAX_PERMITS);
+        let wanted_blocks = total_bytes.div_ceil(unit_bytes);
+        let blocks = wanted_blocks.min(Semaphore::MAX_PERMITS);
         Self {
             fallback_per_response_bytes,
+            unit_bytes,
             total_blocks: blocks,
             permits: Arc::new(Semaphore::new(blocks)),
         }
@@ -1076,6 +1231,9 @@ impl ResponseBufferReservation {
     /// [`RESPONSE_BUFFER_OVERLOAD_STATUS`]. Already-held blocks stay held until
     /// this value drops.
     fn reserve_against(&mut self, budget: &Budget, retained_bytes: usize) -> bool {
+        // Block reservations belong to the block-granular budgets; the
+        // byte-granular request budget is charged by `RequestBufferPermit`.
+        debug_assert_eq!(budget.unit_bytes, RESERVATION_UNIT_BYTES);
         self.reserve_on(&budget.permits, retained_bytes)
     }
 
@@ -1894,9 +2052,15 @@ impl IsolatedBudget {
         Self(Budget::new(fallback_per_response_bytes, total_bytes))
     }
 
+    /// An isolated buffered-REQUEST budget, charged per byte exactly as the
+    /// production one.
+    pub(crate) fn new_request(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
+        Self(Budget::for_requests(fallback_per_request_bytes, total_bytes))
+    }
+
     /// Currently unreserved capacity, in bytes.
     pub(crate) fn available_bytes(&self) -> usize {
-        self.0.permits.available_permits() * RESERVATION_UNIT_BYTES
+        self.0.permits.available_permits() * self.0.unit_bytes
     }
 
     /// Bind this budget where production binds [`BudgetRef::global`], so a test

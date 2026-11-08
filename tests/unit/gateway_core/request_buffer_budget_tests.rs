@@ -749,16 +749,18 @@ fn the_charge_covers_the_retained_capacity_and_grows_geometrically() {
         let reserved = collector.reserved_bytes();
         assert!(reserved >= collector.len(), "retained bytes are charged");
         assert!(
-            reserved <= (2 * collector.len()).div_ceil(UNIT) * UNIT,
-            "the charge must track retained bytes, not the ceiling"
+            reserved <= 2 * collector.len(),
+            "the charge must track retained capacity, not the ceiling or a block"
         );
         if reserved != previous_reserved {
             growths += 1;
             previous_reserved = reserved;
         }
     }
+    // Geometric growth: about log2(n) charges for n one-byte chunks, never one
+    // per chunk.
     assert!(
-        growths <= 4,
+        growths <= 20,
         "one-byte chunks must not take a semaphore operation per chunk: {growths} growths"
     );
     let (body, permit) = collector.finish();
@@ -812,7 +814,7 @@ async fn stalled_h1_h2_collects_hold_no_budget_and_complete_uploads_still_succee
         panic!("a stalled upload that finishes must be collected");
     };
     assert_eq!(body, b"late body");
-    assert_eq!(permit.reserved_bytes(), UNIT);
+    assert_eq!(permit.reserved_bytes(), b"late body".len());
     drop((body, permit));
 
     drop(stalled);
@@ -1030,12 +1032,15 @@ fn every_body_replacement_is_charged_before_a_later_phase_keeps_it() {
         .next()
         .expect("bounded normalization phase");
     let normalized = normalization
-        .find(".into_plugin_result(ctx);")
+        .find("let result = result.into_plugin_result(ctx);")
         .expect("normalizer call");
     let covered = normalization
-        .find("let covered = charge_covers(charge.as_deref_mut(), body.capacity());")
+        .find(".is_none_or(|charge| charge.cover(body.capacity()));")
         .expect("normalized body is charged");
-    assert!(normalized < covered);
+    let decode_released = normalization
+        .find("drop(decode_charge);")
+        .expect("decode charge released");
+    assert!(normalized < covered && covered < decode_released);
 
     let transforms = proxy
         .split("pub(crate) async fn apply_request_body_plugins_with_context(")
@@ -1048,7 +1053,7 @@ fn every_body_replacement_is_charged_before_a_later_phase_keeps_it() {
         .find("if !charge_covers(charge.as_deref_mut(), transformed.capacity()) {")
         .expect("each replacement is charged");
     let installed = transforms
-        .find("current = transformed;")
+        .find("body = transformed;")
         .expect("replacement installed");
     assert!(
         covered < installed,
@@ -1181,7 +1186,7 @@ async fn a_grow_then_shrink_chain_publishes_only_its_final_body() {
     // The charge covered the peak; publication narrows it to the final body.
     assert_eq!(charge.reserved_bytes(), 3 * UNIT);
     let published = charge.into_charged_bytes(body).expect("covered");
-    assert_eq!(budget.available_bytes(), total - UNIT);
+    assert_eq!(budget.available_bytes(), total - 10);
     drop(published);
     assert_eq!(budget.available_bytes(), total);
 }
@@ -1250,4 +1255,89 @@ fn a_refused_pre_dispatch_transform_commits_through_the_reject_pipeline() {
     let dropped = refusal.find("drop(buffered);").expect("body dropped");
     let first_await = refusal.find(".await").expect("reject pipeline awaits");
     assert!(dropped < first_await);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Charges are byte-granular.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn many_one_byte_uploads_hold_only_their_bytes_and_a_complete_upload_still_fits() {
+    // A block-granular charge rounded every one-byte stalled upload up to a
+    // whole 64 KiB block, so a few thousand one-byte streams held the whole
+    // budget. Charges now track the retained capacity exactly.
+    let budget = two_ceiling_budget();
+    let total = budget.available_bytes();
+    let mut trickling: Vec<_> = (0..4096).map(|_| budget.collector(0)).collect();
+    for collector in &mut trickling {
+        assert_eq!(collector.append(b"x"), Ok(()));
+    }
+    assert_eq!(budget.available_bytes(), total - 4096);
+
+    // The PRODUCTION H1/H2 collector holds one-byte uploads open the same way.
+    let mut stalled = Vec::new();
+    for _ in 0..64 {
+        let (tx, rx) = tokio::sync::mpsc::channel::<FrameResult>(1);
+        tx.send(data_frame(b"x".to_vec()))
+            .await
+            .expect("first byte");
+        let body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let mut collect = Box::pin(collect_charged_request_body_for_test(body, &budget, 0));
+        assert!(futures::poll!(collect.as_mut()).is_pending());
+        stalled.push((tx, collect));
+    }
+    assert_eq!(budget.available_bytes(), total - 4096 - 64);
+
+    // A complete, ceiling-sized upload from someone else is admitted.
+    let victim = complete_body(vec![data_frame(vec![3u8; 2 * UNIT - 8192])]);
+    let outcome = collect_charged_request_body_for_test(victim, &budget, 0).await;
+    let Outcome::Collected { body, permit, .. } = outcome else {
+        panic!("one-byte uploads must not refuse a complete upload");
+    };
+    assert_eq!(permit.reserved_bytes(), body.capacity());
+    drop((body, permit));
+
+    // Genuinely retained bytes still exhaust the budget.
+    let mut filler = budget.collector(0);
+    assert_eq!(filler.append(&vec![1u8; 2 * UNIT]), Ok(()));
+    let mut over = budget.collector(0);
+    assert_eq!(
+        over.append(&vec![1u8; 2 * UNIT]),
+        Err(ResponseBufferRetainRejection::BudgetExhausted),
+        "retained bytes must still be bounded by the budget"
+    );
+    drop((over, filler, stalled, trickling));
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[tokio::test]
+async fn a_decoded_body_stays_charged_until_its_handed_off_charge_is_released() {
+    use ferrum_edge::_test_support::{
+        ResponseBufferBudgetProbe, decode_and_hand_off_charge_for_test,
+    };
+    // The decode charge travels back from the blocking decoder with the
+    // plaintext and through the replacement scope, so the completed output is
+    // never held uncharged before the buffered-request charge covers it.
+    let probe = ResponseBufferBudgetProbe::new(UNIT, 16 * UNIT);
+    let total = probe.available_bytes();
+    let plaintext = compressible_plaintext();
+    let compressed = gzip(&plaintext);
+    let handoff = decode_and_hand_off_charge_for_test(
+        &probe,
+        &["gzip".to_string()],
+        &compressed,
+        1_048_576,
+    )
+    .await
+    .expect("decoded");
+    assert!(
+        total - handoff.available_after_decode >= handoff.plaintext_capacity,
+        "the decoded plaintext must come back charged"
+    );
+    assert_eq!(
+        handoff.available_after_handoff,
+        handoff.available_after_decode,
+        "the handed-off decode charge must still cover the unconsumed output"
+    );
+    assert_eq!(handoff.available_after_release, total);
 }

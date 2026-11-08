@@ -4993,21 +4993,33 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
             continue;
         }
         let deadline = ctx.grpc_deadline_at();
-        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+        // A decoding normalizer hands its plaintext's decode charge out of the
+        // call, so the plaintext stays charged until the buffered-request
+        // charge below covers it.
+        let normalize = crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
             plugin.normalize_buffered_request_body_before_before_proxy(ctx, headers, body),
-        )
-        .await
-        .into_plugin_result(ctx);
+        );
+        let (result, decode_charge) =
+            response_buffer_budget::with_replacement_decode_charge(normalize).await;
+        let result = result.into_plugin_result(ctx);
         // Charged before any later phase awaits. An uncovered body is dropped
         // (and its charge released) whatever the normalizer decided, so a
         // rejection keeps its own status while nothing uncharged stays resident.
-        let covered = charge_covers(charge.as_deref_mut(), body.capacity());
+        let covered = charge
+            .as_deref_mut()
+            .is_none_or(|charge| charge.cover(body.capacity()));
         if !covered {
             *body = Vec::new();
         }
+        drop(decode_charge);
         match result {
-            PluginResult::Continue if !covered => return Err(RequestBodyCapacityExceeded),
+            PluginResult::Continue if !covered => {
+                // Counted only when the client is answered with the capacity
+                // refusal, not when the normalizer's own rejection wins.
+                response_buffer_budget::note_request_buffer_refusal();
+                return Err(RequestBodyCapacityExceeded);
+            }
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
@@ -6924,54 +6936,47 @@ pub(crate) async fn apply_request_body_plugins_with_context(
     }
 
     let content_type = headers.get("content-type").map(|value| value.as_str());
-    let mut current = body_bytes;
+    let mut body = body_bytes;
     for plugin in plugins {
         if plugin.modifies_request_body() {
             let deadline = ctx
                 .as_deref()
                 .and_then(RequestContext::grpc_deadline_at)
                 .or(grpc_deadline_at);
-            let transformed = if let Some(ctx) = ctx.as_deref_mut() {
-                if let Some(deadline) = deadline {
-                    match tokio::time::timeout_at(
-                        deadline,
-                        plugin.transform_request_body_with_context(
-                            ctx,
-                            &current,
-                            content_type,
-                            headers,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(transformed) => transformed,
-                        Err(_) => {
-                            ctx.metadata.insert(
-                                "grpc_deadline.request_body_transform_timed_out".to_string(),
-                                "true".to_string(),
-                            );
-                            break;
-                        }
+            // `None` is a deadline that cut the transform short. A decoding
+            // transform hands its plaintext's decode charge out of the call,
+            // so the plaintext stays charged until the charge below covers it.
+            let transform = async {
+                if let Some(ctx) = ctx.as_deref_mut() {
+                    let transform = plugin.transform_request_body_with_context(
+                        ctx,
+                        &body,
+                        content_type,
+                        headers,
+                    );
+                    let Some(deadline) = deadline else {
+                        return Some(transform.await);
+                    };
+                    let transformed = tokio::time::timeout_at(deadline, transform).await;
+                    if transformed.is_err() {
+                        ctx.metadata.insert(
+                            "grpc_deadline.request_body_transform_timed_out".to_string(),
+                            "true".to_string(),
+                        );
                     }
+                    transformed.ok()
                 } else {
-                    plugin
-                        .transform_request_body_with_context(ctx, &current, content_type, headers)
-                        .await
+                    let transform = plugin.transform_request_body(&body, content_type, headers);
+                    let Some(deadline) = deadline else {
+                        return Some(transform.await);
+                    };
+                    tokio::time::timeout_at(deadline, transform).await.ok()
                 }
-            } else if let Some(deadline) = deadline {
-                match tokio::time::timeout_at(
-                    deadline,
-                    plugin.transform_request_body(&current, content_type, headers),
-                )
-                .await
-                {
-                    Ok(transformed) => transformed,
-                    Err(_) => break,
-                }
-            } else {
-                plugin
-                    .transform_request_body(&current, content_type, headers)
-                    .await
+            };
+            let (transformed, decode_charge) =
+                response_buffer_budget::with_replacement_decode_charge(transform).await;
+            let Some(transformed) = transformed else {
+                break;
             };
             if let Some(transformed) = transformed {
                 // Charged before it is installed and before the next transform
@@ -6979,11 +6984,12 @@ pub(crate) async fn apply_request_body_plugins_with_context(
                 if !charge_covers(charge.as_deref_mut(), transformed.capacity()) {
                     return Err(RequestBodyCapacityExceeded);
                 }
-                current = transformed;
+                body = transformed;
             }
+            drop(decode_charge);
         }
     }
-    Ok(current)
+    Ok(body)
 }
 
 pub(crate) async fn run_final_request_body_hooks(

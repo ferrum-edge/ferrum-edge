@@ -999,7 +999,8 @@ async fn h3_buffered_grpc_upload_reset_is_cancelled_and_logged_before_write() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let snapshot = request_buffer_snapshot(&harness).await;
-        if snapshot["reserved_bytes"].as_u64() == Some(ONE_BLOCK_BYTES) {
+        // Charges are byte-granular: the drain holds exactly the bytes it read.
+        if snapshot["reserved_bytes"].as_u64() > Some(0) {
             break;
         }
         assert!(

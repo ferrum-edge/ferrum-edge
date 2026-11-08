@@ -17208,7 +17208,7 @@ pub mod _test_support {
 
     impl RequestBufferBudgetProbe {
         pub fn new(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
-            Self(crate::proxy::response_buffer_budget::IsolatedBudget::new(
+            Self(crate::proxy::response_buffer_budget::IsolatedBudget::new_request(
                 fallback_per_request_bytes,
                 total_bytes,
             ))
@@ -17600,6 +17600,65 @@ pub mod _test_support {
             Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
             Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
         }
+    }
+
+    /// Budget readings across one decoded request-body replacement.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DecodeChargeHandoffForTest {
+        pub plaintext_capacity: usize,
+        /// Available bytes once the decode returned its plaintext.
+        pub available_after_decode: usize,
+        /// Available bytes after the replacement scope handed the charge
+        /// back, with the worker output still unconsumed.
+        pub available_after_handoff: usize,
+        /// Available bytes once the handed-off charge is released.
+        pub available_after_release: usize,
+    }
+
+    /// Decode through the PRODUCTION charge-retaining decoder against an
+    /// ISOLATED budget, then pass the decode charge through the PRODUCTION
+    /// replacement scope exactly as a decoding normalizer does, holding the
+    /// completed output across yields before it is consumed. `None` when the
+    /// decode is refused.
+    pub async fn decode_and_hand_off_charge_for_test(
+        probe: &ResponseBufferBudgetProbe,
+        codings: &[String],
+        body: &[u8],
+        max_decoded_bytes: usize,
+    ) -> Option<DecodeChargeHandoffForTest> {
+        use crate::plugins::charged_decode::decode_charged_content_coding_chain_with_charge;
+        use crate::proxy::response_buffer_budget::{
+            hand_off_replacement_decode_charge, with_replacement_decode_charge,
+        };
+        let limits = crate::plugins::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes,
+            max_cumulative_bytes: max_decoded_bytes,
+            max_codings: codings.len().max(1),
+            max_amplification_ratio: 1024,
+        };
+        let (plaintext, charge) = decode_charged_content_coding_chain_with_charge(
+            codings,
+            body,
+            limits,
+            probe.0.handle(),
+        )
+        .ok()?;
+        let available_after_decode = probe.available_bytes();
+        let ((), handed_off) = with_replacement_decode_charge(async {
+            tokio::task::yield_now().await;
+            hand_off_replacement_decode_charge(charge);
+            tokio::task::yield_now().await;
+        })
+        .await;
+        let available_after_handoff = probe.available_bytes();
+        drop(handed_off);
+        let available_after_release = probe.available_bytes();
+        Some(DecodeChargeHandoffForTest {
+            plaintext_capacity: plaintext.capacity(),
+            available_after_decode,
+            available_after_handoff,
+            available_after_release,
+        })
     }
 
     /// Undo a body's `Content-Encoding` exactly as `openapi_validator` does

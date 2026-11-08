@@ -18482,7 +18482,9 @@ components:
             reservation_unit_bytes:
               type: integer
               format: uint64
-              description: Granularity of one reservation block (64 KiB).
+              description: |
+                Granularity of one reservation (1 byte): buffered request
+                bodies are charged by the bytes they retain.
             fallback_max_bytes:
               type: integer
               format: uint64

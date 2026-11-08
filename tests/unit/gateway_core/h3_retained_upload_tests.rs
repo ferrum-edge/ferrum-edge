@@ -22,6 +22,9 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::proxy::auth_lifetime::ComposedAuthBound;
 
+/// A small upload body.
+const SOAP: &[u8] = b"small soap envelope";
+
 /// A two-block fallback ceiling inside an eight-block aggregate budget.
 fn budget() -> RequestBufferBudgetProbe {
     RequestBufferBudgetProbe::new(2 * UNIT, 8 * UNIT)
@@ -188,10 +191,10 @@ fn a_finished_body_keeps_only_its_resident_charge() {
     assert_eq!(body, b"small soap envelope");
     assert_eq!(
         permit.reserved_bytes(),
-        UNIT,
-        "a small body must not hold a ceiling-sized claim for the whole request"
+        SOAP.len(),
+        "a small body is charged exactly its retained bytes, never a ceiling or a block"
     );
-    assert_eq!(budget.available_bytes(), total - UNIT);
+    assert_eq!(budget.available_bytes(), total - SOAP.len());
     drop(body);
     drop(permit);
     assert_eq!(budget.available_bytes(), total);
@@ -209,7 +212,7 @@ fn a_published_body_is_released_when_its_last_dispatch_copy_drops() {
         .finish_and_publish()
         .expect("the charge covers the collected body");
     assert_eq!(&body[..], b"small soap envelope");
-    assert_eq!(budget.available_bytes(), total - UNIT);
+    assert_eq!(budget.available_bytes(), total - SOAP.len());
     // The first attempt and a retry replay share the one charged allocation.
     let attempt = body.clone();
     let replay = body.clone();
@@ -217,7 +220,7 @@ fn a_published_body_is_released_when_its_last_dispatch_copy_drops() {
     drop(attempt);
     assert_eq!(
         budget.available_bytes(),
-        total - UNIT,
+        total - SOAP.len(),
         "a live replay copy keeps the allocation charged"
     );
     drop(replay);
@@ -247,7 +250,7 @@ async fn a_drain_cancelled_by_its_bound_releases_admission_before_the_wait_retur
     assert_eq!(upload.push(&[9u8; 1024]), Ok(()));
     assert_eq!(
         budget.available_bytes(),
-        total - UNIT,
+        total - 1024,
         "the partial upload is charged for what it retains, not for its ceiling"
     );
 
@@ -594,4 +597,40 @@ fn every_h3_drain_reads_to_the_end_of_the_request_stream() {
         bridge.contains("super::server::drain_h3_request_body(stream, upload, charge).await"),
         "the bridge drains must share the native-H3 drain"
     );
+}
+
+#[test]
+fn many_one_byte_uploads_hold_only_their_bytes_and_a_complete_upload_still_fits() {
+    // Charges are byte-granular: a one-byte stalled upload holds one byte of
+    // the budget, never a whole reservation block.
+    let budget = budget();
+    let total = budget.available_bytes();
+    let mut trickling = Vec::new();
+    for _ in 0..4096 {
+        let mut upload = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
+        assert_eq!(upload.push(b"x"), Ok(()));
+        trickling.push(upload);
+    }
+    assert_eq!(budget.available_bytes(), total - 4096);
+
+    // A complete, ceiling-sized upload from someone else still collects.
+    let mut honest = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
+    assert_eq!(honest.push(&vec![7u8; 2 * UNIT]), Ok(()));
+    drop(honest);
+
+    // Genuinely retained bytes still exhaust the budget.
+    let mut fill = Vec::new();
+    loop {
+        let mut upload = H3RetainedUploadProbe::admit(&budget, 2 * UNIT);
+        match upload.push(&vec![1u8; 2 * UNIT]) {
+            Ok(()) => fill.push(upload),
+            Err(rejection) => {
+                assert_eq!(rejection, ResponseBufferRetainRejection::BudgetExhausted);
+                break;
+            }
+        }
+        assert!(fill.len() <= 4, "the budget must still bound retained bytes");
+    }
+    drop((trickling, fill));
+    assert_eq!(budget.available_bytes(), total);
 }

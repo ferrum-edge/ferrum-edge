@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uploads and sent no body could therefore hold the whole 256 MiB budget for
   a read timeout and get every other principal's buffered upload refused with
   `503`. The charge now grows with the bytes an upload actually retains,
+  byte for byte (a one-byte upload holds one byte, not a 64 KiB block),
   taken before each growth of the buffer as the response-side budget already
   does, on HTTP/1.1, HTTP/2, native HTTP/3 and the HTTP/3 bridges. An upload
   that has sent nothing holds no budget. When the budget cannot cover a
