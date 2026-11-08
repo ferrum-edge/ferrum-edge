@@ -38,6 +38,9 @@ const REDIS_PASSWORD: &str = "redis-password-must-not-leak";
 const KAFKA_PASSWORD: &str = "kafka-sasl-password-must-not-leak";
 const SLACK_WEBHOOK: &str = "https://hooks.slack.com/services/T000/B000/slack-token-must-not-leak";
 const RAW_CONFIG: &str = "scalar-config-must-not-leak";
+const TRIGGER_HEADER: &str = "trigger-header-operand-must-not-leak";
+const TRIGGER_QUERY: &str = "trigger-query-operand-must-not-leak";
+const EXT_AUTHZ_PREFIX: &str = "/check/ext-authz-prefix-must-not-leak";
 
 fn key(secret: &str) -> HmacSha256Key {
     fingerprint_key(secret).expect("a non-empty secret derives a key")
@@ -580,6 +583,80 @@ fn export_fingerprints_request_transformer_rule_values() {
     assert_eq!(config["rules"][1]["target"], "query");
 }
 
+/// A plugin `trigger` (a sibling of `config`) is exported through the same
+/// projection: its header, query and cookie operands are fingerprinted at any
+/// depth of the tree, while field names, match kinds and structure are
+/// exported verbatim.
+#[test]
+fn export_fingerprints_plugin_trigger_operands() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let triggered: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "triggered",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {},
+        "trigger": {"when": {"any": [
+            {"not": {"match": {"header": {
+                "name": "x-skip",
+                "value": {"exact": [TRIGGER_HEADER]}
+            }}}},
+            {"match": {"query": {"name": "debug", "value": {"regex": TRIGGER_QUERY}}}},
+            {"match": {"method": ["POST"]}}
+        ]}},
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("trigger fixture");
+    config.plugin_configs.push(triggered);
+
+    let export = export(config, ADMIN_SECRET);
+    let any = &plugin(&export, "triggered")["trigger"]["when"]["any"];
+    let header = &any[0]["not"]["match"]["header"];
+    assert_eq!(header["name"], "x-skip");
+    assert!(is_fingerprint(&header["value"]["exact"][0]), "{header}");
+    let query = &any[1]["match"]["query"];
+    assert_eq!(query["name"], "debug");
+    assert!(is_fingerprint(&query["value"]["regex"]), "{query}");
+    assert_eq!(any[2]["match"]["method"], json!(["POST"]));
+    let text = export.to_string();
+    for secret in [TRIGGER_HEADER, TRIGGER_QUERY] {
+        assert!(!text.contains(secret), "export leaked {secret}");
+    }
+}
+
+/// A `mesh_authz` external-authorization `path_prefix` is fingerprinted in the
+/// export, while the provider's name, service, and port are exported verbatim.
+#[test]
+fn export_fingerprints_mesh_authz_ext_authz_path_prefix() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let mesh_authz: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "mesh-authz",
+        "plugin_name": "mesh_authz",
+        "scope": "global",
+        "enabled": false,
+        "config": {"mesh_slice": {"ext_authz_providers": [{
+            "name": "ext-check",
+            "service": "authz.shop.svc.cluster.local",
+            "port": 9000,
+            "path_prefix": EXT_AUTHZ_PREFIX
+        }]}},
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("mesh_authz fixture");
+    config.plugin_configs.push(mesh_authz);
+
+    let export = export(config, ADMIN_SECRET);
+    let slice = &plugin(&export, "mesh-authz")["config"]["mesh_slice"];
+    let provider = &slice["ext_authz_providers"][0];
+    assert!(is_fingerprint(&provider["path_prefix"]), "{provider}");
+    assert_eq!(provider["name"], "ext-check");
+    assert_eq!(provider["service"], "authz.shop.svc.cluster.local");
+    assert_eq!(provider["port"], 9000);
+    assert!(!export.to_string().contains(EXT_AUTHZ_PREFIX));
+}
+
 const INLINE_CLIENT_CERT: &str =
     "-----BEGIN CERTIFICATE-----\nY2xpZW50LWNlcnQ=\n-----END CERTIFICATE-----\n";
 const INLINE_CLIENT_KEY: &str =
@@ -743,4 +820,126 @@ fn export_fingerprints_inline_backend_tls_private_keys_and_keeps_references() {
         at("/port_overrides/8443/tls/client_key_path"),
         "k8s://ferrum/p8443#tls.key"
     );
+}
+
+/// A certificate-plus-key bundle in a plugin certificate source is
+/// fingerprinted exactly like the Proxy and Upstream TLS fields, while a
+/// certificate-only CA source and a key reference are exported verbatim.
+#[test]
+fn export_fingerprints_plugin_certificate_plus_key_bundles() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let bundle = format!("{INLINE_CLIENT_CERT}{INLINE_CLIENT_KEY}");
+    let udp: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "udp-dtls",
+        "plugin_name": "udp_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "host": "logs.internal",
+            "dtls": true,
+            "dtls_cert_path": bundle,
+            "dtls_key_path": "k8s://ferrum/udp-client#tls.key",
+            "dtls_ca_cert_path": INLINE_CLIENT_CERT
+        },
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("udp_logging fixture");
+    config.plugin_configs.push(udp);
+
+    let export = export(config, ADMIN_SECRET);
+    let udp = &plugin(&export, "udp-dtls")["config"];
+    assert!(is_fingerprint(&udp["dtls_cert_path"]), "{udp}");
+    assert_eq!(udp["dtls_ca_cert_path"], INLINE_CLIENT_CERT);
+    assert_eq!(udp["dtls_key_path"], "k8s://ferrum/udp-client#tls.key");
+    assert!(!export.to_string().contains(INLINE_CLIENT_KEY_BODY));
+}
+
+/// An `opa_host` base path is fingerprinted in the export; `policy_path`
+/// stays verbatim.
+#[test]
+fn export_fingerprints_opa_host_base_path() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let opa: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "opa",
+        "plugin_name": "opa",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "opa_host": "https://opa.example.com/opa-base-path-must-not-leak",
+            "policy_path": "/v1/data/authz/allow"
+        },
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("opa fixture");
+    config.plugin_configs.push(opa);
+
+    let export = export(config, ADMIN_SECRET);
+    let opa = &plugin(&export, "opa")["config"];
+    assert!(is_fingerprint(&opa["opa_host"]), "{opa}");
+    assert_eq!(opa["policy_path"], "/v1/data/authz/allow");
+    assert!(!export.to_string().contains("opa-base-path-must-not-leak"));
+}
+
+/// A custom plugin cannot be classified, so every scalar leaf of its config is
+/// fingerprinted in the export; keys and `null` stay verbatim.
+#[test]
+fn export_fingerprints_every_custom_plugin_scalar_leaf() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let custom: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "custom-object",
+        "plugin_name": "third_party_custom_plugin",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "auth_headers": [{"name": "X-Vendor-Token", "value": "custom-pair-must-not-leak"}],
+            "account_id": 987654321,
+            "note": null
+        },
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("custom plugin fixture");
+    config.plugin_configs.push(custom);
+
+    let export = export(config, ADMIN_SECRET);
+    let custom = &plugin(&export, "custom-object")["config"];
+    let pair = &custom["auth_headers"][0];
+    assert!(is_fingerprint(&pair["name"]), "{custom}");
+    assert!(is_fingerprint(&pair["value"]), "{custom}");
+    assert!(is_fingerprint(&custom["account_id"]), "{custom}");
+    assert_eq!(custom["note"], Value::Null);
+    assert!(!export.to_string().contains("custom-pair-must-not-leak"));
+}
+
+/// A `request_mirror` shadow path is fingerprinted in the export like an
+/// endpoint URL path; the host, port, and protocol stay verbatim.
+#[test]
+fn export_fingerprints_request_mirror_path() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let mirror: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "mirror",
+        "plugin_name": "request_mirror",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "mirror_host": "shadow.internal",
+            "mirror_port": 8443,
+            "mirror_protocol": "https",
+            "mirror_path": "/ingest/mirror-path-must-not-leak"
+        },
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("request_mirror fixture");
+    config.plugin_configs.push(mirror);
+
+    let export = export(config, ADMIN_SECRET);
+    let mirror = &plugin(&export, "mirror")["config"];
+    assert!(is_fingerprint(&mirror["mirror_path"]), "{mirror}");
+    assert_eq!(mirror["mirror_host"], "shadow.internal");
+    assert_eq!(mirror["mirror_port"], 8443);
+    assert_eq!(mirror["mirror_protocol"], "https");
+    assert!(!export.to_string().contains("mirror-path-must-not-leak"));
 }
