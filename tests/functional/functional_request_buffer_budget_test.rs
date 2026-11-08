@@ -288,6 +288,152 @@ async fn stalled_buffered_uploads_do_not_hold_the_budget_against_other_clients()
     backend_task.abort();
 }
 
+/// A request-body transform growth larger than the whole request-buffer
+/// budget, so covering the replacement must be refused.
+const TRANSFORM_PADDING_BYTES: usize = 80 * 1024;
+
+#[ignore]
+#[tokio::test]
+async fn a_transform_capacity_refusal_keeps_its_503_under_a_smaller_response_limit() {
+    // Sol review (round 9): the capacity refusal a request-body transform
+    // triggers is the gateway-local terminal. A route response-size limit
+    // smaller than its fixed body must not turn it into a `502` "Response body
+    // too large" before any backend was contacted.
+    let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
+    let mut gateway = TestGateway::builder()
+        .mode_file(transform_capacity_config(backend_port))
+        .log_level("warn")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env(
+            "FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES",
+            FALLBACK_BYTES.to_string(),
+        )
+        .env(
+            "FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES",
+            FALLBACK_BYTES.to_string(),
+        )
+        .spawn()
+        .await
+        .expect("start transform-capacity gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("http1 client");
+
+    let response = client
+        .post(gateway.proxy_url("/buffered-capacity"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("refused upload is answered");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "the transform-capacity refusal must keep its gateway-local 503; got {status} {body}"
+    );
+    assert!(
+        body.contains("Request buffering capacity exceeded"),
+        "response policy must not replace the fixed capacity body: {body}"
+    );
+    assert_eq!(
+        buffered_hits(&backend_hits),
+        0,
+        "the refused upload must never reach the backend"
+    );
+
+    // The refusal released its charge: an admissible upload under the same
+    // response limit still succeeds.
+    let response = client
+        .post(gateway.proxy_url("/buffered-admissible"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("admissible upload completes");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "an admissible upload must still be forwarded; got {status} {body}"
+    );
+    assert_eq!(buffered_hits(&backend_hits), 1);
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
+fn transform_capacity_config(backend_port: u16) -> String {
+    let padding = "p".repeat(TRANSFORM_PADDING_BYTES);
+    let mut plugin_configs = Vec::from(transform_plugins("capacity-route", padding));
+    plugin_configs.extend(transform_plugins("admissible-route", "p".to_string()));
+    let config = json!({
+        "version": "1",
+        "proxies": [
+            transform_route("capacity-route", "/buffered-capacity", backend_port),
+            transform_route("admissible-route", "/buffered-admissible", backend_port)
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": plugin_configs
+    });
+    serde_yaml::to_string(&config).expect("serialize transform-capacity config")
+}
+
+/// A buffered route whose request transformer adds `padding` to the JSON body
+/// and whose strict response-size limit is smaller than any error body.
+fn transform_route(id: &str, path: &str, backend_port: u16) -> serde_json::Value {
+    json!({
+        "id": id,
+        "listen_path": path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "strip_listen_path": false,
+        "pool_enable_http2": false,
+        "plugins": [
+            {"plugin_config_id": format!("{id}-transform")},
+            {"plugin_config_id": format!("{id}-response-limit")}
+        ]
+    })
+}
+
+fn transform_plugins(id: &str, padding: String) -> [serde_json::Value; 2] {
+    [
+        json!({
+            "id": format!("{id}-transform"),
+            "proxy_id": id,
+            "plugin_name": "request_transformer",
+            "scope": "proxy",
+            "enabled": true,
+            "config": {"rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "padding",
+                "value": padding
+            }]}
+        }),
+        json!({
+            "id": format!("{id}-response-limit"),
+            "proxy_id": id,
+            "plugin_name": "response_size_limiting",
+            "scope": "proxy",
+            "enabled": true,
+            "config": {"max_bytes": 16, "require_buffered_check": true}
+        }),
+    ]
+}
+
 /// Read one HTTP/1.1 response head from `stream`.
 async fn read_response_head(stream: &mut tokio::net::TcpStream) -> String {
     let mut buf = Vec::with_capacity(1024);

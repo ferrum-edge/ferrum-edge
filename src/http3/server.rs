@@ -538,6 +538,10 @@ fn boxed_finalize_h3_request_buffer_capacity_rejection<'a>(
     plugin_execution_ns: &'a mut u64,
     request_path: &'a str,
 ) -> BoxedH3RejectFuture<'a> {
+    // The gateway-local capacity terminal: marked before any reject hook runs,
+    // so response policy (route response-size limits, rejection-replacement
+    // hooks) cannot replace the fixed `503` / capacity message.
+    ctx.mark_gateway_capacity_response_selected();
     boxed_finalize_h3_dispatch_body_refusal(
         stream,
         state,

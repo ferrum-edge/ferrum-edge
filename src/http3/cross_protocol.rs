@@ -13820,6 +13820,13 @@ where
             "Request body exceeds maximum size",
         ),
     };
+    // A capacity refusal is the gateway-local capacity terminal: mark it so the
+    // reject pipeline's response policy (route response-size limits,
+    // rejection-replacement hooks) cannot replace the fixed `503` / capacity
+    // message, exactly as the request-decode capacity refusal does.
+    if matches!(refusal, BridgeUploadRefusal::BufferCapacity) {
+        ctx.mark_gateway_capacity_response_selected();
+    }
     let mut headers = HashMap::new();
     if matches!(flavor, HttpFlavor::Grpc) || crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
         headers.insert("grpc-status".to_string(), grpc_status.to_string());

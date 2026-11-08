@@ -38965,6 +38965,10 @@ async fn handle_proxy_request_inner(
                         .await);
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
+                        // The gateway-local capacity terminal: marked before
+                        // any reject hook runs, so response policy cannot
+                        // replace the fixed `503` / capacity message.
+                        ctx.mark_gateway_capacity_response_selected();
                         return Ok(finalize_terminal_request_body_read_rejection(
                             &state,
                             &plugins,
@@ -39048,6 +39052,10 @@ async fn handle_proxy_request_inner(
                 let Ok(transformed) = transformed else {
                     drop(buffered);
                     drop(body_hook_ctx);
+                    // The gateway-local capacity terminal: marked before any
+                    // reject hook runs, so response policy cannot replace the
+                    // fixed `503` / capacity message.
+                    ctx.mark_gateway_capacity_response_selected();
                     return Ok(finalize_terminal_request_body_read_rejection(
                         &state,
                         &plugins,
@@ -39545,6 +39553,10 @@ async fn handle_proxy_request_inner(
                     drop(body_hook_ctx);
                     cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
+                    // The gateway-local capacity terminal: marked before any
+                    // reject hook runs, so response policy cannot replace the
+                    // fixed `503` / capacity message.
+                    ctx.mark_gateway_capacity_response_selected();
                     let normalized = boxed_finalize_reject_response(
                         &plugins,
                         &mut ctx,
@@ -45290,6 +45302,15 @@ async fn handle_proxy_request_inner(
     )
     .is_some();
     ctx.record_backend_dispatch_outcome(backend_resp.error_class, backend_resp.request_on_wire);
+    // A dispatch-stage request-buffer capacity refusal (the collect, a
+    // request-body transform, or the fail-closed publication could not be
+    // covered; nothing reached a backend) is the gateway-local capacity
+    // terminal. Mark it before any response hook runs, as the early refusals
+    // do, so response policy cannot replace the fixed `503` / capacity message.
+    let capacity_class = Some(response_buffer_budget::REQUEST_BUFFER_OVERLOAD_ERROR_CLASS);
+    if backend_resp.error_class == capacity_class && !backend_resp.request_on_wire {
+        ctx.mark_gateway_capacity_response_selected();
+    }
     if !last_attempt_recorded {
         ctx.record_backend_attempt(
             backend_resp.error_class,

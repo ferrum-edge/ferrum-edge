@@ -1465,3 +1465,64 @@ fn both_native_grpc_collects_answer_a_capacity_refusal_before_dispatch() {
         assert!(!arm.contains("GrpcProxyError"));
     }
 }
+
+#[test]
+fn every_request_buffer_capacity_refusal_selects_the_gateway_capacity_terminal() {
+    // A capacity refusal that runs reject hooks or the response pipeline marks
+    // the gateway-capacity terminal first, as the request-decode refusal does,
+    // so a route response-size limit or a rejection-replacement hook cannot
+    // turn the fixed `503` into a policy failure. Behavioural proof:
+    // `functional_request_buffer_budget_test`.
+    const MARK: &str = "ctx.mark_gateway_capacity_response_selected();";
+    const TERMINAL: &str = "finalize_terminal_request_body_read_rejection(";
+    const REJECT: &str = "boxed_finalize_reject_response(";
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let mut reject_pipeline_sites = 0;
+    for (index, _) in proxy.match_indices("REQUEST_BUFFER_OVERLOAD_BODY") {
+        let before = &proxy[..index];
+        let start = before.char_indices().rev().nth(900).map_or(0, |(i, _)| i);
+        let window = &before[start..];
+        if window.contains(TERMINAL) || window.contains(REJECT) {
+            reject_pipeline_sites += 1;
+            assert!(
+                window.contains(MARK),
+                "an unmarked capacity refusal: {window}"
+            );
+        }
+    }
+    assert_eq!(
+        reject_pipeline_sites, 3,
+        "a new reject-pipeline capacity refusal must be added to this guard"
+    );
+    // Dispatch-stage refusals reach the response pipeline as a backend
+    // response, which marks them before any response hook.
+    let dispatch = proxy
+        .split("let capacity_class = Some(")
+        .nth(1)
+        .expect("dispatch outcome");
+    let dispatch = &dispatch[..dispatch.find("let mut response_status").expect("bounded")];
+    assert!(dispatch.contains("backend_resp.error_class == capacity_class"));
+    assert!(dispatch.contains(MARK));
+
+    let server = include_str!("../../../src/http3/server.rs");
+    let finalize = server
+        .split("fn boxed_finalize_h3_request_buffer_capacity_rejection<'a>(")
+        .nth(1)
+        .expect("native H3 capacity finalizer")
+        .split("\n}\n")
+        .next()
+        .expect("bounded finalizer");
+    assert!(finalize.contains(MARK));
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let refusal = bridge
+        .split("async fn write_bridge_upload_refusal<S>(")
+        .nth(1)
+        .expect("bridge refusal writer")
+        .split("\n}\n")
+        .next()
+        .expect("bounded writer");
+    let marked = refusal.find(MARK).expect("marked");
+    let rejected = refusal.find("write_final_body_reject(").expect("reject");
+    assert!(marked < rejected);
+}
