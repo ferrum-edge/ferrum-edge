@@ -70,6 +70,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clients. A route that relied on a client value under one of those names
   reaching the backend, in headers on trigger-excluded requests or in
   trailers, no longer receives it.
+- **Non-admin plugin-config reads withhold header values, match operands and
+  selector tokens.** `viewer` and `operator` reads of plugin configs
+  (`GET /plugins/config`, `GET /plugins/config/{id}`, `GET /config/export`)
+  returned these operator-configured values verbatim whenever the field or
+  header name matched no sensitive-name pattern (for example
+  `Ocp-Apim-Subscription-Key` or `x-honeycomb-team`):
+  - `mcp_gateway` `servers.*.headers`
+  - `ai_tool_governor` `approval.headers`
+  - `openapi_validator` `bypass.header_present`
+  - `waf` `custom_rules[].conditions.headers` and
+    `rule_overrides.<id>.conditions.headers`
+  - `mesh_route_dispatch` `rules[].match.headers`, `match.without_headers` and
+    `match.query_params` operands
+  - `mesh_authz` policy `to[].headers` and `when[].values` / `not_values`, and
+    the `mesh_slice` ext-authz check-header values and check-URL
+    `path_prefix`, ProxyConfig `environment` values, extension payloads, and
+    the inline backend client keys of its embedded VirtualService L4 proxies
+    and upstreams
+  - `request_termination` `trigger.header_value`
+  - `transaction_debugger` `capture_request_header_value`
+  - `ai_semantic_firewall` `privacy.snippet_hash_salt`
+  - the `opa` `opa_host` base path (now projected as a structural URL)
+  - outbound destination paths configured apart from their host and port:
+    `request_mirror` `mirror_path` and `mesh_route_dispatch`
+    `rules[].rewrite.uri` (`/` stays visible)
+  - every scalar leaf of a custom plugin's config. A plugin with no built-in
+    sensitivity schema cannot be classified, so its config now fails closed
+    for `viewer` and `operator` reads, audit diffs, and the export. Strings,
+    numbers, and booleans show `[REDACTED]` (a fingerprint in the export),
+    while keys, array shapes, and `null` stay visible. An operator must send
+    real values to change such a config; admin reads stay raw.
+  - inline PEM private keys in `mesh_route_dispatch`
+    `rules[].destination.backend_tls.client_key_path` and `udp_logging`
+    `dtls_key_path`, and certificate-plus-key bundles pasted into a plugin
+    certificate or CA source (`dtls_cert_path`, `dtls_ca_cert_path`, the
+    route-local `client_cert_path` / `server_ca_cert_path`, `soap_ws_security`
+    trusted certificates, `mtls_auth` `ca_certificate_pem`) or anywhere else in
+    a plugin config. Key references and certificate-only PEM stay visible; the
+    classification is shared with the Proxy and Upstream projections
+  - the `header` / `query` / `cookie` operands of every plugin config's
+    resource-level `trigger` (a sibling of `config`, previously never
+    projected), at any depth of its `all` / `any` / `not` tree
+
+  They are now withheld (`[REDACTED]`, or a keyed fingerprint in the export).
+  Header names, match kinds (`exact` / `prefix` / `regex`) and routing metadata
+  stay visible, and a `null` presence-only `waf` condition stays `null`. An
+  `operator` write that echoes the placeholder back at one of these fields is
+  refused with `400`. Because a PEM private key is withheld by its content in
+  any field, an `operator` write carrying the exact string `[REDACTED]` in any
+  string field of a proxy, upstream, or plugin config is now refused too.
+  `admin` reads and `GET /backup` stay raw. The collector,
+  JWKS, control-plane and federation URLs in a `mesh_authz` `mesh_slice` now
+  get the same structural endpoint projection as other collector URLs.
 - **`load_testing` synthetic requests now obey the backend egress policy.**
   `gateway_port` was only range-checked, and replays dialled
   `127.0.0.1:{gateway_port}` from a dedicated client that never consulted
