@@ -1486,7 +1486,11 @@ stripped of newlines and backticks before they are written.
   TLS secret-source resolver, nextest config, or shared compile-graph/controller
   inputs change; plugin-only and admin-only PRs skip it before runner allocation.
   Manual `workflow_dispatch` runs, pushes to
-  `main`, and fail-closed planner cases still run it. Service integration
+  `main`, and fail-closed planner cases still run it. The same job runs the
+  `#[ignore]`d `startup_smoke` binary tests (gateway admin JWT secret behind
+  each provider suffix) with `FERRUM_SECRETS_STARTUP_SMOKE_REQUIRED=1`, so a
+  missing binary, fake or container fails instead of skipping, and then fails
+  if the run recreated `./ferrum-managed-tls`. Service integration
   likewise runs Consul, LDAP, Kafka, MySQL, OIDC, OAuth2 introspection, and
   ClickHouse in one independently reported invocation.
 - PKCS#11 SoftHSM smoke (`run_pkcs11`) compiles the `pkcs11` feature graph and
