@@ -1013,6 +1013,15 @@ pub fn relay_failure_is_idle_expiry(failure: &StreamFirstFailure) -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) const STREAM_SPLICE_IDLE_TIMEOUT_PREFIX: &str = "TCP idle timeout";
 
+/// First-failure message the io_uring splice relay records when the half-close
+/// cap (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) cuts the still-open
+/// direction. Side-less like [`STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE`] but
+/// attributed to the direction that was cut; [`RelayEndReason`] reads both as
+/// the half-close cap.
+#[cfg(target_os = "linux")]
+pub(crate) const STREAM_SPLICE_HALF_CLOSE_CAP_MESSAGE: &str =
+    "TCP half-close cap exceeded (io_uring splice)";
+
 /// Sentinel prefix for `backend_read_timeout_ms` expiry on a splice path.
 /// The b2c splice worker reads from the backend; this fires when that read
 /// side stops producing bytes for the configured backend read timeout.
@@ -1153,6 +1162,168 @@ pub fn relay_failure_is_client_facing(failure: &StreamFirstFailure) -> bool {
         (Direction::ClientToBackend, Some(StreamIoSide::Read))
             | (Direction::BackendToClient, Some(StreamIoSide::Write))
     )
+}
+
+/// Whether a relay's first failure is the half-close cap
+/// (`FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS`) expiring, on the userspace relay
+/// or the io_uring splice relay.
+#[doc(hidden)]
+pub fn relay_failure_is_half_close_cap(failure: &StreamFirstFailure) -> bool {
+    let (_direction, class, side, message) = failure;
+    if side.is_some() || !matches!(class, ErrorClass::ReadWriteTimeout) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if message == STREAM_SPLICE_HALF_CLOSE_CAP_MESSAGE {
+        return true;
+    }
+    message == STREAM_RELAY_HALF_CLOSE_CAP_MESSAGE
+}
+
+/// Why a TCP-family byte relay ended (issue #7030).
+///
+/// The ONE typed reading of a relay's [`StreamCopyResult::first_failure`]: the
+/// relay loops record the end as a `(direction, class, side, message)` tuple
+/// whose idle, half-close and authorization endings are distinguished only by
+/// fixed messages, and this enum is the only place those messages are
+/// interpreted. Both decisions that depend on the ending are made from it:
+///
+/// * [`Self::breaker_outcome`] — the backend circuit-breaker settlement of a
+///   raw TCP relay;
+/// * [`Self::disconnect_cause`] / [`Self::error_class`] — the
+///   `StreamTransactionSummary` classification of every TCP relay (raw TCP,
+///   the sidecar inbound relay, mesh egress) and the HBONE relay's
+///   `client_disconnected` / body error class.
+///
+/// Breaker policy: an idle-window expiry and a half-close-cap expiry are
+/// CLEAN endings. The backend accepted the connection and the relay ran; the
+/// gateway's own timer, not a backend fault, ended it. They settle `Success`,
+/// exactly what HBONE records for the same tunnel (HBONE settles its breaker
+/// `Success` once the backend connect succeeds and never re-scores the relay
+/// end), so a HALF_OPEN probe that ends this way counts toward recovery on
+/// both. An authorization-lifetime expiry and a client-socket failure are
+/// neutral. Only a backend-socket failure (or one no side can be attributed
+/// to) is a connection-class `Failure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum RelayEndReason {
+    /// Both halves observed a clean EOF.
+    Graceful,
+    /// The idle window expired: nothing moved in either direction.
+    IdleExpiry,
+    /// The half-close cap expired after one direction finished.
+    HalfCloseCap,
+    /// The admitted session's authorization lifetime ended the relay
+    /// (credential expiry or the authenticated-stream maximum lifetime).
+    AuthorizationExpired,
+    /// A read from the client or a write back to the client failed.
+    ClientFailure {
+        direction: Direction,
+        class: ErrorClass,
+        side: Option<StreamIoSide>,
+    },
+    /// A backend socket failed, a backend read/write deadline fired, or the
+    /// failure could not be attributed to a side.
+    BackendFailure {
+        direction: Direction,
+        class: ErrorClass,
+        side: Option<StreamIoSide>,
+    },
+}
+
+impl RelayEndReason {
+    /// Classify a relay's first failure (`None` is a graceful end).
+    #[doc(hidden)]
+    pub fn from_first_failure(first_failure: Option<&StreamFirstFailure>) -> Self {
+        let Some(failure) = first_failure else {
+            return Self::Graceful;
+        };
+        if relay_failure_is_idle_expiry(failure) {
+            return Self::IdleExpiry;
+        }
+        if relay_failure_is_half_close_cap(failure) {
+            return Self::HalfCloseCap;
+        }
+        let (direction, class, side, message) = failure;
+        if message == STREAM_RELAY_AUTHORIZATION_EXPIRED_MESSAGE {
+            return Self::AuthorizationExpired;
+        }
+        if relay_failure_is_client_facing(failure) {
+            Self::ClientFailure {
+                direction: *direction,
+                class: *class,
+                side: *side,
+            }
+        } else {
+            Self::BackendFailure {
+                direction: *direction,
+                class: *class,
+                side: *side,
+            }
+        }
+    }
+
+    /// The backend circuit-breaker settlement for a relay that ended this way.
+    #[doc(hidden)]
+    pub fn breaker_outcome(self) -> BreakerOutcome {
+        match self {
+            Self::Graceful | Self::IdleExpiry | Self::HalfCloseCap => BreakerOutcome::Success,
+            Self::AuthorizationExpired | Self::ClientFailure { .. } => BreakerOutcome::Neutral,
+            Self::BackendFailure { .. } => BreakerOutcome::Failure {
+                status_code: 502,
+                connection_error: true,
+            },
+        }
+    }
+
+    /// The `StreamTransactionSummary::disconnect_cause` for this ending.
+    ///
+    /// An authorization expiry is the client-side gateway decision it is on
+    /// every other stream path (`RecvError`, as the TCP setup-phase
+    /// `StreamSetupKind::AuthorizationExpired` and the UDP/DTLS relay report),
+    /// never `IdleTimeout`. Every other ending keeps the cause it always had.
+    #[doc(hidden)]
+    pub fn disconnect_cause(self) -> crate::plugins::DisconnectCause {
+        use crate::plugins::DisconnectCause;
+        match self {
+            Self::Graceful => DisconnectCause::GracefulShutdown,
+            Self::IdleExpiry | Self::HalfCloseCap => DisconnectCause::IdleTimeout,
+            Self::AuthorizationExpired => DisconnectCause::RecvError,
+            Self::ClientFailure {
+                direction,
+                class,
+                side,
+            }
+            | Self::BackendFailure {
+                direction,
+                class,
+                side,
+            } => disconnect_cause_for_failure(direction, &class, side),
+        }
+    }
+
+    /// The `StreamTransactionSummary::error_class` for this ending. An
+    /// authorization expiry is `RequestError`, the class its setup-phase and
+    /// UDP/DTLS siblings carry; every other ending keeps its relay class.
+    #[doc(hidden)]
+    pub fn error_class(self) -> Option<ErrorClass> {
+        match self {
+            Self::Graceful => None,
+            Self::IdleExpiry | Self::HalfCloseCap => Some(ErrorClass::ReadWriteTimeout),
+            Self::AuthorizationExpired => Some(ErrorClass::RequestError),
+            Self::ClientFailure { class, .. } | Self::BackendFailure { class, .. } => Some(class),
+        }
+    }
+
+    /// Whether an HBONE CONNECT stream that carried this relay is reset with
+    /// `RST_STREAM(CONNECT_ERROR)` rather than ended with `END_STREAM`. Only a
+    /// graceful end and the idle window end the stream cleanly; the half-close
+    /// cap can cut a direction that is still streaming, so it resets the wire
+    /// even though it is clean for the breaker.
+    #[doc(hidden)]
+    pub fn resets_hbone_stream(self) -> bool {
+        !matches!(self, Self::Graceful | Self::IdleExpiry)
+    }
 }
 
 /// Map a pre-copy error class (no bytes flowed, direction unknown) to a
@@ -1414,6 +1585,14 @@ impl<S> AuthorizationDeadlineStream<S> {
     }
 }
 
+/// First-failure message of a relay the admitted session's authorization
+/// lifetime ended. Fixed: no expiry value, identity, certificate field, or
+/// provider detail. [`RelayEndReason`] reads it as
+/// [`RelayEndReason::AuthorizationExpired`].
+#[doc(hidden)]
+pub const STREAM_RELAY_AUTHORIZATION_EXPIRED_MESSAGE: &str =
+    "authenticated stream terminated: authorization lifetime reached";
+
 fn authorization_expired_io_error() -> std::io::Error {
     // Fixed message: no expiry value, identity, certificate field, or provider
     // detail. This never reaches the client as a payload — a raw stream has no
@@ -1421,7 +1600,7 @@ fn authorization_expired_io_error() -> std::io::Error {
     // connection-scoped debug log.
     std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        "authenticated stream terminated: authorization lifetime reached",
+        STREAM_RELAY_AUTHORIZATION_EXPIRED_MESSAGE,
     )
 }
 
@@ -3017,19 +3196,22 @@ async fn run_tcp_accept_loop(
                             // socket failed, not the client — so cause is
                             // BackendError, not RecvError. See
                             // `disconnect_cause_for_failure` for the full table.
+                            //
+                            // The typed relay ending decides the cause and the
+                            // class (#7030), so an authorization-lifetime end
+                            // reads as the client-side decision it is, not as
+                            // an idle timeout.
                             match &s.first_failure {
-                                Some((dir, class, side, message)) => {
-                                    let dir = *dir;
-                                    let class = *class;
-                                    let cause =
-                                        disconnect_cause_for_failure(dir, &class, *side);
+                                Some((dir, _class, _side, message)) => {
+                                    let end_reason =
+                                        RelayEndReason::from_first_failure(s.first_failure.as_ref());
                                     (
                                         s.bytes_in,
                                         s.bytes_out,
                                         Some(message.clone()),
-                                        Some(class),
-                                        Some(dir),
-                                        Some(cause),
+                                        end_reason.error_class(),
+                                        Some(*dir),
+                                        Some(end_reason.disconnect_cause()),
                                     )
                                 }
                                 None => (
@@ -4611,26 +4793,20 @@ async fn handle_tcp_connection_inner(
             );
         }
 
-        // Record circuit breaker outcome.
+        // Record circuit breaker outcome from the typed relay ending (#7030):
+        // idle and half-close-cap endings are clean, client-side endings are
+        // neutral, backend-socket failures trip.
         if let Some(cb) = cb_info.cb_probe.current_breaker(
             circuit_breaker_cache,
             &cb_info.namespace,
             proxy_id,
             cb_info.cb_target_key.as_deref(),
         ) {
-            match copy_result.first_failure.as_ref() {
-                Some(failure) if relay_failure_is_client_facing(failure) => {
-                    cb_info.cb_probe.release_neutral();
-                }
-                Some(_) => cb.settle(
-                    cb_info.cb_probe.take_slot(),
-                    BreakerOutcome::Failure {
-                        status_code: 502,
-                        connection_error: true,
-                    },
-                ),
-                None => cb.settle(cb_info.cb_probe.take_slot(), BreakerOutcome::Success),
-            }
+            cb.settle(
+                cb_info.cb_probe.take_slot(),
+                RelayEndReason::from_first_failure(copy_result.first_failure.as_ref())
+                    .breaker_outcome(),
+            );
         }
 
         return Ok(TcpConnectionSuccess {
@@ -5969,29 +6145,19 @@ async fn handle_tcp_connection_inner(
         );
     }
 
-    // Record circuit breaker outcome based on copy result.
+    // Record circuit breaker outcome from the typed relay ending (#7030), the
+    // same settlement the passthrough relay above makes.
     if let Some(cb) = current_cb_info.cb_probe.current_breaker(
         circuit_breaker_cache,
         &current_cb_info.namespace,
         proxy_id,
         current_cb_info.cb_target_key.as_deref(),
     ) {
-        match copy_result.first_failure.as_ref() {
-            Some(failure) if relay_failure_is_client_facing(failure) => {
-                current_cb_info.cb_probe.release_neutral();
-            }
-            Some(_) => cb.settle(
-                current_cb_info.cb_probe.take_slot(),
-                BreakerOutcome::Failure {
-                    status_code: 502,
-                    connection_error: true,
-                },
-            ),
-            None => cb.settle(
-                current_cb_info.cb_probe.take_slot(),
-                BreakerOutcome::Success,
-            ),
-        }
+        cb.settle(
+            current_cb_info.cb_probe.take_slot(),
+            RelayEndReason::from_first_failure(copy_result.first_failure.as_ref())
+                .breaker_outcome(),
+        );
     }
 
     Ok(TcpConnectionSuccess {
@@ -10750,7 +10916,7 @@ async fn bidirectional_splice_io_uring(
                             Direction::BackendToClient,
                             ErrorClass::ReadWriteTimeout,
                             None,
-                            "TCP half-close cap exceeded (io_uring splice)".to_string(),
+                            STREAM_SPLICE_HALF_CLOSE_CAP_MESSAGE.to_string(),
                         ));
                         force_shutdown();
                         (&mut b2c_handle).await
@@ -10773,7 +10939,7 @@ async fn bidirectional_splice_io_uring(
                             Direction::ClientToBackend,
                             ErrorClass::ReadWriteTimeout,
                             None,
-                            "TCP half-close cap exceeded (io_uring splice)".to_string(),
+                            STREAM_SPLICE_HALF_CLOSE_CAP_MESSAGE.to_string(),
                         ));
                         force_shutdown();
                         (&mut c2b_handle).await

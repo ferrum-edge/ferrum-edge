@@ -469,13 +469,15 @@ pub(crate) async fn handle_mesh_tcp_inbound(
                     bytes_out = result.bytes_backend_to_client,
                     "Sidecar raw-TCP inbound relay failed"
                 );
+                // The shared typed relay ending (#7030) classifies the cause
+                // and class exactly as the generic TCP proxy does.
+                let end_reason =
+                    tcp_proxy::RelayEndReason::from_first_failure(result.first_failure.as_ref());
                 (
                     Some(message.clone()),
-                    Some(*class),
+                    end_reason.error_class(),
                     Some(*direction),
-                    Some(tcp_proxy::disconnect_cause_for_failure(
-                        *direction, class, *side,
-                    )),
+                    Some(end_reason.disconnect_cause()),
                 )
             }
             None => {

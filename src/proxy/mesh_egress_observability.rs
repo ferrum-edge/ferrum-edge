@@ -223,13 +223,16 @@ impl CapturedMeshEgressLifecycle {
         self.bytes_sent = result.bytes_client_to_backend;
         self.bytes_received = result.bytes_backend_to_client;
         match result.first_failure.as_ref() {
-            Some((direction, class, side, message)) => {
-                self.connection_error = Some(message.clone());
-                self.error_class = Some(*class);
-                self.disconnect_direction = Some(*direction);
-                self.disconnect_cause = Some(
-                    crate::proxy::tcp_proxy::disconnect_cause_for_failure(*direction, class, *side),
+            Some((direction, _class, _side, message)) => {
+                // The shared typed relay ending (#7030) classifies the cause
+                // and class exactly as the generic TCP proxy does.
+                let end_reason = crate::proxy::tcp_proxy::RelayEndReason::from_first_failure(
+                    result.first_failure.as_ref(),
                 );
+                self.connection_error = Some(message.clone());
+                self.error_class = end_reason.error_class();
+                self.disconnect_direction = Some(*direction);
+                self.disconnect_cause = Some(end_reason.disconnect_cause());
             }
             None => self.complete_gracefully(),
         }

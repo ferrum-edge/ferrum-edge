@@ -853,7 +853,9 @@ proxies:
 
 - **Closed** (normal) — Requests pass through. Responses with status codes in `failure_status_codes` increment the failure counter; connection-level errors also increment it when `trip_on_connection_errors` is enabled. All other responses reset the counter to zero. When the failure counter reaches `failure_threshold`, the circuit opens.
 - **Open** — All requests immediately return `503 Service Unavailable` with `X-Gateway-Error: circuit_breaker_open` without contacting the backend. After `timeout_seconds`, the circuit transitions to Half-Open.
-- **Half-Open** — The circuit allows up to `half_open_max_requests` concurrent probe requests. Successful responses count toward `success_threshold`; when reached, the circuit closes (recovered). Any failure immediately reopens the circuit.
+- **Half-Open** — The circuit allows up to `half_open_max_requests` concurrent probe requests. Successful responses count toward `success_threshold`; when reached, the circuit closes (recovered). Any probe failure immediately reopens the circuit. Only the cycle's own probes decide it: a request admitted while the circuit was still Closed that completes during Half-Open is dropped — its success does not count toward `success_threshold` and its failure does not reopen the circuit (issue #7030). A streaming probe whose slot is returned when response headers arrive still decides its cycle when its body completes.
+
+The success and failure counters are tagged with the open cycle they count, and every increment checks that cycle in the same atomic step, so a completion that raced a reopen can never add a count to the next cycle (issue #7030).
 
 **Probe-slot release:**
 
@@ -885,8 +887,10 @@ late release is a no-op and cannot free a slot a newer probe holds.
 TCP keeps the guard through relay completion
 and rearms it on each retry admission; dropping the connection future also releases
 an unsettled slot. UDP/DTLS still records success when backend setup completes,
-and TCP still records its successful connection outcome at relay completion; the
-guard does not change those boundaries.
+and TCP still records its connection outcome at relay completion; the
+guard does not change those boundaries. A TCP relay that ends on the idle window
+or the half-close cap records a success, as HBONE does for the same tunnel; see
+[TCP/UDP proxy → circuit breaker](tcp_udp_proxy.md).
 
 **Failure detection:**
 

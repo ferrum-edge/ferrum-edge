@@ -417,6 +417,12 @@ Deliberate scope notes:
   backend outcome, so the breaker, passive health, and the adaptive buffer
   tracker are untouched. Retries and backoff sleeps cannot refresh the absolute
   deadline — it is re-checked at the top of every connect attempt.
+- A TCP **relay-phase** expiry ends the userspace relay on its client leg and
+  is health-neutral: the half-open circuit-breaker probe slot is released
+  without a backend outcome. The disconnect summary reports it like its
+  setup-phase and UDP/DTLS siblings (`RecvError` / `ClientToBackend` /
+  `RequestError`), never as an idle timeout (issue #7030); the
+  `connection_error` text stays the fixed authorization-lifetime message.
 - A **buffered H1/H2 upload** is bounded by the collect, not by a body adapter:
   the plan composes over the client RPC deadline and the operator whole-upload
   stall timeout, and the authorization arm is biased first, so a plan that has
