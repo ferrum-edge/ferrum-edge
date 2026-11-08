@@ -4053,6 +4053,53 @@ pub(crate) enum ClientRequestBody {
     Buffered(Box<BufferedClientRequestBody>),
 }
 
+impl ClientRequestBody {
+    /// The pristine client header block every raw-line reconstruction
+    /// boundary (native-gRPC, HBONE, mesh-mTLS and Unix merges, the WebSocket
+    /// collector) rebuilds the backend request from.
+    fn raw_headers_mut(&mut self) -> &mut hyper::HeaderMap {
+        match self {
+            Self::Streaming(request) => request.headers_mut(),
+            Self::Buffered(buffered) => &mut buffered.headers,
+        }
+    }
+}
+
+/// Drop every pristine client field line whose name a backend reads as one of
+/// the route's owned gateway-assertion headers (ASCII case-insensitive, `_`
+/// read as `-`).
+///
+/// The raw-line reconstruction boundaries
+/// ([`headers_mod::merge_proxy_headers_preserving_repeated`] for native gRPC,
+/// HBONE, mesh-mTLS and Unix dispatch, and the WebSocket handshake collector)
+/// keep the client's original field lines whenever their joined form equals
+/// the sanitized materialized value. For an owned assertion that equality is
+/// never permission: a verified `alice, admin` installed once must not reach
+/// the backend as the client's two separate lines. With the client's lines
+/// gone, every boundary emits only the provenance-approved value from the
+/// sanitized map, exactly once; unrelated repeated headers keep their raw
+/// field lines.
+pub(crate) fn strip_route_owned_assertion_field_lines(
+    ctx: &RequestContext,
+    headers: &mut hyper::HeaderMap,
+) {
+    let Some(owned) = ctx.route_owned_request_assertion_headers() else {
+        return;
+    };
+    let names: Vec<hyper::header::HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            owned
+                .iter()
+                .any(|owned| headers_mod::field_names_equivalent_for_backends(name.as_str(), owned))
+        })
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
+    }
+}
+
 /// Request body representation accepted by the secured mesh transports.
 ///
 /// The ordinary fast path keeps streaming the frontend body. Retry-enabled or
@@ -38413,6 +38460,10 @@ async fn handle_proxy_request_inner(
             &mut owned_proxy_headers,
         );
     }
+    // The pass above judged the plugin-facing map; the raw-line boundaries
+    // rebuild from the client's own field lines. Drop those lines for every
+    // owned assertion name once, here, so no boundary can restore them.
+    strip_route_owned_assertion_field_lines(&ctx, client_request_body.raw_headers_mut());
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();

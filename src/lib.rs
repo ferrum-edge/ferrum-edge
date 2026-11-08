@@ -148,6 +148,16 @@ pub mod _test_support {
         );
     }
 
+    /// Drop the pristine client field lines for the route's owned
+    /// gateway-assertion headers, exactly as the H1/H2 ladder does after the
+    /// final assertion pass and before any raw-line reconstruction boundary.
+    pub fn strip_route_owned_assertion_field_lines_for_test(
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut hyper::HeaderMap,
+    ) {
+        crate::proxy::strip_route_owned_assertion_field_lines(ctx, headers);
+    }
+
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =

@@ -56,7 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a mesh RequestAuthentication `outputClaimToHeaders` naming one is now
   rejected (the mesh slice fails closed and the last good one keeps serving).
   The gateway now enforces these assertions once more over the finalized
-  outbound header map on every protocol path: an owned header reaches the
+  outbound header map on every protocol path (and drops the client's own
+  field lines for owned names, so native gRPC, HBONE, mesh-mTLS, Unix and
+  WebSocket dispatch cannot restore them as separate lines): an owned header reaches the
   backend only as the exact name and value an admitted owner installed for
   the request, so a later writer (for example a `correlation_id` preserving a
   client value under the same name) can no longer restore a client copy, and

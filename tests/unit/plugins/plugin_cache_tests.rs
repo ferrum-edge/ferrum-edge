@@ -16922,3 +16922,131 @@ fn every_owned_assertion_and_header_write_publisher_is_candidate_visible() {
         );
     }
 }
+
+/// The raw-line reconstruction boundaries (the native-gRPC / HBONE /
+/// mesh-mTLS / Unix merge and the WebSocket handshake collector) keep a
+/// client's original field lines whenever their joined form equals the
+/// sanitized value. For an owned assertion that is never permission: once the
+/// ladder drops the client's lines for the route's owned names, a verified
+/// compound claim (`alice, admin`, installed once) reaches the backend as one
+/// gateway value, a skipped owner leaves the name absent, and unrelated
+/// repeated metadata keeps its own field lines.
+#[tokio::test]
+async fn raw_reconstruction_never_restores_client_lines_for_an_owned_assertion() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, collect_forwardable_websocket_headers_for_test,
+        run_before_proxy_hooks_for_test, run_final_backend_header_policy_hooks_for_test,
+        strip_route_owned_assertion_field_lines_for_test,
+    };
+    use ferrum_edge::proxy::headers::merge_proxy_headers_preserving_repeated;
+
+    use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let token = create_rs256_token(
+        &json!({"sub": "alice", "user": ["alice", "admin"]}),
+        private_key_pem,
+    );
+    let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
+    for skipped in [false, true] {
+        let mut auth = make_plugin_config_with_json(
+            "auth",
+            "jwks_auth",
+            json!({"providers": [{
+                "jwks": build_rsa_jwks_from_pem(public_key_pem),
+                "claim_headers": {"user": "X-App-User"},
+                "claim_headers_separator": ", "
+            }]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        if skipped {
+            auth.trigger = Some(post_only_trigger());
+        }
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["auth"])],
+            vec![auth],
+        ))
+        .unwrap();
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+
+        // The client sent two `x-app-user` lines (and repeated unrelated
+        // metadata); the materialized view joins each with `, `.
+        let mut raw = hyper::HeaderMap::new();
+        raw.append("x-app-user", "alice".parse().unwrap());
+        raw.append("x-app-user", "admin".parse().unwrap());
+        raw.append("x-md", "a".parse().unwrap());
+        raw.append("x-md", "b".parse().unwrap());
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/orders".to_string(),
+        );
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+        ctx.headers
+            .insert("x-app-user".into(), "alice, admin".into());
+        ctx.headers.insert("x-md".into(), "a, b".into());
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let rejection = ferrum_edge::proxy::run_authentication_phase(
+            AuthMode::Multi,
+            plugins.as_slice(),
+            &mut ctx,
+            &consumer_index,
+        )
+        .await;
+        assert!(rejection.is_none(), "skipped={skipped}");
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        let expected = (!skipped).then_some("alice, admin");
+        assert_eq!(
+            headers.get("x-app-user").map(String::as_str),
+            expected,
+            "skipped={skipped}"
+        );
+
+        // Without the ladder's strip the merge would restore the client's two
+        // lines, because their joined form equals the verified value.
+        if !skipped {
+            let mut unguarded = raw.clone();
+            merge_proxy_headers_preserving_repeated(&mut unguarded, &headers);
+            assert_eq!(unguarded.get_all("x-app-user").iter().count(), 2);
+        }
+
+        strip_route_owned_assertion_field_lines_for_test(&ctx, &mut raw);
+        let mut merged = raw.clone();
+        merge_proxy_headers_preserving_repeated(&mut merged, &headers);
+        let owned_lines: Vec<&str> = merged
+            .get_all("x-app-user")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        let expected_lines: Vec<&str> = expected.into_iter().collect();
+        assert_eq!(owned_lines, expected_lines, "skipped={skipped}: merge");
+        assert_eq!(
+            merged.get_all("x-md").iter().count(),
+            2,
+            "skipped={skipped}"
+        );
+
+        let forwarded = collect_forwardable_websocket_headers_for_test(&raw, &headers);
+        let owned_lines: Vec<&str> = forwarded
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-app-user"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(owned_lines, expected_lines, "skipped={skipped}: ws");
+        let unrelated = forwarded
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-md"))
+            .count();
+        assert_eq!(unrelated, 2, "skipped={skipped}: websocket metadata");
+    }
+}

@@ -1653,7 +1653,12 @@ runs after each `before_proxy` pass and after any finalized-egress header
 overlay: on a route that owns asserted headers, each owned name survives only
 as the exact `(name, value)` pair an admitted owner installed for the request
 (typed per-request provenance), and every other copy or spelling is removed,
-whatever any trigger decided or any later plugin wrote. A request whose
+whatever any trigger decided or any later plugin wrote. The client's own
+field lines for those names are then dropped from the pristine header block,
+so the boundaries that rebuild a backend request from raw field lines (the
+native-gRPC, HBONE, mesh-mTLS and Unix merges and the WebSocket handshake
+collector) emit only the approved value, once, instead of restoring the
+client's lines because their joined form equals it. A request whose
 outbound `content-type` became a gRPC-Web media type during a `before_proxy`
 pass without the `grpc_web` translator having translated that request is
 refused with `415` (a `grpc_web` instance configured on the route but declining
