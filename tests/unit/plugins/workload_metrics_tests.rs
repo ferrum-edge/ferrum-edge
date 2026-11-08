@@ -115,7 +115,10 @@ fn grpc_method_metadata_keys_are_reserved_custom_tag_names() {
     // built-in plugin's `<plugin>_` namespace: a literal
     // `ai_stream_router_pass_through` tag would make `ai_federation` skip its
     // model/provider admission, and a `request_body` tag would replace the
-    // buffered-body view `ai_request_guard` inspects.
+    // buffered-body view `ai_request_guard` inspects. Shared gateway
+    // namespaces are owned too: an absent header-backed
+    // `auth.strip_query_param.ticket` tag would delete `key_auth`'s marker and
+    // forward the query credential despite `hide_credentials`.
     for name in [
         "ai_transcript_audit.record_id",
         "ai_transcript_audit.anything",
@@ -130,6 +133,10 @@ fn grpc_method_metadata_keys_are_reserved_custom_tag_names() {
         "namespace",
         "request_body",
         "response_body",
+        "auth.strip_query_param.ticket",
+        "mcp.tool",
+        "oidc_rp.session_set_cookie",
+        "geo.decision",
     ] {
         for config in [
             json!({"custom_tags": {name: "shared"}}),

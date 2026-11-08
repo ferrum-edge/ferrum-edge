@@ -33,10 +33,12 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
 entry whose name is a metadata key the gateway publishes (for example
 `grpc_full_method`, `consumer_username`, `namespace`, `request_body`,
-`ai_stream_router_pass_through`), or that sits in a built-in plugin's metadata
+`ai_stream_router_pass_through`), that sits in a shared gateway metadata
+namespace (`a2a.`, `auth.`, `authorization.`, `ferrum.`, `geo.`, `hbone.`,
+`mcp.`, `mesh_request_auth.`, `oidc_rp.`, `websocket.`), or that sits in a built-in plugin's metadata
 namespace (`<plugin>.<key>` or `<plugin>_<key>`, for example
 `ai_transcript_audit.record_id` or `waf.action`), is now refused as reserved,
-like `trace_id` (GHSA-9mmx-ghcv-x25q). In mesh mode this includes an Istio
+like `trace_id` (GHSA-9mmx-ghcv-x25q, follow-up to #7081). In mesh mode this includes an Istio
 `Telemetry.tracing[].customTags` entry with such a name; that Telemetry
 resource is reported `FerrumAccepted=False`/`Invalid`. Such a tag overwrote
 gateway-published metadata other plugins read. Rename the tag (for example
