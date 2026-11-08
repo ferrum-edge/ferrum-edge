@@ -730,13 +730,16 @@ SHARED_FEATURE_JOB_PATTERNS = (
 # `secrets::resolve_all_env_secrets()` before `EnvConfig` parse. `src/startup.rs`
 # is listener-failure bookkeeping and is not on that path.
 #
-# `tests/service_integration/common/host_ports.rs` is compiled INTO this target
-# as well: the Vault/LocalStack fixtures include it through `#[path]` rather than
-# reimplementing host-port allocation (issue #5488). It is the one file outside
-# `tests/secrets_functional/` that changes what this job runs, so it is listed
-# here explicitly — the rest of that suite is not an input. The shared
-# container-start retry (`tests/service_integration/common/container_retry.rs`)
-# is included the same way.
+# Files outside `tests/secrets_functional/` that are compiled INTO this target
+# through `#[path]` are listed explicitly; the rest of their suites are not
+# inputs:
+# - `tests/service_integration/common/host_ports.rs`: the Vault/LocalStack
+#   fixtures reuse its host-port allocation (issue #5488);
+# - `tests/service_integration/common/container_retry.rs`: the shared
+#   container-start retry;
+# - `tests/scaffolding/` and `tests/common/gateway_harness.rs`: the port
+#   registry and the gateway child guard / ownership barrier that the
+#   `startup_smoke` binary tests spawn through (issues #7076, #7077).
 SECRETS_BACKENDS_PATTERNS = [
     re.compile(pattern)
     for pattern in (
@@ -746,6 +749,8 @@ SECRETS_BACKENDS_PATTERNS = [
         r"^tests/secrets_functional/",
         r"^tests/service_integration/common/host_ports\.rs$",
         r"^tests/service_integration/common/container_retry\.rs$",
+        r"^tests/scaffolding/",
+        r"^tests/common/gateway_harness\.rs$",
         r"^src/(?:main|gateway_entry)\.rs$",
         r"^src/config/env_config\.rs$",
         r"^\.config/nextest\.toml$",
@@ -1689,6 +1694,18 @@ def self_test() -> int:
             "pull_request",
             ["tests/service_integration/common/container_retry.rs"],
             rust_only | {"run_service_integration": True, "run_secrets_backends": True},
+        ),
+        # The startup smoke spawns through the shared port registry and gateway
+        # harness, both compiled into the secrets target (issues #7076, #7077).
+        (
+            "pull_request",
+            ["tests/common/gateway_harness.rs"],
+            rust_only | {"run_secrets_backends": True},
+        ),
+        (
+            "merge_group",
+            ["tests/scaffolding/ports.rs"],
+            rust_only | {"run_secrets_backends": True},
         ),
         (
             "pull_request",

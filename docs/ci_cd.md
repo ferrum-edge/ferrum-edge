@@ -1481,14 +1481,18 @@ stripped of newlines and backticks before they are written.
 - Inline `#[cfg(test)]` modules in `src/`
 - Secret backend tests compile once with Vault/AWS/GCP/Azure enabled and use
   nextest `--no-fail-fast`. The planner schedules this job (`run_secrets_backends`)
-  only when secret-provider sources, `tests/secrets_functional/`, secret-resolution
-  startup wiring (`src/main.rs`, `src/config/env_config.rs`), the feature-gated
+  only when secret-provider sources, `tests/secrets_functional/` or the shared
+  harness files it compiles in (`tests/scaffolding/`,
+  `tests/common/gateway_harness.rs`, and the service-integration
+  `host_ports.rs` / `container_retry.rs`), secret-resolution startup wiring (`src/main.rs`, `src/config/env_config.rs`), the feature-gated
   TLS secret-source resolver, nextest config, or shared compile-graph/controller
   inputs change; plugin-only and admin-only PRs skip it before runner allocation.
   Manual `workflow_dispatch` runs, pushes to
   `main`, and fail-closed planner cases still run it. The same job runs the
   `#[ignore]`d `startup_smoke` binary tests (gateway admin JWT secret behind
-  each provider suffix) with `FERRUM_SECRETS_STARTUP_SMOKE_REQUIRED=1`, so a
+  the file, GCP, Vault and AWS suffixes; Azure stays fetch-level because its
+  production startup authenticates through Entra ID) with
+  `FERRUM_SECRETS_STARTUP_SMOKE_REQUIRED=1`, so a
   missing binary, fake or container fails instead of skipping, and then fails
   if the run recreated `./ferrum-managed-tls`. Service integration
   likewise runs Consul, LDAP, Kafka, MySQL, OIDC, OAuth2 introspection, and

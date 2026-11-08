@@ -926,10 +926,12 @@ jobs:
       - name: Run gateway startup smoke (provider-resolved admin secret)
         # The `#[ignore]`d `startup_smoke` tests spawn the `ferrum-edge` binary
         # (built by the all-features step above as a bin target of this
-        # package) with FERRUM_ADMIN_JWT_SECRET behind each provider suffix and
-        # prove admin-port ownership with a JWT signed by the resolved secret.
-        # REQUIRED turns a self-skip (missing binary, fake or container) into
-        # a failure.
+        # package) with FERRUM_ADMIN_JWT_SECRET behind the file, GCP, Vault
+        # and AWS suffixes and prove admin-port ownership with a JWT signed by
+        # the resolved secret. Azure has no startup smoke: its production
+        # startup authenticates through Entra ID, so it keeps the fetch-level
+        # `azure_backend` coverage above. REQUIRED turns a self-skip (missing
+        # binary, fake or container) into a failure.
         run: |
           cargo nextest run \
             --features secrets-vault,secrets-aws,secrets-gcp,secrets-azure \
