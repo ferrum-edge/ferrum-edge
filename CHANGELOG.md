@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **Admin API responses always carry the admin security headers** (issue
+  #7074). `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+  `X-Frame-Options: DENY` were set by hand per response, and the raw API-spec
+  `GET` (`200`/`304`), API-spec `DELETE` (`204`), Prometheus `/metrics` and its
+  `401`, `/charges`, `/charges/sink/status` and the builder-failure `500`
+  omitted some of them. One shared helper now sets them, and the admin
+  dispatcher fills any a response still lacks. The raw API-spec `GET`'s
+  builder-failure fallback is now the shared JSON `500` instead of a bare `500`
+  with no `Content-Type`.
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while
