@@ -11824,7 +11824,7 @@ async fn gemini_strict_json_schema_must_be_representable() {
         "$defs": {"item": {"type": "string", "enum": ["a", "b"]}},
         "properties": {
             "when": {"type": "string", "format": "date-time"},
-            "items": {"type": "array", "items": {"$ref": "#/$defs/item", "description": "x"}, "minItems": 1},
+            "items": {"type": "array", "items": {"$ref": "#/$defs/item"}, "minItems": 1},
             "choice": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}
         },
         "required": ["when"],
@@ -11847,6 +11847,11 @@ async fn gemini_strict_json_schema_must_be_representable() {
         json!({"type": "object", "properties": {"r": {"$ref": "#/$defs/x", "minItems": 1}}, "$defs": {"x": {"type": "array"}}}),
         json!({"$ref": "https://schemas.example.invalid/remote.json"}),
         json!({"type": "object", "properties": {"x": 7}}),
+        // Issue #7070: the ai_federation reference rules apply here too.
+        json!({"type": "array", "items": {"$ref": "#/$defs/item", "description": "x"}, "$defs": {"item": {"type": "string"}}}),
+        json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}}),
+        json!({"type": "object", "properties": {"x": {"type": "object", "$defs": {"y": {"type": "string"}}}}}),
+        json!({"$ref": "#/$defs/a", "$defs": {"a": {"type": "array", "items": {"$ref": "#/$defs/a"}}}}),
     ] {
         let error = translate_gemini_body(&plugin, &strict_request(unsupported.clone(), true))
             .await

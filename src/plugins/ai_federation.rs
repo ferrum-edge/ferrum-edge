@@ -116,6 +116,9 @@ use super::ai_stream_router::{
 use super::utils::ai_model_glob::{
     MAX_MODEL_PATTERNS_PER_PROVIDER, is_valid_model_pattern, matches_model_glob,
 };
+use super::utils::ai_translation::{
+    present_tool_calls, screen_gemini_strict_schema_document, valid_tool_call_id, valid_tool_name,
+};
 use super::utils::ambient_cloud_credentials::{
     ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS, AmbientAwsEndpointScope, AwsCredentialSources,
     AwsService, aws_partition_dns_suffix,
@@ -2651,7 +2654,8 @@ fn validate_openai_request(
             ));
         }
 
-        let has_tool_calls = message_object.get("tool_calls").is_some();
+        // `"tool_calls": null` is absent, as on the streaming route (#7070).
+        let has_tool_calls = present_tool_calls(message).is_some();
         match message_object.get("content") {
             Some(Value::String(_)) => {}
             Some(content @ Value::Array(_)) => {
@@ -2683,7 +2687,7 @@ fn validate_openai_request(
             let tool_call_id = message_object
                 .get("tool_call_id")
                 .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
+                .filter(|value| valid_tool_call_id(value))
                 .ok_or_else(|| {
                     format!("ai_federation: messages[{index}] tool message missing tool_call_id")
                 })?;
@@ -2846,86 +2850,32 @@ struct ProviderToolCall<'a> {
     arguments: &'a str,
 }
 
+/// Parse an assistant message's `tool_calls` through the shared OpenAI
+/// admission rules (issue #7070: `null` is absent, ids are bounded), then
+/// read this adapter's Gemini `thought_signature` extension per call.
 fn parse_openai_tool_calls(
     message: &Value,
     message_index: usize,
 ) -> Result<Vec<ParsedToolCall>, String> {
-    let Some(tool_calls_value) = message.get("tool_calls") else {
-        return Ok(Vec::new());
-    };
-    let tool_calls = tool_calls_value.as_array().ok_or_else(|| {
-        format!("ai_federation: messages[{message_index}].tool_calls must be an array")
-    })?;
-    if tool_calls.is_empty() {
-        return Err(format!(
-            "ai_federation: messages[{message_index}].tool_calls must not be empty"
-        ));
-    }
-
-    let mut parsed = Vec::with_capacity(tool_calls.len());
-    for (tool_index, call) in tool_calls.iter().enumerate() {
-        let call_object = call.as_object().ok_or_else(|| {
-            format!(
-                "ai_federation: messages[{message_index}].tool_calls[{tool_index}] must be an object"
-            )
-        })?;
-        if call_object.get("type").and_then(Value::as_str) != Some("function") {
-            return Err(format!(
-                "ai_federation: messages[{message_index}].tool_calls[{tool_index}] must have type 'function'"
-            ));
-        }
-        let id = call_object
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] missing id"
-                )
-            })?;
-        let function = call_object
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                format!(
-                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] missing function"
-                )
-            })?;
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| valid_tool_name(value))
-            .ok_or_else(|| {
-                format!(
-                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] has invalid function name"
-                )
-            })?;
-        let arguments = function
-            .get("arguments")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments must be a JSON string"
-                )
-            })?;
-        let arguments: Value = serde_json::from_str(arguments).map_err(|error| {
-            format!(
-                "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments are not valid JSON: {error}"
-            )
-        })?;
-        if !arguments.is_object() {
-            return Err(format!(
-                "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments must encode a JSON object"
-            ));
-        }
-        let thought_signature = parse_tool_call_thought_signature(
-            call_object,
-            &format!("messages[{message_index}].tool_calls[{tool_index}]"),
-        )?;
+    let calls = super::utils::ai_translation::parse_openai_tool_calls(message, message_index)
+        .map_err(|error| format!("ai_federation: {error}"))?;
+    let entries = present_tool_calls(message)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut parsed = Vec::with_capacity(calls.len());
+    for (tool_index, (call, entry)) in calls.into_iter().zip(entries).enumerate() {
+        let thought_signature = match entry.as_object() {
+            Some(call_object) => parse_tool_call_thought_signature(
+                call_object,
+                &format!("messages[{message_index}].tool_calls[{tool_index}]"),
+            )?,
+            None => None,
+        };
         parsed.push(ParsedToolCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            arguments,
+            id: call.id,
+            name: call.name,
+            arguments: call.arguments,
             thought_signature,
         });
     }
@@ -2963,7 +2913,7 @@ fn parse_provider_tool_calls<'a>(
         let id = call
             .get("id")
             .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .filter(|value| valid_tool_call_id(value))
             .ok_or_else(|| format!("ai_federation: {scope} has an invalid id"))?;
         let function = call
             .get("function")
@@ -2987,14 +2937,6 @@ fn parse_provider_tool_calls<'a>(
         });
     }
     Ok(parsed)
-}
-
-fn valid_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn parse_openai_tools(openai_body: &Value) -> Result<Option<Vec<Value>>, String> {
@@ -3099,26 +3041,8 @@ fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
 }
 
 fn tool_result_text(content: &Value) -> Result<String, String> {
-    if let Some(text) = content.as_str() {
-        return Ok(text.to_string());
-    }
-    let parts = content
-        .as_array()
-        .ok_or("ai_federation: tool message content must be a string or text-parts array")?;
-    let mut text = String::new();
-    for (index, part) in parts.iter().enumerate() {
-        if part.get("type").and_then(Value::as_str) != Some("text") {
-            return Err(format!(
-                "ai_federation: tool message content[{index}] must be a text part"
-            ));
-        }
-        text.push_str(
-            part.get("text").and_then(Value::as_str).ok_or_else(|| {
-                format!("ai_federation: tool message content[{index}] missing text")
-            })?,
-        );
-    }
-    Ok(text)
+    super::utils::ai_translation::tool_result_text(content)
+        .map_err(|error| format!("ai_federation: {error}"))
 }
 
 fn normalized_stop_sequences(openai_body: &Value) -> Result<Option<Value>, String> {
@@ -3319,272 +3243,6 @@ fn non_zero_penalty(body: &Value, field: &str) -> Result<Option<Value>, String> 
     }
 }
 
-/// JSON Schema keywords Gemini/Vertex `responseJsonSchema` documents as
-/// enforced (Gemini API structured-output guide, "JSON Schema support"; Vertex
-/// AI "Supported schema fields"). Deliberately conservative: a keyword that is
-/// not listed here is treated as unenforced for a strict schema.
-const GEMINI_STRICT_SCHEMA_KEYWORDS: &[&str] = &[
-    "type",
-    "title",
-    "description",
-    "enum",
-    "format",
-    "anyOf",
-    "$ref",
-    "$defs",
-    "properties",
-    "required",
-    "additionalProperties",
-    "items",
-    "prefixItems",
-    "minItems",
-    "maxItems",
-    "minimum",
-    "maximum",
-];
-
-/// String `format` values Gemini documents as enforced.
-const GEMINI_STRICT_SCHEMA_FORMATS: &[&str] = &["date-time", "date", "time"];
-
-/// Nesting bound for the strict-schema screen. Deeper schemas are refused
-/// rather than walked, so hostile nesting cannot grow the stack.
-const MAX_STRICT_SCHEMA_DEPTH: usize = 32;
-
-/// Upper bound on `$defs` entries in a strict schema, so the reference-graph
-/// walk below is bounded.
-const MAX_STRICT_SCHEMA_DEFS: usize = 256;
-
-/// The reference-graph node a `$ref` names: `None` for the root (`#`), or the
-/// root `$defs` entry.
-type StrictSchemaRefTarget<'a> = Option<&'a str>;
-
-/// Screen a complete strict JSON Schema against what Gemini/Vertex
-/// `responseJsonSchema` enforces.
-///
-/// Beyond the keyword subset ([`screen_gemini_strict_schema`]), references are
-/// held to the shapes Google documents (GenerateContent `GenerationConfig`
-/// response JSON schema restrictions): a `$ref` node carries no sibling
-/// keyword (other than the root's own `$defs`), targets only `#` or an existing
-/// root `#/$defs/<name>`, `$defs` appears only at the root, and the reference
-/// graph is acyclic. Google admits recursion only through optional
-/// properties; telling those apart reliably is not attempted here, so a
-/// strict schema with ANY recursive reference is refused (conservative; send
-/// it with `strict: false` to forward it as guidance).
-fn screen_gemini_strict_schema_document(root: &Value) -> Result<(), String> {
-    let defs = match root.get("$defs") {
-        None => None,
-        Some(Value::Object(defs)) if defs.len() <= MAX_STRICT_SCHEMA_DEFS => Some(defs),
-        Some(Value::Object(_)) => {
-            return Err(format!(
-                "strict json_schema declares more than {MAX_STRICT_SCHEMA_DEFS} `$defs` entries"
-            ));
-        }
-        Some(_) => return Err("strict json_schema `$defs` must be an object".to_string()),
-    };
-    screen_gemini_strict_schema(root, defs, 0, true)?;
-
-    // Reference graph: the root plus every `$defs` entry, each with the
-    // targets its own subtree references (a definition's references are
-    // collected without descending into the root `$defs`).
-    let mut nodes: Vec<(StrictSchemaRefTarget<'_>, Vec<StrictSchemaRefTarget<'_>>)> = Vec::new();
-    let mut root_refs = Vec::new();
-    collect_strict_schema_refs(root, true, &mut root_refs);
-    nodes.push((None, root_refs));
-    if let Some(defs) = defs {
-        for (name, definition) in defs {
-            let mut refs = Vec::new();
-            collect_strict_schema_refs(definition, false, &mut refs);
-            nodes.push((Some(name.as_str()), refs));
-        }
-    }
-    // Iterative three-colour DFS: 0 unvisited, 1 on the stack, 2 done.
-    let index_of =
-        |target: StrictSchemaRefTarget<'_>| nodes.iter().position(|(node, _)| *node == target);
-    let mut colour = vec![0u8; nodes.len()];
-    for start in 0..nodes.len() {
-        if colour[start] != 0 {
-            continue;
-        }
-        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
-        colour[start] = 1;
-        while let Some((node, next_edge)) = stack.last().copied() {
-            let edges = &nodes[node].1;
-            if next_edge == edges.len() {
-                colour[node] = 2;
-                stack.pop();
-                continue;
-            }
-            if let Some(top) = stack.last_mut() {
-                top.1 += 1;
-            }
-            let Some(target) = index_of(edges[next_edge]) else {
-                // Unresolvable targets were already refused by the screen.
-                continue;
-            };
-            match colour[target] {
-                0 => {
-                    colour[target] = 1;
-                    stack.push((target, 0));
-                }
-                1 => {
-                    return Err(
-                        "strict json_schema uses a recursive `$ref`, which Gemini only honours through optional properties"
-                            .to_string(),
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Collect the `$ref` targets of one schema subtree. `at_root` skips the
-/// root's own `$defs` (each definition is its own graph node).
-fn collect_strict_schema_refs<'a>(
-    schema: &'a Value,
-    at_root: bool,
-    out: &mut Vec<StrictSchemaRefTarget<'a>>,
-) {
-    let Value::Object(object) = schema else {
-        return;
-    };
-    for (keyword, value) in object {
-        match keyword.as_str() {
-            "$ref" => {
-                if let Some(reference) = value.as_str() {
-                    out.push(reference.strip_prefix("#/$defs/"));
-                }
-            }
-            "$defs" if at_root => {}
-            "properties" | "$defs" => {
-                if let Some(members) = value.as_object() {
-                    for member in members.values() {
-                        collect_strict_schema_refs(member, false, out);
-                    }
-                }
-            }
-            "anyOf" | "prefixItems" => {
-                if let Some(members) = value.as_array() {
-                    for member in members {
-                        collect_strict_schema_refs(member, false, out);
-                    }
-                }
-            }
-            "items" | "additionalProperties" => {
-                collect_strict_schema_refs(value, false, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Check one strict JSON Schema node (and every nested subschema) against the
-/// Gemini-enforced subset. The error names the first offending keyword,
-/// bounded, without echoing any schema value. `defs` is the root `$defs`
-/// object every `#/$defs/<name>` reference must resolve into.
-fn screen_gemini_strict_schema(
-    schema: &Value,
-    defs: Option<&serde_json::Map<String, Value>>,
-    depth: usize,
-    at_root: bool,
-) -> Result<(), String> {
-    if depth > MAX_STRICT_SCHEMA_DEPTH {
-        return Err(format!(
-            "strict json_schema nests deeper than {MAX_STRICT_SCHEMA_DEPTH} levels"
-        ));
-    }
-    let object = match schema {
-        // Boolean subschemas (`true` / `false`) carry no keywords.
-        Value::Bool(_) => return Ok(()),
-        Value::Object(object) => object,
-        _ => return Err("strict json_schema contains a non-object subschema".to_string()),
-    };
-    // Google forbids sibling keywords next to `$ref`; the root may still
-    // declare the `$defs` its reference points into.
-    if object.contains_key("$ref")
-        && object
-            .keys()
-            .any(|keyword| keyword != "$ref" && !(at_root && keyword == "$defs"))
-    {
-        return Err(
-            "strict json_schema combines `$ref` with sibling keywords, which Gemini does not support"
-                .to_string(),
-        );
-    }
-    for (keyword, value) in object {
-        if !GEMINI_STRICT_SCHEMA_KEYWORDS.contains(&keyword.as_str()) {
-            return Err(format!(
-                "strict json_schema uses `{}`, which Gemini does not enforce",
-                bounded_error_value(keyword)
-            ));
-        }
-        match keyword.as_str() {
-            "format" => {
-                if !value
-                    .as_str()
-                    .is_some_and(|format| GEMINI_STRICT_SCHEMA_FORMATS.contains(&format))
-                {
-                    return Err(
-                        "strict json_schema uses a `format` Gemini does not enforce (supported: date-time, date, time)"
-                            .to_string(),
-                    );
-                }
-            }
-            "$ref" => {
-                // Only the root (`#`) or an existing root definition resolves
-                // inside the schema the provider receives.
-                let resolves = value.as_str().is_some_and(|reference| {
-                    reference == "#"
-                        || reference
-                            .strip_prefix("#/$defs/")
-                            .is_some_and(|name| defs.is_some_and(|defs| defs.contains_key(name)))
-                });
-                if !resolves {
-                    return Err(
-                        "strict json_schema `$ref` must be `#` or name an existing `#/$defs/<name>` entry"
-                            .to_string(),
-                    );
-                }
-            }
-            "$defs" => {
-                if !at_root {
-                    return Err(
-                        "strict json_schema declares `$defs` below the root schema".to_string()
-                    );
-                }
-                let members = value
-                    .as_object()
-                    .ok_or_else(|| "strict json_schema `$defs` must be an object".to_string())?;
-                for member in members.values() {
-                    screen_gemini_strict_schema(member, defs, depth + 1, false)?;
-                }
-            }
-            "properties" => {
-                let members = value
-                    .as_object()
-                    .ok_or_else(|| format!("strict json_schema `{keyword}` must be an object"))?;
-                for member in members.values() {
-                    screen_gemini_strict_schema(member, defs, depth + 1, false)?;
-                }
-            }
-            "anyOf" | "prefixItems" => {
-                let members = value
-                    .as_array()
-                    .ok_or_else(|| format!("strict json_schema `{keyword}` must be an array"))?;
-                for member in members {
-                    screen_gemini_strict_schema(member, defs, depth + 1, false)?;
-                }
-            }
-            "items" | "additionalProperties" => {
-                screen_gemini_strict_schema(value, defs, depth + 1, false)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 /// Parse and gate the extended generation controls for one translating
 /// adapter. See [`TranslatedGenerationControls`] for the support matrix.
 fn translated_generation_controls(
@@ -3768,8 +3426,17 @@ fn translated_generation_controls(
             schema,
             strict: true,
         } = &response_format
-        && let Err(detail) = screen_gemini_strict_schema_document(schema)
+        && let Err(refusal) = screen_gemini_strict_schema_document(schema)
     {
+        // The shared screen (issue #7070) decides; this adapter's diagnostic
+        // names an unenforced keyword, bounded.
+        let detail = match refusal.unenforced_keyword() {
+            Some(keyword) => format!(
+                "strict json_schema uses `{}`, which Gemini does not enforce",
+                bounded_error_value(keyword)
+            ),
+            None => refusal.to_string(),
+        };
         return Err(unrepresentable_control(adapter, "response_format", &detail));
     }
     // Anthropic alone can disable parallel tool use (`tool_choice`).
@@ -3855,7 +3522,7 @@ fn canonicalize_openai_tool_arguments(body: &mut Value) -> Result<(), String> {
 
     for (message_index, message) in messages.iter_mut().enumerate() {
         if message.get("role").and_then(Value::as_str) != Some("assistant")
-            || message.get("tool_calls").is_none()
+            || present_tool_calls(message).is_none()
         {
             continue;
         }
@@ -10560,6 +10227,13 @@ pub mod test_helpers {
     }
 
     /// Expose request translation for tests.
+    /// The provider-independent OpenAI request admission (message history,
+    /// tool calls/results, tools, stop) every federated request passes before
+    /// translation.
+    pub fn validate_openai_request_test(openai_body: &Value) -> Result<(), String> {
+        validate_openai_request(openai_body, false)
+    }
+
     pub fn translate_request_test(
         provider_type: &str,
         openai_body: &Value,
