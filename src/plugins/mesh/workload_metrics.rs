@@ -2914,7 +2914,13 @@ fn validate_custom_tag_name(name: &str) -> Result<(), String> {
                 | "grpc_service"
                 | "grpc_method"
                 | "grpc_full_method"
-        );
+        )
+        // A built-in plugin's own metadata namespace (`<plugin>.<key>`, for
+        // example `ai_transcript_audit.record_id` or `waf.action`) carries that
+        // plugin's coordination and decision state; a tag there could alias it.
+        || name
+            .split_once('.')
+            .is_some_and(|(namespace, _)| crate::plugins::is_builtin_plugin_name(namespace));
     if reserved || is_sensitive_metadata_key(name) {
         return Err(format!(
             "workload_metrics: custom tag name {name:?} is reserved or sensitive"

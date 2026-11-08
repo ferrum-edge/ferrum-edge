@@ -108,8 +108,29 @@ fn grpc_method_metadata_keys_are_reserved_custom_tag_names() {
             );
         }
     }
-    // Neighbouring names stay ordinary dimensions.
-    for name in ["grpc", "grpc_service_tier", "rpc_method"] {
+    // A built-in plugin's metadata namespace is reserved too: a literal
+    // `ai_transcript_audit.record_id` tag would make overlapping transactions
+    // share one audit staging entry.
+    for name in [
+        "ai_transcript_audit.record_id",
+        "ai_transcript_audit.anything",
+        "waf.action",
+        "grpc_method_router.rule",
+    ] {
+        for config in [
+            json!({"custom_tags": {name: "shared"}}),
+            json!({"custom_header_tags": {name: "x-tenant"}}),
+            json!({"custom_env_tags": {name: "ISTIO_META_ZONE"}}),
+        ] {
+            let Err(error) = WorkloadMetrics::new(&config) else {
+                panic!("{config} must be rejected");
+            };
+            assert!(error.contains("reserved or sensitive"), "{config}: {error}");
+        }
+    }
+    // Neighbouring names stay ordinary dimensions, including a dotted name
+    // whose namespace is not a built-in plugin.
+    for name in ["grpc", "grpc_service_tier", "rpc_method", "team.owner"] {
         let config = json!({"custom_tags": {name: "value"}});
         assert!(WorkloadMetrics::new(&config).is_ok(), "{config}");
     }

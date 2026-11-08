@@ -28,14 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `workload_metrics`: gRPC method keys are reserved custom tag names (#7092)
+### `workload_metrics`: gRPC method keys and plugin namespaces are reserved custom tag names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
-entry named `grpc_service`, `grpc_method` or `grpc_full_method` is now refused
-as reserved, like `trace_id` (GHSA-9mmx-ghcv-x25q). In mesh mode this includes
-an Istio `Telemetry.tracing[].customTags` entry with one of those names. Such a
-tag overwrote the gRPC method metadata `grpc_method_router` publishes. Rename
-the tag (for example `rpc_method`) before upgrading.
+entry named `grpc_service`, `grpc_method` or `grpc_full_method`, or named under
+a built-in plugin's metadata namespace (`<plugin>.<key>`, for example
+`ai_transcript_audit.record_id` or `waf.action`), is now refused as reserved,
+like `trace_id` (GHSA-9mmx-ghcv-x25q). In mesh mode this includes an Istio
+`Telemetry.tracing[].customTags` entry with such a name; that Telemetry
+resource is reported `FerrumAccepted=False`/`Invalid`. Such a tag overwrote
+gateway-published metadata other plugins read. Rename the tag (for example
+`rpc_method` or `team.owner`) before upgrading.
 
 ### Repeated `Content-Type` and gateway-asserted request headers (#7064)
 
