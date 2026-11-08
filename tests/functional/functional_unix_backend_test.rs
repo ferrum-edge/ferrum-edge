@@ -445,14 +445,13 @@ plugin_configs: []
     )
 }
 
-/// Issue #6022: a native gRPC upload the request-buffer budget cannot admit,
+/// Issue #6022: a native gRPC upload the request-buffer budget cannot cover,
 /// refused at a backend-dispatch seam (here the Unix-socket body preparation),
 /// is a Trailers-Only `RESOURCE_EXHAUSTED`, not a bare `503` its client would
-/// read as `UNAVAILABLE`. The upload's retained ceiling
-/// (`max_grpc_recv_size_bytes`, 1 GiB) is larger than the whole request-buffer
-/// budget (256 MiB by default; the in-process gateway never resizes it), so the
-/// refusal is deterministic and comes before any byte is read or the socket is
-/// dialed.
+/// read as `UNAVAILABLE`. The budget is charged by the bytes an upload
+/// retains, so the test holds every free block of the in-process gateway's
+/// process-global budget: the upload's first growth is refused, before the
+/// socket is dialed.
 #[test]
 #[ignore]
 fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
@@ -557,6 +556,8 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
         .header("te", "trailers")
         .body(())
         .expect("request");
+    let held_budget = ferrum_edge::_test_support::exhaust_process_request_buffer_budget_for_test()
+        .expect("hold the free request-buffer budget");
     let (response, mut upload) = client.send_request(request, false).expect("open RPC");
     let message = Bytes::from_static(&[0, 0, 0, 0, 4, b'p', b'i', b'n', b'g']);
     upload.send_data(message, true).expect("unary message");
@@ -564,6 +565,7 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
         .await
         .expect("response timeout")
         .expect("response");
+    drop(held_budget);
     // gRPC errors ride HTTP 200.
     assert_eq!(response.status(), http::StatusCode::OK);
     let header = |name: &str| {
@@ -625,6 +627,159 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
     driver.abort();
     acceptor.abort();
     gateway.shutdown().await;
+}
+
+/// Round 14: a native-gRPC buffered collect the request-buffer budget refuses
+/// (here a translated gRPC-Web browser upload on an ordinary h2c gRPC route)
+/// commits through the reject pipeline, so the reject-path `after_proxy`
+/// decorators run: the allowed origin's CORS headers reach the browser, which
+/// would otherwise hide the `RESOURCE_EXHAUSTED` as a CORS failure.
+#[test]
+#[ignore]
+fn native_grpc_web_buffer_capacity_refusal_runs_the_reject_decorators() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        native_grpc_web_buffer_capacity_refusal_runs_the_reject_decorators_inner,
+    );
+}
+
+const CAPACITY_CORS_ORIGIN: &str = "https://app.example";
+
+async fn native_grpc_web_buffer_capacity_refusal_runs_the_reject_decorators_inner() {
+    use bytes::Bytes;
+
+    let (backend_port, backend) = reserve_placeholder_port().await;
+    let dials = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&dials);
+    let acceptor = tokio::spawn(async move {
+        while let Ok((_stream, _)) = backend.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let env = EnvConfig {
+        pool_warmup_enabled: false,
+        log_level: "warn".into(),
+        max_grpc_recv_size_bytes: 1 << 30,
+        ..Default::default()
+    };
+    let mut gateway = TrustedProjectedGateway::spawn_from_yaml(
+        &native_grpc_web_cors_config(backend_port),
+        TrustedProjectedGatewayOptions {
+            env,
+            ..TrustedProjectedGatewayOptions::default()
+        },
+    )
+    .await
+    .expect("start native gRPC-Web gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
+
+    let port = gateway.proxy_http_port;
+    let socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("h2c socket");
+    let (client, connection) = h2::client::handshake(socket).await.expect("frontend h2");
+    let driver = tokio::spawn(connection);
+    let mut client = client.ready().await.expect("client ready");
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{port}/grpc/echo.Echo/Upload"))
+        .header("content-type", "application/grpc-web+proto")
+        .header("origin", CAPACITY_CORS_ORIGIN)
+        .body(())
+        .expect("request");
+    let held_budget = ferrum_edge::_test_support::exhaust_process_request_buffer_budget_for_test()
+        .expect("hold the free request-buffer budget");
+    let (response, mut upload) = client.send_request(request, false).expect("open RPC");
+    let message = Bytes::from_static(&[0, 0, 0, 0, 4, b'p', b'i', b'n', b'g']);
+    upload.send_data(message, true).expect("unary message");
+    let response = tokio::time::timeout(Duration::from_secs(10), response)
+        .await
+        .expect("response timeout")
+        .expect("response");
+    drop(held_budget);
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        header("access-control-allow-origin").as_deref(),
+        Some(CAPACITY_CORS_ORIGIN),
+        "the reject-path CORS decorator must run on the capacity refusal"
+    );
+    assert_eq!(
+        header("content-type").as_deref(),
+        Some("application/grpc-web+proto")
+    );
+    assert_eq!(header("grpc-status"), None);
+    let mut body = response.into_body();
+    let data = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("response DATA");
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .expect("release capacity");
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes
+    })
+    .await
+    .expect("response body timeout");
+    assert!(data.len() >= 5, "a complete gRPC-Web frame header");
+    assert_eq!(data[0], 0x80, "one gRPC-Web trailer frame");
+    let trailers = std::str::from_utf8(&data[5..]).expect("terminal metadata");
+    assert!(trailers.contains("grpc-status: 8\r\n"));
+    assert!(trailers.contains("grpc-message: Request buffering capacity exceeded\r\n"));
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        0,
+        "the refused upload must never dial the backend"
+    );
+
+    driver.abort();
+    acceptor.abort();
+    gateway.shutdown().await;
+}
+
+fn native_grpc_web_cors_config(backend_port: u16) -> String {
+    format!(
+        r#"version: "1"
+proxies:
+  - id: "native-grpc"
+    listen_path: "/grpc"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "grpc-web"
+      - plugin_config_id: "cors"
+    updated_at: "2026-10-09T00:00:00Z"
+consumers: []
+upstreams: []
+plugin_configs:
+  - id: "grpc-web"
+    plugin_name: "grpc_web"
+    scope: "proxy"
+    proxy_id: "native-grpc"
+    enabled: true
+    config: {{}}
+  - id: "cors"
+    plugin_name: "cors"
+    scope: "proxy"
+    proxy_id: "native-grpc"
+    enabled: true
+    config:
+      allowed_origins: ["{CAPACITY_CORS_ORIGIN}"]
+      exposed_headers: ["grpc-status", "grpc-message"]
+"#
+    )
 }
 
 // ── Issue #6776: relayed client upload aborts are not backend failures ────

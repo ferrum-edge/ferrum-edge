@@ -3118,6 +3118,9 @@ pub struct RequestContext {
     /// owning transform must emit these bytes so the backend never sees a
     /// compressed body without `Content-Encoding`.
     compression_staged_request_plaintext: Option<Vec<u8>>,
+    /// The request-decode charge that covers the staged plaintext until the
+    /// owning transform emits it.
+    compression_staged_decode_charge: crate::proxy::response_buffer_budget::DecodeChargeHold,
     /// Set when the response-encode owner cannot produce bytes that match a
     /// previously committed gateway `Content-Encoding`. Shared transform loops
     /// must restore an identity representation (or otherwise fail closed)
@@ -4773,6 +4776,7 @@ impl RequestContext {
             compression_response_decisions_pending: 0,
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
+            compression_staged_decode_charge: Default::default(),
             compression_response_encode_aborted: false,
             response_stream_id: None,
             response_stream_completion: None,
@@ -5731,12 +5735,25 @@ impl RequestContext {
         self.compression_response_buffer_permit.take()
     }
 
-    pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
+    pub(crate) fn set_compression_staged_request_plaintext(
+        &mut self,
+        plaintext: Vec<u8>,
+        decode_charge: crate::proxy::response_buffer_budget::DecodeChargeHold,
+    ) {
         self.compression_staged_request_plaintext = Some(plaintext);
+        self.compression_staged_decode_charge = decode_charge;
     }
 
-    pub(crate) fn take_compression_staged_request_plaintext(&mut self) -> Option<Vec<u8>> {
-        self.compression_staged_request_plaintext.take()
+    /// The staged plaintext together with the decode charge that covers it.
+    pub(crate) fn take_compression_staged_request_plaintext(
+        &mut self,
+    ) -> Option<(
+        Vec<u8>,
+        crate::proxy::response_buffer_budget::DecodeChargeHold,
+    )> {
+        let plaintext = self.compression_staged_request_plaintext.take()?;
+        let decode_charge = std::mem::take(&mut self.compression_staged_decode_charge);
+        Some((plaintext, decode_charge))
     }
 
     pub(crate) fn mark_compression_response_encode_aborted(&mut self) {
@@ -6487,6 +6504,9 @@ impl RequestContext {
             compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: std::mem::take(
                 &mut self.compression_staged_request_plaintext,
+            ),
+            compression_staged_decode_charge: std::mem::take(
+                &mut self.compression_staged_decode_charge,
             ),
             compression_response_encode_aborted: std::mem::take(
                 &mut self.compression_response_encode_aborted,

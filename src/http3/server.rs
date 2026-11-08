@@ -66,11 +66,13 @@ use crate::proxy::headers::{
     strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::response_buffer_budget::{
-    BudgetRef, RequestBufferPermit, buffered_request_body_ceiling, prospective_retained_len,
+    BudgetRef, ChargedRequestCollector, RequestBufferPermit, RetainRejection,
+    buffered_request_body_ceiling,
 };
 use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
+    boxed_apply_buffered_request_body_normalization_before_before_proxy,
     log_pre_backend_rejected_request, log_rejected_request, log_rejected_request_with_path,
     plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase_with_envelope,
 };
@@ -272,76 +274,64 @@ fn h3_early_upload_bound(
 /// One native-H3 retained upload under the shared buffered-request contract
 /// (issue #6009), the H3 counterpart of `buffer_request_body_for_before_proxy`.
 ///
-/// Admission is taken BEFORE the first byte is allocated: an effective limit of
-/// `0` folds to the finite `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` ceiling,
-/// and that ceiling is charged against the shared
-/// `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` budget. Growth is capped at the
-/// ceiling, so the allocation never outruns the charge. The partial bytes and
-/// the charge are one value: dropping it on `413`, disconnect, timeout,
-/// deadline, or task cancellation releases both exactly once.
+/// An effective limit of `0` folds to the finite
+/// `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` ceiling, and the retained buffer
+/// is charged against the shared `FERRUM_REQUEST_BUFFER_MAX_TOTAL_BYTES` budget
+/// as it grows ([`ChargedRequestCollector`]): each growth is charged before it
+/// is allocated, and nothing is charged before the first DATA byte, so a
+/// stalled upload cannot hold budget other principals' uploads need. The
+/// partial bytes and the charge are one value: dropping it on `413`, `503`,
+/// disconnect, timeout, deadline, or task cancellation releases both exactly
+/// once.
 pub(crate) struct H3RetainedUpload {
-    body: Vec<u8>,
-    ceiling: usize,
-    permit: RequestBufferPermit,
+    collector: ChargedRequestCollector,
 }
 
 impl H3RetainedUpload {
-    /// `None` when the shared budget refuses: the caller answers `503` /
-    /// `RESOURCE_EXHAUSTED` with the health-neutral buffer-capacity class.
-    pub(crate) fn admit(effective_limit: usize) -> Option<Self> {
+    /// Open the retained upload for an effective request-body limit. Charges
+    /// nothing yet; a growth the shared budget refuses is reported by
+    /// [`Self::push`] as [`RetainRejection::BudgetExhausted`], which the caller
+    /// answers `503` / `RESOURCE_EXHAUSTED` with the health-neutral
+    /// buffer-capacity class.
+    pub(crate) fn admit(effective_limit: usize) -> Self {
         Self::admit_in(
             BudgetRef::request_buffer(),
             buffered_request_body_ceiling(effective_limit),
         )
     }
 
-    /// The same admission against an explicitly chosen budget; external tests
+    /// The same upload against an explicitly chosen budget; external tests
     /// bind an isolated one.
-    pub(crate) fn admit_in(budget: BudgetRef<'_>, ceiling: usize) -> Option<Self> {
-        let permit = RequestBufferPermit::reserve_in(budget, ceiling)?;
-        Some(Self {
-            body: Vec::new(),
-            ceiling,
-            permit,
-        })
+    pub(crate) fn admit_in(budget: BudgetRef<'_>, ceiling: usize) -> Self {
+        Self {
+            collector: ChargedRequestCollector::new_in(budget, ceiling),
+        }
     }
 
-    /// Append one DATA chunk. `false` when the retained ceiling would be
-    /// exceeded; the caller drops `self`, releasing the partial bytes and the
-    /// charge together.
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> bool {
-        let needed = prospective_retained_len(self.body.len(), chunk.len());
-        if needed > self.ceiling {
-            return false;
-        }
-        if needed > self.body.capacity() {
-            // Geometric growth, clamped to the charged ceiling.
-            let target = needed
-                .max(self.body.capacity().saturating_mul(2))
-                .min(self.ceiling);
-            self.body.reserve_exact(target - self.body.len());
-        }
-        self.body.extend_from_slice(chunk);
-        true
+    /// Append one DATA chunk. [`RetainRejection::TooLarge`] when the retained
+    /// ceiling would be exceeded, [`RetainRejection::BudgetExhausted`] when the
+    /// shared budget refuses the growth; either way the caller drops `self`,
+    /// releasing the partial bytes and the charge together.
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<(), RetainRejection> {
+        self.collector.append(chunk)
     }
 
     /// The collected body plus its charge, narrowed to the allocation that
     /// stays resident.
-    pub(crate) fn finish(mut self) -> (Vec<u8>, RequestBufferPermit) {
-        self.permit.narrow_to_retained(self.body.capacity());
-        (self.body, self.permit)
+    pub(crate) fn finish(self) -> (Vec<u8>, RequestBufferPermit) {
+        self.collector.finish()
     }
 
     /// Bytes collected so far. External-test seam.
     #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn collected_len(&self) -> usize {
-        self.body.len()
+        self.collector.len()
     }
 
     /// Capacity the charge currently covers. External-test seam.
     #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserved_bytes(&self) -> usize {
-        self.permit.reserved_bytes()
+        self.collector.reserved_bytes()
     }
 }
 
@@ -351,14 +341,17 @@ impl H3RetainedUpload {
 /// retry replay shares one allocation, and the charge is released when the last
 /// copy drops. That happens once dispatch and every retry are done, before the
 /// response is relayed, not when the handler returns. A body that no drain
-/// charged is published uncharged.
+/// charged is published uncharged. `None` means a request-body plugin grew the
+/// body past what the shared budget can cover: the caller answers the `503` /
+/// `RESOURCE_EXHAUSTED` capacity refusal instead of retaining it uncharged.
+#[must_use]
 pub(crate) fn publish_h3_retained_body(
     body: Vec<u8>,
     charge: Option<RequestBufferPermit>,
-) -> Bytes {
+) -> Option<Bytes> {
     match charge {
         Some(permit) => permit.into_charged_bytes(body),
-        None => Bytes::from(body),
+        None => Some(Bytes::from(body)),
     }
 }
 
@@ -428,25 +421,32 @@ impl H3UploadReadError {
     }
 }
 
-/// Drain an H3 request-body recv half into an admitted, capped buffer.
+/// What [`drain_h3_request_body`] returns: the complete body, a retained-body
+/// refusal (`413` ceiling or `503` shared budget), or a stream read failure.
+pub(crate) type H3RetainedUploadResult =
+    Result<Result<Vec<u8>, RetainRejection>, H3UploadReadError>;
+
+/// Drain an H3 request-body recv half into a charged, capped buffer.
 ///
 /// The buffer and its charge live inside this future, so timeout/deadline
 /// cancellation and stream-read failures drop the partial upload and release
-/// its admission before any rejection hook or response write runs. On success
-/// the charge moves into `charge`, which the caller keeps for as long as it
-/// owns the body or any copy of it. Returns `Ok(None)` when the retained
-/// ceiling would be exceeded (also dropping the partial buffer and charge).
+/// its charge before any rejection hook or response write runs. On success the
+/// charge moves into `charge`, which the caller keeps for as long as it owns
+/// the body or any copy of it. Returns `Ok(Err(TooLarge))` when the retained
+/// ceiling would be exceeded (`413`) and `Ok(Err(BudgetExhausted))` when the
+/// shared budget refuses a growth (`503`), in both cases also dropping the
+/// partial buffer and charge.
 pub(crate) async fn drain_h3_request_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut upload: H3RetainedUpload,
     charge: &mut Option<RequestBufferPermit>,
-) -> Result<Option<Vec<u8>>, H3UploadReadError>
+) -> H3RetainedUploadResult
 where
     S: RecvStream,
 {
     while let Some(chunk) = stream.recv_data().await? {
-        if !upload.push(chunk.chunk()) {
-            return Ok(None);
+        if let Err(rejection) = upload.push(chunk.chunk()) {
+            return Ok(Err(rejection));
         }
     }
     // `recv_data` also ends at a trailer section, which ends the body but not
@@ -460,7 +460,7 @@ where
     stream.recv_trailers().await?;
     let (body, permit) = upload.finish();
     *charge = Some(permit);
-    Ok(Some(body))
+    Ok(Ok(body))
 }
 
 type BoxedH3RejectFuture<'a> =
@@ -468,8 +468,9 @@ type BoxedH3RejectFuture<'a> =
 
 /// The shared request-buffer budget could not admit a native-H3 buffered
 /// upload (issue #6009): the same `503` / gRPC `RESOURCE_EXHAUSTED` refusal
-/// H1/H2 return, before a byte is read. Boxed behind a thin trampoline so the
-/// cold arm does not widen `handle_h3_request`'s frame.
+/// H1/H2 return, when the shared budget refuses a growth of the retained
+/// buffer. Boxed behind a thin trampoline so the cold arm does not widen
+/// `handle_h3_request`'s frame.
 #[inline(never)]
 fn boxed_send_h3_request_buffer_capacity_rejection<'a>(
     stream: &'a mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -538,6 +539,10 @@ fn boxed_finalize_h3_request_buffer_capacity_rejection<'a>(
     plugin_execution_ns: &'a mut u64,
     request_path: &'a str,
 ) -> BoxedH3RejectFuture<'a> {
+    // The gateway-local capacity terminal: marked before any reject hook runs,
+    // so response policy (route response-size limits, rejection-replacement
+    // hooks) cannot replace the fixed `503` / capacity message.
+    ctx.mark_gateway_capacity_response_selected();
     boxed_finalize_h3_dispatch_body_refusal(
         stream,
         state,
@@ -4918,17 +4923,7 @@ async fn handle_h3_request(
             protocol_max_body,
             authenticate_body_requirements.plugin_limit,
         );
-        let Some(upload) = H3RetainedUpload::admit(max_body) else {
-            boxed_send_h3_request_buffer_capacity_rejection(
-                &mut stream,
-                &state,
-                http_flavor,
-                grpc_web_response_content_type,
-                initial_response_header_policy_plugins.as_ref(),
-            )
-            .await?;
-            return Ok(());
-        };
+        let upload = H3RetainedUpload::admit(max_body);
         let upload_bound = h3_early_upload_bound(
             &ctx,
             &plugin_cache_view,
@@ -4943,8 +4938,19 @@ async fn handle_h3_request(
         )
         .await
         {
-            Ok(Some(body_data)) => body_data,
-            Ok(None) => {
+            Ok(Ok(body_data)) => body_data,
+            Ok(Err(RetainRejection::BudgetExhausted)) => {
+                boxed_send_h3_request_buffer_capacity_rejection(
+                    &mut stream,
+                    &state,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    initial_response_header_policy_plugins.as_ref(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(Err(RetainRejection::TooLarge)) => {
                 record_h3_flavor_aware_reject(&state, http_flavor, 413);
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
@@ -5146,17 +5152,7 @@ async fn handle_h3_request(
             authorize_body_requirements.plugin_limit,
         );
         if crate::proxy::early_upload_phase_needs_fresh_drain(&prebuffered_body_data) {
-            let Some(upload) = H3RetainedUpload::admit(body_limit) else {
-                boxed_send_h3_request_buffer_capacity_rejection(
-                    &mut stream,
-                    &state,
-                    http_flavor,
-                    grpc_web_response_content_type,
-                    initial_response_header_policy_plugins.as_ref(),
-                )
-                .await?;
-                return Ok(());
-            };
+            let upload = H3RetainedUpload::admit(body_limit);
             let upload_bound = h3_early_upload_bound(
                 &ctx,
                 &plugin_cache_view,
@@ -5171,8 +5167,19 @@ async fn handle_h3_request(
             )
             .await
             {
-                Ok(Some(body_data)) => body_data,
-                Ok(None) => {
+                Ok(Ok(body_data)) => body_data,
+                Ok(Err(RetainRejection::BudgetExhausted)) => {
+                    boxed_send_h3_request_buffer_capacity_rejection(
+                        &mut stream,
+                        &state,
+                        http_flavor,
+                        grpc_web_response_content_type,
+                        initial_response_header_policy_plugins.as_ref(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Ok(Err(RetainRejection::TooLarge)) => {
                     record_h3_flavor_aware_reject(&state, http_flavor, 413);
                     send_h3_error_flavor_aware_with_policy(
                         &mut stream,
@@ -5451,17 +5458,7 @@ async fn handle_h3_request(
     if before_proxy_body_requirements.required
         && crate::proxy::early_upload_phase_needs_fresh_drain(&prebuffered_body_data)
     {
-        let Some(upload) = H3RetainedUpload::admit(before_proxy_body_limit) else {
-            boxed_send_h3_request_buffer_capacity_rejection(
-                &mut stream,
-                &state,
-                http_flavor,
-                grpc_web_response_content_type,
-                initial_response_header_policy_plugins.as_ref(),
-            )
-            .await?;
-            return Ok(());
-        };
+        let upload = H3RetainedUpload::admit(before_proxy_body_limit);
         let upload_bound = h3_early_upload_bound(
             &ctx,
             &plugin_cache_view,
@@ -5476,8 +5473,19 @@ async fn handle_h3_request(
         )
         .await
         {
-            Ok(Some(body_data)) => body_data,
-            Ok(None) => {
+            Ok(Ok(body_data)) => body_data,
+            Ok(Err(RetainRejection::BudgetExhausted)) => {
+                boxed_send_h3_request_buffer_capacity_rejection(
+                    &mut stream,
+                    &state,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    initial_response_header_policy_plugins.as_ref(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(Err(RetainRejection::TooLarge)) => {
                 record_h3_flavor_aware_reject(&state, http_flavor, 413);
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
@@ -5599,17 +5607,36 @@ async fn handle_h3_request(
             .has(crate::plugin_cache::PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
         {
             let mut tmp_headers = std::mem::take(&mut ctx.headers);
+            // Boxed out of line: the normalizer chain must not widen this
+            // handler's frame (see `h3_request_handler_boxes_its_largest_dispatch_relays`).
             let normalize_result =
-                crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+                boxed_apply_buffered_request_body_normalization_before_before_proxy(
                     &plugins,
                     &mut ctx,
                     &mut tmp_headers,
                     body_data,
+                    retained_request_charge.as_mut(),
                     before_proxy_body_requirements.needs_text,
                     before_proxy_body_requirements.needs_bytes,
                 )
                 .await;
             ctx.headers = tmp_headers;
+            // A normalized body the budget cannot cover was dropped inside the
+            // phase; refuse before any rejection hook awaits.
+            let Ok(normalize_result) = normalize_result else {
+                // Nothing of the refused body may outlive the refusal's write.
+                drop(retained_request_charge.take());
+                *body_data = Vec::new();
+                boxed_send_h3_request_buffer_capacity_rejection(
+                    &mut stream,
+                    &state,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    initial_response_header_policy_plugins.as_ref(),
+                )
+                .await?;
+                return Ok(());
+            };
             if !matches!(normalize_result, PluginResult::Continue) {
                 rejected = Some((normalize_result, "normalize_buffered_request_body"));
             }
@@ -6725,22 +6752,7 @@ async fn handle_h3_request(
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
         if !body_was_prebuffered {
-            let Some(upload) = H3RetainedUpload::admit(content_length_limit) else {
-                // The shared budget refused (#6009): the same committed
-                // terminal-body rejection contract as the oversize arm below.
-                return boxed_finalize_h3_request_buffer_capacity_rejection(
-                    &mut stream,
-                    &state,
-                    &plugins,
-                    &mut ctx,
-                    http_flavor,
-                    grpc_web_response_content_type,
-                    start_time,
-                    &mut plugin_execution_ns,
-                    &original_request_path,
-                )
-                .await;
-            };
+            let upload = H3RetainedUpload::admit(content_length_limit);
             body_data = match collect_h3_request_body_under_authorization(
                 drain_h3_request_body(&mut stream, upload, &mut retained_request_charge),
                 h3_upload_authorization_bound(
@@ -6751,8 +6763,24 @@ async fn handle_h3_request(
             )
             .await
             {
-                Ok(Some(body_data)) => body_data,
-                Ok(None) => {
+                Ok(Ok(body_data)) => body_data,
+                Ok(Err(RetainRejection::BudgetExhausted)) => {
+                    // The shared budget refused (#6009): the same committed
+                    // terminal-body rejection contract as the oversize arm below.
+                    return boxed_finalize_h3_request_buffer_capacity_rejection(
+                        &mut stream,
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type,
+                        start_time,
+                        &mut plugin_execution_ns,
+                        &original_request_path,
+                    )
+                    .await;
+                }
+                Ok(Err(RetainRejection::TooLarge)) => {
                     let rejection = finalize_h3_terminal_body_read_rejection(
                         &state,
                         &plugins,
@@ -6862,14 +6890,33 @@ async fn handle_h3_request(
             .or_insert_with(|| method.clone());
         let terminal_hook_start = std::time::Instant::now();
         let grpc_deadline_at = ctx.grpc_deadline_at();
-        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+        // Each replacement is charged before it is installed; an uncovered one
+        // is dropped with the body and its charge released inside the chain.
+        let transformed = crate::proxy::boxed_apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,
             &hook_headers,
             body_data,
+            retained_request_charge.as_mut(),
         )
         .await;
+        let Ok(transformed) = transformed else {
+            // Nothing of the refused body may outlive the refusal's writes.
+            drop(retained_request_charge.take());
+            return boxed_finalize_h3_request_buffer_capacity_rejection(
+                &mut stream,
+                &state,
+                &plugins,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type,
+                start_time,
+                &mut plugin_execution_ns,
+                &original_request_path,
+            )
+            .await;
+        };
         // `bytes_sent` above is the raw client-wire length; gRPC messages come
         // from the transformed, backend-visible body so translated gRPC-Web
         // requests count native frames instead of base64 / trailer framing,
@@ -7302,22 +7349,7 @@ async fn handle_h3_request(
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
         if !body_was_prebuffered {
-            let Some(upload) = H3RetainedUpload::admit(content_length_limit) else {
-                cb_probe.release_neutral();
-                drop(preacquired_backend_admission.take_if_acquired());
-                return boxed_finalize_h3_request_buffer_capacity_rejection(
-                    &mut stream,
-                    &state,
-                    &plugins,
-                    &mut ctx,
-                    http_flavor,
-                    grpc_web_response_content_type,
-                    start_time,
-                    &mut plugin_execution_ns,
-                    &original_request_path,
-                )
-                .await;
-            };
+            let upload = H3RetainedUpload::admit(content_length_limit);
             body_data = match collect_h3_request_body_under_authorization(
                 drain_h3_request_body(&mut stream, upload, &mut retained_request_charge),
                 h3_upload_authorization_bound(
@@ -7328,8 +7360,24 @@ async fn handle_h3_request(
             )
             .await
             {
-                Ok(Some(body_data)) => body_data,
-                Ok(None) => {
+                Ok(Ok(body_data)) => body_data,
+                Ok(Err(RetainRejection::BudgetExhausted)) => {
+                    cb_probe.release_neutral();
+                    drop(preacquired_backend_admission.take_if_acquired());
+                    return boxed_finalize_h3_request_buffer_capacity_rejection(
+                        &mut stream,
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type,
+                        start_time,
+                        &mut plugin_execution_ns,
+                        &original_request_path,
+                    )
+                    .await;
+                }
+                Ok(Err(RetainRejection::TooLarge)) => {
                     cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
                     return boxed_finalize_h3_request_body_too_large_rejection(
@@ -7425,14 +7473,35 @@ async fn handle_h3_request(
             .entry(":method".to_string())
             .or_insert_with(|| method.clone());
         let grpc_deadline_at = ctx.grpc_deadline_at();
-        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+        // Each replacement is charged before it is installed; an uncovered one
+        // is dropped with the body and its charge released inside the chain.
+        let transformed = crate::proxy::boxed_apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,
             &hook_headers,
             body_data,
+            retained_request_charge.as_mut(),
         )
         .await;
+        let Ok(transformed) = transformed else {
+            // Nothing of the refused body may outlive the refusal's writes.
+            drop(retained_request_charge.take());
+            cb_probe.release_neutral();
+            drop(preacquired_backend_admission.take_if_acquired());
+            return boxed_finalize_h3_request_buffer_capacity_rejection(
+                &mut stream,
+                &state,
+                &plugins,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type,
+                start_time,
+                &mut plugin_execution_ns,
+                &original_request_path,
+            )
+            .await;
+        };
         // Same contract as the terminal-hook ladder above: count the
         // backend-visible representation, not the client wire bytes, and an
         // untranslated pass-through upload on its decoded frames.
@@ -8078,21 +8147,7 @@ async fn handle_h3_request(
                 let body_was_prebuffered = prebuffered_body_data.is_some();
                 let mut body_data = prebuffered_body_data.take().unwrap_or_default();
                 if !body_was_prebuffered {
-                    let Some(upload) = H3RetainedUpload::admit(content_length_limit) else {
-                        cb_probe.release_neutral();
-                        return boxed_finalize_h3_request_buffer_capacity_rejection(
-                            &mut stream,
-                            &state,
-                            &plugins,
-                            &mut ctx,
-                            http_flavor,
-                            grpc_web_response_content_type,
-                            start_time,
-                            &mut plugin_execution_ns,
-                            &original_request_path,
-                        )
-                        .await;
-                    };
+                    let upload = H3RetainedUpload::admit(content_length_limit);
                     body_data = match collect_h3_request_body_under_authorization(
                         drain_h3_request_body(&mut stream, upload, &mut retained_request_charge),
                         h3_upload_authorization_bound(
@@ -8103,8 +8158,23 @@ async fn handle_h3_request(
                     )
                     .await
                     {
-                        Ok(Some(body_data)) => body_data,
-                        Ok(None) => {
+                        Ok(Ok(body_data)) => body_data,
+                        Ok(Err(RetainRejection::BudgetExhausted)) => {
+                            cb_probe.release_neutral();
+                            return boxed_finalize_h3_request_buffer_capacity_rejection(
+                                &mut stream,
+                                &state,
+                                &plugins,
+                                &mut ctx,
+                                http_flavor,
+                                grpc_web_response_content_type,
+                                start_time,
+                                &mut plugin_execution_ns,
+                                &original_request_path,
+                            )
+                            .await;
+                        }
+                        Ok(Err(RetainRejection::TooLarge)) => {
                             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                                 &state,
                                 &proxy,
@@ -9944,21 +10014,7 @@ async fn handle_h3_request(
     let body_was_prebuffered = prebuffered_body_data.is_some();
     let mut body_data = prebuffered_body_data.take().unwrap_or_default();
     if !body_was_prebuffered {
-        let Some(upload) = H3RetainedUpload::admit(effective_max_request_body_size_bytes) else {
-            cb_probe.release_neutral();
-            return boxed_finalize_h3_request_buffer_capacity_rejection(
-                &mut stream,
-                &state,
-                &plugins,
-                &mut ctx,
-                http_flavor,
-                grpc_web_response_content_type,
-                start_time,
-                &mut plugin_execution_ns,
-                &original_request_path,
-            )
-            .await;
-        };
+        let upload = H3RetainedUpload::admit(effective_max_request_body_size_bytes);
         body_data = match collect_h3_request_body_under_authorization(
             drain_h3_request_body(&mut stream, upload, &mut retained_request_charge),
             h3_upload_authorization_bound(
@@ -9969,8 +10025,23 @@ async fn handle_h3_request(
         )
         .await
         {
-            Ok(Some(body_data)) => body_data,
-            Ok(None) => {
+            Ok(Ok(body_data)) => body_data,
+            Ok(Err(RetainRejection::BudgetExhausted)) => {
+                cb_probe.release_neutral();
+                return boxed_finalize_h3_request_buffer_capacity_rejection(
+                    &mut stream,
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    start_time,
+                    &mut plugin_execution_ns,
+                    &original_request_path,
+                )
+                .await;
+            }
+            Ok(Err(RetainRejection::TooLarge)) => {
                 cb_probe.release_neutral();
                 return boxed_finalize_h3_request_body_too_large_rejection(
                     &mut stream,
@@ -10076,16 +10147,36 @@ async fn handle_h3_request(
             .entry(":method".to_string())
             .or_insert_with(|| method.clone());
         let grpc_deadline_at = ctx.grpc_deadline_at();
-        crate::proxy::apply_request_body_plugins_with_context(
+        // Each replacement is charged before it is installed; an uncovered one
+        // is dropped with the body and its charge released inside the chain.
+        crate::proxy::boxed_apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,
             &hook_headers,
             body_data,
+            retained_request_charge.as_mut(),
         )
         .await
     } else {
-        body_data
+        Ok(body_data)
+    };
+    let Ok(body_data) = body_data else {
+        // Nothing of the refused body may outlive the refusal's writes.
+        drop(retained_request_charge.take());
+        cb_probe.release_neutral();
+        return boxed_finalize_h3_request_buffer_capacity_rejection(
+            &mut stream,
+            &state,
+            &plugins,
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            start_time,
+            &mut plugin_execution_ns,
+            &original_request_path,
+        )
+        .await;
     };
 
     // Skip the per-plugin context-aware dispatch when no plugin opted in via
@@ -10254,8 +10345,24 @@ async fn handle_h3_request(
     // Publish the body for dispatch (#6009) exactly as H1/H2 do: the
     // request-buffer charge moves onto shared `Bytes`, every attempt and retry
     // replay shares the one allocation, and the charge is released when the
-    // last copy drops, before the response is relayed.
-    let mut body_data = publish_h3_retained_body(body_data, retained_request_charge.take());
+    // last copy drops, before the response is relayed. A body a request-body
+    // plugin grew past what the budget can cover is refused, not retained.
+    let Some(mut body_data) = publish_h3_retained_body(body_data, retained_request_charge.take())
+    else {
+        cb_probe.release_neutral();
+        return boxed_finalize_h3_request_buffer_capacity_rejection(
+            &mut stream,
+            &state,
+            &plugins,
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            start_time,
+            &mut plugin_execution_ns,
+            &original_request_path,
+        )
+        .await;
+    };
 
     // The matched route rule's deadlines (#5646) for every native attempt
     // below; both `None` when the rule carries no timeouts.

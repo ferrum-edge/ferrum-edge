@@ -610,13 +610,30 @@ fn amplification_is_within_bounds(raw_len: usize, decoded_len: usize, ratio: u32
 /// plaintext is handed back as a plain `Vec`. That is the DECODE working set
 /// bound the advisory names — the surviving plaintext is separately bounded per
 /// request by `max_decompressed_request_size` and the wire body limit, and the
-/// buffered-request budget charges the body the caller publishes.
+/// buffered-request budget charges the body the caller publishes. A caller that
+/// keeps the plaintext as a request body uses
+/// [`decode_charged_content_coding_chain_with_charge`] instead, so the
+/// plaintext stays charged until the buffered-request charge covers it.
 pub(crate) fn decode_charged_content_coding_chain(
     codings: &[String],
     body: &[u8],
     limits: crate::plugins::utils::content_encoding::DecodeLimits,
     budget: BudgetRef<'_>,
 ) -> Result<Vec<u8>, ChargedDecodeError> {
+    decode_charged_content_coding_chain_with_charge(codings, body, limits, budget)
+        .map(|(plaintext, _working_set)| plaintext)
+}
+
+/// [`decode_charged_content_coding_chain`], returning the plaintext together
+/// with the decode charge, narrowed to the plaintext's capacity. The caller
+/// keeps that charge until another charge (the buffered-request one) covers
+/// the plaintext, so the plaintext is never held uncharged in between.
+pub(crate) fn decode_charged_content_coding_chain_with_charge(
+    codings: &[String],
+    body: &[u8],
+    limits: crate::plugins::utils::content_encoding::DecodeLimits,
+    budget: BudgetRef<'_>,
+) -> Result<(Vec<u8>, ResponseBufferReservation), ChargedDecodeError> {
     if codings.is_empty() {
         // The caller resolved `identity`-only lists before reaching here, so an
         // empty list means the parse and this decode disagreed. Fail closed.
@@ -667,5 +684,9 @@ pub(crate) fn decode_charged_content_coding_chain(
     if !amplification_is_within_bounds(body.len(), plaintext.len(), ratio) {
         return Err(ChargedDecodeError::TooLarge);
     }
-    Ok(plaintext)
+    // Release the transient working set (scratch, previous passes) and keep
+    // the charge for the plaintext alone. `false` means the charge does not
+    // cover it, which the per-growth charging excludes; keep the whole charge.
+    let _: bool = reservation.narrow_to_covered(plaintext.capacity());
+    Ok((plaintext, reservation))
 }
