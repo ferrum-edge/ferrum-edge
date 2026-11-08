@@ -1640,7 +1640,10 @@ because gating them could only add disclosure or forgery, never remove work:
   installed it for this request (a typed provenance marker), never because of
   the value. `mesh_authz` ext_authz `headersToUpstreamOnAllow` names follow
   Istio semantics instead: they are provider-owned only on a request the
-  instance CUSTOM-checked, so a skipped instance does not touch them.
+  instance CUSTOM-checked, so a skipped instance does not touch them. The
+  owned names are also on the route's request-trailer strip list (see
+  [Backend Request Trailers](#backend-request-trailers)), which no trigger
+  affects.
 
 The authoritative check runs once more over the finalized outbound header
 map, inside the backend-boundary header policy pass every H1/H2 and H3 ladder
@@ -1660,16 +1663,15 @@ write that would undo either guarantee: a `request_transformer` header rule or
 plugin on the route owns as a gateway assertion, and, on such a route without a
 `grpc_web` translator, one that could set `content-type` to a gRPC-Web media
 type.
-  Without it a client that misses the trigger could forward a forged value the
-  backend reads as a gateway assertion. Sanitization is claimed per
-  destination per request, so a trigger-admitted sibling instance that shares
-  a destination keeps the value it installs, in either order; a skipped
-  `spiffe_identity` keeps `x-ferrum-peer-spiffe-id` only when an admitted
-  sibling's own `before_proxy` installed it for this request, never because a
-  value equals the peer identity. The same claim destinations are also on the
-  route's request-trailer strip list (see
-  [Backend Request Trailers](#backend-request-trailers)), which no trigger
-  affects.
+
+The final pass is the last point a plugin's outbound map is judged; a few
+headers are written by the gateway itself after it (per-attempt
+`traceparent`, the remaining `grpc-timeout`, `early-data`, the WebSocket
+handshake's gateway assertions, framing and forwarding fields). Configuration
+admission therefore refuses those names as an owned assertion destination
+(`claim_headers`, `output_claim_headers`, OPA `decision_request_headers`,
+mesh `outputClaimToHeaders`), so no owned header can collide with a
+gateway-written one.
 
 `response_caching` has one configuration-specific restriction: its default
 `add_cache_status_header: true` publishes named response-trailer ownership, a

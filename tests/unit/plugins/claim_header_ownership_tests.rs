@@ -516,3 +516,55 @@ fn claim_headers_refuse_the_whole_consumer_assertion_namespace() {
         "Istio outputClaimToHeaders shares the reserved namespace"
     );
 }
+
+/// Headers the gateway itself writes on the backend request after the plugin
+/// chain and the final gateway-assertion pass (per-attempt `traceparent`, the
+/// remaining `grpc-timeout`, the WebSocket handshake's `x-geo-country`, ...)
+/// can never be an owned assertion destination: the gateway's later write
+/// would replace a verified value. One shared predicate refuses them for
+/// `claim_headers`, OPA `decision_request_headers`, and mesh
+/// `outputClaimToHeaders`; an ordinary destination is still admitted.
+#[test]
+fn owned_destinations_refuse_headers_the_gateway_writes_after_the_plugin_chain() {
+    for header in [
+        "traceparent",
+        "TraceState",
+        "grpc-timeout",
+        "X_Geo_Country",
+        "x-b3-traceid",
+    ] {
+        let config = json!({"claim_headers": {"sub": header}});
+        let error = parse_claim_headers(
+            config.as_object().expect("object"),
+            "claim_headers",
+            "test_auth",
+            PREFIX,
+        )
+        .expect_err("a gateway-written destination must fail admission");
+        assert!(error.contains("gateway-reserved"), "{header}: {error}");
+        assert!(
+            ferrum_edge::plugins::utils::claim_header_fanout::is_output_claim_reserved_header(
+                header
+            ),
+            "{header}"
+        );
+        let opa = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": "ferrum/authz/allow",
+            "decision_request_headers": [header],
+        });
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("opa", &opa).is_err(),
+            "{header}"
+        );
+    }
+    let config = json!({"claim_headers": {"email": "X-User-Email"}});
+    let admitted = parse_claim_headers(
+        config.as_object().expect("object"),
+        "claim_headers",
+        "test_auth",
+        PREFIX,
+    )
+    .expect("an ordinary destination is admitted");
+    assert_eq!(admitted.len(), 1);
+}

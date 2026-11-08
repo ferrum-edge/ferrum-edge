@@ -16740,6 +16740,12 @@ fn content_type_relabel_to_grpc_web_is_refused_on_untranslated_assertion_chains(
             false,
             true,
         ),
+        (
+            transformer_header_rule("add", "Content_Type", "value", "application/grpc-web"),
+            true,
+            false,
+            true,
+        ),
         (grpc_web_literal.clone(), true, true, false),
         (
             transformer_header_rule("update", "content-type", "value", "application/json"),

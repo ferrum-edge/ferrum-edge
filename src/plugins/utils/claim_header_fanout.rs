@@ -614,6 +614,11 @@ pub fn is_output_claim_reserved_header(name: &str) -> bool {
         )
         || lowercase.starts_with("x-ferrum-")
         || lowercase.starts_with("x-forwarded-")
+        // Headers the gateway writes after the final gateway-assertion pass
+        // (per-attempt `traceparent`, `grpc-timeout`, ...): an owned
+        // destination there would be overwritten, or would strip the
+        // gateway's own value. Shared by every owned-name validator.
+        || crate::proxy::headers::is_gateway_post_hook_request_header(&lowercase)
 }
 
 #[cfg(test)]

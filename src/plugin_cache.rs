@@ -866,7 +866,7 @@ fn validate_request_header_writes_against_owned_assertions(
                 }
             }
             if !translator_present
-                && name.eq_ignore_ascii_case("content-type")
+                && field_names_equivalent_for_backends(&name, "content-type")
                 && literal
                     .as_deref()
                     .is_none_or(crate::plugins::grpc_web::is_grpc_web_content_type)

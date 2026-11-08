@@ -234,6 +234,44 @@ fn fold_field_name_byte(byte: u8) -> u8 {
     }
 }
 
+/// Returns `true` for request headers the gateway itself writes or rewrites on
+/// the backend request AFTER the `before_proxy` chain and the final
+/// gateway-assertion pass (`proxy::enforce_route_owned_request_assertions`):
+/// per-attempt trace context (`traceparent`, with the rest of the W3C / B3
+/// trace-context family the gateway propagates), gRPC call parameters such as
+/// the remaining `grpc-timeout`, the 0-RTT `early-data` marker, framing fields
+/// the backend request builders set, the gateway assertions re-injected on the
+/// WebSocket handshake ([`is_gateway_assertion_header`]), and the router's
+/// `x-path-param-*` captures.
+///
+/// A plugin-owned assertion destination (`claim_headers`,
+/// `output_claim_headers`, OPA `decision_request_headers`) must never name
+/// one: the gateway's own later write would replace the verified value, or the
+/// final pass would strip the gateway's. Folded like every destination gate
+/// (ASCII case-insensitive, `_` read as `-`); configuration-time only.
+pub fn is_gateway_post_hook_request_header(name: &str) -> bool {
+    let folded = name.to_ascii_lowercase().replace('_', "-");
+    is_gateway_assertion_header(&folded)
+        || is_path_param_assertion_header(&folded)
+        || folded.starts_with("grpc-")
+        || matches!(
+            folded.as_str(),
+            "traceparent"
+                | "tracestate"
+                | "b3"
+                | "x-b3-traceid"
+                | "x-b3-spanid"
+                | "x-b3-parentspanid"
+                | "x-b3-sampled"
+                | "x-b3-flags"
+                | "early-data"
+                | "te"
+                | "host"
+                | "content-length"
+                | "transfer-encoding"
+        )
+}
+
 /// Returns `true` for every backend-visible gateway assertion: the
 /// [`is_consumer_assertion_header`] namespace plus the private GeoIP result
 /// (`x-geo-country`). ASCII case-insensitive with `_` equivalent to `-`
