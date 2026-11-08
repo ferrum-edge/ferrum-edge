@@ -27,8 +27,8 @@ info:
     unset (default), tokens without `aud` are accepted, but tokens carrying an
     `aud` claim are rejected per RFC 7519 strict audience handling.
 
-    Every admin API response, whatever its status, content type or endpoint,
-    carries `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+    Every response the admin API service produces, whatever its status,
+    content type or endpoint, carries `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
     `X-Frame-Options: DENY`. Per-response declarations below list them where a
     response documents its headers.
 
