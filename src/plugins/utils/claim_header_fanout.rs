@@ -388,16 +388,29 @@ pub fn apply_claim_headers_from_context(
     if destinations.is_empty() {
         return;
     }
-    sanitize_owned_claim_header_destinations(ctx, headers, destinations);
-    for (metadata_key, header_name) in destinations.entries() {
+    let newly_claimed = sanitize_owned_claim_header_destinations(ctx, headers, destinations);
+    let mut installed_keys: Vec<&str> = Vec::new();
+    for (index, (metadata_key, header_name)) in destinations.entries().enumerate() {
         if let Some(value) = ctx
             .plugin_state_opt_mut()
             .and_then(|state| state.pending_claim_headers.remove(metadata_key))
         {
-            // Provenance for the final gateway-assertion pass over the
-            // outbound map: only an installed `(name, value)` pair survives it.
+            // Current authorized state for the final gateway-assertion pass:
+            // only this exact value survives it.
             ctx.record_installed_request_assertion(header_name, &value);
             headers.insert(header_name.to_string(), value);
+            installed_keys.push(destinations.sanitization_keys[index].as_str());
+        }
+    }
+    // A destination this instance sanitized for this request and filled with
+    // nothing is cleared: any earlier owner's value (an OPA decision header of
+    // the same name, say) is retired rather than left as stale provenance. A
+    // destination an earlier claim instance already claimed keeps that
+    // instance's decision.
+    for (index, (_, header_name)) in destinations.entries().enumerate() {
+        let key = destinations.sanitization_keys[index].as_str();
+        if newly_claimed[index] && !installed_keys.contains(&key) {
+            ctx.record_cleared_request_assertion(header_name);
         }
     }
 }
@@ -439,15 +452,23 @@ pub fn sanitize_claim_header_destinations(
 /// `_` as `-` ([`crate::proxy::headers::field_names_equivalent_for_backends`]):
 /// a client `X_Authenticated_Email` reaches a CGI-style backend as the same
 /// variable as the gateway's `x-authenticated-email`.
+///
+/// Returns, per destination entry, whether THIS call claimed its sanitization
+/// (no earlier instance had).
 fn sanitize_owned_claim_header_destinations(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
     destinations: &ClaimHeaderDestinations,
-) {
+) -> Vec<bool> {
     if destinations.is_empty() {
-        return;
+        return Vec::new();
     }
     let sanitized = ctx.plugin_state_mut();
+    let newly_claimed: Vec<bool> = destinations
+        .sanitization_keys
+        .iter()
+        .map(|key| !sanitized.sanitized_claim_header_destinations.contains(key))
+        .collect();
     headers.retain(|name, _| {
         !destinations
             .names()
@@ -464,6 +485,7 @@ fn sanitize_owned_claim_header_destinations(
                 .insert(key.clone());
         }
     }
+    newly_claimed
 }
 
 /// A destination name as a CGI-style backend reads it: ASCII-lowercased with

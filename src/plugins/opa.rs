@@ -810,10 +810,19 @@ impl Opa {
                 .iter()
                 .any(|destination| field_names_equivalent_for_backends(destination, name))
         });
+        // Current authorized state for the final gateway-assertion pass and a
+        // trigger-skipped sibling: every destination this decision did not
+        // fill is cleared (retiring an earlier instance's value), and every
+        // filled one carries exactly the policy's value.
+        for destination in destinations {
+            if !staged
+                .iter()
+                .any(|(name, _)| field_names_equivalent_for_backends(name, destination))
+            {
+                ctx.record_cleared_request_assertion(destination);
+            }
+        }
         for (name, value) in staged {
-            // Provenance for the final gateway-assertion pass over the
-            // outbound map and for a trigger-skipped sibling owning the same
-            // name: only this exact pair survives them.
             ctx.record_installed_request_assertion(&name, &value);
             ctx.headers.insert(name, value);
         }

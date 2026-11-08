@@ -2250,6 +2250,97 @@ async fn opa_allow_obligation_installs_listed_upstream_headers() {
     );
 }
 
+/// Provenance is the CURRENT authorized state, not history. When a later
+/// admitted OPA instance withdraws a decision header an earlier one installed
+/// (a bare-`true` allow), a later writer restoring the client's same value
+/// (`correlation_id` preserving `x-user-role`) is stripped by the final pass,
+/// so the header is absent at the backend. A legitimate value from the last
+/// admitted owner survives.
+#[tokio::test]
+async fn a_withdrawn_decision_header_cannot_be_resurrected_on_stale_provenance() {
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        run_final_backend_header_policy_hooks_for_test,
+    };
+    use ferrum_edge::config::types::{GatewayConfig, PluginScope};
+
+    use super::plugin_utils::{make_plugin_config_with_json, make_proxy};
+
+    let first = MockServer::start().await;
+    mount_opa(
+        &first,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-user-role": "admin"}}}),
+    )
+    .await;
+    let withdrawing = MockServer::start().await;
+    mount_opa(&withdrawing, 200, json!({"result": true})).await;
+    let replacing = MockServer::start().await;
+    mount_opa(
+        &replacing,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-user-role": "auditor"}}}),
+    )
+    .await;
+    let opa = |id: &str, server: &MockServer, priority: u16| {
+        let mut config = base_config(&server.uri());
+        config["decision_request_headers"] = json!(["x-user-role"]);
+        let mut opa =
+            make_plugin_config_with_json(id, "opa", config, PluginScope::Proxy, Some("p1"));
+        opa.priority_override = Some(priority);
+        opa
+    };
+    // (second owner, correlation header, value at the backend)
+    let cases = [
+        (&withdrawing, "x-user-role", None),
+        (&replacing, "x-correlation-ref", Some("auditor")),
+    ];
+    for (second, correlation_header, expected) in cases {
+        let label = format!("{correlation_header} -> {expected:?}");
+        let mut correlation = make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": correlation_header, "inbound_policy": "preserve"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        correlation.priority_override = Some(1500);
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![make_proxy("p1", "/", vec!["first", "second", "corr"])],
+            plugin_configs: vec![
+                opa("first", &first, 2050),
+                opa("second", second, 2060),
+                correlation,
+            ],
+            ..Default::default()
+        };
+        let cache = PluginCache::new(&config).unwrap_or_else(|error| panic!("{label}: {error}"));
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+
+        let mut ctx = make_ctx();
+        ctx.headers.insert("x-user-role".into(), "admin".into());
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        for plugin in plugins.iter() {
+            assert_continue(plugin.authorize(&mut ctx).await);
+        }
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert_continue(result);
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        assert_eq!(
+            headers.get("x-user-role").map(String::as_str),
+            expected,
+            "{label}"
+        );
+    }
+}
+
 /// An admitted OPA instance and a trigger-skipped claim-fanout instance can
 /// own the same header (`decision_request_headers: X-Tenant` beside
 /// `claim_headers: {tenant: X-Tenant}`). The skipped instance still removes

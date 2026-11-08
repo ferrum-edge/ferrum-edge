@@ -3882,12 +3882,17 @@ pub(crate) struct PluginRequestState {
     /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
     /// configured.
     pub(crate) sanitized_claim_header_destinations: HashSet<String>,
-    /// `(name, value)` pairs an admitted owning instance installed on the
-    /// backend request for this request: verified claim headers, OPA decision
-    /// headers, the forwarded peer SPIFFE ID. The final gateway-assertion pass
-    /// over the outbound map keeps an owned header only when its pair is here,
-    /// so a value that merely equals a gateway fact is never proof.
-    pub(crate) installed_request_assertions: Vec<(String, String)>,
+    /// CURRENT authorized state of every gateway-asserted request header an
+    /// admitted owner decided on for this request, keyed by its
+    /// backend-equivalent name (ASCII lowercase, `_` folded to `-`):
+    /// `Some(value)` when the latest admitted owner installed `value`, `None`
+    /// when it cleared the destination (a missing claim, an OPA allow without
+    /// that obligation, a forwarding identity with no peer identity). A later
+    /// decision replaces an earlier one, so a withdrawn value can never be
+    /// resurrected on stale provenance. The final gateway-assertion pass keeps
+    /// an owned header only when it equals the current `Some(value)`; a
+    /// trigger-skipped owner never writes here.
+    pub(crate) request_assertion_state: Vec<(String, Option<String>)>,
     /// Set by the `grpc_web` translation owner's own `before_proxy` once it
     /// rewrote this request to native gRPC. A request whose final outbound
     /// `content-type` is gRPC-Web without this marker was not translated.
@@ -6716,36 +6721,51 @@ impl RequestContext {
             .map(Vec::as_slice)
     }
 
-    /// Record that an admitted owning instance installed `name: value` on the
-    /// backend request for this request: a verified claim header, an OPA
-    /// decision header, the forwarded peer SPIFFE ID. The final gateway
-    /// assertion pass (`proxy::enforce_route_owned_request_assertions`) and the
-    /// trigger-skip sanitizers keep only recorded pairs.
+    /// Replace the current authorized state of the gateway-asserted header a
+    /// backend reads as `name`: `Some(value)` for an install, `None` for a
+    /// clear. The final gateway-assertion pass
+    /// (`proxy::enforce_route_owned_request_assertions`) and the trigger-skip
+    /// sanitizers keep an owned header only when it equals the current value.
     ///
-    /// Gated by its callers: only an admitted owner's install reaches it, so
-    /// a route that owns no asserted header (and the plugin-free request
-    /// path) never materializes per-plugin state here.
-    pub(crate) fn record_installed_request_assertion(&mut self, name: &str, value: &str) {
-        if self.request_assertion_installed(name, value) {
-            return;
+    /// Gated by its callers: only an admitted owner's own decision reaches it
+    /// (a claim install, an OPA allow, a forwarded SPIFFE identity), so a route
+    /// that owns no asserted header (and the plugin-free request path) never
+    /// materializes per-plugin state here.
+    fn set_request_assertion_state(&mut self, name: &str, value: Option<&str>) {
+        let folded = name.to_ascii_lowercase().replace('_', "-");
+        let value = value.map(str::to_string);
+        let state = &mut self.plugin_state_mut().request_assertion_state;
+        match state.iter_mut().find(|(owned, _)| *owned == folded) {
+            Some((_, current)) => *current = value,
+            None => state.push((folded, value)),
         }
-        self.plugin_state_mut()
-            .installed_request_assertions
-            .push((name.to_string(), value.to_string()));
     }
 
-    /// Whether an admitted owning instance installed exactly `value` under a
-    /// name a backend reads as `name` (ASCII case-insensitive, `_` read as
-    /// `-`) for this request.
+    /// An admitted owner installed `name: value` for this request; it replaces
+    /// any earlier decision for that destination.
+    pub(crate) fn record_installed_request_assertion(&mut self, name: &str, value: &str) {
+        self.set_request_assertion_state(name, Some(value));
+    }
+
+    /// An admitted owner cleared `name` for this request (it sanitized the
+    /// destination and installed nothing); any earlier owner's value is
+    /// retired, so nothing can bring it back.
+    pub(crate) fn record_cleared_request_assertion(&mut self, name: &str) {
+        self.set_request_assertion_state(name, None);
+    }
+
+    /// Whether the CURRENT authorized value of the header a backend reads as
+    /// `name` (ASCII case-insensitive, `_` read as `-`) is exactly `value`.
     pub(crate) fn request_assertion_installed(&self, name: &str, value: &str) -> bool {
         use crate::proxy::headers::field_names_equivalent_for_backends;
 
         let Some(state) = self.plugin_state() else {
             return false;
         };
-        let installed = &state.installed_request_assertions;
-        installed.iter().any(|(owned, owned_value)| {
-            owned_value == value && field_names_equivalent_for_backends(owned, name)
+        let current = &state.request_assertion_state;
+        current.iter().any(|(owned, owned_value)| {
+            owned_value.as_deref() == Some(value)
+                && field_names_equivalent_for_backends(owned, name)
         })
     }
 

@@ -616,13 +616,13 @@ const PLUGIN_STATE_MUT_CALL_SITES: &[(&str, Option<&str>, &str)] = &[
          backend-visible header map actually differs from the inbound one",
     ),
     (
-        "record_installed_request_assertion",
+        "set_request_assertion_state",
         None,
-        "reached only from an admitted owner's install of a gateway-asserted \
-         request header (a resolved claim value an authenticating \
-         `jwks_auth` / `oauth2_introspection` / `oidc_relying_party` staged, an \
-         `opa` decision header, a `spiffe_identity` `forward_identity` peer \
-         ID), so a plugin-free request never calls it",
+        "reached only from an admitted owner's own install or clear of a \
+         gateway-asserted request header (an authenticating `jwks_auth` / \
+         `oauth2_introspection` / `oidc_relying_party` claim destination, an \
+         `opa` decision header, a `spiffe_identity` `forward_identity` \
+         identity), so a plugin-free request never calls it",
     ),
     (
         "mark_query_credential_partition_digest",

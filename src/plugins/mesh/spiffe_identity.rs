@@ -723,11 +723,14 @@ impl Plugin for SpiffeIdentity {
             .peer_spiffe_id
             .as_ref()
             .map(|id| id.as_str().to_string());
-        if let Some(id) = peer_id {
-            // Provenance for the final gateway-assertion pass and a
-            // trigger-skipped sibling: only this exact pair survives them.
-            ctx.record_installed_request_assertion(FORWARDED_IDENTITY_HEADER, &id);
-            headers.insert(FORWARDED_IDENTITY_HEADER.to_string(), id);
+        // Current authorized state for the final gateway-assertion pass and a
+        // trigger-skipped sibling: exactly this identity, or none at all.
+        match peer_id {
+            Some(id) => {
+                ctx.record_installed_request_assertion(FORWARDED_IDENTITY_HEADER, &id);
+                headers.insert(FORWARDED_IDENTITY_HEADER.to_string(), id);
+            }
+            None => ctx.record_cleared_request_assertion(FORWARDED_IDENTITY_HEADER),
         }
         PluginResult::Continue
     }

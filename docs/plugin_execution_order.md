@@ -1636,9 +1636,10 @@ because gating them could only add disclosure or forgery, never remove work:
   destination of `jwks_auth`, `oauth2_introspection`, and `oidc_relying_party`,
   `opa` `decision_request_headers`, and `spiffe_identity`'s
   `x-ferrum-peer-spiffe-id` with `forward_identity`. A skipped instance keeps
-  one of its names only as the exact name and value an admitted owner, of any
-  of these plugins, installed for this request (one shared typed provenance
-  record), never because of the value alone: a skipped `jwks_auth` sharing
+  one of its names only as the current authorized value an admitted owner, of
+  any of these plugins, set for this request (one shared typed per-request
+  state, which a skipped instance never changes), never because of the value
+  alone: a skipped `jwks_auth` sharing
   `X-Tenant` with an admitted OPA keeps OPA's value and drops every other
   copy. `mesh_authz` ext_authz `headersToUpstreamOnAllow` names follow
   Istio semantics instead: they are provider-owned only on a request the
@@ -1651,8 +1652,9 @@ The authoritative check runs once more over the finalized outbound header
 map, inside the backend-boundary header policy pass every H1/H2 and H3 ladder
 runs after each `before_proxy` pass and after any finalized-egress header
 overlay: on a route that owns asserted headers, each owned name survives only
-as the exact `(name, value)` pair an admitted owner installed for the request
-(typed per-request provenance), and every other copy or spelling is removed,
+as its CURRENT authorized value for the request (typed per-request state: the
+latest admitted owner's install replaces, and its clear retires, any earlier
+decision), and every other copy or spelling is removed,
 whatever any trigger decided or any later plugin wrote. The client's own
 field lines for those names are then dropped from the pristine header block,
 so the boundaries that rebuild a backend request from raw field lines (the
