@@ -10950,6 +10950,25 @@ async fn validate_restore_candidate_on_blocking_pool(
 }
 
 /// Restore the gateway configuration from a backup payload.
+/// `restore_errors` for a lost-lease recovery response that returns while the
+/// restore guard is still held (issue #7062). Its Drop retains the durable
+/// fence whenever the restore phase forbids release, so the response says the
+/// namespace needs manual recovery.
+fn restore_recovery_errors(
+    guard: &MtlsDnsAdmissionGuardLifecycle,
+    namespace: &str,
+    mut errors: Vec<String>,
+) -> Vec<String> {
+    if !guard.restore_phase_allows_release() {
+        error!(
+            namespace = %namespace,
+            "Restore: lost-lease recovery did not complete; namespace admission guard retained for manual recovery"
+        );
+        errors.push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+    }
+    errors
+}
+
 async fn handle_restore(
     state: &AdminState,
     actor: &AuditActor,
@@ -11570,7 +11589,11 @@ async fn handle_restore(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
                         "error": response_error,
-                        "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                        "restore_errors": restore_recovery_errors(
+                            &restore_guard,
+                            namespace,
+                            vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                        ),
                     }),
                 ));
             }
@@ -11626,7 +11649,11 @@ async fn handle_restore(
                             StatusCode::SERVICE_UNAVAILABLE,
                             &json!({
                                 "error": response_error,
-                                "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                                "restore_errors": restore_recovery_errors(
+                                    &restore_guard,
+                                    namespace,
+                                    vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                                ),
                             }),
                         )
                     }
@@ -11634,16 +11661,13 @@ async fn handle_restore(
             );
         }
         if intervening_write {
-            let mut restore_errors = vec![NAMESPACE_ADMISSION_LOST_MESSAGE];
             // A clear that may have removed rows leaves the guard in the
             // cleared phase: returning drops it and its Drop keeps the fence.
-            if !restore_guard.restore_phase_allows_release() {
-                error!(
-                    namespace = %namespace,
-                    "Restore: clear outcome incomplete after an intervening namespace lease; namespace admission guard retained for manual recovery"
-                );
-                restore_errors.push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE);
-            }
+            let restore_errors = restore_recovery_errors(
+                &restore_guard,
+                namespace,
+                vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+            );
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
@@ -11777,7 +11801,7 @@ async fn handle_restore(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
                             "error": response_error,
-                            "restore_errors": errors,
+                            "restore_errors": restore_recovery_errors(&restore_guard, namespace, errors),
                         }),
                     ));
                 }
@@ -11823,7 +11847,14 @@ async fn handle_restore(
                         );
                         json_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({"error": response_error}),
+                            &json!({
+                                "error": response_error,
+                                "restore_errors": restore_recovery_errors(
+                                    &restore_guard,
+                                    namespace,
+                                    vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                                ),
+                            }),
                         )
                     }
                 },

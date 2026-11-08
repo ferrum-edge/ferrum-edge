@@ -50,8 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until an operator intervened. Recovery now keeps the original guard owner
   across the lease reacquisition and runs the rollback under it, so a failed
   or cancelled recovery leaves the namespace fenced. A clear that failed
-  without a definitive atomic abort is treated as incomplete. When the import
-  rollback is skipped after another writer took the lease, the `503` now lists
+  without a definitive atomic abort is treated as incomplete. Every recovery
+  `503` that leaves the namespace fenced now lists
   `namespace admission guard retained; manual recovery required` in
   `restore_errors`.
 - **BREAKING — requests with more than one `Content-Type` are refused**
