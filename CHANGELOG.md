@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permits-all check instead of a negative prefix that only happened to work. A
   new unit test fails when a helper shared by both charts' `_helpers.tpl`
   drifts.
+- **Admin API responses always carry the admin security headers** (issue
+  #7074). `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+  `X-Frame-Options: DENY` were set by hand per response, and the raw API-spec
+  `GET` (`200`/`304`), API-spec `DELETE` (`204`), Prometheus `/metrics` and its
+  `401`, `/charges`, `/charges/sink/status` and the builder-failure `500`
+  omitted some of them. One shared helper now sets them, and the admin
+  dispatcher fills any a response still lacks. The raw API-spec `GET`'s
+  builder-failure fallback is now the shared JSON `500` instead of a bare `500`
+  with no `Content-Type`.
 - **BREAKING — `oidc_relying_party` refuses a non-string
   `client_auth.private_key_jwt_alg` / `client_auth.private_key_jwt_kid`**
   (issue #7069). The constructor read both with a lenient string accessor, so a
