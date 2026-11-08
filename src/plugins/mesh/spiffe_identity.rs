@@ -751,7 +751,7 @@ impl Plugin for SpiffeIdentity {
         if !self.forward_identity {
             return;
         }
-        let owned = [FORWARDED_IDENTITY_HEADER.to_string()];
+        let owned = [FORWARDED_IDENTITY_HEADER];
         crate::plugins::strip_uninstalled_request_assertions(ctx, headers, &owned);
     }
 

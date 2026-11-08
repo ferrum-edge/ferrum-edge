@@ -33871,10 +33871,12 @@ fn untranslated_grpc_web_refusal() -> PluginResult {
 /// Every header a plugin on the matched route owns as a gateway assertion
 /// (`Plugin::owned_request_assertion_header_names`: `claim_headers` /
 /// `output_claim_headers` destinations, OPA decision headers,
-/// `x-ferrum-peer-spiffe-id`) survives only as the exact `(name, value)` pair
-/// an admitted owning instance installed for this request
-/// (`RequestContext::record_installed_request_assertion`); every other copy and
-/// spelling is removed. Runs inside [`run_final_backend_header_policy_hooks`],
+/// `x-ferrum-peer-spiffe-id`) survives as at most ONE entry: the current
+/// `(name, value)` install of an admitted owning instance for this request
+/// (`RequestContext::record_installed_request_assertion`), under the exact
+/// name it wrote. Every other copy and spelling is removed, even one whose
+/// value equals the install, because each spelling would reach the backend as
+/// its own field line. Runs inside [`run_final_backend_header_policy_hooks`],
 /// so after every `before_proxy` pass, every deferred pass and any
 /// finalized-egress header overlay, on the H1/H2 and H3 ladders alike, and
 /// whatever any trigger decided: no later writer (a `request_transformer`

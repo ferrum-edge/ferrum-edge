@@ -61,8 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   view, so native gRPC, HBONE, mesh-mTLS, Unix and WebSocket dispatch, the
   secured-mesh retry replay and `request_mirror` cannot restore them as
   separate lines): an owned header reaches the
-  backend only as its current authorized value (the latest admitted owner's
-  install or clear replaces any earlier decision), so a later writer (for example a `correlation_id` preserving a
+  backend only as its current authorized value, as one field under the name
+  the owner wrote (the latest admitted owner's install or clear replaces any
+  earlier decision), so a later writer (for example a `correlation_id` preserving a
   client value under the same name) can no longer restore a client copy, and
   a request relabelled to a gRPC-Web `content-type` that the `grpc_web`
   translator did not translate is refused with `415`.

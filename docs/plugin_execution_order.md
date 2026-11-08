@@ -1654,7 +1654,10 @@ runs after each `before_proxy` pass and after any finalized-egress header
 overlay: on a route that owns asserted headers, each owned name survives only
 as its CURRENT authorized value for the request (typed per-request state: the
 latest admitted owner's install replaces, and its clear retires, any earlier
-decision), and every other copy or spelling is removed,
+decision), as ONE entry under the exact name that owner wrote, and every other
+copy or spelling is removed (an equal-valued `x_app_user` beside an installed
+`x-app-user` too, since each spelling would reach the backend as its own field
+line),
 whatever any trigger decided or any later plugin wrote. The client's own
 field lines for those names are then dropped from every pristine header
 store — the dispatch body and the request context's retained wire view — so

@@ -17156,12 +17156,146 @@ async fn oidc_forward_access_token_owns_authorization_only_when_the_instance_run
         }
         let mut headers = ctx.headers.clone();
         let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
-        assert!(matches!(result, PluginResult::Continue), "skipped={skipped}");
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "skipped={skipped}"
+        );
         run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
         assert_eq!(
             headers.get("authorization").map(String::as_str),
             expected,
             "skipped={skipped}"
         );
+    }
+}
+
+/// Every owned backend-equivalence class reaches the backend as at most ONE
+/// field. A `correlation_id` that preserves the client's `x_app_user` after
+/// `jwks_auth` installed the verified `x-app-user` restores an equal-valued
+/// alias the backend boundaries would emit as a second field line; the final
+/// pass keeps only the owner's own entry, and a cleared (missing claim) or
+/// trigger-skipped owner leaves none, in the map, the raw-line merge and the
+/// WebSocket handshake collector alike.
+#[tokio::test]
+async fn an_owned_assertion_reaches_the_backend_as_one_field_across_spellings() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, collect_forwardable_websocket_headers_for_test,
+        run_before_proxy_hooks_for_test, run_final_backend_header_policy_hooks_for_test,
+        strip_route_owned_assertion_field_lines_for_test,
+    };
+    use ferrum_edge::proxy::headers::{
+        field_names_equivalent_for_backends, merge_proxy_headers_preserving_repeated,
+    };
+
+    use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
+    let owned = |name: &str| field_names_equivalent_for_backends(name, "x-app-user");
+    let with_user = json!({"sub": "alice", "user": "alice"});
+    let without_user = json!({"sub": "alice"});
+    // (label, token claims, owner skipped by its trigger, value at the backend)
+    let cases = [
+        ("installed", &with_user, false, Some("alice")),
+        ("missing claim", &without_user, false, None),
+        ("skipped owner", &with_user, true, None),
+    ];
+    for (label, claims, skipped, expected) in cases {
+        let token = create_rs256_token(claims, private_key_pem);
+        let mut auth = make_plugin_config_with_json(
+            "auth",
+            "jwks_auth",
+            json!({"providers": [{
+                "jwks": build_rsa_jwks_from_pem(public_key_pem),
+                "claim_headers": {"user": "X-App-User"}
+            }]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        if skipped {
+            auth.trigger = Some(post_only_trigger());
+        }
+        // Runs after the owner's `before_proxy` and preserves the client's
+        // `x_app_user` value under that spelling.
+        let mut correlation = make_plugin_config_with_json(
+            "corr",
+            "correlation_id",
+            json!({"header_name": "x_app_user", "inbound_policy": "preserve"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        correlation.priority_override = Some(1500);
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["auth", "corr"])],
+            vec![auth, correlation],
+        ))
+        .unwrap();
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let plugins = view.plugins();
+
+        let mut raw = hyper::HeaderMap::new();
+        raw.append("x_app_user", "alice".parse().unwrap());
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/orders".to_string(),
+        );
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+        ctx.headers.insert("x_app_user".into(), "alice".into());
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let rejection = ferrum_edge::proxy::run_authentication_phase(
+            AuthMode::Multi,
+            plugins.as_slice(),
+            &mut ctx,
+            &consumer_index,
+        )
+        .await;
+        assert!(rejection.is_none(), "{label}");
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue), "{label}");
+        // The later writer restored the client's alias spelling.
+        assert_eq!(
+            headers.get("x_app_user").map(String::as_str),
+            Some("alice"),
+            "{label}"
+        );
+
+        run_final_backend_header_policy_hooks_for_test(&plugins, &ctx, &mut headers);
+        let expected_values: Vec<&str> = expected.into_iter().collect();
+        let map_values: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| owned(name.as_str()))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(map_values, expected_values, "{label}: map");
+        assert_eq!(
+            headers.get("x-app-user").map(String::as_str),
+            expected,
+            "{label}: the owner's own entry"
+        );
+
+        strip_route_owned_assertion_field_lines_for_test(&ctx, &mut raw);
+        let mut merged = raw.clone();
+        merge_proxy_headers_preserving_repeated(&mut merged, &headers);
+        let merged_values: Vec<&str> = merged
+            .iter()
+            .filter(|(name, _)| owned(name.as_str()))
+            .map(|(_, value)| value.to_str().unwrap())
+            .collect();
+        assert_eq!(merged_values, expected_values, "{label}: merge");
+
+        let forwarded = collect_forwardable_websocket_headers_for_test(&raw, &headers);
+        let forwarded_values: Vec<&str> = forwarded
+            .iter()
+            .filter(|(name, _)| owned(name.as_str()))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(forwarded_values, expected_values, "{label}: websocket");
     }
 }

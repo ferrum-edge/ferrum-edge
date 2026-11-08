@@ -437,8 +437,10 @@ pub fn sanitize_claim_header_destinations(
     if destinations.is_empty() {
         return;
     }
-    let owned: Vec<String> = destinations.names().map(str::to_string).collect();
-    crate::plugins::strip_uninstalled_request_assertions(ctx, headers, &owned);
+    // The precomputed backend-equivalence keys name the same classes as the
+    // destinations, so the skip path allocates nothing.
+    let owned = destinations.sanitization_keys.as_slice();
+    crate::plugins::strip_uninstalled_request_assertions(ctx, headers, owned);
 }
 
 /// Remove every gateway-owned destination this instance still has to claim.
