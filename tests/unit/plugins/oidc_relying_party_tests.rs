@@ -4059,62 +4059,87 @@ async fn private_key_jwt_assertion_audience_is_the_token_endpoint() {
     assert_eq!(header["kid"], json!("rp-key-1"));
 }
 
-/// Current OIDC behaviour (suspected bug E, deliberately preserved by the
-/// shared-helper extraction): a non-string `private_key_jwt_alg` falls back to
-/// `RS256` and a non-string `private_key_jwt_kid` to no `kid`, on the wire.
-/// `oauth2_introspection` rejects the same values at admission
-/// (`oauth2_private_key_jwt_rejects_non_string_alg_and_kid`). If bug E is
-/// fixed, this test must change together with a CHANGELOG entry.
+/// `null` `private_key_jwt_alg` / `private_key_jwt_kid` mean "default" (the
+/// OpenAPI schema types both as `string | null`): the assertion is signed
+/// `RS256` and carries no `kid` header, on the wire.
 #[tokio::test]
-async fn private_key_jwt_non_string_alg_and_kid_default_to_rs256_without_kid() {
+async fn private_key_jwt_null_alg_and_kid_default_to_rs256_without_kid() {
     const RSA_PEM: &str = include_str!("../../fixtures/test_rsa_private.pem");
-    for (alg, kid) in [
-        (json!(123), json!(456)),
-        (json!(null), json!(null)),
-        (json!(false), json!(["k"])),
-    ] {
-        let label = format!("alg={alg} kid={kid}");
-        let (header, claims, token_endpoint) = refresh_grant_client_assertion(json!({
-            "method": "private_key_jwt",
-            "private_key_jwt_alg": alg,
-            "private_key_jwt_kid": kid,
-            "private_key_pem": RSA_PEM
-        }))
-        .await;
-        assert_eq!(header["alg"], json!("RS256"), "{label}");
-        assert!(header.get("kid").is_none(), "{label}: no kid header");
-        assert_eq!(claims["aud"], json!(token_endpoint), "{label}");
-    }
+    let (header, claims, token_endpoint) = refresh_grant_client_assertion(json!({
+        "method": "private_key_jwt",
+        "private_key_jwt_alg": null,
+        "private_key_jwt_kid": null,
+        "private_key_pem": RSA_PEM
+    }))
+    .await;
+    assert_eq!(header["alg"], json!("RS256"));
+    assert!(header.get("kid").is_none(), "no kid header");
+    assert_eq!(claims["aud"], json!(token_endpoint));
 }
 
-/// OIDC admission for `private_key_jwt_alg` / `private_key_jwt_kid` typing,
-/// paired with the introspection rejection test: omitted fields and non-string
-/// (numeric, `null`) values are all admitted today (bug E preserved).
+/// OIDC admission for `private_key_jwt_alg` / `private_key_jwt_kid` typing
+/// (issue #7069). The OpenAPI schema allows only `string` or `null` for both,
+/// whatever the `method`, so the constructor refuses every other JSON type with
+/// a field-specific error instead of silently signing `RS256` with no `kid`.
+/// Omitted and `null` values still select the defaults. Unlike
+/// `oauth2_introspection` (`oauth2_private_key_jwt_rejects_non_string_alg_and_kid`),
+/// `null` is admitted here because this plugin's schema allows it.
 #[test]
-fn private_key_jwt_non_string_alg_and_kid_are_admitted_with_defaults() {
+fn private_key_jwt_non_string_alg_and_kid_are_refused_and_null_is_admitted() {
     const RSA_PEM: &str = include_str!("../../fixtures/test_rsa_private.pem");
-    let cases = [
+    // `None` omits `method`, which selects `client_secret_basic`.
+    let config_with = |method: Option<&str>, extra: serde_json::Value| {
+        let mut client_auth = match method {
+            Some("private_key_jwt") => json!({
+                "method": "private_key_jwt",
+                "private_key_pem": RSA_PEM
+            }),
+            Some(method) => json!({ "method": method, "client_secret": "secret" }),
+            None => json!({ "client_secret": "secret" }),
+        };
+        for (key, value) in extra.as_object().expect("object").clone() {
+            client_auth[key.as_str()] = value;
+        }
+        let mut config = base_config();
+        config["providers"][0]["client_auth"] = client_auth;
+        config
+    };
+
+    for field in ["private_key_jwt_alg", "private_key_jwt_kid"] {
+        let expected = format!("oidc_relying_party: `client_auth.{field}` must be a string");
+        for bad in [
+            json!(123),
+            json!(true),
+            json!(["ES384"]),
+            json!({ "alg": "ES384" }),
+        ] {
+            // The schema types the field regardless of the selected method, so
+            // a non-`private_key_jwt` client refuses it too.
+            for method in [Some("private_key_jwt"), Some("client_secret_basic"), None] {
+                let config = config_with(method, json!({ field: bad.clone() }));
+                let result = validate_plugin_config("oidc_relying_party", &config);
+                let Err(error) = result else {
+                    panic!("{field}={bad} with method={method:?} must be rejected at admission");
+                };
+                assert!(
+                    error.contains(&expected),
+                    "{field}={bad} with method={method:?}: expected {expected:?}, got: {error}"
+                );
+            }
+        }
+    }
+
+    let admitted = [
         ("omitted alg and kid", json!({})),
-        ("numeric alg", json!({"private_key_jwt_alg": 123})),
         ("null alg", json!({"private_key_jwt_alg": null})),
-        ("numeric kid", json!({"private_key_jwt_kid": 123})),
         ("null kid", json!({"private_key_jwt_kid": null})),
         (
             "string alg and kid",
             json!({"private_key_jwt_alg": "RS256", "private_key_jwt_kid": "k1"}),
         ),
     ];
-    for (label, extra) in cases {
-        let mut client_auth = json!({
-            "method": "private_key_jwt",
-            "private_key_pem": RSA_PEM
-        });
-        let extra_fields = extra.as_object().expect("object").clone();
-        for (key, value) in extra_fields {
-            client_auth[key.as_str()] = value;
-        }
-        let mut config = base_config();
-        config["providers"][0]["client_auth"] = client_auth;
+    for (label, extra) in admitted {
+        let config = config_with(Some("private_key_jwt"), extra);
         let result = validate_plugin_config("oidc_relying_party", &config);
         assert!(result.is_ok(), "{label} must be admitted, got: {result:?}");
     }
