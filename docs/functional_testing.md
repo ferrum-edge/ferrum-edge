@@ -499,30 +499,36 @@ spawners that do not go through `TestGateway` should call
 `pin_gateway_command_rust_log`.
 
 The same barrier is mandatory for suites that keep a bespoke spawner
-instead of `TestGatewayBuilder`. `functional_websocket_test.rs` binds its
-`wait_for_owned_gateway` to the child through the shared
-`wait_for_child_gateway_readiness`, because a bare TCP accept let an
-unrelated H2 fixture that had claimed the released proxy port answer the
-RFC 8441 Extended CONNECT handshake and reset it with `PROTOCOL_ERROR`
-(issue #3435).
+instead of `TestGatewayBuilder`. Each bespoke spawner mints a
+`SpawnedGatewayIdentity` per spawn attempt, applies it to the `Command`
+(`apply_to_command`: admin JWT secret and issuer plus
+`FERRUM_METRICS_BEARER_TOKEN`), and waits on
+`wait_for_owned_gateway_identity(child, admin_port, &identity, timeout)`:
+ready `/health`, HTTP 200 from JWT-only `GET /proxies` under that attempt's
+admin JWT, and `Child::try_wait` around both. `/health` detail alone is not
+enough: `FERRUM_METRICS_ALLOWED_CIDRS` grants it to any caller from an allowed
+source, so a foreign gateway configured that way would satisfy a token-only
+probe (issue #7076). `functional_websocket_test.rs` is the original case: a bare
+TCP accept let an unrelated H2 fixture that had claimed the released proxy port
+answer the RFC 8441 Extended CONNECT handshake and reset it with
+`PROTOCOL_ERROR` (issue #3435).
 
-Bespoke spawners that do not mint a `SpawnedGatewayIdentity` take the
-explicit health-only alternative through two shared helpers in
-`tests/common/gateway_harness.rs`, and keep their timeout and second stage
-visible at the call site:
+Each site keeps its timeout and second stage visible in a local
+`wait_for_owned_gateway`, pinned by
+`tests/unit/gateway_core/bespoke_spawner_readiness_contract_tests.rs`:
 
-- `wait_for_child_gateway_readiness(child, admin_port, token, timeout)` is
-  the wait `TestGateway` uses when admin-auth verification is off:
-  authenticated `/health` `ready: true`, with `Child::try_wait` before every
-  probe and after success. It is readiness, not JWT ownership.
 - `wait_for_child_tcp_accept(child, port, deadline)` is an optional second
-  stage: a TCP accept on a listener port, with `Child::try_wait` before every
-  connect and after a successful one, spending what is left of the same
-  absolute deadline.
-
-Suites whose listeners treat any accepted socket as real traffic
-(passthrough, scripted UDP) and `functional_overload_test.rs` use only the
-first stage. `functional_grpc_test.rs` keeps its own h2c probe.
+  stage after the ownership barrier: a TCP accept on a listener port, with
+  `Child::try_wait` before every connect and after a successful one, spending
+  what is left of the same absolute deadline.
+- Suites whose listeners treat any accepted socket as real traffic
+  (passthrough, scripted UDP) and `functional_overload_test.rs` use only the
+  ownership barrier. `functional_grpc_test.rs` follows it with its own
+  child-bound h2c probe on a separate 15 s budget.
+- `wait_for_child_gateway_readiness(child, admin_port, token, timeout)` remains
+  the explicit health-only alternative, for a spawner whose scenario cannot
+  enable admin-auth verification. No bespoke spawner uses it today; a new one
+  needs a row with a reason in the contract test.
 
 ## Spawned Gateway Teardown
 
@@ -542,6 +548,19 @@ so teardown is a property of scope rather than of reaching the last line.
 which starts a real gateway, proves it relays, then panics inside
 `catch_unwind` and asserts both that the child is reaped and that its ports are
 bindable again.
+
+Teardown also decides whether a coverage run sees the suite at all: a gateway
+killed with SIGKILL writes no LLVM profile. `shutdown()` goes through
+`shutdown_gateway_child`, which sends SIGTERM and waits a grace period when
+`LLVM_PROFILE_FILE` is set, so do not hand-roll `child.kill()` in a spawner or
+its `Drop`; call `configure_coverage_gateway_command(&mut cmd)` right after
+`Command::new` so the drain fits that grace period. A bespoke spawner also sets
+`FERRUM_TLS_MANAGED_STORE_PATH` to a directory in a temp dir that outlives the
+child (issue #5706), and leases its handoff ports with
+`scaffolding::ports::unbound_port` rather than binding `127.0.0.1:0` and
+dropping the listener, which lands inside the ephemeral source range.
+`tests/unit/gateway_core/bespoke_spawner_lifecycle_contract_tests.rs` pins these
+rules for every spawner migrated in issue #7077.
 
 ## Host-Dependent Socket Fixtures
 

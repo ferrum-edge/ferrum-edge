@@ -37,15 +37,6 @@ fn write_config(path: &std::path::Path, content: &str) {
     std::fs::write(path, content).expect("write config");
 }
 
-/// Per-spawn `FERRUM_METRICS_BEARER_TOKEN` so authenticated `/health` can prove
-/// this child owns the admin port (issue #4373 / #3428). Never logged.
-fn mint_observability_token() -> String {
-    format!(
-        "ferrum-edge-scripted-udp-probe-{}",
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
 /// Spawn the gateway subprocess with stream-proxy-specific env vars.
 /// `Stdio::null()` for stdout per CLAUDE.md functional-test rule;
 /// `Stdio::piped()` causes deadlock if not drained.
@@ -54,19 +45,26 @@ fn mint_observability_token() -> String {
 /// can grep log output.
 ///
 /// Identity env is applied after `extra_env` so a caller (or leaked parent
-/// shell) cannot replace this attempt's token or open a CIDR allowlist that
-/// would let a foreign listener answer the authenticated `/health` tier.
+/// shell) cannot replace this attempt's credentials or open a CIDR allowlist
+/// that would let a foreign listener answer the authenticated `/health` tier.
 fn spawn_gateway(
     config_path: &str,
     proxy_http_port: u16,
     admin_port: u16,
     extra_env: &[(&str, String)],
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
     capture_paths: Option<(&std::path::Path, &std::path::Path)>,
-) -> std::io::Result<std::process::Child> {
+) -> std::io::Result<crate::common::GatewayChildGuard> {
     let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
+        // Keep any managed-TLS store out of the checkout (issue #5706): the
+        // config file lives in the attempt's TempDir, which outlives this child.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
@@ -88,8 +86,8 @@ fn spawn_gateway(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
-        .env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
+    identity.apply_to_command(&mut cmd);
+    cmd.env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
     match capture_paths {
         Some((stdout_path, stderr_path)) => {
             cmd.stdout(std::process::Stdio::from(std::fs::File::create(
@@ -104,7 +102,7 @@ fn spawn_gateway(
                 .stderr(std::process::Stdio::null());
         }
     }
-    cmd.spawn()
+    Ok(crate::common::GatewayChildGuard::new(cmd.spawn()?))
 }
 
 /// Wait until `child` owns its admin listener and reports fully ready.
@@ -116,38 +114,41 @@ fn spawn_gateway(
 /// Connecting that UDP port as a readiness probe would look like real
 /// traffic, so authenticated `ready: true` is the barrier.
 ///
-/// Barrier (`TestGateway`'s health-only path, via the shared
-/// `wait_for_child_gateway_readiness`; not JWT ownership):
+/// Barrier (`TestGateway`'s JWT ownership path, via the shared
+/// `wait_for_owned_gateway_identity`):
 /// 1. `Child::try_wait` before every probe and after the successful one — a
 ///    dead child voids the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token
-///    with `ready: true`.
+///    with `ready: true`, AND HTTP 200 from JWT-only `GET /proxies` under this
+///    attempt's admin JWT. `/health` detail alone can be granted to a foreign
+///    gateway by `FERRUM_METRICS_ALLOWED_CIDRS`; the JWT cannot (issue #7076).
 ///
 /// A successful response from a foreign or previous listener cannot admit this
 /// attempt once this child has exited.
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-    crate::common::wait_for_child_gateway_readiness(
-        child,
-        admin_port,
-        observability_token,
-        STARTUP_TIMEOUT,
-    )
-    .await
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await
 }
 
 /// Include the bounded, redacted capture tail in spawn-failure errors.
-/// Tokens are never logged.
+/// Attempt credentials are never logged.
 fn attempt_failure_detail(
     error: &str,
     capture_paths: &Option<(std::path::PathBuf, std::path::PathBuf)>,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> String {
-    let error = error.replace(observability_token, "***");
+    let secrets = [
+        identity.observability_token.as_str(),
+        identity.jwt_secret.as_str(),
+    ];
+    let error = secrets.iter().fold(error.to_string(), |text, secret| {
+        text.replace(secret, "***")
+    });
     let Some((stdout, stderr)) = capture_paths else {
         return error;
     };
@@ -165,7 +166,7 @@ fn attempt_failure_detail(
     }
     format!(
         "{error}\n--- captured gateway output ---\n{}",
-        crate::common::scrub_gateway_capture_for_diagnostics(&combined, &[observability_token])
+        crate::common::scrub_gateway_capture_for_diagnostics(&combined, &secrets)
     )
 }
 
@@ -216,14 +217,14 @@ where
         } else {
             None
         };
-        let observability_token = mint_observability_token();
+        let identity = crate::common::SpawnedGatewayIdentity::mint("scripted-udp");
 
         let mut child = match spawn_gateway(
             config_path.to_str().unwrap(),
             proxy_http_port,
             admin_port,
             &extra_env,
-            &observability_token,
+            &identity,
             capture_paths
                 .as_ref()
                 .map(|(o, e)| (o.as_path(), e.as_path())),
@@ -235,7 +236,7 @@ where
             }
         };
 
-        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
+        match wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
             Ok(()) => {
                 return GatewayFixture {
                     child: Some(child),
@@ -247,17 +248,12 @@ where
                 };
             }
             Err(error) => {
-                last_err = attempt_failure_detail(
-                    &error.to_string(),
-                    &capture_paths,
-                    &observability_token,
-                );
+                last_err = attempt_failure_detail(&error.to_string(), &capture_paths, &identity);
                 eprintln!(
                     "scripted UDP gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
                      (udp={udp_port}, admin={admin_port}, http={proxy_http_port}): {last_err}"
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                child.shutdown();
             }
         }
     }
@@ -267,7 +263,9 @@ where
 }
 
 struct GatewayFixture {
-    child: Option<std::process::Child>,
+    /// Reaped on drop by the guard (issue #4991); declared first so the
+    /// gateway is shut down before its temp dir is removed.
+    child: Option<crate::common::GatewayChildGuard>,
     udp_port: u16,
     #[allow(dead_code)] // Kept for test diagnostics even when the test only uses `udp_port`.
     admin_port: u16,
@@ -316,30 +314,23 @@ impl GatewayFixture {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        let Some(pid) = child.id() else {
+            return;
+        };
         let _ = std::process::Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
+            .args(["-TERM", &pid.to_string()])
             .status();
         // Bound the wait so a hung gateway can't stall the test
-        // forever; SIGKILL after the deadline as a final fallback.
+        // forever; the guard's shutdown is the final fallback.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            match child.try_wait() {
+            match child.child_mut().try_wait() {
                 Ok(Some(_)) => return,
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 Err(_) => break,
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-impl Drop for GatewayFixture {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        child.shutdown();
     }
 }
 
