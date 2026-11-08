@@ -2714,6 +2714,14 @@ pub mod _test_support {
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(duration)
     }
 
+    pub fn grpc_deadline_parse_grpc_timeout_for_test(value: &str) -> Option<std::time::Duration> {
+        crate::plugins::grpc_deadline::parse_grpc_timeout(value)
+    }
+
+    pub fn grpc_proxy_parse_grpc_timeout_value_for_test(value: &str) -> Option<u64> {
+        crate::proxy::grpc_proxy::parse_grpc_timeout_value(value)
+    }
+
     pub fn apply_remaining_grpc_timeout_header_for_test(
         headers: &mut hyper::HeaderMap,
         deadline: tokio::time::Instant,

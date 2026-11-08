@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **Stream lane refusals name the route's protocol; proxy `grpc-timeout`
+  rounds sub-millisecond values up** (issue #7072). A per-port load-balancing
+  refusal (`LEAST_LATENCY`, or a non-source-IP `hash_on`) now names the
+  route's own scheme (`tcp`, `tcps`, `udp` or `dtls`) instead of always
+  saying "TCP" or "UDP". The proxy's own `grpc-timeout` reader (the gRPC
+  streaming timeout and upload-bound selection) now uses the `grpc_deadline`
+  parser and rounds `u`/`n` values up to the next millisecond instead of down,
+  matching the receipt-anchored request deadline: `1500u` is 2 ms on every
+  path (that reader used to see 1 ms).
 - **`ferrum-gateway` chart: IPv4-mapped admin binds and allowlist entries
   follow the runtime** (issue #7078; the mesh chart got the same fixes in
   `4fb5df58f`). With `admin.bindAddress: "::ffff:127.0.0.2"` and the default
