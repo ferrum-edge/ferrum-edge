@@ -1772,6 +1772,7 @@ fn single_content_type_media_types_are_still_accepted() {
             "application/grpc",
             // A comma inside a quoted parameter value separates nothing.
             r#"multipart/form-data; boundary="a,b""#,
+            r#"multipart/form-data; boundary="a,application/grpc-web,b""#,
             r#"text/plain; a="esc \" , b""#,
         ] {
             let headers = headers_with_content_type(&[value]);

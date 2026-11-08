@@ -16876,9 +16876,11 @@ async fn relabel_to_grpc_web_is_refused_unless_this_request_was_translated() {
 /// value (`application/json, application/grpc-web+proto`), which a backend
 /// resolving the singleton field to its last member reads as gRPC-Web. The
 /// ingress protocol guard refuses the two lines with `400`; behind it, the
-/// end-of-pass check treats any gRPC-Web member (or any list) as a gRPC-Web
-/// relabel and refuses it with `415` on an untranslated assertion route. A
-/// single JSON type, a route owning no assertion, and translated gRPC-Web pass.
+/// end-of-pass check treats any list of media types, or a single type whose
+/// essence is gRPC-Web, as a gRPC-Web relabel and refuses it with `415` on an
+/// untranslated assertion route. A single JSON type, a quoted multipart
+/// boundary holding a gRPC-Web-looking token, a route owning no assertion,
+/// and translated gRPC-Web pass.
 #[tokio::test]
 async fn a_joined_content_type_with_a_grpc_web_member_is_refused_on_assertion_routes() {
     let joined = "application/json, application/grpc-web+proto";
@@ -16888,9 +16890,20 @@ async fn a_joined_content_type_with_a_grpc_web_member_is_refused_on_assertion_ro
     let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], listed).await;
     assert_eq!(status, Some(415), "non-singleton media type");
 
+    // A gRPC-Web essence is gRPC-Web whatever its parameters (an invalid one
+    // here), in any case.
+    let essence = "Application/GRPC-Web+proto; charset";
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], essence).await;
+    assert_eq!(status, Some(415), "untranslated gRPC-Web essence");
+
     let json = "application/json";
     let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], json).await;
     assert_eq!(status, None, "single JSON type");
+    // Parameter values are never inspected: a quoted boundary holding a
+    // gRPC-Web-looking token is one multipart media type.
+    let multipart = r#"multipart/form-data; boundary="a,application/grpc-web,b""#;
+    let status = before_proxy_funnel_status(vec![claim_owning_jwks(true)], multipart).await;
+    assert_eq!(status, None, "quoted boundary");
     let status = before_proxy_funnel_status(vec![claim_owning_jwks(false)], joined).await;
     assert_eq!(status, None, "route owning no assertion");
     let translated = vec![claim_owning_jwks(true), grpc_web_translator()];

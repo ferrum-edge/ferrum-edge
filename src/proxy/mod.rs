@@ -33857,15 +33857,23 @@ fn outbound_content_type_is_grpc_web(headers: &HashMap<String, String>) -> bool 
     })
 }
 
-/// Whether a backend may read the `content-type` value as gRPC-Web: it names a
-/// gRPC-Web media type, any comma-separated member does (a materialized pair
-/// of client field lines is `", "`-joined, and a backend may resolve the
-/// singleton field to any member), or it is not a single media type at all.
+/// Whether a backend may read the `content-type` value as gRPC-Web.
+///
+/// A value listing more than one media type (a comma outside a properly closed
+/// quoted string, the same tokenizer as the ingress guard; a materialized pair
+/// of client field lines is `", "`-joined) always may, since a backend can
+/// resolve the singleton field to any member. Otherwise only the single media
+/// type's essence (the `type/subtype` before any `;`, trimmed, ASCII
+/// case-insensitive) is compared with the gRPC-Web media types: parameter
+/// values are never inspected, so a quoted `boundary` that merely contains a
+/// gRPC-Web-looking token is not gRPC-Web, and a gRPC-Web essence is gRPC-Web
+/// whatever its parameters.
 fn content_type_may_be_grpc_web(value: &str) -> bool {
-    media_type_value_is_list(value.as_bytes())
-        || value
-            .split(',')
-            .any(|member| crate::plugins::grpc_web::is_grpc_web_content_type(member.trim()))
+    if media_type_value_is_list(value.as_bytes()) {
+        return true;
+    }
+    let essence = value.split_once(';').map_or(value, |(essence, _)| essence);
+    crate::plugins::grpc_web::is_grpc_web_content_type(essence.trim())
 }
 
 fn untranslated_grpc_web_refusal() -> PluginResult {

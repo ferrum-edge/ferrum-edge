@@ -31,8 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header contains more than one media type`). Ordinary requests get `400`;
   native gRPC and gRPC-Web keep the existing protocol-error framing. On a
   route that owns gateway-asserted headers, an untranslated request whose
-  outbound `content-type` has any gRPC-Web member, or lists more than one
-  media type, is also refused with `415`.
+  outbound `content-type` lists more than one media type, or whose single
+  media type has a gRPC-Web essence (parameters ignored), is also refused with
+  `415`.
 - **A trigger-skipped instance still strips the gateway-owned request headers
   it owns.** `claim_headers` / `output_claim_headers` destinations on
   `jwks_auth`, `oauth2_introspection` and `oidc_relying_party` are documented
