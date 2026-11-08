@@ -33308,6 +33308,68 @@ fn boxed_finalize_reject_response<'a>(
     )
 }
 
+/// A post-`before_proxy` request-buffer capacity refusal on the native-gRPC
+/// branch (the buffered collect, a request-body transform, or the fail-closed
+/// publication could not be covered), committed through the same reject
+/// pipeline as the H1/H2 pre-dispatch transform refusal: the gateway capacity
+/// terminal is marked first, so reject-path `after_proxy` decorators (CORS for
+/// a translated gRPC-Web browser client) run while no replacer or body coding
+/// can restate it; the committed-response hooks run; gRPC-Web is framed once;
+/// and the rejection is logged and counted once. The caller has already
+/// dropped the body and its charge and released the probe and admission.
+/// Constructed out of line and returned boxed, for the reason documented on
+/// [`boxed_finalize_reject_response`].
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_finalize_request_buffer_capacity_rejection<'a>(
+    plugins: &'a [Arc<dyn Plugin>],
+    ctx: &'a mut RequestContext,
+    state: &'a ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    request_path: Option<&'a str>,
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&'a str>,
+) -> BoxedRejectionResponseFuture<'a> {
+    Box::pin(async move {
+        ctx.mark_gateway_capacity_response_selected();
+        let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+            plugins,
+            ctx,
+            StatusCode::SERVICE_UNAVAILABLE,
+            Bytes::from(response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY),
+            request_buffer_capacity_reject_headers(is_grpc_request),
+            is_grpc_request,
+            grpc_web_response_content_type.is_none(),
+        )
+        .await;
+        apply_grpc_reject_metadata(ctx, &normalized);
+        let grpc_web_response = build_grpc_web_reject_response(
+            plugins,
+            ctx,
+            grpc_web_response_content_type,
+            &normalized,
+        )
+        .await;
+        log_rejected_request_with_path(
+            plugins,
+            ctx,
+            normalized.http_status.as_u16(),
+            start_time,
+            finalized_request_rejection_phase(false),
+            plugin_execution_ns,
+            request_path,
+        )
+        .await;
+        ctx.terminal_record.mark_counted();
+        record_request(state, normalized.http_status.as_u16());
+        if let Some(response) = grpc_web_response {
+            return response;
+        }
+        build_response_from_normalized_reject(normalized)
+    })
+}
+
 /// Rejection phase logged for a route total that elapsed while an early
 /// (pre-`before_proxy`) collector was still buffering the upload (issue #6008).
 pub(crate) const EARLY_ROUTE_UPLOAD_TIMEOUT_REJECTION_PHASE: &str =
@@ -40446,14 +40508,17 @@ async fn handle_proxy_request_inner(
                         Err(grpc_proxy::GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
                             cb_probe.release_neutral();
                             drop(preacquired_backend_admission.take_if_acquired());
-                            let response = build_request_buffer_capacity_response(
+                            return Ok(boxed_finalize_request_buffer_capacity_rejection(
+                                &plugins,
+                                &mut ctx,
+                                &state,
+                                start_time,
+                                plugin_execution_ns,
+                                Some(&original_request_path),
                                 true,
                                 grpc_web_response_content_type,
-                                initial_response_header_policy_plugins.as_ref(),
-                            );
-                            ctx.terminal_record.mark_counted();
-                            record_request(&state, response.status().as_u16());
-                            return Ok(response);
+                            )
+                            .await);
                         }
                         Err(grpc_proxy::GrpcRequestBodyCollectError::ClientDisconnected) => {
                             // The client reset or dropped its upload (issue
@@ -40550,16 +40615,23 @@ async fn handle_proxy_request_inner(
                 (Err(RequestBodyCapacityExceeded), _) => None,
             };
             let Some(grpc_req_body) = grpc_req_body else {
+                // The chain dropped the body and released its charge; the hook
+                // context (and any decode charge staged on it) goes too, before
+                // the refusal's hooks await.
+                drop(deferred_body_hook_ctx.take());
                 cb_probe.release_neutral();
                 drop(preacquired_backend_admission.take_if_acquired());
-                let response = build_request_buffer_capacity_response(
+                return Ok(boxed_finalize_request_buffer_capacity_rejection(
+                    &plugins,
+                    &mut ctx,
+                    &state,
+                    start_time,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
                     true,
                     grpc_web_response_content_type,
-                    initial_response_header_policy_plugins.as_ref(),
-                );
-                ctx.terminal_record.mark_counted();
-                record_request(&state, response.status().as_u16());
-                return Ok(response);
+                )
+                .await);
             };
             // Count gRPC messages from the transformed, backend-visible body —
             // NOT the client wire bytes recorded into `bytes_sent_observed`
@@ -41007,14 +41079,17 @@ async fn handle_proxy_request_inner(
                             let Some(grpc_req_body) = grpc_req_body else {
                                 cb_probe.release_neutral();
                                 drop(preacquired_backend_admission.take_if_acquired());
-                                let response = build_request_buffer_capacity_response(
+                                return Ok(boxed_finalize_request_buffer_capacity_rejection(
+                                    &plugins,
+                                    &mut ctx,
+                                    &state,
+                                    start_time,
+                                    plugin_execution_ns,
+                                    Some(&original_request_path),
                                     true,
                                     grpc_web_response_content_type,
-                                    initial_response_header_policy_plugins.as_ref(),
-                                );
-                                ctx.terminal_record.mark_counted();
-                                record_request(&state, response.status().as_u16());
-                                return Ok(response);
+                                )
+                                .await);
                             };
                             Ok((buffered.method, buffered.headers, grpc_req_body))
                         }
@@ -41168,14 +41243,17 @@ async fn handle_proxy_request_inner(
                     Err(grpc_proxy::GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
                         cb_probe.release_neutral();
                         drop(preacquired_backend_admission.take_if_acquired());
-                        let response = build_request_buffer_capacity_response(
+                        return Ok(boxed_finalize_request_buffer_capacity_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            plugin_execution_ns,
+                            Some(&original_request_path),
                             true,
                             grpc_web_response_content_type,
-                            initial_response_header_policy_plugins.as_ref(),
-                        );
-                        ctx.terminal_record.mark_counted();
-                        record_request(&state, response.status().as_u16());
-                        return Ok(response);
+                        )
+                        .await);
                     }
                     // A client reset mid-upload is the client's CANCELLED, never
                     // a dispatch error charged through the retry loop (issue

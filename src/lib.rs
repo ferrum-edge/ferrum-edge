@@ -17283,7 +17283,7 @@ pub mod _test_support {
             self.0.len() == 0
         }
 
-        /// Capacity the charge currently covers, in whole blocks.
+        /// Capacity the charge currently covers, in bytes.
         pub fn reserved_bytes(&self) -> usize {
             self.0.reserved_bytes()
         }

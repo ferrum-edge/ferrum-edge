@@ -688,7 +688,8 @@ fn every_request_body_publication_fails_closed() {
         let handling: String = publication.chars().take(1_200).collect();
         assert!(
             handling.contains("request_buffer_capacity_backend_response(")
-                || handling.contains("build_request_buffer_capacity_response("),
+                || handling.contains("build_request_buffer_capacity_response(")
+                || handling.contains("boxed_finalize_request_buffer_capacity_rejection("),
             "a request-body publication must answer the capacity terminal when the budget \
              cannot cover the body"
         );
@@ -1475,8 +1476,9 @@ async fn a_native_grpc_upload_the_budget_cannot_cover_is_a_capacity_refusal() {
 fn both_native_grpc_collects_answer_a_capacity_refusal_before_dispatch() {
     // The buffered native-gRPC collect's capacity refusal keeps its own type
     // and is answered with the same gateway-local capacity terminal as every
-    // other buffered request, before dispatch: it never becomes a
-    // `GrpcProxyError` that the retry loop or the backend classifier sees.
+    // other buffered request, before dispatch, through the reject pipeline
+    // (round 14): it never becomes a `GrpcProxyError` that the retry loop or
+    // the backend classifier sees.
     let proxy = include_str!("../../../src/proxy/mod.rs");
     let arms: Vec<&str> = proxy
         .split("Err(grpc_proxy::GrpcRequestBodyCollectError::BufferCapacityExceeded) => {")
@@ -1488,8 +1490,8 @@ fn both_native_grpc_collects_answer_a_capacity_refusal_before_dispatch() {
         "the split and the mixed native-gRPC collects"
     );
     for arm in arms {
-        let arm = &arm[..arm.find("return Ok(response);").expect("bounded arm")];
-        assert!(arm.contains("build_request_buffer_capacity_response("));
+        let arm = &arm[..arm.find(".await);").expect("bounded arm")];
+        assert!(arm.contains("boxed_finalize_request_buffer_capacity_rejection("));
         assert!(arm.contains("cb_probe.release_neutral();"));
         assert!(!arm.contains("GrpcProxyError"));
     }
@@ -1522,6 +1524,36 @@ fn every_request_buffer_capacity_refusal_selects_the_gateway_capacity_terminal()
     assert_eq!(
         reject_pipeline_sites, 3,
         "a new reject-pipeline capacity refusal must be added to this guard"
+    );
+    // The native-gRPC capacity refusals share one reject-pipeline helper,
+    // which marks before its reject hooks run.
+    let native = proxy
+        .split("fn boxed_finalize_request_buffer_capacity_rejection<'a>(")
+        .nth(1)
+        .expect("native-gRPC capacity refusal helper")
+        .split("\n}\n")
+        .next()
+        .expect("bounded helper");
+    let marked = native.find(MARK).expect("helper marks the terminal");
+    let hooks = native
+        .find("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+        .expect("reject-path hooks");
+    assert!(marked < hooks);
+    for call in [
+        "apply_grpc_reject_metadata(",
+        "build_grpc_web_reject_response(",
+        "log_rejected_request_with_path(",
+        "ctx.terminal_record.mark_counted();",
+        "record_request(state,",
+    ] {
+        assert!(native.contains(call), "the helper must use `{call}`");
+    }
+    assert_eq!(
+        proxy
+            .matches("return Ok(boxed_finalize_request_buffer_capacity_rejection(")
+            .count(),
+        4,
+        "both native-gRPC collects, the split transform and the mixed publication"
     );
     // Dispatch-stage refusals reach the response pipeline as a backend
     // response, which marks them before any response hook.
