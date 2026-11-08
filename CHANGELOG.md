@@ -367,8 +367,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary while being recorded as failover writes, fencing the next failback
   onto a failover database that did not have them. Deferred migrations now run
   on the newly connected pool before it is published, so after a failure the
-  previous pool and topology are still in place. `mark_primary` now requires
-  the permit that the failback-fence check returns; the permit is revalidated
+  previous pool and topology are still in place. Primary publication now
+  requires the permit that the failback-fence check returns; the permit is revalidated
   right before the primary pool or connection is published, so an Admin write
   admitted on failover in the meantime aborts the failback with nothing
   published. The fence is never cleared by a failback. Since #7061 the status

@@ -865,13 +865,19 @@ fn failover_topology_publication_is_one_consistent_cut_under_concurrency() {
 
     let state = Arc::new(DbFailoverTopologyState::new(true));
     let done = Arc::new(AtomicBool::new(false));
+    // Every observer and the toggler must be running before publication
+    // starts, so they overlap it; each observer also samples at least once
+    // before it checks for completion.
+    let start = Arc::new(std::sync::Barrier::new(6));
     let observers: Vec<_> = (0..4)
         .map(|_| {
             let state = Arc::clone(&state);
             let done = Arc::clone(&done);
+            let start = Arc::clone(&start);
             std::thread::spawn(move || {
+                start.wait();
                 let mut observed = 0u64;
-                while !done.load(Ordering::Acquire) {
+                loop {
                     let (on_primary_handle, status) = state.handle_and_status();
                     assert_eq!(
                         on_primary_handle, status.primary_active,
@@ -893,6 +899,9 @@ fn failover_topology_publication_is_one_consistent_cut_under_concurrency() {
                         );
                     }
                     observed += 1;
+                    if done.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
                 observed
             })
@@ -901,13 +910,16 @@ fn failover_topology_publication_is_one_consistent_cut_under_concurrency() {
     let noter = {
         let state = Arc::clone(&state);
         let done = Arc::clone(&done);
+        let start = Arc::clone(&start);
         std::thread::spawn(move || {
+            start.wait();
             while !done.load(Ordering::Acquire) {
                 state.set_allow_writes(true);
                 state.set_allow_writes(false);
             }
         })
     };
+    start.wait();
     for _ in 0..2_000 {
         state.publish_failover(false, "db://failover");
         let permit = state

@@ -8785,13 +8785,6 @@ impl DatabaseStore {
         // Nothing below can fail: the pool and its topology are published
         // together under this same lock.
 
-        // Disable and close the configured primary-topology replica before
-        // exposing a failover pool. Keeping the dormant pool would make it
-        // look immediately available on failback and skip the one reconnect
-        // that refreshes its connections after the topology transition.
-        if topology == DatabaseTopology::Failover {
-            self.suppress_read_replica_pool();
-        }
         // A replica only serves reads while the primary is published, so a
         // fresh one is installed before the publication that activates it.
         if let Some(new_replica) = new_replica {
@@ -8818,6 +8811,17 @@ impl DatabaseStore {
                 .failover_topology
                 .publish_failover(new_pool, &Self::redact_url(db_url)),
         };
+        // Disable and close the configured primary-topology replica once the
+        // failover topology is published. Keeping the dormant pool would make
+        // it look immediately available on failback and skip the one
+        // reconnect that refreshes its connections after the transition.
+        // Suppressing AFTER publication closes the race with a concurrent
+        // `reconnect_read_replica`: one that installed its pool before this
+        // point is removed here, and one that installs later sees failover
+        // topology in its own post-install check and removes itself.
+        if topology == DatabaseTopology::Failover {
+            self.suppress_read_replica_pool();
+        }
         self.topology_epoch
             .store(next_topology_epoch, Ordering::Release);
         info!(
