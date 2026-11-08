@@ -81,7 +81,7 @@ use super::charged_decode::{ChargedDecodeError, decode_charged_content_coding_ch
 use super::utils::content_encoding::{DecodeLimits, parse_content_codings_including_zstd};
 use super::{Plugin, PluginResult, RequestContext};
 use crate::proxy::response_buffer_budget::{
-    BudgetRef, REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_STATUS,
+    BudgetRef, DecodeChargeHold, REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_STATUS,
     ResponseBufferReservation, hand_off_replacement_decode_charge,
 };
 
@@ -991,7 +991,7 @@ impl CompressionPlugin {
                     *body = decompressed;
                     // The plaintext stays charged by its decode until the
                     // buffered-request charge covers it.
-                    hand_off_replacement_decode_charge(decode_charge);
+                    hand_off_replacement_decode_charge(DecodeChargeHold::new(decode_charge));
                 } else {
                     // Fallback path: headers are stripped only after staging the
                     // validated plaintext for the later body transform.
@@ -1000,7 +1000,13 @@ impl CompressionPlugin {
                         decompressed.len(),
                         marker
                     );
-                    ctx.set_compression_staged_request_plaintext(decompressed);
+                    // The staged plaintext keeps its decode charge until the
+                    // owning transform emits it and the buffered-request
+                    // charge covers it.
+                    ctx.set_compression_staged_request_plaintext(
+                        decompressed,
+                        DecodeChargeHold::new(decode_charge),
+                    );
                 }
                 ctx.metadata
                     .insert(REQUEST_DECODED_METADATA_KEY.to_string(), marker);
@@ -1607,7 +1613,7 @@ impl CompressionPlugin {
             Ok((decompressed, decode_charge)) => {
                 // The plaintext stays charged by its decode until the
                 // buffered-request charge covers the replacement.
-                hand_off_replacement_decode_charge(decode_charge);
+                hand_off_replacement_decode_charge(DecodeChargeHold::new(decode_charge));
                 debug!(
                     "compression: decompressed request body from {} to {} bytes",
                     raw_len,
@@ -2819,7 +2825,10 @@ impl Plugin for CompressionPlugin {
         }
         // Fallback path staged validated plaintext when headers were stripped
         // without a mutable body view. Emit those bytes; never re-decode.
-        if let Some(plaintext) = ctx.take_compression_staged_request_plaintext() {
+        if let Some((plaintext, decode_charge)) = ctx.take_compression_staged_request_plaintext() {
+            // Charged by its decode until the buffered-request charge covers
+            // the emitted body.
+            hand_off_replacement_decode_charge(decode_charge);
             return Some(plaintext);
         }
         // Early normalization already replaced the buffered body with validated

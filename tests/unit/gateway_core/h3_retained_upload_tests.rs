@@ -629,7 +629,10 @@ fn many_one_byte_uploads_hold_only_their_bytes_and_a_complete_upload_still_fits(
                 break;
             }
         }
-        assert!(fill.len() <= 4, "the budget must still bound retained bytes");
+        assert!(
+            fill.len() <= 4,
+            "the budget must still bound retained bytes"
+        );
     }
     drop((trickling, fill));
     assert_eq!(budget.available_bytes(), total);

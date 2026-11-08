@@ -524,6 +524,9 @@ fn blocks_for(retained_bytes: usize) -> u32 {
 /// capacity exactly.
 pub(crate) const REQUEST_RESERVATION_UNIT_BYTES: usize = 1;
 
+/// Units one tokio semaphore permit can hold (its count is a `u32`).
+const MAX_PERMIT_UNITS: usize = u32::MAX as usize;
+
 struct Budget {
     fallback_per_response_bytes: usize,
     /// Bytes one semaphore permit stands for: [`RESERVATION_UNIT_BYTES`] for
@@ -677,7 +680,10 @@ fn request_buffer_budget() -> &'static Budget {
 #[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
 pub(crate) fn init_request_buffer(fallback_per_request_bytes: usize, total_bytes: usize) {
     if REQUEST_BUFFER_BUDGET
-        .set(Budget::for_requests(fallback_per_request_bytes, total_bytes))
+        .set(Budget::for_requests(
+            fallback_per_request_bytes,
+            total_bytes,
+        ))
         .is_err()
     {
         tracing::warn!(
@@ -765,32 +771,29 @@ impl RequestBufferPermit {
 
     /// Grow the charge to cover `retained_bytes` without counting a refusal.
     /// Already-held permits are reused, so a growth the charge already covers
-    /// costs no semaphore operation. A growth larger than one acquisition can
-    /// take (`u32::MAX` permits) is acquired in parts, all or nothing.
+    /// costs no semaphore operation.
+    ///
+    /// One semaphore permit holds at most `u32::MAX` units, so a charge that
+    /// would need more is refused instead of wrapping the merged permit count.
+    /// The retained ceiling is capped below that ([`Budget::ceiling`]), so this
+    /// refusal is defence in depth.
     fn try_grow(&mut self, retained_bytes: usize) -> bool {
         let wanted = self.units_for(retained_bytes);
         if wanted <= self.units {
             return true;
         }
-        let mut missing = wanted - self.units;
-        let mut acquired: Option<OwnedSemaphorePermit> = None;
-        while missing > 0 {
-            let part = u32::try_from(missing).unwrap_or(u32::MAX);
-            // A refused part drops `acquired`, returning every earlier part.
-            let Ok(permit) = Arc::clone(&self.permits).try_acquire_many_owned(part) else {
-                return false;
-            };
-            match acquired.as_mut() {
-                Some(held) => held.merge(permit),
-                None => acquired = Some(permit),
-            }
-            missing -= part as usize;
+        if wanted > MAX_PERMIT_UNITS {
+            return false;
         }
-        if let Some(acquired) = acquired {
-            match self.permit.as_mut() {
-                Some(held) => held.merge(acquired),
-                None => self.permit = Some(acquired),
-            }
+        let Ok(missing) = u32::try_from(wanted - self.units) else {
+            return false;
+        };
+        let Ok(acquired) = Arc::clone(&self.permits).try_acquire_many_owned(missing) else {
+            return false;
+        };
+        match self.permit.as_mut() {
+            Some(held) => held.merge(acquired),
+            None => self.permit = Some(acquired),
         }
         self.units = wanted;
         true
@@ -928,11 +931,32 @@ pub(crate) fn charge_covers(charge: Option<&mut RequestBufferPermit>, capacity: 
     covered
 }
 
+/// A request-decode charge kept alive beside the decoded bytes it covers.
+///
+/// Shared by every clone of the request context that carries those bytes, so
+/// the charge is released only when the last holder drops it.
+#[derive(Clone, Default)]
+pub(crate) struct DecodeChargeHold(Option<Arc<ResponseBufferReservation>>);
+
+impl DecodeChargeHold {
+    pub(crate) fn new(charge: ResponseBufferReservation) -> Self {
+        Self(Some(Arc::new(charge)))
+    }
+}
+
+impl std::fmt::Debug for DecodeChargeHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeChargeHold")
+            .field("held", &self.0.is_some())
+            .finish()
+    }
+}
+
 tokio::task_local! {
     /// The decode working-set charge of a body a plugin just replaced with
     /// decoded plaintext, held until the buffered-request charge covers the
     /// replacement.
-    static REPLACEMENT_DECODE_CHARGE: std::cell::RefCell<Option<ResponseBufferReservation>>;
+    static REPLACEMENT_DECODE_CHARGE: std::cell::RefCell<Option<DecodeChargeHold>>;
 }
 
 /// Run one normalizer or request-body transform so that a decode working-set
@@ -946,7 +970,7 @@ tokio::task_local! {
 /// and drops the returned decode charge second.
 pub(crate) async fn with_replacement_decode_charge<F>(
     future: F,
-) -> (F::Output, Option<ResponseBufferReservation>)
+) -> (F::Output, Option<DecodeChargeHold>)
 where
     F: std::future::Future,
 {
@@ -963,7 +987,7 @@ where
 /// [`with_replacement_decode_charge`], which keeps it until the buffered-request
 /// charge covers the replacement. Outside such a scope it is simply released,
 /// exactly as before.
-pub(crate) fn hand_off_replacement_decode_charge(charge: ResponseBufferReservation) {
+pub(crate) fn hand_off_replacement_decode_charge(charge: DecodeChargeHold) {
     let _ = REPLACEMENT_DECODE_CHARGE.try_with(move |slot| {
         *slot.borrow_mut() = Some(charge);
     });
@@ -1156,11 +1180,22 @@ impl Budget {
     }
 
     fn ceiling(&self, effective_limit: usize) -> usize {
-        if effective_limit > 0 {
+        let ceiling = if effective_limit > 0 {
             effective_limit
         } else {
             self.fallback_per_response_bytes
-        }
+        };
+        ceiling.min(self.max_charge_bytes())
+    }
+
+    /// The largest single charge this budget can represent: one semaphore
+    /// permit holds at most `u32::MAX` units. That is 4 GiB - 1 for the
+    /// byte-granular request budget, so a single retained request body is
+    /// capped there and a larger upload is refused as too large rather than
+    /// overflowing the permit count; the block-granular budgets' bound
+    /// (256 TiB) is never reached.
+    fn max_charge_bytes(&self) -> usize {
+        self.unit_bytes.saturating_mul(MAX_PERMIT_UNITS)
     }
 }
 
@@ -2055,7 +2090,10 @@ impl IsolatedBudget {
     /// An isolated buffered-REQUEST budget, charged per byte exactly as the
     /// production one.
     pub(crate) fn new_request(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
-        Self(Budget::for_requests(fallback_per_request_bytes, total_bytes))
+        Self(Budget::for_requests(
+            fallback_per_request_bytes,
+            total_bytes,
+        ))
     }
 
     /// Currently unreserved capacity, in bytes.

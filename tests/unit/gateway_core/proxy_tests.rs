@@ -2313,7 +2313,7 @@ fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
 
     let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
     let collect = grpc
-        .split("pub(crate) async fn collect_grpc_request_body(")
+        .split("pub(crate) async fn collect_grpc_upload<B>(")
         .nth(1)
         .expect("buffered gRPC collect")
         .split("\n}\n")
@@ -2327,8 +2327,8 @@ fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
         collect
             .matches("grpc_request_body_client_disconnected(e.as_ref())")
             .count(),
-        2,
-        "both the size-limited and unlimited collects report a client disconnect"
+        1,
+        "the charged, bounded collect reports a client disconnect"
     );
 }
 

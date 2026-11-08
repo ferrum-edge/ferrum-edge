@@ -25,9 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uploads and sent no body could therefore hold the whole 256 MiB budget for
   a read timeout and get every other principal's buffered upload refused with
   `503`. The charge now grows with the bytes an upload actually retains,
-  byte for byte (a one-byte upload holds one byte, not a 64 KiB block),
+  byte for byte (a one-byte upload holds one byte, not a 64 KiB block; a
+  single retained body is capped at 4 GiB - 1 byte),
   taken before each growth of the buffer as the response-side budget already
-  does, on HTTP/1.1, HTTP/2, native HTTP/3 and the HTTP/3 bridges. An upload
+  does, on HTTP/1.1, HTTP/2, native HTTP/3, the HTTP/3 bridges and buffered
+  native gRPC (which previously took no charge at all, and with
+  `FERRUM_MAX_GRPC_RECV_SIZE_BYTES=0` was unbounded; it now folds to
+  `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` like every buffered collect). An upload
   that has sent nothing holds no budget. When the budget cannot cover a
   growth, the upload is refused with the same `503` / gRPC
   `RESOURCE_EXHAUSTED` as before, now after reading part of the body rather

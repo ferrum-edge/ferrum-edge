@@ -2093,12 +2093,13 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
         2,
         "a post-admission buffered upload arm reverted to the unbounded collect"
     );
-    // Both buffered native-gRPC collects.
+    // The one charged, bounded native-gRPC collect (a `0` limit folds to the
+    // buffered fallback ceiling, so there is no separate unbounded arm).
     assert_eq!(
         GRPC_PROXY_SOURCE
             .matches("collect_request_body_under_authorization(")
             .count(),
-        2,
+        1,
         "a buffered gRPC upload arm reverted to the unbounded collect"
     );
     // Every authorization arm returns the health-neutral placeholder, so the

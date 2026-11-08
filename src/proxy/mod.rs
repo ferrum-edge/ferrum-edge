@@ -40246,7 +40246,9 @@ async fn handle_proxy_request_inner(
         );
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
-            let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
+            // The body keeps its buffered-request charge through the transform
+            // below and is published with it afterwards.
+            let grpc_upload = match client_request_body {
                 ClientRequestBody::Streaming(request) => {
                     match grpc_proxy::collect_grpc_request_body(
                         *request,
@@ -40257,7 +40259,12 @@ async fn handle_proxy_request_inner(
                     )
                     .await
                     {
-                        Ok(parts) => parts,
+                        Ok(collected) => (
+                            collected.method,
+                            collected.headers,
+                            collected.body,
+                            Some(collected.charge),
+                        ),
                         Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
                             // `cb_probe` remains armed: returning drops it and
                             // releases the admitted HALF_OPEN slot exactly once,
@@ -40367,27 +40374,15 @@ async fn handle_proxy_request_inner(
                             initial_response_header_policy_plugins.as_ref(),
                         ));
                     }
-                    // A body a request-body plugin grew past what the budget
-                    // can cover is refused rather than retained uncharged.
-                    let grpc_req_body = match buffered.budget {
-                        Some(permit) => permit.into_charged_bytes(buffered.body),
-                        None => Some(Bytes::from(buffered.body)),
-                    };
-                    let Some(grpc_req_body) = grpc_req_body else {
-                        cb_probe.release_neutral();
-                        drop(preacquired_backend_admission.take_if_acquired());
-                        let response = build_request_buffer_capacity_response(
-                            true,
-                            grpc_web_response_content_type,
-                            initial_response_header_policy_plugins.as_ref(),
-                        );
-                        ctx.terminal_record.mark_counted();
-                        record_request(&state, response.status().as_u16());
-                        return Ok(response);
-                    };
-                    (buffered.method, buffered.headers, grpc_req_body)
+                    (
+                        buffered.method,
+                        buffered.headers,
+                        buffered.body,
+                        buffered.budget,
+                    )
                 }
             };
+            let (grpc_method, grpc_headers, grpc_req_body, mut grpc_body_charge) = grpc_upload;
 
             // Store body metadata for plugins that read via ctx.metadata
             let request_body_size_bytes = grpc_req_body.len().to_string();
@@ -40417,19 +40412,24 @@ async fn handle_proxy_request_inner(
                 .entry(":path".to_string())
                 .or_insert_with(|| path.clone());
             let grpc_deadline_at = ctx.grpc_deadline_at();
-            // The transform runs on a copy of the published body, which takes
-            // no request-buffer charge of its own (a documented follow-up), so
-            // the chain has no charge to refuse.
+            // Each replacement is charged before it is installed; an uncovered
+            // one is dropped with the body and its charge released inside the
+            // chain. The result is published with that charge, fail closed.
             let transformed = apply_request_body_plugins_with_context(
                 &plugins,
                 deferred_body_hook_ctx.as_mut(),
                 grpc_deadline_at,
                 &hook_headers,
-                grpc_req_body.to_vec(),
-                None,
+                grpc_req_body,
+                grpc_body_charge.as_mut(),
             )
             .await;
-            let Ok(transformed) = transformed else {
+            let grpc_req_body = match (transformed, grpc_body_charge) {
+                (Ok(transformed), Some(permit)) => permit.into_charged_bytes(transformed),
+                (Ok(transformed), None) => Some(Bytes::from(transformed)),
+                (Err(RequestBodyCapacityExceeded), _) => None,
+            };
+            let Some(grpc_req_body) = grpc_req_body else {
                 cb_probe.release_neutral();
                 drop(preacquired_backend_admission.take_if_acquired());
                 let response = build_request_buffer_capacity_response(
@@ -40441,7 +40441,6 @@ async fn handle_proxy_request_inner(
                 record_request(&state, response.status().as_u16());
                 return Ok(response);
             };
-            let grpc_req_body = bytes::Bytes::from(transformed);
             // Count gRPC messages from the transformed, backend-visible body —
             // NOT the client wire bytes recorded into `bytes_sent_observed`
             // above. A translated gRPC-Web request only becomes native
@@ -40858,7 +40857,7 @@ async fn handle_proxy_request_inner(
                 // trailers reach the client immediately when safe.
                 let collected = match client_request_body {
                     ClientRequestBody::Streaming(request) => {
-                        grpc_proxy::collect_grpc_request_body(
+                        grpc_proxy::collect_grpc_request_body_published(
                             *request,
                             effective_max_grpc_recv_size_bytes,
                             proxy.backend_read_timeout_ms,

@@ -1065,6 +1065,7 @@ fn every_body_replacement_is_charged_before_a_later_phase_keeps_it() {
     assert_eq!(count(proxy, "buffered.budget.as_mut(),\n"), 5);
     assert_eq!(count(proxy, "Some(&mut request_buffer_permit),\n"), 1);
     assert_eq!(count(proxy, "request_buffer_permit.as_mut(),\n"), 1);
+    assert_eq!(count(proxy, "grpc_body_charge.as_mut(),\n"), 1);
     assert_eq!(count(server, "retained_request_charge.as_mut(),\n"), 4);
     assert_eq!(count(bridge, "prebuffered_body_charge.as_mut(),\n"), 1);
     // A refusal that awaits a writer first drops the charge it still owns: the
@@ -1322,22 +1323,117 @@ async fn a_decoded_body_stays_charged_until_its_handed_off_charge_is_released() 
     let total = probe.available_bytes();
     let plaintext = compressible_plaintext();
     let compressed = gzip(&plaintext);
-    let handoff = decode_and_hand_off_charge_for_test(
-        &probe,
-        &["gzip".to_string()],
-        &compressed,
-        1_048_576,
-    )
-    .await
-    .expect("decoded");
+    let handoff =
+        decode_and_hand_off_charge_for_test(&probe, &["gzip".to_string()], &compressed, 1_048_576)
+            .await
+            .expect("decoded");
     assert!(
         total - handoff.available_after_decode >= handoff.plaintext_capacity,
         "the decoded plaintext must come back charged"
     );
     assert_eq!(
-        handoff.available_after_handoff,
-        handoff.available_after_decode,
+        handoff.available_after_handoff, handoff.available_after_decode,
         "the handed-off decode charge must still cover the unconsumed output"
     );
     assert_eq!(handoff.available_after_release, total);
+}
+
+// ---------------------------------------------------------------------------
+// 11. Permit-count bound, staged plaintext, and native gRPC.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn a_single_request_charge_is_capped_at_one_permit_without_wrapping() {
+    // One semaphore permit counts at most `u32::MAX` bytes. A larger charge is
+    // refused instead of wrapping the permit count (which would leak budget on
+    // release), and the retained ceiling is capped at that bound. Nothing is
+    // allocated: the budget is only semaphore arithmetic.
+    let max = u32::MAX as usize;
+    let budget = RequestBufferBudgetProbe::new(UNIT, 2 * max + 2);
+    let total = budget.available_bytes();
+    assert_eq!(budget.buffered_request_body_ceiling(2 * max), max);
+    assert!(budget.try_reserve(max + 1).is_none());
+    assert_eq!(budget.available_bytes(), total, "a refusal takes nothing");
+    let permit = budget.try_reserve(max).expect("one full permit");
+    assert_eq!(permit.reserved_bytes(), max);
+    assert_eq!(budget.available_bytes(), total - max);
+    drop(permit);
+    assert_eq!(budget.available_bytes(), total, "release returns it all");
+}
+
+#[tokio::test]
+async fn staged_decoded_plaintext_stays_charged_until_its_transform_emits_it() {
+    use ferrum_edge::_test_support::{ResponseBufferBudgetProbe, staged_decode_charge_for_test};
+    // `compression`'s fallback decode stages plaintext on the request context
+    // before the transform that emits it runs; its decode charge travels with
+    // it, survives context clones, and is handed to the replacement scope.
+    let probe = ResponseBufferBudgetProbe::new(UNIT, 16 * UNIT);
+    let total = probe.available_bytes();
+    let staged = staged_decode_charge_for_test(&probe, 3 * UNIT)
+        .await
+        .expect("staged");
+    assert_eq!(staged.available_while_staged, total - 3 * UNIT);
+    assert_eq!(
+        staged.available_after_clone_dropped, staged.available_while_staged,
+        "a dropped context clone must not release the staged charge"
+    );
+    assert_eq!(
+        staged.available_after_emit, staged.available_while_staged,
+        "the emitted plaintext stays charged until the buffered charge covers it"
+    );
+    assert_eq!(staged.available_after_release, total);
+}
+
+#[tokio::test]
+async fn a_stalled_native_grpc_upload_holds_only_its_bytes() {
+    use ferrum_edge::_test_support::{
+        GrpcChargedCollectOutcomeForTest, collect_grpc_upload_for_test,
+    };
+    let budget = two_ceiling_budget();
+    let total = budget.available_bytes();
+    let (tx, rx) = tokio::sync::mpsc::channel::<FrameResult>(1);
+    tx.send(data_frame(b"\0\0\0\0\x05hello".to_vec()))
+        .await
+        .expect("first frame");
+    let body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let mut collect = Box::pin(collect_grpc_upload_for_test(body, &budget, 4 * UNIT));
+    assert!(futures::poll!(collect.as_mut()).is_pending());
+    assert_eq!(
+        budget.available_bytes(),
+        total - 10,
+        "a stalled gRPC upload holds only the bytes it has sent"
+    );
+    drop(tx);
+    assert_eq!(
+        collect.await,
+        GrpcChargedCollectOutcomeForTest::Collected(10)
+    );
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[tokio::test]
+async fn a_native_grpc_upload_the_budget_cannot_cover_is_resource_exhausted() {
+    use ferrum_edge::_test_support::{
+        GrpcChargedCollectOutcomeForTest, collect_grpc_upload_for_test,
+    };
+    let budget = two_ceiling_budget();
+    let held = budget
+        .try_reserve(budget.available_bytes())
+        .expect("other uploads hold the budget");
+    let body = complete_body(vec![data_frame(vec![0u8; 64])]);
+    let outcome = collect_grpc_upload_for_test(body, &budget, 4 * UNIT).await;
+    let expected = GrpcChargedCollectOutcomeForTest::ResourceExhausted(
+        "Request buffering capacity exceeded".to_string(),
+    );
+    assert_eq!(outcome, expected);
+    drop(held);
+
+    // Over the gRPC ceiling is RESOURCE_EXHAUSTED too, with its own message.
+    let body = complete_body(vec![data_frame(vec![0u8; 101])]);
+    let outcome = collect_grpc_upload_for_test(body, &budget, 100).await;
+    let expected = GrpcChargedCollectOutcomeForTest::ResourceExhausted(
+        String::from("gRPC request payload size exceeds maximum of 100 bytes"),
+    );
+    assert_eq!(outcome, expected);
 }

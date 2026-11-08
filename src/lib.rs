@@ -17208,10 +17208,12 @@ pub mod _test_support {
 
     impl RequestBufferBudgetProbe {
         pub fn new(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
-            Self(crate::proxy::response_buffer_budget::IsolatedBudget::new_request(
-                fallback_per_request_bytes,
-                total_bytes,
-            ))
+            Self(
+                crate::proxy::response_buffer_budget::IsolatedBudget::new_request(
+                    fallback_per_request_bytes,
+                    total_bytes,
+                ),
+            )
         }
 
         /// Currently unreserved capacity, in bytes.
@@ -17290,6 +17292,42 @@ pub mod _test_support {
         pub fn finish(self) -> (Vec<u8>, RequestBufferPermitProbe) {
             let (body, permit) = self.0.finish();
             (body, RequestBufferPermitProbe(permit))
+        }
+    }
+
+    /// Terminal outcome of the PRODUCTION buffered native-gRPC charged collect
+    /// (`collect_grpc_upload`), projected from the crate-private error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum GrpcChargedCollectOutcomeForTest {
+        Collected(usize),
+        ResourceExhausted(String),
+        ClientDisconnected,
+        Other,
+    }
+
+    /// Run the PRODUCTION buffered native-gRPC collect over `body` against an
+    /// isolated buffered-request budget, with `max_grpc_recv_size_bytes` as the
+    /// gRPC ceiling exactly as the proxy folds it.
+    pub async fn collect_grpc_upload_for_test<B>(
+        body: B,
+        budget: &RequestBufferBudgetProbe,
+        max_grpc_recv_size_bytes: usize,
+    ) -> GrpcChargedCollectOutcomeForTest
+    where
+        B: http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>,
+    {
+        use crate::proxy::grpc_proxy::{GrpcRequestBodyCollectError, collect_grpc_upload};
+        let ceiling = budget.0.buffered_request_body_ceiling(max_grpc_recv_size_bytes);
+        let collector = budget.0.request_collector(max_grpc_recv_size_bytes);
+        match collect_grpc_upload(body, collector, ceiling, 0, None, None).await {
+            Ok(collected) => GrpcChargedCollectOutcomeForTest::Collected(collected.body.len()),
+            Err(GrpcRequestBodyCollectError::ResourceExhausted(message)) => {
+                GrpcChargedCollectOutcomeForTest::ResourceExhausted(message)
+            }
+            Err(GrpcRequestBodyCollectError::ClientDisconnected) => {
+                GrpcChargedCollectOutcomeForTest::ClientDisconnected
+            }
+            Err(_) => GrpcChargedCollectOutcomeForTest::Other,
         }
     }
 
@@ -17462,7 +17500,7 @@ pub mod _test_support {
         request_body_read_timeout_ms: u64,
     ) -> GrpcBufferedCollectOutcomeForTest {
         use crate::proxy::grpc_proxy::GrpcRequestBodyCollectError;
-        let collected = crate::proxy::grpc_proxy::collect_grpc_request_body(
+        let collected = crate::proxy::grpc_proxy::collect_grpc_request_body_published(
             request,
             max_grpc_recv_size_bytes,
             request_body_read_timeout_ms,
@@ -17628,7 +17666,7 @@ pub mod _test_support {
     ) -> Option<DecodeChargeHandoffForTest> {
         use crate::plugins::charged_decode::decode_charged_content_coding_chain_with_charge;
         use crate::proxy::response_buffer_budget::{
-            hand_off_replacement_decode_charge, with_replacement_decode_charge,
+            DecodeChargeHold, hand_off_replacement_decode_charge, with_replacement_decode_charge,
         };
         let limits = crate::plugins::utils::content_encoding::DecodeLimits {
             max_decoded_bytes,
@@ -17646,7 +17684,7 @@ pub mod _test_support {
         let available_after_decode = probe.available_bytes();
         let ((), handed_off) = with_replacement_decode_charge(async {
             tokio::task::yield_now().await;
-            hand_off_replacement_decode_charge(charge);
+            hand_off_replacement_decode_charge(DecodeChargeHold::new(charge));
             tokio::task::yield_now().await;
         })
         .await;
@@ -17657,6 +17695,64 @@ pub mod _test_support {
             plaintext_capacity: plaintext.capacity(),
             available_after_decode,
             available_after_handoff,
+            available_after_release,
+        })
+    }
+
+    /// Budget readings across the `compression` staged-plaintext handoff.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct StagedDecodeChargeForTest {
+        /// Available bytes while the plaintext is staged on the context.
+        pub available_while_staged: usize,
+        /// Available bytes after a context clone carrying it was dropped.
+        pub available_after_clone_dropped: usize,
+        /// Available bytes after the owning transform emitted the plaintext,
+        /// with the handed-off charge still held by the replacement scope.
+        pub available_after_emit: usize,
+        /// Available bytes once that charge is released.
+        pub available_after_release: usize,
+    }
+
+    /// Stage `staged_bytes` of plaintext on a request context with a decode
+    /// charge taken from an ISOLATED budget, exactly as the `compression`
+    /// fallback decode does, then emit it through the PRODUCTION replacement
+    /// scope as its transform does.
+    pub async fn staged_decode_charge_for_test(
+        probe: &ResponseBufferBudgetProbe,
+        staged_bytes: usize,
+    ) -> Option<StagedDecodeChargeForTest> {
+        use crate::proxy::response_buffer_budget::{
+            DecodeChargeHold, hand_off_replacement_decode_charge, with_replacement_decode_charge,
+        };
+        let charge = probe.0.try_reserve(staged_bytes)?;
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/upload".to_string(),
+        );
+        ctx.set_compression_staged_request_plaintext(
+            vec![0u8; staged_bytes],
+            DecodeChargeHold::new(charge),
+        );
+        let available_while_staged = probe.available_bytes();
+        drop(ctx.clone());
+        let available_after_clone_dropped = probe.available_bytes();
+        let (plaintext, handed_off) = with_replacement_decode_charge(async {
+            let (plaintext, decode_charge) = ctx.take_compression_staged_request_plaintext()?;
+            hand_off_replacement_decode_charge(decode_charge);
+            tokio::task::yield_now().await;
+            Some(plaintext)
+        })
+        .await;
+        let plaintext = plaintext?;
+        let available_after_emit = probe.available_bytes();
+        drop(handed_off);
+        drop(plaintext);
+        let available_after_release = probe.available_bytes();
+        Some(StagedDecodeChargeForTest {
+            available_while_staged,
+            available_after_clone_dropped,
+            available_after_emit,
             available_after_release,
         })
     }
