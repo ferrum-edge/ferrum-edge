@@ -3587,3 +3587,83 @@ async fn opa_host_base_path_is_projected_for_non_admins_and_audit() {
     let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
     assert_eq!(stored["config"]["opa_host"], opa_host);
 }
+
+/// A custom plugin has no built-in sensitivity schema, so its config cannot be
+/// classified and fails closed: viewer and operator reads withhold every scalar
+/// leaf (keys, array shapes, and `null` stay visible), admin reads stay raw,
+/// and an operator write that echoes the read back is refused before the
+/// stored values could be overwritten.
+#[tokio::test]
+async fn custom_plugin_configs_fail_closed_for_non_admins() {
+    let tmp = TempDir::new().unwrap();
+    let store = make_store(&tmp).await;
+    let plugin_id = "custom-plugin-fail-closed";
+    let stored_config = json!({
+        "auth_headers": [{"name": "X-Vendor-Token", "value": "custom-pair-canary"}],
+        "account": {"id": 987654321, "enabled": true},
+        "note": null
+    });
+    store
+        .create_plugin_config(&PluginConfig {
+            labels: Default::default(),
+            id: plugin_id.to_string(),
+            plugin_name: "third_party_custom_plugin".to_string(),
+            namespace: "ferrum".to_string(),
+            config: stored_config.clone(),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: false,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist custom plugin config");
+
+    let state = admin_state(store);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = format!("/plugins/config/{plugin_id}");
+
+    let expected = json!({
+        "auth_headers": [{"name": "[REDACTED]", "value": "[REDACTED]"}],
+        "account": {"id": "[REDACTED]", "enabled": "[REDACTED]"},
+        "note": null
+    });
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, &path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        assert_eq!(projected["config"], expected);
+    }
+
+    let (status, raw) = get_json(&base, &path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    assert_eq!(raw["config"], stored_config);
+
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, &path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    let write_path = format!("{path}?expected_proxy_ids=");
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        &write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "custom echo accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/account/id") && error.contains("/config/auth_headers/0/value"),
+        "unexpected refusal: {error}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
+    assert_eq!(stored["config"], stored_config);
+}

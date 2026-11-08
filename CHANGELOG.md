@@ -39,9 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `transaction_debugger` `capture_request_header_value`
   - `ai_semantic_firewall` `privacy.snippet_hash_salt`
   - the `opa` `opa_host` base path (now projected as a structural URL)
-  - every value of a `headers` / `custom_headers` / `request_headers` /
-    `extra_headers` / `header_present` map in a custom plugin's config, at any
-    depth (built-ins declare their header maps in their schema)
+  - every scalar leaf of a custom plugin's config. A plugin with no built-in
+    sensitivity schema cannot be classified, so its config now fails closed
+    for `viewer` and `operator` reads, audit diffs, and the export. Strings,
+    numbers, and booleans show `[REDACTED]` (a fingerprint in the export),
+    while keys, array shapes, and `null` stay visible. An operator must send
+    real values to change such a config; admin reads stay raw.
   - inline PEM private keys in `mesh_route_dispatch`
     `rules[].destination.backend_tls.client_key_path` and `udp_logging`
     `dtls_key_path`, and certificate-plus-key bundles pasted into a plugin

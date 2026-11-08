@@ -100,15 +100,11 @@ fn unknown_custom_plugins_get_no_schema_rules_but_still_project() {
             "batch_size": 50
         }),
     );
-    // Heuristic layer still fires for custom plugins.
+    // A custom plugin cannot be classified, so every scalar leaf is withheld
+    // and only the keys stay visible.
     assert_eq!(projected["api_key"], REDACTED);
-    // Structural URL sweep still strips userinfo on a path no rule names.
-    assert_eq!(
-        projected["sink_url"],
-        "https://redacted@sink.example.com/ingest"
-    );
-    // Safe-value control: ordinary tuning survives.
-    assert_eq!(projected["batch_size"], 50);
+    assert_eq!(projected["sink_url"], REDACTED);
+    assert_eq!(projected["batch_size"], REDACTED);
     assert_no_canaries(
         &projected,
         &[
@@ -940,20 +936,18 @@ fn opa_host_base_path_is_projected() {
     assert_eq!(origin["opa_host"], "http://opa:8181");
 }
 
-/// A custom plugin has no schema, so every value of a map keyed `headers`,
-/// `custom_headers`, `request_headers`, `extra_headers`, or `header_present`
-/// (any spelling, any depth) is withheld. Header names, header-name lists, and
-/// `null` values stay visible, and built-ins keep their deliberately visible
-/// response-header maps.
+/// A custom plugin has no schema, so its config fails closed: every scalar
+/// leaf (string, number, boolean) is withheld wherever it sits, under any key
+/// spelling or list shape, while object keys, array shapes, and `null` values
+/// stay visible. Built-ins keep their declared projection.
 #[test]
-fn custom_plugin_header_maps_are_withheld_at_any_depth() {
+fn custom_plugin_configs_fail_closed_at_every_scalar_leaf() {
     let raw = json!({
-        "headers": {"x-honeycomb-team": "chm-top-canary", "x-null": null},
-        "sinks": [{"customHeaders": {"X-Vendor-Token": "chm-nested-canary"}}],
-        "outbound": {"request-headers": {"x-tenant": {"value": "chm-object-canary"}}},
-        "extra_headers": ["x-forwarded-for", "x-request-id"],
-        "header_present": {"x-skip": "chm-present-canary"},
-        "batch_size": 50
+        "headers": {"x-honeycomb-team": "cfc-header-canary", "x-null": null},
+        "auth_headers": [{"name": "X-Vendor-Token", "value": "cfc-pair-canary"}],
+        "account": {"id": 987654321, "enabled": true},
+        "sinks": [{"target": "cfc-sink-canary", "weights": [1, 2]}],
+        "empty": {}
     });
     assert!(
         placeholder_sites("some_custom_plugin", &raw).is_empty(),
@@ -961,50 +955,40 @@ fn custom_plugin_header_maps_are_withheld_at_any_depth() {
     );
 
     let projected = project("some_custom_plugin", raw);
-    assert_eq!(projected["headers"]["x-honeycomb-team"], REDACTED);
-    assert_eq!(projected["headers"]["x-null"], Value::Null);
     assert_eq!(
-        projected["sinks"][0]["customHeaders"]["X-Vendor-Token"],
-        REDACTED
-    );
-    assert_eq!(
-        projected["outbound"]["request-headers"]["x-tenant"],
-        REDACTED
-    );
-    assert_eq!(
-        projected["extra_headers"],
-        json!(["x-forwarded-for", "x-request-id"])
-    );
-    assert_eq!(projected["header_present"]["x-skip"], REDACTED);
-    assert_eq!(projected["batch_size"], 50);
-    assert_no_canaries(
-        &projected,
-        &[
-            "chm-top-canary",
-            "chm-nested-canary",
-            "chm-object-canary",
-            "chm-present-canary",
-        ],
+        projected,
+        json!({
+            "headers": {"x-honeycomb-team": REDACTED, "x-null": null},
+            "auth_headers": [{"name": REDACTED, "value": REDACTED}],
+            "account": {"id": REDACTED, "enabled": REDACTED},
+            "sinks": [{"target": REDACTED, "weights": [REDACTED, REDACTED]}],
+            "empty": {}
+        })
     );
     let mut sites = placeholder_sites("some_custom_plugin", &projected);
     sites.sort();
     assert_eq!(
         sites,
         [
-            "/config/header_present/x-skip",
+            "/config/account/enabled",
+            "/config/account/id",
+            "/config/auth_headers/0/name",
+            "/config/auth_headers/0/value",
             "/config/headers/x-honeycomb-team",
-            "/config/outbound/request-headers/x-tenant",
-            "/config/sinks/0/customHeaders/X-Vendor-Token",
+            "/config/sinks/0/target",
+            "/config/sinks/0/weights/0",
+            "/config/sinks/0/weights/1",
         ]
     );
 
-    // Built-ins declare their header maps in the schema instead; response
-    // headers they keep visible on purpose are not touched.
+    // Built-ins keep their declared projection: response headers they show on
+    // purpose stay visible.
     let termination = project(
         "request_termination",
         json!({"status_code": 503, "headers": {"Retry-After": "120"}}),
     );
     assert_eq!(termination["headers"]["Retry-After"], "120");
+    assert_eq!(termination["status_code"], 503);
     let mock = project(
         "response_mock",
         json!({"rules": [{"path": "/v1", "headers": {"x-mock": "static-value"}}]}),

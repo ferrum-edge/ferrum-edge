@@ -881,3 +881,34 @@ fn export_fingerprints_opa_host_base_path() {
     assert_eq!(opa["policy_path"], "/v1/data/authz/allow");
     assert!(!export.to_string().contains("opa-base-path-must-not-leak"));
 }
+
+/// A custom plugin cannot be classified, so every scalar leaf of its config is
+/// fingerprinted in the export; keys and `null` stay verbatim.
+#[test]
+fn export_fingerprints_every_custom_plugin_scalar_leaf() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let custom: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "custom-object",
+        "plugin_name": "third_party_custom_plugin",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "auth_headers": [{"name": "X-Vendor-Token", "value": "custom-pair-must-not-leak"}],
+            "account_id": 987654321,
+            "note": null
+        },
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("custom plugin fixture");
+    config.plugin_configs.push(custom);
+
+    let export = export(config, ADMIN_SECRET);
+    let custom = &plugin(&export, "custom-object")["config"];
+    let pair = &custom["auth_headers"][0];
+    assert!(is_fingerprint(&pair["name"]), "{custom}");
+    assert!(is_fingerprint(&pair["value"]), "{custom}");
+    assert!(is_fingerprint(&custom["account_id"]), "{custom}");
+    assert_eq!(custom["note"], Value::Null);
+    assert!(!export.to_string().contains("custom-pair-must-not-leak"));
+}
