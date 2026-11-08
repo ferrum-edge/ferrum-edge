@@ -30,9 +30,10 @@
 //! The harness is deliberately the bounded one `functional_grpc_plugins_test` /
 //! `functional_websocket_test` use: one echo backend holding its own pre-bound
 //! listener, and one gateway child spawned onto simultaneously-held proxy/admin
-//! port reservations that are released only at the spawn call, with readiness
-//! proven by the authenticated `/health` detail tier for that attempt's own
-//! bearer token — never by a bare TCP accept or a sleep. No unbounded servers.
+//! port reservations that are released only at the spawn call, with ownership
+//! proven by that attempt's own admin identity (authenticated `/health` detail
+//! plus a JWT-only `GET /proxies`) — never by a bare TCP accept or a sleep. No
+//! unbounded servers.
 //!
 //! Two harness properties are load-bearing and covered by their own plain
 //! (non-`#[ignore]`) guards at the bottom of this file:
@@ -41,7 +42,7 @@
 //!   a spawn attempt is retried ONLY when those diagnostics demonstrate an
 //!   address-in-use bind race. A config parse error, a child panic, or a failed
 //!   readiness/authentication check fails immediately with the captured tail
-//!   (bearer token redacted) rather than being re-rolled into "did not start".
+//!   (attempt credentials redacted) rather than being re-rolled into "did not start".
 //! - **Every live call is bounded.** `send_grpc_request` carries a per-call
 //!   timeout, and the reload poll loop hands each call the smaller of that
 //!   ceiling and its own remaining deadline, so a wedged gateway fails
@@ -278,19 +279,6 @@ fn has_field(message: &[u8], target: u32) -> bool {
 // Harness
 // ============================================================================
 
-/// Per-spawn-attempt observability credential.
-///
-/// The authenticated `/health` detail tier is the only thing that proves the
-/// listener answering on an admin port is THIS child rather than a parallel
-/// test's gateway that happened to inherit the port. A fresh token per attempt
-/// means a retry can never be satisfied by the corpse of the previous one.
-fn mint_observability_token() -> String {
-    format!(
-        "ferrum-edge-a2a-grpc-card-probe-{}",
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
 /// Echo backend: returns the request body as the gRPC response body, mirrors
 /// `x-set-grpc-encoding` into the response `grpc-encoding`, and mirrors
 /// `x-set-grpc-status` into the terminal trailer so a test can drive a non-OK
@@ -407,20 +395,21 @@ impl AttemptLogs {
         ))
     }
 
-    /// Read the tail of both captures with the attempt's bearer token removed.
+    /// Read the tail of both captures with the attempt's credentials removed.
     ///
-    /// That token is the only secret this harness injects, and it unlocks the
-    /// authenticated admin detail tier, so it must not reach a CI log even
-    /// though the attempt that minted it is already void.
-    fn read_bounded(&self, secret: &str) -> ChildDiagnostics {
+    /// The attempt's admin JWT secret and metrics bearer token are the only
+    /// secrets this harness injects, and they unlock the admin API and its
+    /// detail tier, so they must not reach a CI log even though the attempt
+    /// that minted them is already void.
+    fn read_bounded(&self, secrets: &[&str]) -> ChildDiagnostics {
         ChildDiagnostics {
-            stdout: read_tail_redacted(&self.stdout, secret),
-            stderr: read_tail_redacted(&self.stderr, secret),
+            stdout: read_tail_redacted(&self.stdout, secrets),
+            stderr: read_tail_redacted(&self.stderr, secrets),
         }
     }
 }
 
-fn read_tail_redacted(path: &Path, secret: &str) -> String {
+fn read_tail_redacted(path: &Path, secrets: &[&str]) -> String {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) => return format!("<unavailable: {error}>"),
@@ -436,17 +425,20 @@ fn read_tail_redacted(path: &Path, secret: &str) -> String {
     if let Err(error) = file.read_to_end(&mut buffer) {
         return format!("<unavailable: {error}>");
     }
-    let text = String::from_utf8_lossy(&buffer);
-    redact_secret(&text, secret)
+    let mut text = String::from_utf8_lossy(&buffer).into_owned();
+    for secret in secrets {
+        text = redact_secret(&text, secret);
+    }
+    text
 }
 
-/// Replace every occurrence of the attempt's bearer token. An empty `secret`
+/// Replace every occurrence of one attempt credential. An empty `secret`
 /// would otherwise make `replace` splice the marker between every character.
 fn redact_secret(text: &str, secret: &str) -> String {
     if secret.is_empty() {
         return text.to_string();
     }
-    text.replace(secret, "<redacted-probe-token>")
+    text.replace(secret, "<redacted-attempt-secret>")
 }
 
 /// Substrings that DEMONSTRATE the child lost a race for a port it was handed,
@@ -492,24 +484,27 @@ fn start_gateway(
     config_path: &str,
     gateway: PortReservation,
     admin: PortReservation,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
     logs: &AttemptLogs,
-) -> Result<(std::process::Child, u16, u16), Box<dyn std::error::Error>> {
+    managed_store_dir: &Path,
+) -> Result<(crate::common::GatewayChildGuard, u16, u16), Box<dyn std::error::Error>> {
     let http_port = gateway.port;
     let admin_port = admin.port;
     let (stdout, stderr) = logs.stdio()?;
     let mut command = std::process::Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut command);
     command.arg("run");
+    // Ownership proof for this exact child (issue #3428 / #2132 / #7076): a
+    // per-attempt admin JWT secret/issuer and metrics bearer token that no
+    // foreign gateway can answer for.
+    identity.apply_to_command(&mut command);
     command
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_ACCEPT_THREADS", "1")
-        // Ownership proof for this exact child (issue #3428 / #2132): presenting
-        // this token unlocks the authenticated `/health` detail tier, which no
-        // foreign gateway can answer.
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
+        .env("FERRUM_TLS_MANAGED_STORE_PATH", managed_store_dir)
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
@@ -521,7 +516,7 @@ fn start_gateway(
     gateway.drop_and_take_port();
     admin.drop_and_take_port();
 
-    let child = command.spawn()?;
+    let child = crate::common::GatewayChildGuard::new(command.spawn()?);
     Ok((child, http_port, admin_port))
 }
 
@@ -533,37 +528,34 @@ fn start_gateway(
 /// dies with `Address already in use` while the foreign listener keeps answering
 /// the probe, and every later data-path assertion is made against a stranger.
 ///
-/// Barrier (`TestGateway`'s health-only path, via the shared
-/// `wait_for_child_gateway_readiness` + `wait_for_child_tcp_accept`; not JWT
-/// ownership):
+/// Barrier (`TestGateway`'s JWT ownership path, via the shared
+/// `wait_for_owned_gateway_identity` + `wait_for_child_tcp_accept`):
 /// 1. `Child::try_wait` before every probe and after a successful one, in both
 ///    stages — a dead child voids the attempt instead of being polled for
 ///    until the timeout.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token with
-///    `ready: true`, which flips only after every listener bind (proxy included).
+///    `ready: true`, which flips only after every listener bind (proxy included),
+///    AND HTTP 200 from JWT-only `GET /proxies` under this attempt's admin JWT.
+///    `/health` detail alone can be granted to a foreign gateway by
+///    `FERRUM_METRICS_ALLOWED_CIDRS`; the per-attempt JWT cannot (issue #7076).
 /// 3. TCP connect to the proxy port once identity is proven.
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
     gateway_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
     let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
-    crate::common::wait_for_child_gateway_readiness(
-        child,
-        admin_port,
-        observability_token,
-        STARTUP_TIMEOUT,
-    )
-    .await?;
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await?;
     crate::common::wait_for_child_tcp_accept(child, gateway_port, deadline).await
 }
 
 /// Bounded spawn retry for the ONE non-deterministic startup failure.
 ///
 /// Every attempt takes fresh, simultaneously-held port reservations and a fresh
-/// ownership token, so a failed attempt never leaves a half-claimed port or a
+/// admin identity, so a failed attempt never leaves a half-claimed port or a
 /// reusable credential behind. What changed for the root review is *when* a
 /// retry happens at all: a retry is only taken when the child's own captured
 /// diagnostics DEMONSTRATE an address-in-use bind race
@@ -579,7 +571,7 @@ async fn wait_for_owned_gateway(
 async fn start_gateway_with_retry(
     config_path: &str,
     log_dir: &Path,
-) -> (std::process::Child, u16, u16) {
+) -> (crate::common::GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         // Each attempt gets fresh non-ephemeral ports: start_gateway retains
@@ -597,14 +589,15 @@ async fn start_gateway_with_retry(
                 continue;
             }
         };
-        let observability_token = mint_observability_token();
+        let identity = crate::common::SpawnedGatewayIdentity::mint("a2a-grpc-card");
         let logs = AttemptLogs::create(log_dir, attempt);
         let started = start_gateway(
             config_path,
             gateway_reservation,
             admin_reservation,
-            &observability_token,
+            &identity,
             &logs,
+            &log_dir.join(format!("managed-tls-{attempt}")),
         );
         // Spawning is deterministic: a missing or non-executable gateway binary
         // will not become executable on the next attempt.
@@ -619,18 +612,18 @@ async fn start_gateway_with_retry(
             }
         };
 
-        match wait_for_owned_gateway(&mut child, admin_port, &observability_token, gateway_port)
-            .await
-        {
+        match wait_for_owned_gateway(child.child_mut(), admin_port, &identity, gateway_port).await {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(readiness_error) => {
                 // A still-live child from a void attempt must not outlive it and
                 // keep holding ports the next attempt could be offered. Reaping
                 // it first also closes its capture files, so the tail read below
                 // sees everything it managed to write.
-                let _ = child.kill();
-                let _ = child.wait();
-                let diagnostics = logs.read_bounded(&observability_token);
+                child.shutdown();
+                let diagnostics = logs.read_bounded(&[
+                    identity.observability_token.as_str(),
+                    identity.jwt_secret.as_str(),
+                ]);
                 let stdout = diagnostics.stdout;
                 let stderr = diagnostics.stderr;
                 assert!(
@@ -885,7 +878,7 @@ plugin_configs:
 }
 
 struct Harness {
-    gateway: std::process::Child,
+    gateway: crate::common::GatewayChildGuard,
     backend: tokio::task::JoinHandle<()>,
     /// Only read by the Unix-only SIGHUP reload path.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -928,7 +921,7 @@ impl Harness {
     #[cfg(unix)]
     async fn reload_with(&self, template: String) {
         write_config(&self.config_path, &render(&template, self.backend_port));
-        let pid = self.gateway.id();
+        let pid = self.gateway.id().expect("gateway child is still owned");
         let output = std::process::Command::new("kill")
             .args(["-HUP", &pid.to_string()])
             .output()
@@ -963,7 +956,7 @@ impl Harness {
         let deadline = Instant::now() + RELOAD_DEADLINE;
         let mut last_observation = String::from("no request issued yet");
         loop {
-            if let Ok(Some(status)) = self.gateway.try_wait() {
+            if let Ok(Some(status)) = self.gateway.child_mut().try_wait() {
                 panic!(
                     "{context}: gateway exited with {status} while waiting for the reload to take \
                      effect (last observation: {last_observation})"
@@ -998,8 +991,7 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let _ = self.gateway.kill();
-        let _ = self.gateway.wait();
+        self.gateway.shutdown();
         self.backend.abort();
     }
 }
@@ -1504,22 +1496,27 @@ fn only_a_demonstrated_address_in_use_race_is_retryable() {
 }
 
 /// Child diagnostics are captured, bounded to the tail, and stripped of the
-/// attempt's bearer token before they can reach a CI log.
+/// attempt's credentials before they can reach a CI log.
 #[test]
 fn child_diagnostics_are_bounded_and_redact_the_probe_token() {
     let temp = TempDir::new().expect("temp dir");
     let logs = AttemptLogs::create(temp.path(), 1);
     let token = "ferrum-edge-a2a-grpc-card-probe-deadbeef";
+    let jwt_secret = "ferrum-edge-a2a-grpc-card-admin-secret-deadbeef";
 
     let filler = "x".repeat(MAX_DIAGNOSTIC_BYTES as usize * 3);
     let mut out = std::fs::File::create(&logs.stdout).expect("create stdout capture");
     write!(out, "{filler}TAIL-MARKER").expect("write stdout capture");
     let mut err = std::fs::File::create(&logs.stderr).expect("create stderr capture");
-    write!(err, "probing with bearer {token} -> 401").expect("write stderr capture");
+    write!(
+        err,
+        "probing with bearer {token} -> 401; jwt key {jwt_secret}"
+    )
+    .expect("write stderr capture");
     drop(out);
     drop(err);
 
-    let diagnostics = logs.read_bounded(token);
+    let diagnostics = logs.read_bounded(&[token, jwt_secret]);
     let stdout = diagnostics.stdout;
     let stderr = diagnostics.stderr;
     let stdout_len = stdout.len();
@@ -1532,17 +1529,17 @@ fn child_diagnostics_are_bounded_and_redact_the_probe_token() {
         "the TAIL is what explains a startup failure, so it must be the part kept"
     );
     assert!(
-        !stderr.contains(token),
-        "the per-attempt bearer token must never be surfaced in a diagnostic"
+        !stderr.contains(token) && !stderr.contains(jwt_secret),
+        "the per-attempt credentials must never be surfaced in a diagnostic"
     );
     assert!(
-        stderr.contains("<redacted-probe-token>"),
+        stderr.contains("<redacted-attempt-secret>"),
         "redaction must be visible rather than silently dropping the line: {stderr}"
     );
 
     // A missing capture is reported, never panicked on: the point of these files
     // is to explain a failure, so reading them must not become a second one.
-    let missing = AttemptLogs::create(temp.path(), 99).read_bounded(token);
+    let missing = AttemptLogs::create(temp.path(), 99).read_bounded(&[token]);
     assert!(missing.stdout.starts_with("<unavailable"));
 }
 

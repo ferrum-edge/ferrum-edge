@@ -30,9 +30,8 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use crate::common::{
-    configure_coverage_gateway_command, continue_if_backend_available,
-    continue_if_tls_fixture_available, host_port_from_db_url, shutdown_gateway_child,
-    tcp_endpoint_reachable,
+    GatewayChildGuard, configure_coverage_gateway_command, continue_if_backend_available,
+    continue_if_tls_fixture_available, host_port_from_db_url, tcp_endpoint_reachable,
 };
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -41,7 +40,7 @@ use mongodb::options::ClientOptions;
 use mongodb::{Client as MongoClient, Database as MongoDatabase};
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -62,7 +61,10 @@ const DEFAULT_CERT_DIR: &str = "/tmp/ferrum-mongo-tls-certs";
 
 /// Test harness for MongoDB functional testing.
 struct MongoTestHarness {
-    gateway_process: Option<Child>,
+    gateway_process: Option<GatewayChildGuard>,
+    /// Private managed-TLS store for every gateway this harness spawns, so a
+    /// child never writes `./ferrum-managed-tls` into the checkout (#5706).
+    managed_tls_store: tempfile::TempDir,
     proxy_base_url: String,
     admin_base_url: String,
     jwt_secret: String,
@@ -77,16 +79,14 @@ impl MongoTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let identity = crate::common::SpawnedGatewayIdentity::mint("mongodb");
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
+        // Gateway handoff ports come from the registry outside the host's
+        // ephemeral source range (leases are kept for the process).
+        let admin_port = crate::scaffolding::ports::unbound_port().await?;
+        let proxy_port = crate::scaffolding::ports::unbound_port().await?;
 
         Ok(Self {
             gateway_process: None,
+            managed_tls_store: tempfile::TempDir::new()?,
             proxy_base_url: format!("http://127.0.0.1:{}", proxy_port),
             admin_base_url: format!("http://127.0.0.1:{}", admin_port),
             jwt_secret: identity.jwt_secret,
@@ -177,6 +177,10 @@ impl MongoTestHarness {
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                self.managed_tls_store.path(),
+            )
             .env("FERRUM_LOG_LEVEL", "info")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -188,14 +192,14 @@ impl MongoTestHarness {
         }
         configure_coverage_gateway_command(&mut command);
         identity.apply_to_command(&mut command);
-        let child = command.spawn()?;
+        let child = GatewayChildGuard::new(command.spawn()?);
 
         self.gateway_process = Some(child);
         match self.wait_for_health().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    shutdown_gateway_child(&mut child);
+                    child.shutdown();
                 }
                 Err(e)
             }
@@ -353,6 +357,10 @@ impl MongoTestHarness {
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                self.managed_tls_store.path(),
+            )
             .env("FERRUM_LOG_LEVEL", "info")
             .env("FERRUM_DB_TLS_MODE", tls_mode);
         if !insecure {
@@ -361,17 +369,19 @@ impl MongoTestHarness {
 
         configure_coverage_gateway_command(&mut command);
         identity.apply_to_command(&mut command);
-        let child = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let child = GatewayChildGuard::new(
+            command
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
 
         self.gateway_process = Some(child);
         match self.wait_for_health().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    shutdown_gateway_child(&mut child);
+                    child.shutdown();
                 }
                 Err(e)
             }
@@ -432,6 +442,10 @@ impl MongoTestHarness {
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                self.managed_tls_store.path(),
+            )
             .env("FERRUM_LOG_LEVEL", "info")
             .env("FERRUM_DB_TLS_MODE", "verify-full")
             .env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path)
@@ -441,29 +455,24 @@ impl MongoTestHarness {
             .stderr(Stdio::null());
         configure_coverage_gateway_command(&mut command);
         identity.apply_to_command(&mut command);
-        let child = command.spawn()?;
+        let child = GatewayChildGuard::new(command.spawn()?);
 
         self.gateway_process = Some(child);
         match self.wait_for_health().await {
             Ok(()) => Ok(()),
             Err(e) => {
                 if let Some(mut child) = self.gateway_process.take() {
-                    shutdown_gateway_child(&mut child);
+                    child.shutdown();
                 }
                 Err(e)
             }
         }
     }
 
-    /// Reallocate ephemeral ports after a failed startup attempt.
+    /// Lease fresh handoff ports after a failed startup attempt.
     async fn reallocate_ports(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
-        self.admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
-        self.proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
+        self.admin_port = crate::scaffolding::ports::unbound_port().await?;
+        self.proxy_port = crate::scaffolding::ports::unbound_port().await?;
 
         self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
         self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
@@ -481,7 +490,7 @@ impl MongoTestHarness {
             .as_mut()
             .ok_or("gateway process missing")?;
         crate::common::wait_for_owned_gateway_identity(
-            child,
+            child.child_mut(),
             self.admin_port,
             &identity,
             Duration::from_secs(30),
@@ -512,8 +521,9 @@ impl MongoTestHarness {
 
 impl Drop for MongoTestHarness {
     fn drop(&mut self) {
+        // Reap before `managed_tls_store` is removed.
         if let Some(mut child) = self.gateway_process.take() {
-            shutdown_gateway_child(&mut child);
+            child.shutdown();
         }
     }
 }
@@ -523,11 +533,11 @@ fn find_binary() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
 }
 
 /// Create a simple echo HTTP server for backend testing.
+/// Serve line echo on a listener the test bound and still holds, so the backend
+/// port is never released and re-bound.
 async fn start_echo_backend(
-    port: u16,
+    listener: tokio::net::TcpListener,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
-
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -818,8 +828,9 @@ async fn test_mongodb_plaintext_full_lifecycle() {
         .await
         .expect("Bind backend");
     let backend_port = backend_listener.local_addr().expect("Backend addr").port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port).await.expect("Start echo");
+    let _backend = start_echo_backend(backend_listener)
+        .await
+        .expect("Start echo");
     println!("Echo backend on port {}", backend_port);
 
     // Start gateway
@@ -873,8 +884,9 @@ async fn test_mongodb_tls_connection() {
         .await
         .expect("Bind backend");
     let backend_port = backend_listener.local_addr().expect("Backend addr").port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port).await.expect("Start echo");
+    let _backend = start_echo_backend(backend_listener)
+        .await
+        .expect("Start echo");
 
     let mut harness = MongoTestHarness::new().await.expect("Create harness");
     harness
@@ -919,8 +931,9 @@ async fn test_mongodb_tls_require_connection() {
         .await
         .expect("Bind backend");
     let backend_port = backend_listener.local_addr().expect("Backend addr").port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port).await.expect("Start echo");
+    let _backend = start_echo_backend(backend_listener)
+        .await
+        .expect("Start echo");
 
     let mut harness = MongoTestHarness::new().await.expect("Create harness");
     harness
@@ -970,8 +983,9 @@ async fn test_mongodb_mtls_connection() {
         .await
         .expect("Bind backend");
     let backend_port = backend_listener.local_addr().expect("Backend addr").port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port).await.expect("Start echo");
+    let _backend = start_echo_backend(backend_listener)
+        .await
+        .expect("Start echo");
 
     let mut harness = MongoTestHarness::new().await.expect("Create harness");
     harness

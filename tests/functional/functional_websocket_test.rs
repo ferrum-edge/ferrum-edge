@@ -417,15 +417,14 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-/// Mint a per-spawn-attempt observability credential.
+/// Mint per-spawn-attempt admin credentials (issue #3428 / #7076).
 ///
 /// Nothing here is a real secret — it exists only so two gateways started by two
 /// parallel tests can never be mistaken for each other — but it is still handled
 /// like one: it is never printed, and identity failures report why the probe
-/// failed, never the credential. Mirrors `InstanceIdentity` in
-/// `tests/common/gateway_harness.rs` (issue #3428).
-fn mint_observability_token() -> String {
-    format!("ferrum-edge-ws-probe-{}", uuid::Uuid::new_v4().simple())
+/// failed, never the credential.
+fn mint_gateway_identity() -> crate::common::SpawnedGatewayIdentity {
+    crate::common::SpawnedGatewayIdentity::mint("ws")
 }
 
 /// Spawn the gateway subprocess. Returns the child plus the admin HTTP port
@@ -437,8 +436,9 @@ fn start_gateway_with_extra_env(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
-    observability_token: &str,
-) -> Result<(std::process::Child, u16, std::path::PathBuf), Box<dyn std::error::Error>> {
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> Result<(crate::common::GatewayChildGuard, u16, std::path::PathBuf), Box<dyn std::error::Error>>
+{
     // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
     // in the same functional shard never contend on the default admin ports
     // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
@@ -447,14 +447,14 @@ fn start_gateway_with_extra_env(
     //
     // The admin HTTP port must be a real port, never the `0` sentinel: `0`
     // disables the plaintext admin listener, and this file's readiness barrier
-    // proves child identity through that listener.
-    let admin_http_port = std::net::TcpListener::bind_test("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())?;
+    // proves child identity through that listener. It is a registry handoff
+    // outside the kernel's ephemeral source range (issue #7077 D4).
+    let admin_http_port = crate::scaffolding::ports::unbound_tcp_port()?;
     let stderr_path =
         std::path::Path::new(config_path).with_extension(format!("gateway-{http_port}.stderr.log"));
     let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -462,13 +462,12 @@ fn start_gateway_with_extra_env(
         .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
         .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        // Ownership proof for this exact child (issue #3428 pattern). Presenting
-        // this token unlocks the authenticated detail tier of `/health`, which
-        // no other gateway on the box can answer with. A leaked parent-shell
-        // CIDR allowlist would let a foreign gateway answer the detail tier
-        // without the token, so it is scrubbed from the child's environment.
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
-        .env_remove("FERRUM_METRICS_ALLOWED_CIDRS")
+        // Keep any managed-TLS store out of the checkout (issue #5706): the
+        // config file lives in the test's TempDir, which outlives this child.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -487,8 +486,18 @@ fn start_gateway_with_extra_env(
     for (name, value) in extra_env {
         cmd.env(name, value);
     }
+    // Ownership proof for this exact child (issue #3428 / #7076), applied last
+    // so `extra_env` cannot replace it: a per-attempt admin JWT secret/issuer
+    // and metrics bearer token no other gateway on the box can answer for. A
+    // leaked parent-shell CIDR allowlist is scrubbed as well.
+    identity.apply_to_command(&mut cmd);
+    cmd.env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
 
-    Ok((cmd.spawn()?, admin_http_port, stderr_path))
+    Ok((
+        crate::common::GatewayChildGuard::new(cmd.spawn()?),
+        admin_http_port,
+        stderr_path,
+    ))
 }
 
 /// Include the bounded tail of the child log in startup failures. The previous
@@ -497,13 +506,15 @@ fn start_gateway_with_extra_env(
 fn gateway_startup_error(
     error: &str,
     stderr_path: &std::path::Path,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> String {
     const MAX_LOG_CHARS: usize = 4_000;
     let Ok(stderr) = std::fs::read_to_string(stderr_path) else {
         return error.to_string();
     };
-    let stderr = stderr.replace(observability_token, "[REDACTED]");
+    let stderr = stderr
+        .replace(&identity.observability_token, "[REDACTED]")
+        .replace(&identity.jwt_secret, "[REDACTED]");
     let stderr = stderr.trim();
     if stderr.is_empty() {
         return error.to_string();
@@ -1087,18 +1098,19 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// an h2 server without RFC 8441 `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so it reset
 /// the Extended CONNECT that a real Ferrum listener accepts.
 ///
-/// The barrier is `TestGateway`'s health-only path (issue #3428), via the shared
-/// `wait_for_child_gateway_readiness` + `wait_for_child_tcp_accept` helpers.
-/// It is not the JWT ownership barrier (`wait_for_owned_gateway_identity`):
+/// The barrier is `TestGateway`'s JWT ownership path (issues #3428 / #7076), via
+/// the shared `wait_for_owned_gateway_identity` + `wait_for_child_tcp_accept`
+/// helpers:
 ///
 /// 1. `Child::try_wait` is polled before every probe and after a successful
 ///    one, in both stages, so a child that died after a partial bind consumes
 ///    its retry attempt immediately instead of polling whatever claimed the
 ///    released port.
 /// 2. The admin port must answer `/health` in the authenticated detail tier for
-///    this attempt's `FERRUM_METRICS_BEARER_TOKEN` *and* report `ready: true`.
-///    A foreign listener has a different token (or is not a gateway at all) and
-///    is rejected.
+///    this attempt's `FERRUM_METRICS_BEARER_TOKEN` *and* report `ready: true`,
+///    and then answer JWT-only `GET /proxies` with HTTP 200 under this
+///    attempt's admin JWT. `/health` detail alone can be granted to a foreign
+///    gateway by `FERRUM_METRICS_ALLOWED_CIDRS`; the per-attempt JWT cannot.
 /// 3. `ready` flips only after `wait_for_start_signals` observed every listener
 ///    bind — HTTP, HTTPS, and HTTP/3 proxy listeners included — so an identified,
 ///    ready child is proof that the child owns the port being probed. It holds
@@ -1114,25 +1126,20 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
     gateway_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 60s, not 30s: the TLS/HTTP3 cold start documented above.
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
     let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
-    crate::common::wait_for_child_gateway_readiness(
-        child,
-        admin_port,
-        observability_token,
-        STARTUP_TIMEOUT,
-    )
-    .await?;
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await?;
     crate::common::wait_for_child_tcp_accept(child, gateway_port, deadline).await
 }
 
-/// Start the gateway with retry logic to handle ephemeral port races.
+/// Start the gateway with retry logic to handle handoff port races.
 ///
-/// Each attempt allocates a fresh gateway port and a fresh instance credential,
+/// Each attempt allocates a fresh gateway port and a fresh admin identity,
 /// starts the gateway subprocess, and waits for that child to prove it owns its
 /// ports ([`wait_for_owned_gateway`]). An attempt whose child lost the port race
 /// is void: the process is killed and a new attempt is made with a different
@@ -1142,7 +1149,7 @@ async fn start_gateway_with_retry(
     https_port: Option<u16>,
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
-) -> (std::process::Child, u16) {
+) -> (crate::common::GatewayChildGuard, u16) {
     start_gateway_with_retry_extra_env(config_path, https_port, tls_cert_path, tls_key_path, &[])
         .await
 }
@@ -1153,12 +1160,12 @@ async fn start_gateway_with_retry_extra_env(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16) {
+) -> (crate::common::GatewayChildGuard, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
-        let observability_token = mint_observability_token();
+        let identity = mint_gateway_identity();
         match start_gateway_with_extra_env(
             config_path,
             gateway_port,
@@ -1166,26 +1173,17 @@ async fn start_gateway_with_retry_extra_env(
             tls_cert_path,
             tls_key_path,
             extra_env,
-            &observability_token,
+            &identity,
         ) {
             Ok((mut child, admin_port, stderr_path)) => {
-                let owned = wait_for_owned_gateway(
-                    &mut child,
-                    admin_port,
-                    &observability_token,
-                    gateway_port,
-                )
-                .await;
+                let owned =
+                    wait_for_owned_gateway(child.child_mut(), admin_port, &identity, gateway_port)
+                        .await;
                 match owned {
                     Ok(()) => return (child, gateway_port),
                     Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        last_err = gateway_startup_error(
-                            &e.to_string(),
-                            &stderr_path,
-                            &observability_token,
-                        );
+                        child.shutdown();
+                        last_err = gateway_startup_error(&e.to_string(), &stderr_path, &identity);
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
@@ -1214,12 +1212,12 @@ async fn start_gateway_with_retry_extra_env(
 async fn start_gateway_plain_with_retry_extra_env(
     config_path: &str,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16) {
+) -> (crate::common::GatewayChildGuard, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
-        let observability_token = mint_observability_token();
+        let identity = mint_gateway_identity();
         match start_gateway_with_extra_env(
             config_path,
             gateway_port,
@@ -1227,26 +1225,17 @@ async fn start_gateway_plain_with_retry_extra_env(
             None,
             None,
             extra_env,
-            &observability_token,
+            &identity,
         ) {
             Ok((mut child, admin_port, stderr_path)) => {
-                let owned = wait_for_owned_gateway(
-                    &mut child,
-                    admin_port,
-                    &observability_token,
-                    gateway_port,
-                )
-                .await;
+                let owned =
+                    wait_for_owned_gateway(child.child_mut(), admin_port, &identity, gateway_port)
+                        .await;
                 match owned {
                     Ok(()) => return (child, gateway_port),
                     Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        last_err = gateway_startup_error(
-                            &e.to_string(),
-                            &stderr_path,
-                            &observability_token,
-                        );
+                        child.shutdown();
+                        last_err = gateway_startup_error(&e.to_string(), &stderr_path, &identity);
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
@@ -1279,7 +1268,7 @@ async fn start_gateway_tls_with_retry(
     config_path: &str,
     tls_cert_path: &str,
     tls_key_path: &str,
-) -> (std::process::Child, u16, u16) {
+) -> (crate::common::GatewayChildGuard, u16, u16) {
     start_gateway_tls_with_retry_extra_env(config_path, tls_cert_path, tls_key_path, &[]).await
 }
 
@@ -1288,13 +1277,13 @@ async fn start_gateway_tls_with_retry_extra_env(
     tls_cert_path: &str,
     tls_key_path: &str,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16, u16) {
+) -> (crate::common::GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_http_port = free_port().await;
         let gateway_https_port = free_port().await;
-        let observability_token = mint_observability_token();
+        let identity = mint_gateway_identity();
         match start_gateway_with_extra_env(
             config_path,
             gateway_http_port,
@@ -1302,26 +1291,21 @@ async fn start_gateway_tls_with_retry_extra_env(
             Some(tls_cert_path),
             Some(tls_key_path),
             extra_env,
-            &observability_token,
+            &identity,
         ) {
             Ok((mut child, admin_port, stderr_path)) => {
                 let owned = wait_for_owned_gateway(
-                    &mut child,
+                    child.child_mut(),
                     admin_port,
-                    &observability_token,
+                    &identity,
                     gateway_https_port,
                 )
                 .await;
                 match owned {
                     Ok(()) => return (child, gateway_http_port, gateway_https_port),
                     Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        last_err = gateway_startup_error(
-                            &e.to_string(),
-                            &stderr_path,
-                            &observability_token,
-                        );
+                        child.shutdown();
+                        last_err = gateway_startup_error(&e.to_string(), &stderr_path, &identity);
                         eprintln!(
                             "Gateway TLS startup attempt {}/{} failed (ports {}/{}): {}",
                             attempt, MAX_ATTEMPTS, gateway_http_port, gateway_https_port, last_err
@@ -1528,12 +1512,16 @@ async fn test_file_mode_rejects_non_object_correlation_id_config() {
         None,
         None,
         &[],
-        &mint_observability_token(),
+        &mint_gateway_identity(),
     )
     .expect("spawn gateway with invalid file config");
     let exit_status = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(status) = gateway.try_wait().expect("poll invalid gateway") {
+            if let Some(status) = gateway
+                .child_mut()
+                .try_wait()
+                .expect("poll invalid gateway")
+            {
                 break status;
             }
             sleep(Duration::from_millis(50)).await;
@@ -1547,8 +1535,7 @@ async fn test_file_mode_rejects_non_object_correlation_id_config() {
             "file mode must fail startup for non-object correlation_id config"
         ),
         Err(_) => {
-            let _ = gateway.kill();
-            let _ = gateway.wait();
+            gateway.shutdown();
             panic!("gateway stayed running with non-object correlation_id config");
         }
     }
@@ -1646,8 +1633,7 @@ async fn test_websocket_plaintext_echo() {
         .expect("close preserved-ID H1 WebSocket");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_plaintext_echo PASSED");
 }
@@ -1736,8 +1722,7 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
         .await
         .expect("Failed to send close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1 PASSED");
 }
@@ -1787,8 +1772,7 @@ async fn test_websocket_upgrade_ignores_cors_without_allowed_ws_origins() {
         .await
         .expect("Failed to send close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -1868,8 +1852,7 @@ async fn test_websocket_global_frame_limit_enforced_both_directions() {
         "probe backend should have attempted exactly one oversized response"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     probe_handle.abort();
     println!("test_websocket_global_frame_limit_enforced_both_directions PASSED");
 }
@@ -1915,8 +1898,7 @@ async fn test_websocket_key_auth_rejects_missing_key() {
         other => panic!("expected HTTP 401 handshake rejection, got {other:?}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_key_auth_rejects_missing_key PASSED");
 }
@@ -1959,8 +1941,7 @@ async fn test_h3_websocket_key_auth_reject_strips_transport_policy_fields() {
         Some(r#"ApiKey realm="ferrum-edge""#)
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -2009,8 +1990,7 @@ async fn test_websocket_key_auth_accepts_valid_key() {
         .await
         .expect("Failed to send close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_key_auth_accepts_valid_key PASSED");
 }
@@ -2065,8 +2045,7 @@ async fn test_websocket_tls_echo() {
         .expect("Failed to send close");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_tls_echo PASSED");
 }
@@ -2126,8 +2105,7 @@ async fn test_websocket_multiple_messages() {
         .expect("Failed to send close");
 
     // Cleanup
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_websocket_multiple_messages PASSED");
 }
@@ -2256,8 +2234,7 @@ async fn test_h2_websocket_extended_connect_echo() {
     drop(preserved_ws);
     let _ = tokio::time::timeout(Duration::from_secs(2), conn_task).await;
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_h2_websocket_extended_connect_echo PASSED");
 }
@@ -2298,7 +2275,7 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
         .expect("bind foreign listener");
     let contested_port = squatter.local_addr().unwrap().port();
 
-    let observability_token = mint_observability_token();
+    let identity = mint_gateway_identity();
     let (mut child, admin_port, _stderr_path) = start_gateway_with_extra_env(
         config_path.to_str().unwrap(),
         contested_port,
@@ -2306,14 +2283,13 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
         None,
         None,
         &[],
-        &observability_token,
+        &identity,
     )
     .expect("spawn gateway onto the contested port");
 
     let outcome =
-        wait_for_owned_gateway(&mut child, admin_port, &observability_token, contested_port).await;
-    let _ = child.kill();
-    let _ = child.wait();
+        wait_for_owned_gateway(child.child_mut(), admin_port, &identity, contested_port).await;
+    child.shutdown();
 
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", contested_port))
@@ -2412,8 +2388,7 @@ async fn test_websocket_global_connection_limit_rejects_second_upgrade() {
         .send(Message::Close(None))
         .await
         .expect("close first");
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -2478,8 +2453,7 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
         .send(Message::Close(None))
         .await
         .expect("close first WebSocket");
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -2547,8 +2521,7 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
         .send_close()
         .await
         .expect("close first H3 WebSocket");
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -2610,8 +2583,7 @@ async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() 
     assert!(circuit_body.contains("circuit breaker open"));
     assert_authoritative_content_length(&circuit_headers, circuit_body.len());
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
 }
 
 /// Route method filtering runs before ordinary plugins, but the failed
@@ -2720,8 +2692,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert!(h3_reject_body.contains("Method Not Allowed"));
     assert_authoritative_content_length(&h3_reject_headers, h3_reject_body.len());
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
 }
 
 /// Extended CONNECT (H2 and H3) is forwarded as a WebSocket GET, so route
@@ -2826,8 +2797,7 @@ async fn test_websocket_method_policy_uses_forwarded_get_method() {
     h3_ws.send_text("h3 get").await.expect("send text");
     assert_eq!(h3_ws.recv_text().await.expect("echo"), "Echo: h3 get");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3064,8 +3034,7 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
             .contains("cannot mock a successful WebSocket handshake")
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
 }
 
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the
@@ -3178,8 +3147,7 @@ async fn test_h3_websocket_rfc6455_masked_frames_and_unmasked_refusal() {
         .await
         .expect("close preserved-ID H3 WebSocket");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3231,8 +3199,7 @@ async fn test_h3_websocket_disabled_env_rejects_extended_connect_only() {
         "disabled response should explain H3 WebSocket is disabled"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     http_handle.abort();
 }
 
@@ -3316,8 +3283,7 @@ async fn test_h3_websocket_global_frame_limit_rejects_oversized_client_frame() {
         "oversized H3 WebSocket frame reached backend despite FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     probe_handle.abort();
 }
 
@@ -3400,8 +3366,7 @@ async fn test_h3_websocket_subprotocol_forwarding_and_none() {
     );
     without_subprotocol.send_close().await.expect("close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3490,8 +3455,7 @@ async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
     );
     allowed_origin.send_close().await.expect("close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3530,8 +3494,7 @@ async fn test_h3_websocket_retry_rotates_to_next_upstream_target() {
     assert_eq!(ws.recv_text().await.expect("echo"), "Echo: retry rotation");
     ws.send_close().await.expect("close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     let _keep_dead_port = dead_port_reservation;
 }
@@ -3572,8 +3535,7 @@ async fn test_h3_websocket_failed_backend_upgrade_returns_502() {
             .contains("Backend WebSocket connection failed")
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     let _keep_dead_port = dead_port_reservation;
 }
 
@@ -3628,8 +3590,7 @@ async fn test_h3_websocket_releases_per_ip_request_slot_after_200() {
     assert_eq!(ws.recv_text().await.expect("echo"), "Echo: still open");
     ws.send_close().await.expect("close");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     http_handle.abort();
 }
@@ -3687,8 +3648,7 @@ async fn test_h3_websocket_env_disabled_rejects_connect_but_plain_h3_works() {
         "disabled H3 WebSocket response should explain the env gate"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     http_handle.abort();
 }
@@ -3788,8 +3748,7 @@ async fn test_websocket_idle_timeout_closes_idle_session() {
         "idle WebSocket session should be closed by the gateway within the idle window"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3831,8 +3790,7 @@ async fn test_websocket_idle_timeout_disabled_keeps_session_open() {
     let reply = ws.next().await.expect("No reply").expect("Error reading");
     assert_eq!(reply, Message::Text("Echo: still-here".into()));
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3884,8 +3842,7 @@ async fn test_websocket_idle_timeout_activity_refreshes_then_closes() {
         "session should close once activity stops and the idle window elapses"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -3999,8 +3956,7 @@ async fn test_websocket_max_lifetime_active_traffic_h1_h2_h3_parity() {
         "active H3 traffic must not extend the maximum lifetime"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4109,8 +4065,7 @@ async fn test_websocket_active_jwt_session_closes_at_credential_expiry() {
         "credential expiry must close the active session well before the 30-second maximum"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4154,8 +4109,7 @@ async fn test_websocket_idle_timeout_tunnel_mode_closes_idle_session() {
         "tunnel-mode idle WebSocket session should be closed within the idle window"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4255,8 +4209,7 @@ async fn test_websocket_idle_timeout_sends_symmetric_1001_close() {
     assert_eq!(backend_code, CloseCode::Away);
     assert_eq!(backend_reason, "idle timeout");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4363,8 +4316,7 @@ async fn test_websocket_client_protocol_violation_closes_with_1002() {
     assert_eq!(close.code, CloseCode::Protocol);
     assert_eq!(close.reason.as_str(), "protocol error");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4415,8 +4367,7 @@ async fn test_websocket_backend_reset_closes_client_with_1011() {
     assert_eq!(close.code, CloseCode::Error);
     assert_eq!(close.reason.as_str(), "relay error");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     reset_handle.abort();
 }
 
@@ -4464,8 +4415,7 @@ async fn test_websocket_ping_unresponsive_backend_yields_no_local_pong() {
         Some(other) => panic!("unexpected frame while waiting for silence: {other:?}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4509,8 +4459,7 @@ async fn test_websocket_ping_responsive_backend_yields_exactly_one_pong() {
         Some(other) => panic!("unexpected trailing frame: {other:?}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4562,8 +4511,7 @@ async fn test_websocket_backend_ping_unresponsive_client_yields_no_local_pong() 
     );
 
     let _ = ws.send(Message::Close(None)).await;
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4626,8 +4574,7 @@ async fn test_websocket_backend_ping_responsive_client_yields_exactly_one_pong()
     );
 
     let _ = ws.send(Message::Close(None)).await;
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4692,8 +4639,7 @@ async fn test_h2_websocket_ping_unresponsive_backend_yields_no_local_pong() {
 
     drop(ws);
     conn_task.abort();
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4762,8 +4708,7 @@ async fn test_h2_websocket_ping_responsive_backend_yields_exactly_one_pong() {
 
     drop(ws);
     conn_task.abort();
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -4804,8 +4749,7 @@ async fn test_h3_websocket_ping_unresponsive_backend_yields_no_local_pong() {
         Ok(Err(err)) => panic!("H3 recv error while expecting silence: {err}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     backend_handle.abort();
 }
 
@@ -4853,7 +4797,6 @@ async fn test_h3_websocket_ping_responsive_backend_yields_exactly_one_pong() {
         Ok(Err(err)) => panic!("H3 recv error after first Pong: {err}"),
     }
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }

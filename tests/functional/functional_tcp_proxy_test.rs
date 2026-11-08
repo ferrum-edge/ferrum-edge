@@ -311,18 +311,18 @@ where
 {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        // Allocate fresh ephemeral ports each attempt
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let proxy_listen_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let http_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let http_port = http_listener.local_addr().unwrap().port();
-        drop(http_listener);
-
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        // Fresh registry-leased handoff ports each attempt, outside the host's
+        // ephemeral source range so no outgoing connection can take them
+        // between release and the gateway's bind.
+        let proxy_listen_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve stream listener port");
+        let http_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway HTTP port");
+        let admin_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway admin port");
 
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("config.yaml");

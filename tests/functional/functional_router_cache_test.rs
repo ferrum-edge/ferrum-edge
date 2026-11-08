@@ -15,6 +15,7 @@
 //! Run with:
 //!   cargo test --test functional_tests -- --ignored functional_router_cache --nocapture
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::io::Write;
@@ -64,12 +65,18 @@ fn start_gateway_with_cache_cap(
     admin_port: u16,
     cache_cap: usize,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> std::process::Child {
+) -> GatewayChildGuard {
     let binary_path = crate::common::gateway_binary_path();
     let mut cmd = std::process::Command::new(binary_path);
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        // Keep any managed-TLS/ACME/event store inside the config's temp dir.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_ROUTER_CACHE_MAX_ENTRIES", cache_cap.to_string())
@@ -78,7 +85,7 @@ fn start_gateway_with_cache_cap(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    cmd.spawn().expect("Failed to start gateway binary")
+    GatewayChildGuard::new(cmd.spawn().expect("Failed to start gateway binary"))
 }
 
 /// Allocate an ephemeral port by binding to port 0 and returning the port.
@@ -134,7 +141,7 @@ async fn wait_for_proxy_path(proxy_port: u16, path: &str) -> bool {
 async fn start_gateway_with_retry(
     config_path: &str,
     cache_cap: usize,
-) -> (std::process::Child, u16, u16) {
+) -> (GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
@@ -144,7 +151,7 @@ async fn start_gateway_with_retry(
         let mut child =
             start_gateway_with_cache_cap(config_path, proxy_port, admin_port, cache_cap, &identity);
 
-        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
+        if wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
 
@@ -152,8 +159,7 @@ async fn start_gateway_with_retry(
             "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
             attempt, MAX_ATTEMPTS, proxy_port, admin_port
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        child.shutdown();
 
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
@@ -278,8 +284,7 @@ async fn test_router_cache_500_proxies_normal_routing() {
         &failures[..failures.len().min(5)]
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -373,9 +378,8 @@ async fn test_router_cache_scanner_traffic_preserves_valid_routes() {
     let results = match tokio::time::timeout(deadline, join_all).await {
         Ok(r) => r,
         Err(_) => {
-            // Deadlock / hang — kill and fail loudly.
-            let _ = gw.kill();
-            let _ = gw.wait();
+            // Deadlock / hang — shut the gateway down and fail loudly.
+            gw.shutdown();
             echo.abort();
             panic!(
                 "Router cache test deadlocked: {} requests did not complete within {:?}",
@@ -436,8 +440,7 @@ async fn test_router_cache_scanner_traffic_preserves_valid_routes() {
         scanner_total
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -577,8 +580,7 @@ async fn test_router_cache_hot_entry_survives_scanner_burst() {
         post_ok, POST_SCANNER_REQUESTS
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
 
@@ -668,8 +670,7 @@ async fn test_router_cache_negative_cache_no_degradation() {
     let results = match tokio::time::timeout(deadline, futures::future::join_all(handles)).await {
         Ok(r) => r,
         Err(_) => {
-            let _ = gw.kill();
-            let _ = gw.wait();
+            gw.shutdown();
             echo.abort();
             panic!("Negative-cache test deadlocked after {:?}", deadline);
         }
@@ -729,7 +730,6 @@ async fn test_router_cache_negative_cache_no_degradation() {
         scanner_total
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo.abort();
 }
