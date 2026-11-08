@@ -7068,10 +7068,6 @@ impl MtlsDnsAdmissionGuardLifecycle {
             .set_restore_phase(MtlsDnsRestorePhase::ImportedWithErrors);
     }
 
-    fn restore_phase(&self) -> MtlsDnsRestorePhase {
-        self.hold.restore_phase()
-    }
-
     /// Whether the restore phase allows an explicit release: no multi-phase
     /// restore is in progress, the import succeeded, or the compensating
     /// rollback completed. A half-restored namespace keeps its fence.
@@ -11638,11 +11634,7 @@ async fn handle_restore(
             );
         }
         if intervening_write {
-            let mut body = json!({
-                "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
-                "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
-                "rollback": "not_needed_after_intervening_write",
-            });
+            let mut restore_errors = vec![NAMESPACE_ADMISSION_LOST_MESSAGE];
             // A clear that may have removed rows leaves the guard in the
             // cleared phase: returning drops it and its Drop keeps the fence.
             if !restore_guard.restore_phase_allows_release() {
@@ -11650,9 +11642,16 @@ async fn handle_restore(
                     namespace = %namespace,
                     "Restore: clear outcome incomplete after an intervening namespace lease; namespace admission guard retained for manual recovery"
                 );
-                body["rollback_errors"] = json!([RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE]);
+                restore_errors.push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE);
             }
-            return Ok(json_response(StatusCode::SERVICE_UNAVAILABLE, &body));
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+                    "restore_errors": restore_errors,
+                    "rollback": "not_needed_after_intervening_write",
+                }),
+            ));
         }
     }
     if let Err(e) = delete_result {
@@ -11784,6 +11783,7 @@ async fn handle_restore(
                 }
             };
             if !rollback_guard.immediately_succeeds_generation(lost_generation) {
+                errors.push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
                 error!(
                     namespace = %namespace,
                     "Restore: import rollback skipped after an intervening namespace lease; namespace admission guard retained for manual recovery"
@@ -11794,7 +11794,6 @@ async fn handle_restore(
                         "error": "Config admission was lost during restore import; rollback was skipped because another writer acquired the namespace lease",
                         "restore_errors": errors,
                         "rollback": "skipped_after_intervening_write",
-                        "rollback_errors": [RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE],
                     }),
                 ));
             }

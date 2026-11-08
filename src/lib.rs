@@ -8530,13 +8530,14 @@ pub mod _test_support {
         }
 
         /// Mirror the restore flow's explicit `Cleared` transitions (ambiguous
-        /// atomic clear, reacquired guard after a lost lease during clear).
+        /// atomic clear, or a lost lease during a clear that may have removed
+        /// rows).
         pub fn mark_restore_cleared(&self) {
             self.0.mark_restore_cleared_for_test();
         }
 
         /// Mirror the restore flow's explicit failed-import transition (lease
-        /// lost during import, reacquired guard for the rollback).
+        /// lost during import; the same guard carries the rollback).
         pub fn mark_restore_import_failed(&self) {
             self.0.mark_restore_import_failed_for_test();
         }

@@ -53,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without a definitive atomic abort is treated as incomplete. When the import
   rollback is skipped after another writer took the lease, the `503` now lists
   `namespace admission guard retained; manual recovery required` in
-  `rollback_errors`.
+  `restore_errors`.
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while
@@ -334,9 +334,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release and Drop keep the fence until the import succeeds or the rollback
   completes. A rollback that runs but fails now retains the fence too: the
   `500` response keeps `rollback: "incomplete"` and says the guard was
-  retained, and recovery follows the `unknown_outcome` procedure. A guard
-  reacquired for recovery gets the incomplete phase inside its acquisition
-  task, so cancelling during reacquisition no longer releases it. A nested
+  retained, and recovery follows the `unknown_outcome` procedure. Lost-lease
+  recovery keeps the original guard rather than reacquiring one (#7062), so
+  cancelling during recovery no longer releases it. A nested
   mutation restores the prior uncertain state instead of settling it.
 - **The stock xDS client applies a staged ACKed slice when its NACK breaker
   trips** (#7029). When five consecutive invalid responses of one type arrived
