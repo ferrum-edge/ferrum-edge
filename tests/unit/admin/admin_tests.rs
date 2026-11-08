@@ -283,52 +283,59 @@ fn admin_source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str 
     &source[from..to]
 }
 
-/// The restore guard reacquisition statement that precedes `label`.
-fn restore_guard_reacquisition_before<'a>(handler: &'a str, label: &str) -> &'a str {
-    let label_at = handler
-        .find(label)
-        .unwrap_or_else(|| panic!("missing {label}"));
-    let start = handler[..label_at]
-        .rfind("restore_guard = match MtlsDnsAdmissionGuardLifecycle::")
-        .unwrap_or_else(|| panic!("missing reacquisition before {label}"));
-    &handler[start..label_at]
-}
-
-/// Issue #7032: the lost-lease recovery sites cannot be driven through the
-/// SQLite `/restore` harness, so pin their wiring structurally. Both
-/// reacquisitions must apply the inherited incomplete phase inside the
-/// acquisition task, and both rollback finalizers must gate their explicit
-/// release on the recorded restore phase.
+/// Issue #7062 (following #7032): the lost-lease recovery sites cannot be
+/// driven through the SQLite `/restore` harness, so pin their wiring
+/// structurally. Recovery keeps the restore's original guard (the durable
+/// fence) across the namespace lease reacquisition: neither recovery section
+/// may release it or replace it with a reacquired owner, which would leave a
+/// window with no fence over a cleared or partially imported namespace. Both
+/// rollback finalizers must gate their explicit release on the restore phase.
 #[test]
 fn mtls_dns_restore_recovery_paths_keep_phase_gated_fence() {
     let source = include_str!("../../../src/admin/mod.rs");
     let handler = admin_source_section(source, "async fn handle_restore(", "\nasync fn ");
 
-    assert!(
-        handler.contains("let carried_restore_phase = restore_guard.restore_phase();"),
-        "the lost-clear path must capture the phase before releasing the old owner"
-    );
-    let after_clear =
-        restore_guard_reacquisition_before(handler, "\"restore_guard_reacquire_after_clear\"");
-    assert!(
-        after_clear.starts_with(
-            "restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase("
-        ),
-        "lost-clear recovery must reacquire with the inherited phase: {after_clear}"
-    );
-    assert!(after_clear.contains("carried_restore_phase"));
-
-    let after_import = restore_guard_reacquisition_before(
+    let lost_clear = admin_source_section(
         handler,
-        "\"restore_guard_reacquire_for_import_rollback\"",
+        "if let Some(_error) = delete_admission_error {",
+        "if let Err(e) = delete_result {",
+    );
+    let lost_import = admin_source_section(
+        handler,
+        "error_persistence_failure_redacted(\"restore_namespace_admission_lost_during_import\");",
+        "let rollback = finish_failed_restore(",
+    );
+    for (site, section) in [("lost clear", lost_clear), ("lost import", lost_import)] {
+        assert!(
+            !section.contains("restore_guard.release()"),
+            "{site} recovery must not release the restore guard before recovery"
+        );
+        assert!(
+            !section.contains("restore_guard = "),
+            "{site} recovery must keep the original restore guard, not reacquire one"
+        );
+        let reacquire = section
+            .find("crud::lock_namespace_config_admission(")
+            .unwrap_or_else(|| panic!("{site} recovery must reacquire namespace admission"));
+        assert!(
+            section[..reacquire].contains("drop(namespace_config_admission_guard);"),
+            "{site} recovery drops only the lost namespace lease before reacquiring it"
+        );
+    }
+    let failed_import_phase = lost_import
+        .find("restore_guard.retain_restore_import_failed();")
+        .expect("the lost import must record the failed-import phase");
+    assert!(
+        failed_import_phase
+            < lost_import
+                .find("crud::lock_namespace_config_admission(")
+                .expect("lost import reacquisition"),
+        "the lost import must record the failed-import phase before any await"
     );
     assert!(
-        after_import.starts_with(
-            "restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase("
-        ),
-        "lost-import recovery must reacquire with the failed-import phase: {after_import}"
+        lost_clear.contains("restore_guard.retain_restore_cleared();"),
+        "a lost clear that may have removed rows must enter the cleared phase"
     );
-    assert!(after_import.contains("MtlsDnsRestorePhase::ImportedWithErrors"));
 
     assert!(
         handler.contains("if !restore_guard.restore_phase_allows_release() {"),
@@ -365,9 +372,9 @@ fn mtls_dns_restore_recovery_paths_keep_phase_gated_fence() {
 }
 
 #[tokio::test]
-async fn mtls_dns_restore_reacquired_guard_phase_retains_until_rollback_completes() {
-    // Lease lost during clear or import: the reacquired owner inherits the
-    // incomplete phase before its rollback is dispatched.
+async fn mtls_dns_restore_lost_lease_phase_retains_until_rollback_completes() {
+    // Lease lost during clear or import: the original owner stays in the
+    // incomplete phase until its rollback completes.
     let after_clear = AdminMtlsDnsAdmissionHoldProbe::new();
     after_clear.mark_restore_cleared();
     assert!(!after_clear.drop_releases());

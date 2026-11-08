@@ -8548,19 +8548,16 @@ pub mod _test_support {
         }
     }
 
-    /// Cancel a restore-guard recovery reacquisition after its first poll
-    /// (issue #7032). See `admin::cancel_restore_guard_reacquisition_for_test`.
-    pub async fn admin_cancel_restore_guard_reacquisition_for_test(
+    /// Abandon a restore's lost-lease recovery while its namespace lease
+    /// reacquisition is pending (issue #7062). Returns the abandoned restore
+    /// guard owner. See `admin::abandon_restore_lost_lease_recovery_for_test`.
+    pub async fn admin_abandon_restore_lost_lease_recovery_for_test(
         db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
         namespace: &str,
-        inherit_incomplete_restore: bool,
-    ) {
-        crate::admin::cancel_restore_guard_reacquisition_for_test(
-            db,
-            namespace,
-            inherit_incomplete_restore,
-        )
-        .await
+        after_import: bool,
+    ) -> Result<String, anyhow::Error> {
+        crate::admin::abandon_restore_lost_lease_recovery_for_test(db, namespace, after_import)
+            .await
     }
 
     pub fn admin_mtls_dns_admission_contention_response(

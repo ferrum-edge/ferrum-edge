@@ -41,6 +41,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
+  (#7062). When namespace admission was lost during the restore clear or
+  import, recovery released the restore's durable guard and only then
+  reacquired the namespace lease and a new guard. If either reacquisition
+  failed (`503`) or the request was cancelled in between, nothing fenced the
+  cleared or partially imported namespace, so guarded writes were admitted
+  until an operator intervened. Recovery now keeps the original guard owner
+  across the lease reacquisition and runs the rollback under it, so a failed
+  or cancelled recovery leaves the namespace fenced. A clear that failed
+  without a definitive atomic abort is treated as incomplete. When the import
+  rollback is skipped after another writer took the lease, the `503` now lists
+  `namespace admission guard retained; manual recovery required` in
+  `rollback_errors`.
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while

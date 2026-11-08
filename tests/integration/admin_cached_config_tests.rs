@@ -5222,62 +5222,76 @@ async fn mtls_dns_restore_completed_rollback_and_success_release_fence() {
     );
 }
 
-/// Issue #7032: a recovery reacquisition cancelled while its detached
-/// acquisition task is still pending must not let the undelivered lifecycle
-/// release the new durable owner over a half-restored namespace.
+/// Issue #7062: lost-lease recovery keeps the restore's original guard across
+/// the namespace lease reacquisition. When that reacquisition is abandoned
+/// (cancelled while another writer holds the lease, or failed), the dropped
+/// guard leaves the half-restored namespace fenced, and a guarded write is
+/// refused until the fence is cleared. Before the fix the recovery released
+/// the old owner first, so nothing held the fence in that window.
 #[tokio::test]
-async fn mtls_dns_restore_cancelled_recovery_reacquisition_retains_fence() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test_restore_reacquire_fence.db");
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
-        .await
-        .expect("Failed to connect to test database");
-    let pool = db.pool();
-    let backend: Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend> = Arc::new(db);
+async fn mtls_dns_restore_abandoned_lost_lease_recovery_keeps_guarded_writes_refused() {
+    for (after_import, db_name) in [
+        (false, "test_restore_lost_clear_recovery_fence.db"),
+        (true, "test_restore_lost_import_recovery_fence.db"),
+    ] {
+        let (temp_dir, pool, base_url, token, _shutdown) = restore_fence_test_server(db_name).await;
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            temp_dir.path().join(db_name).to_string_lossy()
+        );
+        let recovery_db =
+            DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+                .await
+                .expect("Failed to connect the recovery store");
+        let recovery_db: Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend> =
+            Arc::new(recovery_db);
 
-    ferrum_edge::_test_support::admin_cancel_restore_guard_reacquisition_for_test(
-        backend.clone(),
-        "ferrum",
-        true,
-    )
-    .await;
-    settle_guard_drop_cleanup().await;
-    assert!(
-        mtls_dns_restore_owner(&pool, "ferrum").await.is_some(),
-        "the undelivered reacquired guard must retain the inherited incomplete phase"
-    );
-
-    // Control: the same cancelled reacquisition without an inherited phase
-    // claims the fence and its Drop releases it through the backend.
-    sqlx::query(
-        "UPDATE mtls_dns_admission_locks SET restore_owner = NULL, updated_at = ? \
-         WHERE namespace = ?",
-    )
-    .bind("2000-01-01T00:00:00+00:00")
-    .bind("ferrum")
-    .execute(&pool)
-    .await
-    .expect("Failed to reset the mTLS DNS admission fence");
-    ferrum_edge::_test_support::admin_cancel_restore_guard_reacquisition_for_test(
-        backend, "ferrum", false,
-    )
-    .await;
-    settle_guard_drop_cleanup().await;
-    let updated_at: String =
-        sqlx::query_scalar("SELECT updated_at FROM mtls_dns_admission_locks WHERE namespace = ?")
-            .bind("ferrum")
-            .fetch_one(&pool)
+        let abandoned_owner =
+            ferrum_edge::_test_support::admin_abandon_restore_lost_lease_recovery_for_test(
+                recovery_db,
+                "ferrum",
+                after_import,
+            )
             .await
-            .expect("Failed to inspect the mTLS DNS admission fence");
-    assert_ne!(
-        updated_at, "2000-01-01T00:00:00+00:00",
-        "the control reacquisition must have claimed the fence"
-    );
-    assert!(
-        mtls_dns_restore_owner(&pool, "ferrum").await.is_none(),
-        "without an inherited phase the undelivered guard releases its owner"
-    );
+            .expect("model the abandoned recovery");
+        settle_guard_drop_cleanup().await;
+        assert_eq!(
+            mtls_dns_restore_owner(&pool, "ferrum").await.as_deref(),
+            Some(abandoned_owner.as_str()),
+            "after_import={after_import}: the abandoned recovery must keep the original owner's fence"
+        );
+
+        let write = json!({
+            "id": "write-after-abandoned-restore",
+            "listen_path": "/after",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        });
+        let (status, body) = admin_post(&base_url, "/proxies", &token, &write).await;
+        assert_eq!(
+            status, 503,
+            "after_import={after_import}: a guarded write over the half-restored namespace must be refused: {body:?}"
+        );
+
+        // Control: the refusal is the fence's. Once an operator clears it, the
+        // same write is admitted.
+        sqlx::query(
+            "UPDATE mtls_dns_admission_locks SET restore_owner = NULL, updated_at = ? \
+             WHERE namespace = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind("ferrum")
+        .execute(&pool)
+        .await
+        .expect("Failed to clear the mTLS DNS admission fence");
+        let (status, body) = admin_post(&base_url, "/proxies", &token, &write).await;
+        assert_eq!(
+            status, 201,
+            "after_import={after_import}: the write must succeed once the fence is cleared: {body:?}"
+        );
+    }
 }
 
 /// Rollback must faithfully replay the raw pre-restore snapshot even when it
