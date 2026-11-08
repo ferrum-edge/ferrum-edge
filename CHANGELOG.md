@@ -64,6 +64,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `admin` reads and `GET /backup` stay raw. The collector,
   JWKS, control-plane and federation URLs in a `mesh_authz` `mesh_slice` now
   get the same structural endpoint projection as other collector URLs.
+- **Cleartext auth endpoints are admitted only for loopback IP literals,
+  never the name `localhost`.** `oauth2_introspection` (credentialed
+  `http://` endpoints and `client_auth.method: none`), `jwks_auth`
+  (`jwks_uri` / `discovery_url`), `oidc_relying_party` (`discovery_url`,
+  `token_endpoint`, `userinfo_endpoint`, `jwks_uri`, discovered endpoints and
+  `client_auth.method: none`) and `ai_transcript_audit`
+  (`sink.allow_insecure_loopback`) accepted the name `localhost` as
+  loopback, so a DNS override or resolver mapping could carry client secrets,
+  authorization codes, audit transcripts, or an attacker-chosen key set over
+  cleartext to another host. They now follow the #6659 rule: only
+  `127.0.0.0/8` and `::1` literals qualify. Under `client_auth.method: none`,
+  an OIDC token endpoint learned from discovery must meet the same rule (a
+  named discovered revocation endpoint is ignored, so logout skips
+  revocation), and
+  `ai_transcript_audit` judges the sink scheme on the parsed URL (a leading
+  space or embedded tab no longer skips the cleartext guard). **Upgrade:**
+  replace `http://localhost` with `http://127.0.0.1` (or `[::1]`) in these
+  fields. Configured browser-followed OIDC URLs (`authorization_endpoint`,
+  `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) and the
+  `issuer` identifier keep `localhost`; a discovered plaintext endpoint must
+  share the loopback IP-literal discovery origin.
+- **`tcp_logging` no-verify TLS advertises the crypto provider's signature
+  schemes and warns.** Under `FERRUM_TLS_NO_VERIFY` the plugin used a private
+  verifier with a hard-coded scheme list that did not follow the build's
+  provider (ED448, which neither ring nor AWS-LC verifies, and ECDSA P-521,
+  which ring does not) and logged nothing. It now uses the
+  shared `NoVerifier` and warns that verification is disabled, like
+  `ws_logging` and `ldap_auth`.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The
   Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`
@@ -80,6 +108,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mtls_mode: unset` (and `unset` port overrides); an omitted native
   `mtls_mode` still means `permissive`. The `FerrumAccepted` status message for
   an `UNSET` policy now reports the inheritance.
+- **AI gRPC enrollment is decided on the bound backend path, and
+  `ai_response_guard` gRPC frame budgets are bounded.** `ai_response_guard`
+  and `ai_transcript_audit` let the plugin-writable `grpc_full_method`
+  metadata outrank the private bound backend path and compared the untrimmed
+  path, so another plugin's metadata could un-enroll the method the backend
+  serves and an upstream base path hid an enrolled method. Both now resolve
+  the canonical trailing `/Service/Method` exactly as `body_validator` does
+  (bound path, then pre-routing metadata, then the request path).
+  `ai_response_guard` `grpc.max_messages` is capped at 1024 and
+  `grpc.max_message_bytes` at 67108864 (the `max_scan_bytes` ceiling); a
+  larger configured value is rejected at admission.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,
@@ -138,6 +177,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream closes on any response-handling error. It still discards the slice
   when the bearer credential that produced it has rotated, been invalidated, or
   passed its deadline.
+- **The Vault secret backend reads `FERRUM_TLS_CA_BUNDLE_PATH` without
+  blocking startup.** The bundle was read with a blocking `std::fs::read`
+  (twice, once inside vaultrs) on the startup secret-resolution runtime, so a
+  FIFO or stalled mount hung `run` / `validate` past the fetch timeout. It now
+  uses the same detached, non-blocking, regular-file, 4 MiB-capped reader as
+  Azure Key Vault, client construction is bounded by the fetch timeout, and a
+  non-PEM or certificate-free bundle fails closed with a reference-free error.
+  Direct Vault lookups read a non-UTF-8 `FERRUM_TLS_CA_BUNDLE_PATH` like
+  Azure's instead of silently skipping it (startup still rejects non-UTF-8
+  `FERRUM_*` values), and construction no longer needs system CA roots when
+  the bundle supplies the trust anchor. **Upgrade:** the undocumented vaultrs
+  ambient defaults are no longer consulted: `VAULT_CACERT` / `VAULT_CAPATH`
+  (set `FERRUM_TLS_CA_BUNDLE_PATH` instead), `VAULT_CLIENT_CERT` /
+  `VAULT_CLIENT_KEY` (blocking reads; no Vault client identity is loaded), and
+  `VAULT_SKIP_VERIFY` (Vault TLS verification is always on).
 - **A failed SQL failback no longer leaves the primary pool live behind
   failover topology** (#7033). On a store bootstrapped from
   `FERRUM_DB_CONFIG_BACKUP_PATH`, a primary failback published the primary pool

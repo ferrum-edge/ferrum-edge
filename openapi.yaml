@@ -24424,19 +24424,20 @@ components:
               jwks_uri:
                 type: string
                 format: uri
-                pattern: "^\\s*(https://[^\\s/?#@]+([/?#]\\S*)?|http://([lL][oO][cC][aA][lL][hH][oO][sS][tT]|127\\.[0-9.]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]+)?([/?#]\\S*)?)\\s*$"
-                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or localhost endpoints. URL userinfo is rejected. Exactly one of jwks_uri, discovery_url, or jwks may be configured per provider.
+                pattern: "^\\s*(https://[^\\s/?#@]+([/?#]\\S*)?|http://(127\\.[0-9.]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]+)?([/?#]\\S*)?)\\s*$"
+                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for a loopback IP-literal host (127.0.0.0/8 or [::1]); the name localhost does not qualify, because DNS overrides and the resolver decide where a name connects. URL userinfo is rejected. Exactly one of jwks_uri, discovery_url, or jwks may be configured per provider.
               discovery_url:
                 type: string
                 format: uri
-                pattern: "^\\s*(https://[^\\s/?#@]+([/?#]\\S*)?|http://([lL][oO][cC][aA][lL][hH][oO][sS][tT]|127\\.[0-9.]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]+)?([/?#]\\S*)?)\\s*$"
+                pattern: "^\\s*(https://[^\\s/?#@]+([/?#]\\S*)?|http://(127\\.[0-9.]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]+)?([/?#]\\S*)?)\\s*$"
                 description: >-
                   OIDC discovery URL (auto-discovers jwks_uri). The discovered
                   jwks_uri must use the same origin as the discovery URL
                   (scheme, host, and effective port). For IdPs that serve JWKS
                   from a different origin than discovery, configure jwks_uri
-                  directly instead. HTTPS is required except for literal
-                  loopback or localhost endpoints. URL userinfo is rejected.
+                  directly instead. HTTPS is required except for a loopback
+                  IP-literal host (127.0.0.0/8 or [::1]); the name localhost
+                  does not qualify. URL userinfo is rejected.
                   After the first successful resolution, discovery is re-run
                   every jwks_refresh_interval_secs; a changed jwks_uri is
                   adopted once its key set has usable keys, otherwise the
@@ -24972,8 +24973,9 @@ components:
                   introspection_endpoint or discovery_url must be configured.
                   Must use https when
                   client_auth.method is credentialed (client_secret_basic,
-                  client_secret_post, or private_key_jwt) and the host is not
-                  loopback/localhost; http is only permitted for loopback hosts.
+                  client_secret_post, or private_key_jwt) and the host is not a
+                  loopback IP literal; http is only permitted for a loopback IP
+                  literal (127.0.0.0/8 or ::1), never for the name localhost.
                   Surrounding whitespace is trimmed. A path or query is
                   accepted, but operational diagnostics record only the endpoint
                   origin (scheme, host, port).
@@ -24986,8 +24988,8 @@ components:
                   Exactly one of introspection_endpoint or discovery_url must be
                   configured. Must
                   use https when client_auth.method is credentialed and the host
-                  is not loopback/localhost; http is only permitted for loopback
-                  hosts. The discovered endpoint must preserve the discovery
+                  is not a loopback IP literal; http is only permitted for a
+                  loopback IP literal, never for the name localhost. The discovered endpoint must preserve the discovery
                   URL's scheme, normalized host, and effective port.
               issuer:
                 type: string
@@ -25053,8 +25055,9 @@ components:
                       matching. Credentialed methods (client_secret_basic,
                       client_secret_post, private_key_jwt) require an https
                       endpoint for non-loopback hosts; http is only accepted
-                      for loopback/localhost endpoints. The 'none' method is
-                      loopback/localhost-only regardless of scheme.
+                      for a loopback IP-literal host. The 'none' method is
+                      loopback-IP-literal-only regardless of scheme; the name
+                      localhost qualifies for neither.
                       client_secret_basic and client_secret_post require
                       client_id and client_secret; private_key_jwt requires
                       client_id and private_key_pem.
@@ -25383,7 +25386,7 @@ components:
               discovery_url:
                 type: [string, "null"]
                 minLength: 1
-                description: OIDC discovery URL. Mutually exclusive with authorization_endpoint, token_endpoint, and jwks_uri. The document must carry an `issuer` exactly equal to `issuer`. Its endpoints must use HTTPS and may live on other origins (Google and Microsoft Entra ID publish cross-origin endpoints); plain HTTP is accepted only for a loopback development discovery_url and only on its own origin.
+                description: OIDC discovery URL. Mutually exclusive with authorization_endpoint, token_endpoint, and jwks_uri. The document must carry an `issuer` exactly equal to `issuer`. Its endpoints must use HTTPS and may live on other origins (Google and Microsoft Entra ID publish cross-origin endpoints); plain HTTP is accepted only for a loopback development discovery_url and only on its own origin. Every gateway-dialed URL (discovery_url, token_endpoint, userinfo_endpoint, jwks_uri, and discovered endpoints) admits plain HTTP only for a loopback IP-literal host (127.0.0.0/8 or [::1]), never for the name localhost, because DNS overrides and the resolver decide where a name connects; configured browser-followed URLs (authorization_endpoint, end_session_endpoint, redirect_uri, post_logout_redirect_uri) and the issuer identifier keep the localhost development case, while a discovered plaintext endpoint must share the loopback IP-literal discovery origin. With client_auth.method none, a discovered token_endpoint must also be a loopback IP literal, and a discovered revocation_endpoint that is not one is ignored (logout skips revocation).
               authorization_endpoint:
                 type: [string, "null"]
                 minLength: 1
@@ -25435,7 +25438,7 @@ components:
                       - none
                       - null
                     default: client_secret_basic
-                    description: Null or absent selects client_secret_basic. A non-string value is rejected. "none" is admitted only for localhost or literal loopback token endpoints.
+                    description: Null or absent selects client_secret_basic. A non-string value is rejected. "none" is admitted only for a token endpoint whose host is a loopback IP literal (the name localhost does not qualify), including a token endpoint learned from discovery.
                   client_secret:
                     type: string
                     minLength: 1
@@ -37045,7 +37048,7 @@ components:
                   builtins: {type: array, maxItems: 0}
                   custom_patterns: {maxItems: 0}
           then: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults. Redacted captures replace malformed function.arguments JSON with [UNPARSEABLE] and set arguments_redaction_failed=true on the captured function object; valid arguments retain member-name redaction. Explicit full_body raw capture is unchanged. Every fixed scalar whose runtime default is used when the key is omitted also accepts an explicit null; the batching keys (sink.batch_size, sink.flush_interval_ms, sink.buffer_capacity, sink.max_retries, sink.retry_delay_ms), sink.endpoint_url, sink.custom_headers, redaction.custom_patterns, grpc, grpc.descriptor_path, and grpc.methods do NOT — null is a type error for those, exactly as the schema states. RUNTIME-ONLY CHECKS this component deliberately cannot express, all of which still reject the configuration at construction: (1) arithmetic relationships between limits — limits.max_entry_bytes must be >= the worst-case serialized-JSON contract implied by the configured capture limits, limits.buffer_max_bytes must be >= both 65536 and the retained charge of limits.max_entry_bytes, and max_request_bytes + max_response_bytes + max_stream_capture_bytes must be <= 2097152; (2) Rust `regex` crate compilation of every redaction.builtins entry and every redaction.custom_patterns[].regex, and rejection of an unknown redaction.builtins name beyond the enum; (3) sink.endpoint_url authority, userinfo, and backend-egress SSRF screening, plus the rule that cleartext http:// is admitted only with sink.allow_insecure_loopback: true AND a localhost / loopback-IP host; (4) sink.custom_headers name/value validity and the ${secret:NAME} template grammar (a resolvable FERRUM_TRANSCRIPT_SINK_SECRET_<NAME> is checked later still, when the background worker activates); (5) node-local existence and decodability of grpc.descriptor_path, and resolution of each method's request_type / response_type / text_fields against that descriptor — Admin/CP admission validates shape only; (6) grpc.methods key normalization (trim plus one optional leading slash) and the rejection of two keys that normalize to the same method path; (7) grpc.methods[].text_fields segment trimming, the per-path segment-depth ceiling, and duplicate detection after normalization, which catches pairs that uniqueItems cannot (\"a.b\" versus \"a . b\"); and (8) the plugin-cache composition rule that refuses a priority override placing this instance at or after a co-located request_deduplication instance."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (3010); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP by default; native gRPC capture requires an explicit descriptor-based grpc enrollment block (enrolled methods only). Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults. Redacted captures replace malformed function.arguments JSON with [UNPARSEABLE] and set arguments_redaction_failed=true on the captured function object; valid arguments retain member-name redaction. Explicit full_body raw capture is unchanged. Every fixed scalar whose runtime default is used when the key is omitted also accepts an explicit null; the batching keys (sink.batch_size, sink.flush_interval_ms, sink.buffer_capacity, sink.max_retries, sink.retry_delay_ms), sink.endpoint_url, sink.custom_headers, redaction.custom_patterns, grpc, grpc.descriptor_path, and grpc.methods do NOT — null is a type error for those, exactly as the schema states. RUNTIME-ONLY CHECKS this component deliberately cannot express, all of which still reject the configuration at construction: (1) arithmetic relationships between limits — limits.max_entry_bytes must be >= the worst-case serialized-JSON contract implied by the configured capture limits, limits.buffer_max_bytes must be >= both 65536 and the retained charge of limits.max_entry_bytes, and max_request_bytes + max_response_bytes + max_stream_capture_bytes must be <= 2097152; (2) Rust `regex` crate compilation of every redaction.builtins entry and every redaction.custom_patterns[].regex, and rejection of an unknown redaction.builtins name beyond the enum; (3) sink.endpoint_url authority, userinfo, and backend-egress SSRF screening, plus the rule that cleartext http:// is admitted only with sink.allow_insecure_loopback: true AND a loopback IP-literal host (not the name localhost); (4) sink.custom_headers name/value validity and the ${secret:NAME} template grammar (a resolvable FERRUM_TRANSCRIPT_SINK_SECRET_<NAME> is checked later still, when the background worker activates); (5) node-local existence and decodability of grpc.descriptor_path, and resolution of each method's request_type / response_type / text_fields against that descriptor — Admin/CP admission validates shape only; (6) grpc.methods key normalization (trim plus one optional leading slash) and the rejection of two keys that normalize to the same method path; (7) grpc.methods[].text_fields segment trimming, the per-path segment-depth ceiling, and duplicate detection after normalization, which catches pairs that uniqueItems cannot (\"a.b\" versus \"a . b\"); and (8) the plugin-cache composition rule that refuses a priority override placing this instance at or after a co-located request_deduplication instance."
       properties:
         mode:
           type: [string, "null"]
@@ -37312,7 +37315,7 @@ components:
           type: object
           required: [endpoint_url]
           additionalProperties: false
-          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map."
+          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to a loopback IP literal (not the name localhost). Unknown sink keys are rejected; custom_headers remains an open string map."
           properties:
             type:
               type: [string, "null"]
@@ -37323,11 +37326,11 @@ components:
               format: uri
               minLength: 1
               pattern: '^[Hh][Tt][Tt][Pp][Ss]?://'
-              description: "Collector URL. Only the http and https schemes are admitted (the pattern is spelled case-insensitively because URL schemes are). HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form. The admin audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only scheme://host[:port] with `[REDACTED_PATH]` / `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers."
+              description: "Collector URL. Only the http and https schemes are admitted (the pattern is spelled case-insensitively because URL schemes are). HTTPS is required by default. HTTP is accepted only for a loopback IP literal (127.0.0.0/8 or [::1], not the name localhost) when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form. The admin audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only scheme://host[:port] with `[REDACTED_PATH]` / `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers."
             allow_insecure_loopback:
               type: [boolean, "null"]
               default: false
-              description: "Allow an http:// collector only when endpoint_url uses localhost or a loopback IP. This never permits remote cleartext delivery."
+              description: "Allow an http:// collector only when endpoint_url uses a loopback IP literal. The name localhost does not qualify: DNS overrides and the resolver decide where a name connects. This never permits remote cleartext delivery."
             custom_headers:
               type: object
               additionalProperties:
@@ -37438,8 +37441,9 @@ components:
             or not — and the final request-body hook makes the authoritative
             enrollment decision. An enrolled instance joins the backend-path
             boundary itself, so that decision uses the backend-effective path
-            the proxy binds and does not require grpc_method_router (whose
-            grpc_full_method, when present, still takes precedence). A call enrolled only by its backend-effective method is staged at that boundary, so a deferred before_proxy short circuit after it still leaves a record. A client-streaming or bidirectional-streaming
+            the proxy binds (its trailing /Service/Method) and does not
+            require grpc_method_router; the bound path is never outranked by
+            the plugin-writable grpc_full_method metadata. A call enrolled only by its backend-effective method is staged at that boundary, so a deferred before_proxy short circuit after it still leaves a record. A client-streaming or bidirectional-streaming
             method on such a proxy therefore gets fully buffered request
             semantics; max_messages caps how much is captured, not how much is
             buffered.
@@ -39310,20 +39314,29 @@ components:
             max_message_bytes:
               type: integer
               minimum: 1
+              maximum: 67108864
               default: 1048576
               description: >-
                 Per-message ceiling, applied to the declared frame length and
                 enforced while inflating a gzip-compressed frame; inflation
                 stops at the tighter of this ceiling and the remaining
                 max_scan_bytes budget. Aggregate decoded payload across frames
-                is additionally capped by max_scan_bytes.
+                is additionally capped by max_scan_bytes. Bounded by an
+                immutable deployment maximum of 67108864 (64 MiB), equal to the
+                max_scan_bytes ceiling — a larger per-message value could never
+                produce an inspection.
             max_messages:
               type: integer
               minimum: 1
+              maximum: 1024
               default: 64
               description: >-
                 Maximum number of length-prefixed frames one buffered gRPC
-                response may carry.
+                response may carry. Bounded by an immutable deployment maximum
+                of 1024 frames: the decoded-byte scan budget bounds decoded
+                payload, not frame count, so legal zero-length frames would
+                otherwise let an operator-configured value drive an effectively
+                unbounded frame vector.
 
     AiToolGovernorConfig:
       type: object

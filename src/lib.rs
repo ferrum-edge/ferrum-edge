@@ -3586,6 +3586,15 @@ pub mod _test_support {
         Ok((resolved.userinfo_endpoint, resolved.end_session_endpoint))
     }
 
+    /// Whether an `oidc_relying_party` instance's discovery task published a
+    /// document within `wait` (a refused document is retried, never published).
+    pub async fn oidc_discovery_published_within_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        wait: std::time::Duration,
+    ) -> bool {
+        plugin.discovery_published_within_for_tests(wait).await
+    }
+
     /// Await a plugin's background discovery task and return the resolved
     /// optional endpoints as `(userinfo, end_session)`. Consumes the plugin so
     /// the discovery task can be awaited to completion.

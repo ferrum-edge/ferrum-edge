@@ -26,7 +26,7 @@ config:
     post_login_default_path: "/"
 ```
 
-Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery. Provider endpoints must use HTTPS except for `localhost` or literal loopback development endpoints.
+Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery. Provider endpoints the gateway itself dials (`discovery_url`, `token_endpoint`, `userinfo_endpoint`, `jwks_uri`, and every discovered endpoint) must use HTTPS except for a loopback IP literal (`127.0.0.0/8` or `[::1]`); the name `localhost` does not qualify, because DNS overrides and the resolver decide where a name connects. Browser-followed URLs (`authorization_endpoint`, `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) and the `issuer` identifier keep the `localhost` development case, and a discovered plaintext endpoint must share the loopback IP-literal discovery origin.
 
 A discovery document is used only when its `issuer` member is exactly the configured `issuer` ([OpenID Connect Discovery §4.3](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationValidation)); a missing or different issuer fails discovery (logged, retried with backoff) and browser challenges answer `503` until it resolves, so a discovery URL pointing at the wrong tenant can never send users or the client credential to that tenant. Once the issuer matched, discovered endpoints must use HTTPS but may live on other origins — Google publishes its token, JWKS, and UserInfo endpoints on hosts other than `accounts.google.com`, and Microsoft Entra ID publishes UserInfo on `graph.microsoft.com`. Plain HTTP is accepted only for a loopback development `discovery_url`, and only on that URL's own origin. Every provider call still dials through the shared plugin HTTP client, whose backend egress policy screens the resolved address.
 
@@ -121,7 +121,7 @@ Supported `client_auth.method` values are:
 | `client_secret_basic` | Sends the client secret with HTTP Basic auth. The client identifier and secret are `application/x-www-form-urlencoded` before the Basic encoding, per [RFC 6749 §2.3.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1), so credentials containing `:`, `+`, spaces, or non-ASCII characters work against a conforming provider |
 | `client_secret_post` | Sends client credentials in the token request body |
 | `private_key_jwt` | Signs a client assertion with RSA, EC, or EdDSA keys (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `EdDSA`). Admission signs a throwaway assertion, so a key that cannot support the selected algorithm — an `ES256` client holding a P-384 key, for example — is refused at config load instead of failing the first token exchange after the authorization code has been spent |
-| `none` | Public client mode, allowed only for localhost or loopback token endpoints |
+| `none` | Public client mode, allowed only when the token endpoint (configured or discovered) is a loopback IP literal; the name `localhost` does not qualify. A discovered `revocation_endpoint` that is not a loopback IP literal is ignored, so logout skips revocation |
 
 ## Logout
 
