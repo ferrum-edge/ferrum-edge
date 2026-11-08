@@ -1573,9 +1573,12 @@ fn heuristic_and_redis_url_callers_match_compact_normalized_spellings() {
     assert!(!is_credential_bearing_url_config_key("redis_url_template"));
     assert!(!is_credential_bearing_url_config_key("url"));
 
-    // End-to-end through the heuristic layer on a custom plugin (no schema).
+    // End-to-end through the heuristic and Redis URL layers on a built-in
+    // whose schema declares no rules (`stdout_logging`), so only those layers
+    // decide. A custom plugin would fail closed instead and withhold every
+    // leaf (see `custom_plugin_configs_fail_closed_at_every_scalar_leaf`).
     let projected = project(
-        "some_custom_plugin",
+        "stdout_logging",
         json!({
             "apiKey": "custom-apikey-canary",
             "redisUrl": "redis://cacheuser:custom-redis-canary@cache.internal:6379/2",
