@@ -1334,8 +1334,10 @@ fn loopback_tls_connector() -> Option<&'static tokio_rustls::TlsConnector> {
 ///
 /// It advertises exactly the signature schemes of the provider the probe
 /// client is built from (issue #7075), like `crate::tls::NoVerifier` does for
-/// the base provider, so a FIPS provider is never offered a scheme it cannot
-/// verify.
+/// the base provider, so a FIPS build never offers a scheme outside its
+/// provider. The list is what ClientHello offers, so it still decides
+/// negotiation: an application whose only certificate needs a scheme the
+/// provider lacks (ECDSA P-521 under ring) fails the probe handshake.
 #[derive(Debug)]
 pub(crate) struct LoopbackNoVerifier {
     schemes: Vec<rustls::SignatureScheme>,

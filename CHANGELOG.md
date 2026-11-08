@@ -54,10 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ferrum-edge validate` and the bootstrap itself; its accepted spelling
     (`true`, case-insensitive) is unchanged and is now documented with the
     other mesh dev opt-ins in `docs/mesh.md`.
-  - The mesh app-probe loopback HTTPS client advertises the signature schemes
-    of its own crypto provider instead of a fixed list, and the `health
-    --tls-no-verify` client uses the shared `NoVerifier`. Neither changes a
-    handshake outcome.
+  - The mesh app-probe loopback HTTPS client now offers only the signature
+    schemes of its own crypto provider instead of a fixed list. The probe
+    still accepts any certificate, but scheme negotiation follows the provider:
+    on the default ring build an application whose only certificate is
+    ECDSA P-521 can no longer complete a sidecar HTTPS probe (ring does not
+    offer `ecdsa_secp521r1_sha512`); serve a P-256/P-384, RSA, or Ed25519
+    certificate instead. The `health --tls-no-verify` client now uses the
+    shared `NoVerifier`, with identical behavior.
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while
