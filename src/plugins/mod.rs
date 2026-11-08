@@ -6721,6 +6721,10 @@ impl RequestContext {
     /// decision header, the forwarded peer SPIFFE ID. The final gateway
     /// assertion pass (`proxy::enforce_route_owned_request_assertions`) and the
     /// trigger-skip sanitizers keep only recorded pairs.
+    ///
+    /// Gated by its callers: only an admitted owner's install reaches it, so
+    /// a route that owns no asserted header (and the plugin-free request
+    /// path) never materializes per-plugin state here.
     pub(crate) fn record_installed_request_assertion(&mut self, name: &str, value: &str) {
         if self.request_assertion_installed(name, value) {
             return;
