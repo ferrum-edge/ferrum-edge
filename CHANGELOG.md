@@ -45,10 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rounds sub-millisecond values up** (issue #7072). A per-port load-balancing
   refusal (`LEAST_LATENCY`, or a non-source-IP `hash_on`) now names the
   route's own scheme (`tcp`, `tcps`, `udp` or `dtls`) instead of always
-  saying "TCP" or "UDP". The proxy's own `grpc-timeout` reader now uses the
-  `grpc_deadline` plugin's parser and rounds `u`/`n` values up to the next
-  millisecond instead of down, so `1500u` is a 2 ms deadline with or without
-  the plugin (it was 1 ms without it).
+  saying "TCP" or "UDP". The proxy's own `grpc-timeout` reader (the gRPC
+  streaming timeout and upload-bound selection) now uses the `grpc_deadline`
+  parser and rounds `u`/`n` values up to the next millisecond instead of down,
+  matching the receipt-anchored request deadline: `1500u` is 2 ms on every
+  path (that reader used to see 1 ms).
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while
