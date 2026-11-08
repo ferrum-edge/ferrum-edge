@@ -46,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route owns as a gateway assertion, or, on such a route without a `grpc_web`
   translator, could set `content-type` to a gRPC-Web media type; a config or
   mesh slice with such a rule is rejected (the last good one keeps serving).
+  Owned assertion destinations (`claim_headers`, `output_claim_headers`, OPA
+  `decision_request_headers`, mesh `outputClaimToHeaders`) must now be
+  application-specific headers: every standard HTTP request field (`Accept`,
+  `User-Agent`, `Origin`, `Cache-Control`, `If-*`, `Content-*`, `Sec-*`,
+  `Proxy-*`, `Access-Control-*`, the trace context, `grpc-*`, framing and
+  forwarding fields, ...) is refused at config load, because a transport or
+  client library may write it after the gateway's final check. A plugin config
+  or a mesh RequestAuthentication `outputClaimToHeaders` naming one is now
+  rejected (the mesh slice fails closed and the last good one keeps serving).
   The gateway now enforces these assertions once more over the finalized
   outbound header map on every protocol path: an owned header reaches the
   backend only as the exact name and value an admitted owner installed for

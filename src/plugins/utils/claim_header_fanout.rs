@@ -622,11 +622,11 @@ pub fn is_output_claim_reserved_header(name: &str) -> bool {
         )
         || lowercase.starts_with("x-ferrum-")
         || lowercase.starts_with("x-forwarded-")
-        // Headers the gateway writes after the final gateway-assertion pass
-        // (per-attempt `traceparent`, `grpc-timeout`, ...): an owned
-        // destination there would be overwritten, or would strip the
-        // gateway's own value. Shared by every owned-name validator.
-        || crate::proxy::headers::is_gateway_post_hook_request_header(&lowercase)
+        // Claim destinations must be application-specific headers: every
+        // standard HTTP request field a transport, client library or the
+        // gateway may write after the final gateway-assertion pass is refused
+        // (the one shared list, used by every owned-name validator).
+        || crate::proxy::headers::is_reserved_assertion_destination(&lowercase)
 }
 
 #[cfg(test)]
