@@ -4468,29 +4468,6 @@ impl Plugin for MeshAuthz {
         self.ext_authz_declared_modified_headers.clone()
     }
 
-    /// The provider-owned `headersToUpstreamOnAllow` names: folded into the
-    /// route's request-trailer strip list, so a client can never restate one
-    /// in request trailers.
-    fn owned_request_assertion_header_names(&self) -> Vec<String> {
-        self.ext_authz_upstream_allow_headers.clone()
-    }
-
-    /// A trigger-skipped instance runs no check and stages nothing, but its
-    /// `headersToUpstreamOnAllow` names stay provider-owned: every client
-    /// spelling is removed, and only a value an admitted instance installed
-    /// for this request survives.
-    fn sanitize_owned_request_headers(
-        &self,
-        ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
-    ) {
-        crate::plugins::strip_uninstalled_policy_request_headers(
-            ctx,
-            headers,
-            &self.ext_authz_upstream_allow_headers,
-        );
-    }
-
     /// Apply an allowed CUSTOM check's `headersToUpstreamOnAllow` result.
     ///
     /// Runs at this plugin's own priority in the ordinary `before_proxy`
@@ -4505,12 +4482,6 @@ impl Plugin for MeshAuthz {
     /// with `_` folded to `-`, the way CGI-style backends read it — so a
     /// client-forged `x-auth-request-user` (or `X_Auth_Request_User`) can
     /// never reach the backend beside, or instead of, the provider's value.
-    ///
-    /// The names stay provider-owned on a request for which this instance
-    /// staged nothing (no CUSTOM rule matched, or the allow came from a
-    /// non-CUSTOM rule): nothing vouched for them, so every client spelling is
-    /// removed too, keeping only a value another admitted instance installed
-    /// for this request.
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -4519,19 +4490,16 @@ impl Plugin for MeshAuthz {
         if self.ext_authz_upstream_allow_headers.is_empty() {
             return PluginResult::Continue;
         }
-        let staged = ctx.plugin_state_opt_mut().and_then(|state| {
+        let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
             state
                 .mesh_ext_authz_upstream_headers
                 .remove(&self.instance_id)
-        });
-        let Some(staged) = staged.filter(|staged| !staged.is_empty()) else {
-            crate::plugins::strip_uninstalled_policy_request_headers(
-                ctx,
-                headers,
-                &self.ext_authz_upstream_allow_headers,
-            );
+        }) else {
             return PluginResult::Continue;
         };
+        if staged.is_empty() {
+            return PluginResult::Continue;
+        }
         headers.retain(|name, _| {
             !staged.iter().any(|(owned, _)| {
                 crate::proxy::headers::field_names_equivalent_for_backends(name, owned)
@@ -4539,19 +4507,9 @@ impl Plugin for MeshAuthz {
         });
         for (name, value) in staged {
             if let Some(value) = value {
-                // Provenance for a sibling instance owning the same name that
-                // staged nothing itself (`strip_uninstalled_policy_request_headers`).
-                ctx.mark_policy_request_header_installed(&name);
                 headers.insert(name, value);
             }
         }
-        // A name this instance owns through another provider is not in this
-        // check's staging; it is still provider-owned, so a client copy goes.
-        crate::plugins::strip_uninstalled_policy_request_headers(
-            ctx,
-            headers,
-            &self.ext_authz_upstream_allow_headers,
-        );
         PluginResult::Continue
     }
 

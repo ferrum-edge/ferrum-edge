@@ -815,6 +815,73 @@ fn validate_opa_obligations_against_credential_owners(
     Ok(())
 }
 
+/// Refuse a configured request-header write (a `request_transformer` header
+/// rule, a `mesh_route_dispatch` `request_transform`) that could re-author a
+/// header another plugin on the same chain owns as a gateway assertion
+/// (`Plugin::owned_request_assertion_header_names`): a `claim_headers`
+/// destination, an OPA decision header, `x-ferrum-peer-spiffe-id`.
+///
+/// Those writes run in `before_proxy`, after the owner's sanitization, so a
+/// template such as `$(header.x-user-email)` would copy the client's value
+/// straight back into the destination the owner just stripped, and a literal
+/// would assert a fixed identity no principal earned. On a chain that owns such
+/// a header but carries no `grpc_web` translator, a write that could label the
+/// request gRPC-Web (`content-type` with a request-derived value or a gRPC-Web
+/// literal) is refused too: it would run after the untranslated gRPC-Web
+/// refusal and send the client's body-embedded trailer frame to a gRPC-Web
+/// backend. Removing an owned header stays legal.
+fn validate_request_header_writes_against_owned_assertions(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    use crate::proxy::headers::field_names_equivalent_for_backends;
+
+    let owners: Vec<(&Arc<dyn Plugin>, Vec<String>)> = plugins
+        .iter()
+        .map(|plugin| (plugin, plugin.owned_request_assertion_header_names()))
+        .filter(|(_, owned)| !owned.is_empty())
+        .collect();
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let translator_present = plugins.iter().any(|plugin| is_builtin_named(plugin, "grpc_web"));
+    for writer in plugins {
+        for (name, literal) in writer.configured_request_header_writes() {
+            for (owner, owned) in &owners {
+                if Arc::ptr_eq(owner, writer) {
+                    continue;
+                }
+                if owned
+                    .iter()
+                    .any(|owned| field_names_equivalent_for_backends(owned, &name))
+                {
+                    return Err(format!(
+                        "plugin {:?} writes request header {name:?}, which plugin {:?} on the \
+                         same effective plugin chain owns as a gateway assertion; a configured \
+                         rule must never re-author a gateway-asserted header",
+                        writer.name(),
+                        owner.name()
+                    ));
+                }
+            }
+            if !translator_present
+                && name.eq_ignore_ascii_case("content-type")
+                && literal
+                    .as_deref()
+                    .is_none_or(crate::plugins::grpc_web::is_grpc_web_content_type)
+            {
+                return Err(format!(
+                    "plugin {:?} may set `content-type` to a gRPC-Web media type on a plugin \
+                     chain that owns gateway-asserted request headers but has no `grpc_web` \
+                     translator; untranslated gRPC-Web is refused there, and relabelling a \
+                     request after that refusal would forward its body-embedded trailers",
+                    writer.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
 pub(crate) fn validate_plugin_security_composition(
@@ -841,6 +908,7 @@ pub(crate) fn validate_plugin_security_composition(
     }
 
     validate_opa_obligations_against_credential_owners(plugins)?;
+    validate_request_header_writes_against_owned_assertions(plugins)?;
 
     for protocol in ALL_PROXY_PROTOCOLS {
         let identity_soap_count = plugins
@@ -1762,8 +1830,8 @@ impl Plugin for PluginInstanceWrapper {
         if !self.runs(ctx, TriggerPhase::PostAuth) {
             // A skipped instance installs nothing, but it still owns the
             // headers it documents as always sanitized (`claim_headers`
-            // destinations, `x-ferrum-peer-spiffe-id`, OPA decision headers,
-            // ext_authz upstream headers). Leaving their client
+            // destinations, `x-ferrum-peer-spiffe-id`, OPA decision headers).
+            // Leaving their client
             // copies would let a trigger forward a client-chosen value the
             // backend reads as a gateway assertion; like credential-redaction
             // discovery, this fail-safe work is never gated.
@@ -1783,6 +1851,10 @@ impl Plugin for PluginInstanceWrapper {
     /// Static chain shape, never gated: the trailer strip list is per route.
     fn owned_request_assertion_header_names(&self) -> Vec<String> {
         self.inner.owned_request_assertion_header_names()
+    }
+    /// Static chain shape, never gated: refused at publication.
+    fn configured_request_header_writes(&self) -> Vec<(String, Option<String>)> {
+        self.inner.configured_request_header_writes()
     }
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
         self.inner.defer_before_proxy_until_backend_path_resolved()
@@ -5270,6 +5342,10 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "request_transformer",
     "serverless_function",
     "soap_ws_security",
+    // `spiffe_identity` with `forward_identity` owns `x-ferrum-peer-spiffe-id`
+    // as a gateway assertion, which the request-header-write refusal reads.
+    // Construction is pure config parsing.
+    "spiffe_identity",
     "sse",
     "workload_metrics",
 ];
@@ -7608,8 +7684,8 @@ impl PluginCacheRequestView {
     }
 
     /// Whether a plugin on this route owns any gateway-assertion request header
-    /// (`claim_headers` destinations, OPA decision headers, ext_authz upstream
-    /// headers).
+    /// (`claim_headers` destinations, OPA decision headers,
+    /// `x-ferrum-peer-spiffe-id`).
     pub fn owns_request_assertion_headers(&self) -> bool {
         self.owns_request_assertion_headers
     }

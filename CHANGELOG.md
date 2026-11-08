@@ -35,15 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every protocol path (HTTP/1.1, HTTP/2, HTTP/3, native gRPC, gRPC-Web),
   whatever any trigger decides, and route-configured trailer names (claim
   destinations and custom credential locations alike) now match `_` spellings
-  as well as ASCII case. `opa` `decision_request_headers` and `mesh_authz`
-  ext_authz `headersToUpstreamOnAllow` names join that trailer list, and a
-  trigger-skipped `opa` or `mesh_authz` instance now also strips client
-  copies of those names from the initial header block (keeping only a value
-  an admitted sibling installed for the request). `mesh_authz` additionally
-  strips them on a request no CUSTOM rule matched, as its docs already
-  promised: a request that relied on a client `headersToUpstreamOnAllow`
-  header (for example `authorization`) reaching the backend without a CUSTOM
-  check no longer does. Untranslated gRPC-Web, whose request
+  as well as ASCII case. `opa` `decision_request_headers` join that trailer
+  list, and a trigger-skipped `opa` instance now also strips client copies of
+  those names from the initial header block (keeping only a value an admitted
+  sibling installed for the request). `mesh_authz` ext_authz
+  `headersToUpstreamOnAllow` names keep Istio semantics and are unchanged.
+  Plugin-cache publication now refuses a `request_transformer` header rule or
+  `mesh_route_dispatch` `request_transform` (a VirtualService
+  `headers.request.set`/`add`) that writes a header another plugin on the
+  route owns as a gateway assertion, or, on such a route without a `grpc_web`
+  translator, could set `content-type` to a gRPC-Web media type; a config or
+  mesh slice with such a rule is rejected (the last good one keeps serving).
+  Untranslated gRPC-Web, whose request
   trailers ride inside the body where only the `grpc_web` translator parses
   them, is now refused with `415` on a route that owns any of these
   gateway-asserted headers (including `x-ferrum-peer-spiffe-id` from

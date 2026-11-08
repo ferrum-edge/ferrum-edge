@@ -33745,8 +33745,8 @@ pub(crate) fn check_routed_path_parameters(
 /// metadata. Only the translator parses that frame (and drops the route's
 /// owned names from it, `grpc_web::split_request_trailer_frame` staging); no
 /// gateway boundary sees it otherwise. On a route whose backend may treat
-/// `claim_headers` destinations, OPA `decision_request_headers` or ext_authz
-/// `headersToUpstreamOnAllow` names as gateway assertions, forwarding a
+/// `claim_headers` destinations, OPA `decision_request_headers` or
+/// `x-ferrum-peer-spiffe-id` as gateway assertions, forwarding a
 /// client-controlled trailer block would let the client restate one, so the
 /// request is refused before any `before_proxy` hook runs. The decision is
 /// taken from the frontend's own gRPC-Web classification and the

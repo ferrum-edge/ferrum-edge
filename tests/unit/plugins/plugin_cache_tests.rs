@@ -16428,9 +16428,8 @@ async fn trigger_skipped_sibling_never_erases_an_admitted_instance_verified_clai
     }
 }
 
-/// OPA `decision_request_headers` and ext_authz-style policy-owned names join
-/// the route's request-trailer strip list too (trailers only: the initial
-/// header behaviour is unchanged), and mark the route as owning assertions.
+/// OPA `decision_request_headers` join the route's request-trailer strip
+/// list too, and mark the route as owning asserted headers.
 #[tokio::test]
 async fn opa_decision_request_headers_are_stripped_from_request_trailers() {
     use ferrum_edge::_test_support::{
@@ -16620,4 +16619,132 @@ fn grpc_web_translator_cannot_carry_an_execution_trigger() {
         .err()
         .expect("a triggered grpc_web translator must be refused");
     assert!(error.contains("response-trailer"), "{error}");
+}
+
+/// One `request_transformer` header rule; `field` names the value-bearing key
+/// (`value` or `new_key`), empty for a removal.
+fn transformer_header_rule(
+    operation: &str,
+    key: &str,
+    field: &str,
+    value: &str,
+) -> serde_json::Value {
+    let mut rule = json!({"operation": operation, "target": "header", "key": key});
+    if !field.is_empty() {
+        rule[field] = json!(value);
+    }
+    rule
+}
+
+fn claim_owning_jwks(claims: bool) -> PluginConfig {
+    let mut config = minimal_plugin_config("jwks_auth");
+    if claims {
+        config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
+    }
+    make_plugin_config_with_json("auth", "jwks_auth", config, PluginScope::Proxy, Some("p1"))
+}
+
+/// Publication outcome on both admission boundaries (candidate admission and
+/// runtime cache construction), which must agree.
+fn composition_error(plugin_configs: Vec<PluginConfig>) -> Option<String> {
+    let ids: Vec<String> = plugin_configs.iter().map(|pc| pc.id.clone()).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let config = make_config(vec![make_proxy("p1", "/", ids)], plugin_configs);
+    let candidate =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None).err();
+    let runtime = PluginCache::new(&config).err();
+    assert_eq!(
+        candidate.is_some(),
+        runtime.is_some(),
+        "admission boundaries disagree: {candidate:?} / {runtime:?}"
+    );
+    runtime
+}
+
+fn header_transformer(rule: serde_json::Value) -> PluginConfig {
+    make_plugin_config_with_json(
+        "rt",
+        "request_transformer",
+        json!({"rules": [rule]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    )
+}
+
+/// A configured request-header write that could re-author a header another
+/// plugin on the chain owns as a gateway assertion (a template copying the
+/// client value back, a literal, a rename) is refused at publication, in any
+/// case or `_` spelling. An unrelated key and a removal of the owned header
+/// are admitted alongside the same owner.
+#[test]
+fn request_header_writes_cannot_re_author_an_owned_assertion() {
+    for refused in [
+        transformer_header_rule("update", "x-user-email", "value", "$(header.x-user-email)"),
+        transformer_header_rule("add", "X_User_Email", "value", "ceo@corp.example"),
+        transformer_header_rule("rename", "x-forged", "new_key", "x-user-email"),
+    ] {
+        let error = composition_error(vec![claim_owning_jwks(true), header_transformer(refused)])
+            .expect("a write to an owned assertion must be refused");
+        assert!(error.contains("owns as a gateway assertion"), "{error}");
+        assert!(error.contains("jwks_auth"), "{error}");
+        assert!(error.contains("request_transformer"), "{error}");
+    }
+    for admitted in [
+        transformer_header_rule("add", "x-tenant", "value", "blue"),
+        transformer_header_rule("remove", "x-user-email", "", ""),
+    ] {
+        let error = composition_error(vec![claim_owning_jwks(true), header_transformer(admitted)]);
+        assert_eq!(error, None);
+    }
+}
+
+/// On a chain that owns gateway-asserted request headers but carries no
+/// `grpc_web` translator, a configured write that could relabel the request
+/// as gRPC-Web (`content-type` from a template, a rename, or a gRPC-Web
+/// literal) is refused at publication. A translator, a non-gRPC-Web literal,
+/// or a chain without owned assertions admits the same rule.
+#[test]
+fn content_type_relabel_to_grpc_web_is_refused_on_untranslated_assertion_chains() {
+    let grpc_web_literal = transformer_header_rule(
+        "update",
+        "content-type",
+        "value",
+        "application/grpc-web+proto",
+    );
+    // (rule, chain owns assertions, translator present, refused)
+    let cases = [
+        (grpc_web_literal.clone(), true, false, true),
+        (
+            transformer_header_rule("update", "Content-Type", "value", "$(header.x-ct)"),
+            true,
+            false,
+            true,
+        ),
+        (
+            transformer_header_rule("rename", "x-ct", "new_key", "content-type"),
+            true,
+            false,
+            true,
+        ),
+        (grpc_web_literal.clone(), true, true, false),
+        (
+            transformer_header_rule("update", "content-type", "value", "application/json"),
+            true,
+            false,
+            false,
+        ),
+        (grpc_web_literal, false, false, false),
+    ];
+    for (rule, owns, translator, refused) in cases {
+        let label = format!("{rule} owns={owns} translator={translator}");
+        let mut plugin_configs = vec![claim_owning_jwks(owns), header_transformer(rule)];
+        if translator {
+            plugin_configs.push(grpc_web_translator());
+        }
+        let error = composition_error(plugin_configs);
+        assert_eq!(error.is_some(), refused, "{label}: {error:?}");
+        if let Some(error) = error {
+            assert!(error.contains("`content-type`"), "{label}: {error}");
+        }
+    }
 }

@@ -1167,6 +1167,27 @@ impl Plugin for RequestTransformer {
                 || self.templates_read_headers)
     }
 
+    /// Every static header rule that writes a header: add/update (literal
+    /// unless templated) and the destination of a rename (a moved client
+    /// value). Removals write nothing.
+    fn configured_request_header_writes(&self) -> Vec<(String, Option<String>)> {
+        self.header_rules
+            .iter()
+            .filter_map(|rule| match rule.operation {
+                HeaderOp::Add | HeaderOp::Update => {
+                    let literal = if rule.value_template.is_none() {
+                        rule.value.clone()
+                    } else {
+                        None
+                    };
+                    Some((rule.key.clone(), literal))
+                }
+                HeaderOp::Rename => rule.new_key.clone().map(|new_key| (new_key, None)),
+                HeaderOp::Remove => None,
+            })
+            .collect()
+    }
+
     fn needs_final_request_body_context(&self) -> bool {
         // The context-aware body hook publishes the value-free skip reason;
         // without this the ordinary H1/H2 dispatcher would select the

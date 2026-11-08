@@ -3887,11 +3887,10 @@ pub(crate) struct PluginRequestState {
     /// marker, never because a value equals the admitted peer identity.
     pub(crate) peer_spiffe_identity_forwarded: bool,
     /// Exact names an admitted policy instance installed on the backend
-    /// request for this request (`opa` `decision_request_headers`,
-    /// `mesh_authz` ext_authz `headersToUpstreamOnAllow`). A sibling instance
-    /// that owns the same name but did not install it (trigger-skipped, or no
-    /// allowed check of its own) keeps only these entries and strips every
-    /// other spelling ([`strip_uninstalled_policy_request_headers`]).
+    /// request for this request (`opa` `decision_request_headers`). A
+    /// trigger-skipped sibling that owns the same name keeps only these
+    /// entries and strips every other spelling
+    /// ([`strip_uninstalled_policy_request_headers`]).
     pub(crate) policy_installed_request_headers: HashSet<String>,
     /// Digests of credential-bearing query parameters that were present before
     /// authentication and request transformation. Kept outside public metadata
@@ -11441,9 +11440,8 @@ impl std::ops::BitOr for PluginHooks {
 /// exact entry an admitted policy instance installed for this request
 /// ([`RequestContext::mark_policy_request_header_installed`]).
 ///
-/// Shared by `opa` and `mesh_authz`: their trigger-skip sanitizer
-/// (`Plugin::sanitize_owned_request_headers`) and `mesh_authz`'s own
-/// `before_proxy` when no allowed check of its own staged a result.
+/// Used by `opa`'s trigger-skip sanitizer
+/// (`Plugin::sanitize_owned_request_headers`).
 pub(crate) fn strip_uninstalled_policy_request_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
@@ -12208,6 +12206,17 @@ pub trait Plugin: Any + Send + Sync {
     /// are read after the initial header block was sanitized. The default owns
     /// nothing.
     fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Request headers this instance's static configuration writes, as
+    /// `(lowercase destination name, literal value)` pairs. The value is
+    /// `None` when it is request-derived at runtime (a `$(...)` template, or a
+    /// rename that moves a client value). Removals are not writes. Collected
+    /// only at plugin-cache publication, to refuse a write that would
+    /// re-author a header another plugin on the route owns as a gateway
+    /// assertion. The default writes nothing.
+    fn configured_request_header_writes(&self) -> Vec<(String, Option<String>)> {
         Vec::new()
     }
 
