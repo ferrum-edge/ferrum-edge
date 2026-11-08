@@ -24084,7 +24084,10 @@ fn mesh_inbound_transport_satisfies_mode(
     has_verified_peer_certificate: bool,
 ) -> bool {
     match mode {
-        crate::modes::mesh::config::MtlsMode::Strict => is_tls && has_verified_peer_certificate,
+        // `Unset` never survives the canonical resolver; treat a leaked one as
+        // `Strict` so an inherit marker can never admit an unauthenticated peer.
+        crate::modes::mesh::config::MtlsMode::Strict
+        | crate::modes::mesh::config::MtlsMode::Unset => is_tls && has_verified_peer_certificate,
         crate::modes::mesh::config::MtlsMode::Permissive => true,
         crate::modes::mesh::config::MtlsMode::Disable => !is_tls,
         // DestinationRule-only client modes are invalid on PeerAuthentication.

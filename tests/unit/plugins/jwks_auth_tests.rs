@@ -566,10 +566,24 @@ fn remote_key_endpoints_require_https_and_reject_userinfo() {
         for local_endpoint in [
             "http://127.0.0.1:8080/keys",
             "http://[::1]:8080/keys",
-            "http://localhost:8080/keys",
+            // URL-normalized IP literals connect to the same address.
+            "http://127.1:8080/keys",
+            "http://[0:0:0:0:0:0:0:1]:8080/keys",
         ] {
             JwksAuth::new(&endpoint_config(field, local_endpoint), default_client())
-                .expect("loopback and localhost remain available for local development");
+                .expect("loopback IP literals remain available for local development");
+        }
+
+        // A name never proves the key set is fetched from this machine: DNS
+        // overrides and the resolver decide where it connects (#6659).
+        for named_endpoint in [
+            "http://localhost:8080/keys",
+            "http://api.localhost:8080/keys",
+        ] {
+            let error = JwksAuth::new(&endpoint_config(field, named_endpoint), default_client())
+                .err()
+                .expect("cleartext localhost name must reject");
+            assert!(error.contains("must use https"), "got: {error}");
         }
 
         let with_userinfo = endpoint_config(field, "https://user:secret@idp.example.com/keys");

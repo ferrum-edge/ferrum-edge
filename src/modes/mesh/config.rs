@@ -3204,6 +3204,13 @@ pub enum MtlsMode {
     #[default]
     Permissive,
     Disable,
+    /// Istio `UNSET`: inherit from the next-higher PeerAuthentication tier
+    /// (workload port override -> workload mode -> namespace -> mesh-wide ->
+    /// the `Permissive` default). Only valid on a [`PeerAuthentication`]'s
+    /// `mtls_mode` / `port_overrides`; the canonical resolver in
+    /// `slice::resolve_effective_mtls_mode` folds it into a concrete mode, so
+    /// no resolved inbound posture is ever `Unset`.
+    Unset,
     // ── DestinationRule client-side modes (Istio `ClientTLSSettings.mode`) ──
     /// SIMPLE: originate TLS to the backend, verify the server certificate.
     Simple,
@@ -3217,7 +3224,10 @@ pub enum MtlsMode {
 impl MtlsMode {
     #[inline]
     pub fn is_peer_auth_mode(self) -> bool {
-        matches!(self, Self::Strict | Self::Permissive | Self::Disable)
+        matches!(
+            self,
+            Self::Strict | Self::Permissive | Self::Disable | Self::Unset
+        )
     }
 }
 
@@ -8760,7 +8770,7 @@ fn validate_mesh_traffic_policy_tls(
     }
 
     match tls.mode {
-        MtlsMode::Strict | MtlsMode::Permissive => errors.push(format!(
+        MtlsMode::Strict | MtlsMode::Permissive | MtlsMode::Unset => errors.push(format!(
             "{context}.mode: {mode:?} is invalid for DestinationRule client TLS",
             mode = tls.mode
         )),
