@@ -77,11 +77,12 @@ use crate::util::http_headers::{
 };
 use crate::util::unknown_keys::reject_unknown_keys;
 
-use super::charged_decode::{ChargedDecodeError, decode_charged_content_coding_chain};
+use super::charged_decode::{ChargedDecodeError, decode_charged_content_coding_chain_with_charge};
 use super::utils::content_encoding::{DecodeLimits, parse_content_codings_including_zstd};
 use super::{Plugin, PluginResult, RequestContext};
 use crate::proxy::response_buffer_budget::{
-    BudgetRef, REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_STATUS,
+    BudgetRef, DecodeChargeHold, REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_STATUS,
+    ResponseBufferReservation, hand_off_replacement_decode_charge,
 };
 
 /// Accepted top-level `compression` config keys.
@@ -811,7 +812,7 @@ impl CompressionPlugin {
     /// buffer and Huffman tables from the stream header before it emits a single
     /// output byte, so a per-layer output ceiling checked after the decoder call
     /// cannot bound that allocation at all. Routing through
-    /// [`decode_charged_content_coding_chain`] is what makes it bounded: the
+    /// [`decode_charged_content_coding_chain_with_charge`] is what makes it bounded: the
     /// active decoder's heap ceiling is reserved before the decoder is
     /// CONSTRUCTED, every growth of the output buffer is reserved before it is
     /// allocated, and a stacked list charges the previous pass's still-resident
@@ -821,21 +822,24 @@ impl CompressionPlugin {
     ///
     /// A budget refusal is the GATEWAY's transient capacity terminal, never a
     /// `400`: the upload was well formed and no backend was involved. The
-    /// working-set charge is released when this returns; the surviving plaintext
+    /// plaintext comes back together with its decode charge, carried through
+    /// the blocking task, so the caller can keep it charged until the
+    /// buffered-request charge covers it
+    /// ([`hand_off_replacement_decode_charge`]); the surviving plaintext also
     /// stays bounded per request by `max_decompressed_request_size` and the
     /// effective wire body limit.
     async fn decode_request_body_charged(
         codings: Vec<String>,
         data: Vec<u8>,
         limits: DecodeLimits,
-    ) -> Result<Vec<u8>, RequestDecodeRefusal> {
+    ) -> Result<(Vec<u8>, ResponseBufferReservation), RequestDecodeRefusal> {
         let Ok(permit) = try_acquire_codec_permit() else {
             warn_sampled!("compression: codec admission saturated while decoding request body");
             return Err(RequestDecodeRefusal::CodecUnavailable);
         };
         let decoded = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            decode_charged_content_coding_chain(
+            decode_charged_content_coding_chain_with_charge(
                 &codings,
                 &data,
                 limits,
@@ -844,7 +848,7 @@ impl CompressionPlugin {
         })
         .await;
         match decoded {
-            Ok(Ok(plaintext)) => Ok(plaintext),
+            Ok(Ok(decoded)) => Ok(decoded),
             Ok(Err(ChargedDecodeError::CapacityRefused)) => {
                 // Not a worker failure: nothing decoded incorrectly, the
                 // aggregate budget simply had no room for this decode's working
@@ -957,9 +961,9 @@ impl CompressionPlugin {
                 }
 
                 let limits = self.request_decode_limits(ctx.route_request_body_limit());
-                let decompressed =
+                let (decompressed, decode_charge) =
                     match Self::decode_request_body_charged(codings, decode_source, limits).await {
-                        Ok(plaintext) => plaintext,
+                        Ok(decoded) => decoded,
                         Err(refusal) => return refusal.into_reject(ctx),
                     };
 
@@ -985,6 +989,9 @@ impl CompressionPlugin {
                         marker
                     );
                     *body = decompressed;
+                    // The plaintext stays charged by its decode until the
+                    // buffered-request charge covers it.
+                    hand_off_replacement_decode_charge(DecodeChargeHold::new(decode_charge));
                 } else {
                     // Fallback path: headers are stripped only after staging the
                     // validated plaintext for the later body transform.
@@ -993,7 +1000,13 @@ impl CompressionPlugin {
                         decompressed.len(),
                         marker
                     );
-                    ctx.set_compression_staged_request_plaintext(decompressed);
+                    // The staged plaintext keeps its decode charge until the
+                    // owning transform emits it and the buffered-request
+                    // charge covers it.
+                    ctx.set_compression_staged_request_plaintext(
+                        decompressed,
+                        DecodeChargeHold::new(decode_charge),
+                    );
                 }
                 ctx.metadata
                     .insert(REQUEST_DECODED_METADATA_KEY.to_string(), marker);
@@ -1597,7 +1610,10 @@ impl CompressionPlugin {
         let limits = self.request_decode_limits(route_limit);
         let raw_len = body.len();
         match Self::decode_request_body_charged(codings, body.to_vec(), limits).await {
-            Ok(decompressed) => {
+            Ok((decompressed, decode_charge)) => {
+                // The plaintext stays charged by its decode until the
+                // buffered-request charge covers the replacement.
+                hand_off_replacement_decode_charge(DecodeChargeHold::new(decode_charge));
                 debug!(
                     "compression: decompressed request body from {} to {} bytes",
                     raw_len,
@@ -2809,7 +2825,10 @@ impl Plugin for CompressionPlugin {
         }
         // Fallback path staged validated plaintext when headers were stripped
         // without a mutable body view. Emit those bytes; never re-decode.
-        if let Some(plaintext) = ctx.take_compression_staged_request_plaintext() {
+        if let Some((plaintext, decode_charge)) = ctx.take_compression_staged_request_plaintext() {
+            // Charged by its decode until the buffered-request charge covers
+            // the emitted body.
+            hand_off_replacement_decode_charge(decode_charge);
             return Some(plaintext);
         }
         // Early normalization already replaced the buffered body with validated

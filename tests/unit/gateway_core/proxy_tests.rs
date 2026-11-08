@@ -2313,7 +2313,7 @@ fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
 
     let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
     let collect = grpc
-        .split("pub(crate) async fn collect_grpc_request_body(")
+        .split("pub(crate) async fn collect_grpc_upload<B>(")
         .nth(1)
         .expect("buffered gRPC collect")
         .split("\n}\n")
@@ -2327,8 +2327,8 @@ fn buffered_grpc_client_disconnect_is_cancelled_not_a_gateway_error() {
         collect
             .matches("grpc_request_body_client_disconnected(e.as_ref())")
             .count(),
-        2,
-        "both the size-limited and unlimited collects report a client disconnect"
+        1,
+        "the charged, bounded collect reports a client disconnect"
     );
 }
 
@@ -4361,8 +4361,13 @@ fn test_buffered_h2_request_collectors_require_h2_end_stream() {
             .find(gated)
             .unwrap_or_else(|| panic!("{signature}: the collected body must be gated"));
         // Every buffered collect in the function reads the gated body: no
-        // `Limited` or raw `collect` may be built before the gate.
-        for collect in ["Limited::new(", "BodyExt::collect("] {
+        // `Limited`, charged collect, or raw `collect` may be built before the
+        // gate.
+        for collect in [
+            "Limited::new(",
+            "BodyExt::collect(",
+            "collect_charged_request_body(",
+        ] {
             if let Some(first) = collector.find(collect) {
                 assert!(
                     gate < first,

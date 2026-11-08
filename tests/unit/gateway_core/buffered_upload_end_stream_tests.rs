@@ -62,7 +62,8 @@ enum Collector {
     Early,
     /// `collect_grpc_request_body` with `max_grpc_recv_size_bytes > 0`.
     GrpcLimited,
-    /// `collect_grpc_request_body` with no size limit.
+    /// `collect_grpc_request_body` with a `0` limit (folds to the buffered
+    /// fallback ceiling).
     GrpcUnlimited,
 }
 

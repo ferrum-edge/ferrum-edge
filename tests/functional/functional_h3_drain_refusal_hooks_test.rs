@@ -721,8 +721,10 @@ async fn h3_grpc_bridge_drain_oversize_runs_reject_hooks_and_logs() {
     );
 }
 
-/// The same drain when the shared request-buffer budget cannot admit the
-/// upload's retained ceiling: a 1 MiB gRPC ceiling against a one-block budget.
+/// The same drain when the shared request-buffer budget cannot cover the
+/// upload's retained bytes: a two-block upload under a 1 MiB gRPC ceiling
+/// against a one-block budget. The budget is charged by what the drain
+/// retains, so the upload must outgrow it before it is refused.
 /// `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` has a 64 KiB floor, which also
 /// floors the total budget; this case pins both values to that minimum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -745,7 +747,7 @@ async fn h3_grpc_bridge_drain_capacity_refusal_runs_reject_hooks_and_logs() {
     let answer = h3_upload(
         &proxy_url(https_port, GRPC_PATH),
         "application/grpc",
-        &grpc_frame(b"ping"),
+        &grpc_frame(&[b'g'; 2 * ONE_BLOCK_BYTES as usize]),
     )
     .await;
 
@@ -997,7 +999,8 @@ async fn h3_buffered_grpc_upload_reset_is_cancelled_and_logged_before_write() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let snapshot = request_buffer_snapshot(&harness).await;
-        if snapshot["reserved_bytes"].as_u64() == Some(ONE_BLOCK_BYTES) {
+        // Charges are byte-granular: the drain holds exactly the bytes it read.
+        if snapshot["reserved_bytes"].as_u64() > Some(0) {
             break;
         }
         assert!(

@@ -2093,12 +2093,13 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
         2,
         "a post-admission buffered upload arm reverted to the unbounded collect"
     );
-    // Both buffered native-gRPC collects.
+    // The one charged, bounded native-gRPC collect (a `0` limit folds to the
+    // buffered fallback ceiling, so there is no separate unbounded arm).
     assert_eq!(
         GRPC_PROXY_SOURCE
             .matches("collect_request_body_under_authorization(")
             .count(),
-        2,
+        1,
         "a buffered gRPC upload arm reverted to the unbounded collect"
     );
     // Every authorization arm returns the health-neutral placeholder, so the
@@ -2113,10 +2114,10 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
     // survivor could keep the deadline-aware collector while a SECOND, raw
     // collect is added beside it, or the bound could be dropped from whichever
     // arm survived. So pin it per dispatcher as well — inside each
-    // post-admission buffered region every `.collect()` must be an argument of
-    // the authorized collector, the region must never fall back to the
-    // deadline-only entry point, and the collect must stay wrapped in a
-    // fail-closed `Limited`.
+    // post-admission buffered region every collect must be an argument of the
+    // authorized collector, the region must never fall back to the
+    // deadline-only entry point, and the collect must stay bounded by the
+    // fail-closed, charged request collector.
     assert_buffered_upload_region_stays_bounded(
         "reqwest",
         "\nasync fn proxy_to_backend(",
@@ -2129,9 +2130,10 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
     );
 }
 
-/// Every `.collect()` inside one post-admission buffered upload region is an
+/// Every collect inside one post-admission buffered upload region is an
 /// argument of the authorized, deadline-aware collector, and the collect it
-/// feeds is bounded by the fail-closed retained ceiling (issues #3815 / #4153).
+/// feeds is bounded by the fail-closed retained ceiling and charged as it grows
+/// (issues #3815 / #4153).
 #[track_caller]
 fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, close: &str) {
     let region = PROXY_SOURCE
@@ -2150,8 +2152,15 @@ fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, clo
     );
     assert_eq!(
         region.matches(".collect()").count(),
+        0,
+        "a {dispatcher} buffered upload collect bypassed the charged collector"
+    );
+    assert_eq!(
+        region
+            .matches("collect_charged_request_body(gated, ")
+            .count(),
         authorized,
-        "a {dispatcher} buffered upload collect bypassed the authorized collector"
+        "a {dispatcher} buffered upload collect bypassed the charged collector"
     );
     assert!(
         !region.contains("collect_request_body_with_deadline("),
@@ -2164,8 +2173,9 @@ fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, clo
          retained ceiling"
     );
     assert!(
-        region.contains("http_body_util::Limited::new("),
-        "the {dispatcher} buffered upload must stay wrapped in `Limited`"
+        region.contains("response_buffer_budget::ChargedRequestCollector::new(retained_ceiling)"),
+        "the {dispatcher} buffered upload must be charged by what it retains, \
+         within the fail-closed ceiling"
     );
 }
 

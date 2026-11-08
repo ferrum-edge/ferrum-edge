@@ -3123,8 +3123,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         let result = crate::proxy::run_final_request_body_hooks_with_provenance(
             plugins,
             Some(&mut *ctx),
@@ -3159,8 +3161,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         let result = crate::proxy::run_final_request_body_hooks_with_provenance_in(
             plugins,
             Some(&mut *ctx),
@@ -3219,8 +3223,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         crate::proxy::run_final_request_body_hooks_with_provenance(
             plugins,
             None,
@@ -10823,10 +10829,46 @@ pub mod _test_support {
         headers: &HashMap<String, String>,
         body_bytes: Vec<u8>,
     ) -> Vec<u8> {
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins, None, None, headers, body_bytes, None,
+        )
+        .await;
+        uncharged_request_body_transform(transformed)
+    }
+
+    /// The transform chain with no request-buffer charge has nothing to
+    /// refuse, so its capacity error is unreachable.
+    fn uncharged_request_body_transform(
+        transformed: Result<Vec<u8>, crate::proxy::RequestBodyCapacityExceeded>,
+    ) -> Vec<u8> {
+        match transformed {
+            Ok(body) => body,
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
+                unreachable!("an uncharged body is never refused for capacity")
+            }
+        }
+    }
+
+    /// Run the PRODUCTION request-body transform chain with a request-buffer
+    /// charge, so a test can observe that every replacement is charged before
+    /// the next transform runs. `None` is the capacity refusal: the uncovered
+    /// replacement and the body were dropped and the charge released.
+    pub async fn apply_request_body_plugins_with_charge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+        charge: &mut RequestBufferPermitProbe,
+    ) -> Option<Vec<u8>> {
         crate::proxy::apply_request_body_plugins_with_context(
-            plugins, None, None, headers, body_bytes,
+            plugins,
+            None,
+            None,
+            headers,
+            body,
+            Some(&mut charge.0),
         )
         .await
+        .ok()
     }
 
     /// Model the H1/H2 buffered request-body hook round trip: clone the live
@@ -10848,8 +10890,10 @@ pub mod _test_support {
             None,
             headers,
             body,
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         let result = crate::proxy::run_final_request_body_hooks(
             plugins,
             Some(&mut hook_ctx),
@@ -10874,7 +10918,7 @@ pub mod _test_support {
         headers: &mut HashMap<String, String>,
         body: &mut Vec<u8>,
     ) -> crate::plugins::PluginResult {
-        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+        apply_buffered_request_body_normalization_with_requirements_for_test(
             plugins, ctx, headers, body, true, true,
         )
         .await
@@ -10888,15 +10932,65 @@ pub mod _test_support {
         needs_body_text: bool,
         needs_body_bytes: bool,
     ) -> crate::plugins::PluginResult {
-        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+        // With no request-buffer charge there is nothing for the budget to
+        // refuse, so the phase always yields a plugin result.
+        match crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
             plugins,
             ctx,
             headers,
             body,
+            None,
             needs_body_text,
             needs_body_bytes,
         )
         .await
+        {
+            Ok(result) => result,
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
+                unreachable!("an uncharged body is never refused for capacity")
+            }
+        }
+    }
+
+    /// Outcome of the PRODUCTION pre-`before_proxy` normalization phase run
+    /// with a request-buffer charge.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChargedNormalizationOutcomeForTest {
+        Continue,
+        Rejected,
+        BufferCapacityExceeded,
+    }
+
+    /// Run the PRODUCTION pre-`before_proxy` normalization phase with the
+    /// collected body's request-buffer charge, exactly as both protocol
+    /// handlers do, so a test can observe that a normalized (for example
+    /// decompressed) body is charged before any later phase keeps it.
+    pub async fn apply_buffered_request_body_normalization_with_charge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: &mut Vec<u8>,
+        charge: &mut RequestBufferPermitProbe,
+    ) -> ChargedNormalizationOutcomeForTest {
+        match crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+            plugins,
+            ctx,
+            headers,
+            body,
+            Some(&mut charge.0),
+            true,
+            true,
+        )
+        .await
+        {
+            Ok(crate::plugins::PluginResult::Continue) => {
+                ChargedNormalizationOutcomeForTest::Continue
+            }
+            Ok(_) => ChargedNormalizationOutcomeForTest::Rejected,
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
+                ChargedNormalizationOutcomeForTest::BufferCapacityExceeded
+            }
+        }
     }
 
     /// Drive the client-request-contract phase exactly as both protocol
@@ -17104,18 +17198,22 @@ pub mod _test_support {
         /// Move this claim onto a cheaply cloneable [`bytes::Bytes`] view of
         /// `data`, exactly as dispatch does after a governed collect (in-dispatch
         /// or pre-auth). The charge is released when the last clone drops
-        /// (issue #4231).
-        pub fn into_charged_bytes(self, data: Vec<u8>) -> bytes::Bytes {
+        /// (issue #4231). `None` is the fail-closed capacity refusal: the
+        /// budget could not grow the charge to cover `data`, and both were
+        /// dropped.
+        pub fn into_charged_bytes(self, data: Vec<u8>) -> Option<bytes::Bytes> {
             self.0.into_charged_bytes(data)
         }
     }
 
     impl RequestBufferBudgetProbe {
         pub fn new(fallback_per_request_bytes: usize, total_bytes: usize) -> Self {
-            Self(crate::proxy::response_buffer_budget::IsolatedBudget::new(
-                fallback_per_request_bytes,
-                total_bytes,
-            ))
+            Self(
+                crate::proxy::response_buffer_budget::IsolatedBudget::new_request(
+                    fallback_per_request_bytes,
+                    total_bytes,
+                ),
+            )
         }
 
         /// Currently unreserved capacity, in bytes.
@@ -17129,13 +17227,158 @@ pub mod _test_support {
             self.0.buffered_request_body_ceiling(effective_limit)
         }
 
-        /// The PRODUCTION admission a buffered request path takes before it
-        /// allocates. `None` when the aggregate budget refuses, which is what
-        /// makes the refusal happen BEFORE the collect rather than after it.
+        /// A buffered-request charge of `bytes`, taken up front: the same
+        /// permit type the production collectors grow and publish. `None` when
+        /// the aggregate budget refuses.
         pub fn try_reserve(&self, bytes: usize) -> Option<RequestBufferPermitProbe> {
             self.0
                 .try_reserve_request_permit(bytes)
                 .map(RequestBufferPermitProbe)
+        }
+
+        /// The PRODUCTION buffered-request collector every H1/H2 collect and
+        /// native-H3 drain uses, bound to this budget. Charges nothing until
+        /// bytes are appended.
+        pub fn collector(&self, effective_limit: usize) -> RequestBufferCollectorProbe {
+            RequestBufferCollectorProbe(self.0.request_collector(effective_limit))
+        }
+    }
+
+    /// Hold every block currently free in the PROCESS-GLOBAL buffered-request
+    /// budget until the returned claim drops, so an in-process gateway's next
+    /// buffered collect is refused on its first growth. The budget charges
+    /// retained bytes, so this is how a functional test reaches the capacity
+    /// refusal without uploading the whole budget. Process-global: only for a
+    /// test that owns its process (nextest runs each test in its own).
+    pub fn exhaust_process_request_buffer_budget_for_test() -> Option<RequestBufferPermitProbe> {
+        use crate::proxy::response_buffer_budget::{
+            BudgetRef, RequestBufferPermit, request_buffer_snapshot,
+        };
+        let available = request_buffer_snapshot().available_bytes;
+        RequestBufferPermit::reserve_in(BudgetRef::request_buffer(), available)
+            .map(RequestBufferPermitProbe)
+    }
+
+    /// The PRODUCTION buffered-request collector (`ChargedRequestCollector`),
+    /// bound to a [`RequestBufferBudgetProbe`].
+    pub struct RequestBufferCollectorProbe(
+        crate::proxy::response_buffer_budget::ChargedRequestCollector,
+    );
+
+    impl RequestBufferCollectorProbe {
+        /// Append one body chunk under the per-request ceiling and the
+        /// aggregate budget, exactly as every buffered collect does per frame.
+        pub fn append(&mut self, chunk: &[u8]) -> Result<(), ResponseBufferRetainRejection> {
+            self.0
+                .append(chunk)
+                .map_err(ResponseBufferRetainRejection::from_internal)
+        }
+
+        /// Bytes collected so far.
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.len() == 0
+        }
+
+        /// Capacity the charge currently covers, in bytes.
+        pub fn reserved_bytes(&self) -> usize {
+            self.0.reserved_bytes()
+        }
+
+        /// The collected body and its narrowed charge.
+        pub fn finish(self) -> (Vec<u8>, RequestBufferPermitProbe) {
+            let (body, permit) = self.0.finish();
+            (body, RequestBufferPermitProbe(permit))
+        }
+    }
+
+    /// Terminal outcome of the PRODUCTION buffered native-gRPC charged collect
+    /// (`collect_grpc_upload`), projected from the crate-private error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum GrpcChargedCollectOutcomeForTest {
+        Collected(usize),
+        ResourceExhausted(String),
+        BufferCapacityExceeded,
+        ClientDisconnected,
+        Other,
+    }
+
+    /// Run the PRODUCTION buffered native-gRPC collect over `body` against an
+    /// isolated buffered-request budget, with `max_grpc_recv_size_bytes` as the
+    /// gRPC ceiling exactly as the proxy folds it.
+    pub async fn collect_grpc_upload_for_test<B>(
+        body: B,
+        budget: &RequestBufferBudgetProbe,
+        max_grpc_recv_size_bytes: usize,
+    ) -> GrpcChargedCollectOutcomeForTest
+    where
+        B: http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>,
+    {
+        use crate::proxy::grpc_proxy::{GrpcRequestBodyCollectError, collect_grpc_upload};
+        let ceiling = budget
+            .0
+            .buffered_request_body_ceiling(max_grpc_recv_size_bytes);
+        let collector = budget.0.request_collector(max_grpc_recv_size_bytes);
+        match collect_grpc_upload(body, collector, ceiling, 0, None, None).await {
+            Ok(collected) => GrpcChargedCollectOutcomeForTest::Collected(collected.body.len()),
+            Err(GrpcRequestBodyCollectError::ResourceExhausted(message)) => {
+                GrpcChargedCollectOutcomeForTest::ResourceExhausted(message)
+            }
+            Err(GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
+                GrpcChargedCollectOutcomeForTest::BufferCapacityExceeded
+            }
+            Err(GrpcRequestBodyCollectError::ClientDisconnected) => {
+                GrpcChargedCollectOutcomeForTest::ClientDisconnected
+            }
+            Err(_) => GrpcChargedCollectOutcomeForTest::Other,
+        }
+    }
+
+    /// Terminal outcome of the PRODUCTION H1/H2 charged request-body collect
+    /// (`collect_charged_request_body`), projected from the crate-private
+    /// types.
+    pub enum ChargedRequestCollectOutcomeForTest {
+        Collected {
+            body: Vec<u8>,
+            trailers: Option<hyper::HeaderMap>,
+            permit: RequestBufferPermitProbe,
+        },
+        TooLarge,
+        BufferCapacityExceeded,
+        ClientDisconnected,
+    }
+
+    /// Run the PRODUCTION H1/H2 charged request-body collect over `body`
+    /// against an isolated budget, so a test can hold collects open and
+    /// observe what they charge.
+    pub async fn collect_charged_request_body_for_test<B>(
+        body: B,
+        budget: &RequestBufferBudgetProbe,
+        effective_limit: usize,
+    ) -> ChargedRequestCollectOutcomeForTest
+    where
+        B: http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>,
+    {
+        use crate::proxy::ChargedRequestCollectError;
+        let collector = budget.0.request_collector(effective_limit);
+        match crate::proxy::collect_charged_request_body(body, collector).await {
+            Ok(collected) => ChargedRequestCollectOutcomeForTest::Collected {
+                body: collected.body,
+                trailers: collected.trailers,
+                permit: RequestBufferPermitProbe(collected.permit),
+            },
+            Err(ChargedRequestCollectError::TooLarge) => {
+                ChargedRequestCollectOutcomeForTest::TooLarge
+            }
+            Err(ChargedRequestCollectError::BufferCapacityExceeded) => {
+                ChargedRequestCollectOutcomeForTest::BufferCapacityExceeded
+            }
+            Err(ChargedRequestCollectError::Body(_)) => {
+                ChargedRequestCollectOutcomeForTest::ClientDisconnected
+            }
         }
     }
 
@@ -17249,6 +17492,7 @@ pub mod _test_support {
     pub enum GrpcBufferedCollectOutcomeForTest {
         Collected(usize),
         ResourceExhausted,
+        BufferCapacityExceeded,
         ClientDisconnected,
         TimedOut,
         DeadlineExceeded,
@@ -17263,7 +17507,7 @@ pub mod _test_support {
         request_body_read_timeout_ms: u64,
     ) -> GrpcBufferedCollectOutcomeForTest {
         use crate::proxy::grpc_proxy::GrpcRequestBodyCollectError;
-        let collected = crate::proxy::grpc_proxy::collect_grpc_request_body(
+        let collected = crate::proxy::grpc_proxy::collect_grpc_request_body_published(
             request,
             max_grpc_recv_size_bytes,
             request_body_read_timeout_ms,
@@ -17275,6 +17519,9 @@ pub mod _test_support {
             Ok((_, _, body)) => GrpcBufferedCollectOutcomeForTest::Collected(body.len()),
             Err(GrpcRequestBodyCollectError::ResourceExhausted(_)) => {
                 GrpcBufferedCollectOutcomeForTest::ResourceExhausted
+            }
+            Err(GrpcRequestBodyCollectError::BufferCapacityExceeded) => {
+                GrpcBufferedCollectOutcomeForTest::BufferCapacityExceeded
             }
             Err(GrpcRequestBodyCollectError::TimedOut) => {
                 GrpcBufferedCollectOutcomeForTest::TimedOut
@@ -17307,17 +17554,22 @@ pub mod _test_support {
     pub struct H3RetainedUploadProbe(crate::http3::server::H3RetainedUpload);
 
     impl H3RetainedUploadProbe {
-        /// Admit one upload exactly as every native-H3 drain site does: fold
-        /// the effective limit to the retained ceiling, then charge that
-        /// ceiling before a byte is allocated. `None` is the `503` refusal.
-        pub fn admit(budget: &RequestBufferBudgetProbe, effective_limit: usize) -> Option<Self> {
+        /// Open one upload exactly as every native-H3 drain site does: fold
+        /// the effective limit to the retained ceiling. Nothing is charged
+        /// until a DATA chunk is retained.
+        pub fn admit(budget: &RequestBufferBudgetProbe, effective_limit: usize) -> Self {
             let ceiling = budget.0.buffered_request_body_ceiling(effective_limit);
-            crate::http3::server::H3RetainedUpload::admit_in(budget.0.handle(), ceiling).map(Self)
+            let upload =
+                crate::http3::server::H3RetainedUpload::admit_in(budget.0.handle(), ceiling);
+            Self(upload)
         }
 
-        /// Append one DATA chunk; `false` is the `413` (drop the probe).
-        pub fn push(&mut self, chunk: &[u8]) -> bool {
-            self.0.push(chunk)
+        /// Append one DATA chunk. `TooLarge` is the `413` and
+        /// `BudgetExhausted` the `503` (drop the probe either way).
+        pub fn push(&mut self, chunk: &[u8]) -> Result<(), ResponseBufferRetainRejection> {
+            self.0
+                .push(chunk)
+                .map_err(ResponseBufferRetainRejection::from_internal)
         }
 
         pub fn collected_len(&self) -> usize {
@@ -17338,7 +17590,7 @@ pub mod _test_support {
         /// Finish and publish the body for dispatch through the PRODUCTION
         /// native-H3 publication (`publish_h3_retained_body`): the charge
         /// moves onto the shared `Bytes` every attempt and retry replays.
-        pub fn finish_and_publish(self) -> bytes::Bytes {
+        pub fn finish_and_publish(self) -> Option<bytes::Bytes> {
             let (body, permit) = self.0.finish();
             crate::http3::server::publish_h3_retained_body(body, Some(permit))
         }
@@ -17396,6 +17648,123 @@ pub mod _test_support {
             Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
             Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
         }
+    }
+
+    /// Budget readings across one decoded request-body replacement.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DecodeChargeHandoffForTest {
+        pub plaintext_capacity: usize,
+        /// Available bytes once the decode returned its plaintext.
+        pub available_after_decode: usize,
+        /// Available bytes after the replacement scope handed the charge
+        /// back, with the worker output still unconsumed.
+        pub available_after_handoff: usize,
+        /// Available bytes once the handed-off charge is released.
+        pub available_after_release: usize,
+    }
+
+    /// Decode through the PRODUCTION charge-retaining decoder against an
+    /// ISOLATED budget, then pass the decode charge through the PRODUCTION
+    /// replacement scope exactly as a decoding normalizer does, holding the
+    /// completed output across yields before it is consumed. `None` when the
+    /// decode is refused.
+    pub async fn decode_and_hand_off_charge_for_test(
+        probe: &ResponseBufferBudgetProbe,
+        codings: &[String],
+        body: &[u8],
+        max_decoded_bytes: usize,
+    ) -> Option<DecodeChargeHandoffForTest> {
+        use crate::plugins::charged_decode::decode_charged_content_coding_chain_with_charge;
+        use crate::proxy::response_buffer_budget::{
+            DecodeChargeHold, hand_off_replacement_decode_charge, with_replacement_decode_charge,
+        };
+        let limits = crate::plugins::utils::content_encoding::DecodeLimits {
+            max_decoded_bytes,
+            max_cumulative_bytes: max_decoded_bytes,
+            max_codings: codings.len().max(1),
+            max_amplification_ratio: 1024,
+        };
+        let (plaintext, charge) = decode_charged_content_coding_chain_with_charge(
+            codings,
+            body,
+            limits,
+            probe.0.handle(),
+        )
+        .ok()?;
+        let available_after_decode = probe.available_bytes();
+        let ((), handed_off) = with_replacement_decode_charge(async {
+            tokio::task::yield_now().await;
+            hand_off_replacement_decode_charge(DecodeChargeHold::new(charge));
+            tokio::task::yield_now().await;
+        })
+        .await;
+        let available_after_handoff = probe.available_bytes();
+        drop(handed_off);
+        let available_after_release = probe.available_bytes();
+        Some(DecodeChargeHandoffForTest {
+            plaintext_capacity: plaintext.capacity(),
+            available_after_decode,
+            available_after_handoff,
+            available_after_release,
+        })
+    }
+
+    /// Budget readings across the `compression` staged-plaintext handoff.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct StagedDecodeChargeForTest {
+        /// Available bytes while the plaintext is staged on the context.
+        pub available_while_staged: usize,
+        /// Available bytes after a context clone carrying it was dropped.
+        pub available_after_clone_dropped: usize,
+        /// Available bytes after the owning transform emitted the plaintext,
+        /// with the handed-off charge still held by the replacement scope.
+        pub available_after_emit: usize,
+        /// Available bytes once that charge is released.
+        pub available_after_release: usize,
+    }
+
+    /// Stage `staged_bytes` of plaintext on a request context with a decode
+    /// charge taken from an ISOLATED budget, exactly as the `compression`
+    /// fallback decode does, then emit it through the PRODUCTION replacement
+    /// scope as its transform does.
+    pub async fn staged_decode_charge_for_test(
+        probe: &ResponseBufferBudgetProbe,
+        staged_bytes: usize,
+    ) -> Option<StagedDecodeChargeForTest> {
+        use crate::proxy::response_buffer_budget::{
+            DecodeChargeHold, hand_off_replacement_decode_charge, with_replacement_decode_charge,
+        };
+        let charge = probe.0.try_reserve(staged_bytes)?;
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/upload".to_string(),
+        );
+        ctx.set_compression_staged_request_plaintext(
+            vec![0u8; staged_bytes],
+            DecodeChargeHold::new(charge),
+        );
+        let available_while_staged = probe.available_bytes();
+        drop(ctx.clone());
+        let available_after_clone_dropped = probe.available_bytes();
+        let (plaintext, handed_off) = with_replacement_decode_charge(async {
+            let (plaintext, decode_charge) = ctx.take_compression_staged_request_plaintext()?;
+            hand_off_replacement_decode_charge(decode_charge);
+            tokio::task::yield_now().await;
+            Some(plaintext)
+        })
+        .await;
+        let plaintext = plaintext?;
+        let available_after_emit = probe.available_bytes();
+        drop(handed_off);
+        drop(plaintext);
+        let available_after_release = probe.available_bytes();
+        Some(StagedDecodeChargeForTest {
+            available_while_staged,
+            available_after_clone_dropped,
+            available_after_emit,
+            available_after_release,
+        })
     }
 
     /// Undo a body's `Content-Encoding` exactly as `openapi_validator` does

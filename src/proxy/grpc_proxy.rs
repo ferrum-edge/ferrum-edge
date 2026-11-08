@@ -62,7 +62,6 @@ use crate::tls::backend::{
     append_pool_key_component, backend_svid_generation_for_client_cert,
     backend_tls_config_cache_key, pool_key_host_port_prefix, write_backend_host_port_prefix,
 };
-use crate::util::body_limit::is_length_limit_error;
 
 /// Canonical terminal message for a gateway-owned client RPC deadline.
 ///
@@ -2745,7 +2744,14 @@ pub enum GrpcProxyError {
 /// operator stall-timeout and client RPC-deadline wire messages while both let
 /// their pre-dispatch probe guard settle neutrally.
 pub(crate) enum GrpcRequestBodyCollectError {
+    /// The upload exceeded the gRPC receive ceiling.
     ResourceExhausted(String),
+    /// The aggregate buffered-request budget refused to grow the buffer: the
+    /// gateway-local `gateway_buffer_capacity` refusal (gRPC
+    /// `RESOURCE_EXHAUSTED` with the fixed capacity message). Always before
+    /// any backend dispatch, so it is never retried and never a backend
+    /// failure.
+    BufferCapacityExceeded,
     TimedOut,
     DeadlineExceeded,
     /// The admitted stream's authorization lifetime elapsed while the gateway was
@@ -6180,6 +6186,15 @@ async fn proxy_grpc_streaming_dispatch(
 /// gRPC proxies. The body bytes, method, and headers are returned so the caller
 /// can run plugin hooks before dispatching via `proxy_grpc_request_core`.
 ///
+/// The collect is charged against the buffered-request budget by the bytes it
+/// retains, exactly like every other buffered client upload: a stalled upload
+/// holds only what it has sent. The ceiling is `max_grpc_recv_size_bytes`
+/// (`0` folds to the fail-closed buffered fallback). Over the ceiling the
+/// upload is `RESOURCE_EXHAUSTED`; a budget refusal is the distinct
+/// gateway-local `BufferCapacityExceeded`, answered before dispatch. The charge
+/// is returned with the body so the caller can grow it over request-body
+/// transforms and publish it with the dispatched bytes.
+///
 /// `auth` is the admitted stream's authorization-lifetime plan (issue #3815).
 /// A buffered gRPC upload never reaches the streaming upload adapters, so this
 /// collect is the only seam that can stop a continuously active client-streaming
@@ -6190,47 +6205,100 @@ pub(crate) async fn collect_grpc_request_body(
     request_body_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
     auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
-) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
+) -> Result<GrpcCollectedRequestBody, GrpcRequestBodyCollectError> {
+    use super::response_buffer_budget::{ChargedRequestCollector, buffered_request_body_ceiling};
     let (parts, body) = req.into_parts();
     // An HTTP/2 client's masked reset is a failed read, never a complete
     // request (issue #6022); see `body::H2EndStreamGated`.
     let require_end_stream = parts.version == hyper::Version::HTTP_2;
     let body = super::body::H2EndStreamGated::new(body, require_end_stream);
-    let body_bytes = if max_grpc_recv_size_bytes > 0 {
-        let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        let collected = super::collect_request_body_under_authorization(
-            BodyExt::collect(limited),
-            grpc_deadline_at,
-            request_body_read_timeout_ms,
-            auth,
-        )
-        .await
-        .map_err(map_authorized_upload_wait_error)?;
-        match collected {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                if is_length_limit_error(e.as_ref()) {
-                    return Err(GrpcRequestBodyCollectError::ResourceExhausted(format!(
-                        "gRPC request payload size exceeds maximum of {} bytes",
-                        max_grpc_recv_size_bytes
-                    )));
-                }
-                return Err(grpc_request_body_client_disconnected(e.as_ref()));
-            }
+    let ceiling = buffered_request_body_ceiling(max_grpc_recv_size_bytes);
+    let collected = collect_grpc_upload(
+        body,
+        ChargedRequestCollector::new(ceiling),
+        ceiling,
+        request_body_read_timeout_ms,
+        grpc_deadline_at,
+        auth,
+    )
+    .await?;
+    Ok(GrpcCollectedRequestBody {
+        method: parts.method,
+        headers: parts.headers,
+        body: collected.body,
+        charge: collected.permit,
+    })
+}
+
+/// The charged collect behind [`collect_grpc_request_body`], over any client
+/// body: `collector` charges the buffered-request budget as the body is
+/// retained, within `ceiling`.
+pub(crate) async fn collect_grpc_upload<B>(
+    body: B,
+    collector: super::response_buffer_budget::ChargedRequestCollector,
+    ceiling: usize,
+    request_body_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+) -> Result<super::ChargedRequestCollect, GrpcRequestBodyCollectError>
+where
+    B: http_body::Body<Data = Bytes, Error = super::body::BoxError>,
+{
+    use super::ChargedRequestCollectError;
+    let collected = super::collect_request_body_under_authorization(
+        super::collect_charged_request_body(body, collector),
+        grpc_deadline_at,
+        request_body_read_timeout_ms,
+        auth,
+    )
+    .await
+    .map_err(map_authorized_upload_wait_error)?;
+    match collected {
+        Ok(collected) => Ok(collected),
+        Err(ChargedRequestCollectError::TooLarge) => {
+            let message = format!("gRPC request payload size exceeds maximum of {ceiling} bytes");
+            Err(GrpcRequestBodyCollectError::ResourceExhausted(message))
         }
-    } else {
-        super::collect_request_body_under_authorization(
-            BodyExt::collect(body),
-            grpc_deadline_at,
-            request_body_read_timeout_ms,
-            auth,
-        )
-        .await
-        .map_err(map_authorized_upload_wait_error)?
-        .map_err(|e| grpc_request_body_client_disconnected(e.as_ref()))?
-        .to_bytes()
+        Err(ChargedRequestCollectError::BufferCapacityExceeded) => {
+            Err(GrpcRequestBodyCollectError::BufferCapacityExceeded)
+        }
+        Err(ChargedRequestCollectError::Body(e)) => {
+            Err(grpc_request_body_client_disconnected(e.as_ref()))
+        }
+    }
+}
+
+/// A buffered native-gRPC upload and the buffered-request charge that covers
+/// it.
+pub(crate) struct GrpcCollectedRequestBody {
+    pub(crate) method: hyper::Method,
+    pub(crate) headers: hyper::HeaderMap,
+    pub(crate) body: Vec<u8>,
+    pub(crate) charge: super::response_buffer_budget::RequestBufferPermit,
+}
+
+/// [`collect_grpc_request_body`], published as charged [`Bytes`] for a caller
+/// that runs no request-body transform: the charge is released when the last
+/// dispatch or replay copy drops.
+pub(crate) async fn collect_grpc_request_body_published(
+    req: Request<Incoming>,
+    max_grpc_recv_size_bytes: usize,
+    request_body_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
+    let collected = collect_grpc_request_body(
+        req,
+        max_grpc_recv_size_bytes,
+        request_body_read_timeout_ms,
+        grpc_deadline_at,
+        auth,
+    )
+    .await?;
+    let Some(body) = collected.charge.into_charged_bytes(collected.body) else {
+        return Err(GrpcRequestBodyCollectError::BufferCapacityExceeded);
     };
-    Ok((parts.method, parts.headers, body_bytes))
+    Ok((collected.method, collected.headers, body))
 }
 
 /// A failed read of the client's buffered gRPC upload. Every such failure is
