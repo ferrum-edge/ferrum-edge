@@ -1013,8 +1013,9 @@ async fn a_decompressed_body_the_budget_cannot_cover_is_refused_and_dropped() {
 #[test]
 fn every_body_replacement_is_charged_before_a_later_phase_keeps_it() {
     // Normalizers and request-body transforms can replace the collected body
-    // with a larger one. Each replacement point grows the charge before the
-    // next await, on both protocol paths.
+    // with a larger one. Each replacement is charged before it is installed
+    // and before the next await, on both protocol paths, and a refusal leaves
+    // nothing of the body behind while the refusal is written.
     let proxy = include_str!("../../../src/proxy/mod.rs");
     let server = include_str!("../../../src/http3/server.rs");
     let bridge = include_str!("../../../src/http3/cross_protocol.rs");
@@ -1029,18 +1030,187 @@ fn every_body_replacement_is_charged_before_a_later_phase_keeps_it() {
         .find(".into_plugin_result(ctx);")
         .expect("normalizer call");
     let covered = normalization
-        .find("if !charge_covers(charge.as_deref_mut(), body.capacity()) {")
+        .find("let covered = charge_covers(charge.as_deref_mut(), body.capacity());")
         .expect("normalized body is charged");
     assert!(normalized < covered);
-    assert!(proxy.contains("buffered.budget.as_mut(),\n"));
-    assert!(server.contains("retained_request_charge.as_mut(),\n"));
-    assert_eq!(proxy.matches("if !charge_covers(").count(), 6);
-    assert_eq!(proxy.matches("if !request_buffer_permit.cover(").count(), 1);
-    assert_eq!(server.matches("if !charge_covers(").count(), 3);
-    assert_eq!(
-        bridge
-            .matches("crate::proxy::response_buffer_budget::charge_covers(")
-            .count(),
-        1
+
+    let transforms = proxy
+        .split("pub(crate) async fn apply_request_body_plugins_with_context(")
+        .nth(1)
+        .expect("transform chain")
+        .split("\n}\n")
+        .next()
+        .expect("bounded transform chain");
+    let covered = transforms
+        .find("if !charge_covers(charge.as_deref_mut(), transformed.capacity()) {")
+        .expect("each replacement is charged");
+    let installed = transforms
+        .find("current = transformed;")
+        .expect("replacement installed");
+    assert!(
+        covered < installed,
+        "a replacement is charged before it is installed"
     );
+
+    // Every charged body hands its charge to the chain and the normalizer.
+    let count = |source: &str, needle: &str| source.matches(needle).count();
+    assert_eq!(count(proxy, "buffered.budget.as_mut(),\n"), 5);
+    assert_eq!(count(proxy, "Some(&mut request_buffer_permit),\n"), 1);
+    assert_eq!(count(proxy, "request_buffer_permit.as_mut(),\n"), 1);
+    assert_eq!(count(server, "retained_request_charge.as_mut(),\n"), 4);
+    assert_eq!(count(bridge, "prebuffered_body_charge.as_mut(),\n"), 1);
+    // A refusal that awaits a writer first drops the charge it still owns: the
+    // three H3 transforms and the H3 normalization, beside the two existing
+    // rejection paths that already released it.
+    assert_eq!(count(server, "drop(retained_request_charge.take());"), 6);
+    assert_eq!(count(bridge, "drop(prebuffered_body_charge.take());"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Each request-body transform replacement is charged before the next runs.
+// ---------------------------------------------------------------------------
+
+/// Replaces the body with `size` bytes.
+struct ResizeBody {
+    size: usize,
+}
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for ResizeBody {
+    fn name(&self) -> &str {
+        "resize_body"
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        true
+    }
+
+    async fn transform_request_body(
+        &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _request_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        Some(vec![b'r'; self.size])
+    }
+}
+
+/// Holds the transform chain until released, like a slow later hook.
+struct PausingTransform {
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for PausingTransform {
+    fn name(&self) -> &str {
+        "pausing_transform"
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        true
+    }
+
+    async fn transform_request_body(
+        &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _request_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.release.notified().await;
+        None
+    }
+}
+
+#[tokio::test]
+async fn a_growing_transform_is_charged_while_a_later_transform_is_paused() {
+    use ferrum_edge::_test_support::apply_request_body_plugins_with_charge_for_test;
+    let budget = probe(8);
+    let total = budget.available_bytes();
+    let mut charge = budget.try_reserve(UNIT).expect("collected body charged");
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<std::sync::Arc<dyn ferrum_edge::plugins::Plugin>> = vec![
+        std::sync::Arc::new(ResizeBody { size: 3 * UNIT }),
+        std::sync::Arc::new(PausingTransform {
+            release: std::sync::Arc::clone(&release),
+        }),
+    ];
+    let headers = std::collections::HashMap::new();
+    let mut chain = Box::pin(apply_request_body_plugins_with_charge_for_test(
+        &plugins,
+        &headers,
+        vec![0u8; UNIT],
+        &mut charge,
+    ));
+    assert!(futures::poll!(chain.as_mut()).is_pending());
+    assert_eq!(
+        budget.available_bytes(),
+        total - 3 * UNIT,
+        "the grown intermediate body must be charged while a later transform awaits"
+    );
+    release.notify_one();
+    let body = chain.await.expect("the budget covers the grown body");
+    assert_eq!(body.len(), 3 * UNIT);
+    assert_eq!(charge.reserved_bytes(), 3 * UNIT);
+    drop((body, charge));
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[tokio::test]
+async fn a_grow_then_shrink_chain_publishes_only_its_final_body() {
+    use ferrum_edge::_test_support::apply_request_body_plugins_with_charge_for_test;
+    let budget = probe(8);
+    let total = budget.available_bytes();
+    let mut charge = budget.try_reserve(UNIT).expect("collected body charged");
+    let plugins: Vec<std::sync::Arc<dyn ferrum_edge::plugins::Plugin>> = vec![
+        std::sync::Arc::new(ResizeBody { size: 3 * UNIT }),
+        std::sync::Arc::new(ResizeBody { size: 10 }),
+    ];
+    let headers = std::collections::HashMap::new();
+    let body = apply_request_body_plugins_with_charge_for_test(
+        &plugins,
+        &headers,
+        vec![0u8; UNIT],
+        &mut charge,
+    )
+    .await
+    .expect("the budget covers the peak");
+    assert_eq!(body.len(), 10);
+    // The charge covered the peak; publication narrows it to the final body.
+    assert_eq!(charge.reserved_bytes(), 3 * UNIT);
+    let published = charge.into_charged_bytes(body).expect("covered");
+    assert_eq!(budget.available_bytes(), total - UNIT);
+    drop(published);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[tokio::test]
+async fn a_refused_transform_releases_body_and_charge_before_the_refusal_is_written() {
+    use ferrum_edge::_test_support::apply_request_body_plugins_with_charge_for_test;
+    let budget = probe(4);
+    let mut charge = budget.try_reserve(UNIT).expect("collected body charged");
+    let other = budget.try_reserve(2 * UNIT).expect("another upload");
+    let plugins: Vec<std::sync::Arc<dyn ferrum_edge::plugins::Plugin>> =
+        vec![std::sync::Arc::new(ResizeBody { size: 3 * UNIT })];
+    let headers = std::collections::HashMap::new();
+    let refused = apply_request_body_plugins_with_charge_for_test(
+        &plugins,
+        &headers,
+        vec![0u8; UNIT],
+        &mut charge,
+    )
+    .await;
+    assert!(refused.is_none(), "an uncovered replacement must be refused");
+    // The caller still owns the emptied permit while it awaits the refusal
+    // writer and its hooks; nothing of the refused body stays charged.
+    assert_eq!(charge.reserved_bytes(), 0);
+    assert_eq!(
+        budget.available_bytes(),
+        2 * UNIT,
+        "the refused body's charge is released before the refusal is written"
+    );
+    let writer = tokio::task::yield_now();
+    writer.await;
+    assert_eq!(budget.available_bytes(), 2 * UNIT);
+    drop((charge, other));
+    assert_eq!(budget.available_bytes(), 4 * UNIT);
 }

@@ -3123,8 +3123,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         let result = crate::proxy::run_final_request_body_hooks_with_provenance(
             plugins,
             Some(&mut *ctx),
@@ -3159,8 +3161,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         let result = crate::proxy::run_final_request_body_hooks_with_provenance_in(
             plugins,
             Some(&mut *ctx),
@@ -3219,8 +3223,10 @@ pub mod _test_support {
             deadline,
             headers,
             body.to_vec(),
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         crate::proxy::run_final_request_body_hooks_with_provenance(
             plugins,
             None,
@@ -10823,10 +10829,46 @@ pub mod _test_support {
         headers: &HashMap<String, String>,
         body_bytes: Vec<u8>,
     ) -> Vec<u8> {
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins, None, None, headers, body_bytes, None,
+        )
+        .await;
+        uncharged_request_body_transform(transformed)
+    }
+
+    /// The transform chain with no request-buffer charge has nothing to
+    /// refuse, so its capacity error is unreachable.
+    fn uncharged_request_body_transform(
+        transformed: Result<Vec<u8>, crate::proxy::RequestBodyCapacityExceeded>,
+    ) -> Vec<u8> {
+        match transformed {
+            Ok(body) => body,
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
+                unreachable!("an uncharged body is never refused for capacity")
+            }
+        }
+    }
+
+    /// Run the PRODUCTION request-body transform chain with a request-buffer
+    /// charge, so a test can observe that every replacement is charged before
+    /// the next transform runs. `None` is the capacity refusal: the uncovered
+    /// replacement and the body were dropped and the charge released.
+    pub async fn apply_request_body_plugins_with_charge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+        charge: &mut RequestBufferPermitProbe,
+    ) -> Option<Vec<u8>> {
         crate::proxy::apply_request_body_plugins_with_context(
-            plugins, None, None, headers, body_bytes,
+            plugins,
+            None,
+            None,
+            headers,
+            body,
+            Some(&mut charge.0),
         )
         .await
+        .ok()
     }
 
     /// Model the H1/H2 buffered request-body hook round trip: clone the live
@@ -10848,8 +10890,10 @@ pub mod _test_support {
             None,
             headers,
             body,
+            None,
         )
         .await;
+        let transformed = uncharged_request_body_transform(transformed);
         let result = crate::proxy::run_final_request_body_hooks(
             plugins,
             Some(&mut hook_ctx),
@@ -10902,7 +10946,7 @@ pub mod _test_support {
         .await
         {
             Ok(result) => result,
-            Err(crate::proxy::NormalizedBodyCapacityExceeded) => {
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
                 unreachable!("an uncharged body is never refused for capacity")
             }
         }
@@ -10943,7 +10987,7 @@ pub mod _test_support {
                 ChargedNormalizationOutcomeForTest::Continue
             }
             Ok(_) => ChargedNormalizationOutcomeForTest::Rejected,
-            Err(crate::proxy::NormalizedBodyCapacityExceeded) => {
+            Err(crate::proxy::RequestBodyCapacityExceeded) => {
                 ChargedNormalizationOutcomeForTest::BufferCapacityExceeded
             }
         }

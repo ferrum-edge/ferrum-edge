@@ -32,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RESOURCE_EXHAUSTED` as before, now after reading part of the body rather
   than before reading any. A body that request decompression (`compression`
   `decompress_request`) or a request-body plugin replaces with a larger one is
-  charged for the larger body as soon as the normalizer or transform returns,
-  before any later hook awaits, and the request is refused with the same
-  `503` / `RESOURCE_EXHAUSTED` when the budget cannot cover it, so no buffered
+  charged for the larger body before it is installed and before the next
+  normalizer, transform or hook awaits. When the budget cannot cover it, the
+  body and its whole charge are released at once, before the refusal is
+  written, and the request gets the same `503` / `RESOURCE_EXHAUSTED` (a
+  normalizer that itself rejected keeps its own rejection), so no buffered
   request body is retained beyond what the budget admitted.
 - **Cleartext auth endpoints are admitted only for loopback IP literals,
   never the name `localhost`.** `oauth2_introspection` (credentialed

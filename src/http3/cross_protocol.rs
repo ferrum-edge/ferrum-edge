@@ -1167,20 +1167,21 @@ where
             // they do on the H1/H2 dispatch path. This bridge path has no
             // `:method` pseudo-header for the no-context hook to consult.
             let grpc_deadline_at = ctx.grpc_deadline_at();
+            // Each replacement is charged before it is installed; an uncovered
+            // one is dropped with the body and its charge released inside the
+            // chain.
             let transformed = crate::proxy::apply_request_body_plugins_with_context(
                 plugins,
                 Some(&mut *ctx),
                 grpc_deadline_at,
                 proxy_headers,
                 body,
+                prebuffered_body_charge.as_mut(),
             )
             .await;
-            // Charged before the validators await: a replacement the budget
-            // cannot cover is dropped here, never kept uncharged.
-            if !crate::proxy::response_buffer_budget::charge_covers(
-                prebuffered_body_charge.as_mut(),
-                transformed.capacity(),
-            ) {
+            let Ok(transformed) = transformed else {
+                // Nothing of the refused body may outlive the refusal's writes.
+                drop(prebuffered_body_charge.take());
                 cb_probe.release_neutral();
                 return Box::pin(write_bridge_upload_refusal(
                     stream,
@@ -1193,7 +1194,7 @@ where
                     backend_start,
                 ))
                 .await;
-            }
+            };
             // Run validators. Reject = emit a trailers-only native gRPC error,
             // a gRPC-Web trailer frame when that client representation was
             // retained, or a plain JSON error otherwise, then return early

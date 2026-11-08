@@ -374,12 +374,11 @@ fn every_h3_dispatch_publishes_the_charge_with_the_body() {
     }
     // Publication fails closed: a body a request-body plugin grew past what
     // the budget can cover is refused, never retained uncharged.
+    let charged = "retained_request_charge.as_mut(),\n";
     assert_eq!(
-        server
-            .matches("charge_covers(retained_request_charge.as_mut(), transformed.capacity())")
-            .count(),
-        2,
-        "both native-H3 transforms that keep the body must cover it before keeping it"
+        server.matches(charged).count(),
+        4,
+        "the native-H3 normalization and all three transforms must charge their replacements"
     );
     for (source, publication) in [
         (server, "Some(mut body_data) = publish_h3_retained_body("),

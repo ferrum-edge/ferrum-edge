@@ -67,7 +67,7 @@ use crate::proxy::headers::{
 };
 use crate::proxy::response_buffer_budget::{
     BudgetRef, ChargedRequestCollector, RequestBufferPermit, RetainRejection,
-    buffered_request_body_ceiling, charge_covers,
+    buffered_request_body_ceiling,
 };
 use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::proxy::{
@@ -5612,6 +5612,9 @@ async fn handle_h3_request(
             // A normalized body the budget cannot cover was dropped inside the
             // phase; refuse before any rejection hook awaits.
             let Ok(normalize_result) = normalize_result else {
+                // Nothing of the refused body may outlive the refusal's write.
+                drop(retained_request_charge.take());
+                *body_data = Vec::new();
                 boxed_send_h3_request_buffer_capacity_rejection(
                     &mut stream,
                     &state,
@@ -6871,18 +6874,20 @@ async fn handle_h3_request(
             .or_insert_with(|| method.clone());
         let terminal_hook_start = std::time::Instant::now();
         let grpc_deadline_at = ctx.grpc_deadline_at();
+        // Each replacement is charged before it is installed; an uncovered one
+        // is dropped with the body and its charge released inside the chain.
         let transformed = crate::proxy::apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,
             &hook_headers,
             body_data,
+            retained_request_charge.as_mut(),
         )
         .await;
-        // The transformed body replaces the charged one for the rest of the
-        // request, so its charge must cover it before any further phase keeps
-        // it.
-        if !charge_covers(retained_request_charge.as_mut(), transformed.capacity()) {
+        let Ok(transformed) = transformed else {
+            // Nothing of the refused body may outlive the refusal's writes.
+            drop(retained_request_charge.take());
             return boxed_finalize_h3_request_buffer_capacity_rejection(
                 &mut stream,
                 &state,
@@ -6895,7 +6900,7 @@ async fn handle_h3_request(
                 &original_request_path,
             )
             .await;
-        }
+        };
         // `bytes_sent` above is the raw client-wire length; gRPC messages come
         // from the transformed, backend-visible body so translated gRPC-Web
         // requests count native frames instead of base64 / trailer framing,
@@ -7452,18 +7457,20 @@ async fn handle_h3_request(
             .entry(":method".to_string())
             .or_insert_with(|| method.clone());
         let grpc_deadline_at = ctx.grpc_deadline_at();
+        // Each replacement is charged before it is installed; an uncovered one
+        // is dropped with the body and its charge released inside the chain.
         let transformed = crate::proxy::apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,
             &hook_headers,
             body_data,
+            retained_request_charge.as_mut(),
         )
         .await;
-        // The transformed body replaces the charged one for the rest of the
-        // request, so its charge must cover it before any further phase keeps
-        // it.
-        if !charge_covers(retained_request_charge.as_mut(), transformed.capacity()) {
+        let Ok(transformed) = transformed else {
+            // Nothing of the refused body may outlive the refusal's writes.
+            drop(retained_request_charge.take());
             cb_probe.release_neutral();
             drop(preacquired_backend_admission.take_if_acquired());
             return boxed_finalize_h3_request_buffer_capacity_rejection(
@@ -7478,7 +7485,7 @@ async fn handle_h3_request(
                 &original_request_path,
             )
             .await;
-        }
+        };
         // Same contract as the terminal-hook ladder above: count the
         // backend-visible representation, not the client wire bytes, and an
         // untranslated pass-through upload on its decoded frames.
@@ -10124,20 +10131,23 @@ async fn handle_h3_request(
             .entry(":method".to_string())
             .or_insert_with(|| method.clone());
         let grpc_deadline_at = ctx.grpc_deadline_at();
+        // Each replacement is charged before it is installed; an uncovered one
+        // is dropped with the body and its charge released inside the chain.
         crate::proxy::apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
             grpc_deadline_at,
             &hook_headers,
             body_data,
+            retained_request_charge.as_mut(),
         )
         .await
     } else {
-        body_data
+        Ok(body_data)
     };
-    // Charged before the final hooks await: a replacement the budget cannot
-    // cover is dropped here, never kept uncharged.
-    if !charge_covers(retained_request_charge.as_mut(), body_data.capacity()) {
+    let Ok(body_data) = body_data else {
+        // Nothing of the refused body may outlive the refusal's writes.
+        drop(retained_request_charge.take());
         cb_probe.release_neutral();
         return boxed_finalize_h3_request_buffer_capacity_rejection(
             &mut stream,
@@ -10151,7 +10161,7 @@ async fn handle_h3_request(
             &original_request_path,
         )
         .await;
-    }
+    };
 
     // Skip the per-plugin context-aware dispatch when no plugin opted in via
     // `needs_final_request_body_context`. The default impl of

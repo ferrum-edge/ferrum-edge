@@ -761,9 +761,18 @@ impl RequestBufferPermit {
     /// capacity refusal, counted once: the caller must drop the allocation and
     /// answer [`REQUEST_BUFFER_OVERLOAD_STATUS`] instead of keeping bytes the
     /// budget does not cover.
+    ///
+    /// A refusal also releases the whole existing charge at once. The refused
+    /// request keeps no body, so nothing this charge paid for stays resident,
+    /// and the capacity is returned before the caller awaits any rejection
+    /// writer or hook rather than whenever the emptied permit finally drops.
     #[must_use]
     pub(crate) fn cover(&mut self, retained_capacity: usize) -> bool {
-        self.grow_to(retained_capacity)
+        if self.grow_to(retained_capacity) {
+            return true;
+        }
+        self.reservation = ResponseBufferReservation::new();
+        false
     }
 
     /// Publish `data` as cheaply cloneable [`Bytes`] whose charge is released
@@ -816,12 +825,12 @@ impl RequestBufferPermit {
     }
 }
 
-/// Grow a buffered request body's charge to cover the allocation a
-/// request-body plugin replaced it with, right after the transform and before
-/// the replacement is kept across any further phase. `false` is the capacity
-/// refusal: the caller drops the replacement and answers
-/// [`REQUEST_BUFFER_OVERLOAD_STATUS`]. A body no governed collect charged
-/// (`None`) has no charge to grow.
+/// Grow a buffered request body's charge to cover the allocation a normalizer
+/// or request-body plugin replaced it with, before the replacement is kept
+/// across any further await. `false` is the capacity refusal: the charge has
+/// already been released ([`RequestBufferPermit::cover`]), and the caller drops
+/// the replacement and the body and answers [`REQUEST_BUFFER_OVERLOAD_STATUS`].
+/// A body no governed collect charged (`None`) has no charge to grow.
 #[must_use]
 pub(crate) fn charge_covers(charge: Option<&mut RequestBufferPermit>, capacity: usize) -> bool {
     charge.is_none_or(|charge| charge.cover(capacity))

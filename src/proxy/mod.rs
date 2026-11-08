@@ -4806,22 +4806,23 @@ async fn prepare_mesh_request_body(
     let body = if request_body_prepared {
         buffered.body
     } else {
+        // Each replacement is charged before it is installed; an uncovered one
+        // is dropped with the body and its charge released inside the chain.
         let transformed = apply_request_body_plugins_with_context(
             plugins,
             ctx.as_deref_mut(),
             grpc_deadline_at,
             headers,
             buffered.body,
+            buffered.budget.as_mut(),
         )
         .await;
-        // Charged before the final hooks await: a replacement the budget
-        // cannot cover is dropped here, never kept uncharged.
-        if !charge_covers(buffered.budget.as_mut(), transformed.capacity()) {
+        let Ok(transformed) = transformed else {
             return Err(request_buffer_capacity_backend_response(
                 request_ctx,
                 resolved_ip,
             ));
-        }
+        };
         match run_final_request_body_hooks(
             plugins,
             ctx.as_deref_mut(),
@@ -4956,11 +4957,11 @@ pub(crate) fn refresh_request_body_views_after_normalization(
     }
 }
 
-/// A buffered request body a gateway-owned normalizer replaced (for example a
-/// decompressed upload) that the request-buffer budget could not cover. The
-/// replacement has already been dropped; the caller answers the capacity
-/// terminal before any rejection hook awaits.
-pub(crate) struct NormalizedBodyCapacityExceeded;
+/// A buffered request body a gateway-owned normalizer (for example request
+/// decompression) or a request-body transform replaced with one the
+/// request-buffer budget could not cover. The replacement has already been
+/// dropped and the charge released; the caller answers the capacity terminal.
+pub(crate) struct RequestBodyCapacityExceeded;
 
 /// Run opt-in buffered-body normalizers after the pre-`before_proxy` buffer is
 /// stored and before any `before_proxy` hook.
@@ -4972,8 +4973,9 @@ pub(crate) struct NormalizedBodyCapacityExceeded;
 /// can replace that body with a larger one (decoded plaintext), so the charge
 /// is grown to cover the replacement as soon as each normalizer returns, with
 /// no await in between and before any later phase keeps it. When the budget
-/// cannot cover it, the replacement is dropped and this returns
-/// [`NormalizedBodyCapacityExceeded`].
+/// cannot cover it, the replacement is dropped and the charge released; a
+/// normalizer that also rejected keeps its own rejection, otherwise this
+/// returns [`RequestBodyCapacityExceeded`].
 pub(crate) async fn apply_buffered_request_body_normalization_before_before_proxy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -4982,7 +4984,7 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
     mut charge: Option<&mut response_buffer_budget::RequestBufferPermit>,
     needs_body_text: bool,
     needs_body_bytes: bool,
-) -> Result<PluginResult, NormalizedBodyCapacityExceeded> {
+) -> Result<PluginResult, RequestBodyCapacityExceeded> {
     let was_decoded = ctx
         .metadata
         .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
@@ -4997,11 +4999,15 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
         )
         .await
         .into_plugin_result(ctx);
-        if !charge_covers(charge.as_deref_mut(), body.capacity()) {
+        // Charged before any later phase awaits. An uncovered body is dropped
+        // (and its charge released) whatever the normalizer decided, so a
+        // rejection keeps its own status while nothing uncharged stays resident.
+        let covered = charge_covers(charge.as_deref_mut(), body.capacity());
+        if !covered {
             *body = Vec::new();
-            return Err(NormalizedBodyCapacityExceeded);
         }
         match result {
+            PluginResult::Continue if !covered => return Err(RequestBodyCapacityExceeded),
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
@@ -6895,15 +6901,26 @@ fn is_forwarded_token(value: &str) -> bool {
         })
 }
 
+/// Run the request-body transform chain over a buffered body.
+///
+/// `charge` is the request-buffer charge of the body being transformed. A
+/// transform can return a larger replacement; the charge is grown to cover each
+/// replacement before it is installed and before the next transform runs, so
+/// no replacement is ever held uncharged across an await. When the budget
+/// cannot cover one, the replacement and the body are dropped, the charge is
+/// released ([`response_buffer_budget::RequestBufferPermit::cover`]), and this
+/// returns [`RequestBodyCapacityExceeded`]: the caller answers the capacity
+/// terminal. A body no governed collect charged (`None`) is never refused.
 pub(crate) async fn apply_request_body_plugins_with_context(
     plugins: &[Arc<dyn Plugin>],
     mut ctx: Option<&mut RequestContext>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     headers: &HashMap<String, String>,
     body_bytes: Vec<u8>,
-) -> Vec<u8> {
+    mut charge: Option<&mut response_buffer_budget::RequestBufferPermit>,
+) -> Result<Vec<u8>, RequestBodyCapacityExceeded> {
     if body_bytes.is_empty() || !plugins.iter().any(|plugin| plugin.modifies_request_body()) {
-        return body_bytes;
+        return Ok(body_bytes);
     }
 
     let content_type = headers.get("content-type").map(|value| value.as_str());
@@ -6957,11 +6974,16 @@ pub(crate) async fn apply_request_body_plugins_with_context(
                     .await
             };
             if let Some(transformed) = transformed {
+                // Charged before it is installed and before the next transform
+                // awaits; an uncovered replacement drops here with the body.
+                if !charge_covers(charge.as_deref_mut(), transformed.capacity()) {
+                    return Err(RequestBodyCapacityExceeded);
+                }
                 current = transformed;
             }
         }
     }
-    current
+    Ok(current)
 }
 
 pub(crate) async fn run_final_request_body_hooks(
@@ -39004,18 +39026,21 @@ async fn handle_proxy_request_inner(
                     .then(|| ctx.clone_for_final_request_body_hooks());
                 let terminal_hook_start = Instant::now();
                 let grpc_deadline_at = ctx.grpc_deadline_at();
+                // Each replacement is charged before it is installed; an
+                // uncovered one is dropped with the body and its charge
+                // released inside the chain, before the refusal below awaits.
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
                     &hook_headers,
                     std::mem::take(&mut buffered.body),
+                    buffered.budget.as_mut(),
                 )
                 .await;
-                // The transformed body replaces the charged one for the rest of
-                // the request, so its charge must cover it before any further
-                // phase (final hooks, egress, dispatch) keeps it.
-                if !charge_covers(buffered.budget.as_mut(), transformed.capacity()) {
+                let Ok(transformed) = transformed else {
+                    drop(buffered);
+                    drop(body_hook_ctx);
                     return Ok(finalize_terminal_request_body_read_rejection(
                         &state,
                         &plugins,
@@ -39029,7 +39054,7 @@ async fn handle_proxy_request_inner(
                         &original_request_path,
                     )
                     .await);
-                }
+                };
                 let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
@@ -39491,18 +39516,19 @@ async fn handle_proxy_request_inner(
                 let grpc_deadline_at = ctx.grpc_deadline_at();
                 let mut body_hook_ctx = needs_final_request_body_context
                     .then(|| ctx.clone_for_final_request_body_hooks());
+                // Each replacement is charged before it is installed; an
+                // uncovered one is dropped with the body and its charge
+                // released inside the chain.
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
                     body_hook_ctx.as_mut(),
                     grpc_deadline_at,
                     &hook_headers,
                     std::mem::take(&mut buffered.body),
+                    buffered.budget.as_mut(),
                 )
                 .await;
-                // The transformed body replaces the charged one for the rest of
-                // the request, so its charge must cover it before any further
-                // phase keeps it.
-                if !charge_covers(buffered.budget.as_mut(), transformed.capacity()) {
+                let Ok(transformed) = transformed else {
                     cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
                     let response = build_request_buffer_capacity_response(
@@ -39515,7 +39541,7 @@ async fn handle_proxy_request_inner(
                     ctx.terminal_record.mark_counted();
                     record_request(&state, response.status().as_u16());
                     return Ok(response);
-                }
+                };
                 let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
@@ -40353,16 +40379,31 @@ async fn handle_proxy_request_inner(
                 .entry(":path".to_string())
                 .or_insert_with(|| path.clone());
             let grpc_deadline_at = ctx.grpc_deadline_at();
-            let grpc_req_body = bytes::Bytes::from(
-                apply_request_body_plugins_with_context(
-                    &plugins,
-                    deferred_body_hook_ctx.as_mut(),
-                    grpc_deadline_at,
-                    &hook_headers,
-                    grpc_req_body.to_vec(),
-                )
-                .await,
-            );
+            // The transform runs on a copy of the published body, which takes
+            // no request-buffer charge of its own (a documented follow-up), so
+            // the chain has no charge to refuse.
+            let transformed = apply_request_body_plugins_with_context(
+                &plugins,
+                deferred_body_hook_ctx.as_mut(),
+                grpc_deadline_at,
+                &hook_headers,
+                grpc_req_body.to_vec(),
+                None,
+            )
+            .await;
+            let Ok(transformed) = transformed else {
+                cb_probe.release_neutral();
+                drop(preacquired_backend_admission.take_if_acquired());
+                let response = build_request_buffer_capacity_response(
+                    true,
+                    grpc_web_response_content_type,
+                    initial_response_header_policy_plugins.as_ref(),
+                );
+                ctx.terminal_record.mark_counted();
+                record_request(&state, response.status().as_u16());
+                return Ok(response);
+            };
+            let grpc_req_body = bytes::Bytes::from(transformed);
             // Count gRPC messages from the transformed, backend-visible body —
             // NOT the client wire bytes recorded into `bytes_sent_observed`
             // above. A translated gRPC-Web request only becomes native
@@ -52403,17 +52444,19 @@ async fn proxy_to_backend(
                 let body_bytes = if request_body_prepared {
                     buffered.body
                 } else {
+                    // Each replacement is charged before it is installed; an
+                    // uncovered one is dropped with the body and its charge
+                    // released inside the chain.
                     let body_bytes = apply_request_body_plugins_with_context(
                         plugins,
                         ctx.as_deref_mut(),
                         request_ctx.grpc_deadline_at(),
                         &headers.for_plugin_hooks(!plugins.is_empty()),
                         buffered.body,
+                        buffered.budget.as_mut(),
                     )
                     .await;
-                    // Charged before the final hooks await: a replacement the
-                    // budget cannot cover is dropped here, never kept uncharged.
-                    if !charge_covers(buffered.budget.as_mut(), body_bytes.capacity()) {
+                    let Ok(body_bytes) = body_bytes else {
                         return backend_dispatch_response(
                             request_buffer_capacity_backend_response(
                                 Some(request_ctx),
@@ -52422,7 +52465,7 @@ async fn proxy_to_backend(
                             None,
                             None,
                         );
-                    }
+                    };
                     match run_final_request_body_hooks(
                         plugins,
                         ctx,
@@ -52740,17 +52783,19 @@ async fn proxy_to_backend(
                 );
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
+                // Each replacement is charged before it is installed; an
+                // uncovered one is dropped with the body and its charge
+                // released inside the chain.
                 let body_bytes = apply_request_body_plugins_with_context(
                     plugins,
                     ctx.as_deref_mut(),
                     request_ctx.grpc_deadline_at(),
                     &headers.for_plugin_hooks(!plugins.is_empty()),
                     body_bytes,
+                    Some(&mut request_buffer_permit),
                 )
                 .await;
-                // Charged before the final hooks await: a replacement the
-                // budget cannot cover is dropped here, never kept uncharged.
-                if !request_buffer_permit.cover(body_bytes.capacity()) {
+                let Ok(body_bytes) = body_bytes else {
                     return backend_dispatch_response(
                         request_buffer_capacity_backend_response(
                             Some(request_ctx),
@@ -52759,7 +52804,7 @@ async fn proxy_to_backend(
                         None,
                         None,
                     );
-                }
+                };
                 // gRPC message accounting uses the transformed, backend-visible
                 // body; `bytes_sent` above stays the raw client-wire length.
                 crate::plugins::grpc_web::record_request_grpc_message_count(
@@ -66393,22 +66438,23 @@ async fn proxy_to_backend_http3(
     let request_body = if request_body_prepared {
         request_body
     } else {
+        // Each replacement is charged before it is installed; an uncovered one
+        // is dropped with the body and its charge released inside the chain.
         let request_body = apply_request_body_plugins_with_context(
             plugins,
             ctx.as_deref_mut(),
             grpc_deadline_at,
             headers,
             request_body,
+            request_buffer_permit.as_mut(),
         )
         .await;
-        // Charged before the final hooks await: a replacement the budget
-        // cannot cover is dropped here, never kept uncharged.
-        if !charge_covers(request_buffer_permit.as_mut(), request_body.capacity()) {
+        let Ok(request_body) = request_body else {
             return (
                 request_buffer_capacity_backend_response(Some(request_ctx), resolved_ip),
                 None,
             );
-        }
+        };
         match run_final_request_body_hooks(plugins, ctx, grpc_deadline_at, headers, &request_body)
             .await
         {
