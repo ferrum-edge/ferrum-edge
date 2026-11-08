@@ -538,14 +538,9 @@ impl Http2PoolManager {
     }
 
     /// The direct-H2 pool's HTTP/2 client builder: the shared `PoolConfig`
-    /// builder with the pool keepalive applied and the outbound stream bound
-    /// seeded from the cap, exactly like the gRPC pool.
+    /// builder every H2 pool family uses.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
-        crate::pool::hyper_h2_client_builder(
-            pool_config,
-            crate::pool::H2ClientKeepalive::FromPoolConfig,
-            crate::pool::H2ClientInitialSendStreams::FromStreamCap,
-        )
+        crate::pool::hyper_h2_client_builder(pool_config)
     }
 
     /// Cached backend rustls config for this proxy's TLS identity. A miss is

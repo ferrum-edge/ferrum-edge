@@ -2055,14 +2055,9 @@ impl GrpcPoolManager {
     }
 
     /// The gRPC pool's HTTP/2 client builder: the shared `PoolConfig` builder
-    /// with the pool keepalive applied and the outbound stream bound seeded
-    /// from the cap, exactly like the direct-H2 pool.
+    /// every H2 pool family uses.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
-        crate::pool::hyper_h2_client_builder(
-            pool_config,
-            crate::pool::H2ClientKeepalive::FromPoolConfig,
-            crate::pool::H2ClientInitialSendStreams::FromStreamCap,
-        )
+        crate::pool::hyper_h2_client_builder(pool_config)
     }
 
     /// Create an h2c (cleartext HTTP/2) connection using prior knowledge.
@@ -4776,18 +4771,13 @@ async fn open_hbone_grpc_sender(
     // nothing else: the only thing it decides is whether this nested HTTP/2
     // connection may be held open across RPCs.
     let peer_advertises_fence = tunnel.peer_advertises_inner_reuse();
-    // The same effective pool configuration the inner key was built from, so a
-    // pooled carrier's wire settings and its key can never disagree.
-    //
-    // Unlike the direct gRPC pool, this nested connection applies neither the
-    // pool's HTTP/2 PING keepalive (the outer HBONE carrier runs its own) nor
-    // the cap as hyper's initial outbound stream bound; both are kept as they
-    // were when this builder was hand-written.
-    let builder = crate::pool::hyper_h2_client_builder(
-        &inner_pool_config,
-        crate::pool::H2ClientKeepalive::NotApplied,
-        crate::pool::H2ClientInitialSendStreams::HyperDefault,
-    );
+    // The same effective pool configuration the inner key was built from, and
+    // the same shared builder as the direct gRPC pool, so a pooled carrier's
+    // wire settings and its key can never disagree (issue #7071). That
+    // includes the pool's HTTP/2 PING keepalive: the outer HBONE carrier's own
+    // PINGs prove only the tunnel to the destination relay, while these prove
+    // the destination app behind it is still serving this connection.
+    let builder = crate::pool::hyper_h2_client_builder(&inner_pool_config);
 
     // The inner connection is CLEARTEXT HTTP/2 to the destination app, so — as
     // on the direct-dial h2c path — nothing about the outer hop proves the app
@@ -4835,10 +4825,11 @@ async fn open_hbone_grpc_sender(
     // task below is the only place that can keep reading it — and a single
     // sample taken right here would be wrong: `await_peer_settings` proves only
     // that the peer's SETTINGS BYTES arrived, while `h2` defers applying them
-    // until it writes the SETTINGS ACK, so this early read still reports
-    // hyper's pre-settings `DEFAULT_INITIAL_MAX_SEND_STREAMS` of 100. Recording
-    // 100 for a destination advertising 8 left `is_saturated()` permanently
-    // false and queued RPCs 9..100 pending-open inside `h2`.
+    // until it writes the SETTINGS ACK, so this early read still reports the
+    // pre-settings bound (the configured stream cap, else hyper's
+    // `DEFAULT_INITIAL_MAX_SEND_STREAMS` of 100). Recording 100 for a
+    // destination advertising 8 left `is_saturated()` permanently false and
+    // queued RPCs 9..100 pending-open inside `h2`.
     //
     // The load is therefore created BEFORE the spawn and shared with the pool,
     // and the driver stores the connection's current value after every poll.

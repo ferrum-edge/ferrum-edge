@@ -2067,14 +2067,10 @@ impl MeshMtlsConnectionPool {
                     });
                 }
 
-                // Pool keepalive applies; the cap is advertised but, unlike the
-                // direct-H2/gRPC pools, not seeded as hyper's initial outbound
-                // stream bound (kept as it was when this was hand-written).
-                let builder = crate::pool::hyper_h2_client_builder(
-                    pool_config,
-                    crate::pool::H2ClientKeepalive::FromPoolConfig,
-                    crate::pool::H2ClientInitialSendStreams::HyperDefault,
-                );
+                // The shared builder every H2 pool family uses: the DR stream
+                // cap this pool keys on bounds outbound streams from the first
+                // one, not only after the peer's SETTINGS (issue #7071).
+                let builder = crate::pool::hyper_h2_client_builder(pool_config);
 
                 let io = TokioIo::new(tls_stream);
                 let (sender, connection) =

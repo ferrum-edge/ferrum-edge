@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Changed
+- **Mesh HTTP/2 backend connections use the same builder settings as the
+  direct-H2 and gRPC pools** (issue #7071).
+  - Sidecar mesh-mTLS connections and the nested HTTP/2 connection a native
+    gRPC call opens inside an HBONE tunnel now seed hyper's initial outbound
+    stream bound from the DestinationRule `connectionPool.http.maxConcurrentStreams`
+    cap (or the global pool cap). A new connection no longer opens up to 100
+    streams before the peer's SETTINGS frame arrives; the peer's advertised
+    limit still replaces the cap once it does.
+  - The nested-HBONE gRPC connection now applies the pool HTTP/2 PING
+    keepalive (`FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` /
+    `_TIMEOUT_SECONDS`, only while an RPC is in flight) and the 4096
+    reset-stream cap. The outer HBONE carrier's PINGs prove only the tunnel to
+    the destination relay; these detect a destination app that stopped
+    serving the inner connection. The nested pool key already carried these
+    settings, so key and wire settings now agree.
 - **Circuit-breaker policy for TCP relay endings, HALF_OPEN stragglers, and
   cycle counters** (issue #7030).
   - A raw TCP relay that ends on its idle window (`tcp_idle_timeout_seconds`)
