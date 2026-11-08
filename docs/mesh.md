@@ -4689,6 +4689,18 @@ Defaults and full descriptions are in [configuration.md → Mesh Runtime](config
 
 Both gates must agree before a self-signed root is minted: `FERRUM_MESH_CA_BOOTSTRAP_DEV=true` **and** `FERRUM_MESH_PRODUCTION_MODE` not `true`. Anything else fails closed.
 
+**Accepted spellings.** Each guardrail has one canonical reader in `src/identity/` that runtime startup and `ferrum-edge validate` share. Values are matched ASCII case-insensitively:
+
+| Variable | Turns on for | Anything else |
+|---|---|---|
+| `FERRUM_MESH_PRODUCTION_MODE` | `true` or `1`, surrounding whitespace ignored | off; in `mesh` mode a value other than `true`, `false`, `1`, `0` or empty is a startup error |
+| `FERRUM_MESH_ALLOW_NO_CA` | `true` or `1`, surrounding whitespace ignored | off (refused) |
+| `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY` | `true` or `1`, surrounding whitespace ignored | off (refused) |
+| `FERRUM_MESH_CA_BOOTSTRAP_DEV` | exactly `true` (no surrounding whitespace) | off (bootstrap refused) |
+| `FERRUM_MESH_ALLOW_STATIC_ID` | exactly `true` (no surrounding whitespace) | off (attestor refused) |
+
+A value outside a dev opt-in's spelling leaves the shortcut off, so the narrower spelling can only fail closed. `FERRUM_MESH_PRODUCTION_MODE`'s broader spelling likewise errs toward refusing the dev shortcuts.
+
 Relatedly, running the Experimental `FERRUM_MESH_TOPOLOGY=node_waypoint` topology under `FERRUM_MESH_PRODUCTION_MODE=true` logs a startup `warn!` (not a refusal — the production identity guardrails all still apply, and the NodeWaypoint eBPF live gate deliberately runs the production identity profile) noting that Experimental surfaces are excluded from the GA contract (see [mesh_supported_matrix.md](mesh_supported_matrix.md)).
 
 **The internal root is process-local and stays that way.** The bootstrap helper mints the root **in memory, per process**. There is no env var, admin endpoint, or CLI flag that persists, exports, or imports it, and none is planned: an export surface would turn a dev shortcut into a distributable private CA key. Two `internal` processes on one host therefore hold two unrelated roots and cannot complete mTLS in either direction — the outbound SPIFFE verifier rejects the peer chain, and no PERMISSIVE setting creates a plaintext east-west fallback for sidecar outbound. To run more than one mesh process locally, give each one file-based SVID material issued by a **shared** root: see [File-Based SVIDs: Two-Process Local Mesh](#file-based-svids-two-process-local-mesh).

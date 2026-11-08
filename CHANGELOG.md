@@ -41,6 +41,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **Control-plane and platform drift: one reader per rule** (issue #7075).
+  - Remote control-plane URLs in mesh multicluster logs are now rendered as
+    `scheme://host[:port]/redacted`, the structural form notification and
+    observability endpoints already use. Path, query, and fragment no longer
+    appear in those log lines (userinfo was already stripped).
+  - `SpireAgentCa` (a library CA the mesh runtime does not construct) now runs
+    its X.509 stream on the shared Workload API fetch loop, so its
+    `spire_agent` CA-health series exists before the first connect and a
+    clean stream end counts in `ferrum_mesh_cert_rotation_failures_total`.
+  - `FERRUM_MESH_CA_BOOTSTRAP_DEV` is read by one helper shared by
+    `ferrum-edge validate` and the bootstrap itself; its accepted spelling
+    (`true`, case-insensitive) is unchanged and is now documented with the
+    other mesh dev opt-ins in `docs/mesh.md`.
+  - The mesh app-probe loopback HTTPS client advertises the signature schemes
+    of its own crypto provider instead of a fixed list, and the `health
+    --tls-no-verify` client uses the shared `NoVerifier`. Neither changes a
+    handshake outcome.
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while

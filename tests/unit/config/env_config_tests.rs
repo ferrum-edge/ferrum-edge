@@ -1130,6 +1130,77 @@ fn test_env_config_mesh_mode_file_needs_no_ferrum_cp_credentials() {
     );
 }
 
+/// Issue #7075: `EnvConfig` validation (what `ferrum-edge validate` runs),
+/// `bootstrap_allowed`, and `bootstrap_dev_root` read
+/// `FERRUM_MESH_CA_BOOTSTRAP_DEV` through one helper, so they agree on every
+/// spelling. Only `true` (ASCII case-insensitive, untrimmed) opts in; every
+/// other value fails closed.
+#[test]
+fn test_internal_ca_bootstrap_opt_in_spelling_agrees_between_validate_and_bootstrap() {
+    use ferrum_edge::identity::ca::bootstrap;
+    use ferrum_edge::identity::spiffe::TrustDomain;
+
+    for (spelling, opted_in) in [
+        ("true", true),
+        ("TRUE", true),
+        ("True", true),
+        (" true", false),
+        ("true ", false),
+        ("1", false),
+        ("yes", false),
+        ("false", false),
+        ("", false),
+    ] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_MESH_CONFIG_PROTOCOL", "file"),
+                ("FERRUM_MESH_FILE_CONFIG_PATH", "/etc/ferrum/mesh.yaml"),
+                ("FERRUM_MESH_CA_BACKEND", "internal"),
+                ("FERRUM_MESH_CA_BOOTSTRAP_DEV", spelling),
+                (
+                    "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                    "spiffe://cluster.local/ns/ferrum/sa/api",
+                ),
+            ],
+            || {
+                remove_var("FERRUM_DP_CP_GRPC_URLS");
+                remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+                remove_var("FERRUM_MESH_PRODUCTION_MODE");
+                remove_var("FERRUM_MESH_ALLOW_NO_CA");
+
+                assert_eq!(
+                    bootstrap::dev_bootstrap_opted_in(),
+                    opted_in,
+                    "dev_bootstrap_opted_in for {spelling:?}"
+                );
+                assert_eq!(
+                    bootstrap::bootstrap_allowed(),
+                    opted_in,
+                    "bootstrap_allowed for {spelling:?}"
+                );
+                let trust_domain = TrustDomain::new("td.bootstrap-spelling").unwrap();
+                assert_eq!(
+                    bootstrap::bootstrap_dev_root(bootstrap::BootstrapConfig::new(trust_domain))
+                        .is_ok(),
+                    opted_in,
+                    "bootstrap_dev_root for {spelling:?}"
+                );
+                match EnvConfig::from_env() {
+                    Ok(_) => assert!(opted_in, "validate admitted {spelling:?}"),
+                    Err(error) => {
+                        assert!(!opted_in, "validate refused {spelling:?}: {error}");
+                        assert!(
+                            error.contains("FERRUM_MESH_CA_BOOTSTRAP_DEV"),
+                            "validate must name the opt-in for {spelling:?}: {error}"
+                        );
+                    }
+                }
+            },
+        );
+    }
+}
+
 #[test]
 fn test_env_config_mesh_mode_missing_jwt_secret() {
     with_env_vars(
