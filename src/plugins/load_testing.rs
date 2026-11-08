@@ -624,6 +624,29 @@ listener is disabled; set `gateway_tls` to select an enabled listener and/or set
             ));
         }
 
+        // Synthetic replays go straight from a dedicated client to the
+        // `127.0.0.1` literal, which reqwest never hands to the policy-aware
+        // DNS resolver and which never reaches the `execute*` literal-IP
+        // screen, so the backend egress policy is applied to that dial here,
+        // like every other plugin endpoint (`gateway_addresses` included).
+        // There is no self-dial exemption: which process owns
+        // `127.0.0.1:{gateway_port}` cannot be proven at construction (dynamic
+        // Gateway listeners, IPv6 wildcard binds, co-bound `SO_REUSEADDR`
+        // sockets). The policy is node-local, so validation clients admitting
+        // config for other nodes (a control plane) check shape only; every
+        // serving node enforces it when it builds the plugin.
+        if http_client.is_serving_node() {
+            let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            if let Some(reason) = http_client.backend_allow_ips().deny_reason(&loopback) {
+                return Err(format!(
+                    "load_testing: synthetic requests dial `gateway_port` \"{gateway_port}\" on \
+127.0.0.1, which the backend egress policy blocks ({reason}); permit loopback explicitly with \
+FERRUM_BACKEND_ALLOW_CIDRS=127.0.0.1/32 (this re-permits every loopback port) or adjust \
+FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_DENY_CIDRS."
+                ));
+            }
+        }
+
         let scheme = if gateway_tls { "https" } else { "http" };
         let gateway_base_url = format!("{}://127.0.0.1:{}", scheme, gateway_port);
 

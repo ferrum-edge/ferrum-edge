@@ -35329,7 +35329,10 @@ components:
             when gateway_tls is enabled) resolved with the same environment >
             ferrum.conf/--settings precedence the listener itself uses, then
             8000/8443. A resolved port of 0 (disabled listener) is rejected
-            whichever configuration source supplied it.
+            whichever configuration source supplied it. Serving nodes screen
+            the 127.0.0.1 dial target with the backend egress policy, so a
+            policy that denies loopback rejects the plugin unless 127.0.0.1 is
+            allow-listed; control-plane admission checks the range only.
         gateway_tls:
           type: [boolean, "null"]
           default: false
