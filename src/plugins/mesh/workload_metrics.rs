@@ -2907,6 +2907,13 @@ fn validate_custom_tag_name(name: &str) -> Result<(), String> {
                 | "peer_spiffe_id"
                 | "request_protocol"
                 | "response_flags"
+                // The gRPC method keys `grpc_method_router` publishes. A tag
+                // under one of these names would let a Telemetry author (or,
+                // for a header tag, the request sender) choose the method key
+                // other plugins read (GHSA-9mmx-ghcv-x25q).
+                | "grpc_service"
+                | "grpc_method"
+                | "grpc_full_method"
         );
     if reserved || is_sensitive_metadata_key(name) {
         return Err(format!(

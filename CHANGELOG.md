@@ -41,6 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **BREAKING — `workload_metrics` reserves the gRPC method metadata keys as
+  custom tag names** (GHSA-9mmx-ghcv-x25q, follow-up to #7081). A
+  `custom_tags`, `custom_header_tags` or `custom_env_tags` entry (in mesh mode,
+  an Istio `Telemetry.tracing[].customTags` entry) named `grpc_service`,
+  `grpc_method` or `grpc_full_method` overwrote the method key that
+  `grpc_method_router` publishes and per-method plugin policy reads, so a
+  Telemetry author or, for a header tag, the request sender chose it. Such a
+  tag now fails `workload_metrics` construction as reserved, like `trace_id`.
+  **Operator action:** rename any such tag.
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while
