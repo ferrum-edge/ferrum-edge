@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **BREAKING — `workload_metrics` reserves the gRPC method metadata keys as
-  custom tag names** (GHSA-9mmx-ghcv-x25q, follow-up to #7081). A
+  custom tag names** (issue #7092; GHSA-9mmx-ghcv-x25q, follow-up to #7081). A
   `custom_tags`, `custom_header_tags` or `custom_env_tags` entry (in mesh mode,
   an Istio `Telemetry.tracing[].customTags` entry) named `grpc_service`,
   `grpc_method` or `grpc_full_method` overwrote the method key that
