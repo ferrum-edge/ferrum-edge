@@ -17437,11 +17437,7 @@ async fn mesh_custom_owned_header_at_backend(
     let plugins = view.plugins();
     let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        path.to_string(),
-    );
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
     ctx.headers
         .insert("host".to_string(), "api.example.com".to_string());
     ctx.headers

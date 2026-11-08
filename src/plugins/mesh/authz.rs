@@ -4512,11 +4512,13 @@ impl Plugin for MeshAuthz {
             // provider's verified decision IS its current authorized state:
             // record the install (or the removal) so the final
             // gateway-assertion pass keeps exactly this value.
-            let route_owned = ctx.route_owned_request_assertion_headers().is_some_and(|owned| {
-                owned.iter().any(|owned| {
-                    crate::proxy::headers::field_names_equivalent_for_backends(owned, &name)
-                })
-            });
+            let route_owned = ctx
+                .route_owned_request_assertion_headers()
+                .is_some_and(|owned| {
+                    owned.iter().any(|owned| {
+                        crate::proxy::headers::field_names_equivalent_for_backends(owned, &name)
+                    })
+                });
             match value {
                 Some(value) => {
                     if route_owned {
