@@ -41,6 +41,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **`ferrum-gateway` chart: IPv4-mapped admin binds and allowlist entries
+  follow the runtime** (issue #7078; the mesh chart got the same fixes in
+  `4fb5df58f`). With `admin.bindAddress: "::ffff:127.0.0.2"` and the default
+  exec probes, the chart required `admin.allowedCidrs` to include
+  `::ffff:127.0.0.2/128` and refused `127.0.0.1/32`, but the runtime observes
+  the probes from `127.0.0.1` and canonicalizes that mapped CIDR to
+  `127.0.0.2/32`, so a release that rendered cleanly dropped its own probes and
+  restart-looped. The probe source is now canonicalized to IPv4 first, and
+  the allowlist check uses the mapped peer the IPv6 listener actually sees
+  (`::ffff:127.0.0.1`), so an ordinary IPv6 rule that covers it (for example
+  `::/80`) still admits the probes in both charts. A bare
+  mapped allowlist entry (`::ffff:a.b.c.d` with no prefix) is now a `/32` in the
+  permits-all check instead of a negative prefix that only happened to work. A
+  new unit test fails when a helper shared by both charts' `_helpers.tpl`
+  drifts.
 - **BREAKING — `workload_metrics` custom tags can no longer overwrite
   gateway-published metadata** (issue #7092; GHSA-9mmx-ghcv-x25q, follow-up to
   #7081). A `custom_tags`, `custom_header_tags` or `custom_env_tags` entry (in

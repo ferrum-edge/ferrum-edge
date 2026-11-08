@@ -25,6 +25,7 @@ mod cached_synthetic_bytes_share_tests;
 #[cfg(unix)]
 mod cgroup_tree_walk_tests;
 mod charged_content_coding_chain_tests;
+mod chart_helpers_parity_tests;
 mod chart_image_tag_helm_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;

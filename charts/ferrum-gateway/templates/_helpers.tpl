@@ -238,10 +238,22 @@ app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
 
 {{/* Source address the admin listener observes for the computed exec probe.
      Linux selects 127.0.0.1 when connecting to any concrete 127/8 destination;
-     other concrete/wildcard probe hosts use the same local address they dial. */}}
+     other concrete/wildcard probe hosts use the same local address they dial.
+     IPv4-mapped IPv6 destinations are canonicalized to IPv4 first (matching the
+     runtime), so `::ffff:127.0.0.2` is a 127/8 dial and the observed source is
+     `127.0.0.1`, not the mapped destination text. Ordinary IPv6 is unchanged.
+     Input is the root context: the probe host comes from the chart-wide
+     `.Values.admin` through `ferrum-gateway.probeHost`, unlike the mesh copy,
+     which takes an already-resolved per-component host. */}}
 {{- define "ferrum-gateway.probeSource" -}}
 {{- $host := include "ferrum-gateway.probeHost" . -}}
-{{- if regexMatch "^127\\." $host -}}127.0.0.1
+{{- $v4 := include "ferrum-gateway.ipv4ToInt" $host -}}
+{{- if eq $v4 "" -}}{{- $v4 = include "ferrum-gateway.ipv4MappedToInt" $host -}}{{- end -}}
+{{- if ne $v4 "" -}}
+{{- $int := $v4 | int64 -}}
+{{- if eq (div $int 16777216 | int) 127 -}}127.0.0.1
+{{- else -}}{{ include "ferrum-gateway.ipv4IntToDotted" $int }}
+{{- end -}}
 {{- else -}}{{ $host }}
 {{- end -}}
 {{- end -}}
@@ -265,6 +277,12 @@ app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
 {{- $parts := splitList "." $v -}}
 {{- add (mul (index $parts 0 | int64) 16777216) (mul (index $parts 1 | int64) 65536) (mul (index $parts 2 | int64) 256) (index $parts 3 | int64) -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Convert an unsigned 32-bit IPv4 integer back to dotted-decimal. */}}
+{{- define "ferrum-gateway.ipv4IntToDotted" -}}
+{{- $v := . | int64 -}}
+{{- printf "%d.%d.%d.%d" (div $v 16777216) (mod (div $v 65536) 256) (mod (div $v 256) 256) (mod $v 256) -}}
 {{- end -}}
 
 {{/* Convert one validated IPv6 hextet to an integer. Helm has no base-16 atoi. */}}
@@ -397,8 +415,14 @@ app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
 {{- if and (eq $networkV4 "") (ne $mappedV4 "") -}}{{- $networkV4 = $mappedV4 -}}{{- end -}}
 {{- if ne $networkV4 "" -}}
 {{- $prefix := 32 -}}
-{{- if eq (len $parts) 2 -}}{{- $prefix = atoi (trim (index $parts 1)) -}}{{- end -}}
+{{- if eq (len $parts) 2 -}}
+{{- $prefix = atoi (trim (index $parts 1)) -}}
+{{- /* Mapped CIDRs are stored as IPv4 after subtracting the 96-bit prefix.
+     Bare mapped addresses have no prefix to subtract: they are already a
+     single IPv4 host (/32). Subtracting 96 from that default 32 produced a
+     negative length and could collapse the family to "permits all". */ -}}
 {{- if ne $mappedV4 "" -}}{{- $prefix = sub $prefix 96 | int -}}{{- end -}}
+{{- end -}}
 {{- $bits := include "ferrum-gateway.ipv4Bits" $networkV4 -}}
 {{- $_ := set $coverage (printf "4:%s" (substr 0 $prefix $bits)) true -}}
 {{- else -}}
@@ -945,7 +969,13 @@ Validation: fail render on missing/unsafe configuration.
 {{- $probeHost := include "ferrum-gateway.probeHost" . -}}
 {{- $probeSource := include "ferrum-gateway.probeSource" . -}}
 {{- $probeIsV6 := contains ":" $probeSource -}}
-{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probeSource "allowedCidrs" $adminAllowedCidrs) -}}
+{{- /* A mapped bind is served by an IPv6 socket, so the listener sees the probe
+     as the mapped peer (`::ffff:127.0.0.1`) and the runtime matches it against
+     IPv4 rules and ordinary IPv6 rules alike. Check that form; the dotted
+     source stays the diagnostic. */ -}}
+{{- $probePeer := $probeSource -}}
+{{- if include "ferrum-gateway.ipv4MappedToInt" $probeHost -}}{{- $probePeer = printf "::ffff:%s" $probeSource -}}{{- end -}}
+{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probePeer "allowedCidrs" $adminAllowedCidrs) -}}
 {{- if not $hasProbeSource -}}
 {{- $probeCidr := ternary (printf "%s/128" $probeSource) (printf "%s/32" $probeSource) $probeIsV6 -}}
 {{- fail (printf "admin.allowedCidrs must include %s (or bare %s) while the default exec probes are enabled; the computed exec probes dial admin host %s from source %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR) or override/disable every computed probe handler." $probeCidr $probeSource $probeHost $probeSource) -}}
