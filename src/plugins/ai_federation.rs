@@ -117,7 +117,8 @@ use super::utils::ai_model_glob::{
     MAX_MODEL_PATTERNS_PER_PROVIDER, is_valid_model_pattern, matches_model_glob,
 };
 use super::utils::ai_translation::{
-    present_tool_calls, screen_gemini_strict_schema_document, valid_tool_call_id, valid_tool_name,
+    self, present_tool_calls, screen_gemini_strict_schema_document, valid_tool_call_id,
+    valid_tool_name,
 };
 use super::utils::ambient_cloud_credentials::{
     ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS, AmbientAwsEndpointScope, AwsCredentialSources,
@@ -2851,20 +2852,20 @@ struct ProviderToolCall<'a> {
 }
 
 /// Parse an assistant message's `tool_calls` through the shared OpenAI
-/// admission rules (issue #7070: `null` is absent, ids are bounded), then
-/// read this adapter's Gemini `thought_signature` extension per call.
+/// admission rules (issue #7070: `null` is absent, ids are bounded), reading
+/// this adapter's Gemini `thought_signature` extension right after each
+/// entry's common fields, so diagnostics keep per-call order.
 fn parse_openai_tool_calls(
     message: &Value,
     message_index: usize,
 ) -> Result<Vec<ParsedToolCall>, String> {
-    let calls = super::utils::ai_translation::parse_openai_tool_calls(message, message_index)
-        .map_err(|error| format!("ai_federation: {error}"))?;
-    let entries = present_tool_calls(message)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let mut parsed = Vec::with_capacity(calls.len());
-    for (tool_index, (call, entry)) in calls.into_iter().zip(entries).enumerate() {
+    let federation_error = |error: String| format!("ai_federation: {error}");
+    let entries = ai_translation::openai_tool_call_entries(message, message_index)
+        .map_err(federation_error)?;
+    let mut parsed = Vec::with_capacity(entries.len());
+    for (tool_index, entry) in entries.iter().enumerate() {
+        let call = ai_translation::parse_openai_tool_call(entry, message_index, tool_index)
+            .map_err(federation_error)?;
         let thought_signature = match entry.as_object() {
             Some(call_object) => parse_tool_call_thought_signature(
                 call_object,
@@ -3041,8 +3042,7 @@ fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
 }
 
 fn tool_result_text(content: &Value) -> Result<String, String> {
-    super::utils::ai_translation::tool_result_text(content)
-        .map_err(|error| format!("ai_federation: {error}"))
+    ai_translation::tool_result_text(content).map_err(|error| format!("ai_federation: {error}"))
 }
 
 fn normalized_stop_sequences(openai_body: &Value) -> Result<Option<Value>, String> {

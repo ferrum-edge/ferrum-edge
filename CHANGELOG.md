@@ -47,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`plugins::utils::ai_translation`), so the same request gets the same answer
   on a buffered and a streaming route. Client-visible changes:
   - `ai_stream_router` (Gemini, `strict: true`) now refuses a `$ref` with any
-    sibling keyword (including `title` / `description`), a `$ref` that is not
+    sibling keyword other than the root's own `$defs` (including `title` /
+    `description`), a `$ref` that is not
     `#` or an existing root `#/$defs/<name>`, `$defs` below the root, and a
     recursive reference graph, as `ai_federation` already did.
   - `ai_federation` now treats `"tool_calls": null` as absent (it was a

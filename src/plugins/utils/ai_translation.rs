@@ -445,18 +445,16 @@ pub(crate) fn parse_tool_arguments_object(
     Ok(parsed)
 }
 
-/// Parse and validate an OpenAI assistant message's `tool_calls`.
+/// The entries of an OpenAI assistant message's `tool_calls`.
 ///
-/// Absent or JSON `null` yields no calls. Otherwise the value must be a
-/// non-empty array of `{"type":"function","id":..,"function":{"name":..,
-/// "arguments":"<JSON object>"}}` entries with a [`valid_tool_call_id`] and a
-/// [`valid_tool_name`]. Errors carry no plugin prefix; callers add their own.
-pub(crate) fn parse_openai_tool_calls(
+/// Absent or JSON `null` yields no entries. Otherwise the value must be a
+/// non-empty array. Errors carry no plugin prefix; callers add their own.
+pub(crate) fn openai_tool_call_entries(
     message: &Value,
     message_index: usize,
-) -> Result<Vec<ParsedToolCall>, String> {
+) -> Result<&[Value], String> {
     let Some(tool_calls_value) = present_tool_calls(message) else {
-        return Ok(Vec::new());
+        return Ok(&[]);
     };
     let tool_calls = tool_calls_value
         .as_array()
@@ -466,59 +464,77 @@ pub(crate) fn parse_openai_tool_calls(
             "messages[{message_index}].tool_calls must not be empty"
         ));
     }
+    Ok(tool_calls)
+}
 
-    let mut parsed = Vec::with_capacity(tool_calls.len());
-    for (tool_index, call) in tool_calls.iter().enumerate() {
-        let call_object = call.as_object().ok_or_else(|| {
-            format!("messages[{message_index}].tool_calls[{tool_index}] must be an object")
+/// Parse and validate one `tool_calls[tool_index]` entry:
+/// `{"type":"function","id":..,"function":{"name":..,"arguments":"<JSON
+/// object>"}}` with a [`valid_tool_call_id`] and a [`valid_tool_name`].
+/// Errors carry no plugin prefix; callers add their own.
+pub(crate) fn parse_openai_tool_call(
+    call: &Value,
+    message_index: usize,
+    tool_index: usize,
+) -> Result<ParsedToolCall, String> {
+    let call_object = call.as_object().ok_or_else(|| {
+        format!("messages[{message_index}].tool_calls[{tool_index}] must be an object")
+    })?;
+    if call_object.get("type").and_then(Value::as_str) != Some("function") {
+        return Err(format!(
+            "messages[{message_index}].tool_calls[{tool_index}] must have type 'function'"
+        ));
+    }
+    let id = call_object
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| valid_tool_call_id(value))
+        .ok_or_else(|| format!("messages[{message_index}].tool_calls[{tool_index}] missing id"))?;
+    let function = call_object
+        .get("function")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            format!("messages[{message_index}].tool_calls[{tool_index}] missing function")
         })?;
-        if call_object.get("type").and_then(Value::as_str) != Some("function") {
-            return Err(format!(
-                "messages[{message_index}].tool_calls[{tool_index}] must have type 'function'"
-            ));
-        }
-        let id = call_object
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| valid_tool_call_id(value))
-            .ok_or_else(|| {
-                format!("messages[{message_index}].tool_calls[{tool_index}] missing id")
-            })?;
-        let function = call_object
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                format!("messages[{message_index}].tool_calls[{tool_index}] missing function")
-            })?;
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| valid_tool_name(value))
-            .ok_or_else(|| {
-                format!(
-                    "messages[{message_index}].tool_calls[{tool_index}] has invalid function name"
-                )
-            })?;
-        let arguments = function
-            .get("arguments")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "messages[{message_index}].tool_calls[{tool_index}] arguments must be a JSON string"
-                )
-            })?;
-        let arguments = parse_tool_arguments_object(
-            arguments,
-            ToolArgumentsField::Modern {
-                message_index,
-                tool_index,
-            },
-        )?;
-        parsed.push(ParsedToolCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            arguments,
-        });
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| valid_tool_name(value))
+        .ok_or_else(|| {
+            format!("messages[{message_index}].tool_calls[{tool_index}] has invalid function name")
+        })?;
+    let arguments = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "messages[{message_index}].tool_calls[{tool_index}] arguments must be a JSON string"
+            )
+        })?;
+    let arguments = parse_tool_arguments_object(
+        arguments,
+        ToolArgumentsField::Modern {
+            message_index,
+            tool_index,
+        },
+    )?;
+    Ok(ParsedToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+/// Parse and validate an OpenAI assistant message's `tool_calls`: the
+/// [`openai_tool_call_entries`] array, each entry through
+/// [`parse_openai_tool_call`] in order.
+pub(crate) fn parse_openai_tool_calls(
+    message: &Value,
+    message_index: usize,
+) -> Result<Vec<ParsedToolCall>, String> {
+    let entries = openai_tool_call_entries(message, message_index)?;
+    let mut parsed = Vec::with_capacity(entries.len());
+    for (tool_index, call) in entries.iter().enumerate() {
+        parsed.push(parse_openai_tool_call(call, message_index, tool_index)?);
     }
     Ok(parsed)
 }
