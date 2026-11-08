@@ -89,7 +89,6 @@ mod inner {
     };
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use anyhow::Context;
-    use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use dashmap::DashMap;
@@ -1209,14 +1208,14 @@ mod inner {
     /// sqlx-backed `DatabaseStore`. Uses the official `mongodb` Rust driver.
     ///
     /// **Failover & reconnect**: the live `Client`, `Database`, and generated
-    /// TLS PEM guards are wrapped in one `ArcSwap` bundle so
+    /// TLS PEM guards are one bundle, published atomically together with the
+    /// failover topology (`DbFailoverTopologyState`, issue #7061), so
     /// [`Self::try_failover_reconnect`] can atomically replace the underlying
     /// client when the primary URL is unreachable and a configured failover URL
     /// is healthy. Readers that already loaded the old bundle keep using it
     /// (commands in flight complete normally), then drop their reference and
-    /// pick up the new one on the next call. This mirrors the
-    /// `Arc<ArcSwap<AnyPool>>` pattern used by the sqlx `DatabaseStore` for the
-    /// same reason — without it, every "failover" attempt would just ping the
+    /// pick up the new one on the next call. The sqlx `DatabaseStore` publishes
+    /// its pool the same way for the same reason — without it, every "failover" attempt would just ping the
     /// dead client and the gateway would never recover for standalone
     /// (non-replica-set) MongoDB deployments.
     /// Topology label passed to Mongo reconnect publication test hooks
@@ -1245,9 +1244,8 @@ mod inner {
         /// Invoked immediately before the fail-fast Admin + generation
         /// `try_write` acquisition.
         pub before_lock: Option<MongoReconnectTransitionHook>,
-        /// Invoked while publication guards are held, after connection
-        /// ArcSwap (and after failover `mark_failover`), before primary
-        /// `mark_primary` finalizes the transition.
+        /// Invoked while publication guards are held, after the connection
+        /// and its topology were published together.
         pub while_holding: Option<MongoReconnectTransitionHook>,
     }
 
@@ -1420,11 +1418,6 @@ mod inner {
 
     #[derive(Clone)]
     pub struct MongoStore {
-        // The live client, database handle, and any generated TLS PEM paths.
-        // Swapping the bundle as one Arc keeps files present while an old
-        // client can still open sockets, then removes them when the final old
-        // bundle reference is dropped.
-        connection: Arc<ArcSwap<MongoConnectionBundle>>,
         // Admission operations hold the read side from acquisition through
         // mutation completion / response construction. A reconnect must take
         // the write side before swapping `connection`, so one protected
@@ -1446,8 +1439,9 @@ mod inner {
         // `connection_generation`. Readers never take both locks nested on the
         // same fair RwLock.
         admin_write_topology: Arc<tokio::sync::RwLock<()>>,
-        /// Monotonic process-local generation of `connection`, published under
-        /// the same Admin + admission write guards as the ArcSwap.
+        /// Monotonic process-local generation of the published connection,
+        /// stored under the same Admin + admission write guards as the
+        /// publication.
         topology_epoch: Arc<AtomicU64>,
         // Multi-step admission guards outlive an individual trait call. Their owner
         // token indexes the exact connection bundle and generation pin that
@@ -1473,8 +1467,14 @@ mod inner {
         audit_max_rows_prune_gates:
             Arc<DashMap<String, crate::admin::audit::AuditMaxRowsPruneGate>>,
         failover_urls: Vec<String>,
-        /// Sticky failover topology / write-window state (issue #3001).
-        failover_topology: crate::config::db_backend::DbFailoverTopologyState,
+        /// Sticky failover topology / write-window state (issue #3001),
+        /// published together with the live connection bundle as one value
+        /// (issue #7061). The bundle holds the client, database handle, and
+        /// any generated TLS PEM paths; swapping it as one Arc keeps files
+        /// present while an old client can still open sockets, then removes
+        /// them when the final old bundle reference is dropped.
+        failover_topology:
+            crate::config::db_backend::DbFailoverTopologyState<Arc<MongoConnectionBundle>>,
         /// External-test hooks around [`Self::publish_reconnected_bundle`].
         /// Empty in production; see
         /// [`Self::set_reconnect_transition_hooks_for_test`].
@@ -1566,7 +1566,6 @@ mod inner {
             }
 
             Ok(Self {
-                connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
                 topology_epoch: Arc::new(AtomicU64::new(1)),
@@ -1580,7 +1579,9 @@ mod inner {
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 audit_max_rows_prune_gates: Arc::new(DashMap::new()),
                 failover_urls: Vec::new(),
-                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(
+                    Arc::new(connection),
+                ),
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
                 protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
@@ -1993,9 +1994,9 @@ mod inner {
                                     crate::startup::sanitize_startup_scalar(url)
                                 );
                                 store.failover_urls = failover_urls.to_vec();
-                                store
-                                    .failover_topology
-                                    .mark_failover(&crate::config::db_backend::redact_url(url));
+                                store.failover_topology.mark_connected_to_failover(
+                                    &crate::config::db_backend::redact_url(url),
+                                );
                                 return Ok(store);
                             }
                             Err(_error) => {
@@ -2024,7 +2025,7 @@ mod inner {
         /// keeps generated TLS PEM guards alive for any driver handle cloned
         /// from it.
         fn connection(&self) -> Arc<MongoConnectionBundle> {
-            self.connection.load_full()
+            self.failover_topology.handle()
         }
 
         async fn install_reconnected_bundle(
@@ -2058,16 +2059,15 @@ mod inner {
         ///   permits use only (1); admission uses only (2); publication takes
         ///   exclusive sides in that order. A deferred reconnect leaves
         ///   topology untouched.
-        /// - Failover: `mark_failover` runs *before* the ArcSwap so
+        /// - The connection and its topology are published in ONE store
+        ///   (`publish_failover` / `publish_primary`, issue #7061), so
         ///   `admit_write()` / `check_write_allowed()` can never observe a
-        ///   failover connection while `primary_active` is still true.
-        /// - Primary: ArcSwap runs *before* `mark_primary` so writes stay
-        ///   fail-closed until the primary connection is published; both
-        ///   steps complete while the same publication guards are held so a
-        ///   concurrent failover cannot publish and then be overwritten only
-        ///   in metadata by a delayed `mark_primary` (fail-open).
-        /// - After the gate flips, publication cannot fail (swap is infallible
-        ///   under the held guards), so there is no post-flip restore path.
+        ///   failover connection while `primary_active` is still true, and a
+        ///   primary connection never goes live while topology still reports
+        ///   failover. Publication runs while the publication guards are
+        ///   held, so a concurrent failover cannot interleave with it.
+        /// - Publication cannot fail (the store is infallible under the held
+        ///   guards), so there is no post-publication restore path.
         ///
         /// Covered callers: [`Self::install_reconnected_bundle`] (primary
         /// `reconnect`) and [`Self::reconnect_failover`]
@@ -2113,22 +2113,25 @@ mod inner {
             if let Some(permit) = primary_failback_permit.as_ref() {
                 self.failover_topology.revalidate_primary_failback(permit)?;
             }
-            if topology == MongoReconnectTopology::Failover {
-                self.failover_topology.mark_failover(url_redacted);
-            }
-            let _old_connection = self.connection.swap(Arc::new(new_connection));
+            let new_connection = Arc::new(new_connection);
+            let _old_connection = match primary_failback_permit {
+                Some(permit) => {
+                    self.failover_topology
+                        .publish_primary(new_connection, permit, url_redacted)
+                }
+                None => self
+                    .failover_topology
+                    .publish_failover(new_connection, url_redacted),
+            };
             self.topology_epoch
                 .store(next_topology_epoch, Ordering::Release);
             self.replica_set_configured
                 .store(replica_set_configured, Ordering::Release);
-            // Test seam: hold publication guards across the primary
-            // mark_primary window so a concurrent failover cannot interleave
-            // and then be overwritten only in metadata.
+            // Test seam: hold the publication guards after publication so a
+            // concurrent failover/primary must wait for this one to release
+            // them.
             self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology)
                 .await;
-            if let Some(permit) = primary_failback_permit {
-                self.failover_topology.mark_primary(permit, url_redacted);
-            }
             Ok(())
         }
 
@@ -2221,7 +2224,6 @@ mod inner {
             let db = client.database(&settings.database_name);
             let connection = MongoConnectionBundle::new(client, db, lease_client, Vec::new());
             Ok(Self {
-                connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
                 topology_epoch: Arc::new(AtomicU64::new(1)),
@@ -2235,7 +2237,9 @@ mod inner {
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 audit_max_rows_prune_gates: Arc::new(DashMap::new()),
                 failover_urls,
-                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(
+                    std::sync::Arc::new(connection),
+                ),
                 reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(false)),
                 protected_namespaces: vec![crate::config::types::DEFAULT_NAMESPACE.to_string()],
@@ -15509,14 +15513,13 @@ mod inner {
             )
             .await?;
 
-            // Atomic swap + topology finalization under the same publication
-            // guards. Readers that already loaded the old `Client` or
+            // Connection and topology published in one store under the
+            // publication guards. Readers that already loaded the old `Client` or
             // `Database` handle keep using it (in-flight commands complete);
             // the next call to `db()`/`client()` picks up the new handle. Any
             // generated TLS files are owned by the same bundle as the driver
             // client, so old files are deleted only after the final old bundle
-            // reference is dropped. Primary `mark_primary` runs after the swap
-            // but still under the guards (issue #3001 fail-open race).
+            // reference is dropped (issues #3001, #7061).
             self.install_reconnected_bundle(
                 new_connection,
                 replica_set_configured,
@@ -19898,7 +19901,6 @@ mod inner {
             let db = client.database(&settings.database_name);
             let connection = MongoConnectionBundle::new(client, db, lease_client, Vec::new());
             MongoStore {
-                connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 connection_generation: std::sync::Arc::new(tokio::sync::RwLock::new(())),
                 admin_write_topology: std::sync::Arc::new(tokio::sync::RwLock::new(())),
                 topology_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -19912,7 +19914,9 @@ mod inner {
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 audit_max_rows_prune_gates: std::sync::Arc::new(DashMap::new()),
                 failover_urls,
-                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(
+                    std::sync::Arc::new(connection),
+                ),
                 reconnect_transition_test_hooks: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,

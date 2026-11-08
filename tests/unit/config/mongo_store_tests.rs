@@ -983,14 +983,18 @@ fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
     }
 }
 
-/// Issue #3001: Mongo failover must flip the write gate before publishing the
-/// connection (SQL `reconnect_for_topology` parity). Default-disabled admin
-/// writes must never observe a failover connection while `primary_active`
-/// still reads true. Primary `mark_primary` must finalize under the same
-/// publication guards after ArcSwap. Deferred reconnects must not change
-/// topology.
+/// Issue #3001: default-disabled admin writes must never observe a failover
+/// connection while `primary_active` still reads true, and a primary
+/// connection must never go live while topology still reports failover.
+/// Since issue #7061 that is a type-level guarantee: the connection (Mongo
+/// bundle, SQL pool) lives inside `DbFailoverTopologyState` and the only way
+/// to replace it is `publish_failover` / `publish_primary`, which store the
+/// handle and its topology together (behaviour pinned in
+/// `db_backend_tests::failover_topology_publication_*`). What remains
+/// structural here is lock order, fail-fast publication, and staged
+/// migrations. Deferred reconnects must not change topology.
 #[test]
-fn reconnect_failover_marks_topology_before_publishing_connection() {
+fn reconnect_publishes_connection_and_topology_together_under_guards() {
     let reconnect_failover = mongo_fn_body("        async fn reconnect_failover(");
     assert!(
         reconnect_failover.contains("build_connection_bundle("),
@@ -998,22 +1002,13 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
     );
     assert!(
         reconnect_failover.contains("publish_reconnected_bundle("),
-        "reconnect_failover must publish through the ordered helper"
+        "reconnect_failover must publish through the guarded helper"
     );
     assert!(
         reconnect_failover.contains("MongoReconnectTopology::Failover")
             && (reconnect_failover.contains("redact_url(db_url)")
                 || reconnect_failover.contains("crate::config::db_backend::redact_url(db_url)")),
         "reconnect_failover must publish as Failover with a redacted URL:\n{reconnect_failover}"
-    );
-    // Must not reintroduce the old post-publish mark_failover call site.
-    let after_publish = reconnect_failover
-        .split("publish_reconnected_bundle(")
-        .nth(1)
-        .expect("publish call");
-    assert!(
-        !after_publish.contains("mark_failover("),
-        "mark_failover must not run after publication in reconnect_failover:\n{reconnect_failover}"
     );
 
     let publish = mongo_fn_body("        async fn publish_reconnected_bundle(");
@@ -1029,42 +1024,28 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
     let generation_try_write_at = publish_body
         .find("connection_generation.try_write()")
         .expect("publish_reconnected_bundle must fail-fast on the generation guard second");
-    let mark_failover_at = publish_body
-        .find("mark_failover(")
-        .expect("publish_reconnected_bundle must mark failover under the guards");
-    let swap_at = publish_body
-        .find("connection.swap(")
-        .expect("publish_reconnected_bundle must ArcSwap the connection");
-    let mark_primary_at = publish_body
-        .find("mark_primary(")
-        .expect("publish_reconnected_bundle must mark primary under the guards");
+    let failback_check_at = publish_body
+        .find("ensure_primary_failback_allowed()")
+        .expect("publish_reconnected_bundle must check the failback fence under the guards");
+    let publish_at = publish_body
+        .find(".publish_primary(")
+        .into_iter()
+        .chain(publish_body.find(".publish_failover("))
+        .min()
+        .expect("publish_reconnected_bundle must publish through the topology state");
     assert!(
         admin_try_write_at < generation_try_write_at
-            && generation_try_write_at < mark_failover_at
-            && mark_failover_at < swap_at
-            && swap_at < mark_primary_at,
-        "admin try_write -> generation try_write -> mark_failover -> swap -> mark_primary is the serialized order:\n{publish_body}"
+            && generation_try_write_at < failback_check_at
+            && failback_check_at < publish_at,
+        "admin try_write -> generation try_write -> failback fence -> publish is the serialized order:\n{publish_body}"
     );
     assert!(
         !publish_body.contains(".write().await"),
         "Mongo publication must stay fail-fast (try_write), never unbounded write().await:\n{publish_body}"
     );
 
-    // Primary reconnect must not finalize topology outside the publication
-    // critical section (the pre-fix fail-open race).
-    let reconnect = mongo_fn_body("        async fn reconnect(");
-    assert!(
-        reconnect.contains("install_reconnected_bundle("),
-        "reconnect must publish via install_reconnected_bundle:\n{reconnect}"
-    );
-    assert!(
-        !reconnect.contains("mark_primary("),
-        "reconnect must not call mark_primary after releasing publication guards:\n{reconnect}"
-    );
-
-    // SQL parity: failover topology flips before pool publication, and the
-    // reconnect transition *write* lock serializes publication through deferred
-    // migrations / primary mark_primary. Admin mutations take a shared *read*
+    // SQL parity: the reconnect transition *write* lock serializes publication
+    // through staged deferred migrations. Admin mutations take a shared *read*
     // pin via acquire_write_topology_permit so reconnect cannot redirect an
     // in-flight write (issue #3001 check-to-use race).
     let sql_source = include_str!("../../../src/config/db_loader.rs");
@@ -1073,47 +1054,28 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         .nth(1)
         .and_then(|rest| rest.split("\n    /// Extract the hostname").next())
         .expect("DatabaseStore::reconnect_for_topology body");
-    assert!(
-        sql_reconnect.contains("self.reconnect_transition.write().await"),
-        "SQL reconnect_for_topology must serialize publication under reconnect_transition write lock:\n{sql_reconnect}"
-    );
     let sql_lock = sql_reconnect
         .find("self.reconnect_transition.write().await")
-        .expect("reconnect_transition write lock");
-    let sql_mark = sql_reconnect
-        .find("mark_failover(")
-        .expect("SQL failover path must call mark_failover");
-    let sql_swap = sql_reconnect
-        .find("self.pool.swap(")
-        .expect("SQL failover path must swap the pool");
+        .expect("SQL reconnect must serialize publication under reconnect_transition write lock");
     let sql_failback_check = sql_reconnect
         .find("ensure_primary_failback_allowed()")
         .expect("SQL primary path must check the failback fence under the transition lock");
     let sql_migrations = sql_reconnect
         .find("maybe_apply_deferred_migrations_on_pool(new_pool.clone())")
         .expect("SQL reconnect must migrate the staged pool under the transition lock");
-    let sql_mark_primary = sql_reconnect
-        .find(".mark_primary(permit,")
-        .expect("SQL primary path must call mark_primary with the failback permit");
-    assert!(
-        sql_lock < sql_mark && sql_mark < sql_swap,
-        "write lock -> mark_failover -> pool.swap is the fail-closed failover order:\n{sql_reconnect}"
-    );
+    let sql_publish = sql_reconnect
+        .find(".publish_primary(")
+        .into_iter()
+        .chain(sql_reconnect.find(".publish_failover("))
+        .min()
+        .expect("SQL reconnect must publish through the topology state");
     // Issue #7033: deferred migrations run on the staged pool *before* any
-    // publication, so a migration failure can never leave the new pool live
-    // while topology still reports the previous side.
+    // publication, so a migration failure can never leave the new pool live.
     assert!(
         sql_lock < sql_failback_check
             && sql_failback_check < sql_migrations
-            && sql_migrations < sql_mark
-            && sql_migrations < sql_swap
-            && sql_swap < sql_mark_primary,
-        "write lock -> failback fence -> staged-pool migrations -> publish -> mark_primary must stay under the same write lock:\n{sql_reconnect}"
-    );
-    let after_swap = &sql_reconnect[sql_swap..sql_mark_primary];
-    assert!(
-        !after_swap.contains("?;") && !after_swap.contains("return Err"),
-        "nothing fallible may run between pool.swap and mark_primary:\n{after_swap}"
+            && sql_migrations < sql_publish,
+        "write lock -> failback fence -> staged-pool migrations -> publish must stay under the same write lock:\n{sql_reconnect}"
     );
     let connect_at = sql_reconnect
         .find("connect_any_pool_with_timeout(")
@@ -1781,11 +1743,13 @@ async fn reconnect_between_admin_permit_and_admission_is_fail_fast() {
     );
 }
 
-/// Issue #3001: a primary publication that pauses after ArcSwap (before
-/// `mark_primary`) must not let a concurrent failover publish and then be
-/// overwritten only in metadata by a delayed `mark_primary` — that left the
-/// live bundle on failover while `primary_active=true` and made write gating
-/// fail open. Rendezvous via test seams; no sleeps.
+/// Issue #3001: a primary publication that pauses while holding the
+/// publication guards must not let a concurrent failover publish and then be
+/// overwritten only in metadata by a delayed primary finalization — that left
+/// the live bundle on failover while `primary_active=true` and made write
+/// gating fail open. Since issue #7061 the bundle and topology are published
+/// in one store, so the paused primary is already consistent. Rendezvous via
+/// test seams; no sleeps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delayed_primary_publish_cannot_overwrite_later_failover_topology() {
     use std::sync::Mutex as StdMutex;
@@ -1872,13 +1836,13 @@ async fn delayed_primary_publish_cannot_overwrite_later_failover_topology() {
         .await
         .expect("primary publish must enter while_holding under the publication guards");
     assert!(
-        !store.failover_topology_status().primary_active,
-        "primary must stay fail-closed until mark_primary after the deferred window"
+        store.failover_topology_status().primary_active,
+        "the primary bundle and its topology are published together (issue #7061)"
     );
     assert_eq!(
         mongo_store_published_database_name_for_test(&store),
         "primary_bundle",
-        "bundle must already be primary while mark_primary is still pending under the guards"
+        "the published bundle must match the published primary topology"
     );
 
     let failover_store = store.clone();

@@ -2902,11 +2902,12 @@ async fn failover_write_gate_fences_primary_after_opt_in_admission() {
     );
 }
 
-/// Issue #3001: a primary reconnect that pauses after pool publication (the
-/// deferred-migration window) must not let a concurrent failover publish and
-/// then be overwritten by a delayed `mark_primary` — that left the active pool
-/// on failover while `primary_active=true` and made `check_write_allowed` fail
-/// open. Rendezvous via test seams; no sleeps.
+/// Issue #3001: a primary reconnect that pauses while holding the transition
+/// lock must not let a concurrent failover publish and then be overwritten by
+/// a delayed primary finalization — that left the active pool on failover
+/// while `primary_active=true` and made `check_write_allowed` fail open. Since
+/// issue #7061 the pool and topology are published in one store, so the paused
+/// primary is already consistent. Rendezvous via test seams; no sleeps.
 #[tokio::test]
 async fn delayed_primary_reconnect_cannot_overwrite_later_failover_topology() {
     use ferrum_edge::config::db_backend::DatabaseBackend;
@@ -2995,8 +2996,13 @@ async fn delayed_primary_reconnect_cannot_overwrite_later_failover_topology() {
         .await
         .expect("primary reconnect must enter while_holding under the transition mutex");
     assert!(
-        !store.failover_topology_status().primary_active,
-        "primary must stay fail-closed until mark_primary after the deferred window"
+        store.failover_topology_status().primary_active,
+        "the primary pool and its topology are published together (issue #7061)"
+    );
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["ferrum".to_string(), "primary-ns".to_string()],
+        "the published pool must match the published primary topology"
     );
 
     let failover_store = store.clone();

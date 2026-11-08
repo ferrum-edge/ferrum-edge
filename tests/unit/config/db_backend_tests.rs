@@ -689,11 +689,11 @@ fn incremental_result_not_empty_with_added_consumer() {
 
 #[test]
 fn failover_topology_state_transitions_and_opt_in_risk_marker() {
-    let state = DbFailoverTopologyState::new();
+    let state = DbFailoverTopologyState::new(());
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
 
-    state.mark_failover("sqlite:///tmp/failover.db");
+    state.publish_failover((), "sqlite:///tmp/failover.db");
     let status = state.status();
     assert!(!status.primary_active);
     assert_eq!(
@@ -708,11 +708,11 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
     let permit = state
         .ensure_primary_failback_allowed()
         .expect("failback is not fenced without an admitted write");
-    state.mark_primary(permit, "sqlite:///tmp/primary.db");
+    state.publish_primary((), permit, "sqlite:///tmp/primary.db");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
 
-    state.mark_failover("sqlite:///tmp/failover.db");
+    state.publish_failover((), "sqlite:///tmp/failover.db");
     state.set_allow_writes(true);
     let status = state.status();
     assert!(status.allow_writes);
@@ -723,7 +723,7 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
 
     // Switching failover URLs must preserve the sticky opt-in risk marker and
     // must not spam additional transition warnings (silent URL refresh).
-    state.mark_failover("sqlite:///tmp/failover-2.db");
+    state.publish_failover((), "sqlite:///tmp/failover-2.db");
     let status = state.status();
     assert!(!status.primary_active);
     assert!(status.opt_in_writes_enabled_during_window);
@@ -737,7 +737,7 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
     state.note_admin_write();
     assert!(state.ensure_primary_failback_allowed().is_err());
     assert!(state.status().primary_failback_fenced);
-    state.mark_failover("sqlite:///tmp/failover-3.db");
+    state.publish_failover((), "sqlite:///tmp/failover-3.db");
     assert!(
         state.status().primary_failback_fenced,
         "switching failover URLs must not clear the admission fence"
@@ -746,17 +746,17 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
 }
 
 #[test]
-fn failover_topology_mark_primary_emits_clear_window() {
-    let state = DbFailoverTopologyState::new();
-    state.mark_failover("postgres://***/***/ferrum");
+fn failover_topology_publish_primary_emits_clear_window() {
+    let state = DbFailoverTopologyState::new(());
+    state.publish_failover((), "postgres://***/***/ferrum");
     let permit = state.ensure_primary_failback_allowed().unwrap();
-    state.mark_primary(permit, "postgres://***/***/ferrum");
+    state.publish_primary((), permit, "postgres://***/***/ferrum");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
     assert!(state.status().failover_since_unix_ms.is_none());
 }
 
-/// Issue #7033: `mark_primary` consumes the permit only a passing
+/// Issue #7033: `publish_primary` consumes the permit only a passing
 /// `ensure_primary_failback_allowed` returns. A permit issued before a later
 /// failover write is refused by `revalidate_primary_failback`, and even a
 /// broken caller that finalizes with it cannot erase the fence: it holds
@@ -765,9 +765,9 @@ fn failover_topology_mark_primary_emits_clear_window() {
 fn failover_topology_stale_failback_permit_is_refused_and_never_clears_fence() {
     use ferrum_edge::config::db_backend::primary_failback_fenced;
 
-    let state = DbFailoverTopologyState::new();
+    let state = DbFailoverTopologyState::new(());
     // A permit taken while failover writes are still unfenced is fresh.
-    state.mark_failover("sqlite:///tmp/failover.db");
+    state.publish_failover((), "sqlite:///tmp/failover.db");
     let permit = state.ensure_primary_failback_allowed().unwrap();
     assert!(state.revalidate_primary_failback(&permit).is_ok());
 
@@ -786,12 +786,12 @@ fn failover_topology_stale_failback_permit_is_refused_and_never_clears_fence() {
 
     // Publishers abort on the revalidation above; if a broken caller
     // finalizes anyway, the fence must stay set and visible.
-    state.mark_primary(permit, "sqlite:///tmp/primary.db");
+    state.publish_primary((), permit, "sqlite:///tmp/primary.db");
     let status = state.status();
     assert!(status.primary_active);
     assert!(
         status.primary_failback_fenced,
-        "mark_primary must never clear the failover-write fence"
+        "publish_primary must never clear the failover-write fence"
     );
 }
 
@@ -800,20 +800,20 @@ fn failover_topology_stale_failback_permit_is_refused_and_never_clears_fence() {
 /// writes.
 #[test]
 fn failover_topology_permit_stays_fresh_across_primary_writes() {
-    let state = DbFailoverTopologyState::new();
+    let state = DbFailoverTopologyState::new(());
     let permit = state.ensure_primary_failback_allowed().unwrap();
     state.note_admin_write();
     assert!(state.revalidate_primary_failback(&permit).is_ok());
-    state.mark_primary(permit, "sqlite:///tmp/primary.db");
+    state.publish_primary((), permit, "sqlite:///tmp/primary.db");
     assert!(state.primary_active());
     assert!(!state.status().primary_failback_fenced);
 }
 
 #[test]
 fn failover_topology_opt_in_at_transition_marks_window() {
-    let state = DbFailoverTopologyState::new();
+    let state = DbFailoverTopologyState::new(());
     state.set_allow_writes(true);
-    state.mark_failover("sqlite:///tmp/failover.db");
+    state.publish_failover((), "sqlite:///tmp/failover.db");
     assert!(
         state.status().opt_in_writes_enabled_during_window,
         "opt-in already enabled at failover transition must mark the window"
@@ -821,6 +821,105 @@ fn failover_topology_opt_in_at_transition_marks_window() {
     // Repeated set_allow_writes(true) must stay sticky without clearing.
     state.set_allow_writes(true);
     assert!(state.status().opt_in_writes_enabled_during_window);
+}
+
+/// Issue #7061: the handle and its topology are one publication. Publishing
+/// replaces both and returns the previous handle; status derives from the
+/// same snapshot as the handle.
+#[test]
+fn failover_topology_publication_replaces_handle_and_topology_together() {
+    let state = DbFailoverTopologyState::new("primary-0");
+    let (handle, status) = state.handle_and_status();
+    assert_eq!(handle, "primary-0");
+    assert!(status.primary_active);
+
+    assert_eq!(
+        state.publish_failover("failover-1", "db://failover"),
+        "primary-0"
+    );
+    let (handle, status) = state.handle_and_status();
+    assert_eq!(handle, "failover-1");
+    assert!(!status.primary_active);
+    assert_eq!(status.active_url_redacted.as_deref(), Some("db://failover"));
+
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    assert_eq!(
+        state.publish_primary("primary-2", permit, "db://primary"),
+        "failover-1"
+    );
+    let (handle, status) = state.handle_and_status();
+    assert_eq!(handle, "primary-2");
+    assert!(status.primary_active);
+    assert_eq!(status.active_url_redacted.as_deref(), Some("db://primary"));
+    assert_eq!(state.handle(), "primary-2");
+}
+
+/// Issue #7061: a concurrent observer never sees a primary handle next to
+/// failover topology (or the reverse), nor a primary status that still
+/// carries the failover URL or window start, however publications and
+/// Admin-write notes interleave.
+#[test]
+fn failover_topology_publication_is_one_consistent_cut_under_concurrency() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let state = Arc::new(DbFailoverTopologyState::new(true));
+    let done = Arc::new(AtomicBool::new(false));
+    let observers: Vec<_> = (0..4)
+        .map(|_| {
+            let state = Arc::clone(&state);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut observed = 0u64;
+                while !done.load(Ordering::Acquire) {
+                    let (on_primary_handle, status) = state.handle_and_status();
+                    assert_eq!(
+                        on_primary_handle, status.primary_active,
+                        "handle and topology must come from one publication: {status:?}"
+                    );
+                    if status.primary_active {
+                        assert!(status.failover_since_unix_ms.is_none(), "{status:?}");
+                        assert_ne!(
+                            status.active_url_redacted.as_deref(),
+                            Some("db://failover"),
+                            "{status:?}"
+                        );
+                    } else {
+                        assert!(status.failover_since_unix_ms.is_some(), "{status:?}");
+                        assert_eq!(
+                            status.active_url_redacted.as_deref(),
+                            Some("db://failover"),
+                            "{status:?}"
+                        );
+                    }
+                    observed += 1;
+                }
+                observed
+            })
+        })
+        .collect();
+    let noter = {
+        let state = Arc::clone(&state);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                state.set_allow_writes(true);
+                state.set_allow_writes(false);
+            }
+        })
+    };
+    for _ in 0..2_000 {
+        state.publish_failover(false, "db://failover");
+        let permit = state
+            .ensure_primary_failback_allowed()
+            .expect("no Admin write was admitted on failover");
+        state.publish_primary(true, permit, "db://primary");
+    }
+    done.store(true, Ordering::Release);
+    noter.join().expect("noter thread");
+    for observer in observers {
+        assert!(observer.join().expect("observer thread") > 0);
+    }
 }
 
 #[test]

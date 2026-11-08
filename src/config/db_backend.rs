@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use percent_encoding::percent_decode_str;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
 
 /// Upper bound, in canonical JSON bytes, on the representation that fences one
@@ -620,7 +620,71 @@ pub fn checked_next_config_topology_epoch(current: u64) -> Result<u64, anyhow::E
     })
 }
 
-/// Shared sticky-failover window state for SQL and MongoDB config stores.
+/// Which side of the sticky-failover window the published topology is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbTopologyPhase {
+    Primary,
+    /// `since_unix_ms` is when this failover window began.
+    Failover {
+        since_unix_ms: u64,
+    },
+}
+
+/// Every status-bearing field of the sticky-failover topology. Published only
+/// as part of a [`DbTopologyPublication`], so a reader always sees one
+/// consistent cut (issue #7061).
+#[derive(Debug, Clone)]
+struct DbTopologyView {
+    phase: DbTopologyPhase,
+    active_url_redacted: Option<String>,
+    allow_writes: bool,
+    /// Sticky for the current failover window: opt-in writes were enabled at
+    /// any point while on failover.
+    opt_in_during_window: bool,
+    /// Conservative process-local fence: an Admin mutation was admitted on
+    /// failover. Cleared only when a new failover window begins.
+    failover_write_admitted: bool,
+    /// Bumped by every Admin mutation admitted on failover, so a
+    /// [`PrimaryFailbackPermit`] taken before such a write is detectably stale.
+    /// Monotonic for the life of the process.
+    failover_write_generation: u64,
+}
+
+impl DbTopologyView {
+    fn primary_active(&self) -> bool {
+        self.phase == DbTopologyPhase::Primary
+    }
+
+    fn status(&self) -> DbFailoverTopologyStatus {
+        DbFailoverTopologyStatus {
+            primary_active: self.primary_active(),
+            failover_since_unix_ms: match self.phase {
+                DbTopologyPhase::Primary => None,
+                DbTopologyPhase::Failover { since_unix_ms } => Some(since_unix_ms),
+            },
+            active_url_redacted: self.active_url_redacted.clone(),
+            allow_writes: self.allow_writes,
+            opt_in_writes_enabled_during_window: self.opt_in_during_window,
+            primary_failback_fenced: self.failover_write_admitted,
+        }
+    }
+
+    fn permit_stale(&self, permit: &PrimaryFailbackPermit) -> bool {
+        self.failover_write_generation != permit.fence_generation
+            || (!self.primary_active() && self.failover_write_admitted)
+    }
+}
+
+/// The active datastore handle (SQL pool, Mongo connection bundle) and the
+/// topology it belongs to, published as ONE value (issue #7061). A reader
+/// can never see a new handle next to the previous topology or the reverse.
+struct DbTopologyPublication<H> {
+    handle: H,
+    view: DbTopologyView,
+}
+
+/// Shared sticky-failover window state for SQL and MongoDB config stores,
+/// published together with the store's active datastore handle `H`.
 ///
 /// Tracks topology transitions and a process-local opt-in risk marker for
 /// issue #3001. Contract: default fail-closed admin writes on failover;
@@ -629,211 +693,287 @@ pub fn checked_next_config_topology_epoch(current: u64) -> Result<u64, anyhow::E
 /// fences automatic primary failback until the process is restarted after
 /// operator reconciliation or confirmed replication catch-up. This state is
 /// not durable across process restart.
-#[derive(Clone)]
-pub struct DbFailoverTopologyState {
-    primary_active: Arc<AtomicBool>,
-    failover_since_unix_ms: Arc<AtomicU64>,
-    active_url_redacted: Arc<ArcSwap<Option<String>>>,
-    allow_writes: Arc<AtomicBool>,
-    opt_in_during_window: Arc<AtomicBool>,
-    /// Conservative process-local fence: an Admin mutation was admitted on failover.
-    failover_write_admitted: Arc<AtomicBool>,
-    /// Bumped by every Admin mutation admitted on failover, so a
-    /// [`PrimaryFailbackPermit`] taken before such a write is detectably stale.
-    failover_write_generation: Arc<AtomicU64>,
-    /// Ensures the opt-in-enabled signal logs at most once per failover window.
-    opt_in_signal_logged: Arc<AtomicBool>,
+///
+/// The handle and every status field live in one `ArcSwap` (issue #7061):
+/// [`Self::status`], [`Self::primary_active`] and [`Self::handle`] each read
+/// one consistent snapshot. The only way to change the handle is
+/// [`Self::publish_failover`] or [`Self::publish_primary`], which replace the
+/// handle and the topology in a single store, so "the write gate flips before
+/// a failover handle is visible" and "a primary handle is never visible while
+/// topology still reports failover" hold by construction rather than by
+/// statement order at each call site. Clones share the same state.
+pub struct DbFailoverTopologyState<H = ()> {
+    current: Arc<ArcSwap<DbTopologyPublication<H>>>,
 }
 
-impl Default for DbFailoverTopologyState {
-    fn default() -> Self {
-        Self::new()
+impl<H> Clone for DbFailoverTopologyState<H> {
+    fn clone(&self) -> Self {
+        Self {
+            current: Arc::clone(&self.current),
+        }
     }
 }
 
-impl DbFailoverTopologyState {
-    pub fn new() -> Self {
+impl Default for DbFailoverTopologyState<()> {
+    fn default() -> Self {
+        Self::new(())
+    }
+}
+
+/// What one topology update changed, for logging after it is published.
+struct DbTopologyTransition {
+    entered_failover: Option<u64>,
+    /// `(window start, opt-in was enabled during the window)`.
+    left_failover: Option<(u64, bool)>,
+    opt_in_became_effective: bool,
+    fenced_now: bool,
+    /// Start of the failover window the update left published (0 on primary).
+    window_since_unix_ms: u64,
+    allow_writes: bool,
+}
+
+impl DbTopologyTransition {
+    fn between(prev: &DbTopologyView, next: &DbTopologyView) -> Self {
+        let entered_failover = match (prev.phase, next.phase) {
+            (DbTopologyPhase::Primary, DbTopologyPhase::Failover { since_unix_ms }) => {
+                Some(since_unix_ms)
+            }
+            _ => None,
+        };
+        let left_failover = match (prev.phase, next.phase) {
+            (DbTopologyPhase::Failover { since_unix_ms }, DbTopologyPhase::Primary) => {
+                Some((since_unix_ms, prev.opt_in_during_window))
+            }
+            _ => None,
+        };
         Self {
-            primary_active: Arc::new(AtomicBool::new(true)),
-            failover_since_unix_ms: Arc::new(AtomicU64::new(0)),
-            active_url_redacted: Arc::new(ArcSwap::from_pointee(None)),
-            allow_writes: Arc::new(AtomicBool::new(false)),
-            opt_in_during_window: Arc::new(AtomicBool::new(false)),
-            failover_write_admitted: Arc::new(AtomicBool::new(false)),
-            failover_write_generation: Arc::new(AtomicU64::new(0)),
-            opt_in_signal_logged: Arc::new(AtomicBool::new(false)),
+            entered_failover,
+            left_failover,
+            opt_in_became_effective: next.opt_in_during_window
+                && (!prev.opt_in_during_window || entered_failover.is_some()),
+            fenced_now: next.failover_write_admitted && !prev.failover_write_admitted,
+            window_since_unix_ms: match next.phase {
+                DbTopologyPhase::Failover { since_unix_ms } => since_unix_ms,
+                DbTopologyPhase::Primary => 0,
+            },
+            allow_writes: next.allow_writes,
         }
+    }
+}
+
+impl<H: Clone> DbFailoverTopologyState<H> {
+    /// A store that starts on the configured primary with `handle` active.
+    pub fn new(handle: H) -> Self {
+        Self {
+            current: Arc::new(ArcSwap::from_pointee(DbTopologyPublication {
+                handle,
+                view: DbTopologyView {
+                    phase: DbTopologyPhase::Primary,
+                    active_url_redacted: None,
+                    allow_writes: false,
+                    opt_in_during_window: false,
+                    failover_write_admitted: false,
+                    failover_write_generation: 0,
+                },
+            })),
+        }
+    }
+
+    /// The active datastore handle.
+    pub fn handle(&self) -> H {
+        self.current.load().handle.clone()
+    }
+
+    /// The active datastore handle and the topology status it was published
+    /// with, from one load.
+    pub fn handle_and_status(&self) -> (H, DbFailoverTopologyStatus) {
+        let current = self.current.load();
+        (current.handle.clone(), current.view.status())
+    }
+
+    /// Apply `update` to the current publication with compare-and-swap,
+    /// retrying on a concurrent update, and return what changed between the
+    /// publication it replaced and the one it stored.
+    fn update(
+        &self,
+        mut update: impl FnMut(&DbTopologyPublication<H>) -> DbTopologyPublication<H>,
+    ) -> DbTopologyTransition {
+        let mut current = self.current.load_full();
+        loop {
+            let next = Arc::new(update(current.as_ref()));
+            let transition = DbTopologyTransition::between(&current.view, &next.view);
+            let previous = self.current.compare_and_swap(&current, next);
+            if Arc::ptr_eq(&previous, &current) {
+                return transition;
+            }
+            current = arc_swap::Guard::into_inner(previous);
+        }
+    }
+
+    fn update_view(&self, mut update: impl FnMut(&mut DbTopologyView)) -> DbTopologyTransition {
+        self.update(|current| {
+            let mut view = current.view.clone();
+            update(&mut view);
+            DbTopologyPublication {
+                handle: current.handle.clone(),
+                view,
+            }
+        })
     }
 
     pub fn set_allow_writes(&self, allow: bool) {
-        self.allow_writes.store(allow, Ordering::Release);
-        if allow && !self.primary_active() {
-            self.note_opt_in_enabled_during_window();
-        }
+        let transition = self.update_view(|view| {
+            view.allow_writes = allow;
+            if allow && !view.primary_active() {
+                view.opt_in_during_window = true;
+            }
+        });
+        self.log_transition(&transition);
+    }
+
+    fn log_transition(&self, transition: &DbTopologyTransition) {
+        let url = self
+            .current
+            .load()
+            .view
+            .active_url_redacted
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string());
+        log_topology_transition(transition, &url);
     }
 
     pub fn allow_writes(&self) -> bool {
-        self.allow_writes.load(Ordering::Acquire)
+        self.current.load().view.allow_writes
     }
 
     pub fn primary_active(&self) -> bool {
-        self.primary_active.load(Ordering::Acquire)
+        self.current.load().view.primary_active()
     }
 
+    /// Status derived from one load, so every field describes the same
+    /// published topology.
     pub fn status(&self) -> DbFailoverTopologyStatus {
-        let since = self.failover_since_unix_ms.load(Ordering::Acquire);
-        DbFailoverTopologyStatus {
-            primary_active: self.primary_active(),
-            failover_since_unix_ms: (since > 0).then_some(since),
-            active_url_redacted: (**self.active_url_redacted.load()).clone(),
-            allow_writes: self.allow_writes(),
-            opt_in_writes_enabled_during_window: self.opt_in_during_window.load(Ordering::Acquire),
-            primary_failback_fenced: self.failover_write_admitted.load(Ordering::Acquire),
+        self.current.load().view.status()
+    }
+
+    /// Move `view` onto the failover URL. Entering failover from the primary
+    /// opens a new window: its start time, a fresh opt-in marker (already set
+    /// if opt-in writes are enabled) and a cleared failover-write fence.
+    /// Already on failover, only the redacted URL changes.
+    fn enter_failover(view: &mut DbTopologyView, redacted_url: &str, now_unix_ms: u64) {
+        view.active_url_redacted = Some(redacted_url.to_string());
+        if view.primary_active() {
+            view.phase = DbTopologyPhase::Failover {
+                since_unix_ms: now_unix_ms,
+            };
+            view.opt_in_during_window = view.allow_writes;
+            view.failover_write_admitted = false;
         }
     }
 
-    fn now_unix_ms() -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+    /// Record that a store which was just connected (not yet shared) is on a
+    /// failover URL: its initial handle already is the failover connection.
+    /// Runtime transitions use [`Self::publish_failover`], which swaps the
+    /// handle in the same store.
+    pub fn mark_connected_to_failover(&self, redacted_url: &str) {
+        let now = topology_now_unix_ms();
+        let transition = self.update_view(|view| Self::enter_failover(view, redacted_url, now));
+        log_topology_transition(&transition, redacted_url);
     }
 
-    /// Sticky opt-in risk marker for the current failover window, with at most
-    /// one log line when the opt-in first becomes effective on failover.
-    fn note_opt_in_enabled_during_window(&self) {
-        self.opt_in_during_window.store(true, Ordering::Release);
-        if self
-            .opt_in_signal_logged
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let redacted = (**self.active_url_redacted.load())
-                .clone()
-                .unwrap_or_else(|| "<unknown>".to_string());
-            warn!(
-                active_url_redacted = %redacted,
-                failover_since_unix_ms = self.failover_since_unix_ms.load(Ordering::Acquire),
-                "FERRUM_DB_FAILOVER_ALLOW_WRITES is enabled on failover topology; an admitted Admin mutation will fence automatic primary failback until this process is restarted after operator reconciliation or confirmed replication catch-up. Use only with operator-asserted synchronously replicated multi-primary replication"
-            );
-        }
-    }
-
-    /// Record transition onto a failover URL. Emits a bounded topology signal
-    /// only when leaving primary topology. Subsequent failover reconnects update
-    /// the redacted URL without additional warnings (poll/TLS retry safe).
-    pub fn mark_failover(&self, redacted_url: &str) {
-        let was_primary = self.primary_active.swap(false, Ordering::AcqRel);
-        self.active_url_redacted
-            .store(Arc::new(Some(redacted_url.to_string())));
-        if was_primary {
-            let since = Self::now_unix_ms();
-            self.failover_since_unix_ms.store(since, Ordering::Release);
-            self.opt_in_during_window.store(false, Ordering::Release);
-            self.failover_write_admitted.store(false, Ordering::Release);
-            self.opt_in_signal_logged.store(false, Ordering::Release);
-            let allow = self.allow_writes();
-            warn!(
-                active_url_redacted = %redacted_url,
-                failover_since_unix_ms = since,
-                allow_writes = allow,
-                "Database topology transitioned to failover; admin writes fail closed unless FERRUM_DB_FAILOVER_ALLOW_WRITES=true"
-            );
-            if allow {
-                self.note_opt_in_enabled_during_window();
+    /// Publish `handle` as the active connection to a failover URL, together
+    /// with the failover topology, in one store. Emits a bounded topology
+    /// signal only when leaving primary topology; subsequent failover
+    /// reconnects update the redacted URL silently (poll/TLS retry safe).
+    /// Returns the handle it replaced.
+    pub fn publish_failover(&self, handle: H, redacted_url: &str) -> H {
+        let now = topology_now_unix_ms();
+        let mut replaced = None;
+        let transition = self.update(|current| {
+            replaced = Some(current.handle.clone());
+            let mut view = current.view.clone();
+            Self::enter_failover(&mut view, redacted_url, now);
+            DbTopologyPublication {
+                handle: handle.clone(),
+                view,
             }
-        }
-        // Already on failover: silent redacted-URL refresh only.
+        });
+        log_topology_transition(&transition, redacted_url);
+        replaced.unwrap_or(handle)
     }
 
-    /// Record a successful return to the configured primary. Emits one failback
-    /// summary; when opt-in writes were enabled during the window, that summary
-    /// is the bounded divergence-risk marker (issue #3001).
+    /// Publish `handle` as the active connection to the configured primary,
+    /// together with the primary topology, in one store. Emits one failback
+    /// summary; when opt-in writes were enabled during the window, that
+    /// summary is the bounded divergence-risk marker (issue #3001).
     ///
     /// Requires the [`PrimaryFailbackPermit`] returned by
-    /// [`Self::ensure_primary_failback_allowed`], so a caller cannot mark the
-    /// primary active without first consulting the failover-write fence
-    /// (issue #7033). Publishers revalidate the permit with
-    /// [`Self::revalidate_primary_failback`] immediately before publishing the
-    /// primary connection, all under one exclusive topology transition.
+    /// [`Self::ensure_primary_failback_allowed`], so a caller cannot publish
+    /// the primary without first consulting the failover-write fence (issue
+    /// #7033). Publishers revalidate the permit with
+    /// [`Self::revalidate_primary_failback`] immediately before publishing,
+    /// all under one exclusive topology transition.
     ///
     /// This never clears the failover-write fence: it holds until the
     /// operator reconciles and restarts the process. A permit that went stale
     /// before this call (a broken caller) is logged at error level and the
-    /// fence is left set and visible in status.
-    ///
-    /// `primary_active` is published last, after the window bookkeeping and
-    /// the active URL, so a concurrent [`Self::status`] is less likely to see
-    /// `primary_active = true` next to the failover URL. Status is still not
-    /// one consistent cut across these fields.
-    pub fn mark_primary(&self, permit: PrimaryFailbackPermit, redacted_url: &str) {
-        if self.primary_failback_permit_stale(&permit) {
+    /// fence is left set and visible in status. Returns the handle it
+    /// replaced.
+    pub fn publish_primary(
+        &self,
+        handle: H,
+        permit: PrimaryFailbackPermit,
+        redacted_url: &str,
+    ) -> H {
+        let mut replaced = None;
+        let mut stale_permit = false;
+        let transition = self.update(|current| {
+            replaced = Some(current.handle.clone());
+            // Judged against exactly the publication this store replaces.
+            stale_permit = current.view.permit_stale(&permit);
+            let mut view = current.view.clone();
+            view.phase = DbTopologyPhase::Primary;
+            view.opt_in_during_window = false;
+            view.active_url_redacted = Some(redacted_url.to_string());
+            DbTopologyPublication {
+                handle: handle.clone(),
+                view,
+            }
+        });
+        if stale_permit {
             error!(
                 active_url_redacted = %redacted_url,
                 "Primary failback finalized with a stale failback permit: an Admin mutation was admitted on failover after the fence check. The failover-write fence stays set; reconcile the failover changes onto the primary or confirm replication catch-up, then restart this process"
             );
         }
-        let since = self.failover_since_unix_ms.swap(0, Ordering::AcqRel);
-        let opt_in = self.opt_in_during_window.swap(false, Ordering::AcqRel);
-        self.opt_in_signal_logged.store(false, Ordering::Release);
-        self.active_url_redacted
-            .store(Arc::new(Some(redacted_url.to_string())));
-        let was_failover = !self.primary_active.swap(true, Ordering::AcqRel);
-        if was_failover || since > 0 {
-            let until = Self::now_unix_ms();
-            if opt_in {
-                warn!(
-                    active_url_redacted = %redacted_url,
-                    failover_since_unix_ms = since,
-                    failover_until_unix_ms = until,
-                    "Database topology transitioned back to primary after an opt-in failover write window; Admin API mutations during that window are not guaranteed on this primary unless the operator's synchronously replicated multi-primary topology already applied them. This divergence-risk marker is process-local and does not survive restart"
-                );
-            } else {
-                info!(
-                    active_url_redacted = %redacted_url,
-                    failover_since_unix_ms = since,
-                    failover_until_unix_ms = until,
-                    "Database topology transitioned back to primary"
-                );
-            }
-        }
+        log_topology_transition(&transition, redacted_url);
+        replaced.unwrap_or(handle)
     }
 
     /// Record an Admin mutation admitted while the failover topology is pinned.
     pub fn note_admin_write(&self) {
-        if !self.primary_active() {
-            self.failover_write_generation
-                .fetch_add(1, Ordering::AcqRel);
-        }
-        if !self.primary_active()
-            && self
-                .failover_write_admitted
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            let redacted = (**self.active_url_redacted.load())
-                .clone()
-                .unwrap_or_else(|| "<unknown>".to_string());
-            warn!(
-                active_url_redacted = %redacted,
-                failover_since_unix_ms = self.failover_since_unix_ms.load(Ordering::Acquire),
-                "Admin mutation admitted on failover topology; automatic primary failback is now fenced until this process is restarted after operator reconciliation or confirmed replication catch-up"
-            );
-        }
+        let transition = self.update_view(|view| {
+            if !view.primary_active() {
+                view.failover_write_generation = view.failover_write_generation.wrapping_add(1);
+                view.failover_write_admitted = true;
+            }
+        });
+        self.log_transition(&transition);
     }
 
     /// Prevent a stale recovered primary from replacing failover-side writes.
     ///
     /// On success returns the [`PrimaryFailbackPermit`] that
-    /// [`Self::mark_primary`] consumes. The permit records the failover-write
-    /// generation it was issued at; see [`Self::revalidate_primary_failback`].
+    /// [`Self::publish_primary`] consumes. The permit records the
+    /// failover-write generation it was issued at, read from the same
+    /// snapshot as the fence; see [`Self::revalidate_primary_failback`].
     pub fn ensure_primary_failback_allowed(&self) -> Result<PrimaryFailbackPermit, anyhow::Error> {
-        // Read the generation before the fence so a write admitted between
-        // the two loads makes the permit stale rather than slipping past it.
-        let fence_generation = self.failover_write_generation.load(Ordering::Acquire);
-        if self.primary_active() || !self.failover_write_admitted.load(Ordering::Acquire) {
-            return Ok(PrimaryFailbackPermit { fence_generation });
+        let current = self.current.load();
+        let view = &current.view;
+        if view.primary_active() || !view.failover_write_admitted {
+            return Ok(PrimaryFailbackPermit {
+                fence_generation: view.failover_write_generation,
+            });
         }
         Err(PrimaryFailbackFenced.into())
     }
@@ -846,30 +986,76 @@ impl DbFailoverTopologyState {
         &self,
         permit: &PrimaryFailbackPermit,
     ) -> Result<(), anyhow::Error> {
-        if self.primary_failback_permit_stale(permit) {
+        if self.current.load().view.permit_stale(permit) {
             return Err(PrimaryFailbackFenced.into());
         }
         Ok(())
     }
+}
 
-    fn primary_failback_permit_stale(&self, permit: &PrimaryFailbackPermit) -> bool {
-        if self.failover_write_generation.load(Ordering::Acquire) != permit.fence_generation {
-            return true;
+fn topology_now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Emit the bounded topology signals for one published update.
+fn log_topology_transition(transition: &DbTopologyTransition, redacted_url: &str) {
+    let since = transition.window_since_unix_ms;
+    if let Some(since) = transition.entered_failover {
+        warn!(
+            active_url_redacted = %redacted_url,
+            failover_since_unix_ms = since,
+            allow_writes = transition.allow_writes,
+            "Database topology transitioned to failover; admin writes fail closed unless FERRUM_DB_FAILOVER_ALLOW_WRITES=true"
+        );
+    }
+    if transition.opt_in_became_effective {
+        warn!(
+            active_url_redacted = %redacted_url,
+            failover_since_unix_ms = since,
+            "FERRUM_DB_FAILOVER_ALLOW_WRITES is enabled on failover topology; an admitted Admin mutation will fence automatic primary failback until this process is restarted after operator reconciliation or confirmed replication catch-up. Use only with operator-asserted synchronously replicated multi-primary replication"
+        );
+    }
+    if transition.fenced_now {
+        warn!(
+            active_url_redacted = %redacted_url,
+            failover_since_unix_ms = since,
+            "Admin mutation admitted on failover topology; automatic primary failback is now fenced until this process is restarted after operator reconciliation or confirmed replication catch-up"
+        );
+    }
+    if let Some((since, opt_in)) = transition.left_failover {
+        let until = topology_now_unix_ms();
+        if opt_in {
+            warn!(
+                active_url_redacted = %redacted_url,
+                failover_since_unix_ms = since,
+                failover_until_unix_ms = until,
+                "Database topology transitioned back to primary after an opt-in failover write window; Admin API mutations during that window are not guaranteed on this primary unless the operator's synchronously replicated multi-primary topology already applied them. This divergence-risk marker is process-local and does not survive restart"
+            );
+        } else {
+            info!(
+                active_url_redacted = %redacted_url,
+                failover_since_unix_ms = since,
+                failover_until_unix_ms = until,
+                "Database topology transitioned back to primary"
+            );
         }
-        !self.primary_active() && self.failover_write_admitted.load(Ordering::Acquire)
     }
 }
 
 /// Proof that [`DbFailoverTopologyState::ensure_primary_failback_allowed`]
 /// passed. Only that method constructs it, and
-/// [`DbFailoverTopologyState::mark_primary`] consumes it, so "mark the primary
-/// active only after the failover-write fence was checked" is enforced by the
+/// [`DbFailoverTopologyState::publish_primary`] consumes it, so "publish the
+/// primary only after the failover-write fence was checked" is enforced by the
 /// type system rather than by call-site convention (issue #7033). It carries
 /// the failover-write generation it was issued at, so
 /// [`DbFailoverTopologyState::revalidate_primary_failback`] can refuse it
 /// once a later failover write has been admitted.
 #[derive(Debug)]
-#[must_use = "a primary failback permit is only useful when passed to mark_primary"]
+#[must_use = "a primary failback permit is only useful when passed to publish_primary"]
 pub struct PrimaryFailbackPermit {
     fence_generation: u64,
 }
