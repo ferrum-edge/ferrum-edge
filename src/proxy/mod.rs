@@ -56909,20 +56909,21 @@ fn build_request_buffer_capacity_response(
 /// [`retry::BackendResponse`] rather than a built response.
 ///
 /// Use the frontend's trusted request classification, which survives outbound
-/// header transforms. Pass-through gRPC-Web receives the same framed terminal
-/// as an early refusal; translated gRPC-Web retains the native terminal for
-/// its plugin to encode exactly once (issue #6022).
+/// header transforms. Every gRPC-Web client, pass-through or translated,
+/// receives the same framed terminal as an early refusal. The H1/H2 response
+/// pipeline marks this refusal as the gateway capacity terminal before any
+/// response hook, and that mark skips every later body transform, the
+/// `grpc_web` translation included, so a translated client's terminal must
+/// already be framed here (it is never encoded twice).
 pub(crate) fn request_buffer_capacity_backend_response(
     ctx: Option<&RequestContext>,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
-    let passthrough_web = ctx.filter(|ctx| {
-        ctx.request_is_grpc_web() && !crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
-    });
+    let grpc_web = ctx.filter(|ctx| ctx.request_is_grpc_web());
     let is_grpc = ctx.is_some_and(|ctx| {
         ctx.request_http_flavor() == HttpFlavor::Grpc || ctx.request_is_grpc_web()
     });
-    let (status_code, body, response_headers) = if let Some(ctx) = passthrough_web {
+    let (status_code, body, response_headers) = if let Some(ctx) = grpc_web {
         let content_type = crate::plugins::grpc_web::retained_response_content_type(ctx).unwrap_or(
             if ctx.request_is_grpc_web_text() {
                 "application/grpc-web-text+proto"

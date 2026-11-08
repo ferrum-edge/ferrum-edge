@@ -358,6 +358,35 @@ fn backend_seam_refusal_frames_passthrough_grpc_web_resource_exhausted() {
 }
 
 #[test]
+fn backend_seam_refusal_frames_translated_grpc_web_too() {
+    // The H1/H2 response pipeline marks this refusal as the gateway capacity
+    // terminal, which skips the `grpc_web` translation, so a translated client's
+    // terminal is framed here rather than left native with a `grpc-status`
+    // header (the Unix-socket h2c translated gRPC-Web functional test).
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/rpc".into());
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Plain);
+    set_request_grpc_web_upload_for_test(&mut ctx, false);
+    ctx.metadata
+        .insert("grpc_web_mode".to_string(), "binary".to_string());
+    ctx.metadata.insert(
+        "grpc_web_original_ct".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+    let response = request_buffer_capacity_backend_response_for_test(Some(&ctx), None);
+    assert_eq!(response.status_code, 200);
+    assert!(!response.headers.contains_key("grpc-status"));
+    assert_eq!(
+        response.headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web+proto")
+    );
+    let body = response.body_bytes().to_vec();
+    assert_eq!(body[0], 0x80, "exactly one terminal frame");
+    let trailers = std::str::from_utf8(&body[5..]).unwrap();
+    assert!(trailers.contains("grpc-status: 8\r\n"));
+    assert!(trailers.contains("grpc-message: Request buffering capacity exceeded\r\n"));
+}
+
+#[test]
 fn exhaustion_is_backend_health_neutral_and_distinct_from_oversize() {
     assert_eq!(
         REQUEST_BUFFER_OVERLOAD_ERROR_CLASS,
