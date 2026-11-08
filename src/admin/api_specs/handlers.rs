@@ -1738,6 +1738,13 @@ async fn validate_bundle(
 
     // Plugins
     let known_plugins = crate::plugins::available_plugins();
+    // The same validation client direct admin plugin writes use, so a node
+    // that serves traffic applies its node-local plugin checks (load_testing
+    // `gateway_port`) here too, while a control plane checks shape only.
+    // Built once; a construction failure (only possible without a
+    // `ProxyState`, from the process compression policy) is reported on each
+    // enabled plugin, as the per-plugin client this replaced reported it.
+    let plugin_http_client = crate::admin::plugin_validation_http_client(state);
     for plugin in &bundle.plugins {
         let mut plugin_errors: Vec<String> = Vec::new();
 
@@ -1785,11 +1792,17 @@ async fn validate_bundle(
                         &state.backend_allow_ips,
                     )
                 } else {
-                    crate::plugins::validate_plugin_config_with_policy(
-                        &plugin.plugin_name,
-                        &plugin.config,
-                        &state.backend_allow_ips,
-                    )
+                    match &plugin_http_client {
+                        Ok(http_client) => {
+                            crate::plugins::validate_plugin_config_with_policy_and_client(
+                                &plugin.plugin_name,
+                                &plugin.config,
+                                &state.backend_allow_ips,
+                                http_client.clone(),
+                            )
+                        }
+                        Err(error) => Err(error.clone()),
+                    }
                 };
             if let Err(error) = validation {
                 plugin_errors.push(error);

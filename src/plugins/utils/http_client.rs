@@ -331,6 +331,13 @@ pub struct PluginHttpClient {
     /// puts it in its length-gated mode. `None` on clients that never resolved
     /// it (validation and library paths), which stay silent.
     max_response_body_size_bytes: Option<usize>,
+    /// `true` on the client a serving node builds its plugins with, so
+    /// plugins apply node-local egress checks (`load_testing`'s loopback
+    /// dial) at construction. `false` on validation clients that admit config
+    /// for other nodes (a control plane, config-load sweeps), which check shape
+    /// only because the backend egress policy that governs the dial is the
+    /// serving node's.
+    serving_node: bool,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -365,6 +372,7 @@ impl std::fmt::Debug for PluginHttpClient {
                 "max_response_body_size_bytes",
                 &self.max_response_body_size_bytes,
             )
+            .field("serving_node", &self.serving_node)
             .finish()
     }
 }
@@ -1496,6 +1504,7 @@ impl PluginHttpClient {
             compression_brotli_enabled: true,
             max_request_body_size_bytes: 0,
             max_response_body_size_bytes: None,
+            serving_node: false,
         }
     }
 
@@ -1571,6 +1580,7 @@ impl PluginHttpClient {
             compression_brotli_enabled: true,
             max_request_body_size_bytes: 0,
             max_response_body_size_bytes: None,
+            serving_node: false,
         }
     }
 
@@ -1695,6 +1705,20 @@ impl PluginHttpClient {
 
     pub(crate) fn max_response_body_size_bytes(&self) -> Option<usize> {
         self.max_response_body_size_bytes
+    }
+
+    /// Mark this client as the one a serving node builds its plugins with,
+    /// so node-local egress checks apply at plugin construction.
+    pub fn for_serving_node(mut self) -> Self {
+        self.serving_node = true;
+        self
+    }
+
+    /// Whether this client belongs to a node that serves traffic (see
+    /// [`Self::for_serving_node`]). `false` on validation clients that admit
+    /// config for other nodes.
+    pub fn is_serving_node(&self) -> bool {
+        self.serving_node
     }
 
     /// Follow the gateway's live CRL list on plugin egress (issue #6621).
