@@ -41,6 +41,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **`ferrum-gateway` chart: IPv4-mapped admin binds and allowlist entries
+  follow the runtime** (issue #7078; the mesh chart got the same fixes in
+  `4fb5df58f`). With `admin.bindAddress: "::ffff:127.0.0.2"` and the default
+  exec probes, the chart required `admin.allowedCidrs` to include
+  `::ffff:127.0.0.2/128` and refused `127.0.0.1/32`, but the runtime observes
+  the probes from `127.0.0.1` and canonicalizes that mapped CIDR to
+  `127.0.0.2/32`, so a release that rendered cleanly dropped its own probes and
+  restart-looped. The probe source is now canonicalized to IPv4 first. A bare
+  mapped allowlist entry (`::ffff:a.b.c.d` with no prefix) is now a `/32` in the
+  permits-all check instead of a negative prefix that only happened to work. A
+  new unit test fails when a helper shared by both charts' `_helpers.tpl`
+  drifts.
 - **BREAKING — requests with more than one `Content-Type` are refused**
   (issue/PR #7064). `Content-Type` is a singleton field (RFC 9110 §8.3). The
   gateway classified a request by its first `Content-Type` field line while
