@@ -31,7 +31,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 ### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
-entry whose name is a metadata key the gateway publishes (for example
+entry whose name is a reviewed gateway-published metadata key (for example
 `grpc_full_method`, `consumer_username`, `namespace`, `request_body`,
 `ai_stream_router_pass_through`), that sits in a shared gateway metadata
 namespace (`a2a.`, `auth.`, `authorization.`, `ferrum.`, `geo.`, `hbone.`,

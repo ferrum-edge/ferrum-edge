@@ -54,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `auth.strip_query_param.<name>` (which tells egress to strip a query
   credential under `hide_credentials`), or `ai_transcript_audit.record_id`
   (which made overlapping transactions share one audit staging entry). A tag
-  name that is any metadata key the gateway publishes, sits in a shared
+  name that is a reviewed gateway metadata key or family, sits in a shared
   gateway metadata namespace (`auth.`, `mcp.`, `geo.`, `ferrum.`, `oidc_rp.`,
   ...), or sits in a built-in plugin's namespace (`<plugin>.<key>` or
   `<plugin>_<key>`), now fails `workload_metrics` construction (and Istio
