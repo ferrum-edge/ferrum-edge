@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **SQL/MongoDB failover topology and the active pool are one publication**
+  (#7061). The sticky-failover state was several separately stored fields next
+  to a separately swapped pool or MongoDB connection, so an unpinned observer
+  (authenticated `/health` and `/status` detail) could briefly see
+  `primary_active: true` next to the failover URL, or the new pool before its
+  topology. The pool (or connection bundle) and every topology field now live
+  in one atomic value: failover and failback publish the connection and its
+  topology in a single store, and status is read from one snapshot. Admission
+  was already unaffected. Behaviour and response fields are unchanged.
 - **`ai_federation` and `ai_stream_router` share one OpenAI translation
   admission** (issue #7070). The strict-schema screen, tool-call parsing, id
   and function-name rules, and tool-result flattening now live in one module
@@ -474,13 +483,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary while being recorded as failover writes, fencing the next failback
   onto a failover database that did not have them. Deferred migrations now run
   on the newly connected pool before it is published, so after a failure the
-  previous pool and topology are still in place. `mark_primary` now requires
-  the permit that the failback-fence check returns; the permit is revalidated
+  previous pool and topology are still in place. Primary publication now
+  requires the permit that the failback-fence check returns; the permit is revalidated
   right before the primary pool or connection is published, so an Admin write
   admitted on failover in the meantime aborts the failback with nothing
-  published. The fence is never cleared by a failback. Status fields are still
-  read separately, so `/status` can briefly show a mixed view while a
-  transition is in progress, but that view no longer persists after an error.
+  published. The fence is never cleared by a failback. Since #7061 the status
+  fields and the pool are one publication, so `/status` no longer shows a
+  mixed view during a transition either.
 - **Streaming `ai_federation` providers with an empty `aws_region` are
   adaptive route keys** (#7018). The constructor treats `"aws_region": ""` as
   absent, so an OpenAI-compatible provider carrying it streams to its

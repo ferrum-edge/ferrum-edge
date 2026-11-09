@@ -20,7 +20,8 @@
 //! **Key implementation details**:
 //! - Postgres `?` → `$N` placeholder rewrite via `q()` method (sqlx `Any` uses `?`)
 //! - `>500` IN-clause threshold switches to full-table fetch + in-memory filter
-//! - `ArcSwap`-based pool swap enables zero-downtime DNS re-resolution on failover
+//! - The active pool is published atomically with its failover topology
+//!   (`DbFailoverTopologyState`), enabling zero-downtime DNS re-resolution on failover
 //! - Batch chunking (`BATCH_CHUNK_SIZE`) for large imports to stay within DB limits
 
 use crate::config::db_backend::{
@@ -59,7 +60,7 @@ use crate::config::validation_pipeline::{
 use crate::fips::approved::Sha256;
 use crate::proxy::stream_match::StreamMatchCriteria;
 use crate::util::deserialization as config_decode;
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use dashmap::DashMap;
@@ -818,30 +819,31 @@ pub struct SqlReconnectTransitionTestHooks {
     /// reconnect transition write lock.
     pub before_lock: Option<SqlReconnectTransitionHook>,
     /// Invoked while the reconnect transition write lock is held, after
-    /// deferred migrations on the staged pool and pool publication (and after
-    /// failover gate-before-publish), before primary `mark_primary` finalizes
-    /// the transition.
+    /// deferred migrations on the staged pool and after the pool and its
+    /// topology were published together.
     pub while_holding: Option<SqlReconnectTransitionHook>,
 }
 
 /// Database configuration store.
 ///
-/// The inner pool is wrapped in `ArcSwap` so it can be atomically replaced
-/// when DNS re-resolution detects that the database FQDN now points to a
-/// different IP. All readers (query methods, transactions) take a cheap
-/// `Arc` clone of the current pool, so in-flight queries finish on the old
-/// pool while new queries go to the freshly connected one.
+/// The active pool is published inside `failover_topology` so it can be
+/// atomically replaced when DNS re-resolution detects that the database FQDN
+/// now points to a different IP, or on failover/failback. All readers (query
+/// methods, transactions) take a cheap clone of the current pool, so in-flight
+/// queries finish on the old pool while new queries go to the freshly
+/// connected one.
 #[derive(Clone)]
 pub struct DatabaseStore {
-    pool: Arc<ArcSwap<AnyPool>>,
     read_replica_url: Option<String>,
     read_replica_pool: Arc<ArcSwapOption<AnyPool>>,
     /// Read replicas belong to the configured primary topology. While the
     /// active write/runtime pool points at a failover URL, admin reads must
     /// stay on that same active pool rather than crossing into a replica of
     /// the unavailable primary topology. Also tracks sticky failover topology
-    /// and the process-local opt-in divergence-risk marker (issue #3001).
-    failover_topology: DbFailoverTopologyState,
+    /// and the process-local opt-in divergence-risk marker (issue #3001), and
+    /// publishes the active pool together with that topology as one value
+    /// (issue #7061).
+    failover_topology: DbFailoverTopologyState<AnyPool>,
     /// Write-locks serialize SQL reconnect publication + topology transitions
     /// across concurrent callers (DB polling/failover and DB TLS reload),
     /// including the deferred-migration await window. Admin mutations take a
@@ -1980,10 +1982,9 @@ impl DatabaseStore {
         .await?;
 
         let store = Self {
-            pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            failover_topology: DbFailoverTopologyState::new(),
+            failover_topology: DbFailoverTopologyState::new(pool),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
             topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
@@ -2080,10 +2081,9 @@ impl DatabaseStore {
         let pool = options.connect_lazy(&snapshot_url)?;
 
         Ok(Self {
-            pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            failover_topology: DbFailoverTopologyState::new(),
+            failover_topology: DbFailoverTopologyState::new(pool),
             reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
             topology_epoch: Arc::new(AtomicU64::new(1)),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
@@ -8545,7 +8545,7 @@ impl DatabaseStore {
         if let Some(fault_pool) = crate::config::test_db_fault::tripped_fault_pool() {
             return fault_pool;
         }
-        (**self.pool.load()).clone()
+        self.failover_topology.handle()
     }
 
     #[allow(dead_code)]
@@ -8782,24 +8782,11 @@ impl DatabaseStore {
             return Err(error);
         }
 
-        // Nothing below can fail: once the pool is swapped in, the topology
-        // finalization that matches it always runs under this same lock.
+        // Nothing below can fail: the pool and its topology are published
+        // together under this same lock.
 
-        // Disable and close the configured primary-topology replica before
-        // exposing a failover pool. Keeping the dormant pool would make it
-        // look immediately available on failback and skip the one reconnect
-        // that refreshes its connections after the topology transition.
-        // Gate-before-publish: flip the write gate before ArcSwap so
-        // `check_write_allowed()` / `admit_write()` cannot observe a failover
-        // pool while `primary_active` is still true.
-        if topology == DatabaseTopology::Failover {
-            self.failover_topology
-                .mark_failover(&Self::redact_url(db_url));
-            self.suppress_read_replica_pool();
-        }
-
-        // Atomic swap — readers that already loaded the old pool keep using it.
-        let old_pool = self.pool.swap(Arc::new(new_pool));
+        // A replica only serves reads while the primary is published, so a
+        // fresh one is installed before the publication that activates it.
         if let Some(new_replica) = new_replica {
             let old_replica = self.read_replica_pool.swap(Some(Arc::new(new_replica)));
             if let Some(old_replica) = old_replica {
@@ -8807,6 +8794,33 @@ impl DatabaseStore {
                     old_replica.close().await;
                 });
             }
+        }
+
+        // One atomic store publishes the pool AND its topology (issue #7061):
+        // `check_write_allowed()` / `admit_write()` can never observe a
+        // failover pool while `primary_active` is still true, and a primary
+        // pool never goes live while topology still reports failover. Readers
+        // that already loaded the old pool keep using it. The primary arm
+        // consumes the failback permit checked under this same lock.
+        let old_pool = match primary_failback_permit {
+            Some(permit) => {
+                self.failover_topology
+                    .publish_primary(new_pool, permit, &Self::redact_url(db_url))
+            }
+            None => self
+                .failover_topology
+                .publish_failover(new_pool, &Self::redact_url(db_url)),
+        };
+        // Disable and close the configured primary-topology replica once the
+        // failover topology is published. Keeping the dormant pool would make
+        // it look immediately available on failback and skip the one
+        // reconnect that refreshes its connections after the transition.
+        // Suppressing AFTER publication closes the race with a concurrent
+        // `reconnect_read_replica`: one that installed its pool before this
+        // point is removed here, and one that installs later sees failover
+        // topology in its own post-install check and removes itself.
+        if topology == DatabaseTopology::Failover {
+            self.suppress_read_replica_pool();
         }
         self.topology_epoch
             .store(next_topology_epoch, Ordering::Release);
@@ -8821,21 +8835,10 @@ impl DatabaseStore {
             old_pool.close().await;
         });
 
-        // Test seam: hold the transition between publication and topology
-        // finalization so a later failover/primary cannot interleave and then
-        // be overwritten by a delayed mark_primary / mismatched topology
-        // finalization.
+        // Test seam: hold the transition after publication so a concurrent
+        // failover/primary must wait for this one to release the lock.
         self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology_kind)
             .await;
-
-        // Primary failback stays fail-closed for writes until the primary pool
-        // is published: mark_primary only after the swap, under the same lock
-        // that `ensure_primary_failback_allowed` ran under (the permit proves
-        // the fence was checked).
-        if let Some(permit) = primary_failback_permit {
-            self.failover_topology
-                .mark_primary(permit, &Self::redact_url(db_url));
-        }
 
         Ok(())
     }
@@ -8893,7 +8896,7 @@ impl DatabaseStore {
                             store.failover_urls = failover_urls.to_vec();
                             store
                                 .failover_topology
-                                .mark_failover(&Self::redact_url(url));
+                                .mark_connected_to_failover(&Self::redact_url(url));
                             return Ok(store);
                         }
                         Err(e) => {
@@ -12480,13 +12483,12 @@ impl DatabaseBackend for DatabaseStore {
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
-        let primary = self.pool.load();
+        let (primary, topology) = self.failover_topology.handle_and_status();
         let size = primary.size();
         let idle = primary.num_idle() as u32;
 
-        let replica = self
-            .failover_topology
-            .primary_active()
+        let replica = topology
+            .primary_active
             .then(|| self.read_replica_pool.load_full())
             .flatten()
             .map(|rp| {
