@@ -6998,22 +6998,15 @@ struct MtlsDnsAdmissionGuardLifecycle {
 }
 
 impl MtlsDnsAdmissionGuardLifecycle {
+    /// Acquire the guard in a detached task. If the request is cancelled while
+    /// acquisition is pending, the undelivered lifecycle is dropped in that
+    /// task and its Drop releases the new durable owner.
+    ///
+    /// A restore never reacquires this guard over a half-restored namespace:
+    /// lost-lease recovery keeps the original owner across the namespace
+    /// lease reacquisition (issue #7062), so no window opens in which the
+    /// fence is released.
     async fn acquire(db: Arc<dyn DatabaseBackend>, namespace: &str) -> Result<Self, anyhow::Error> {
-        Self::acquire_with_restore_phase(db, namespace, MtlsDnsRestorePhase::Idle).await
-    }
-
-    /// Acquire a guard whose lifecycle starts in `restore_phase`. Recovery
-    /// paths that reacquire the fence over a half-restored namespace pass the
-    /// inherited incomplete phase here so it is applied inside the detached
-    /// acquisition task, before the lifecycle is delivered: if the request is
-    /// cancelled while acquisition is pending, the undelivered lifecycle is
-    /// dropped in that task and its Drop retains the new durable owner
-    /// instead of releasing it (issue #7032).
-    async fn acquire_with_restore_phase(
-        db: Arc<dyn DatabaseBackend>,
-        namespace: &str,
-        restore_phase: MtlsDnsRestorePhase,
-    ) -> Result<Self, anyhow::Error> {
         let namespace = namespace.to_string();
         let acquire_db = db.clone();
         let acquire_namespace = namespace.clone();
@@ -7022,14 +7015,10 @@ impl MtlsDnsAdmissionGuardLifecycle {
             let result = acquire_db
                 .acquire_mtls_dns_admission_guard(&acquire_namespace)
                 .await
-                .map(|guard_owner| {
-                    let lifecycle = Self::new(acquire_db, &acquire_namespace, guard_owner);
-                    lifecycle.hold.set_restore_phase(restore_phase);
-                    lifecycle
-                });
+                .map(|guard_owner| Self::new(acquire_db, &acquire_namespace, guard_owner));
             // If the request disappeared while acquisition was in flight, the
-            // undelivered lifecycle is dropped here. Its Drop starts bounded
-            // cleanup only when its restore phase and mutation state allow it.
+            // undelivered lifecycle is dropped here and its Drop starts
+            // bounded cleanup.
             let _ = result_tx.send(result);
         });
         result_rx.await.map_err(|_| {
@@ -7075,10 +7064,6 @@ impl MtlsDnsAdmissionGuardLifecycle {
     fn retain_restore_import_failed(&self) {
         self.hold
             .set_restore_phase(MtlsDnsRestorePhase::ImportedWithErrors);
-    }
-
-    fn restore_phase(&self) -> MtlsDnsRestorePhase {
-        self.hold.restore_phase()
     }
 
     /// Whether the restore phase allows an explicit release: no multi-phase
@@ -7181,34 +7166,43 @@ pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
     state.release_on_drop()
 }
 
-/// Start a recovery reacquisition of the restore guard and cancel the
-/// request-side future after its first poll, before the detached acquisition
-/// task can deliver the lifecycle. With `inherit_incomplete_restore`, the
-/// reacquisition carries the failed-import phase the restore flow passes, so
-/// the undelivered lifecycle must retain the new durable owner.
+/// Model `handle_restore`'s lost-lease recovery being abandoned (issue
+/// #7062): after a committed clear (and, with `after_import`, an import with
+/// errors), the namespace lease reacquisition is cancelled while it waits
+/// behind another holder, and the request drops the restore guard it kept
+/// across that reacquisition. Returns the abandoned guard owner.
 // External tests reach this through the lib target's `_test_support` shim;
 // the bin target recompiles this module without that caller.
 #[allow(dead_code)]
-pub(crate) async fn cancel_restore_guard_reacquisition_for_test(
+pub(crate) async fn abandon_restore_lost_lease_recovery_for_test(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,
-    inherit_incomplete_restore: bool,
-) {
-    let phase = if inherit_incomplete_restore {
-        MtlsDnsRestorePhase::ImportedWithErrors
-    } else {
-        MtlsDnsRestorePhase::Idle
-    };
-    let reacquire =
-        MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase(db, namespace, phase);
-    tokio::pin!(reacquire);
-    std::future::poll_fn(|context| {
-        // Any lifecycle delivered on this first poll is dropped here, which
-        // exercises the same Drop decision as the undelivered one.
-        let _ = std::future::Future::poll(reacquire.as_mut(), context);
-        std::task::Poll::Ready(())
-    })
-    .await;
+    after_import: bool,
+) -> Result<String, anyhow::Error> {
+    // Another writer holds the namespace lease, so the recovery waits.
+    let competing_admission = crud::lock_namespace_config_admission(db.clone(), namespace).await?;
+    let restore_guard = MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await?;
+    let guard_owner = restore_guard.guard_owner().to_string();
+    let operation = restore_guard.operation();
+    operation
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .map_err(|()| anyhow::anyhow!("test clear failed"))?;
+    if after_import {
+        restore_guard.retain_restore_import_failed();
+    }
+    {
+        let reacquire = crud::lock_namespace_config_admission(db.clone(), namespace);
+        tokio::pin!(reacquire);
+        std::future::poll_fn(|context| {
+            let _ = std::future::Future::poll(reacquire.as_mut(), context);
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    drop(restore_guard);
+    drop(competing_admission);
+    Ok(guard_owner)
 }
 
 /// Hold the datastore namespace guard across an admin read/modify/write
@@ -10939,6 +10933,25 @@ async fn validate_restore_candidate_on_blocking_pool(
 }
 
 /// Restore the gateway configuration from a backup payload.
+/// `restore_errors` for a lost-lease recovery response that returns while the
+/// restore guard is still held (issue #7062). Its Drop retains the durable
+/// fence whenever the restore phase forbids release, so the response says the
+/// namespace needs manual recovery.
+fn restore_recovery_errors(
+    guard: &MtlsDnsAdmissionGuardLifecycle,
+    namespace: &str,
+    mut errors: Vec<String>,
+) -> Vec<String> {
+    if !guard.restore_phase_allows_release() {
+        error!(
+            namespace = %namespace,
+            "Restore: lost-lease recovery did not complete; namespace admission guard retained for manual recovery"
+        );
+        errors.push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+    }
+    errors
+}
+
 async fn handle_restore(
     state: &AdminState,
     actor: &AuditActor,
@@ -11528,20 +11541,18 @@ async fn handle_restore(
     if let Some(_error) = delete_admission_error {
         error_persistence_failure_redacted("restore_namespace_admission_lost_during_clear");
         let lost_generation = namespace_config_admission_guard.generation();
-        let carried_restore_phase = restore_guard.restore_phase();
-        if let Err(release_error) = restore_guard.release().await {
-            let response_error = redacted_recovery_error_message(
-                "restore_guard_release_before_clear_recovery",
-                "Config admission was lost during restore clear and the restore guard could not be released before recovery",
-                &release_error,
-            );
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": response_error,
-                    "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
-                }),
-            ));
+        // The restore guard (the durable mTLS DNS fence) is NOT released for
+        // recovery (issue #7062): it stays held across the lease reacquisition
+        // below and carries the recovery, so no window exists in which guarded
+        // writes are admitted over a cleared or partially cleared namespace.
+        // A failed or cancelled reacquisition drops it in an incomplete phase,
+        // and its Drop retains the fence. A clear that failed without a
+        // definitive atomic abort may have removed some rows, so it is
+        // incomplete too.
+        if let Err(error) = delete_result.as_ref()
+            && (!error.mode().is_atomic() || error.has_unknown_commit_result())
+        {
+            restore_guard.retain_restore_cleared();
         }
         drop(namespace_config_admission_guard);
         namespace_config_admission_guard = match crud::lock_namespace_config_admission(
@@ -11561,39 +11572,17 @@ async fn handle_restore(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
                         "error": response_error,
-                        "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                        "restore_errors": restore_recovery_errors(
+                            &restore_guard,
+                            namespace,
+                            vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                        ),
                     }),
                 ));
             }
         };
         let intervening_write =
             !namespace_config_admission_guard.immediately_succeeds_generation(lost_generation);
-        // The reacquired owner inherits the incomplete-restore phase inside
-        // acquisition, so a cancelled acquisition or an unpolled/cancelled
-        // recovery still retains it.
-        restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase(
-            db.clone(),
-            namespace,
-            carried_restore_phase,
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(recovery_error) => {
-                let response_error = redacted_recovery_error_message(
-                    "restore_guard_reacquire_after_clear",
-                    "Config admission was reacquired after restore clear, but the restore guard could not be reacquired",
-                    &recovery_error,
-                );
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": response_error,
-                        "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
-                    }),
-                ));
-            }
-        };
         if delete_result.is_ok() {
             let restore_errors = vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()];
             let rollback = async {
@@ -11643,7 +11632,11 @@ async fn handle_restore(
                             StatusCode::SERVICE_UNAVAILABLE,
                             &json!({
                                 "error": response_error,
-                                "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                                "restore_errors": restore_recovery_errors(
+                                    &restore_guard,
+                                    namespace,
+                                    vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                                ),
                             }),
                         )
                     }
@@ -11651,11 +11644,18 @@ async fn handle_restore(
             );
         }
         if intervening_write {
+            // A clear that may have removed rows leaves the guard in the
+            // cleared phase: returning drops it and its Drop keeps the fence.
+            let restore_errors = restore_recovery_errors(
+                &restore_guard,
+                namespace,
+                vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+            );
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
                     "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
-                    "restore_errors": [NAMESPACE_ADMISSION_LOST_MESSAGE],
+                    "restore_errors": restore_errors,
                     "rollback": "not_needed_after_intervening_write",
                 }),
             ));
@@ -11764,20 +11764,11 @@ async fn handle_restore(
             errors.insert(0, NAMESPACE_ADMISSION_LOST_MESSAGE.to_string());
             restore_guard.retain_restore_import_failed();
             let lost_generation = namespace_config_admission_guard.generation();
-            if let Err(release_error) = restore_guard.release().await {
-                let response_error = redacted_recovery_error_message(
-                    "restore_guard_release_before_import_rollback",
-                    "Config admission was lost during restore import and the restore guard could not be released before rollback",
-                    &release_error,
-                );
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": response_error,
-                        "restore_errors": errors,
-                    }),
-                ));
-            }
+            // As after a lost clear (issue #7062): the restore guard keeps the
+            // durable fence across the lease reacquisition and carries the
+            // rollback. Every early return below drops it in the failed-import
+            // phase, so its Drop retains the fence over the partially imported
+            // namespace.
             drop(namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
                 .await
@@ -11793,12 +11784,17 @@ async fn handle_restore(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &json!({
                             "error": response_error,
-                            "restore_errors": errors,
+                            "restore_errors": restore_recovery_errors(&restore_guard, namespace, errors),
                         }),
                     ));
                 }
             };
             if !rollback_guard.immediately_succeeds_generation(lost_generation) {
+                errors.push(RESTORE_ADMISSION_GUARD_RETAINED_MESSAGE.to_string());
+                error!(
+                    namespace = %namespace,
+                    "Restore: import rollback skipped after an intervening namespace lease; namespace admission guard retained for manual recovery"
+                );
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
@@ -11808,32 +11804,6 @@ async fn handle_restore(
                     }),
                 ));
             }
-            // The reacquired owner inherits the failed-import phase inside
-            // acquisition, so a cancelled acquisition or an unpolled/cancelled
-            // rollback still retains it.
-            restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase(
-                db.clone(),
-                namespace,
-                MtlsDnsRestorePhase::ImportedWithErrors,
-            )
-            .await
-            {
-                Ok(guard) => guard,
-                Err(rollback_error) => {
-                    let response_error = redacted_recovery_error_message(
-                        "restore_guard_reacquire_for_import_rollback",
-                        "Config admission was reacquired after restore import, but the restore guard could not be reacquired",
-                        &rollback_error,
-                    );
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": response_error,
-                            "restore_errors": errors,
-                        }),
-                    ));
-                }
-            };
             let rollback = finish_failed_restore(
                 state,
                 db.clone(),
@@ -11860,7 +11830,14 @@ async fn handle_restore(
                         );
                         json_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({"error": response_error}),
+                            &json!({
+                                "error": response_error,
+                                "restore_errors": restore_recovery_errors(
+                                    &restore_guard,
+                                    namespace,
+                                    vec![NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()],
+                                ),
+                            }),
                         )
                     }
                 },

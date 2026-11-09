@@ -59,6 +59,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
+  (#7062). When namespace admission was lost during the restore clear or
+  import, recovery released the restore's durable guard and only then
+  reacquired the namespace lease and a new guard. If either reacquisition
+  failed (`503`) or the request was cancelled in between, nothing fenced the
+  cleared or partially imported namespace, so guarded writes were admitted
+  until an operator intervened. Recovery now keeps the original guard owner
+  across the lease reacquisition and runs the rollback under it, so a failed
+  or cancelled recovery leaves the namespace fenced. A clear that failed
+  without a definitive atomic abort is treated as incomplete. Every recovery
+  `503` that leaves the namespace fenced now lists
+  `namespace admission guard retained; manual recovery required` in
+  `restore_errors`.
 - **SQL/MongoDB failover topology and the active pool are one publication**
   (#7061). The sticky-failover state was several separately stored fields next
   to a separately swapped pool or MongoDB connection, so an unpinned observer
@@ -446,9 +459,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release and Drop keep the fence until the import succeeds or the rollback
   completes. A rollback that runs but fails now retains the fence too: the
   `500` response keeps `rollback: "incomplete"` and says the guard was
-  retained, and recovery follows the `unknown_outcome` procedure. A guard
-  reacquired for recovery gets the incomplete phase inside its acquisition
-  task, so cancelling during reacquisition no longer releases it. A nested
+  retained, and recovery follows the `unknown_outcome` procedure. Lost-lease
+  recovery keeps the original guard rather than reacquiring one (#7062), so
+  cancelling during recovery no longer releases it. A nested
   mutation restores the prior uncertain state instead of settling it.
 - **The stock xDS client applies a staged ACKed slice when its NACK breaker
   trips** (#7029). When five consecutive invalid responses of one type arrived
