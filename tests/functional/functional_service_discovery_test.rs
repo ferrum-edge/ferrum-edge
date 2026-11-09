@@ -20,6 +20,7 @@
 //!   cargo test --test functional_tests -- --ignored \
 //!       functional_service_discovery --nocapture
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::io::Write;
@@ -71,12 +72,18 @@ fn start_gateway_in_file_mode(
     http_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> std::process::Child {
+) -> GatewayChildGuard {
     let binary_path = crate::common::gateway_binary_path();
     let mut cmd = std::process::Command::new(binary_path);
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        // Keep any managed-TLS/ACME/event store inside the config's temp dir.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "warn")
@@ -84,7 +91,7 @@ fn start_gateway_in_file_mode(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    cmd.spawn().expect("Failed to start gateway binary")
+    GatewayChildGuard::new(cmd.spawn().expect("Failed to start gateway binary"))
 }
 
 async fn wait_for_owned_gateway(
@@ -108,10 +115,10 @@ async fn ephemeral_port() -> u16 {
         .expect("lease test port")
 }
 
-/// Retry-style gateway startup — fresh ephemeral ports per attempt, gateway
-/// is killed before each retry. Matches the pattern used by other functional
+/// Retry-style gateway startup — fresh handoff ports per attempt, gateway
+/// is shut down before each retry. Matches the pattern used by other functional
 /// tests in this crate.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+async fn start_gateway_with_retry(config_path: &str) -> (GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
@@ -119,7 +126,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("service-discovery");
         let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port, &identity);
-        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
+        if wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
 
@@ -127,8 +134,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
             "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
             attempt, MAX_ATTEMPTS, proxy_port, admin_port
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        child.shutdown();
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
         }
@@ -206,8 +212,7 @@ plugin_configs: []
     let body = resp.text().await.unwrap_or_default();
     assert!(body.contains("sd-echo"), "unexpected body: {}", body);
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo_task.abort();
 }
 
@@ -268,8 +273,7 @@ plugin_configs: []
         resp.status()
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo_task.abort();
 }
 
@@ -334,14 +338,13 @@ plugin_configs: []
     );
 
     // Gateway process must still be alive.
-    match gw.try_wait() {
+    match gw.child_mut().try_wait() {
         Ok(None) => {} // still running, good
         Ok(Some(status)) => panic!("gateway exited while consul was unreachable: {:?}", status),
         Err(e) => panic!("could not query gateway process state: {}", e),
     }
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo_task.abort();
 }
 
@@ -451,8 +454,7 @@ plugin_configs: []
         sleep(Duration::from_millis(250)).await;
     }
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     echo_task.abort();
 
     assert!(

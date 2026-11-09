@@ -25,6 +25,11 @@
 //!   cargo test --features secrets-azure --test secrets_functional azure_backend
 
 mod common;
+// The registry-backed port allocator and the shared gateway harness, included
+// the same way `service_integration` does, so the startup smoke spawns the
+// gateway under the same rules as every functional spawner.
+#[path = "../scaffolding/mod.rs"]
+mod scaffolding;
 
 mod cross_backend;
 mod file_backend;

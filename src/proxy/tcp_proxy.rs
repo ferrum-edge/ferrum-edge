@@ -6356,17 +6356,18 @@ fn tcp_port_lane_refusal(
     refusal: crate::proxy::backend_dispatch::StreamPortLaneRefusal,
 ) -> anyhow::Error {
     use crate::proxy::backend_dispatch::StreamPortLaneRefusal;
+    // Both arms name the route's own scheme (`tcp` or `tcps`) so an operator
+    // reading a TLS-origination refusal is not told it was plain TCP.
+    let protocol = proxy.effective_scheme();
     let detail = match refusal {
         StreamPortLaneRefusal::LeastLatency => format!(
-            "for TCP port {port}: per-port LEAST_LATENCY requires stream latency sampling on \
-             every dispatch path"
+            "for {protocol} port {port}: per-port LEAST_LATENCY requires stream latency \
+             sampling on every dispatch path"
         ),
-        StreamPortLaneRefusal::NonIpHashKey => {
-            let protocol = proxy.effective_scheme();
-            format!(
-                "for {protocol} port {port}: stream per-port consistent hashing supports only source-IP hash keys"
-            )
-        }
+        StreamPortLaneRefusal::NonIpHashKey => format!(
+            "for {protocol} port {port}: stream per-port consistent hashing supports only \
+             source-IP hash keys"
+        ),
     };
     StreamSetupError::new(StreamSetupKind::UnsupportedStreamPolicy, detail).into()
 }
@@ -7235,6 +7236,66 @@ mod backend_target_selection_tests {
             "error should make the unsupported policy explicit: {}",
             setup.message
         );
+    }
+
+    /// Issue #7072: both refusal arms name the route's own scheme, so a
+    /// `tcps` route is never reported as plain TCP.
+    #[test]
+    fn resolve_backend_target_port_lane_refusals_name_the_route_scheme() {
+        let refusing_overrides = [
+            (
+                "least_latency",
+                crate::config::types::UpstreamPortOverride {
+                    algorithm: Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency),
+                    ..Default::default()
+                },
+                "per-port LEAST_LATENCY requires stream latency sampling",
+            ),
+            (
+                "non_ip_hash_on",
+                crate::config::types::UpstreamPortOverride {
+                    algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+                    hash_on: Some("header:x-user-id".to_string()),
+                    ..Default::default()
+                },
+                "supports only source-IP hash keys",
+            ),
+        ];
+        for (scheme, label) in [(BackendScheme::Tcp, "tcp"), (BackendScheme::Tcps, "tcps")] {
+            for (case, port_override, reason) in &refusing_overrides {
+                let mut config = config_with_two_targets();
+                config.upstreams[0].algorithm =
+                    crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+                config.upstreams[0]
+                    .port_overrides
+                    .insert(5432, port_override.clone());
+                let mut proxy = proxy_with_subset(None);
+                proxy.upstream_id = Some("orders".to_string());
+                proxy.backend_scheme = Some(scheme);
+                config.proxies.push(proxy);
+                config.resolve_dispatch_port_overrides();
+                let proxy = config.proxies.pop().expect("proxy pushed above");
+                let cache = LoadBalancerCache::new(&config);
+                let snapshot = cache.load();
+
+                let err =
+                    resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                        .expect_err("refusing per-port policy must fail setup");
+                let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+                assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+                assert!(
+                    setup.message.contains(&format!("for {label} port 5432:")),
+                    "{label}/{case}: refusal must name the route scheme: {}",
+                    setup.message
+                );
+                assert!(
+                    setup.message.contains(reason),
+                    "{label}/{case}: refusal must keep its reason: {}",
+                    setup.message
+                );
+            }
+        }
     }
 
     /// The whole change rests on one assumption: a synthetic target carrying

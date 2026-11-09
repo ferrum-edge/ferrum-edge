@@ -7,6 +7,7 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_sse
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::io::Write;
@@ -20,12 +21,9 @@ use tokio::time::sleep;
 // Echo Server Helper
 // ============================================================================
 
-/// Start a simple HTTP echo server that returns SSE-style responses.
-async fn start_sse_echo_server(port: u16) {
-    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind SSE echo server");
-
+/// Serve SSE-style responses on a listener the test has held since it chose
+/// the port (no drop-and-rebind window for another process to take it).
+async fn start_sse_echo_server(listener: TcpListener) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -51,7 +49,7 @@ fn start_gateway_file_mode(
     http_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+) -> Result<GatewayChildGuard, Box<dyn std::error::Error>> {
     // Build (or verify the prebuilt artifact) via the shared helper so this
     // file shares the `OnceLock` memoization and `FERRUM_SKIP_GATEWAY_BUILD=1`
     // contract used by the [`crate::common::TestGateway`] builder.
@@ -61,9 +59,15 @@ fn start_gateway_file_mode(
         crate::common::locate_binary(false).map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     let mut cmd = std::process::Command::new(binary_path);
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        // Keep any managed-TLS/ACME/event store inside the config's temp dir.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "debug")
@@ -71,7 +75,7 @@ fn start_gateway_file_mode(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    Ok(cmd.spawn()?)
+    Ok(GatewayChildGuard::new(cmd.spawn()?))
 }
 
 /// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
@@ -91,17 +95,16 @@ async fn wait_for_owned_gateway(
     .is_ok()
 }
 
-/// Create a temp config file with the SSE plugin and return (TempDir, config_path, backend_port).
+/// Create a temp config file with the SSE plugin and return
+/// (TempDir, config_path, backend_listener).
 ///
-/// Backend port is allocated here (same-process listener, no race).
+/// The backend listener stays bound and is handed to `start_sse_echo_server`.
 /// Proxy and admin ports are allocated by `start_gateway_with_retry()`.
-async fn setup_sse_config() -> (TempDir, String, u16) {
-    // Bind to port 0 to get an ephemeral port for the backend (same-process, safe)
+async fn setup_sse_config() -> (TempDir, String, TcpListener) {
     let backend_listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
 
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
@@ -143,30 +146,29 @@ plugin_configs:
     (
         temp_dir,
         config_path.to_string_lossy().to_string(),
-        backend_port,
+        backend_listener,
     )
 }
 
 /// Start the gateway with retry on port-binding failures.
 ///
-/// Allocates fresh ephemeral proxy and admin ports on each attempt to handle
-/// the bind-drop-rebind port race. Returns (child, proxy_port, admin_port).
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+/// Leases fresh proxy and admin handoff ports (outside the host's ephemeral
+/// source range) on each attempt. Returns (child, proxy_port, admin_port).
+async fn start_gateway_with_retry(config_path: &str) -> (GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        let proxy_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway proxy port");
+        let admin_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway admin port");
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("sse");
         let mut child = start_gateway_file_mode(config_path, proxy_port, admin_port, &identity)
             .expect("Failed to start gateway");
 
-        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
+        if wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
 
@@ -174,8 +176,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
             "Gateway startup attempt {}/{} failed (ports: proxy={}, admin={})",
             attempt, MAX_ATTEMPTS, proxy_port, admin_port
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        child.shutdown();
 
         if attempt < MAX_ATTEMPTS {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -191,10 +192,10 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 #[ignore]
 #[tokio::test]
 async fn test_sse_plugin_rejects_without_accept_header() {
-    let (_temp_dir, config_path, backend_port) = setup_sse_config().await;
+    let (_temp_dir, config_path, backend_listener) = setup_sse_config().await;
 
     // Start echo server
-    let echo_server = tokio::spawn(start_sse_echo_server(backend_port));
+    let echo_server = tokio::spawn(start_sse_echo_server(backend_listener));
     sleep(Duration::from_millis(500)).await;
 
     // Start gateway with retry to handle ephemeral port races
@@ -225,18 +226,17 @@ async fn test_sse_plugin_rejects_without_accept_header() {
     );
 
     // Cleanup
-    let _ = gateway_process.kill();
-    let _ = gateway_process.wait();
+    gateway_process.shutdown();
     echo_server.abort();
 }
 
 #[ignore]
 #[tokio::test]
 async fn test_sse_plugin_allows_valid_sse_request() {
-    let (_temp_dir, config_path, backend_port) = setup_sse_config().await;
+    let (_temp_dir, config_path, backend_listener) = setup_sse_config().await;
 
     // Start echo server
-    let echo_server = tokio::spawn(start_sse_echo_server(backend_port));
+    let echo_server = tokio::spawn(start_sse_echo_server(backend_listener));
     sleep(Duration::from_millis(500)).await;
 
     // Start gateway with retry to handle ephemeral port races
@@ -294,18 +294,17 @@ async fn test_sse_plugin_allows_valid_sse_request() {
     );
 
     // Cleanup
-    let _ = gateway_process.kill();
-    let _ = gateway_process.wait();
+    gateway_process.shutdown();
     echo_server.abort();
 }
 
 #[ignore]
 #[tokio::test]
 async fn test_sse_plugin_rejects_post_when_require_get() {
-    let (_temp_dir, config_path, backend_port) = setup_sse_config().await;
+    let (_temp_dir, config_path, backend_listener) = setup_sse_config().await;
 
     // Start echo server
-    let echo_server = tokio::spawn(start_sse_echo_server(backend_port));
+    let echo_server = tokio::spawn(start_sse_echo_server(backend_listener));
     sleep(Duration::from_millis(500)).await;
 
     // Start gateway with retry to handle ephemeral port races
@@ -337,7 +336,6 @@ async fn test_sse_plugin_rejects_post_when_require_get() {
     );
 
     // Cleanup
-    let _ = gateway_process.kill();
-    let _ = gateway_process.wait();
+    gateway_process.shutdown();
     echo_server.abort();
 }

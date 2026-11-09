@@ -21,7 +21,7 @@
 //! tests into TLS parse failures), and the readiness probe identifies the child
 //! it reached rather than accepting whatever holds the port.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,7 +65,7 @@ const ACME_KEY_AUTHORIZATION: &str = "abc_DEF-123.injector-test-thumbprint";
 /// A spawned injector-mode gateway. `Drop` reaps the child so a failing
 /// assertion cannot leak a listener into the rest of the shard.
 struct InjectorGateway {
-    child: Child,
+    child: crate::common::GatewayChildGuard,
     port: u16,
     /// Retained so the on-disk TLS material outlives the child.
     tmp: tempfile::TempDir,
@@ -78,8 +78,8 @@ struct InjectorGateway {
 
 impl Drop for InjectorGateway {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Reap before `tmp` is removed; SIGTERM + grace under coverage.
+        self.child.shutdown();
     }
 }
 
@@ -122,6 +122,7 @@ async fn try_start_injector(
     let trust_domain = format!("injector-probe-{}-{port}.test", std::process::id());
 
     let mut command = Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut command);
     command.arg("run");
     command
         .env("FERRUM_MODE", "injector")
@@ -180,9 +181,11 @@ async fn try_start_injector(
         seed_pending_tls_alpn_order(tmp.path())?;
     }
 
-    let child = command
-        .spawn()
-        .map_err(|e| format!("spawn injector: {e}"))?;
+    let child = crate::common::GatewayChildGuard::new(
+        command
+            .spawn()
+            .map_err(|e| format!("spawn injector: {e}"))?,
+    );
     let mut gateway = InjectorGateway {
         child,
         port,
@@ -255,6 +258,7 @@ fn child_exit_status(
 ) -> Result<Option<std::process::ExitStatus>, String> {
     gateway
         .child
+        .child_mut()
         .try_wait()
         .map_err(|e| format!("poll injector child: {e}"))
 }

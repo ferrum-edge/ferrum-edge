@@ -716,6 +716,42 @@ pub fn is_builtin_safe_metadata_name(key: &str) -> bool {
         && (BUILTIN_SAFE_METADATA_KEYS.contains(&key) || is_builtin_metadata_key_family(key))
 }
 
+/// Whether `key` is a metadata name the gateway itself publishes: a reviewed
+/// built-in name, a fixed-grammar per-instance family, or a payload view
+/// (`request_body` / `response_body`). Configuration that writes transaction
+/// metadata under operator-chosen names (for example `workload_metrics`
+/// custom tags) must not reuse one, because other plugins read these keys as
+/// decision and coordination state. This is an ownership test, not a logging
+/// allowlist: payload names stay unloggable.
+pub fn is_gateway_published_metadata_name(key: &str) -> bool {
+    is_payload_metadata_key(key)
+        || BUILTIN_SAFE_METADATA_KEYS.contains(&key)
+        || is_builtin_metadata_key_family(key)
+        || GATEWAY_METADATA_NAMESPACES
+            .iter()
+            .any(|namespace| key.starts_with(namespace))
+}
+
+/// Dotted metadata namespaces the gateway writes that are not a built-in
+/// plugin's own name (those are owned by the plugin; see
+/// `workload_metrics`' custom-tag check). Several carry decision state other
+/// plugins read: `auth.strip_query_param.<name>` tells the egress path and
+/// `request_transformer` which credential query parameter to strip.
+const GATEWAY_METADATA_NAMESPACES: &[&str] = &[
+    "a2a.",
+    "auth.",
+    "authorization.",
+    "ferrum.",
+    "geo.",
+    "hbone.",
+    "mcp.",
+    "mesh.",
+    "mesh_authz.",
+    "mesh_request_auth.",
+    "oidc_rp.",
+    "websocket.",
+];
+
 /// Whether `key` matches an operator allowlist entry (exact or `prefix*`).
 pub fn matches_safe_metadata_entries(key: &str, entries: &[String]) -> bool {
     entries.iter().any(|entry| match entry.strip_suffix('*') {

@@ -128,23 +128,11 @@ impl Drop for RebindingDnsServer {
 // Gateway Helpers
 // ============================================================================
 
-fn otel_ldap_observability_token(proxy_port: u16, admin_port: u16, attempt: u32) -> String {
-    format!(
-        "ferrum-edge-otel-ldap-probe-{}-{}-{}-{}",
-        std::process::id(),
-        proxy_port,
-        admin_port,
-        attempt
-    )
-}
-
-#[test]
-fn otel_ldap_observability_token_is_unique_per_attempt_and_ports() {
-    let base = otel_ldap_observability_token(10_001, 20_002, 1);
-    assert_ne!(base, otel_ldap_observability_token(10_001, 20_002, 2));
-    assert_ne!(base, otel_ldap_observability_token(10_001, 20_003, 1));
-    assert_ne!(base, otel_ldap_observability_token(10_002, 20_002, 1));
-    assert!(base.contains(&std::process::id().to_string()));
+/// Lease a non-ephemeral port for the gateway child to bind (D4, #7077).
+async fn gateway_handoff_port() -> u16 {
+    crate::scaffolding::ports::unbound_port()
+        .await
+        .expect("lease gateway handoff port")
 }
 
 /// Start the gateway in file mode with the given config and ports.
@@ -153,13 +141,21 @@ fn start_gateway_with_dns(
     proxy_port: u16,
     admin_port: u16,
     dns_resolver: Option<SocketAddr>,
-    observability_token: &str,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> Result<crate::common::GatewayChildGuard, Box<dyn std::error::Error>> {
     let binary_path = crate::common::gateway_binary_path();
 
     let mut command = std::process::Command::new(binary_path);
+    crate::common::configure_coverage_gateway_command(&mut command);
     command.arg("run");
+    // Per-attempt admin JWT secret/issuer and metrics bearer token: the
+    // ownership proof `wait_for_owned_gateway` checks (issue #7076).
+    identity.apply_to_command(&mut command);
+    // Keep any managed-TLS store out of the checkout (issue #5706): the config
+    // file lives in the attempt's TempDir, which outlives this child.
+    let managed_store = std::path::Path::new(config_path).with_file_name("managed-tls");
     command
+        .env("FERRUM_TLS_MANAGED_STORE_PATH", &managed_store)
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
@@ -167,7 +163,6 @@ fn start_gateway_with_dns(
         .env("FERRUM_LOG_LEVEL", "debug")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("FERRUM_ACCEPT_THREADS", "1")
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -176,55 +171,45 @@ fn start_gateway_with_dns(
             .env("FERRUM_DNS_RESOLVER_ADDRESS", resolver.to_string())
             .env("FERRUM_DNS_TRY_TCP_ON_ERROR", "false");
     }
-    let child = command.spawn()?;
-
-    Ok(child)
+    Ok(crate::common::GatewayChildGuard::new(command.spawn()?))
 }
 
 fn start_gateway(
     config_path: &str,
     proxy_port: u16,
     admin_port: u16,
-    observability_token: &str,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    start_gateway_with_dns(
-        config_path,
-        proxy_port,
-        admin_port,
-        None,
-        observability_token,
-    )
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> Result<crate::common::GatewayChildGuard, Box<dyn std::error::Error>> {
+    start_gateway_with_dns(config_path, proxy_port, admin_port, None, identity)
 }
 
 /// Prove *this* child owns its admin/proxy listeners before returning.
 ///
 /// Bare unauthenticated `/health` is not identity (issue #2132 / #3428): the
-/// bind-drop-rebind port reservation can let a parallel gateway answer on the
-/// released admin port while this child dies on proxy bind failure.
+/// released port reservation can let a parallel gateway answer on the admin
+/// port while this child dies on proxy bind failure. `/health` detail alone is
+/// not enough either: `FERRUM_METRICS_ALLOWED_CIDRS` can grant it to a foreign
+/// gateway, so the barrier also requires HTTP 200 from JWT-only `GET /proxies`
+/// under this attempt's admin JWT (`wait_for_owned_gateway_identity`, #7076).
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
     proxy_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
     let deadline = Instant::now() + STARTUP_TIMEOUT;
-    crate::common::wait_for_child_gateway_readiness(
-        child,
-        admin_port,
-        observability_token,
-        STARTUP_TIMEOUT,
-    )
-    .await?;
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await?;
     crate::common::wait_for_child_tcp_accept(child, proxy_port, deadline).await
 }
 
-/// Start the gateway with retry logic to handle ephemeral port races.
+/// Start the gateway with retry logic to handle handoff port races.
 /// Returns (gateway_process, echo_handle, proxy_port, admin_port, _temp_dir, _backend_listener).
 async fn start_otel_gateway_with_retry(
     config_template: &str,
 ) -> (
-    std::process::Child,
+    crate::common::GatewayChildGuard,
     tokio::task::JoinHandle<()>,
     u16,
     u16,
@@ -239,17 +224,8 @@ async fn start_otel_gateway_with_retry(
             .expect("bind backend");
         let backend_port = backend_listener.local_addr().unwrap().port();
 
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0")
-            .await
-            .expect("bind proxy");
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0")
-            .await
-            .expect("bind admin");
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        let proxy_port = gateway_handoff_port().await;
+        let admin_port = gateway_handoff_port().await;
 
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let config_path = temp_dir.path().join("config.yaml");
@@ -262,12 +238,12 @@ async fn start_otel_gateway_with_retry(
         sleep(Duration::from_millis(200)).await;
 
         // Start gateway
-        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("otel-ldap");
         let mut gateway_process = match start_gateway(
             &config_path.to_string_lossy(),
             proxy_port,
             admin_port,
-            &observability_token,
+            &identity,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -284,9 +260,9 @@ async fn start_otel_gateway_with_retry(
         };
 
         match wait_for_owned_gateway(
-            &mut gateway_process,
+            gateway_process.child_mut(),
             admin_port,
-            &observability_token,
+            &identity,
             proxy_port,
         )
         .await
@@ -305,8 +281,7 @@ async fn start_otel_gateway_with_retry(
                     "Gateway startup attempt {}/{} failed: {}",
                     attempt, MAX_ATTEMPTS, e
                 );
-                let _ = gateway_process.kill();
-                let _ = gateway_process.wait();
+                gateway_process.shutdown();
                 echo_handle.abort();
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_secs(1)).await;
@@ -408,8 +383,7 @@ plugin_configs:
     assert_eq!(parts[3], "01", "traceparent flags should be '01'");
 
     // Cleanup
-    let _ = gateway_process.kill();
-    let _ = gateway_process.wait();
+    gateway_process.shutdown();
     echo_handle.abort();
 }
 
@@ -488,8 +462,7 @@ plugin_configs:
     );
 
     // Cleanup
-    let _ = gateway_process.kill();
-    let _ = gateway_process.wait();
+    gateway_process.shutdown();
     echo_handle.abort();
 }
 
@@ -501,7 +474,7 @@ plugin_configs:
 async fn start_ldap_gateway_with_retry(
     config_template: &str,
 ) -> (
-    std::process::Child,
+    crate::common::GatewayChildGuard,
     tokio::task::JoinHandle<()>,
     u16,
     u16,
@@ -514,17 +487,8 @@ async fn start_ldap_gateway_with_retry(
             .expect("bind backend");
         let backend_port = backend_listener.local_addr().unwrap().port();
 
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0")
-            .await
-            .expect("bind proxy");
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0")
-            .await
-            .expect("bind admin");
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        let proxy_port = gateway_handoff_port().await;
+        let admin_port = gateway_handoff_port().await;
 
         // Use a port that we do NOT listen on — guaranteeing LDAP connection failure
         let ldap_listener = TcpListener::bind_test("127.0.0.1:0")
@@ -544,12 +508,12 @@ async fn start_ldap_gateway_with_retry(
         let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
         sleep(Duration::from_millis(200)).await;
 
-        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("otel-ldap");
         let mut gateway_process = match start_gateway(
             &config_path.to_string_lossy(),
             proxy_port,
             admin_port,
-            &observability_token,
+            &identity,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -566,9 +530,9 @@ async fn start_ldap_gateway_with_retry(
         };
 
         match wait_for_owned_gateway(
-            &mut gateway_process,
+            gateway_process.child_mut(),
             admin_port,
-            &observability_token,
+            &identity,
             proxy_port,
         )
         .await
@@ -587,8 +551,7 @@ async fn start_ldap_gateway_with_retry(
                     "Gateway startup attempt {}/{} failed: {}",
                     attempt, MAX_ATTEMPTS, e
                 );
-                let _ = gateway_process.kill();
-                let _ = gateway_process.wait();
+                gateway_process.shutdown();
                 echo_handle.abort();
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_secs(1)).await;
@@ -604,7 +567,7 @@ async fn start_ldap_rebinding_gateway_with_retry(
     ldap_port: u16,
     dns_resolver: SocketAddr,
 ) -> (
-    std::process::Child,
+    crate::common::GatewayChildGuard,
     tokio::task::JoinHandle<()>,
     u16,
     u16,
@@ -617,16 +580,8 @@ async fn start_ldap_rebinding_gateway_with_retry(
             .expect("bind rebind-test backend");
         let backend_port = backend_listener.local_addr().unwrap().port();
 
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0")
-            .await
-            .expect("bind proxy");
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0")
-            .await
-            .expect("bind admin");
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        let proxy_port = gateway_handoff_port().await;
+        let admin_port = gateway_handoff_port().await;
 
         let temp_dir = TempDir::new().expect("create rebind-test temp directory");
         let config_path = temp_dir.path().join("config.yaml");
@@ -637,13 +592,13 @@ async fn start_ldap_rebinding_gateway_with_retry(
 
         let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
         sleep(Duration::from_millis(200)).await;
-        let observability_token = otel_ldap_observability_token(proxy_port, admin_port, attempt);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("otel-ldap");
         let mut gateway_process = match start_gateway_with_dns(
             &config_path.to_string_lossy(),
             proxy_port,
             admin_port,
             Some(dns_resolver),
-            &observability_token,
+            &identity,
         ) {
             Ok(process) => process,
             Err(error) => {
@@ -659,9 +614,9 @@ async fn start_ldap_rebinding_gateway_with_retry(
         };
 
         match wait_for_owned_gateway(
-            &mut gateway_process,
+            gateway_process.child_mut(),
             admin_port,
-            &observability_token,
+            &identity,
             proxy_port,
         )
         .await
@@ -679,8 +634,7 @@ async fn start_ldap_rebinding_gateway_with_retry(
                 eprintln!(
                     "Gateway rebind-test startup attempt {attempt}/{MAX_ATTEMPTS} failed: {error}"
                 );
-                let _ = gateway_process.kill();
-                let _ = gateway_process.wait();
+                gateway_process.shutdown();
                 echo_handle.abort();
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_secs(1)).await;
@@ -761,8 +715,7 @@ plugin_configs:
     );
 
     // Cleanup
-    let _ = gateway_process.kill();
-    let _ = gateway_process.wait();
+    gateway_process.shutdown();
     echo_handle.abort();
 }
 
@@ -823,8 +776,7 @@ plugin_configs:
     );
 
     // Cleanup
-    let _ = gateway_process.kill();
-    let _ = gateway_process.wait();
+    gateway_process.shutdown();
     echo_handle.abort();
 }
 
@@ -903,7 +855,6 @@ plugin_configs:
         "the LDAP listener must not receive a connection after the denied rebind"
     );
 
-    let _ = gateway_process.kill();
-    let _ = gateway_process.wait();
+    gateway_process.shutdown();
     echo_handle.abort();
 }

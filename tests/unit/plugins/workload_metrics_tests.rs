@@ -86,6 +86,77 @@ fn explicit_default_contracts_remain_accepted() {
     }
 }
 
+/// The gRPC method keys `grpc_method_router` publishes are reserved custom tag
+/// names (GHSA-9mmx-ghcv-x25q): a literal, header or environment tag under one
+/// of them would otherwise overwrite the method key that per-method plugin
+/// policy reads before the backend path is bound.
+#[test]
+fn grpc_method_metadata_keys_are_reserved_custom_tag_names() {
+    for name in ["grpc_service", "grpc_method", "grpc_full_method"] {
+        for config in [
+            json!({"custom_tags": {name: "/pkg.Svc/Other"}}),
+            json!({"custom_header_tags": {name: "x-grpc-method"}}),
+            json!({"custom_env_tags": {name: "ISTIO_META_GRPC_METHOD"}}),
+        ] {
+            let Err(error) = WorkloadMetrics::new(&config) else {
+                panic!("{config} must be rejected");
+            };
+            assert!(error.contains("reserved or sensitive"), "{config}: {error}");
+            assert!(
+                validate_plugin_config("workload_metrics", &config).is_err(),
+                "{config}"
+            );
+        }
+    }
+    // A built-in plugin's metadata namespace is reserved too: a literal
+    // `ai_transcript_audit.record_id` tag would make overlapping transactions
+    // share one audit staging entry.
+    // So is every other key the gateway publishes into metadata, and a
+    // built-in plugin's `<plugin>_` namespace: a literal
+    // `ai_stream_router_pass_through` tag would make `ai_federation` skip its
+    // model/provider admission, and a `request_body` tag would replace the
+    // buffered-body view `ai_request_guard` inspects. Shared gateway
+    // namespaces are owned too: an absent header-backed
+    // `auth.strip_query_param.ticket` tag would delete `key_auth`'s marker and
+    // forward the query credential despite `hide_credentials`.
+    for name in [
+        "ai_transcript_audit.record_id",
+        "ai_transcript_audit.anything",
+        "waf.action",
+        "grpc_method_router.rule",
+        "ai_stream_router_pass_through",
+        "ai_stream_router_claimed",
+        "ai_federation_status",
+        "suppress_backend_consumer_identity_headers",
+        "consumer_username",
+        "fault_injected",
+        "namespace",
+        "request_body",
+        "response_body",
+        "auth.strip_query_param.ticket",
+        "mcp.tool",
+        "oidc_rp.session_set_cookie",
+        "geo.decision",
+    ] {
+        for config in [
+            json!({"custom_tags": {name: "shared"}}),
+            json!({"custom_header_tags": {name: "x-tenant"}}),
+            json!({"custom_env_tags": {name: "ISTIO_META_ZONE"}}),
+        ] {
+            let Err(error) = WorkloadMetrics::new(&config) else {
+                panic!("{config} must be rejected");
+            };
+            assert!(error.contains("reserved or sensitive"), "{config}: {error}");
+        }
+    }
+    // Neighbouring names stay ordinary dimensions, including a dotted name
+    // whose namespace is not a built-in plugin.
+    for name in ["grpc", "grpc_service_tier", "rpc_method", "team.owner"] {
+        let config = json!({"custom_tags": {name: "value"}});
+        assert!(WorkloadMetrics::new(&config).is_ok(), "{config}");
+    }
+}
+
 fn instance(id: &str, config: Value, scope: PluginScope) -> PluginConfig {
     make_plugin_config_with_json(id, "workload_metrics", config, scope, None)
 }

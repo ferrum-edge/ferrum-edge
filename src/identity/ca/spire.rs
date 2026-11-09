@@ -8,11 +8,14 @@
 //! ## How it works
 //!
 //! The SPIRE Agent's Workload API streams X.509 SVIDs to registered
-//! workloads. This CA backend opens the streaming `FetchX509SVID` RPC at
-//! construction time, parks a background task that continuously feeds the
-//! latest SVID + bundle into an `ArcSwap`, and serves `issue_svid` /
-//! `trust_bundle` reads from that snapshot. The agent handles rotation —
-//! when it pushes a fresh SVID, the snapshot is atomically replaced.
+//! workloads. This CA backend starts the shared Workload API fetch loop
+//! ([`crate::identity::workload_api::fetch_loop`], the same loop mesh startup
+//! uses) at construction time with the `spire_agent` metrics source, and serves
+//! `issue_svid` / `trust_bundle` reads from its snapshot. The agent handles
+//! rotation — when it pushes a fresh SVID, the snapshot is atomically replaced.
+//! Reconnect, CA-health, and rotation-failure telemetry therefore follow the
+//! fetch loop's rules (the health series exists before the first connect, and
+//! a clean stream end counts as a rotation failure) instead of a private copy.
 //!
 //! ## Issuance semantics
 //!
@@ -51,10 +54,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     CaError, CertificateAuthority, IssuanceRequest, PublishedJwtAuthority, PublishedTrustBundle,
@@ -63,6 +65,9 @@ use super::{
 use crate::identity::SvidBundle;
 use crate::identity::spiffe::TrustDomain;
 use crate::identity::workload_api::client::{JwtBundleSet, WorkloadApiClient};
+use crate::identity::workload_api::fetch_loop::{
+    FetchLoopConfig, FetchLoopMetricsSource, SvidFetchHandle, spawn_fetch_loop_with_handle,
+};
 
 /// Default UDS path for the SPIRE Agent. Operators override via
 /// `FERRUM_MESH_SPIRE_AGENT_SOCKET`.
@@ -95,25 +100,17 @@ impl Default for SpireAgentCaConfig {
     }
 }
 
-/// Internal snapshot holding the latest agent-pushed SVID and bundles.
-#[derive(Debug, Clone)]
-struct AgentSnapshot {
-    bundle: SvidBundle,
-}
-
 /// SPIRE-Agent-backed certificate authority.
 ///
 /// Holds a shared snapshot of the latest SVID pushed by the agent over the
-/// Workload API stream. A background task keeps the snapshot up to date;
+/// Workload API stream. The shared fetch loop keeps the snapshot up to date;
 /// all `CertificateAuthority` methods read from it lock-free.
 pub struct SpireAgentCa {
     config: SpireAgentCaConfig,
-    /// Latest snapshot. `None` until the first SVID arrives.
-    current: Arc<ArcSwap<Option<AgentSnapshot>>>,
-    /// Fires once the first SVID has been observed.
-    first_ready: Arc<Notify>,
-    first_received: Arc<std::sync::atomic::AtomicBool>,
-    /// Cancels the detached Workload API stream task when this CA is dropped.
+    /// Latest agent-pushed SVID (`None` until the first one arrives) and the
+    /// first-SVID notifier, both owned by the shared fetch loop.
+    svid: SvidFetchHandle,
+    /// Cancels the detached Workload API fetch-loop task when this CA is dropped.
     stream_task_abort: AbortHandle,
     /// JWT authorities the agent publishes, keyed by trust domain. Fed by a
     /// second background stream over the agent's own `FetchJWTBundles` RPC and
@@ -129,17 +126,20 @@ impl SpireAgentCa {
     /// Build and start the background fetch loop. Returns once the first SVID
     /// has arrived from the agent (or after `INITIAL_SVID_TIMEOUT`).
     pub async fn new(config: SpireAgentCaConfig) -> Result<Self, CaError> {
-        let current: Arc<ArcSwap<Option<AgentSnapshot>>> = Arc::new(ArcSwap::new(Arc::new(None)));
-        let first_ready = Arc::new(Notify::new());
-        let first_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Spawn the background stream loop.
-        let stream_task = tokio::spawn(stream_loop(
-            config.socket_path.clone(),
-            Arc::clone(&current),
-            Arc::clone(&first_ready),
-            Arc::clone(&first_received),
-        ));
+        // The X.509 stream is the shared Workload API fetch loop (issue #7075),
+        // labelled `spire_agent` so its CA-health and rotation-failure series
+        // match the mesh SPIRE producer's.
+        let svid = SvidFetchHandle::new();
+        let stream_task = spawn_fetch_loop_with_handle(
+            FetchLoopConfig {
+                socket_path: config.socket_path.clone(),
+                expected_spiffe_id: None,
+                reconnect_backoff: RECONNECT_BACKOFF_INITIAL,
+                max_reconnect_backoff: RECONNECT_BACKOFF_MAX,
+                metrics_source: FetchLoopMetricsSource::SpireAgent,
+            },
+            svid.clone(),
+        );
         // JWT trust material rides its own stream (issue #3617). It is
         // deliberately NOT joined to the X.509 stream's readiness: a deployment
         // that issues no JWT-SVIDs must still start, and JWT bundles are not
@@ -152,9 +152,7 @@ impl SpireAgentCa {
         ));
         let ca = Self {
             config: config.clone(),
-            current: Arc::clone(&current),
-            first_ready: Arc::clone(&first_ready),
-            first_received: Arc::clone(&first_received),
+            svid,
             stream_task_abort: stream_task.abort_handle(),
             jwt_bundles: Arc::clone(&jwt_bundles),
             jwt_stream_task_abort: jwt_stream_task.abort_handle(),
@@ -163,35 +161,24 @@ impl SpireAgentCa {
         drop(jwt_stream_task);
 
         // Wait for the first SVID with a timeout so startup does not hang
-        // indefinitely when the agent is unreachable.
-        let notified = first_ready.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-
-        if !first_received.load(std::sync::atomic::Ordering::Acquire) {
-            match tokio::time::timeout(INITIAL_SVID_TIMEOUT, notified).await {
-                Ok(()) => {
-                    crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
-                        "spire_agent",
-                        true,
-                    );
-                    info!(
-                        socket = %config.socket_path,
-                        "SPIRE agent CA: received initial SVID"
-                    );
-                }
-                Err(_) => {
-                    crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
-                        "spire_agent",
-                        false,
-                    );
-                    warn!(
-                        socket = %config.socket_path,
-                        timeout_secs = INITIAL_SVID_TIMEOUT.as_secs(),
-                        "SPIRE agent CA: timed out waiting for initial SVID — \
-                         CA will serve once the agent pushes one"
-                    );
-                }
+        // indefinitely when the agent is unreachable. CA health is published
+        // by the fetch loop itself (unhealthy before the first connect, healthy
+        // on each install), so this wait only logs. If this future is dropped
+        // while waiting, dropping `ca` aborts both background tasks.
+        match tokio::time::timeout(INITIAL_SVID_TIMEOUT, ca.svid.wait_for_first_svid()).await {
+            Ok(()) => {
+                info!(
+                    socket = %config.socket_path,
+                    "SPIRE agent CA: received initial SVID"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    socket = %config.socket_path,
+                    timeout_secs = INITIAL_SVID_TIMEOUT.as_secs(),
+                    "SPIRE agent CA: timed out waiting for initial SVID — \
+                     CA will serve once the agent pushes one"
+                );
             }
         }
 
@@ -203,29 +190,18 @@ impl SpireAgentCa {
         &self.config
     }
 
-    /// Snapshot the current SVID bundle. Returns `None` before the first
-    /// agent push.
-    fn snapshot(&self) -> Option<AgentSnapshot> {
-        let guard = self.current.load();
-        guard.as_ref().clone()
+    /// Snapshot the current SVID bundle. The inner value is `None` before the
+    /// first agent push.
+    fn snapshot(&self) -> Arc<Option<SvidBundle>> {
+        self.svid.snapshot()
     }
 
     /// Block until the first SVID arrives.
     ///
-    /// Race-free: registers a waiter before checking the flag — same
-    /// pattern as [`crate::identity::workload_api::fetch_loop::SvidFetchHandle`].
+    /// Race-free: delegates to [`SvidFetchHandle::wait_for_first_svid`],
+    /// which registers a waiter before checking the flag.
     pub async fn wait_for_first_svid(&self) {
-        let notified = self.first_ready.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-
-        if self
-            .first_received
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        notified.await;
+        self.svid.wait_for_first_svid().await;
     }
 }
 
@@ -233,108 +209,6 @@ impl Drop for SpireAgentCa {
     fn drop(&mut self) {
         self.stream_task_abort.abort();
         self.jwt_stream_task_abort.abort();
-    }
-}
-
-/// Background loop that keeps the snapshot up to date. Never returns
-/// unless the task is cancelled.
-async fn stream_loop(
-    socket_path: String,
-    current: Arc<ArcSwap<Option<AgentSnapshot>>>,
-    first_ready: Arc<Notify>,
-    first_received: Arc<std::sync::atomic::AtomicBool>,
-) {
-    let mut backoff = RECONNECT_BACKOFF_INITIAL;
-    // Track the last successfully-fetched SPIFFE ID so subsequent rotation
-    // failures attribute to the actual workload identity instead of "unknown".
-    // Per-workload alerting (e.g. `ferrum_mesh_cert_rotation_failures_total`
-    // grouped by `spiffe_id`) needs this label to be stable across reconnects.
-    let attributed_spiffe_id = |current: &Arc<ArcSwap<Option<AgentSnapshot>>>| -> String {
-        current
-            .load_full()
-            .as_ref()
-            .as_ref()
-            .map(|snap| snap.bundle.spiffe_id.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-
-    loop {
-        match WorkloadApiClient::connect(&socket_path).await {
-            Ok(mut client) => match client.fetch_x509_svid_stream(None).await {
-                Ok((mut stream, _first_signal)) => {
-                    info!(socket = %socket_path, "SPIRE agent CA: stream established");
-                    backoff = RECONNECT_BACKOFF_INITIAL;
-
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(bundle) => {
-                                debug!(
-                                    spiffe_id = %bundle.spiffe_id,
-                                    "SPIRE agent CA: received SVID"
-                                );
-                                record_spire_bundle_metrics(&bundle);
-                                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
-                                    "spire_agent",
-                                    true,
-                                );
-                                let snapshot = AgentSnapshot { bundle };
-                                current.store(Arc::new(Some(snapshot)));
-
-                                let was_first =
-                                    first_received.swap(true, std::sync::atomic::Ordering::AcqRel);
-                                if !was_first {
-                                    first_ready.notify_waiters();
-                                }
-                            }
-                            Err(e) => {
-                                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
-                                    "spire_agent",
-                                    false,
-                                );
-                                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                                    attributed_spiffe_id(&current),
-                                    "spire_agent",
-                                );
-                                warn!(
-                                    error = %e,
-                                    "SPIRE agent CA: stream error — reconnecting"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health(
-                        "spire_agent",
-                        false,
-                    );
-                    crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                        attributed_spiffe_id(&current),
-                        "spire_agent",
-                    );
-                    error!(
-                        error = %e,
-                        "SPIRE agent CA: stream RPC failed"
-                    );
-                }
-            },
-            Err(e) => {
-                crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("spire_agent", false);
-                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                    attributed_spiffe_id(&current),
-                    "spire_agent",
-                );
-                error!(
-                    error = %e,
-                    socket = %socket_path,
-                    "SPIRE agent CA: failed to connect"
-                );
-            }
-        }
-
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
 }
 
@@ -355,28 +229,6 @@ fn leaf_not_after(cert_chain_der: &[Vec<u8>]) -> Result<chrono::DateTime<chrono:
         })
 }
 
-fn record_spire_bundle_metrics(bundle: &crate::identity::SvidBundle) {
-    if let Ok(not_after) = leaf_not_after(&bundle.cert_chain_der) {
-        crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
-            &bundle.spiffe_id,
-            "spire_agent",
-            &not_after,
-        );
-    }
-    crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle_roots(
-        bundle.trust_bundles.local.trust_domain.as_str(),
-        "spire_agent",
-        bundle.trust_bundles.local.x509_authorities.as_slice(),
-    );
-    for federated in bundle.trust_bundles.federated.values() {
-        crate::plugins::mesh::prometheus_helpers::record_mesh_trust_bundle_roots(
-            federated.trust_domain.as_str(),
-            "spire_agent",
-            federated.x509_authorities.as_slice(),
-        );
-    }
-}
-
 #[async_trait]
 impl CertificateAuthority for SpireAgentCa {
     /// Return the current SVID from the agent snapshot.
@@ -385,7 +237,8 @@ impl CertificateAuthority for SpireAgentCa {
     /// agent controls issuance. The returned `SignedSvid` always reflects the
     /// latest agent-pushed SVID.
     async fn issue_svid(&self, req: IssuanceRequest) -> Result<SignedSvid, CaError> {
-        let snap = self.snapshot().ok_or_else(|| {
+        let snap = self.snapshot();
+        let bundle = snap.as_ref().as_ref().ok_or_else(|| {
             CaError::Upstream(
                 "SPIRE agent has not yet pushed an SVID — is the agent running and \
                  is this workload registered?"
@@ -405,38 +258,38 @@ impl CertificateAuthority for SpireAgentCa {
             IssuanceRequest::Generate { spiffe_id, .. } => spiffe_id,
         };
 
-        if requested_id != &snap.bundle.spiffe_id {
+        if requested_id != &bundle.spiffe_id {
             return Err(CaError::BadCsr(format!(
                 "requested SPIFFE ID '{}' does not match agent-issued SVID '{}'; \
                  the SPIRE agent controls identity assignment",
-                requested_id, snap.bundle.spiffe_id
+                requested_id, bundle.spiffe_id
             )));
         }
 
-        let not_after = leaf_not_after(&snap.bundle.cert_chain_der)?;
+        let not_after = leaf_not_after(&bundle.cert_chain_der)?;
         crate::plugins::mesh::prometheus_helpers::record_mesh_cert_expiry_at(
-            &snap.bundle.spiffe_id,
+            &bundle.spiffe_id,
             "spire_agent",
             &not_after,
         );
         crate::plugins::mesh::prometheus_helpers::set_mesh_ca_health("spire_agent", true);
 
         Ok(SignedSvid {
-            spiffe_id: snap.bundle.spiffe_id.clone(),
-            cert_chain_der: snap.bundle.cert_chain_der.clone(),
-            private_key_pkcs8_der: snap.bundle.private_key_pkcs8_der.clone(),
+            spiffe_id: bundle.spiffe_id.clone(),
+            cert_chain_der: bundle.cert_chain_der.clone(),
+            private_key_pkcs8_der: bundle.private_key_pkcs8_der.clone(),
             not_after,
         })
     }
 
     async fn trust_bundle(&self, td: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
-        let snap = self.snapshot().ok_or_else(|| {
+        let snap = self.snapshot();
+        let svid_bundle = snap.as_ref().as_ref().ok_or_else(|| {
             CaError::Upstream("SPIRE agent has not yet pushed trust bundles".to_string())
         })?;
 
         // Check local bundle first, then federated.
-        let bundle = snap
-            .bundle
+        let bundle = svid_bundle
             .trust_bundles
             .get(td)
             .ok_or_else(|| CaError::UnknownTrustDomain(td.to_string()))?;
@@ -499,11 +352,11 @@ impl CertificateAuthority for SpireAgentCa {
         // to whatever the X.509 bundle set carried (a native/file-sourced
         // deployment can populate `TrustBundle.jwt_authorities` directly), and
         // distinguish "no JWT keys" from "not a trust domain we hold at all".
-        let snap = self.snapshot().ok_or_else(|| {
+        let snap = self.snapshot();
+        let svid_bundle = snap.as_ref().as_ref().ok_or_else(|| {
             CaError::Upstream("SPIRE agent has not yet pushed trust bundles".to_string())
         })?;
-        let bundle = snap
-            .bundle
+        let bundle = svid_bundle
             .trust_bundles
             .get(td)
             .ok_or_else(|| CaError::UnknownTrustDomain(td.to_string()))?;
@@ -590,7 +443,6 @@ async fn jwt_bundle_stream_loop(socket_path: String, jwt_bundles: Arc<ArcSwap<Jw
 #[cfg(test)]
 mod tests {
     use std::future;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use crate::identity::ca::CertificateAuthority;
@@ -631,9 +483,7 @@ mod tests {
         let jwt_stream_task_abort = stream_task_abort.clone();
         SpireAgentCa {
             config: SpireAgentCaConfig::default(),
-            current: Arc::new(ArcSwap::new(Arc::new(Some(AgentSnapshot { bundle })))),
-            first_ready: Arc::new(Notify::new()),
-            first_received: Arc::new(AtomicBool::new(true)),
+            svid: SvidFetchHandle::from_slot(Arc::new(ArcSwap::new(Arc::new(Some(bundle))))),
             stream_task_abort,
             jwt_bundles: Arc::new(ArcSwap::new(Arc::new(JwtBundleSet::new()))),
             jwt_stream_task_abort,
@@ -693,7 +543,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), ca.wait_for_first_svid())
             .await
             .expect("ready snapshot should not block");
-        assert!(ca.first_received.load(Ordering::Acquire));
+        assert!(ca.snapshot().is_some());
 
         drop(ca);
         let _ = stream_task.await;

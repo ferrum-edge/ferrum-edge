@@ -237,6 +237,11 @@ use url::{Host, Url};
 use super::utils::ai_model_glob::{
     MAX_MODEL_PATTERNS_PER_PROVIDER, is_valid_model_pattern, matches_model_glob,
 };
+use super::utils::ai_translation::{
+    MAX_TOOL_ARGUMENTS_BYTES, ParsedToolCall, ToolArgumentsField, parse_openai_tool_calls,
+    parse_tool_arguments_object, present_tool_calls, screen_gemini_strict_schema_document,
+    tool_result_text, valid_tool_call_id, valid_tool_name,
+};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::content_encoding::{
     DecodeLimits, decode_content_encoding, parse_content_codings,
@@ -1832,13 +1837,6 @@ fn gemini_user_parts(content: &Value) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-#[derive(Clone)]
-struct ParsedToolCall {
-    id: String,
-    name: String,
-    arguments: Value,
-}
-
 /// Upper bound on one Gemini thought signature (base64 text bytes).
 const MAX_THOUGHT_SIGNATURE_BYTES: usize = 64 * 1024;
 
@@ -1894,142 +1892,8 @@ fn openai_tool_call_thought_signature(
         .ok_or_else(malformed)
 }
 
-/// Upper bound on a tool/function-call `arguments` JSON string (bytes).
-const MAX_TOOL_ARGUMENTS_BYTES: usize = 256 * 1024;
-/// Upper bound on a modern tool-call or tool-result ID (bytes).
-const MAX_TOOL_CALL_ID_BYTES: usize = 128;
-
-fn valid_tool_call_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= MAX_TOOL_CALL_ID_BYTES
-}
-
-fn valid_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-}
-
-#[derive(Clone, Copy)]
-enum ToolArgumentsField {
-    Modern {
-        message_index: usize,
-        tool_index: usize,
-    },
-    Legacy {
-        message_index: usize,
-    },
-}
-
-impl ToolArgumentsField {
-    fn error(self, detail: &str) -> String {
-        match self {
-            Self::Modern {
-                message_index,
-                tool_index,
-            } => format!("messages[{message_index}].tool_calls[{tool_index}] {detail}"),
-            Self::Legacy { message_index } => {
-                format!("messages[{message_index}].function_call {detail}")
-            }
-        }
-    }
-}
-
 fn legacy_tool_use_id(message_index: usize) -> String {
     format!("call_legacy_{message_index}")
-}
-
-fn parse_tool_arguments_object(
-    arguments: &str,
-    field: ToolArgumentsField,
-) -> Result<Value, String> {
-    if arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
-        return Err(field.error("arguments exceed the maximum allowed size"));
-    }
-    let parsed: Value = serde_json::from_str(arguments).map_err(|_| {
-        // Field-specific only: never echo argument bytes (may hold credentials).
-        field.error("arguments are not valid JSON")
-    })?;
-    if !parsed.is_object() {
-        return Err(field.error("arguments must encode a JSON object"));
-    }
-    Ok(parsed)
-}
-
-fn parse_openai_tool_calls(
-    message: &Value,
-    message_index: usize,
-) -> Result<Vec<ParsedToolCall>, String> {
-    let Some(tool_calls_value) = message.get("tool_calls") else {
-        return Ok(Vec::new());
-    };
-    if tool_calls_value.is_null() {
-        return Ok(Vec::new());
-    }
-    let tool_calls = tool_calls_value
-        .as_array()
-        .ok_or_else(|| format!("messages[{message_index}].tool_calls must be an array"))?;
-    if tool_calls.is_empty() {
-        return Err(format!(
-            "messages[{message_index}].tool_calls must not be empty"
-        ));
-    }
-
-    let mut parsed = Vec::with_capacity(tool_calls.len());
-    for (tool_index, call) in tool_calls.iter().enumerate() {
-        let call_object = call.as_object().ok_or_else(|| {
-            format!("messages[{message_index}].tool_calls[{tool_index}] must be an object")
-        })?;
-        if call_object.get("type").and_then(Value::as_str) != Some("function") {
-            return Err(format!(
-                "messages[{message_index}].tool_calls[{tool_index}] must have type 'function'"
-            ));
-        }
-        let id = call_object
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| valid_tool_call_id(value))
-            .ok_or_else(|| {
-                format!("messages[{message_index}].tool_calls[{tool_index}] missing id")
-            })?;
-        let function = call_object
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                format!("messages[{message_index}].tool_calls[{tool_index}] missing function")
-            })?;
-        let name = function
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| valid_tool_name(value))
-            .ok_or_else(|| {
-                format!(
-                    "messages[{message_index}].tool_calls[{tool_index}] has invalid function name"
-                )
-            })?;
-        let arguments = function
-            .get("arguments")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "messages[{message_index}].tool_calls[{tool_index}] arguments must be a JSON string"
-                )
-            })?;
-        let arguments = parse_tool_arguments_object(
-            arguments,
-            ToolArgumentsField::Modern {
-                message_index,
-                tool_index,
-            },
-        )?;
-        parsed.push(ParsedToolCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            arguments,
-        });
-    }
-    Ok(parsed)
 }
 
 /// Parse a legacy OpenAI assistant `function_call` into one Anthropic-bound tool use.
@@ -2072,30 +1936,6 @@ fn parse_openai_function_call(
     }))
 }
 
-fn tool_result_text(content: &Value) -> Result<String, String> {
-    if let Some(text) = content.as_str() {
-        return Ok(text.to_string());
-    }
-    if content.is_null() {
-        return Ok(String::new());
-    }
-    let parts = content
-        .as_array()
-        .ok_or("tool message content must be a string or text-parts array")?;
-    let mut text = String::new();
-    for (index, part) in parts.iter().enumerate() {
-        if part.get("type").and_then(Value::as_str) != Some("text") {
-            return Err(format!("tool message content[{index}] must be a text part"));
-        }
-        text.push_str(
-            part.get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("tool message content[{index}] missing text"))?,
-        );
-    }
-    Ok(text)
-}
-
 fn anthropic_text_content_blocks(text: &str) -> Vec<Value> {
     if text.is_empty() {
         Vec::new()
@@ -2129,9 +1969,7 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
             return Err(format!("messages[{index}] has unsupported role '{role}'"));
         }
 
-        let has_tool_calls = message_object
-            .get("tool_calls")
-            .is_some_and(|value| !value.is_null());
+        let has_tool_calls = present_tool_calls(message).is_some();
         let legacy_call = parse_openai_function_call(message, index)?;
         let has_legacy_call = legacy_call.is_some();
 
@@ -2347,9 +2185,7 @@ fn validate_anthropic_translation(
             .rev()
             .find(|message| message["role"].as_str() == Some("assistant"))
             .is_some_and(|message| {
-                message
-                    .get("tool_calls")
-                    .is_some_and(|value| !value.is_null())
+                present_tool_calls(message).is_some()
                     || message
                         .get("function_call")
                         .is_some_and(|value| !value.is_null())
@@ -2531,119 +2367,6 @@ enum ResponseFormat<'a> {
     JsonSchema { schema: &'a Value, strict: bool },
 }
 
-/// JSON Schema keywords Gemini `responseJsonSchema` documents as enforced.
-/// Deliberately conservative: an unlisted keyword (`minLength`, `pattern`,
-/// `uniqueItems`, `oneOf`, `const`, ...) is treated as unenforced, so a strict
-/// schema using it is refused rather than silently weakened.
-const GEMINI_STRICT_SCHEMA_KEYWORDS: &[&str] = &[
-    "type",
-    "title",
-    "description",
-    "enum",
-    "format",
-    "anyOf",
-    "$ref",
-    "$defs",
-    "properties",
-    "required",
-    "additionalProperties",
-    "items",
-    "prefixItems",
-    "minItems",
-    "maxItems",
-    "minimum",
-    "maximum",
-];
-
-/// String `format` values Gemini documents as enforced.
-const GEMINI_STRICT_SCHEMA_FORMATS: &[&str] = &["date-time", "date", "time"];
-
-/// Non-`$` keywords that may sit beside `$ref`: annotations that change no
-/// constraint. `$`-prefixed siblings (`$defs`) are reference/definition
-/// metadata Gemini permits beside `$ref`; every keyword still has to pass
-/// [`GEMINI_STRICT_SCHEMA_KEYWORDS`], and `$defs` entries are screened too.
-const GEMINI_REF_SIBLING_ANNOTATIONS: &[&str] = &["title", "description"];
-
-/// Nesting bound for the strict-schema screen; deeper schemas are refused
-/// rather than walked, so hostile nesting cannot grow the stack.
-const MAX_STRICT_SCHEMA_DEPTH: usize = 32;
-
-/// Check one strict JSON Schema node (and every nested subschema) against the
-/// Gemini-enforced subset. Diagnostics are fixed and never echo schema keys or
-/// values.
-fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), &'static str> {
-    if depth > MAX_STRICT_SCHEMA_DEPTH {
-        return Err("strict response_format json_schema nests too deeply for Gemini translation");
-    }
-    let object = match schema {
-        // Boolean subschemas (`true` / `false`) carry no keywords.
-        Value::Bool(_) => return Ok(()),
-        Value::Object(object) => object,
-        _ => return Err("strict response_format json_schema contains a non-object subschema"),
-    };
-    if object.contains_key("$ref")
-        && object.keys().any(|keyword| {
-            !keyword.starts_with('$') && !GEMINI_REF_SIBLING_ANNOTATIONS.contains(&keyword.as_str())
-        })
-    {
-        return Err(
-            "strict response_format json_schema combines `$ref` with sibling constraints, which Gemini does not apply",
-        );
-    }
-    for (keyword, value) in object {
-        if !GEMINI_STRICT_SCHEMA_KEYWORDS.contains(&keyword.as_str()) {
-            return Err(
-                "strict response_format json_schema uses a keyword Gemini does not enforce",
-            );
-        }
-        match keyword.as_str() {
-            "format" => {
-                if !value
-                    .as_str()
-                    .is_some_and(|format| GEMINI_STRICT_SCHEMA_FORMATS.contains(&format))
-                {
-                    return Err(
-                        "strict response_format json_schema uses a `format` Gemini does not enforce (supported: date-time, date, time)",
-                    );
-                }
-            }
-            "$ref" => {
-                // Only document-local references resolve inside the schema the
-                // provider receives.
-                if !value
-                    .as_str()
-                    .is_some_and(|reference| reference.starts_with('#'))
-                {
-                    return Err(
-                        "strict response_format json_schema `$ref` must be a local `#...` reference",
-                    );
-                }
-            }
-            "properties" | "$defs" => {
-                let members = value.as_object().ok_or(
-                    "strict response_format json_schema `properties` / `$defs` must be an object",
-                )?;
-                for member in members.values() {
-                    screen_gemini_strict_schema(member, depth + 1)?;
-                }
-            }
-            "anyOf" | "prefixItems" => {
-                let members = value.as_array().ok_or(
-                    "strict response_format json_schema `anyOf` / `prefixItems` must be an array",
-                )?;
-                for member in members {
-                    screen_gemini_strict_schema(member, depth + 1)?;
-                }
-            }
-            "items" | "additionalProperties" => {
-                screen_gemini_strict_schema(value, depth + 1)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 fn openai_response_format(
     openai_body: &Value,
 ) -> Result<Option<ResponseFormat<'_>>, ParamRejection> {
@@ -2762,8 +2485,11 @@ fn validate_gemini_request_params(openai_body: &Value) -> Result<(), ParamReject
         strict: true,
     }) = openai_response_format(openai_body)?
     {
-        screen_gemini_strict_schema(schema, 0)
-            .map_err(|message| ParamRejection::unsupported("response_format", message))?;
+        // One strict-schema contract for both AI route kinds (issue #7070).
+        // The fixed diagnostic never echoes schema keys or values.
+        screen_gemini_strict_schema_document(schema).map_err(|refusal| {
+            ParamRejection::unsupported("response_format", refusal.to_string())
+        })?;
     }
     // Gemini has no switch that limits a turn to one function call, so a
     // client that disabled parallel calls for callable tools cannot have that

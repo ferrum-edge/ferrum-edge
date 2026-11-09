@@ -165,7 +165,12 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
 /// char-boundary violation.
 ///
 /// Per gRPC spec the digit portion is at most 8 ASCII digits.
-fn parse_grpc_timeout(val: &str) -> Option<Duration> {
+///
+/// This is the single `grpc-timeout` grammar: the proxy's own deadline reader
+/// (`grpc_proxy::parse_grpc_timeout_value`) projects this result through
+/// [`duration_millis_ceil_saturating`], so the plugin and the transport cannot
+/// drift on validation or sub-millisecond rounding.
+pub(crate) fn parse_grpc_timeout(val: &str) -> Option<Duration> {
     let bytes = val.as_bytes();
     if bytes.is_empty() {
         return None;

@@ -36,6 +36,7 @@ mod unit {
         mod ai_token_metrics_tests;
         mod ai_tool_governor_tests;
         mod ai_transcript_audit_tests;
+        mod ai_translation_parity_tests;
         mod ai_usage_stream_tests;
         mod ambient_cloud_credentials_tests;
         mod api_chargeback_sink_tests;

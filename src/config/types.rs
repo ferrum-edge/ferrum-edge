@@ -1063,12 +1063,12 @@ pub struct UpstreamPortOverride {
     /// Per-port PER-CONNECTION HTTP/2 stream cap mapped from DestinationRule
     /// `connectionPool.http.maxConcurrentStreams`. Projected onto the per-target
     /// effective proxy's `pool_http2_max_concurrent_streams` and threaded
-    /// into the H2/gRPC backend builders via
-    /// `http2::Builder::max_concurrent_streams` (peer SETTINGS) and
-    /// `initial_max_send_streams` (local outbound-stream initial cap).
-    /// Applies to direct-H2 and gRPC pool entries; those pools include the
-    /// effective value in their base keys (`none` when unset) so update/delete
-    /// cannot reuse a connection built under a prior limit. Reqwest's H2 path
+    /// into every hyper H2 backend builder (direct H2, gRPC, mesh mTLS, and the
+    /// nested-HBONE gRPC dial) via `http2::Builder::max_concurrent_streams`
+    /// (peer SETTINGS) and `initial_max_send_streams` (local outbound-stream
+    /// initial cap). Those pools include the effective value in their keys
+    /// (`none` when unset) so update/delete cannot reuse a connection built
+    /// under a prior limit. Reqwest's H2 path
     /// does not expose the same builder knob today and therefore does not
     /// key on it. This is one connection's transport state and is deliberately
     /// NOT the destination request budget (`http2_max_requests`): a peer's

@@ -1102,6 +1102,73 @@ fn test_parse_grpc_timeout_sub_millisecond_clamps_to_1() {
 }
 
 #[test]
+fn test_parse_grpc_timeout_sub_millisecond_rounds_up() {
+    // Issue #7072: the proxy used to floor `u`/`n` values, so `1500u` became
+    // 1 ms here but 2 ms on a route with the `grpc_deadline` plugin.
+    let headers = headers_with_grpc_timeout("1500u");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(2));
+    let headers = headers_with_grpc_timeout("999999n");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(1));
+    let headers = headers_with_grpc_timeout("1000001n");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(2));
+}
+
+/// Issue #7072: the proxy deadline reader and the `grpc_deadline` plugin must
+/// agree on every `grpc-timeout` value: the same accept/reject decision, and
+/// the proxy's milliseconds equal the plugin's ceiling projection (zero stays
+/// "absent" in both).
+#[test]
+fn proxy_and_grpc_deadline_plugin_parse_grpc_timeout_identically() {
+    use ferrum_edge::_test_support::{
+        grpc_deadline_duration_millis_ceil_saturating_for_test as plugin_ms,
+        grpc_deadline_parse_grpc_timeout_for_test as plugin_parse,
+        grpc_proxy_parse_grpc_timeout_value_for_test as proxy_parse,
+    };
+
+    // (wire value, expected proxy milliseconds)
+    let cases: &[(&str, Option<u64>)] = &[
+        ("1H", Some(3_600_000)),
+        ("2M", Some(120_000)),
+        ("5S", Some(5_000)),
+        ("200m", Some(200)),
+        ("5000u", Some(5)),
+        ("5000000n", Some(5)),
+        ("1500u", Some(2)),
+        ("999999n", Some(1)),
+        ("1n", Some(1)),
+        ("1u", Some(1)),
+        ("99999999m", Some(99_999_999)),
+        ("99999999H", Some(99_999_999 * 3_600_000)),
+        ("999999999m", None),
+        ("123456789S", None),
+        ("", None),
+        ("m", None),
+        ("0m", None),
+        ("0S", None),
+        ("00000000n", None),
+        ("5X", None),
+        ("5\u{00e9}", None),
+        ("5\u{2126}", None),
+        ("+5S", None),
+        ("-5S", None),
+        (" 5S", None),
+        ("5 S", None),
+        ("5S ", None),
+        ("abcS", None),
+        ("1.5S", None),
+    ];
+    for (value, expected) in cases {
+        let proxy = proxy_parse(value);
+        assert_eq!(proxy, *expected, "proxy parse of {value:?}");
+        let plugin = plugin_parse(value).and_then(plugin_ms);
+        assert_eq!(
+            proxy, plugin,
+            "proxy and grpc_deadline must agree on {value:?}"
+        );
+    }
+}
+
+#[test]
 fn test_parse_grpc_timeout_zero_returns_none() {
     let headers = headers_with_grpc_timeout("0S");
     assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
