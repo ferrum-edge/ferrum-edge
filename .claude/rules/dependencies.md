@@ -113,10 +113,12 @@ sections:
   (`ci_runtime_plan.decide_relevance` over merged PRs). → "NodeWaypoint
   relevance contract".
 - Fuzz lane (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, `FUZZ_WORKFLOW`,
-  `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`): both shapes are byte-frozen once
-  adopted; a `fuzz-smoke` change appends a one-way successor generation that
-  carries each `CI_FUZZ_SMOKE_*_BUDGET` text exactly once. → "Admitted
-  `fuzz-smoke` generations".
+  `FUZZ_SANITIZER_SMOKE_WORKFLOW`, `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`): all
+  three shapes are byte-frozen once adopted; a `fuzz-smoke` change appends a
+  one-way successor generation. Each `CI_FUZZ_SMOKE_*_BUDGET` text appears
+  exactly once in its host (a generation that carries the budget, or
+  `fuzz-smoke-main.yml` beside one that does not; `fuzz_budget_placement_errors`).
+  → "Admitted `fuzz-smoke` generations".
 - Release image families (`RELEASE_IMAGE_FAMILY_GENERATIONS`): `release.yml` is
   either the two-family shape or the complete three-family `-ebpf-tools`
   contract; the trusted base decides, and a three-family base refuses a revert.

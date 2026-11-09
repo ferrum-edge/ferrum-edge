@@ -281,18 +281,29 @@ shares.
 
 - Hostile-parser fuzzing lives in the isolated `fuzz/` cargo-fuzz workspace; see
   `docs/fuzz.md` for budgets, corpora policy, and crash promotion.
-- Ordinary full-mode PR CI runs the deterministic `Fuzz Smoke` property gate
-  (`cargo test --locked` in `fuzz/`) in `.github/workflows/ci.yml`.
-- The bounded sanitizer smoke runs on push to `main` and manual
-  `workflow_dispatch` of `ci.yml` only -- not on `pull_request` (#3902, cost)
-  and not on `merge_group` (#4238, blast radius). Six targets run at
-  `-runs=512`, `-max_total_time=8`, `-max_len=4096`; `datagram_client_address`
-  runs as its own invocation at the same bounds with `-max_len=65536`, its
-  documented 64 KiB budget (#4442), and `ocsp_response` / `jwt_svid` /
-  `tls_material` (#6584) run as their own loop at the same 64 KiB `-max_len`.
-- `Swatinem/rust-cache` `save-if` for that job is strictly a push to `main`;
-  pull_request, fork, merge_group, and workflow_dispatch never publish a
-  `fuzz-smoke` cache.
+- Ordinary full-mode CI runs the deterministic `Fuzz Smoke` property gate
+  (`cargo test --locked` in `fuzz/`) in `.github/workflows/ci.yml` on every
+  event; it is the only fuzz job in the required `Tests` aggregate.
+- The bounded sanitizer smoke runs in its own workflow,
+  `.github/workflows/fuzz-smoke-main.yml`, on push to `main` and manual
+  `workflow_dispatch` only -- not on `pull_request` (#3902, cost) and not on
+  `merge_group` (#4238, blast radius) -- and is not a required check, so its
+  ~55-minute sanitizer build stays off main's `CI` critical path. Six targets
+  run at `-runs=512`, `-max_total_time=8`, `-max_len=4096`;
+  `datagram_client_address` runs as its own invocation at the same bounds with
+  `-max_len=65536`, its documented 64 KiB budget (#4442), and `ocsp_response` /
+  `jwt_svid` / `tls_material` (#6584) run as their own loop at the same 64 KiB
+  `-max_len`. A new fuzz target must be scheduled in that file and in
+  `fuzz.yml` (`fuzz_target_schedule_parity_tests.rs`).
+- Fuzz caches: `fuzz-property-smoke` holds only the line-tables-only property
+  build; `fuzz-sanitizer-smoke` holds only the Cargo registry
+  (`cache-targets: "false"`). Do not cache the sanitizer target directory: the
+  retired combined `fuzz-smoke` entry was 7.2 GB and evicted
+  `ci-standalone-cargo`. Both smoke caches' `save-if` is strictly a push to
+  `main`; pull_request, fork, merge_group, and workflow_dispatch never publish
+  them (the scheduled `fuzz.yml` `fuzz-sanitized` cache is a separate frozen
+  contract). `fuzz-smoke-main.yml` uses `queue: max` so every push to `main`
+  gets its own sanitizer run; do not drop it.
 - Longer sanitizer-backed runs remain scheduled in `.github/workflows/fuzz.yml`.
 
 ## CI Expectations

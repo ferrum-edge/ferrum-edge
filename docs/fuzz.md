@@ -22,8 +22,8 @@ only under `fuzz/` — the production `ferrum-edge` binary does not depend on th
 The `datagram_client_address` target parses attacker-controlled UDP bytes
 entirely **before** the MAC decision, so it is scheduled in **both** required
 lanes (issue #4442): the `.github/workflows/fuzz.yml` sanitizer matrix and its
-shell allowlist, and the byte-frozen `fuzz-smoke` bounded budget in
-`.github/workflows/ci.yml`. Its entry point walks the header, both
+shell allowlist, and the byte-frozen push-to-main bounded budget in
+`.github/workflows/fuzz-smoke-main.yml`. Its entry point walks the header, both
 application-reserved TLVs (`0xE0` authentication tag, `0xE1` freshness record),
 and — when a freshness TLV is present — the fixed-length freshness value.
 The structural parser the target exercises permits either TLV to be absent
@@ -36,8 +36,8 @@ envelope here is deliberate and is not an authentication decision.
 Both lanes run it at `-max_len=65536`, the target's documented 64 KiB budget
 (`fuzz_support::MAX_FUZZ_INPUT_BYTES`), rather than the smoke loop's generic
 4 KiB ceiling: a parser whose length boundaries are reachable in one required
-lane and unreachable in the other is not actually scheduled. In the smoke job
-it is therefore its own invocation rather than a seventh entry in the
+lane and unreachable in the other is not actually scheduled. In the bounded
+budget it is therefore its own invocation rather than a seventh entry in the
 six-target loop; every other bound (`-runs=512`, `-max_total_time=8`,
 `-timeout=2`, `-rss_limit_mb=1024`) matches the loop's.
 
@@ -77,55 +77,63 @@ rejects crash artifacts larger than 64 KiB before upload.
 - **PR gate** (`ci.yml` → `Fuzz Smoke`): the locked `proptest` smoke tests
   (`cargo test --locked` in `fuzz/`). This is a required gate for full-mode
   pull requests and merge-queue runs whose changes match the `run_fuzz_smoke`
-  path gate (see [ci_cd.md](ci_cd.md)); every other event runs it
-  unconditionally.
-- **Bounded libFuzzer budget** (same `Fuzz Smoke` job, `if: github.event_name ==
-  'push' || github.event_name == 'workflow_dispatch'`): six targets at ~8 s each
-  (`-runs=512`, `-max_total_time=8`, `-max_len=4096`, `-timeout=2`,
-  `-rss_limit_mb=1024`), then `ocsp_response`, `jwt_svid`, and `tls_material`
-  (issue #6584) and
-  `datagram_client_address` (issue #4442) at the same bounds with
-  `-max_len=65536`. It runs on the push to `main` and on manual
-  `workflow_dispatch` of `ci.yml` only (#3902 moved it off `pull_request` for
-  cost, #4238 off `merge_group` for blast radius; the bounds did not change).
-  Every merged change still reaches the budget seconds later through
-  the push to `main`, which is also the only event permitted to populate this
-  lane's cache.
+  path gate (see [ci_cd.md](ci_cd.md)); every other event, including the push
+  to `main`, runs it unconditionally. It caches only the property build, at
+  line-tables-only debuginfo, under the `fuzz-property-smoke` key, which only a
+  push to `main` may write.
+- **Bounded libFuzzer budget** (`.github/workflows/fuzz-smoke-main.yml` →
+  `Fuzz sanitizer smoke`): six targets at `-runs=512`, `-max_total_time=8`,
+  `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024`, then `ocsp_response`,
+  `jwt_svid`, and `tls_material` (issue #6584) and `datagram_client_address`
+  (issue #4442) at the same bounds with `-max_len=65536`. It runs on every push
+  to `main` and on manual `workflow_dispatch` only (#3902 moved it off
+  `pull_request` for cost, #4238 off `merge_group` for blast radius; the bounds
+  did not change). Every push to `main` gets its own run of its own commit:
+  runs are serialized and never cancelled, and `queue: max` keeps pending runs
+  queued instead of letting a newer push replace them, so a busy day builds a
+  backlog rather than skipping commits. It is not a required check: until the 2026-11-09 test sweep
+  it was a step of the required `Fuzz Smoke` job, where its ~55-minute
+  sanitizer build kept main's serialized `CI` run open for 25–55 minutes after
+  every other job had finished, while every target reached `-runs=512` in 0–2
+  seconds. Its cache holds only the Cargo registry (`cache-targets: "false"`).
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer
   builds of all ten targets, 300 s per target at `-max_len=65536`, bounded
   crash artifacts uploaded after size/count checks, a 2048 MiB RSS cap, 7-day
   retention, and concurrency capped at two targets. Unchanged by #3902/#4238.
 
 `cargo fuzz run` defaults to AddressSanitizer, so the bounded budget is a
-sanitizer build in both lanes. That build, not the fuzzing, was the cost: the
-`Fuzz Smoke` job averaged ~47 minutes on pull requests, of which ~39 minutes was
-compiling the instrumented targets for ~48 seconds of fuzzing. The `Fuzz Smoke`
-job now uses the repository's checksum-pinned `setup-sccache` action and
-`Swatinem/rust-cache` (fuzz workspace, `fuzz-smoke` shared key); it holds only
-`contents: read` and uses no remote compiler-cache backend. `save-if` is
-strictly `${{ github.event_name == 'push' && github.ref ==
-'refs/heads/main' }}`: pull requests (including same-repository PR refs and
-forks), `merge_group`, and `workflow_dispatch` never publish a `fuzz-smoke`
-cache.
+sanitizer build in both libFuzzer lanes. That build, not the fuzzing, is the
+cost: about 47 minutes for the first target plus about 8 minutes of serial
+per-target rebuilds, for fewer than ten seconds of fuzzing in total. Caching
+the sanitizer target directory did not help: rust-cache drops the
+`ferrum-edge` path dependency and every vendored patch crate, so a restore
+(about three minutes for 7.2 GB) saved about three minutes of compile, and the
+entry evicted `ci-standalone-cargo` on alternate main runs. The property gate
+uses the repository's checksum-pinned `setup-sccache` action and
+`Swatinem/rust-cache`; it holds only `contents: read` and uses no remote
+compiler-cache backend. Both smoke caches (`fuzz-property-smoke` and
+`fuzz-sanitizer-smoke`) save only under the strict `save-if`
+`${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`: pull
+requests (including same-repository PR refs and forks), `merge_group`, and
+`workflow_dispatch` never publish one. The scheduled `fuzz.yml` lane keeps its
+own frozen `fuzz-sanitized` cache, which runs only on `schedule` and
+`workflow_dispatch` and has no such predicate.
 The credential-bearing sccache GHA backend is never enabled. After a
 successful property-smoke command the run logs `Fuzz property smoke seconds`,
 and after a successful sanitizer budget `Fuzz sanitizer lane seconds`; both
 echoes sit after their commands under `set -e`, so a failed or skipped
-command emits no duration line. Runs that execute the sanitizer budget print
-`sccache --show-stats` just before it, so the log shows directly whether the
-sanitizer build reused compilation. The closing report step runs on every
-outcome: it prints the lane shape the run took, a closing `--show-stats`, and
-the on-disk cache size. When sccache is unavailable both steps say so, and the
-closing step emits a warning annotation rather than letting caching fail
-silently.
+command emits no duration line. The property gate's closing report step runs
+on every outcome: it prints the lane shape, a closing `--show-stats`, and the
+on-disk cache size, and emits a warning annotation when sccache is
+unavailable.
 
-Both hosted shapes are byte-frozen by the trusted Cross build policy. The
+All three hosted shapes are byte-frozen by the trusted Cross build policy. The
 `fuzz-smoke` job is admitted as an ordered list of generations with one-way
-transitions (`CI_FUZZ_SMOKE_JOB_GENERATIONS`); see
-[ci_cd.md](ci_cd.md#admitted-fuzz-smoke-generations). Scheduling a new target
-therefore requires a new admitted generation of that job (and moving the
-`fuzz.yml` whole-file freeze with it), a direct-to-`main` trusted-policy change
-that no pull request can carry.
+transitions (`CI_FUZZ_SMOKE_JOB_GENERATIONS`); `fuzz.yml` (`FUZZ_WORKFLOW`) and
+`fuzz-smoke-main.yml` (`FUZZ_SANITIZER_SMOKE_WORKFLOW`) are whole-file
+contracts; see [ci_cd.md](ci_cd.md#admitted-fuzz-smoke-generations).
+Scheduling a new target therefore moves both whole-file freezes, a
+trusted-policy change that no ordinary pull request can carry.
 
 The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
 `librdkafka` from source with OAuthBearer OIDC disabled. librdkafka 2.12.1
@@ -176,7 +184,7 @@ in the `fuzz/` crate per `docs/dependency-policy.md`.
 
 ## Compile-time resource observations (#4694)
 
-The main/manual sanitizer smoke step emits `Fuzz build resources:` JSON records
+The push-to-main / manual sanitizer smoke step (`fuzz-smoke-main.yml`) emits `Fuzz build resources:` JSON records
 to the hosted log during compilation and its sanitizer target run: samples 30
 seconds apart, capped at 240 records and two hours, holding only numeric host
 memory/swap, root-cgroup, and visible-process RSS counters (no process
@@ -189,7 +197,7 @@ double-count shared pages and root-cgroup counters may include other runner
 processes, so no sample alone proves a rustc OOM; compare the final samples and
 OOM counters with the runner's termination annotation.
 
-Both sanitizer lanes (`fuzz-smoke` on main/manual and the scheduled `fuzz.yml`)
+Both sanitizer lanes (`fuzz-smoke-main.yml` on main/manual and the scheduled `fuzz.yml`)
 add a bounded 12 GiB swap file under `/mnt` before building, because the
 AddressSanitizer release compile exceeds a 16 GiB RAM + 3 GiB swap runner (the
 2026-10-01 observer sample recorded a 14.6 GiB rustc RSS peak). Provisioning
