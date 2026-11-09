@@ -1921,30 +1921,14 @@ pub mod _test_support {
         )
     }
 
-    /// `Debug` rendering of the shared hyper HTTP/2 client builder
-    /// (`pool::hyper_h2_client_builder`); hyper's builder has no getters.
-    /// `pool_keepalive` selects `H2ClientKeepalive::FromPoolConfig` (else
-    /// `NotApplied`); `seed_initial_send_streams` selects
-    /// `H2ClientInitialSendStreams::FromStreamCap` (else `HyperDefault`).
-    pub fn hyper_h2_client_builder_debug_for_test(
+    /// The shared hyper HTTP/2 client builder every `PoolConfig`-driven pool
+    /// family uses (`pool::hyper_h2_client_builder`). hyper's builder has no
+    /// getters, but its `Debug` rendering covers the full HTTP/2 config, and it
+    /// can drive a real handshake over an in-memory transport.
+    pub fn hyper_h2_client_builder_for_test(
         pool_config: &crate::config::PoolConfig,
-        pool_keepalive: bool,
-        seed_initial_send_streams: bool,
-    ) -> String {
-        let keepalive = if pool_keepalive {
-            crate::pool::H2ClientKeepalive::FromPoolConfig
-        } else {
-            crate::pool::H2ClientKeepalive::NotApplied
-        };
-        let initial_send_streams = if seed_initial_send_streams {
-            crate::pool::H2ClientInitialSendStreams::FromStreamCap
-        } else {
-            crate::pool::H2ClientInitialSendStreams::HyperDefault
-        };
-        format!(
-            "{:?}",
-            crate::pool::hyper_h2_client_builder(pool_config, keepalive, initial_send_streams)
-        )
+    ) -> hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor> {
+        crate::pool::hyper_h2_client_builder(pool_config)
     }
 
     /// UDP backend selection with an optional session destination, so tests can

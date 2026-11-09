@@ -4432,11 +4432,12 @@ pub struct MeshConnectionPoolHttp {
     pub http2_max_requests: Option<u32>,
     /// Mapped from `maxConcurrentStreams`: Istio's per-HTTP/2-connection stream
     /// limit. Projects to `Proxy.pool_http2_max_concurrent_streams` per port via
-    /// `resolve_effective_proxy_for_target` and threads into the direct-H2 /
-    /// gRPC hyper builder knobs (`max_concurrent_streams` advertises the local
-    /// SETTINGS value, `initial_max_send_streams` seeds the outbound bound until
-    /// the peer's SETTINGS arrive — a peer may raise or lower it, which is why
-    /// this can never be the destination request budget).
+    /// `resolve_effective_proxy_for_target` and threads into the shared hyper
+    /// H2 builder used by direct H2, gRPC, mesh mTLS and nested-HBONE gRPC
+    /// (`max_concurrent_streams` advertises the local SETTINGS value,
+    /// `initial_max_send_streams` seeds the outbound bound until the peer's
+    /// SETTINGS arrive — a peer may raise or lower it, which is why this can
+    /// never be the destination request budget).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_streams: Option<u32>,
     /// Mapped from `h2UpgradePolicy`. Controls whether plain-HTTP backend

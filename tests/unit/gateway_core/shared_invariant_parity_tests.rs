@@ -4735,80 +4735,58 @@ fn every_stream_path_admits_its_port_lane_through_the_shared_policy() {
 // `pool_config.http2_adaptive_window`. The direct-H2, gRPC, mesh-mTLS and
 // nested-HBONE gRPC builders used to be four hand-written copies; they now
 // call `pool::hyper_h2_client_builder`, whose behaviour is pinned in
-// `h2_client_builder_tests.rs`. This table pins each site's explicit options
-// and that no site builds its own `PoolConfig`-driven hyper H2 client again.
+// `h2_client_builder_tests.rs`. Issue #7071 removed the per-site keepalive and
+// initial-send-stream options, so every site gets identical wire settings and a
+// pool key built from the same `PoolConfig` describes what was dialed. This
+// table pins that each site calls the shared builder with the `PoolConfig`
+// alone and that no site builds its own `PoolConfig`-driven hyper H2 client.
 
-/// `(path, number of shared-builder calls, keepalive option, send-stream option)`.
-const H2_CLIENT_BUILDER_SITES: &[(&str, usize, &str, &str)] = &[
-    (
-        "src/proxy/http2_pool.rs",
-        1,
-        "H2ClientKeepalive::FromPoolConfig",
-        "H2ClientInitialSendStreams::FromStreamCap",
-    ),
-    (
-        "src/proxy/mesh_mtls_pool.rs",
-        1,
-        "H2ClientKeepalive::FromPoolConfig",
-        "H2ClientInitialSendStreams::HyperDefault",
-    ),
+/// `(path, number of shared-builder calls)`.
+const H2_CLIENT_BUILDER_SITES: &[(&str, usize)] = &[
+    ("src/proxy/http2_pool.rs", 1),
+    ("src/proxy/mesh_mtls_pool.rs", 1),
+    ("src/proxy/grpc_proxy.rs", 2),
 ];
 
 #[test]
-fn every_pool_config_h2_client_uses_the_shared_builder_with_explicit_options() {
+fn every_pool_config_h2_client_uses_the_shared_builder_with_no_site_options() {
     const CALL: &str = "crate::pool::hyper_h2_client_builder(";
-    let options = |text: &str, at: usize| -> String {
+    let args_at = |text: &str, at: usize| -> String {
         let open = at + CALL.len() - 1;
         let close = after_matching_close(text.as_bytes(), open);
         text[open..close].split_whitespace().collect()
     };
 
-    for &(path, calls, keepalive, send_streams) in H2_CLIENT_BUILDER_SITES {
+    for &(path, calls) in H2_CLIENT_BUILDER_SITES {
         let production = without_cfg_test_items(&source(path));
         let found: Vec<_> = production.match_indices(CALL).collect();
         assert_eq!(found.len(), calls, "{path}: shared H2 builder calls");
         for (at, _) in found {
-            let args = options(&production, at);
+            let args = args_at(&production, at);
             assert!(
-                args.contains(keepalive) && args.contains(send_streams),
-                "{path}: expected `{keepalive}` + `{send_streams}`, got {args}"
+                !args.contains(','),
+                "{path}: the shared H2 builder takes the `PoolConfig` alone, got \
+                 {args}; a per-site wire difference would let a pool key and the \
+                 connection it names disagree (issue #7071)"
             );
         }
     }
 
-    // gRPC: the pooled direct dial (`build_h2_builder`) and the nested-HBONE
-    // dial deliberately differ, so pin each call by its enclosing item.
+    // gRPC: both the pooled direct dial (`build_h2_builder`) and the
+    // nested-HBONE dial build through the shared helper.
     let grpc = without_cfg_test_items(&source("src/proxy/grpc_proxy.rs"));
-    let pooled = item_body(&grpc, "fn build_h2_builder(", "\n    }\n");
-    let nested = item_body(&grpc, "async fn open_hbone_grpc_sender(", "\n}\n");
-    for (site, body, keepalive, send_streams) in [
+    for (site, body) in [
         (
             "gRPC pool",
-            pooled,
-            "H2ClientKeepalive::FromPoolConfig",
-            "H2ClientInitialSendStreams::FromStreamCap",
+            item_body(&grpc, "fn build_h2_builder(", "\n    }\n"),
         ),
         (
             "nested-HBONE gRPC dial",
-            nested,
-            "H2ClientKeepalive::NotApplied",
-            "H2ClientInitialSendStreams::HyperDefault",
+            item_body(&grpc, "async fn open_hbone_grpc_sender(", "\n}\n"),
         ),
     ] {
-        let at = body
-            .find(CALL)
-            .unwrap_or_else(|| panic!("{site} must use the shared H2 builder"));
-        let args = options(body, at);
-        assert!(
-            args.contains(keepalive) && args.contains(send_streams),
-            "{site}: expected `{keepalive}` + `{send_streams}`, got {args}"
-        );
+        assert!(body.contains(CALL), "{site} must use the shared H2 builder");
     }
-    assert_eq!(
-        grpc.matches(CALL).count(),
-        2,
-        "grpc_proxy shared H2 builder calls"
-    );
 
     // No PoolConfig-driven hyper H2 client is hand-built anywhere else. The
     // Unix-socket h2c client uses fixed constants, not `PoolConfig`, and the
