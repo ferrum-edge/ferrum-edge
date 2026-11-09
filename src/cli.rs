@@ -1680,7 +1680,7 @@ fn health_request_tls(
     if no_verify {
         tls_config
             .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerifier));
+            .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
     }
 
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
@@ -1698,47 +1698,6 @@ fn health_request_tls(
         "Failed to send TLS request; check endpoint and certificate trust".to_string()
     })?;
     read_health_response_head(&mut tls_stream, deadline, "TLS")
-}
-
-/// Certificate verifier that accepts any certificate (testing / self-signed).
-#[derive(Debug)]
-struct NoVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        crate::fips::base_crypto_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

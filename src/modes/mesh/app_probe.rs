@@ -1311,14 +1311,14 @@ fn loopback_tls_connector() -> Option<&'static tokio_rustls::TlsConnector> {
     static CONNECTOR: OnceLock<Option<tokio_rustls::TlsConnector>> = OnceLock::new();
     CONNECTOR
         .get_or_init(|| {
-            let builder = rustls::ClientConfig::builder_with_provider(
-                rustls::crypto::CryptoProvider::get_default()?.clone(),
-            )
-            .with_safe_default_protocol_versions()
-            .ok()?;
+            let provider = rustls::crypto::CryptoProvider::get_default()?.clone();
+            let verifier = LoopbackNoVerifier::for_provider(&provider);
+            let builder = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .ok()?;
             let config = builder
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(LoopbackNoVerifier))
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
             Some(tokio_rustls::TlsConnector::from(Arc::new(config)))
         })
@@ -1331,8 +1331,27 @@ fn loopback_tls_connector() -> Option<&'static tokio_rustls::TlsConnector> {
 /// no name and no trust anchor to check, and kubelet's own HTTPS probe does
 /// not verify either. This verifier is reachable ONLY from
 /// [`probe_http_get`] and is never installed on any mesh data path.
+///
+/// It advertises exactly the signature schemes of the provider the probe
+/// client is built from (issue #7075), like `crate::tls::NoVerifier` does for
+/// the base provider, so a FIPS build never offers a scheme outside its
+/// provider. The list is what ClientHello offers, so it still decides
+/// negotiation: an application whose only certificate needs a scheme the
+/// provider lacks (ECDSA P-521 under ring) fails the probe handshake.
 #[derive(Debug)]
-struct LoopbackNoVerifier;
+pub(crate) struct LoopbackNoVerifier {
+    schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl LoopbackNoVerifier {
+    pub(crate) fn for_provider(provider: &rustls::crypto::CryptoProvider) -> Self {
+        Self {
+            schemes: provider
+                .signature_verification_algorithms
+                .supported_schemes(),
+        }
+    }
+}
 
 impl rustls::client::danger::ServerCertVerifier for LoopbackNoVerifier {
     fn verify_server_cert(
@@ -1365,17 +1384,6 @@ impl rustls::client::danger::ServerCertVerifier for LoopbackNoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
+        self.schemes.clone()
     }
 }

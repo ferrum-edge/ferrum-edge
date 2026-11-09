@@ -2084,15 +2084,14 @@ fn next_backoff_secs(current: u64) -> u64 {
     common_next_backoff_secs(current, true)
 }
 
+/// Log rendering of a remote control-plane URL: `scheme://host[:port]/redacted`.
+///
+/// Delegates to the structural endpoint redaction the notification and
+/// observability sinks use (issue #7075), so userinfo, path, query, and
+/// fragment never reach a log line even when an operator embeds a token in
+/// them. The full URL is still used for the actual dial.
 fn sanitize_url_for_logging(url: &str) -> String {
-    match reqwest::Url::parse(url) {
-        Ok(mut parsed) => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.to_string()
-        }
-        Err(_) => "<unparseable>".to_string(),
-    }
+    crate::plugins::utils::log_helpers::redacted_endpoint_url_str(url)
 }
 
 // ── Native gRPC remote source ─────────────────────────────────────────────
