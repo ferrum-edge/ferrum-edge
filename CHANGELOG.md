@@ -41,6 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **`ai_federation` and `ai_stream_router` share one OpenAI translation
+  admission** (issue #7070). The strict-schema screen, tool-call parsing, id
+  and function-name rules, and tool-result flattening now live in one module
+  (`plugins::utils::ai_translation`), so the same request gets the same answer
+  on a buffered and a streaming route. Client-visible changes:
+  - `ai_stream_router` (Gemini, `strict: true`) now refuses a `$ref` with any
+    sibling keyword other than the root's own `$defs` (including `title` /
+    `description`), a `$ref` that is not
+    `#` or an existing root `#/$defs/<name>`, `$defs` below the root, and a
+    recursive reference graph, as `ai_federation` already did.
+  - `ai_federation` now treats `"tool_calls": null` as absent (it was a
+    `400`), refuses a tool-call `id` or `tool_call_id` longer than 128 bytes,
+    and refuses a tool-call `arguments` string over 256 KiB. Its "arguments are
+    not valid JSON" error no longer includes the JSON parser's detail.
 - **Control-plane and platform drift: one reader per rule** (issue #7075).
   - Remote control-plane URLs in mesh multicluster logs are now rendered as
     `scheme://host[:port]/redacted`, the structural form notification and
