@@ -35,7 +35,7 @@ underlying cause remains unknown.
 
 ## Release hold review
 
-Release hold reviewed 2026-10-09 by Ferrum Edge maintainers; latest stable 0.9.0; expires 2026-11-08.
+Release hold reviewed 2026-11-08 by Ferrum Edge maintainers; latest stable 0.9.0; expires 2026-12-08.
 
 The latest [published crate source](https://docs.rs/crate/sqlx-core/0.9.0/source/src/any/arguments.rs)
 and [v0.9.0 tag](https://github.com/transact-rs/sqlx/blob/v0.9.0/sqlx-core/src/any/arguments.rs)

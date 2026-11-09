@@ -9,13 +9,14 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mesh_mode -- --ignored --nocapture
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -693,10 +694,16 @@ pub(crate) struct MeshGatewaySpawnOptions<'a> {
     pub(crate) env_overrides: Vec<(&'a str, String)>,
 }
 
-pub(crate) fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> Child {
+/// Spawn a mesh gateway owned by a [`GatewayChildGuard`] from the instant it
+/// exists, so a panic anywhere before the fixture's explicit teardown still
+/// reaps the child and frees its ports (issue #4991).
+pub(crate) fn spawn_mesh_gateway(
+    temp: &TempDir,
+    options: MeshGatewaySpawnOptions<'_>,
+) -> GatewayChildGuard {
     let mut cmd = Command::new(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
-    cmd.spawn().expect("spawn mesh gateway")
+    GatewayChildGuard::new(cmd.spawn().expect("spawn mesh gateway"))
 }
 
 #[cfg(target_os = "linux")]
@@ -704,7 +711,7 @@ fn spawn_mesh_gateway_in_netns(
     temp: &TempDir,
     options: MeshGatewaySpawnOptions<'_>,
     netns_pid: u32,
-) -> Child {
+) -> GatewayChildGuard {
     spawn_mesh_gateway_in_netns_as_uid(temp, options, netns_pid, 1337)
 }
 
@@ -714,7 +721,7 @@ fn spawn_mesh_gateway_in_netns_as_uid(
     options: MeshGatewaySpawnOptions<'_>,
     netns_pid: u32,
     uid: u32,
-) -> Child {
+) -> GatewayChildGuard {
     let mut cmd = Command::new("nsenter");
     cmd.arg(format!("--net=/proc/{netns_pid}/ns/net"))
         .arg("--")
@@ -725,7 +732,9 @@ fn spawn_mesh_gateway_in_netns_as_uid(
         .arg(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
     make_mesh_registry_owned_by_uid(temp, uid);
-    cmd.spawn().expect("spawn mesh gateway inside pod netns")
+    // `nsenter` and `setpriv` exec the gateway, so the guarded pid is the
+    // gateway process itself.
+    GatewayChildGuard::new(cmd.spawn().expect("spawn mesh gateway inside pod netns"))
 }
 
 #[cfg(target_os = "linux")]
@@ -757,14 +766,16 @@ fn spawn_mesh_gateway_in_netns_as_root(
     temp: &TempDir,
     options: MeshGatewaySpawnOptions<'_>,
     netns_pid: u32,
-) -> Child {
+) -> GatewayChildGuard {
     let mut cmd = Command::new("nsenter");
     cmd.arg(format!("--net=/proc/{netns_pid}/ns/net"))
         .arg("--")
         .arg(crate::common::gateway_binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
-    cmd.spawn()
-        .expect("spawn privileged mesh gateway inside pod netns")
+    GatewayChildGuard::new(
+        cmd.spawn()
+            .expect("spawn privileged mesh gateway inside pod netns"),
+    )
 }
 
 fn configure_mesh_gateway_command(
@@ -788,6 +799,12 @@ fn configure_mesh_gateway_command(
         .env("FERRUM_NAMESPACE", "ferrum")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("FERRUM_SHUTDOWN_DRAIN_SECONDS", "0")
+        // Keep any managed-TLS / TLS-event store out of the checkout (#5706):
+        // the binary otherwise defaults to `./ferrum-managed-tls` in its cwd.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            temp.path().join("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", "0")
         .env("FERRUM_ADMIN_HTTP_PORT", "0")
         .env("FERRUM_CP_DP_GRPC_JWT_SECRET", GRPC_SECRET)
@@ -836,25 +853,36 @@ fn configure_mesh_gateway_command(
     }
 }
 
-pub(crate) fn kill_child(child: &mut Child) {
+/// Tear a mesh gateway down through its owning guard.
+///
+/// SIGTERM first, so the gateway flushes its non-blocking log writer (fixtures
+/// read `captured_output` afterwards) and, under the coverage shards, its LLVM
+/// profile; the guard's idempotent `shutdown` then reaps it, force-killing only
+/// a child that ignored the grace period. The guard's `Drop` performs the same
+/// reap on any panic path that never reaches this call.
+pub(crate) fn kill_child(child: &mut GatewayChildGuard) {
     #[cfg(unix)]
     {
-        let pid = child.id();
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+        if let Some(pid) = child.id() {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !child.has_exited() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
+    child.shutdown();
 }
 
-async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+async fn wait_for_child_exit(
+    child: &mut GatewayChildGuard,
+    timeout: Duration,
+) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child.try_wait().expect("poll mesh gateway child") {
+        if let Some(status) = gateway_child_exited(child) {
             return Some(status);
         }
         if Instant::now() >= deadline {
@@ -940,8 +968,11 @@ impl GatewayListenerReadiness {
 }
 
 /// Non-blocking check for a spawned gateway that has already exited.
-fn gateway_child_exited(child: &mut Child) -> Option<ExitStatus> {
-    child.try_wait().expect("poll mesh gateway child")
+fn gateway_child_exited(child: &mut GatewayChildGuard) -> Option<ExitStatus> {
+    child
+        .child_mut()
+        .try_wait()
+        .expect("poll mesh gateway child")
 }
 
 /// The first labelled gateway in `children` that has already exited, rendered as
@@ -950,7 +981,9 @@ fn gateway_child_exited(child: &mut Child) -> Option<ExitStatus> {
 /// A fixture whose gateway died mid-run is VOID: its ports were never owned by
 /// the process the driver believed it was talking to, so any observation made
 /// against them — success, failure, or fail-closed rejection — proves nothing.
-pub(crate) fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> Option<String> {
+pub(crate) fn exited_gateway_diagnostic(
+    children: &mut [(&str, &mut GatewayChildGuard)],
+) -> Option<String> {
     for (label, child) in children.iter_mut() {
         if let Some(status) = gateway_child_exited(child) {
             return Some(format!("{label} exited during the run ({status})"));
@@ -975,7 +1008,7 @@ pub(crate) fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> 
 /// [`GatewayListenerReadiness::ChildExited`] and the caller can consume its
 /// bounded attempt and retry with fresh ports, temp dirs, and control planes.
 pub(crate) async fn wait_for_gateway_listener(
-    child: &mut Child,
+    child: &mut GatewayChildGuard,
     port: u16,
     timeout: Duration,
 ) -> GatewayListenerReadiness {
@@ -7484,9 +7517,9 @@ async fn functional_mesh_sidecar_cross_cluster_egress_rejects_untrusted_client()
 /// capture port plus every child process / control plane / temp dir, so a driver
 /// can drive app requests against `a_outbound_port` then tear it all down.
 struct SidecarCrossClusterFixture {
-    child_a: Child,
-    child_b: Child,
-    child_c: Child,
+    child_a: GatewayChildGuard,
+    child_b: GatewayChildGuard,
+    child_c: GatewayChildGuard,
     cp_a: MeshCpHandle,
     cp_b: MeshCpHandle,
     cp_c: MeshCpHandle,
@@ -8665,9 +8698,9 @@ async fn functional_mesh_ambient_cross_cluster_egress_rejects_untrusted_client()
 /// east-west B SNI-passthrough → dest C Ambient, two trust domains, federated
 /// bundle) — the Ambient counterpart of [`SidecarCrossClusterFixture`].
 struct AmbientCrossClusterFixture {
-    child_a: Child,
-    child_b: Child,
-    child_c: Child,
+    child_a: GatewayChildGuard,
+    child_b: GatewayChildGuard,
+    child_c: GatewayChildGuard,
     cp_a: MeshCpHandle,
     cp_b: MeshCpHandle,
     cp_c: MeshCpHandle,
@@ -9383,7 +9416,7 @@ async fn functional_mesh_file_source_serves_inbound_and_reloads_on_sighup() {
             inbound_authz_mesh_document(server_spiffe, client_spiffe, backend_port, false),
         )
         .expect("rewrite mesh document");
-        let pid = child.id().to_string();
+        let pid = child.child_mut().id().to_string();
         let hup = Command::new("kill")
             .args(["-HUP", &pid])
             .status()
@@ -12145,7 +12178,7 @@ async fn run_sidecar_ingress_reload_phases(
     peers: &MeshPeerSvids,
     ports: &SidecarIngressReloadPorts,
     mesh_doc_path: &std::path::Path,
-    child: &mut Child,
+    child: &mut GatewayChildGuard,
 ) -> Result<(), String> {
     let server_spiffe = peers.server_spiffe.as_str();
     let workload_ports = ports.workload_ports();
@@ -12278,8 +12311,8 @@ async fn run_sidecar_ingress_reload_phases(
 }
 
 /// Deliver SIGHUP to a spawned mesh gateway so the file source reloads.
-fn sighup_mesh_gateway(child: &mut Child) -> Result<(), String> {
-    let pid = child.id().to_string();
+fn sighup_mesh_gateway(child: &mut GatewayChildGuard) -> Result<(), String> {
+    let pid = child.child_mut().id().to_string();
     let status = Command::new("kill")
         .args(["-HUP", &pid])
         .status()
@@ -12972,28 +13005,30 @@ fn live_source_capture_prerequisites() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-struct LiveGatewayChild(Option<Child>);
+struct LiveGatewayChild(Option<GatewayChildGuard>);
 
 #[cfg(target_os = "linux")]
 impl LiveGatewayChild {
-    fn new(child: Child) -> Self {
+    fn new(child: GatewayChildGuard) -> Self {
         Self(Some(child))
     }
 
+    /// SIGTERM, then the guard reaps the child (force-killing only after the
+    /// grace period, and through the coverage-aware teardown).
     fn stop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            let pid = child.id();
-            let _ = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-            for _ in 0..50 {
-                if child.try_wait().is_ok_and(|status| status.is_some()) {
-                    return;
+            if let Some(pid) = child.id() {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+                for _ in 0..50 {
+                    if child.has_exited() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                std::thread::sleep(Duration::from_millis(100));
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            child.shutdown();
         }
     }
 
@@ -13009,24 +13044,28 @@ impl LiveGatewayChild {
         let Some(mut child) = self.0.take() else {
             return false;
         };
-        let pid = child.id();
+        let Some(pid) = child.id() else {
+            return false;
+        };
         let _ = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .status();
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
-            if child.try_wait().is_ok_and(|status| status.is_some()) {
+            if child.has_exited() {
+                child.shutdown();
                 return true;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        // The grace expired: the guard force-reaps the child, so none of its
+        // graceful-shutdown work may be assumed to have run.
+        child.shutdown();
         false
     }
 
     fn poll_status(&mut self) -> String {
-        match self.0.as_mut().map(Child::try_wait) {
+        match self.0.as_mut().map(|child| child.child_mut().try_wait()) {
             Some(Ok(Some(status))) => format!("exited with {status}"),
             Some(Ok(None)) => "still running".to_string(),
             Some(Err(error)) => format!("status check failed: {error}"),
@@ -13079,7 +13118,7 @@ fn identity_bound_registry_helpers_reject_non_uuid_pod_uid() {
 /// backend resolve `/proc/<pid>/ns/net` without mutating the runner's cgroup tree.
 #[cfg(target_os = "linux")]
 struct LivePodNetns {
-    child: Child,
+    child: std::process::Child,
     cgroup_dir: TempDir,
 }
 
@@ -18624,7 +18663,7 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
         ),
     )
     .expect("rewrite mesh document for the update phase");
-    let pid = child.id().to_string();
+    let pid = child.child_mut().id().to_string();
     assert!(
         Command::new("kill")
             .args(["-HUP", &pid])

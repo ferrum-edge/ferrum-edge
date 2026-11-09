@@ -55,37 +55,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
-/// Admin JWT secret wired into every gateway spawned by this file. `/overload`
-/// now exposes its full pressure/counter snapshot only to authorized callers
-/// (admin JWT / metrics token / allowlisted CIDR), so these tests mint an admin
-/// token against this secret to read the detailed body. Must be >= 32 chars.
-const ADMIN_JWT_SECRET: &str = "ferrum-edge-overload-functional-secret-0001";
-
-/// Mint a short-lived admin JWT matching [`ADMIN_JWT_SECRET`] so a test can read
-/// the detailed `/overload` view (gated behind observability auth).
-fn admin_bearer() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64;
-    let claims = serde_json::json!({
-        "iss": "ferrum-edge",
-        "sub": "overload-test",
-        "role": "admin",
-        "iat": now,
-        "nbf": now,
-        "exp": now + 600,
-        "jti": format!("overload-{now}"),
-    });
-    let token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(ADMIN_JWT_SECRET.as_bytes()),
-    )
-    .expect("encode admin JWT");
-    format!("Bearer {token}")
-}
-
 // ============================================================================
 // Slow backend — a minimal HTTP/1.1 server that sleeps before responding.
 // ============================================================================
@@ -132,9 +101,11 @@ async fn start_slow_backend_on(listener: TcpListener, delay_ms: u64, stop: Arc<A
 // test that also drives `max_connections=10` can answer on the released admin
 // port while this child exits — `test_overload_endpoint_shape_normal` then
 // reads that sibling's `level=pressure` snapshot instead of its own `normal`.
-// Each spawn wires a unique `FERRUM_METRICS_BEARER_TOKEN` and waits for
-// authenticated `/health` detail + `ready: true` via the child-bound
-// [`crate::common::wait_for_child_gateway_readiness`].
+// Each spawn attempt mints its own `SpawnedGatewayIdentity` (admin JWT
+// secret/issuer + metrics bearer token) and waits for the child-bound JWT
+// ownership barrier [`crate::common::wait_for_owned_gateway_identity`]
+// (issue #7076). The same identity mints the admin JWT that reads the
+// detailed `/overload` view, so a test can only ever read its own child.
 
 async fn ephemeral_port() -> u16 {
     crate::scaffolding::ports::unbound_port()
@@ -142,27 +113,12 @@ async fn ephemeral_port() -> u16 {
         .expect("lease test port")
 }
 
-/// Derive a per-spawn-attempt observability credential from the test process,
-/// both reserved ports, and the retry attempt. Wired into
-/// `FERRUM_METRICS_BEARER_TOKEN` so authenticated `/health` proves this child —
-/// not a parallel overload gateway that grabbed the released admin port.
-fn overload_observability_token(proxy_port: u16, admin_port: u16, attempt: u32) -> String {
-    format!(
-        "ferrum-edge-overload-probe-{}-{}-{}-{}",
-        std::process::id(),
-        proxy_port,
-        admin_port,
-        attempt
-    )
-}
-
-#[test]
-fn overload_observability_token_is_unique_per_attempt_and_ports() {
-    let base = overload_observability_token(10_001, 20_002, 1);
-    assert_ne!(base, overload_observability_token(10_001, 20_002, 2));
-    assert_ne!(base, overload_observability_token(10_001, 20_003, 1));
-    assert_ne!(base, overload_observability_token(10_002, 20_002, 1));
-    assert!(base.contains(&std::process::id().to_string()));
+/// A spawned overload gateway plus the per-attempt identity it was started
+/// with. The guard reaps the child on every exit path (issue #4991); the
+/// identity mints the admin JWT that reads the detailed `/overload` view.
+struct OverloadGateway {
+    child: crate::common::GatewayChildGuard,
+    identity: crate::common::SpawnedGatewayIdentity,
 }
 
 /// Bundle of overload-related env overrides. Only the entries that are `Some`
@@ -190,14 +146,19 @@ fn start_gateway(
     http_port: u16,
     admin_port: u16,
     env: &OverloadEnv,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
     capture_log_path: Option<&std::path::Path>,
-) -> std::process::Child {
+) -> crate::common::GatewayChildGuard {
     let binary_path = crate::common::gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
+    // Keep any managed-TLS store out of the checkout (issue #5706): the config
+    // file lives in the test's TempDir, which outlives this child.
+    let managed_store = std::path::Path::new(config_path).with_file_name("managed-tls");
     cmd.env("FERRUM_MODE", "file")
+        .env("FERRUM_TLS_MANAGED_STORE_PATH", &managed_store)
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
@@ -206,15 +167,11 @@ fn start_gateway(
         // this log-assertion harness isolated from the developer shell.
         .env_remove("RUST_LOG")
         // Make sure perf features don't destabilize the small functional test harness.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        // Known admin secret so the test can mint a token for the detailed
-        // (auth-gated) `/overload` view. File mode honors this when set.
-        .env("FERRUM_ADMIN_JWT_SECRET", ADMIN_JWT_SECRET)
-        // Per-spawn ownership proof for readiness (issue #3428 / CI run
-        // 30642091981). The static admin JWT above is kept for `/overload`
-        // assertions; this token only proves the child that answered readiness
-        // is *this* child.
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token);
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+    // Per-spawn-attempt admin JWT secret/issuer and metrics bearer token: the
+    // ownership proof for readiness (issue #3428 / #7076) and the credential
+    // that reads the detailed (auth-gated) `/overload` view.
+    identity.apply_to_command(&mut cmd);
 
     if let Some(v) = env.max_connections {
         cmd.env("FERRUM_MAX_CONNECTIONS", v.to_string());
@@ -263,9 +220,8 @@ fn start_gateway(
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .expect("Failed to start gateway binary")
+        .stderr(stderr);
+    crate::common::GatewayChildGuard::new(cmd.spawn().expect("Failed to start gateway binary"))
 }
 
 /// Wait until `child` proves it owns the admin listener for this spawn attempt.
@@ -277,27 +233,25 @@ fn start_gateway(
 /// `test_overload_endpoint_shape_normal` observed `level=pressure` with
 /// `max_connections=10` instead of the unloaded child's `normal`.
 ///
-/// Barrier (`TestGateway`'s health-only path, via the shared
-/// `wait_for_child_gateway_readiness`; not JWT ownership):
+/// Barrier (`TestGateway`'s JWT ownership path, via the shared
+/// `wait_for_owned_gateway_identity`):
 /// 1. `Child::try_wait` before every probe and after the successful one — a
 ///    dead child consumes the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's
-///    `FERRUM_METRICS_BEARER_TOKEN` with `ready: true`.
-/// 3. One more `try_wait` after a successful probe so a child that dies between
-///    answering `/health` and returning cannot look ready.
+///    `FERRUM_METRICS_BEARER_TOKEN` with `ready: true`, AND HTTP 200 from
+///    JWT-only `GET /proxies` under this attempt's admin JWT. `/health` detail
+///    alone can be granted to a foreign gateway by
+///    `FERRUM_METRICS_ALLOWED_CIDRS`; the per-attempt JWT cannot (#7076).
+/// 3. One more `try_wait` after success so a child that dies between
+///    answering and returning cannot look ready.
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-    crate::common::wait_for_child_gateway_readiness(
-        child,
-        admin_port,
-        observability_token,
-        STARTUP_TIMEOUT,
-    )
-    .await
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await
 }
 
 /// Start the gateway with retry across fresh ephemeral ports to avoid
@@ -305,29 +259,21 @@ async fn wait_for_owned_gateway(
 async fn start_gateway_with_retry(
     config_path: &str,
     env: &OverloadEnv,
-) -> (std::process::Child, u16, u16) {
+) -> (OverloadGateway, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
-        let observability_token = overload_observability_token(proxy_port, admin_port, attempt);
-        let mut child = start_gateway(
-            config_path,
-            proxy_port,
-            admin_port,
-            env,
-            &observability_token,
-            None,
-        );
-        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
-            Ok(()) => return (child, proxy_port, admin_port),
+        let identity = crate::common::SpawnedGatewayIdentity::mint("overload");
+        let mut child = start_gateway(config_path, proxy_port, admin_port, env, &identity, None);
+        match wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
+            Ok(()) => return (OverloadGateway { child, identity }, proxy_port, admin_port),
             Err(error) => {
                 eprintln!(
                     "overload gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
                      (proxy_port={proxy_port}, admin_port={admin_port}): {error}"
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                child.shutdown();
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_secs(1)).await;
                 }
@@ -345,29 +291,28 @@ async fn start_gateway_with_retry_capture_logs(
     config_path: &str,
     env: &OverloadEnv,
     log_path: &std::path::Path,
-) -> (std::process::Child, u16, u16) {
+) -> (OverloadGateway, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
-        let observability_token = overload_observability_token(proxy_port, admin_port, attempt);
+        let identity = crate::common::SpawnedGatewayIdentity::mint("overload");
         let mut child = start_gateway(
             config_path,
             proxy_port,
             admin_port,
             env,
-            &observability_token,
+            &identity,
             Some(log_path),
         );
-        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
-            Ok(()) => return (child, proxy_port, admin_port),
+        match wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
+            Ok(()) => return (OverloadGateway { child, identity }, proxy_port, admin_port),
             Err(error) => {
                 eprintln!(
                     "overload gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
                      (proxy_port={proxy_port}, admin_port={admin_port}): {error}"
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                child.shutdown();
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_secs(1)).await;
                 }
@@ -433,15 +378,16 @@ plugin_configs: []
     config_path
 }
 
-/// Fetch `/overload` from the admin port, returning `(status, json)`.
-async fn get_overload(admin_port: u16) -> (u16, serde_json::Value) {
+/// Fetch `/overload` from the admin port with `gw`'s own admin JWT, returning
+/// `(status, json)`.
+async fn get_overload(gw: &OverloadGateway, admin_port: u16) -> (u16, serde_json::Value) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
     let resp = client
         .get(format!("http://127.0.0.1:{admin_port}/overload"))
-        .header("Authorization", admin_bearer())
+        .header("Authorization", gw.identity.auth_header())
         .send()
         .await
         .expect("GET /overload");
@@ -478,11 +424,10 @@ fn count_errors(results: &[Result<reqwest::Response, reqwest::Error>]) -> usize 
     results.iter().filter(|r| r.is_err()).count()
 }
 
-/// Kill and wait for the gateway process and stop the backend.
-async fn teardown(mut gw: std::process::Child, stop: Arc<AtomicBool>) {
+/// Shut the gateway process down and stop the backend.
+async fn teardown(mut gw: OverloadGateway, stop: Arc<AtomicBool>) {
     stop.store(true, Ordering::Relaxed);
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.child.shutdown();
     // Give the background backend loop a moment to notice the stop flag.
     sleep(Duration::from_millis(100)).await;
 }
@@ -712,7 +657,7 @@ async fn test_overload_endpoint_shape_normal() {
     // Give the overload monitor one full interval to populate its snapshot.
     sleep(Duration::from_millis(1200)).await;
 
-    let (status, body) = get_overload(admin_port).await;
+    let (status, body) = get_overload(&gw, admin_port).await;
     assert_eq!(status, 200, "unloaded /overload must return 200 OK");
     assert_eq!(
         body.get("level").and_then(|v| v.as_str()),
@@ -823,7 +768,7 @@ async fn test_disable_keepalive_under_connection_pressure() {
     // flakiness tolerance as documented in the task).
     let mut disabled = false;
     for _ in 0..10 {
-        let (_, body) = get_overload(admin_port).await;
+        let (_, body) = get_overload(&gw, admin_port).await;
         let flag = body
             .get("actions")
             .and_then(|a| a.get("disable_keepalive"))
@@ -933,7 +878,7 @@ async fn test_reject_new_connections_when_critical() {
     let mut saw_critical = false;
     let mut last_body = serde_json::Value::Null;
     for _ in 0..10 {
-        let (_, body) = get_overload(admin_port).await;
+        let (_, body) = get_overload(&gw, admin_port).await;
         let level = body
             .get("level")
             .and_then(|v| v.as_str())
@@ -1052,7 +997,7 @@ async fn test_reject_new_requests_503_when_request_critical() {
     let total_probe_window = t_start.elapsed();
 
     if !got_503 {
-        let (_, body) = get_overload(admin_port).await;
+        let (_, body) = get_overload(&gw, admin_port).await;
         panic!(
             "expected at least one 503 rejection under MAX_REQUESTS=4 + \
              REQ_CRITICAL_THRESHOLD=0.5, probe window={total_probe_window:?}, \
@@ -1108,7 +1053,7 @@ async fn test_overload_recovery_back_to_normal() {
     // Wait until we see pressure flipped.
     let mut saw_pressure = false;
     for _ in 0..20 {
-        let (_, body) = get_overload(admin_port).await;
+        let (_, body) = get_overload(&gw, admin_port).await;
         let dk = body
             .get("actions")
             .and_then(|a| a.get("disable_keepalive"))
@@ -1136,7 +1081,7 @@ async fn test_overload_recovery_back_to_normal() {
     // Poll /overload until we get `normal` back (up to ~3s).
     let mut recovered = false;
     for _ in 0..15 {
-        let (status, body) = get_overload(admin_port).await;
+        let (status, body) = get_overload(&gw, admin_port).await;
         let level = body.get("level").and_then(|v| v.as_str()).unwrap_or("");
         let dk = body
             .get("actions")
@@ -1218,7 +1163,7 @@ async fn test_overload_endpoint_returns_503_under_critical() {
     let mut last_body = serde_json::Value::Null;
     for _ in 0..15 {
         sleep(Duration::from_millis(300)).await;
-        let (status, body) = get_overload(admin_port).await;
+        let (status, body) = get_overload(&gw, admin_port).await;
         last_body = body.clone();
         if status == 503 {
             // Body should still be readable JSON with level=critical.
@@ -1322,7 +1267,7 @@ async fn fd_pressure_disables_keepalive() {
     let mut last_body = serde_json::Value::Null;
     for _ in 0..20 {
         sleep(Duration::from_millis(200)).await;
-        let (_, body) = get_overload(admin_port).await;
+        let (_, body) = get_overload(&gw, admin_port).await;
         last_body = body.clone();
         let fd_ratio = body
             .get("pressure")
@@ -1442,7 +1387,7 @@ async fn request_count_above_threshold_returns_503() {
     );
 
     // /overload must agree.
-    let (_, body) = get_overload(admin_port).await;
+    let (_, body) = get_overload(&gw, admin_port).await;
     let reject = body
         .get("actions")
         .and_then(|a| a.get("reject_new_requests"))
@@ -1651,7 +1596,7 @@ async fn overload_state_transitions_logged_with_warn_then_info() {
     let mut recovered_via_admin = false;
     let mut last_overload_body = serde_json::Value::Null;
     for _ in 0..30 {
-        let (status, body) = get_overload(admin_port).await;
+        let (status, body) = get_overload(&gw, admin_port).await;
         last_overload_body = body.clone();
         let level = body.get("level").and_then(|v| v.as_str()).unwrap_or("");
         let disable_keepalive = body

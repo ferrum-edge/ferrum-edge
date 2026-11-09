@@ -10175,7 +10175,7 @@ pub(crate) fn resolve_backend_target(
             health_port_scope,
             None,
         )
-        .map_err(|refusal| udp_port_lane_refusal(override_port, refusal))?;
+        .map_err(|refusal| udp_port_lane_refusal(proxy, override_port, refusal))?;
         let health_ctx = crate::proxy::backend_dispatch::health_context_for_selection(
             proxy,
             health_checker,
@@ -10277,18 +10277,24 @@ pub(crate) fn udp_backend_host_matches_destination_family(host: &str, destinatio
 }
 
 /// Map a refused per-port lane onto the UDP/DTLS stream-setup error surface.
+///
+/// The detail names the session's own scheme (`udp` or `dtls`), matching the
+/// TCP mapper's `tcp` / `tcps` labels.
 fn udp_port_lane_refusal(
+    proxy: &Proxy,
     port: u16,
     refusal: crate::proxy::backend_dispatch::StreamPortLaneRefusal,
 ) -> anyhow::Error {
     use crate::proxy::backend_dispatch::StreamPortLaneRefusal;
+    let protocol = proxy.effective_scheme();
     let detail = match refusal {
         StreamPortLaneRefusal::LeastLatency => format!(
-            "for UDP port {port}: per-port LEAST_LATENCY requires stream latency sampling on \
-             every dispatch path"
+            "for {protocol} port {port}: per-port LEAST_LATENCY requires stream latency \
+             sampling on every dispatch path"
         ),
         StreamPortLaneRefusal::NonIpHashKey => format!(
-            "for UDP port {port}: stream per-port consistent hashing supports only source-IP hash keys"
+            "for {protocol} port {port}: stream per-port consistent hashing supports only \
+             source-IP hash keys"
         ),
     };
     StreamSetupError::new(StreamSetupKind::UnsupportedStreamPolicy, detail).into()
@@ -12824,6 +12830,78 @@ listen_port: 5300
             "error should make the unsupported policy explicit: {}",
             setup.message
         );
+    }
+
+    /// Issue #7072: both refusal arms name the session's own scheme, so a
+    /// DTLS session is never reported as plain UDP.
+    #[test]
+    fn resolve_udp_backend_target_port_lane_refusals_name_the_session_scheme() {
+        let refusing_overrides = [
+            (
+                serde_json::json!({ "algorithm": "least_latency" }),
+                "per-port LEAST_LATENCY requires stream latency sampling",
+            ),
+            (
+                serde_json::json!({
+                    "algorithm": "consistent_hashing",
+                    "hash_on": "cookie:ferrum-affinity"
+                }),
+                "supports only source-IP hash keys",
+            ),
+        ];
+        for scheme in ["udp", "dtls"] {
+            for (port_override, reason) in &refusing_overrides {
+                let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+                    "version": "1",
+                    "proxies": [{
+                        "id": "udp-proxy",
+                        "backend_scheme": scheme,
+                        "backend_host": "unused.local",
+                        "backend_port": 0,
+                        "listen_port": 5300,
+                        "upstream_id": "dns",
+                    }],
+                    "consumers": [],
+                    "plugin_configs": [],
+                    "upstreams": [{
+                        "id": "dns",
+                        "algorithm": "round_robin",
+                        "targets": [
+                            { "host": "a.local", "port": 5353 },
+                            { "host": "b.local", "port": 5353 }
+                        ],
+                        "port_overrides": { "5353": port_override }
+                    }]
+                }))
+                .expect("gateway config should deserialize");
+                config.resolve_dispatch_port_overrides();
+                let proxy = config.proxies[0].clone();
+                let cache = LoadBalancerCache::new(&config);
+                let snapshot = cache.load();
+
+                let err = super::resolve_backend_target(
+                    &proxy,
+                    &snapshot,
+                    &HealthChecker::new(),
+                    "192.0.2.10",
+                    None,
+                )
+                .expect_err("refusing per-port policy must fail setup");
+                let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+                assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+                assert!(
+                    setup.message.contains(&format!("for {scheme} port 5353:")),
+                    "{scheme}: refusal must name the session scheme: {}",
+                    setup.message
+                );
+                assert!(
+                    setup.message.contains(reason),
+                    "{scheme}: refusal must keep its reason: {}",
+                    setup.message
+                );
+            }
+        }
     }
 
     #[test]

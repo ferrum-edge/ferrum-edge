@@ -55,6 +55,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `400`), refuses a tool-call `id` or `tool_call_id` longer than 128 bytes,
     and refuses a tool-call `arguments` string over 256 KiB. Its "arguments are
     not valid JSON" error no longer includes the JSON parser's detail.
+- **Control-plane and platform drift: one reader per rule** (issue #7075).
+  - Remote control-plane URLs in mesh multicluster logs are now rendered as
+    `scheme://host[:port]/redacted`, the structural form notification and
+    observability endpoints already use. Path, query, and fragment no longer
+    appear in those log lines (userinfo was already stripped).
+  - `SpireAgentCa` (a library CA the mesh runtime does not construct) now runs
+    its X.509 stream on the shared Workload API fetch loop, so its
+    `spire_agent` CA-health series exists before the first connect and a
+    clean stream end counts in `ferrum_mesh_cert_rotation_failures_total`.
+  - `FERRUM_MESH_CA_BOOTSTRAP_DEV` is read by one helper shared by
+    `ferrum-edge validate` and the bootstrap itself; its accepted spelling
+    (`true`, case-insensitive) is unchanged and is now documented with the
+    other mesh dev opt-ins in `docs/mesh.md`.
+  - The mesh app-probe loopback HTTPS client now offers only the signature
+    schemes of its own crypto provider instead of a fixed list. The probe
+    still accepts any certificate, but scheme negotiation follows the provider:
+    on the default ring build an application whose only certificate is
+    ECDSA P-521 can no longer complete a sidecar HTTPS probe (ring does not
+    offer `ecdsa_secp521r1_sha512`); serve a P-256/P-384, RSA, or Ed25519
+    certificate instead. The `health --tls-no-verify` client now uses the
+    shared `NoVerifier`, with identical behavior.
+- **Stream lane refusals name the route's protocol; proxy `grpc-timeout`
+  rounds sub-millisecond values up** (issue #7072). A per-port load-balancing
+  refusal (`LEAST_LATENCY`, or a non-source-IP `hash_on`) now names the
+  route's own scheme (`tcp`, `tcps`, `udp` or `dtls`) instead of always
+  saying "TCP" or "UDP". The proxy's own `grpc-timeout` reader (the gRPC
+  streaming timeout and upload-bound selection) now uses the `grpc_deadline`
+  parser and rounds `u`/`n` values up to the next millisecond instead of down,
+  matching the receipt-anchored request deadline: `1500u` is 2 ms on every
+  path (that reader used to see 1 ms).
+- **`ferrum-gateway` chart: IPv4-mapped admin binds and allowlist entries
+  follow the runtime** (issue #7078; the mesh chart got the same fixes in
+  `4fb5df58f`). With `admin.bindAddress: "::ffff:127.0.0.2"` and the default
+  exec probes, the chart required `admin.allowedCidrs` to include
+  `::ffff:127.0.0.2/128` and refused `127.0.0.1/32`, but the runtime observes
+  the probes from `127.0.0.1` and canonicalizes that mapped CIDR to
+  `127.0.0.2/32`, so a release that rendered cleanly dropped its own probes and
+  restart-looped. The probe source is now canonicalized to IPv4 first, and
+  the allowlist check uses the mapped peer the IPv6 listener actually sees
+  (`::ffff:127.0.0.1`), so an ordinary IPv6 rule that covers it (for example
+  `::/80`) still admits the probes in both charts. A bare
+  mapped allowlist entry (`::ffff:a.b.c.d` with no prefix) is now a `/32` in the
+  permits-all check instead of a negative prefix that only happened to work. A
+  new unit test fails when a helper shared by both charts' `_helpers.tpl`
+  drifts.
+- **BREAKING — `workload_metrics` custom tags can no longer overwrite
+  gateway-published metadata** (issue #7092; GHSA-9mmx-ghcv-x25q, follow-up to
+  #7081). A `custom_tags`, `custom_header_tags` or `custom_env_tags` entry (in
+  mesh mode, an Istio `Telemetry.tracing[].customTags` entry) is written into
+  transaction metadata under its own name, so a Telemetry author or, for a
+  header tag, the request sender could set keys other plugins decide on:
+  `grpc_full_method` (the method key per-method policy reads before the
+  backend path is bound), `ai_stream_router_pass_through` (which makes
+  `ai_federation` skip model/provider admission), `request_body` (the
+  buffered-body view `ai_request_guard` inspects),
+  `auth.strip_query_param.<name>` (which tells egress to strip a query
+  credential under `hide_credentials`), or `ai_transcript_audit.record_id`
+  (which made overlapping transactions share one audit staging entry). A tag
+  name that is a reviewed gateway metadata key or family, sits in a shared
+  gateway metadata namespace (`auth.`, `mcp.`, `geo.`, `ferrum.`, `oidc_rp.`,
+  ...), or sits in a built-in plugin's namespace (`<plugin>.<key>` or
+  `<plugin>_<key>`), now fails `workload_metrics` construction (and Istio
+  Telemetry translation) as reserved, like `trace_id`. **Operator action:**
+  rename any such tag (for example `namespace` → `k8s_namespace`).
+- **Admin API responses always carry the admin security headers** (issue
+  #7074). `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+  `X-Frame-Options: DENY` were set by hand per response, and the raw API-spec
+  `GET` (`200`/`304`), API-spec `DELETE` (`204`), Prometheus `/metrics` and its
+  `401`, `/charges`, `/charges/sink/status` and the builder-failure `500`
+  omitted some of them. One shared helper now sets them, and the admin
+  dispatcher fills any a response still lacks. The raw API-spec `GET`'s
+  builder-failure fallback is now the shared JSON `500` instead of a bare `500`
+  with no `Content-Type`.
 - **BREAKING — `oidc_relying_party` refuses a non-string
   `client_auth.private_key_jwt_alg` / `client_auth.private_key_jwt_kid`**
   (issue #7069). The constructor read both with a lenient string accessor, so a

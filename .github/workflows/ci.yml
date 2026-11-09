@@ -4660,6 +4660,11 @@ jobs:
             --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
             --set-string 'controlPlane.admin.allowedCidrs=127.0.0.1/32' \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe-ok.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set-string controlPlane.admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string 'controlPlane.admin.allowedCidrs=::/80' \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-prod-mapped-loopback-probe-ipv6-rule.yaml"
           if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             --set ambient.enabled=true \
@@ -5278,6 +5283,38 @@ jobs:
             --set mode=file --set admin.bindAddress=127.0.0.2 \
             --set-string admin.allowedCidrs=127.0.0.0/8 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-source-cidr.yaml"
+          # An IPv4-mapped 127/8 bind is canonicalized like the runtime does
+          # (issue #7078): the observed probe source is 127.0.0.1, and the runtime
+          # canonicalizes a mapped allowlist entry to IPv4, so ::ffff:127.0.0.2/128
+          # (that is, 127.0.0.2/32) does not admit the probes.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set-string admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string admin.allowedCidrs=127.0.0.1/32 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-loopback-probe-source.yaml"
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set-string admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string admin.allowedCidrs=::ffff:127.0.0.2/128 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-loopback-wrong-source.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-loopback-wrong-source.err"; then
+            echo "::error title=Mapped loopback probe source not canonicalized::::ffff:127.0.0.2 must probe from 127.0.0.1"
+            exit 1
+          fi
+          grep -F 'dial admin host ::ffff:127.0.0.2 from source 127.0.0.1' "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-loopback-wrong-source.err"
+          # The mapped bind's IPv6 socket sees the probe as ::ffff:127.0.0.1, which
+          # the runtime also matches against ordinary IPv6 rules such as ::/80.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set-string admin.bindAddress=::ffff:127.0.0.2 \
+            --set-string admin.allowedCidrs=::/80 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-loopback-ipv6-rule.yaml"
+          # A bare mapped entry is one IPv4 host (/32), never a family-wide
+          # allowlist, so it still protects a plaintext non-loopback admin bind.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            --set-string 'admin.allowedCidrs=::ffff:10.0.0.1\,127.0.0.1/32' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-bare-admin-cidr.yaml"
           # An unspecified IPv6 admin bind ([::]) is not guaranteed to accept v4-mapped
           # 127.0.0.1, so the computed probes must also dial ::1 for any IPv6 bind form.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
