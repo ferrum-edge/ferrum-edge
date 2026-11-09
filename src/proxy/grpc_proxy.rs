@@ -2055,14 +2055,9 @@ impl GrpcPoolManager {
     }
 
     /// The gRPC pool's HTTP/2 client builder: the shared `PoolConfig` builder
-    /// with the pool keepalive applied and the outbound stream bound seeded
-    /// from the cap, exactly like the direct-H2 pool.
+    /// every H2 pool family uses.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
-        crate::pool::hyper_h2_client_builder(
-            pool_config,
-            crate::pool::H2ClientKeepalive::FromPoolConfig,
-            crate::pool::H2ClientInitialSendStreams::FromStreamCap,
-        )
+        crate::pool::hyper_h2_client_builder(pool_config)
     }
 
     /// Create an h2c (cleartext HTTP/2) connection using prior knowledge.
@@ -4665,15 +4660,19 @@ fn hbone_dispatch_authority<'a>(
 /// queued on. That cap is not sampled once: the load is created here BEFORE the
 /// connection driver is spawned and the driver refreshes it from
 /// `Connection::current_max_send_streams()` after every poll, because the value
-/// available immediately after `await_peer_settings` is still hyper's
-/// pre-settings default. The width ceiling is
+/// available immediately after `await_peer_settings` is still the pre-settings
+/// bound (the configured stream cap, else hyper's default). The width ceiling is
 /// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` clamped by
 /// `hbone_inner_pool::MAX_SHARED_H2_PER_KEY`; see `docs/mesh.md`.
 ///
-/// HTTP/2 PING keepalive is still deliberately NOT enabled on the inner
-/// connection. It is a stream on the outer pooled HBONE connection, which
-/// already carries the pool's keepalive; if that dies, this sender reports
-/// closed and is evicted on the next checkout.
+/// The inner connection is built by the shared `pool::hyper_h2_client_builder`
+/// (issue #7071), so when `enable_http2` is set it sends the pool's HTTP/2 PING
+/// keepalive while an RPC is in flight (never while idle) and is torn down when
+/// a PING goes unanswered for `http2_keep_alive_timeout_seconds`. The outer
+/// pooled HBONE connection runs its own keepalive, which proves only the tunnel
+/// to the destination relay; the inner PINGs also prove the destination app is
+/// still serving this connection. Either way a dead sender reports closed and
+/// is evicted on the next checkout.
 ///
 /// The inner connection is admitted only once the destination app's OWN HTTP/2
 /// connection preface has been observed (`h2c_preface::await_peer_settings`,
@@ -4776,18 +4775,13 @@ async fn open_hbone_grpc_sender(
     // nothing else: the only thing it decides is whether this nested HTTP/2
     // connection may be held open across RPCs.
     let peer_advertises_fence = tunnel.peer_advertises_inner_reuse();
-    // The same effective pool configuration the inner key was built from, so a
-    // pooled carrier's wire settings and its key can never disagree.
-    //
-    // Unlike the direct gRPC pool, this nested connection applies neither the
-    // pool's HTTP/2 PING keepalive (the outer HBONE carrier runs its own) nor
-    // the cap as hyper's initial outbound stream bound; both are kept as they
-    // were when this builder was hand-written.
-    let builder = crate::pool::hyper_h2_client_builder(
-        &inner_pool_config,
-        crate::pool::H2ClientKeepalive::NotApplied,
-        crate::pool::H2ClientInitialSendStreams::HyperDefault,
-    );
+    // The same effective pool configuration the inner key was built from, and
+    // the same shared builder as the direct gRPC pool, so a pooled carrier's
+    // wire settings and its key can never disagree (issue #7071). That
+    // includes the pool's HTTP/2 PING keepalive: the outer HBONE carrier's own
+    // PINGs prove only the tunnel to the destination relay, while these prove
+    // the destination app behind it is still serving this connection.
+    let builder = crate::pool::hyper_h2_client_builder(&inner_pool_config);
 
     // The inner connection is CLEARTEXT HTTP/2 to the destination app, so — as
     // on the direct-dial h2c path — nothing about the outer hop proves the app
@@ -4835,10 +4829,11 @@ async fn open_hbone_grpc_sender(
     // task below is the only place that can keep reading it — and a single
     // sample taken right here would be wrong: `await_peer_settings` proves only
     // that the peer's SETTINGS BYTES arrived, while `h2` defers applying them
-    // until it writes the SETTINGS ACK, so this early read still reports
-    // hyper's pre-settings `DEFAULT_INITIAL_MAX_SEND_STREAMS` of 100. Recording
-    // 100 for a destination advertising 8 left `is_saturated()` permanently
-    // false and queued RPCs 9..100 pending-open inside `h2`.
+    // until it writes the SETTINGS ACK, so this early read still reports the
+    // pre-settings bound (the configured stream cap, else hyper's
+    // `DEFAULT_INITIAL_MAX_SEND_STREAMS` of 100). Recording 100 for a
+    // destination advertising 8 left `is_saturated()` permanently false and
+    // queued RPCs 9..100 pending-open inside `h2`.
     //
     // The load is therefore created BEFORE the spawn and shared with the pool,
     // and the driver stores the connection's current value after every poll.
@@ -7145,47 +7140,21 @@ pub(crate) fn remaining_grpc_timeout_header_value(
 /// Parse a raw `grpc-timeout` header value (e.g. `"100m"`, `"1S"`) into
 /// milliseconds. Shared by [`parse_grpc_timeout_ms`] (hyper `HeaderMap` callers)
 /// and the native-H3 gRPC path, whose headers are a `HashMap<String, String>`.
+///
+/// The grammar (at most 8 ASCII digits plus one ASCII unit letter) is owned by
+/// [`crate::plugins::grpc_deadline::parse_grpc_timeout`], and the millisecond
+/// projection by [`crate::plugins::grpc_deadline::duration_millis_ceil_saturating`],
+/// so a route with and without the `grpc_deadline` plugin gives the same client
+/// deadline the same budget (issue #7072). Sub-millisecond values round UP
+/// (`1500u` is 2 ms), matching the forwarded-budget rule documented on
+/// [`client_deadline_owns_failure`].
+///
+/// `None` means "absent or invalid", and the caller then applies the operator's
+/// `backend_read_timeout_ms` fallback. A zero timeout (`0m`) is `None` too, so a
+/// malformed or zero header can never become a present-but-unbounded deadline.
 pub(crate) fn parse_grpc_timeout_value(val: &str) -> Option<u64> {
-    let bytes = val.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    // The unit suffix is always a single ASCII letter per the gRPC spec. Reject
-    // multi-byte UTF-8 (and any non-letter) here so the digit split below cannot
-    // land on a char boundary or treat a stray byte as the unit.
-    let unit = *bytes.last()?;
-    if !unit.is_ascii_alphabetic() {
-        return None;
-    }
-    let num_str = std::str::from_utf8(&bytes[..bytes.len() - 1]).ok()?;
-    // The gRPC wire format constrains the value to a positive integer of AT MOST
-    // 8 digits (matching the `grpc_deadline` plugin's own validation). Reject
-    // anything longer or non-numeric by returning `None` so a malformed header
-    // such as `18446744073709551615H` does NOT become a present-but-unbounded
-    // deadline — that would let a bad client opt out of the operator's
-    // `backend_read_timeout_ms` fallback. `None` means "absent or invalid", and
-    // the caller then applies the fallback. With at most 8 digits the largest
-    // representable value is `99_999_999 H` ≈ 3.6e14 ms, which always fits in a
-    // `u64`, so the unit multiplies below can never actually overflow for valid
-    // input.
-    if num_str.is_empty() || num_str.len() > 8 || !num_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let num: u64 = num_str.parse().ok()?;
-    if num == 0 {
-        return None;
-    }
-    let ms = match unit {
-        b'H' => num * 3_600_000,
-        b'M' => num * 60_000,
-        b'S' => num * 1_000,
-        b'm' => num,
-        b'u' => num / 1_000, // microseconds → ms, floor to 0 is handled by max(1) below
-        b'n' => num / 1_000_000,
-        _ => return None,
-    };
-    // Ensure at least 1ms for sub-millisecond timeouts
-    Some(ms.max(1))
+    crate::plugins::grpc_deadline::parse_grpc_timeout(val)
+        .and_then(crate::plugins::grpc_deadline::duration_millis_ceil_saturating)
 }
 
 /// Effective timeout for the fully streaming gRPC path.

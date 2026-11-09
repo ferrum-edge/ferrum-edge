@@ -1092,13 +1092,18 @@ fn start_gateway(
     proxy_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> std::process::Child {
+) -> crate::common::GatewayChildGuard {
     let binary_path = crate::common::gateway_binary_path();
+    // The config lives in the test's TempDir, which outlives the child; keep
+    // the managed-TLS store there instead of `./ferrum-managed-tls` (#5706).
+    let managed_tls_store = std::path::Path::new(config_path).with_file_name("managed-tls");
 
     let mut cmd = std::process::Command::new(binary_path);
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        .env("FERRUM_TLS_MANAGED_STORE_PATH", &managed_tls_store)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "debug")
@@ -1106,7 +1111,7 @@ fn start_gateway(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    cmd.spawn().expect("Failed to start gateway binary")
+    crate::common::GatewayChildGuard::new(cmd.spawn().expect("Failed to start gateway binary"))
 }
 
 /// Wait until `child` owns `admin_port`. Unauthenticated `/health` and
@@ -1128,24 +1133,26 @@ async fn wait_for_owned_gateway(
 
 /// Start the gateway with retry on port-binding failures.
 ///
-/// Allocates fresh ephemeral proxy and admin ports on each attempt to handle
-/// the bind-drop-rebind port race (another process can steal the port between
-/// the drop and the gateway bind). Returns (child, proxy_port, admin_port).
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+/// Allocates fresh registry-leased proxy and admin ports outside the host's
+/// ephemeral source range on each attempt; another process can still claim a
+/// released port before the gateway binds it, which the retry absorbs.
+/// Returns (child, proxy_port, admin_port).
+async fn start_gateway_with_retry(
+    config_path: &str,
+) -> (crate::common::GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        let proxy_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway proxy port");
+        let admin_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway admin port");
 
         let identity = crate::common::SpawnedGatewayIdentity::mint("ai-plugins");
         let mut child = start_gateway(config_path, proxy_port, admin_port, &identity);
 
-        if wait_for_owned_gateway(&mut child, admin_port, &identity).await {
+        if wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
             return (child, proxy_port, admin_port);
         }
 
@@ -1153,8 +1160,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
             "Gateway startup attempt {}/{} failed (ports: proxy={}, admin={})",
             attempt, MAX_ATTEMPTS, proxy_port, admin_port
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        child.shutdown();
 
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
@@ -1969,8 +1975,7 @@ upstreams: []
         body
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
 }
 
 #[ignore]
@@ -2050,8 +2055,7 @@ upstreams: []
         "Clean request should pass through to backend"
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
 }
 
 // ============================================================================
@@ -2142,8 +2146,7 @@ upstreams: []
         body
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
 }
 
 #[ignore]
@@ -2235,8 +2238,7 @@ upstreams: []
         body
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
 }
 
 #[ignore]
@@ -2317,6 +2319,5 @@ upstreams: []
         "Valid request should pass through to backend"
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
 }

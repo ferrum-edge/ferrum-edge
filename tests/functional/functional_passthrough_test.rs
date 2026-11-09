@@ -11,7 +11,6 @@ use crate::scaffolding::port_registry::TestSocket;
 use rustls::pki_types::pem::PemObject;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::process::Child;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,11 +20,9 @@ use tokio::time::sleep;
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Plain TCP echo server — reads data, echoes it back, and closes.
-async fn start_tcp_echo_server(port: u16) {
-    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind TCP echo");
-
+/// Serve TCP echo on a listener the test bound and still holds, so the backend
+/// port is never released and re-bound.
+async fn start_tcp_echo_server(listener: TcpListener) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -47,7 +44,8 @@ async fn start_tcp_echo_server(port: u16) {
 }
 
 /// TLS-wrapped TCP echo server — clients perform TLS handshake, then echo.
-async fn start_tls_echo_server(port: u16, cert_pem: &str, key_pem: &str) {
+/// Serve TLS echo on a listener the test bound and still holds.
+async fn start_tls_echo_server(listener: TcpListener, cert_pem: &str, key_pem: &str) {
     use rustls::ServerConfig;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -67,9 +65,6 @@ async fn start_tls_echo_server(port: u16, cert_pem: &str, key_pem: &str) {
         .expect("bad tls config");
 
     let acceptor = TlsAcceptor::from(Arc::new(config));
-    let listener = TcpListener::bind_test(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind TLS echo");
 
     loop {
         if let Ok((stream, _)) = listener.accept().await {
@@ -135,25 +130,6 @@ async fn wait_for_gateway_log(dir: &std::path::Path, needle: &str, within: Durat
     }
 }
 
-/// Kills the gateway child on every exit path, including panics.
-struct GatewayProcess(std::process::Child);
-
-impl Drop for GatewayProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Per-spawn `FERRUM_METRICS_BEARER_TOKEN` so authenticated `/health` can prove
-/// this child owns the admin port (issue #3428). Never logged.
-fn mint_observability_token() -> String {
-    format!(
-        "ferrum-edge-passthrough-probe-{}",
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
 /// Wait until `child` owns its admin listener and reports fully ready.
 ///
 /// Unauthenticated `/health` success is not identity and is not readiness: a
@@ -161,43 +137,41 @@ fn mint_observability_token() -> String {
 /// require JSON `ready: true`. `ready` flips only after every listener bind,
 /// including the stream listener this file actually dials.
 ///
-/// Barrier (`TestGateway`'s health-only path, via the shared
-/// `wait_for_child_gateway_readiness`; not JWT ownership):
+/// Barrier (`TestGateway`'s JWT ownership path, via the shared
+/// `wait_for_owned_gateway_identity`):
 /// 1. `Child::try_wait` before every probe and after the successful one — a
 ///    dead child voids the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token with
-///    `ready: true`.
+///    `ready: true`, AND HTTP 200 from JWT-only `GET /proxies` under this
+///    attempt's admin JWT. `/health` detail alone can be granted to a foreign
+///    gateway by `FERRUM_METRICS_ALLOWED_CIDRS`; the JWT cannot (issue #7076).
+///    Enabling admin JWT verification does not change the listener set.
 ///
 /// No synthetic stream-port connection is made here: passthrough listeners
 /// treat every accepted socket as real traffic, so such a probe can dial the
 /// configured backend and corrupt backend-accept assertions. Authenticated
 /// `ready: true` is already published only after every required listener bind.
 async fn wait_for_owned_gateway(
-    child: &mut Child,
+    child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-    crate::common::wait_for_child_gateway_readiness(
-        child,
-        admin_port,
-        observability_token,
-        STARTUP_TIMEOUT,
-    )
-    .await
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await
 }
 
 /// Start the gateway with retry on port-binding failures.
 ///
-/// Allocates fresh ephemeral proxy listen, HTTP, and admin ports on each attempt
-/// to handle the bind-drop-rebind port race.  The `write_config` closure receives
+/// Leases fresh non-ephemeral proxy listen, HTTP, and admin handoff ports on
+/// each attempt (released only for the child to bind) to handle the port race.  The `write_config` closure receives
 /// `(proxy_listen_port, dir)` and must write the config file, returning
 /// `(config_path_string, TempDir)`.
 ///
 /// Returns (child, proxy_listen_port, http_port, admin_port, TempDir).
 async fn start_gateway_with_retry<F>(
     write_config: F,
-) -> (std::process::Child, u16, u16, u16, TempDir)
+) -> (crate::common::GatewayChildGuard, u16, u16, u16, TempDir)
 where
     F: Fn(u16, &std::path::Path) -> String,
 {
@@ -210,23 +184,21 @@ where
 async fn start_gateway_with_retry_env<F>(
     write_config: F,
     extra_env: &[(&str, &str)],
-) -> (std::process::Child, u16, u16, u16, TempDir)
+) -> (crate::common::GatewayChildGuard, u16, u16, u16, TempDir)
 where
     F: Fn(u16, &std::path::Path) -> String,
 {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let proxy_listen_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let http_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let http_port = http_listener.local_addr().unwrap().port();
-        drop(http_listener);
-
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        let proxy_listen_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("lease stream listener port");
+        let http_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("lease proxy HTTP port");
+        let admin_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("lease admin port");
 
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("config.yaml");
@@ -240,11 +212,16 @@ where
         // them are unaffected.
         let stdout_log = std::fs::File::create(dir.path().join(GATEWAY_STDOUT_LOG)).unwrap();
         let stderr_log = std::fs::File::create(dir.path().join(GATEWAY_STDERR_LOG)).unwrap();
-        let observability_token = mint_observability_token();
+        let identity = crate::common::SpawnedGatewayIdentity::mint("passthrough");
 
         let mut cmd = std::process::Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "file")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                dir.path().join("managed-tls"),
+            )
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
@@ -258,13 +235,14 @@ where
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        // Identity proof is last so extra_env cannot replace this child's token
-        // with a leaked parent-shell credential or CIDR allowlist.
-        cmd.env("FERRUM_METRICS_BEARER_TOKEN", &observability_token)
-            .env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
-        let mut child = cmd.spawn().expect("Failed to start gateway");
+        // Identity proof is last so extra_env cannot replace this child's
+        // credentials with a leaked parent-shell value or CIDR allowlist.
+        identity.apply_to_command(&mut cmd);
+        cmd.env_remove("FERRUM_METRICS_ALLOWED_CIDRS");
+        let mut child =
+            crate::common::GatewayChildGuard::new(cmd.spawn().expect("Failed to start gateway"));
 
-        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
+        match wait_for_owned_gateway(child.child_mut(), admin_port, &identity).await {
             Ok(()) => return (child, proxy_listen_port, http_port, admin_port, dir),
             Err(error) => {
                 eprintln!(
@@ -272,8 +250,7 @@ where
                      (ports: stream={proxy_listen_port}, http={http_port}, \
                      admin={admin_port}): {error}"
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                child.shutdown();
             }
         }
 
@@ -292,8 +269,7 @@ async fn test_tcp_passthrough_plain_echo() {
     // Backend: plain TCP echo (same-process, no port race)
     let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    tokio::spawn(start_tcp_echo_server(backend_port));
+    tokio::spawn(start_tcp_echo_server(backend_listener));
 
     // Start gateway with retry to handle ephemeral port races
     let (mut gateway, proxy_listen_port, _http_port, _admin_port, _dir) =
@@ -333,8 +309,7 @@ upstreams: []
 
     assert_eq!(&buf[..n], msg, "echo response should match");
 
-    gateway.kill().ok();
-    gateway.wait().ok();
+    gateway.shutdown();
 }
 
 /// An attempt at the passthrough circuit-breaker scenario could not establish
@@ -411,7 +386,8 @@ upstreams: []
             )
         })
         .await;
-    let _gateway = GatewayProcess(gateway);
+    // The guard reaps the gateway on every exit path, including panics.
+    let _gateway = gateway;
 
     // ── Step 1: the first attempt must fail and must be observed failing ──
     let mut first = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
@@ -566,12 +542,11 @@ async fn test_tcp_tls_passthrough_forwards_encrypted_data() {
     // Backend: TLS echo server (same-process, no port race)
     let backend_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
 
     let cert_clone = cert_pem.clone();
     let key_clone = key_pem.clone();
     tokio::spawn(async move {
-        start_tls_echo_server(backend_port, &cert_clone, &key_clone).await;
+        start_tls_echo_server(backend_listener, &cert_clone, &key_clone).await;
     });
 
     // Start gateway with retry to handle ephemeral port races
@@ -639,8 +614,7 @@ upstreams: []
         "TLS echo through passthrough should return same data"
     );
 
-    gateway.kill().ok();
-    gateway.wait().ok();
+    gateway.shutdown();
 }
 
 /// Slow-loris defense: a peer that opens a TCP connection to a passthrough
@@ -735,8 +709,7 @@ upstreams: []
         "Backend connection observed too early ({elapsed:?}) — peek timeout may be wired to the wrong knob"
     );
 
-    gateway.kill().ok();
-    gateway.wait().ok();
+    gateway.shutdown();
 }
 
 // ── Issue #3264: general opaque-TLS SNI L4 routing ───────────────────────────
@@ -904,8 +877,7 @@ upstreams: []
         .expect("backend channel open");
     assert_eq!(received_b, hello_b);
 
-    gateway.kill().ok();
-    gateway.wait().ok();
+    gateway.shutdown();
 }
 
 /// Security regression for the core #3264 defect: on an SNI-routed listener,
@@ -1004,8 +976,7 @@ upstreams: []
         .expect("backend channel open");
     assert_eq!(received, hello);
 
-    gateway.kill().ok();
-    gateway.wait().ok();
+    gateway.shutdown();
 }
 
 /// The plaintext fallback is opt-in and, when authorized, sends provably
@@ -1085,8 +1056,7 @@ upstreams: []
     );
     assert!(named.accepts.try_recv().is_err());
 
-    gateway.kill().ok();
-    gateway.wait().ok();
+    gateway.shutdown();
 }
 
 /// A bound, non-listening socket reserves the failed endpoint without a port
@@ -1155,7 +1125,8 @@ plugin_configs: []
             )
         })
         .await;
-        let _gateway = GatewayProcess(gateway);
+        // The guard reaps the gateway on every exit path, including panics.
+        let _gateway = gateway;
         if succeeds {
             // Two successive streams also prove the failed target's connection
             // guard is released, so the second selection still reaches it first.

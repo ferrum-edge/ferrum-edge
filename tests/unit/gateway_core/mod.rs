@@ -16,6 +16,7 @@ mod backend_pending_limit_scope_tests;
 mod backend_reqwest_no_proxy_tests;
 mod backend_send_queue_tests;
 mod backend_tls_cold_build_tests;
+mod bespoke_spawner_lifecycle_contract_tests;
 mod bespoke_spawner_readiness_contract_tests;
 mod buffered_upload_end_stream_tests;
 mod build_profile_panic_strategy_tests;
@@ -24,6 +25,7 @@ mod cached_synthetic_bytes_share_tests;
 #[cfg(unix)]
 mod cgroup_tree_walk_tests;
 mod charged_content_coding_chain_tests;
+mod chart_helpers_parity_tests;
 mod chart_image_tag_helm_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;

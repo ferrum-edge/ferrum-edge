@@ -514,3 +514,37 @@ mod admission {
         }
     }
 }
+
+/// Issue #7075: the loopback HTTPS probe's accept-any verifier advertises the
+/// signature schemes of the provider its client is built from, not a fixed
+/// list, so a FIPS provider is never offered a scheme it cannot verify.
+#[test]
+fn loopback_probe_verifier_advertises_the_client_providers_schemes() {
+    use ferrum_edge::_test_support::mesh_app_probe_loopback_verifier_schemes_for_test as schemes_for;
+
+    let base = ferrum_edge::fips::base_crypto_provider();
+    assert_eq!(
+        schemes_for(&base),
+        base.signature_verification_algorithms.supported_schemes(),
+        "the verifier must mirror the base provider's schemes"
+    );
+
+    // A provider with a narrower mapping must narrow the advertised list too;
+    // a hard-coded list would still return every scheme.
+    let all = base.signature_verification_algorithms.all;
+    let mapping = base.signature_verification_algorithms.mapping;
+    assert!(mapping.len() > 1, "base provider maps more than one scheme");
+    let mut narrowed = base.clone();
+    narrowed.signature_verification_algorithms = rustls::crypto::WebPkiSupportedAlgorithms {
+        all,
+        mapping: &mapping[..1],
+    };
+    let advertised = schemes_for(&narrowed);
+    assert_eq!(
+        advertised,
+        narrowed
+            .signature_verification_algorithms
+            .supported_schemes()
+    );
+    assert_eq!(advertised, vec![mapping[0].0]);
+}

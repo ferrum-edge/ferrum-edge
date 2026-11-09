@@ -15,6 +15,7 @@
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored functional_regex_routing --nocapture
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use std::time::Duration;
@@ -71,13 +72,19 @@ fn start_gateway_in_file_mode(
     http_port: u16,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
-) -> std::process::Child {
+) -> GatewayChildGuard {
     let binary_path = crate::common::gateway_binary_path();
 
     let mut cmd = std::process::Command::new(binary_path);
+    crate::common::configure_coverage_gateway_command(&mut cmd);
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        // Keep any managed-TLS/ACME/event store inside the config's temp dir.
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "warn")
@@ -85,7 +92,7 @@ fn start_gateway_in_file_mode(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     identity.apply_to_command(&mut cmd);
-    cmd.spawn().expect("Failed to start gateway binary")
+    GatewayChildGuard::new(cmd.spawn().expect("Failed to start gateway binary"))
 }
 
 /// Readiness requires this child to own admin `/health` *and* a reachable
@@ -137,8 +144,8 @@ async fn ephemeral_port() -> u16 {
 }
 
 /// Start the gateway with retry to handle ephemeral port races.
-/// Fresh ports each attempt; the gateway is killed before retry.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+/// Fresh ports each attempt; the gateway is shut down before retry.
+async fn start_gateway_with_retry(config_path: &str) -> (GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
@@ -147,7 +154,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let identity = crate::common::SpawnedGatewayIdentity::mint("regex-routing");
         let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port, &identity);
 
-        if wait_for_gateway(admin_port, proxy_port, &mut child, &identity).await {
+        if wait_for_gateway(admin_port, proxy_port, child.child_mut(), &identity).await {
             return (child, proxy_port, admin_port);
         }
 
@@ -155,8 +162,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
             "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
             attempt, MAX_ATTEMPTS, proxy_port, admin_port
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        child.shutdown();
 
         if attempt < MAX_ATTEMPTS {
             sleep(Duration::from_secs(1)).await;
@@ -304,8 +310,7 @@ plugin_configs: []
     assert_eq!(status, 200, "prefix /health-check should 200");
     assert_eq!(body, "backend-E-prefix-health");
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     h_a.abort();
     h_b.abort();
     h_c.abort();
@@ -379,8 +384,7 @@ plugin_configs: []
         get_with_body(&client, &format!("http://127.0.0.1:{proxy_port}/users/")).await;
     assert_eq!(status, 404, "/users/ must NOT match ^/users/[^/]+$");
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     h_users.abort();
 }
 
@@ -449,8 +453,7 @@ plugin_configs: []
     .await;
     assert_eq!(status, 404, "/api/vX/items must NOT match /api/v[0-9]+/.*");
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     h_v.abort();
 }
 
@@ -520,8 +523,7 @@ plugin_configs: []
         "greedy fallback must handle deeper path that the specific pattern cannot"
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     h_first.abort();
     h_second.abort();
 }
@@ -585,8 +587,7 @@ plugin_configs: []
     assert_eq!(status, 200, "/api should 200");
     assert_eq!(body, "backend-prefix-api", "/api must hit prefix proxy");
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     h_prefix.abort();
     h_regex.abort();
 }
@@ -656,8 +657,7 @@ async fn functional_regex_routing_scale_50_regex_routes() {
         "/r00/item/extra has an extra segment — must 404 under full-path anchoring"
     );
 
-    let _ = gw.kill();
-    let _ = gw.wait();
+    gw.shutdown();
     for (_, handle) in backends {
         handle.abort();
     }

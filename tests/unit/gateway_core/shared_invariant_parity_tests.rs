@@ -4735,80 +4735,58 @@ fn every_stream_path_admits_its_port_lane_through_the_shared_policy() {
 // `pool_config.http2_adaptive_window`. The direct-H2, gRPC, mesh-mTLS and
 // nested-HBONE gRPC builders used to be four hand-written copies; they now
 // call `pool::hyper_h2_client_builder`, whose behaviour is pinned in
-// `h2_client_builder_tests.rs`. This table pins each site's explicit options
-// and that no site builds its own `PoolConfig`-driven hyper H2 client again.
+// `h2_client_builder_tests.rs`. Issue #7071 removed the per-site keepalive and
+// initial-send-stream options, so every site gets identical wire settings and a
+// pool key built from the same `PoolConfig` describes what was dialed. This
+// table pins that each site calls the shared builder with the `PoolConfig`
+// alone and that no site builds its own `PoolConfig`-driven hyper H2 client.
 
-/// `(path, number of shared-builder calls, keepalive option, send-stream option)`.
-const H2_CLIENT_BUILDER_SITES: &[(&str, usize, &str, &str)] = &[
-    (
-        "src/proxy/http2_pool.rs",
-        1,
-        "H2ClientKeepalive::FromPoolConfig",
-        "H2ClientInitialSendStreams::FromStreamCap",
-    ),
-    (
-        "src/proxy/mesh_mtls_pool.rs",
-        1,
-        "H2ClientKeepalive::FromPoolConfig",
-        "H2ClientInitialSendStreams::HyperDefault",
-    ),
+/// `(path, number of shared-builder calls)`.
+const H2_CLIENT_BUILDER_SITES: &[(&str, usize)] = &[
+    ("src/proxy/http2_pool.rs", 1),
+    ("src/proxy/mesh_mtls_pool.rs", 1),
+    ("src/proxy/grpc_proxy.rs", 2),
 ];
 
 #[test]
-fn every_pool_config_h2_client_uses_the_shared_builder_with_explicit_options() {
+fn every_pool_config_h2_client_uses_the_shared_builder_with_no_site_options() {
     const CALL: &str = "crate::pool::hyper_h2_client_builder(";
-    let options = |text: &str, at: usize| -> String {
+    let args_at = |text: &str, at: usize| -> String {
         let open = at + CALL.len() - 1;
         let close = after_matching_close(text.as_bytes(), open);
         text[open..close].split_whitespace().collect()
     };
 
-    for &(path, calls, keepalive, send_streams) in H2_CLIENT_BUILDER_SITES {
+    for &(path, calls) in H2_CLIENT_BUILDER_SITES {
         let production = without_cfg_test_items(&source(path));
         let found: Vec<_> = production.match_indices(CALL).collect();
         assert_eq!(found.len(), calls, "{path}: shared H2 builder calls");
         for (at, _) in found {
-            let args = options(&production, at);
+            let args = args_at(&production, at);
             assert!(
-                args.contains(keepalive) && args.contains(send_streams),
-                "{path}: expected `{keepalive}` + `{send_streams}`, got {args}"
+                !args.contains(','),
+                "{path}: the shared H2 builder takes the `PoolConfig` alone, got \
+                 {args}; a per-site wire difference would let a pool key and the \
+                 connection it names disagree (issue #7071)"
             );
         }
     }
 
-    // gRPC: the pooled direct dial (`build_h2_builder`) and the nested-HBONE
-    // dial deliberately differ, so pin each call by its enclosing item.
+    // gRPC: both the pooled direct dial (`build_h2_builder`) and the
+    // nested-HBONE dial build through the shared helper.
     let grpc = without_cfg_test_items(&source("src/proxy/grpc_proxy.rs"));
-    let pooled = item_body(&grpc, "fn build_h2_builder(", "\n    }\n");
-    let nested = item_body(&grpc, "async fn open_hbone_grpc_sender(", "\n}\n");
-    for (site, body, keepalive, send_streams) in [
+    for (site, body) in [
         (
             "gRPC pool",
-            pooled,
-            "H2ClientKeepalive::FromPoolConfig",
-            "H2ClientInitialSendStreams::FromStreamCap",
+            item_body(&grpc, "fn build_h2_builder(", "\n    }\n"),
         ),
         (
             "nested-HBONE gRPC dial",
-            nested,
-            "H2ClientKeepalive::NotApplied",
-            "H2ClientInitialSendStreams::HyperDefault",
+            item_body(&grpc, "async fn open_hbone_grpc_sender(", "\n}\n"),
         ),
     ] {
-        let at = body
-            .find(CALL)
-            .unwrap_or_else(|| panic!("{site} must use the shared H2 builder"));
-        let args = options(body, at);
-        assert!(
-            args.contains(keepalive) && args.contains(send_streams),
-            "{site}: expected `{keepalive}` + `{send_streams}`, got {args}"
-        );
+        assert!(body.contains(CALL), "{site} must use the shared H2 builder");
     }
-    assert_eq!(
-        grpc.matches(CALL).count(),
-        2,
-        "grpc_proxy shared H2 builder calls"
-    );
 
     // No PoolConfig-driven hyper H2 client is hand-built anywhere else. The
     // Unix-socket h2c client uses fixed constants, not `PoolConfig`, and the
@@ -4825,4 +4803,129 @@ fn every_pool_config_h2_client_uses_the_shared_builder_with_explicit_options() {
              crate::pool::hyper_h2_client_builder instead"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #7075: control-plane and platform copies of one rule
+// ---------------------------------------------------------------------------
+
+/// `FERRUM_MESH_CA_BOOTSTRAP_DEV` is read in exactly one place,
+/// `identity::ca::bootstrap::dev_bootstrap_opted_in`, which `bootstrap_allowed`,
+/// `bootstrap_dev_root`, and the `EnvConfig` validation gate all call. A second
+/// inline read could drift to a different spelling.
+#[test]
+fn mesh_ca_bootstrap_dev_opt_in_has_one_reader() {
+    let mut readers = Vec::new();
+    for (path, text) in production_sources() {
+        let production = without_cfg_test_items(&text);
+        let reads = production
+            .matches("var(\"FERRUM_MESH_CA_BOOTSTRAP_DEV\")")
+            .count();
+        if reads > 0 {
+            readers.push((path, reads));
+        }
+    }
+    assert_eq!(
+        readers,
+        vec![("src/identity/ca/bootstrap.rs".to_string(), 1)],
+        "read FERRUM_MESH_CA_BOOTSTRAP_DEV only through \
+         identity::ca::bootstrap::dev_bootstrap_opted_in"
+    );
+    let bootstrap = source("src/identity/ca/bootstrap.rs");
+    let helper = item_body(&bootstrap, "pub fn dev_bootstrap_opted_in(", "\n}");
+    assert!(helper.contains("var(\"FERRUM_MESH_CA_BOOTSTRAP_DEV\")"));
+    for caller in ["pub fn bootstrap_allowed(", "pub fn bootstrap_dev_root("] {
+        let body = item_body(&bootstrap, caller, "\n}");
+        assert!(body.contains("dev_bootstrap_opted_in()"), "{caller}");
+    }
+    assert!(
+        source("src/config/env_config.rs")
+            .contains("crate::identity::ca::bootstrap::dev_bootstrap_opted_in()"),
+        "EnvConfig validation must share the bootstrap opt-in read"
+    );
+}
+
+/// `SpireAgentCa` consumes the shared Workload API fetch loop rather than a
+/// private copy, so it inherits the loop's telemetry fixes (`0afac83f7`): the
+/// `spire_agent` CA-health series exists before the first connect, and a clean
+/// stream end counts as a rotation failure.
+#[test]
+fn spire_agent_ca_x509_stream_is_the_shared_workload_api_fetch_loop() {
+    let spire = without_cfg_test_items(&source("src/identity/ca/spire.rs"));
+    assert!(spire.contains("spawn_fetch_loop_with_handle("));
+    assert!(spire.contains("metrics_source: FetchLoopMetricsSource::SpireAgent"));
+    assert!(
+        !spire.contains("fetch_x509_svid_stream("),
+        "SpireAgentCa must not open its own FetchX509SVID stream"
+    );
+    let fetch_loop = source("src/identity/workload_api/fetch_loop.rs");
+    let main = item_body(&fetch_loop, "async fn fetch_loop_main(", "\n}");
+    assert!(main.contains("config.metrics_source.set_ca_health(false);"));
+    assert!(main.contains("if !failure_recorded {"));
+}
+
+/// Remote control-plane URLs are logged in the same structural
+/// `scheme://host[:port]/redacted` form as notification and observability
+/// endpoints: no userinfo, path, query, or fragment survives.
+#[test]
+fn remote_control_plane_url_logs_use_structural_endpoint_redaction() {
+    use ferrum_edge::plugins::utils::redacted_endpoint_url_str;
+
+    for (url, expected) in [
+        (
+            "https://user:pw@cp.example:8443/tenant-secret?token=x#frag",
+            "https://cp.example:8443/redacted",
+        ),
+        (
+            "http://user@cp.example/tenant-secret?token=x",
+            "http://cp.example/redacted",
+        ),
+        ("https://cp.example", "https://cp.example/redacted"),
+        ("not a url", "redacted-host/redacted"),
+    ] {
+        let rendered = redacted_endpoint_url_str(url);
+        assert_eq!(rendered, expected, "{url}");
+        for leaked in ["user", "pw", "tenant-secret", "token", "frag"] {
+            assert!(!rendered.contains(leaked), "{url} leaked {leaked}");
+        }
+    }
+    let multicluster = without_cfg_test_items(&source("src/modes/mesh/multicluster.rs"));
+    let sanitizer = item_body(&multicluster, "fn sanitize_url_for_logging(", "\n}");
+    assert!(
+        sanitizer.contains("log_helpers::redacted_endpoint_url_str(url)"),
+        "remote CP URL logging must delegate to the shared structural redaction"
+    );
+}
+
+/// Accept-any verifiers live in `crate::tls::NoVerifier` (base provider) or
+/// derive their schemes from the provider their client is built from. No
+/// production `ServerCertVerifier` hard-codes a scheme list, and the CLI keeps
+/// no private copy of `NoVerifier`.
+#[test]
+fn no_production_certificate_verifier_hard_codes_its_signature_schemes() {
+    const SIGNATURE: &str = "fn supported_verify_schemes(";
+    let mut checked = 0;
+    for (path, text) in production_sources() {
+        let production = without_cfg_test_items(&text);
+        for (at, _) in production.match_indices(SIGNATURE) {
+            let rest = &production[at + SIGNATURE.len()..];
+            let body = rest.split("fn ").next().unwrap_or(rest);
+            assert!(
+                !body.contains("SignatureScheme::"),
+                "{path}: supported_verify_schemes must come from a crypto provider or \
+                 an inner verifier, not a fixed list"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 5,
+        "expected the production verifiers, found {checked}"
+    );
+    let cli = without_cfg_test_items(&source("src/cli.rs"));
+    assert!(
+        !cli.contains("ServerCertVerifier for"),
+        "src/cli.rs must use crate::tls::NoVerifier instead of a private verifier"
+    );
+    assert!(cli.contains("crate::tls::NoVerifier"));
 }

@@ -105,6 +105,16 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Signature schemes the mesh app-probe loopback HTTPS verifier
+    /// advertises when its client is built from `provider` (issue #7075).
+    pub fn mesh_app_probe_loopback_verifier_schemes_for_test(
+        provider: &rustls::crypto::CryptoProvider,
+    ) -> Vec<rustls::SignatureScheme> {
+        use rustls::client::danger::ServerCertVerifier;
+        crate::modes::mesh::app_probe::LoopbackNoVerifier::for_provider(provider)
+            .supported_verify_schemes()
+    }
+
     /// Attach a connection's authorization closer to a request context, as the
     /// H1/H2 accept loop does (issue #6768 client-abort scope tests).
     pub fn attach_authorization_connection_closer_for_test(
@@ -1911,30 +1921,14 @@ pub mod _test_support {
         )
     }
 
-    /// `Debug` rendering of the shared hyper HTTP/2 client builder
-    /// (`pool::hyper_h2_client_builder`); hyper's builder has no getters.
-    /// `pool_keepalive` selects `H2ClientKeepalive::FromPoolConfig` (else
-    /// `NotApplied`); `seed_initial_send_streams` selects
-    /// `H2ClientInitialSendStreams::FromStreamCap` (else `HyperDefault`).
-    pub fn hyper_h2_client_builder_debug_for_test(
+    /// The shared hyper HTTP/2 client builder every `PoolConfig`-driven pool
+    /// family uses (`pool::hyper_h2_client_builder`). hyper's builder has no
+    /// getters, but its `Debug` rendering covers the full HTTP/2 config, and it
+    /// can drive a real handshake over an in-memory transport.
+    pub fn hyper_h2_client_builder_for_test(
         pool_config: &crate::config::PoolConfig,
-        pool_keepalive: bool,
-        seed_initial_send_streams: bool,
-    ) -> String {
-        let keepalive = if pool_keepalive {
-            crate::pool::H2ClientKeepalive::FromPoolConfig
-        } else {
-            crate::pool::H2ClientKeepalive::NotApplied
-        };
-        let initial_send_streams = if seed_initial_send_streams {
-            crate::pool::H2ClientInitialSendStreams::FromStreamCap
-        } else {
-            crate::pool::H2ClientInitialSendStreams::HyperDefault
-        };
-        format!(
-            "{:?}",
-            crate::pool::hyper_h2_client_builder(pool_config, keepalive, initial_send_streams)
-        )
+    ) -> hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor> {
+        crate::pool::hyper_h2_client_builder(pool_config)
     }
 
     /// UDP backend selection with an optional session destination, so tests can
@@ -2712,6 +2706,14 @@ pub mod _test_support {
         duration: std::time::Duration,
     ) -> Option<u64> {
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(duration)
+    }
+
+    pub fn grpc_deadline_parse_grpc_timeout_for_test(value: &str) -> Option<std::time::Duration> {
+        crate::plugins::grpc_deadline::parse_grpc_timeout(value)
+    }
+
+    pub fn grpc_proxy_parse_grpc_timeout_value_for_test(value: &str) -> Option<u64> {
+        crate::proxy::grpc_proxy::parse_grpc_timeout_value(value)
     }
 
     pub fn apply_remaining_grpc_timeout_header_for_test(

@@ -157,38 +157,36 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     crate::common::ensure_gateway_built().map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
-fn mint_observability_token() -> String {
-    format!(
-        "ferrum-edge-grpc-plugins-probe-{}",
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
 fn start_gateway(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
-    observability_token: &str,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let child = std::process::Command::new(crate::common::gateway_binary_path())
+    identity: &crate::common::SpawnedGatewayIdentity,
+) -> Result<crate::common::GatewayChildGuard, Box<dyn std::error::Error>> {
+    let mut command = std::process::Command::new(crate::common::gateway_binary_path());
+    crate::common::configure_coverage_gateway_command(&mut command);
+    // Ownership proof for this exact child (issue #3428 / #2132 / #7076): a
+    // per-attempt admin JWT secret/issuer and metrics bearer token that no
+    // foreign gateway can answer for.
+    identity.apply_to_command(&mut command);
+    // Keep any managed-TLS store out of the checkout (issue #5706): the config
+    // file lives in the test's TempDir, which outlives this child.
+    let managed_store = std::path::Path::new(config_path).with_file_name("managed-tls");
+    command
         .arg("run")
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        // Ownership proof for this exact child (issue #3428 / #2132). Presenting
-        // this token unlocks the authenticated `/health` detail tier that no
-        // foreign gateway can answer. Disable pool warmup so backend-hit
-        // witnesses stay aligned with client traffic (HEAD / is also hostile to
-        // this h2c gRPC echo fixture).
-        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
+        .env("FERRUM_TLS_MANAGED_STORE_PATH", &managed_store)
+        // Disable pool warmup so backend-hit witnesses stay aligned with client
+        // traffic (HEAD / is also hostile to this h2c gRPC echo fixture).
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(child)
+        .stderr(std::process::Stdio::null());
+    Ok(crate::common::GatewayChildGuard::new(command.spawn()?))
 }
 
 async fn send_grpc_request(
@@ -250,65 +248,60 @@ async fn send_grpc_request(
 /// up. File-mode proxy bind failure then exits the child, but a foreign TCP
 /// listener on the proxy port plus any `/health` success still looked "ready".
 ///
-/// Barrier (`TestGateway`'s health-only path, via the shared
-/// `wait_for_child_gateway_readiness` + `wait_for_child_tcp_accept`; not JWT
-/// ownership):
+/// Barrier (`TestGateway`'s JWT ownership path, via the shared
+/// `wait_for_owned_gateway_identity` + `wait_for_child_tcp_accept`):
 /// 1. `Child::try_wait` before every probe and after a successful one, in both
 ///    stages — a dead child consumes the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token with
-///    `ready: true` (flips only after every listener bind, including proxy).
+///    `ready: true` (flips only after every listener bind, including proxy),
+///    AND HTTP 200 from JWT-only `GET /proxies` under this attempt's admin JWT.
+///    `/health` detail alone can be granted to a foreign gateway by
+///    `FERRUM_METRICS_ALLOWED_CIDRS`; the per-attempt JWT cannot (issue #7076).
 /// 3. TCP connect to the proxy port after identity is proven.
 async fn wait_for_owned_gateway(
     child: &mut std::process::Child,
     admin_port: u16,
-    observability_token: &str,
+    identity: &crate::common::SpawnedGatewayIdentity,
     gateway_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
     let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
-    crate::common::wait_for_child_gateway_readiness(
-        child,
-        admin_port,
-        observability_token,
-        STARTUP_TIMEOUT,
-    )
-    .await?;
+    crate::common::wait_for_owned_gateway_identity(child, admin_port, identity, STARTUP_TIMEOUT)
+        .await?;
     crate::common::wait_for_child_tcp_accept(child, gateway_port, deadline).await
 }
 
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+async fn start_gateway_with_retry(
+    config_path: &str,
+) -> (crate::common::GatewayChildGuard, u16, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         let admin_port = free_port().await;
-        let observability_token = mint_observability_token();
+        let identity = crate::common::SpawnedGatewayIdentity::mint("grpc-plugins");
 
-        let mut child =
-            match start_gateway(config_path, gateway_port, admin_port, &observability_token) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!(
-                        "Gateway spawn attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, e
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        sleep(Duration::from_secs(1)).await;
-                    }
-                    continue;
+        let mut child = match start_gateway(config_path, gateway_port, admin_port, &identity) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
                 }
-            };
+                continue;
+            }
+        };
 
-        match wait_for_owned_gateway(&mut child, admin_port, &observability_token, gateway_port)
-            .await
-        {
+        match wait_for_owned_gateway(child.child_mut(), admin_port, &identity, gateway_port).await {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(e) => {
                 eprintln!(
                     "Gateway ownership check attempt {}/{} failed: {}",
                     attempt, MAX_ATTEMPTS, e
                 );
-                let _ = child.kill();
-                let _ = child.wait();
+                child.shutdown();
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_secs(1)).await;
                 }
@@ -709,8 +702,7 @@ async fn test_grpc_access_control_distinguishes_authorization_from_missing_ident
         "missing identity must be UNAUTHENTICATED"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -766,8 +758,7 @@ async fn test_grpc_method_router_allow_list() {
         "gRPC rejection should preserve the plugin message"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_method_router_allow_list PASSED");
 }
@@ -824,8 +815,7 @@ async fn test_grpc_method_router_deny_list() {
         "Denied method should preserve the plugin message"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_method_router_deny_list PASSED");
 }
@@ -863,8 +853,7 @@ async fn test_grpc_method_router_enforces_stripped_backend_method() {
         Some("/pkg.Svc/Allowed")
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -892,8 +881,7 @@ async fn test_grpc_method_router_enforces_mesh_rewritten_backend_method() {
     assert!(body.is_empty(), "gRPC rejection should be trailers-only");
     assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
 }
 
@@ -989,8 +977,7 @@ async fn test_grpc_method_router_rate_limiting() {
         "Non-limited method must not increment the Limited witness"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_method_router_rate_limiting PASSED");
 }
@@ -1035,8 +1022,7 @@ async fn test_grpc_response_size_limiting_returns_grpc_error() {
         "gRPC response rejection should expose the bounded generic resource message"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_response_size_limiting_returns_grpc_error PASSED");
 }
@@ -1086,8 +1072,7 @@ async fn test_grpc_deadline_default_injection() {
         timeout_val
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_deadline_default_injection PASSED");
 }
@@ -1127,8 +1112,7 @@ async fn test_grpc_deadline_passthrough() {
         "Backend should receive forwarded grpc-timeout"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_deadline_passthrough PASSED");
 }
@@ -1204,8 +1188,7 @@ async fn test_grpc_deadline_clamped_to_max() {
         timeout_ms
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     println!("test_grpc_deadline_clamped_to_max PASSED");
 }
@@ -1586,8 +1569,7 @@ plugin_configs:
     );
     assert_eq!(passed.text().await.expect("backend body"), "plain-ok");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    gateway.shutdown();
     echo_handle.abort();
     plain_handle.abort();
     println!("test_grpc_plugins_on_plain_http_requests PASSED");
