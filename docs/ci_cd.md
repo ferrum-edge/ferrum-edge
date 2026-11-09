@@ -69,6 +69,7 @@ adding, removing, or materially changing a workflow.
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
 | `fuzz.yml` | Fuzz | Weekly schedule, manual | Sanitizer-backed libFuzzer lane for hostile parser targets; see [fuzz.md](fuzz.md). |
+| `fuzz-smoke-main.yml` | Fuzz Sanitizer Smoke | Push to `main`, manual | The bounded AddressSanitizer libFuzzer budget (`-runs=512`, `-max_total_time=8`, all ten targets) on every push to `main`, each push its own run of its own commit: serialized, never cancelled, and `queue: max` so a pending run is queued rather than replaced (backlog, not extra work, on busy days). Not a required check, so its ~55-minute sanitizer build no longer holds main's `CI` run open. Byte-frozen (`FUZZ_SANITIZER_SMOKE_WORKFLOW`); see [Admitted fuzz/property lane](#admitted-fuzzproperty-lane). |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. A follow-on publisher upserts a `severity:high` issue when the matrix is red. Publisher jobs share `scaling-gate-publisher` with `queue: max` and `cancel-in-progress: false` so overlapping weekly/daily work stays queued; GitHub does not guarantee FIFO, so issue mutation is generation-aware and close is compare-and-set against the recorded run id. |
 | `scaling-gate-freshness.yml` | Scheduled Scaling Gate Freshness | Daily schedule, manual | Fail-closed freshness check of the latest scaling-regression run on `main`. Only a completed success within eight days may close that issue; a newer failure, cancel, timeout, skip, or in-progress run keeps it open, as does stale or missing history. The publish step runs even when static verification fails so a broken contract cannot stay silent. Shares the generation-aware publisher concurrency group (`queue: max`). |
 | `performance-regression.yml` | Performance Regression | Daily schedule on `main`, manual | Out-of-band self-relative overhead benchmark, Criterion microbenchmarks, and the protocol-perf / mesh-baseline static contracts. Not a PR or main-push check; a red run marks the daily `main` tip as regressed. |
@@ -982,7 +983,9 @@ skips dependency compilation). Lanes: `ci-debug` (produced by Unit Tests;
 shared by every debug-profile job through identical `CARGO_BUILD_JOBS` /
 `CARGO_PROFILE_DEV_DEBUG` job env), `ci-lint` (produced by Lint),
 `ci-standalone-cargo` (produced by Standalone Cargo Workspaces), the main-only
-`fuzz-smoke` lane, `ci-coverage` (produced by the coverage `lib-unit` shard),
+`fuzz-property-smoke` lane (Fuzz Smoke's property build, line-tables-only
+debuginfo), the registry-only `fuzz-sanitizer-smoke` lane
+(`cache-targets: "false"`), `ci-coverage` (produced by the coverage `lib-unit` shard),
 and the separately governed FIPS contract lane. The direct eBPF-program cache also retains its main-push writer;
 binary and benchmark sites are restore-only (`save-if: "false"`).
 
@@ -1800,9 +1803,17 @@ This also forgoes saving when tests fail after compilation; no compile-complete
 predicate is inferred. The separate FIPS producer/handoff contract is
 unchanged.
 
-The main-only `fuzz-smoke` lane currently archives its target tree, without a
-sccache directory. The earlier target-only experiment showed that dropping
-compiler-store reuse can increase sanitizer time despite a target-cache hit.
+The retired main-only `fuzz-smoke` lane archived the property **and** sanitizer
+target trees in one entry. On 2026-11-09 that entry was 7.2 GB of the 10 GB
+quota, and it alternated hit/miss in exact opposition with
+`ci-standalone-cargo` on six consecutive main runs with identical keys: each
+run paid either a cold fuzz build plus a 2.5-minute save or a 9–13-minute
+colder Standalone Cargo job. A hit restored for ~3 minutes and still rebuilt the
+`ferrum-edge` path dependency and every vendored patch crate, so the sanitizer
+build gained ~3 minutes at most. The lane is now split: `fuzz-property-smoke`
+caches only the property build at line-tables-only debuginfo (expected near the
+~1 GB `ci-debug` entry), and the push-to-main sanitizer smoke caches only the
+Cargo registry and git checkouts.
 Restore-only benchmark and binary jobs do not create new cache producers.
 Ambient and NodeWaypoint image caches use their separate GHCR contracts.
 
@@ -2262,7 +2273,7 @@ planner-to-live-to-aggregate posture can be rewritten by a pull request
 Issue #2461 requires a short deterministic property/fuzz smoke in ordinary CI
 and a longer sanitizer-backed scheduled lane. The trusted policy rejects any new
 Cross-readable executable surface in `ci.yml` outside the protected ARM64 job,
-so rather than relaxing that rule the policy admits **exactly two** byte-frozen
+so rather than relaxing that rule the policy admits **exactly three** byte-frozen
 shapes and nothing else:
 
 - `CI_FUZZ_SMOKE_JOB` — the entire `fuzz-smoke` job in `ci.yml`. A repository
@@ -2270,15 +2281,19 @@ shapes and nothing else:
   request may neither remove nor alter it. Its surfaces, and only its surfaces,
   are then withheld from the `ci.yml` surface comparison; a top-level surface
   and every other job's surfaces are unaffected. Every command, action pin,
-  toolchain pin (`nightly-2026-09-30`), tool version (`cargo-fuzz 0.13.1`),
-  target name, and libFuzzer bound (`-runs`, `-max_total_time`, `-max_len`,
-  `-timeout`, `-rss_limit_mb`) is part of the contract. All automation commands
-  are inline and cannot be redirected through a repository-supplied script;
-  the read-only job necessarily compiles and executes pull-request-authored Rust
-  tests and fuzz targets. The frozen job installs `protobuf-compiler` before
-  invoking Cargo because the workspace build script requires `protoc`. Its
-  1024 MiB RSS cap leaves bounded headroom above the roughly 400 MiB baseline
-  of the fully linked, sanitizer-instrumented fuzz binaries.
+  toolchain pin (`nightly-2026-09-30`), cache key, and event gate of the
+  property gate is part of the contract. All automation commands are inline and
+  cannot be redirected through a repository-supplied script; the read-only job
+  necessarily compiles and executes pull-request-authored Rust tests. The
+  frozen job installs `protobuf-compiler` before invoking Cargo because the
+  workspace build script requires `protoc`. The libFuzzer half of the contract
+  — `cargo-fuzz 0.13.1`, the ten target names, every bound (`-runs`,
+  `-max_total_time`, `-max_len`, `-timeout`, `-rss_limit_mb`) — belongs to
+  whichever frozen text hosts the push-to-main budget: the retired
+  `CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB` generation, or `FUZZ_SANITIZER_SMOKE_WORKFLOW`
+  beside the adopted one. Its 1024 MiB RSS cap leaves bounded headroom above
+  the roughly 400 MiB baseline of the fully linked, sanitizer-instrumented fuzz
+  binaries.
 
   Because a whole-job freeze cannot express an edit, a change to *where* each
   half of the lane runs (#3902, #4238) or to *which targets* the budget covers
@@ -2303,6 +2318,22 @@ shapes and nothing else:
   Each matrix job gives cold sanitizer compilation a 90-minute outer deadline
   and uses 16 codegen units; the target itself remains independently capped at
   300 seconds, so build variance cannot widen the actual fuzzing budget.
+- `FUZZ_SANITIZER_SMOKE_WORKFLOW` — the whole of
+  `.github/workflows/fuzz-smoke-main.yml`, the push-to-main bounded libFuzzer
+  budget that the adopted `fuzz-smoke` generation no longer carries. Same
+  whole-file rules as `FUZZ_WORKFLOW` (absent until adopted, then neither
+  removable nor editable). It is `push` to `main` + input-less
+  `workflow_dispatch` only, serialized with `cancel-in-progress: false` and
+  `queue: max` (GitHub's default `queue: single` would replace the pending run
+  whenever a third push arrives, so a commit whose fast `CI` went green could
+  skip its own sanitizer run), read-only, secret-free, clears every wrapper input and `RUSTFLAGS`, extends
+  swap by 12 GiB, caches only the Cargo registry (`cache-targets: "false"`,
+  main-only `save-if`), and carries `CI_FUZZ_SMOKE_BOUNDED_BUDGET`,
+  `CI_FUZZ_SMOKE_PARSER_BUDGET`, and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` verbatim
+  exactly once each. `fuzz_budget_placement_errors` refuses a `ci.yml` whose
+  admitted `fuzz-smoke` generation lacks the budget unless this file is present
+  and frozen, so the budget can move between the two frozen texts but never
+  drop out of the schedule.
 
 A lane nothing observes is not a gate, so adopting `CI_FUZZ_SMOKE_JOB` also has
 to make it a required input of the `test` (`Tests`) aggregate. That aggregate is
@@ -2327,7 +2358,7 @@ wiring back out once the trusted base carries it. The aggregate `test` job is no
 otherwise exempt, and no other job, action, automation surface, publisher
 contract, top-level `env`/trigger, or Cross token is affected.
 
-No admitted generation, and not the scheduled lane, names the protected ARM64
+No admitted generation, and neither frozen fuzz workflow, names the protected ARM64
 target or the Cross executable, requests write permission, or references a
 secret; the verifier self-tests assert each of those directly, plus rejection of
 budget widening, unpinned or mutable action/tool pins, local-action
@@ -2346,10 +2377,24 @@ unreviewed place to set a target linker, runner, or rustflags.
 The whole job is frozen, so neither moving the lane nor extending its target
 list can be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS` therefore lists the job's
 admitted texts oldest first, and a generation retires once its successor is on
-`main`. Every earlier transition is spent, so one generation remains:
+`main`. One transition is open (2026-11-09 test sweep), so two generations
+remain:
 
-- `CI_FUZZ_SMOKE_JOB` — main's shape. It accumulates what each retired
-  generation added:
+- `CI_FUZZ_SMOKE_JOB` — the adopted end: the deterministic property smoke alone
+  (`cargo test --locked` in `fuzz/`), the required gate on `pull_request`,
+  `merge_group`, the push to `main`, and `workflow_dispatch`. It drops the swap
+  extension, the `cargo-fuzz` install, and the sanitizer step, caches under the
+  new `fuzz-property-smoke` key at line-tables-only debuginfo, and has a
+  60-minute deadline. The bounded budget moved verbatim to
+  `FUZZ_SANITIZER_SMOKE_WORKFLOW`. Measured reason: over 14 main runs Fuzz
+  Smoke took 44–78 minutes against a next-longest job of 20–30 minutes, because
+  its sanitizer build (~47 minutes for the first target plus ~8 minutes of
+  serial per-target rebuilds) bought fewer than ten seconds of fuzzing (every
+  target reaches `-runs=512` in 0–2 seconds). Main's `CI` concurrency group is
+  serialized, so that also delayed `Main Latest Image` and left more main
+  commits superseded before their own run started.
+- `CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB` — the retired end, main's shape before
+  that sweep. It accumulates what each earlier retired generation added:
   - issue #4238's lane split. `Fuzz Smoke` had been the longest job in required
     pull-request CI (roughly 47 minutes, of which roughly 46 were compilation)
     because the six sanitizer-instrumented libFuzzer targets were rebuilt from
@@ -2392,26 +2437,34 @@ admitted texts oldest first, and a generation retires once its successor is on
 A change to what the job runs edits the byte-frozen `fuzz-smoke` job together
 with the policy that admits it: the new text becomes `CI_FUZZ_SMOKE_JOB`, and
 the current text stays admitted under another name as the retired end until the
-successor is on `main`. The trusted base's policy rejects that pull request, so
-it needs the owner's admin merge.
+successor is on `main`. Any pull request that edits
+`verify_cross_build_policy.py` fails `CI Plan` ("frozen policy files changed")
+and `Trusted Cross Build Policy` ("trusted cross-build policy files cannot be
+changed by a pull request"), so the policy half lands first through the owner's
+reviewed policy migration (admin merge), with `main`'s existing `ci.yml` still
+validating against it. The workflow half then passes `Trusted Cross Build
+Policy` as an ordinary pull request.
 
 What is invariant across every generation:
 
 - the property smoke runs the same `cargo test --locked` and is the required
   full-mode `pull_request` and `merge_group` gate;
-- the six-target loop is byte-identical. The self-test asserts
+- the six-target loop is byte-identical wherever it runs. The self-test asserts
   `CI_FUZZ_SMOKE_BOUNDED_BUDGET` — the six `Fuzz smoke target:` markers, the
   `cargo fuzz run --codegen-units 16` invocation, and `-runs=512`,
   `-max_total_time=8`, `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024` —
-  appears exactly once in every generation, so a generation can never move or
-  extend the lane and relax its bounds in the same change;
+  appears exactly once in every budget host (a generation that carries it, or
+  `FUZZ_SANITIZER_SMOKE_WORKFLOW`), so a change can never move or extend the
+  lane and relax its bounds at the same time;
 - the seventh invocation and the parser-target loop are frozen the same way.
   `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` and `CI_FUZZ_SMOKE_PARSER_BUDGET` must each
-  appear exactly once in every generation, and the self-test separately asserts
-  their 64 KiB `-max_len` and each shared bound;
-- the bounded budget is gated by an **allow-list** —
+  appear exactly once in every budget host, and the self-test separately
+  asserts their 64 KiB `-max_len` and each shared bound;
+- the bounded budget runs only on the push to `main` and on manual dispatch: in
+  the retired generation through the allow-list
   `if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'`
-  — not by excluding events. The self-test rejects a `!=` form outright;
+  (a `!=` form is rejected outright), in `FUZZ_SANITIZER_SMOKE_WORKFLOW`
+  through its only two triggers;
 - compiler caching is admitted only through the repository's own
   `./.github/actions/setup-sccache`, the single local action the contract
   permits. That action installs a checksum-pinned sccache release, never enables
@@ -2431,12 +2484,11 @@ What is invariant across every generation:
   under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
   and nothing else. That predicate is the cache-quota control: `pull_request`
   (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
-  may restore a `fuzz-smoke` cache but cannot publish one;
-- telemetry: the job prints `Fuzz property smoke seconds`, `Fuzz sanitizer lane
-  seconds`, sccache statistics before and after the sanitizer build, the lane
-  shape it took, and the on-disk cache size — so a hosted log shows whether the
-  sanitizer build actually reused work, and warns explicitly when sccache was
-  unavailable.
+  may restore a fuzz cache but cannot publish one;
+- telemetry: the property gate prints `Fuzz property smoke seconds`, the lane
+  shape, closing sccache statistics, and the on-disk cache size, and warns
+  explicitly when sccache was unavailable; the sanitizer budget prints
+  `Fuzz sanitizer lane seconds` and its `Fuzz build resources:` records.
 
 A transition is exact on both ends and one-way. `admitted_fuzz_smoke_errors`
 accepts a `fuzz-smoke` job only at an admitted text (or absent);
@@ -2449,7 +2501,9 @@ directions. It always re-runs every shared tamper mutation against each
 generation, and adds adopted-generation
 mutations covering what #3902, #4238, and #4442 introduced — restoring the
 sanitizer budget to pull requests, dropping it from the push to `main`,
-re-adding it to the merge queue, skipping the property gate on pull requests,
+re-adding it to the merge queue (now as `FUZZ_SANITIZER_SMOKE_WORKFLOW`
+mutations), returning any libFuzzer run to the adopted property gate,
+restoring the fat cache key or full debuginfo, skipping the property gate on pull requests,
 allowing untrusted cache writes, substituting an unpinned third-party sccache
 installer, enabling the credential-bearing GHA backend, widening the cached
 directory, deleting the `datagram_client_address` invocation, re-bounding it to
@@ -2460,8 +2514,11 @@ The scheduled lane's own contract carries the same target inventory: the
 shell allowlist, and the self-test rejects a revision that drops it from either.
 
 The aggregate wiring is unaffected: this is still one job named `fuzz-smoke`,
-so `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS` and the `require_success "Fuzz Smoke"`
-assertion are byte-identical across the transition.
+so `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS` and the `require_planned_gate "Fuzz Smoke"`
+assertion are byte-identical across the transition. The `ci-plan`
+`run_fuzz_smoke` output keeps gating the property job; the push-to-main
+sanitizer workflow has no planner and runs on every push to `main`, exactly as
+the retired step did (the planner sets every gate on a push to `main`).
 
 Delete a retired generation from `CI_FUZZ_SMOKE_JOB_GENERATIONS`, with any
 self-test row that names it, once its successor is on `main`.
@@ -4353,7 +4410,14 @@ the report above measured with the same joins as the baseline.
 
 ### Sanitizer smoke on the main critical path (#4694)
 
-**Status: not changeable by a pull request.** The `fuzz-smoke` job in `ci.yml`
+**Status: superseded (2026-11-09 test sweep).** The sanitizer budget left the
+required `CI` run for `.github/workflows/fuzz-smoke-main.yml` through the
+`fuzz-smoke` generation transition described in
+[Admitted `fuzz-smoke` generations](#admitted-fuzz-smoke-generations), with
+every target and bound unchanged. The analysis below is kept as the record of
+the profile and cache options considered before that move.
+
+**Original status: not changeable by a pull request.** The `fuzz-smoke` job in `ci.yml`
 is byte-frozen by the trusted policy (`CI_FUZZ_SMOKE_JOB_GENERATIONS` in
 `.github/scripts/verify_cross_build_policy.py`), and so is its wiring into the
 required `test` aggregate (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`). Every

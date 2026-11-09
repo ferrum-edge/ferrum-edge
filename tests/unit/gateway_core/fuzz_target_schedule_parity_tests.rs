@@ -5,16 +5,21 @@
 //! for a year before either libFuzzer lane ran it: registration and scheduling
 //! are separate facts, and nothing compared them. These tests compare them.
 //!
-//! Both hosted lanes are byte-frozen by the trusted Cross build policy, so a
-//! pull request cannot repair a divergence found here; it is a direct-to-`main`
-//! trusted-policy change. That is exactly why the divergence has to be visible
-//! in the ordinary test suite rather than only inside the policy self-test.
+//! The two libFuzzer lanes are the scheduled `fuzz.yml` matrix and the
+//! push-to-main bounded budget in `fuzz-smoke-main.yml` (which left the
+//! required `ci.yml` `fuzz-smoke` job in the 2026-11-09 test sweep; that job is
+//! now the property gate alone). Both are byte-frozen by the trusted Cross
+//! build policy, so a pull request cannot repair a divergence found here; it is
+//! a trusted-policy change. That is exactly why the divergence has to be
+//! visible in the ordinary test suite rather than only inside the policy
+//! self-test.
 
 use std::path::{Path, PathBuf};
 
 const FUZZ_MANIFEST: &str = include_str!("../../../fuzz/Cargo.toml");
 const FUZZ_WORKFLOW: &str = include_str!("../../../.github/workflows/fuzz.yml");
-const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
+const SANITIZER_SMOKE_WORKFLOW: &str =
+    include_str!("../../../.github/workflows/fuzz-smoke-main.yml");
 const FUZZ_DOCS: &str = include_str!("../../../docs/fuzz.md");
 const ROOT_MANIFEST: &str = include_str!("../../../Cargo.toml");
 
@@ -44,29 +49,6 @@ fn registered_targets() -> Vec<String> {
 
 fn repo_path(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
-}
-
-/// The `fuzz-smoke` job body in `ci.yml`, so a target named anywhere else in
-/// that very large workflow cannot satisfy the assertions below. A job ends at
-/// the next line indented by exactly two spaces, which is where the next
-/// top-level job key starts.
-fn fuzz_smoke_job() -> &'static str {
-    let start = CI_WORKFLOW
-        .find("\n  fuzz-smoke:\n")
-        .expect("ci.yml carries the fuzz-smoke job")
-        + 1;
-    let body = &CI_WORKFLOW[start..];
-    let mut offset = 0usize;
-    for (index, line) in body.split_inclusive('\n').enumerate() {
-        if index > 0
-            && line.starts_with("  ")
-            && !line.as_bytes().get(2).is_some_and(u8::is_ascii_whitespace)
-        {
-            return &body[..offset];
-        }
-        offset += line.len();
-    }
-    body
 }
 
 /// The literal `case` alternation the scheduled lane re-checks its matrix value
@@ -113,7 +95,7 @@ fn every_registered_fuzz_target_has_a_target_source_and_seed_corpus() {
 }
 
 #[test]
-fn every_registered_fuzz_target_is_scheduled_in_both_required_lanes() {
+fn every_registered_fuzz_target_is_scheduled_in_both_libfuzzer_lanes() {
     for target in registered_targets() {
         assert!(
             FUZZ_WORKFLOW.contains(&format!("          - {target}\n")),
@@ -126,8 +108,8 @@ fn every_registered_fuzz_target_is_scheduled_in_both_required_lanes() {
             "fuzz target {target} is missing from the fuzz.yml shell allowlist"
         );
         assert!(
-            fuzz_smoke_job().contains(target.as_str()),
-            "fuzz target {target} is missing from the required ci.yml fuzz-smoke job"
+            SANITIZER_SMOKE_WORKFLOW.contains(&format!(" {target}")),
+            "fuzz target {target} is missing from the fuzz-smoke-main.yml bounded budget"
         );
         assert!(
             FUZZ_DOCS.contains(&format!("`{target}`")),
@@ -142,10 +124,10 @@ fn datagram_client_address_is_fuzzed_at_its_documented_64_kib_budget() {
     // budget is 64 KiB, and the scheduled sanitizer lane already runs it there;
     // a boundary reachable in one required lane and not the other is not
     // actually scheduled.
-    let job = fuzz_smoke_job();
+    let job = SANITIZER_SMOKE_WORKFLOW;
     let invocation = job
         .find("cargo fuzz run --codegen-units 16 datagram_client_address --")
-        .expect("the fuzz-smoke job invokes datagram_client_address on its own");
+        .expect("the bounded budget invokes datagram_client_address on its own");
     let bounds = &job[invocation..];
     let terminator = bounds
         .find("-rss_limit_mb=1024")
