@@ -60,7 +60,9 @@ continuously refreshes a lock-free `ArcSwap` snapshot of the current SVID and
 trust bundles. All identity reads (TLS resolvers, backend-pool key derivation)
 come from that snapshot. `SpireAgentCa` in `src/identity/ca/spire.rs` remains a
 library CA implementation and is not constructed by the production mesh
-runtime.
+runtime. When a caller does construct it, its X.509 stream is the same
+`workload_api::fetch_loop` with the `spire_agent` metrics source, so its
+CA-health and rotation-failure telemetry match the mesh runtime's.
 
 For the **gateway-to-mesh** path (a north-south `database`/`file`/`dp`-mode
 gateway that originates HBONE traffic into the mesh), Ferrum reads SVID

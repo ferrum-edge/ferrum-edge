@@ -7898,10 +7898,7 @@ impl EnvConfig {
                                     .into(),
                             );
                         }
-                        let bootstrap_dev = std::env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
-                            .map(|v| v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                        if !bootstrap_dev {
+                        if !crate::identity::ca::bootstrap::dev_bootstrap_opted_in() {
                             return Err(
                                 "FERRUM_MESH_CA_BACKEND=internal requires FERRUM_MESH_CA_BOOTSTRAP_DEV=true \
                                  (dev/test only) to bootstrap its self-signed root"

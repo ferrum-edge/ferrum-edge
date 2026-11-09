@@ -3866,6 +3866,21 @@ impl PipeDefault for Vec<String> {
     }
 }
 
+/// Read an optional `client_auth` string field: absent or `null` is `None`,
+/// a string is `Some`, and any other JSON type is a configuration error.
+fn optional_client_auth_string<'a>(
+    auth: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    match auth.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(format!(
+            "oidc_relying_party: `client_auth.{field}` must be a string"
+        )),
+    }
+}
+
 fn parse_client_auth(
     config: &Map<String, Value>,
     auth_endpoint: Option<&str>,
@@ -3884,6 +3899,13 @@ fn parse_client_auth(
             "oidc_relying_party: `provider[0].client_auth.method` must be a string".to_string()
         })?,
     };
+    // The OpenAPI schema types both fields as `string | null` whatever the
+    // method. A non-string value used to fall through to `RS256` / no `kid`,
+    // so a typo such as `["ES384"]` signed with an algorithm the provider was
+    // never registered for and `42` silently dropped the `kid` header
+    // (issue #7069). `null` or absent still selects the default.
+    let alg_field = optional_client_auth_string(&auth, "private_key_jwt_alg")?;
+    let kid_field = optional_client_auth_string(&auth, "private_key_jwt_kid")?;
     match method {
         "client_secret_basic" => Ok(OidcClientAuth::Basic {
             client_secret: SecretString(required_string(&auth, "client_secret", "client_auth")?),
@@ -3893,10 +3915,7 @@ fn parse_client_auth(
         }),
         "private_key_jwt" => {
             let pem = required_string(&auth, "private_key_pem", "client_auth")?;
-            let alg_name = auth
-                .get("private_key_jwt_alg")
-                .and_then(Value::as_str)
-                .unwrap_or("RS256");
+            let alg_name = alg_field.unwrap_or("RS256");
             let alg = oauth_client_auth::private_key_jwt_algorithm(alg_name).ok_or_else(|| {
                 "oidc_relying_party: unsupported `private_key_jwt_alg`".to_string()
             })?;
@@ -3932,9 +3951,7 @@ fn parse_client_auth(
                         "oidc_relying_party: `client_auth.private_key_pem` cannot sign `private_key_jwt_alg` {alg_name:?}"
                     )
                 })?;
-            let kid = auth
-                .get("private_key_jwt_kid")
-                .and_then(Value::as_str)
+            let kid = kid_field
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);

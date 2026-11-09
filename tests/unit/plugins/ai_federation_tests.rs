@@ -11501,6 +11501,41 @@ async fn route_policy_cut_provenance_is_typed_and_class_specific() {
     );
 }
 
+/// Issue #7070 review: the shared tool-call parser still reports the first
+/// failing call. An earlier call's malformed `extra_content` is diagnosed
+/// before a later call's missing id.
+#[test]
+fn tool_call_diagnostics_keep_per_call_order() {
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Look it up"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "call_a",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                        "extra_content": []
+                    },
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }
+                ]
+            }
+        ]
+    });
+    let error =
+        test_helpers::validate_openai_request_test(&body).expect_err("both calls are malformed");
+    assert!(
+        error.contains("messages[1].tool_calls[0]") && error.contains("extra_content"),
+        "{error}"
+    );
+}
+
 /// PR6816-SOL-2 (round 2): reference shapes Google cannot represent are
 /// refused for a strict schema; supported references still pass.
 #[test]

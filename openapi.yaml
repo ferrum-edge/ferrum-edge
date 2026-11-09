@@ -27,6 +27,11 @@ info:
     unset (default), tokens without `aud` are accepted, but tokens carrying an
     `aud` claim are rejected per RFC 7519 strict audience handling.
 
+    Every response the admin API service produces, whatever its status,
+    content type or endpoint, carries `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and
+    `X-Frame-Options: DENY`. Per-response declarations below list them where a
+    response documents its headers.
+
     ## Namespaces
 
     Resource endpoints that include the `X-Ferrum-Namespace` parameter are
@@ -8349,6 +8354,10 @@ paths:
               schema:
                 type: string
                 enum: [nosniff]
+            X-Frame-Options:
+              schema:
+                type: string
+                enum: [DENY]
           content:
             application/json:
               schema:
@@ -8359,7 +8368,7 @@ paths:
                 type: string
                 description: The raw spec document (YAML format)
         "304":
-          description: Spec unchanged — ETag matches `If-None-Match`
+          description: Spec unchanged — ETag matches `If-None-Match`. Carries the same `ETag`, `Vary`, `Cache-Control`, `X-Content-Type-Options` and `X-Frame-Options` as the `200`, and no body.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -8708,6 +8717,10 @@ paths:
               schema:
                 type: string
                 enum: [nosniff]
+            X-Frame-Options:
+              schema:
+                type: string
+                enum: [DENY]
           content:
             application/json:
               schema:
@@ -8718,7 +8731,7 @@ paths:
                 type: string
                 description: The raw spec document (YAML format)
         "304":
-          description: Spec unchanged — ETag matches `If-None-Match`
+          description: Spec unchanged — ETag matches `If-None-Match`. Carries the same `ETag`, `Vary`, `Cache-Control`, `X-Content-Type-Options` and `X-Frame-Options` as the `200`, and no body.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -25454,8 +25467,10 @@ components:
                     type: [string, "null"]
                     enum: [RS256, RS384, RS512, ES256, ES384, EdDSA, null]
                     default: RS256
+                    description: Null or absent selects RS256. A non-string value is rejected for every method.
                   private_key_jwt_kid:
                     type: [string, "null"]
+                    description: Null or absent sends no kid header. A non-string value is rejected for every method.
               redirect_uri:
                 type: string
                 minLength: 1
@@ -28562,8 +28577,11 @@ components:
           description: |
             Custom tags injected into transaction metadata and exported spans.
             Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
-            and cannot collide with reserved, sensitive, `mesh.*`, trace, or
-            authorization keys. This map, `custom_header_tags`, and
+            and cannot collide with reserved, sensitive, `mesh.*`, trace,
+            authorization keys, a reviewed gateway-published metadata key (for
+            example `grpc_full_method`, `consumer_username`, `namespace`), or a
+            built-in plugin's metadata namespace (`<plugin>.<key>` or
+            `<plugin>_<key>`, for example `ai_transcript_audit.record_id`). This map, `custom_header_tags`, and
             `custom_env_tags` may contain at most 32 distinct tag names combined.
             For Istio environment tags, values here are `defaultValue`
             fallbacks only — live data-plane resolution uses `custom_env_tags`.

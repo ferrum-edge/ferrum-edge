@@ -498,14 +498,57 @@ fn admin_builder_fallback_is_500_not_default_200() {
             .and_then(|value| value.to_str().ok()),
         Some("application/json")
     );
-    for source in [
-        include_str!("../../../src/admin/mod.rs"),
-        include_str!("../../../src/admin/config_export.rs"),
-        include_str!("../../../src/admin/api_specs/handlers.rs"),
+    // The fallback carries the full admin security-header set (issue #7074).
+    for (name, expected) in [
+        (hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (hyper::header::CACHE_CONTROL, "no-store"),
+        (hyper::header::X_FRAME_OPTIONS, "DENY"),
+    ] {
+        assert_eq!(
+            response
+                .headers()
+                .get(&name)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected),
+            "{name}"
+        );
+    }
+    for (file, source) in [
+        (
+            "src/admin/mod.rs",
+            include_str!("../../../src/admin/mod.rs"),
+        ),
+        (
+            "src/admin/config_export.rs",
+            include_str!("../../../src/admin/config_export.rs"),
+        ),
+        (
+            "src/admin/api_specs/handlers.rs",
+            include_str!("../../../src/admin/api_specs/handlers.rs"),
+        ),
     ] {
         assert!(
             !source.contains("unwrap_or_else(|_| Response::new("),
-            "admin builder fallbacks must not default to 200"
+            "{file}: admin builder fallbacks must not default to 200"
         );
+        // A hand-built fallback (`Response::new`) bypasses the explicit 500 and
+        // the security headers; only `admin_builder_failure_response` may
+        // construct one.
+        assert!(
+            source.matches("Response::new(").count() <= usize::from(file == "src/admin/mod.rs"),
+            "{file}: build admin fallbacks with admin_builder_failure_response()"
+        );
+        // Security headers come from `with_admin_security_headers` /
+        // `insert_missing_admin_security_headers`, never per-response copies.
+        for literal in [
+            "\"X-Content-Type-Options\"",
+            "\"X-Frame-Options\"",
+            "\"Cache-Control\", \"no-store\"",
+        ] {
+            assert!(
+                !source.contains(literal),
+                "{file}: set {literal} through with_admin_security_headers()"
+            );
+        }
     }
 }

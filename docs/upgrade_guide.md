@@ -28,6 +28,32 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
+
+A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
+entry whose name is a reviewed gateway-published metadata key (for example
+`grpc_full_method`, `consumer_username`, `namespace`, `request_body`,
+`ai_stream_router_pass_through`), that sits in a shared gateway metadata
+namespace (`a2a.`, `auth.`, `authorization.`, `ferrum.`, `geo.`, `hbone.`,
+`mcp.`, `mesh_request_auth.`, `oidc_rp.`, `websocket.`), or that sits in a built-in plugin's metadata
+namespace (`<plugin>.<key>` or `<plugin>_<key>`, for example
+`ai_transcript_audit.record_id` or `waf.action`), is now refused as reserved,
+like `trace_id` (GHSA-9mmx-ghcv-x25q, follow-up to #7081). In mesh mode this includes an Istio
+`Telemetry.tracing[].customTags` entry with such a name; that Telemetry
+resource is reported `FerrumAccepted=False`/`Invalid`. Such a tag overwrote
+gateway-published metadata other plugins read. Rename the tag (for example
+`rpc_method`, `k8s_namespace` or `team.owner`) before upgrading.
+
+### `oidc_relying_party`: non-string `private_key_jwt_alg` / `private_key_jwt_kid` are refused (#7069)
+
+`providers[].client_auth.private_key_jwt_alg` and `private_key_jwt_kid` must be
+a string, `null`, or absent, for every `client_auth.method`, as the OpenAPI
+schema already required. A number, boolean, array or object used to fall back
+silently to `RS256` / no `kid`; it now fails config load with
+``oidc_relying_party: `client_auth.<field>` must be a string``. Replace such a
+value with the intended string (for example `"ES384"` instead of `["ES384"]`)
+or remove it before upgrading.
+
 ### Repeated `Content-Type` and gateway-asserted request headers (#7064)
 
 - **Repeated or list-valued `Content-Type` is refused.** `Content-Type` is a

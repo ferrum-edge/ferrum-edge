@@ -122,11 +122,11 @@
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "blocked",
-          "notes": "Reviewed 2026-10-09: latest stable SQLx/sqlx-core 0.9.0 still binds REAL NULL through f64 and DOUBLE NULL through f32. Upstream main fixes the arms in PR #4359, but no released replacement contains that fix. Preserve the hosted PostgreSQL regression and retain the vendor while patch 001 remains."
+          "notes": "Reviewed 2026-11-08 (previously 2026-10-09): latest stable SQLx/sqlx-core 0.9.0 still binds REAL NULL through f64 and DOUBLE NULL through f32. Upstream main fixes the arms in PR #4359, but no released replacement contains that fix. Preserve the hosted PostgreSQL regression and retain the vendor while patch 001 remains."
         },
         "merged_release_hold": {
-          "reviewed_on": "2026-10-09",
-          "expires_on": "2026-11-08",
+          "reviewed_on": "2026-11-08",
+          "expires_on": "2026-12-08",
           "owner": "Ferrum Edge maintainers",
           "latest_release": "0.9.0",
           "merge_commit": "80f44db8073e9a6a61ef6488eb15341554716d35",

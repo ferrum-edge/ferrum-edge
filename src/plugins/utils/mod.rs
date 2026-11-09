@@ -6,6 +6,7 @@
 pub mod ai_model_glob;
 pub mod ai_pii;
 pub mod ai_providers;
+pub mod ai_translation;
 pub mod ai_usage_stream;
 pub mod ambient_cloud_credentials;
 pub mod auth_attempt;

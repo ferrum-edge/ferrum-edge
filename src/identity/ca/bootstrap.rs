@@ -52,14 +52,27 @@ pub struct BootstrappedRoot {
     pub root_key_pem: String,
 }
 
+/// Canonical read of the `FERRUM_MESH_CA_BOOTSTRAP_DEV` dev opt-in.
+///
+/// Every reader of the opt-in ([`bootstrap_allowed`], [`bootstrap_dev_root`],
+/// and the `EnvConfig` validation gate that lets `validate` agree with
+/// startup) goes through this one function, so the accepted spelling cannot
+/// drift between them. Only `true` (ASCII case-insensitive, no surrounding
+/// whitespace) opts in; any other value, or an unset variable, leaves the
+/// bootstrap refused. This does **not** consult
+/// [`crate::identity::production_mode`]; callers check that guardrail first.
+pub fn dev_bootstrap_opted_in() -> bool {
+    env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Returns `true` iff both gates allow bootstrap to run.
 pub fn bootstrap_allowed() -> bool {
     if crate::identity::production_mode() {
         return false;
     }
-    env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    dev_bootstrap_opted_in()
 }
 
 /// Generate a self-signed root suitable for use as the internal CA's
@@ -74,10 +87,7 @@ pub fn bootstrap_dev_root(config: BootstrapConfig) -> Result<BootstrappedRoot, C
                 .to_string(),
         ));
     }
-    if !env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if !dev_bootstrap_opted_in() {
         return Err(CaError::Config(
             "FERRUM_MESH_CA_BOOTSTRAP_DEV is not set to 'true' — bootstrap refused. \
              Set the env var only in dev/test environments."

@@ -38,7 +38,7 @@ use hyper_util::rt::TokioIo;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::convert::Infallible;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -65,7 +65,7 @@ const API_BATCH_CHUNK: usize = 100;
 #[allow(dead_code)]
 struct ScalePerfHarness {
     _temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    gateway_process: Option<crate::common::GatewayChildGuard>,
     proxy_base_url: String,
     admin_base_url: String,
     jwt_secret: String,
@@ -196,20 +196,17 @@ impl ScalePerfHarness {
         let jwt_issuer = identity.jwt_issuer.clone();
         let observability_token = identity.observability_token.clone();
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
+        // Gateway handoff ports come from the registry outside the host's
+        // ephemeral source range; each harness attempt gets fresh ones.
+        let admin_port = crate::scaffolding::ports::unbound_port().await?;
+        let proxy_port = crate::scaffolding::ports::unbound_port().await?;
 
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
+        // The backend is in-process, so it keeps its bound fixture socket.
         let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0").await?;
         let backend_port = backend_listener.local_addr()?.port();
-        drop(backend_listener);
 
         // Start echo backend
-        start_echo_backend(backend_port).await?;
+        start_echo_backend(backend_listener).await?;
 
         // Build gateway (release mode for meaningful perf numbers). Build only
         // the gateway binary, exactly as the documented prebuild does: a plain
@@ -246,9 +243,15 @@ impl ScalePerfHarness {
         }
 
         let mut command = Command::new(&binary_path);
+        crate::common::configure_coverage_gateway_command(&mut command);
         command.arg("run");
         command
             .env("FERRUM_MODE", "database")
+            // Keep the managed-TLS store out of the checkout (#5706).
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env(
                 "FERRUM_ADMIN_JWT_MAX_TTL",
                 scheduled_scaling_admin_jwt_max_ttl_value(),
@@ -286,7 +289,7 @@ impl ScalePerfHarness {
             }
         }
         identity.apply_to_command(&mut command);
-        let child = command.spawn()?;
+        let child = crate::common::GatewayChildGuard::new(command.spawn()?);
 
         let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
         let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
@@ -308,8 +311,7 @@ impl ScalePerfHarness {
             Ok(()) => Ok(harness),
             Err(e) => {
                 if let Some(mut child) = harness.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    child.shutdown();
                 }
                 Err(e)
             }
@@ -333,7 +335,7 @@ impl ScalePerfHarness {
             .as_mut()
             .ok_or("gateway process missing")?;
         crate::common::wait_for_owned_gateway_identity(
-            child,
+            child.child_mut(),
             admin_port,
             &identity,
             Duration::from_secs(30),
@@ -363,18 +365,19 @@ impl ScalePerfHarness {
 
 impl Drop for ScalePerfHarness {
     fn drop(&mut self) {
+        // Reap before `_temp_dir` (the SQLite DB) is removed; SIGTERM + grace
+        // under coverage so the gateway still writes its profile.
         if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.shutdown();
         }
     }
 }
 
-/// High-performance echo backend using hyper with HTTP/1.1 keep-alive
+/// High-performance echo backend using hyper with HTTP/1.1 keep-alive, on an
+/// already-bound listener it holds for its whole life (no drop-and-rebind).
 async fn start_echo_backend(
-    port: u16,
+    listener: tokio::net::TcpListener,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind_test(format!("127.0.0.1:{}", port)).await?;
     let handle = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -1010,7 +1013,10 @@ async fn run_scale_perf_test(harness: &ScalePerfHarness) {
                 PERF_WARMUP_SECS,
                 PERF_TEST_DURATION_SECS,
                 CONCURRENCY,
-                harness.gateway_process.as_ref().map(Child::id),
+                harness
+                    .gateway_process
+                    .as_ref()
+                    .and_then(crate::common::GatewayChildGuard::id),
             )
             .await
             .expect("Perf test failed");
@@ -2142,7 +2148,7 @@ async fn run_reload_under_load_test(harness: &ScalePerfHarness, total_proxies: u
     let pid = harness
         .gateway_process
         .as_ref()
-        .map(Child::id)
+        .and_then(crate::common::GatewayChildGuard::id)
         .expect("gateway process");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(20)

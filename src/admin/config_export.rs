@@ -462,13 +462,10 @@ pub(crate) async fn handle_config_export(
         bytes = body.len(),
         "Configuration export served"
     );
-    Response::builder()
+    super::with_admin_security_headers(Response::builder())
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header("X-Data-Source", source)
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body)))
         .unwrap_or_else(|_| super::admin_builder_failure_response())
 }

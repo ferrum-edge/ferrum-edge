@@ -4804,3 +4804,128 @@ fn every_pool_config_h2_client_uses_the_shared_builder_with_no_site_options() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #7075: control-plane and platform copies of one rule
+// ---------------------------------------------------------------------------
+
+/// `FERRUM_MESH_CA_BOOTSTRAP_DEV` is read in exactly one place,
+/// `identity::ca::bootstrap::dev_bootstrap_opted_in`, which `bootstrap_allowed`,
+/// `bootstrap_dev_root`, and the `EnvConfig` validation gate all call. A second
+/// inline read could drift to a different spelling.
+#[test]
+fn mesh_ca_bootstrap_dev_opt_in_has_one_reader() {
+    let mut readers = Vec::new();
+    for (path, text) in production_sources() {
+        let production = without_cfg_test_items(&text);
+        let reads = production
+            .matches("var(\"FERRUM_MESH_CA_BOOTSTRAP_DEV\")")
+            .count();
+        if reads > 0 {
+            readers.push((path, reads));
+        }
+    }
+    assert_eq!(
+        readers,
+        vec![("src/identity/ca/bootstrap.rs".to_string(), 1)],
+        "read FERRUM_MESH_CA_BOOTSTRAP_DEV only through \
+         identity::ca::bootstrap::dev_bootstrap_opted_in"
+    );
+    let bootstrap = source("src/identity/ca/bootstrap.rs");
+    let helper = item_body(&bootstrap, "pub fn dev_bootstrap_opted_in(", "\n}");
+    assert!(helper.contains("var(\"FERRUM_MESH_CA_BOOTSTRAP_DEV\")"));
+    for caller in ["pub fn bootstrap_allowed(", "pub fn bootstrap_dev_root("] {
+        let body = item_body(&bootstrap, caller, "\n}");
+        assert!(body.contains("dev_bootstrap_opted_in()"), "{caller}");
+    }
+    assert!(
+        source("src/config/env_config.rs")
+            .contains("crate::identity::ca::bootstrap::dev_bootstrap_opted_in()"),
+        "EnvConfig validation must share the bootstrap opt-in read"
+    );
+}
+
+/// `SpireAgentCa` consumes the shared Workload API fetch loop rather than a
+/// private copy, so it inherits the loop's telemetry fixes (`0afac83f7`): the
+/// `spire_agent` CA-health series exists before the first connect, and a clean
+/// stream end counts as a rotation failure.
+#[test]
+fn spire_agent_ca_x509_stream_is_the_shared_workload_api_fetch_loop() {
+    let spire = without_cfg_test_items(&source("src/identity/ca/spire.rs"));
+    assert!(spire.contains("spawn_fetch_loop_with_handle("));
+    assert!(spire.contains("metrics_source: FetchLoopMetricsSource::SpireAgent"));
+    assert!(
+        !spire.contains("fetch_x509_svid_stream("),
+        "SpireAgentCa must not open its own FetchX509SVID stream"
+    );
+    let fetch_loop = source("src/identity/workload_api/fetch_loop.rs");
+    let main = item_body(&fetch_loop, "async fn fetch_loop_main(", "\n}");
+    assert!(main.contains("config.metrics_source.set_ca_health(false);"));
+    assert!(main.contains("if !failure_recorded {"));
+}
+
+/// Remote control-plane URLs are logged in the same structural
+/// `scheme://host[:port]/redacted` form as notification and observability
+/// endpoints: no userinfo, path, query, or fragment survives.
+#[test]
+fn remote_control_plane_url_logs_use_structural_endpoint_redaction() {
+    use ferrum_edge::plugins::utils::redacted_endpoint_url_str;
+
+    for (url, expected) in [
+        (
+            "https://user:pw@cp.example:8443/tenant-secret?token=x#frag",
+            "https://cp.example:8443/redacted",
+        ),
+        (
+            "http://user@cp.example/tenant-secret?token=x",
+            "http://cp.example/redacted",
+        ),
+        ("https://cp.example", "https://cp.example/redacted"),
+        ("not a url", "redacted-host/redacted"),
+    ] {
+        let rendered = redacted_endpoint_url_str(url);
+        assert_eq!(rendered, expected, "{url}");
+        for leaked in ["user", "pw", "tenant-secret", "token", "frag"] {
+            assert!(!rendered.contains(leaked), "{url} leaked {leaked}");
+        }
+    }
+    let multicluster = without_cfg_test_items(&source("src/modes/mesh/multicluster.rs"));
+    let sanitizer = item_body(&multicluster, "fn sanitize_url_for_logging(", "\n}");
+    assert!(
+        sanitizer.contains("log_helpers::redacted_endpoint_url_str(url)"),
+        "remote CP URL logging must delegate to the shared structural redaction"
+    );
+}
+
+/// Accept-any verifiers live in `crate::tls::NoVerifier` (base provider) or
+/// derive their schemes from the provider their client is built from. No
+/// production `ServerCertVerifier` hard-codes a scheme list, and the CLI keeps
+/// no private copy of `NoVerifier`.
+#[test]
+fn no_production_certificate_verifier_hard_codes_its_signature_schemes() {
+    const SIGNATURE: &str = "fn supported_verify_schemes(";
+    let mut checked = 0;
+    for (path, text) in production_sources() {
+        let production = without_cfg_test_items(&text);
+        for (at, _) in production.match_indices(SIGNATURE) {
+            let rest = &production[at + SIGNATURE.len()..];
+            let body = rest.split("fn ").next().unwrap_or(rest);
+            assert!(
+                !body.contains("SignatureScheme::"),
+                "{path}: supported_verify_schemes must come from a crypto provider or \
+                 an inner verifier, not a fixed list"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 5,
+        "expected the production verifiers, found {checked}"
+    );
+    let cli = without_cfg_test_items(&source("src/cli.rs"));
+    assert!(
+        !cli.contains("ServerCertVerifier for"),
+        "src/cli.rs must use crate::tls::NoVerifier instead of a private verifier"
+    );
+    assert!(cli.contains("crate::tls::NoVerifier"));
+}

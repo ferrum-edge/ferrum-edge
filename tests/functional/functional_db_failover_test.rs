@@ -16,6 +16,7 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_db_failover
 
+use crate::common::GatewayChildGuard;
 use crate::scaffolding::port_registry::TestSocket;
 
 use chrono::Utc;
@@ -23,7 +24,7 @@ use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy, default_namespace};
 use serde_json::json;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
@@ -81,7 +82,7 @@ fn ensure_built() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn wait_for_owned_health(
-    child: &mut Child,
+    child: &mut std::process::Child,
     admin_port: u16,
     identity: &crate::common::SpawnedGatewayIdentity,
 ) -> bool {
@@ -95,10 +96,9 @@ async fn wait_for_owned_health(
     .is_ok()
 }
 
-/// Kill the child process and reap its zombie before any retry re-binds ports.
-fn kill_child(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+/// Shut the gateway down and reap it before any retry re-binds ports.
+fn stop_gateway(mut child: GatewayChildGuard) {
+    child.shutdown();
 }
 
 fn seeded_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
@@ -194,16 +194,12 @@ async fn test_db_failover_urls_startup() {
         let temp_dir = TempDir::new().expect("temp dir");
         let failover_db_path: PathBuf = temp_dir.path().join("failover.db");
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        let admin_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .expect("reserve gateway admin port");
+        let proxy_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
+            .expect("reserve gateway proxy port");
 
         // Primary URL points at a path that does not exist. With `?mode=ro`
         // sqlx returns an error instead of auto-creating the file, so the
@@ -214,8 +210,13 @@ async fn test_db_failover_urls_startup() {
         let identity = mint_failover_identity("db-failover-urls");
 
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env("FERRUM_DB_FAILOVER_URLS", &failover_url)
@@ -228,12 +229,12 @@ async fn test_db_failover_urls_startup() {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
-        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
+        if !wait_for_owned_health(child.child_mut(), admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
-            kill_child(child);
+            stop_gateway(child);
             if attempt < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -302,7 +303,7 @@ async fn test_db_failover_urls_startup() {
             "Failover SQLite file should have been created on disk"
         );
 
-        kill_child(child);
+        stop_gateway(child);
         println!("\n=== DB Failover URLs Test PASSED ===\n");
         return;
     }
@@ -521,16 +522,12 @@ async fn test_db_config_backup_bootstrap() {
         let temp_dir = TempDir::new().expect("temp dir");
         let backup_path: PathBuf = temp_dir.path().join("backup.json");
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        let admin_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .expect("reserve gateway admin port");
+        let proxy_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
+            .expect("reserve gateway proxy port");
 
         // Bind the backend listener early and pass it directly into the echo
         // task — no drop-and-rebind, so the port is held atomically from
@@ -568,8 +565,13 @@ async fn test_db_config_backup_bootstrap() {
         let identity = mint_failover_identity("db-failover-backup");
 
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env(
@@ -585,15 +587,15 @@ async fn test_db_config_backup_bootstrap() {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
         // Note: connecting to the primary DB fails with a short pool timeout,
         // but the backup loader still needs to read and parse the JSON file.
         // Budget plenty of time to avoid timing-out on a slow CI runner.
-        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
+        if !wait_for_owned_health(child.child_mut(), admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
-            kill_child(child);
+            stop_gateway(child);
             if attempt < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -640,7 +642,7 @@ async fn test_db_config_backup_bootstrap() {
         );
         println!("  Health reports admin_writes_enabled=false (DB still down)");
 
-        kill_child(child);
+        stop_gateway(child);
         println!("\n=== DB Config Backup Bootstrap Test PASSED ===\n");
         return;
     }
@@ -709,8 +711,13 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         let identity = mint_failover_identity("db-failover-backup-reject");
 
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env(
@@ -729,7 +736,7 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
         // An invalid backup should fail closed with a non-zero status once the
         // unreachable primary pool times out and the backup rejection path
@@ -737,7 +744,7 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         let deadline = SystemTime::now() + Duration::from_secs(25);
         let mut try_wait_err = None;
         let status = loop {
-            match child.try_wait() {
+            match child.child_mut().try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) if SystemTime::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -751,15 +758,14 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         };
 
         // stderr is a pipe: reading it while a timed-out child is still alive
-        // can block forever waiting for EOF. Terminate and reap first.
+        // can block forever waiting for EOF. Take the pipe, then shut the
+        // child down and reap it before reading.
+        let stderr_pipe = child.child_mut().stderr.take();
         if status.is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.shutdown();
         }
 
-        let stderr = child
-            .stderr
-            .take()
+        let stderr = stderr_pipe
             .map(|mut pipe| {
                 use std::io::Read;
                 let mut buf = String::new();
@@ -843,16 +849,12 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
         let backup_path: PathBuf = temp_dir.path().join("backup-multi-namespace.json");
         let log_path: PathBuf = temp_dir.path().join("gateway.stderr");
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        let admin_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .expect("reserve gateway admin port");
+        let proxy_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
+            .expect("reserve gateway proxy port");
 
         // Held atomically from allocation through server startup.
         let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
@@ -941,8 +943,13 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
 
         let log_file = std::fs::File::create(&log_path).expect("create stderr log");
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env("FERRUM_NAMESPACE", "tenant-a")
@@ -960,16 +967,16 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
             .stdout(Stdio::null())
             .stderr(Stdio::from(log_file));
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
-        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
+        if !wait_for_owned_health(child.child_mut(), admin_port, &identity).await {
             last_err = format!(
                 "attempt {}: health check did not pass (a multi-namespace backup must \
                  still bootstrap the configured namespace)",
                 attempt
             );
             eprintln!("  {}", last_err);
-            kill_child(child);
+            stop_gateway(child);
             if attempt < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1026,7 +1033,7 @@ async fn test_db_config_backup_bootstrap_filters_to_configured_namespace() {
         );
         println!("  tenant-b route 404s and tenant-b credential is rejected");
 
-        kill_child(child);
+        stop_gateway(child);
 
         // 4. The startup log must not disclose the other tenant or any secret.
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -1090,16 +1097,12 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let backup_path: PathBuf = temp_dir.path().join("backup.json");
         let failover_db_path: PathBuf = temp_dir.path().join("failover.db");
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        let admin_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .expect("reserve gateway admin port");
+        let proxy_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
+            .expect("reserve gateway proxy port");
 
         // Minimal backup JSON — we don't need proxy routing to succeed here,
         // only to prove the gateway started and then recovered via failover.
@@ -1122,8 +1125,13 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
         let identity = mint_failover_identity("db-failover-recovery");
 
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", bogus_primary)
             .env("FERRUM_DB_FAILOVER_URLS", &failover_url)
@@ -1140,12 +1148,12 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
-        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
+        if !wait_for_owned_health(child.child_mut(), admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
-            kill_child(child);
+            stop_gateway(child);
             if attempt < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1189,7 +1197,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
                 attempt, last_health
             );
             eprintln!("  {}", last_err);
-            kill_child(child);
+            stop_gateway(child);
             if attempt < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1247,7 +1255,7 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
             "Failover SQLite file should have been created during recovery"
         );
 
-        kill_child(child);
+        stop_gateway(child);
         println!("\n=== DB Backup Bootstrap → Failover Recovery Test PASSED ===\n");
         return;
     }
@@ -1287,16 +1295,12 @@ async fn test_db_read_replica_startup() {
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("gateway.db");
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        let admin_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .expect("reserve gateway admin port");
+        let proxy_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
+            .expect("reserve gateway proxy port");
 
         // Primary and replica point at the same SQLite file — replicates real
         // production semantics where both URLs resolve to the same logical DB
@@ -1307,8 +1311,13 @@ async fn test_db_read_replica_startup() {
         let identity = mint_failover_identity("db-failover-replica");
 
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &primary_url)
             .env("FERRUM_DB_READ_REPLICA_URL", &replica_url)
@@ -1321,12 +1330,12 @@ async fn test_db_read_replica_startup() {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
-        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
+        if !wait_for_owned_health(child.child_mut(), admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
-            kill_child(child);
+            stop_gateway(child);
             if attempt < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1381,7 +1390,7 @@ async fn test_db_read_replica_startup() {
         );
         println!("  Health reports admin_writes_enabled=true");
 
-        kill_child(child);
+        stop_gateway(child);
         println!("\n=== DB Read Replica Startup Test PASSED ===\n");
         return;
     }
@@ -1421,16 +1430,12 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
         let primary_db_path: PathBuf = temp_dir.path().join("primary.db");
         let replica_db_path: PathBuf = temp_dir.path().join("replica-empty.db");
 
-        let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        let admin_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+            .expect("reserve gateway admin port");
+        let proxy_port = crate::scaffolding::ports::unbound_port()
             .await
-            .unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
+            .expect("reserve gateway proxy port");
 
         let backend_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
             .await
@@ -1461,8 +1466,13 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
         let identity = mint_failover_identity("db-failover-authoritative");
 
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run");
         cmd.env("FERRUM_MODE", "database")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                temp_dir.path().join("managed-tls"),
+            )
             .env("FERRUM_DB_TYPE", "sqlite")
             .env("FERRUM_DB_URL", &primary_url)
             .env("FERRUM_DB_READ_REPLICA_URL", &replica_url)
@@ -1475,12 +1485,12 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         identity.apply_to_command(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
-        if !wait_for_owned_health(&mut child, admin_port, &identity).await {
+        if !wait_for_owned_health(child.child_mut(), admin_port, &identity).await {
             last_err = format!("attempt {}: health check did not pass", attempt);
             eprintln!("  {}", last_err);
-            kill_child(child);
+            stop_gateway(child);
             if attempt < MAX_ATTEMPTS {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1525,7 +1535,7 @@ async fn test_db_authoritative_startup_uses_primary_when_replica_is_stale() {
             "Replica SQLite file should have been opened but not used for startup config"
         );
 
-        kill_child(child);
+        stop_gateway(child);
         println!("\n=== DB Authoritative Primary Startup Test PASSED ===\n");
         return;
     }

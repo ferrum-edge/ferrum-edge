@@ -205,6 +205,12 @@ fn start_gateway_with_extra_env(
     cmd.arg("run");
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        // Keep any managed-TLS/ACME/event store inside the config's temp dir
+        // instead of the checkout (issue #5706).
+        .env(
+            "FERRUM_TLS_MANAGED_STORE_PATH",
+            std::path::Path::new(config_path).with_file_name("managed-tls"),
+        )
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_TLS_NO_VERIFY", "true")
@@ -311,18 +317,18 @@ where
 {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        // Allocate fresh ephemeral ports each attempt
-        let proxy_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let proxy_listen_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let http_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let http_port = http_listener.local_addr().unwrap().port();
-        drop(http_listener);
-
-        let admin_listener = TcpListener::bind_test("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
+        // Fresh registry-leased handoff ports each attempt, outside the host's
+        // ephemeral source range so no outgoing connection can take them
+        // between release and the gateway's bind.
+        let proxy_listen_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve stream listener port");
+        let http_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway HTTP port");
+        let admin_port = crate::scaffolding::ports::unbound_port()
+            .await
+            .expect("reserve gateway admin port");
 
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("config.yaml");

@@ -20,7 +20,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
-use crate::common::pin_gateway_command_rust_log;
+use crate::common::{GatewayChildGuard, pin_gateway_command_rust_log};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -73,20 +73,20 @@ fn write_empty_spec(dir: &TempDir) -> PathBuf {
     p
 }
 
-/// Kill the gateway and wait for it to exit.
-fn stop(child: &mut std::process::Child) {
+/// SIGTERM the gateway and wait for it to exit, so its log writer flushes and
+/// a coverage build writes its profile. The guard's own shutdown then only
+/// disarms it (and is the fallback on every early-exit path).
+fn stop(child: &mut GatewayChildGuard) {
     #[cfg(unix)]
     {
-        let pid = child.id();
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+        if let Some(pid) = child.id() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            let _ = child.child_mut().wait();
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
+    child.shutdown();
 }
 
 /// Start the gateway with retry on port-binding failures.
@@ -106,7 +106,7 @@ async fn start_gateway_with_retry<F, R, Fut>(
     extra_ports: usize,
     build_envs: F,
     ready: R,
-) -> (std::process::Child, TlsOnlyPorts, Vec<u16>)
+) -> (GatewayChildGuard, TlsOnlyPorts, Vec<u16>)
 where
     F: Fn(&TlsOnlyPorts, &[u16]) -> Vec<(String, String)>,
     R: Fn(TlsOnlyPorts) -> Fut,
@@ -138,18 +138,24 @@ where
 
         let envs = build_envs(&ports, &extras);
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run")
             .arg("--spec")
             .arg(spec_path)
             .arg("--mode")
             .arg("file")
+            // Keep any managed-TLS/ACME/event store inside the spec's temp dir.
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                spec_path.with_file_name("managed-tls"),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         for (k, v) in &envs {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
         if ready(ports).await {
             return (child, ports, extras);
@@ -418,11 +424,16 @@ async fn functional_tls_only_warn_when_plaintext_disabled_and_no_tls() {
         let admin_http = alloc_port().await;
 
         let mut cmd = Command::new(crate::common::gateway_binary_path());
+        crate::common::configure_coverage_gateway_command(&mut cmd);
         cmd.arg("run")
             .arg("--spec")
             .arg(&spec)
             .arg("--mode")
             .arg("file")
+            .env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                td.path().join("managed-tls"),
+            )
             .env("FERRUM_PROXY_HTTP_PORT", "0")
             // Intentionally no FERRUM_FRONTEND_TLS_CERT_PATH / KEY.
             .env("FERRUM_ADMIN_HTTP_PORT", admin_http.to_string())
@@ -434,12 +445,12 @@ async fn functional_tls_only_warn_when_plaintext_disabled_and_no_tls() {
             .stderr(Stdio::piped());
         pin_gateway_command_rust_log(&mut cmd, "warn");
 
-        let mut child = cmd.spawn().expect("spawn gateway");
+        let mut child = GatewayChildGuard::new(cmd.spawn().expect("spawn gateway"));
 
         // Drain stdout + stderr into shared buffers on dedicated blocking
         // threads so the pipe buffer never fills up and blocks the gateway.
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
+        let mut stdout = child.child_mut().stdout.take().unwrap();
+        let mut stderr = child.child_mut().stderr.take().unwrap();
         let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let sb1 = stdout_buf.clone();
