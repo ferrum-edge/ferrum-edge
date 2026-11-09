@@ -56,9 +56,8 @@ impl DbOutageTestHarness {
                 ferrum_edge::config::test_db_fault::CONTROL_ENV,
                 fault_control_path.to_string_lossy().as_ref(),
             )
-            // Tight poll interval so the test budget for "wait for poll to
-            // observe DB state" stays small. With 1s polls, every
-            // wait_for_poll() can be ~5s instead of ~8s.
+            // Tight poll interval so `wait_for_poll_observed` sees each
+            // fault-state change within about one second.
             .db_poll_interval_seconds(1)
             .spawn()
             .await?;
@@ -105,15 +104,54 @@ impl DbOutageTestHarness {
         );
     }
 
-    /// Wait for DB poll to pick up changes.
-    /// Budget: poll interval (1s, set in `new`) + pool acquire timeout (3s,
-    /// set in `new`) + 1s margin = 5s. Covers both "happy path" pickup
-    /// (poll succeeds in <1s) and "outage detection" (poll connects and
-    /// times out after 3s).
-    async fn wait_for_poll(&self) {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+    /// Wait until the database poll loop has observed the current fault state.
+    ///
+    /// The poll loop owns `/health`'s `admin_writes_enabled`: it clears it
+    /// when a poll fails against the faulted config DB and sets it again only
+    /// after a successful poll (`src/modes/database.rs`). Observing the flip
+    /// is positive evidence that a poll cycle saw the outage (`false`) or the
+    /// recovery (`true`), instead of sleeping out a worst-case budget of poll
+    /// interval (1s) + pool acquire timeout (3s) + margin.
+    ///
+    /// Not needed after an admin write: database-mode writes are synchronous
+    /// read-your-write, so a 2xx already means the generation is live on this
+    /// process (`docs/admin_api.md`, issue #3926).
+    async fn wait_for_poll_observed(&self, writes_enabled: bool) {
+        let client = reqwest::Client::new();
+        let url = format!("{}/health", self.admin_base_url);
+        let deadline = std::time::Instant::now() + POLL_OBSERVATION_TIMEOUT;
+        loop {
+            let last = match client
+                .get(&url)
+                .header("Authorization", self.auth_header())
+                .send()
+                .await
+            {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(health) => {
+                        if health["admin_writes_enabled"].as_bool() == Some(writes_enabled) {
+                            return;
+                        }
+                        format!("admin_writes_enabled={}", health["admin_writes_enabled"])
+                    }
+                    Err(error) => format!("unparseable /health body: {error}"),
+                },
+                Err(error) => format!("/health request failed: {error}"),
+            };
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the DB poll loop did not report admin_writes_enabled={writes_enabled} within \
+                 {POLL_OBSERVATION_TIMEOUT:?}; last observation: {last}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
+
+/// Generous bound for the poll loop to observe a fault-state change. The
+/// expected latency is about one 1s poll interval (the fault seam fails
+/// acquires immediately); the bound absorbs a loaded CI runner.
+const POLL_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 // Drop impl omitted: `self.gw` (TestGateway) kills the gateway subprocess
 // on drop.
@@ -328,8 +366,8 @@ async fn test_db_outage_proxy_continues_with_plugins() {
         "Update proxy with plugins failed"
     );
 
-    // Wait for DB poll to load the config
-    harness.wait_for_poll().await;
+    // No poll wait: the synchronous admin writes above returned 2xx only
+    // once their generation was live (read-your-write, issue #3926).
 
     // Verify proxy works before outage
     println!("  Verifying proxy works before outage...");
@@ -365,8 +403,8 @@ async fn test_db_outage_proxy_continues_with_plugins() {
     println!("\nPhase 2: Simulating database outage...");
     harness.simulate_db_outage();
 
-    // Wait for at least one poll cycle to detect the outage
-    harness.wait_for_poll().await;
+    // Wait for a poll cycle to observe the outage
+    harness.wait_for_poll_observed(false).await;
     harness.assert_gateway_alive();
 
     // Verify proxy STILL works during outage (cached config)
@@ -443,8 +481,8 @@ async fn test_db_outage_proxy_continues_with_plugins() {
     println!("\nPhase 3: Restoring database...");
     harness.restore_db();
 
-    // Wait for DB poll to reconnect
-    harness.wait_for_poll().await;
+    // Wait for a poll cycle to observe the recovery
+    harness.wait_for_poll_observed(true).await;
 
     // Verify proxy still works after recovery
     let resp = client
@@ -556,23 +594,23 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
         "Update proxy with plugin failed"
     );
 
-    // Wait for config to be loaded
-    harness.wait_for_poll().await;
+    // No poll wait: the synchronous admin writes above returned 2xx only
+    // once their generation was live (read-your-write, issue #3926).
     println!("  Test data created: proxy, consumer, plugin config");
 
     // --- Phase 2: Simulate DB outage ---
     println!("\nPhase 2: Simulating database outage...");
     harness.simulate_db_outage();
 
-    // Wait for poll cycle to detect outage
-    harness.wait_for_poll().await;
+    // Wait for a poll cycle to observe the outage
+    harness.wait_for_poll_observed(false).await;
     harness.assert_gateway_alive();
 
-    // Setup used `client` for mutations, then two consecutive `wait_for_poll()` sleeps
-    // (5s each) leave its pooled admin connection idle for exactly
-    // `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (default 10). The admin listener
-    // closes idle connections at that boundary; reqwest may still select the stale
-    // pooled socket for the first post-outage request, racing server close → IncompleteMessage.
+    // Use a fresh client for the outage phase. The admin listener closes idle
+    // connections after `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (default 10);
+    // a slow outage observation could leave the setup client's pooled socket
+    // idle that long, and reqwest may still select it for the first
+    // post-outage request, racing server close → IncompleteMessage.
     let admin_client = reqwest::Client::new();
 
     // --- Phase 2a: Verify reads fall back to cached config ---
@@ -948,8 +986,8 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     println!("\nPhase 3: Restoring database...");
     harness.restore_db();
 
-    // Wait for poll cycle to reconnect
-    harness.wait_for_poll().await;
+    // Wait for a poll cycle to observe the recovery
+    harness.wait_for_poll_observed(true).await;
 
     // Verify health is back to normal
     let resp = admin_client
@@ -1110,7 +1148,8 @@ async fn test_db_outage_key_auth_continues() {
         "Update proxy with plugin failed"
     );
 
-    harness.wait_for_poll().await;
+    // No poll wait: the synchronous admin writes above returned 2xx only
+    // once their generation was live (read-your-write, issue #3926).
 
     // Verify auth works before outage: valid key succeeds
     let resp = client
@@ -1156,7 +1195,7 @@ async fn test_db_outage_key_auth_continues() {
     // --- Simulate DB outage ---
     println!("\nPhase 2: Simulating database outage...");
     harness.simulate_db_outage();
-    harness.wait_for_poll().await;
+    harness.wait_for_poll_observed(false).await;
     harness.assert_gateway_alive();
 
     // Verify auth STILL works during outage: valid key succeeds
@@ -1203,7 +1242,7 @@ async fn test_db_outage_key_auth_continues() {
     // --- Restore DB ---
     println!("\nPhase 3: Restoring database...");
     harness.restore_db();
-    harness.wait_for_poll().await;
+    harness.wait_for_poll_observed(true).await;
 
     // Still works after recovery
     let resp = client
@@ -1302,7 +1341,8 @@ async fn test_db_outage_rate_limiting_continues() {
         "Update proxy with plugin failed"
     );
 
-    harness.wait_for_poll().await;
+    // No poll wait: the synchronous admin writes above returned 2xx only
+    // once their generation was live (read-your-write, issue #3926).
 
     // Verify rate limiting works before outage: send requests until we hit 429
     println!("  Verifying rate limiting before outage...");
@@ -1328,7 +1368,7 @@ async fn test_db_outage_rate_limiting_continues() {
     // --- Simulate DB outage ---
     println!("\nPhase 2: Simulating database outage...");
     harness.simulate_db_outage();
-    harness.wait_for_poll().await;
+    harness.wait_for_poll_observed(false).await;
     harness.assert_gateway_alive();
 
     // Rate limiting state should still be enforced during outage.
@@ -1356,7 +1396,7 @@ async fn test_db_outage_rate_limiting_continues() {
     // --- Restore DB ---
     println!("\nPhase 3: Restoring database...");
     harness.restore_db();
-    harness.wait_for_poll().await;
+    harness.wait_for_poll_observed(true).await;
 
     let resp = client
         .get(format!("{}/rate-test/recovery-req", harness.proxy_base_url))
