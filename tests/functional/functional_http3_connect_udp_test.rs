@@ -201,7 +201,10 @@ async fn start_masque_gateway(config: String, extra_env: &[(&str, &str)]) -> (Te
             .env("FERRUM_POOL_WARMUP_ENABLED", "false")
             .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key");
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+            // Uncached runtime snapshot: `assert_exactly_one_stream_udp_termination`
+            // reads fresh counters instead of waiting out the 1s default cache.
+            .env("FERRUM_METRICS_RUNTIME_CACHE_MS", "0");
         for (key, value) in extra_env {
             builder = builder.env(*key, *value);
         }
@@ -1258,9 +1261,10 @@ async fn stream_udp_terminations(gateway: &TestGateway, class: &str) -> u64 {
 }
 
 /// Poll until the counter reaches `expected`, then prove it does not go past
-/// it. The runtime snapshot is cached (`FERRUM_METRICS_RUNTIME_CACHE_MS`), so a
-/// second read after the cache window is what shows the terminal accounting
-/// fired once for the tunnel rather than once per relayed datagram.
+/// it. `start_masque_gateway` disables the runtime snapshot cache
+/// (`FERRUM_METRICS_RUNTIME_CACHE_MS=0`), so the second, uncached read after a
+/// settle window is what shows the terminal accounting fired once for the
+/// tunnel rather than once per relayed datagram.
 async fn assert_exactly_one_stream_udp_termination(gateway: &TestGateway, class: &str) {
     let expected = 1u64;
     let deadline = std::time::Instant::now() + AUTH_TERMINATION_GRACE;
@@ -1276,7 +1280,7 @@ async fn assert_exactly_one_stream_udp_termination(gateway: &TestGateway, class:
         "expected exactly {expected} stream_udp {class} termination(s) on a freshly spawned \
          gateway; observed {observed}"
     );
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         stream_udp_terminations(gateway, class).await,
         expected,

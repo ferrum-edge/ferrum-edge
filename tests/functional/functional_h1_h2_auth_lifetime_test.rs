@@ -81,6 +81,15 @@ const TOKEN_TTL_SECS: i64 = 6;
 /// multi-minute lifetime the backend script below would otherwise keep alive.
 const TERMINATION_GRACE: Duration = Duration::from_secs(20);
 
+/// Disables the `/metrics/runtime` snapshot cache (default 1s) on every gateway
+/// whose counters `assert_credential_expired_exactly` reads.
+const RUNTIME_METRICS_CACHE_ENV: &str = "FERRUM_METRICS_RUNTIME_CACHE_MS";
+
+/// Settle window between reaching the expected `credential_expired` count and
+/// the re-read that proves it stays there. With the snapshot cache disabled
+/// this is pure observation time for a per-frame double count.
+const CREDENTIAL_EXPIRED_SETTLE: Duration = Duration::from_millis(500);
+
 /// Which RFC 7519 §2 NumericDate shape the minted `exp` carries.
 ///
 /// A NumericDate is a JSON *number*, not an integer, so both shapes are equally
@@ -209,8 +218,9 @@ async fn credential_expired_count(harness: &GatewayHarness, family: &str) -> u64
 }
 
 /// Poll until the family's `credential_expired` counter reaches `expected`, then
-/// assert it does not go higher. The snapshot is cached for
-/// `FERRUM_METRICS_RUNTIME_CACHE_MS`, so this polls rather than sampling once.
+/// assert it does not go higher. Every gateway that reaches this helper disables
+/// the snapshot cache (`FERRUM_METRICS_RUNTIME_CACHE_MS=0`); the poll still
+/// absorbs the asynchronous terminal accounting.
 async fn assert_credential_expired_exactly(harness: &GatewayHarness, family: &str, expected: u64) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let observed = loop {
@@ -227,7 +237,7 @@ async fn assert_credential_expired_exactly(harness: &GatewayHarness, family: &st
          freshly spawned gateway; observed {observed}. Logs:\n{}",
         harness.captured_combined().unwrap_or_default()
     );
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(CREDENTIAL_EXPIRED_SETTLE).await;
     assert_eq!(
         credential_expired_count(harness, family).await,
         expected,
@@ -241,6 +251,9 @@ async fn spawn_gateway(backend_port: u16) -> GatewayHarness {
         .log_level("info")
         .capture_output()
         .pool_warmup_enabled(false)
+        // Uncached runtime snapshot: `assert_credential_expired_exactly` reads
+        // fresh counters instead of waiting out the 1s default cache window.
+        .env(RUNTIME_METRICS_CACHE_ENV, "0")
         .spawn()
         .await
         .expect("spawn gateway")
@@ -596,6 +609,9 @@ async fn h1_h2_auth_lifetime_direct_h1_stalled_checkout_never_reaches_the_backen
         .log_level("debug")
         .capture_output()
         .pool_warmup_enabled(false)
+        // Uncached runtime snapshot: `assert_credential_expired_exactly` reads
+        // fresh counters instead of waiting out the 1s default cache window.
+        .env(RUNTIME_METRICS_CACHE_ENV, "0")
         .spawn()
         .await
         .expect("spawn gateway");
@@ -1082,6 +1098,9 @@ async fn h1_h2_auth_lifetime_buffered_grpc_response_collect_commits_only_the_exp
         .file_config(serde_yaml::to_string(&config).expect("config"))
         .capture_output()
         .pool_warmup_enabled(false)
+        // Uncached runtime snapshot: `assert_credential_expired_exactly` reads
+        // fresh counters instead of waiting out the 1s default cache window.
+        .env(RUNTIME_METRICS_CACHE_ENV, "0")
         .spawn()
         .await
         .expect("gateway");

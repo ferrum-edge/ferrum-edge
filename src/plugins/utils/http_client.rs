@@ -2820,16 +2820,22 @@ mod fallback_tests {
         assert!(matches!(posture, PluginTlsPosture::SkipVerification));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fallback_client_enforces_connect_timeout() {
         // RFC 5737 TEST-NET-1 is non-routable. Without a client-level
         // connect_timeout the dial can hang for the OS SYN-retransmit budget
         // (~75s on Linux). The outer bound proves the fallback builder path
         // inherited the same 30s connect bound as the fully-configured client.
+        //
+        // Both bounds are tokio timers (reqwest's connect timeout is a
+        // `tokio::time::timeout`), so the paused clock auto-advances to
+        // whichever fires first instead of waiting 30s of wall time. Without
+        // the client bound the outer 40s timer would fire first and fail the
+        // `expect` below, so the assertion is unchanged.
         let client =
             build_dns_cached_fallback_client(None, &PluginTlsPosture::PlatformRoots, false)
                 .expect("fallback client builds");
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(40),
             client.get("http://192.0.2.1:9999/").send(),

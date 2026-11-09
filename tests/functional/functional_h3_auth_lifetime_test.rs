@@ -81,6 +81,15 @@ const TOKEN_TTL_SECS: i64 = 6;
 /// multi-minute lifetime the backends in this file would otherwise keep alive.
 const TERMINATION_GRACE: Duration = Duration::from_secs(12);
 
+/// Disables the `/metrics/runtime` snapshot cache (default 1s) on every gateway
+/// whose counters `assert_credential_expired_exactly` reads.
+const RUNTIME_METRICS_CACHE_ENV: &str = "FERRUM_METRICS_RUNTIME_CACHE_MS";
+
+/// Settle window between reaching the expected `credential_expired` count and
+/// the re-read that proves it stays there. With the snapshot cache disabled
+/// this is pure observation time for a per-frame double count.
+const CREDENTIAL_EXPIRED_SETTLE: Duration = Duration::from_millis(500);
+
 /// Mint a real HS256 JWT for `CONSUMER` whose `exp` is `TOKEN_TTL_SECS` in the
 /// future. The gateway's `jwt_auth` plugin validates it and publishes the
 /// authoritative deadline onto the request.
@@ -245,6 +254,9 @@ async fn spawn_h3_gateway(yaml: String, pool_warmup: bool) -> (GatewayHarness, u
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
             .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
             .env("FERRUM_TLS_NO_VERIFY", "true")
+            // Uncached runtime snapshot: `assert_credential_expired_exactly` reads
+            // fresh counters instead of waiting out the 1s default cache window.
+            .env(RUNTIME_METRICS_CACHE_ENV, "0")
             .env(
                 "FERRUM_POOL_WARMUP_ENABLED",
                 if pool_warmup { "true" } else { "false" },
@@ -294,9 +306,9 @@ async fn credential_expired_count(harness: &GatewayHarness, family: &str) -> u64
 }
 
 /// Poll the runtime snapshot until the family's `credential_expired` counter
-/// reaches `expected`, then assert it does not go higher. The snapshot is
-/// cached for `FERRUM_METRICS_RUNTIME_CACHE_MS` (1s by default), so this polls
-/// rather than sampling once.
+/// reaches `expected`, then assert it does not go higher. `spawn_h3_gateway`
+/// disables the snapshot cache (`FERRUM_METRICS_RUNTIME_CACHE_MS=0`); the poll
+/// still absorbs the asynchronous terminal accounting.
 async fn assert_credential_expired_exactly(harness: &GatewayHarness, family: &str, expected: u64) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let observed = loop {
@@ -313,9 +325,9 @@ async fn assert_credential_expired_exactly(harness: &GatewayHarness, family: &st
          freshly spawned gateway; observed {observed}. Logs:\n{}",
         harness.captured_combined().unwrap_or_default()
     );
-    // A second read after the cache window proves the terminal accounting fired
-    // once for the stream rather than once per relayed frame.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // A second, uncached read after a settle window proves the terminal
+    // accounting fired once for the stream rather than once per relayed frame.
+    tokio::time::sleep(CREDENTIAL_EXPIRED_SETTLE).await;
     assert_eq!(
         credential_expired_count(harness, family).await,
         expected,
