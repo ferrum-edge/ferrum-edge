@@ -9691,6 +9691,115 @@ async fn batch_rejects_stream_proxy_on_unbindable_port() {
     drop(held);
 }
 
+/// Issue #7214: `POST /batch` runs the single-write API-spec ownership and
+/// `openapi_validator` admission checks: a batch proxy cannot attach a
+/// spec-owned upstream, and an `openapi_validator` row needs a persisted proxy
+/// with an attached API spec (a batch-created proxy never carries one).
+#[tokio::test]
+async fn batch_runs_api_spec_ownership_and_openapi_validator_checks() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let spec = json!({
+        "openapi": "3.0.3", "info": {"title": "Owned", "version": "1"},
+        "paths": {"/items": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {"id": "spec-proxy", "listen_path": "/spec-proxy",
+            "backend_host": "backend.example.com", "backend_port": 8080},
+        "x-ferrum-upstream": {"id": "owned-upstream", "name": "owned-upstream",
+            "targets": [{"host": "backend.example.com", "port": 8080}]}
+    });
+    let (status, body) = admin_post(&base_url, "/api-specs", &token, &spec).await;
+    assert_eq!(status, 201, "spec import failed: {body:?}");
+    let hand_proxy = json!({
+        "id": "hand-proxy",
+        "listen_path": "/hand-proxy",
+        "backend_host": "backend.example.com",
+        "backend_port": 8080
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &hand_proxy).await;
+    assert_eq!(status, 201, "hand proxy create failed: {body:?}");
+
+    // A hand-managed proxy cannot attach a spec-owned upstream, as with
+    // `POST /proxies`.
+    let attach = json!({
+        "id": "batch-attach",
+        "listen_path": "/batch-attach",
+        "backend_scheme": "http",
+        "upstream_id": "owned-upstream"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &attach).await;
+    assert_eq!(status, 400, "single write must refuse it: {body:?}");
+    let (status, body) =
+        admin_post(&base_url, "/batch", &token, &json!({"proxies": [attach]})).await;
+    assert_eq!(
+        status, 400,
+        "batch attached a spec-owned upstream: {body:?}"
+    );
+    assert!(
+        body["validation_errors"].to_string().contains(
+            "Proxy 'batch-attach' references upstream_id 'owned-upstream' that is owned by api_spec"
+        ),
+        "expected the ownership diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-attach", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+
+    let validator = |id: &str, proxy_id: &str| {
+        json!({
+            "id": id,
+            "plugin_name": "openapi_validator",
+            "scope": "proxy",
+            "proxy_id": proxy_id,
+            "enabled": true,
+            "config": {}
+        })
+    };
+
+    // Persisted target without an attached API spec.
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"plugin_configs": [validator("validator-hand", "hand-proxy")]}),
+    )
+    .await;
+    assert_eq!(status, 400, "batch admitted openapi_validator: {body:?}");
+    assert!(
+        body["validation_errors"].to_string().contains(
+            "PluginConfig 'validator-hand': openapi_validator requires a proxy with an attached api_spec"
+        ),
+        "expected the precondition diagnostic: {body:?}"
+    );
+
+    // Target created by the same batch.
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({
+            "proxies": [{
+                "id": "batch-new",
+                "listen_path": "/batch-new",
+                "backend_host": "backend.example.com",
+                "backend_port": 8080
+            }],
+            "plugin_configs": [validator("validator-new", "batch-new")]
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "batch admitted openapi_validator: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .to_string()
+            .contains("proxy 'batch-new' is created by this batch and cannot carry one"),
+        "expected the batch-created-target diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-new", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
 /// A batch that joins an existing, valid shared-SNI listener group must be
 /// admitted: the port-bucket candidate is re-projected (`resolve_upstream_tls`)
 /// and limited to the ports the batch touches, so neither a half-projected

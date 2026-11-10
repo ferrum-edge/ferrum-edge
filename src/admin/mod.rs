@@ -9958,49 +9958,60 @@ async fn handle_batch_create(
         .collect();
 
     for proxy in &batch.proxies {
-        if let Some(upstream_id) = proxy.upstream_id.as_deref()
-            && !batch_upstream_ids.contains(upstream_id)
-        {
-            match batch_reference_lookup(
-                namespace,
-                db.check_upstream_exists(upstream_id, namespace).await,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Upstream reads are namespace-predicated (issue #2122
-                    // DB-M1): an upstream in another namespace reports as
-                    // missing, so cross-namespace references are rejected
-                    // without disclosing other tenants' resources.
-                    validation_errors.push(format!(
-                        "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
-                        proxy.id, upstream_id, namespace
-                    ));
+        // One namespace-predicated read of a persisted upstream serves the
+        // existence, API-spec ownership and subset checks below.
+        let persisted_upstream = match proxy.upstream_id.as_deref() {
+            Some(upstream_id) if !batch_upstream_ids.contains(upstream_id) => {
+                match batch_reference_lookup(
+                    namespace,
+                    db.get_upstream(namespace, upstream_id).await,
+                ) {
+                    Ok(Some(upstream)) => Some(upstream),
+                    Ok(None) => {
+                        // Upstream reads are namespace-predicated (issue #2122
+                        // DB-M1): an upstream in another namespace reports as
+                        // missing, so cross-namespace references are rejected
+                        // without disclosing other tenants' resources.
+                        validation_errors.push(format!(
+                            "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
+                            proxy.id, upstream_id, namespace
+                        ));
+                        None
+                    }
+                    Err(response) => return Ok(response),
                 }
-                Err(response) => return Ok(response),
             }
+            _ => None,
+        };
+        // Same ownership rule as single-resource proxy admission (issue
+        // #7214): a spec-owned upstream may only back a proxy of the same
+        // spec. Batch strips `api_spec_id` from every submitted resource, so
+        // a batch proxy is never spec-owned and batch upstreams never are.
+        if let (Some(upstream_id), Some(owner_spec_id)) = (
+            proxy.upstream_id.as_deref(),
+            persisted_upstream
+                .as_ref()
+                .and_then(|upstream| upstream.api_spec_id.as_deref()),
+        ) {
+            validation_errors.push(format!(
+                "Proxy '{}' references upstream_id '{}' that is owned by api_spec '{}'; create a hand-managed upstream or update the owning API spec",
+                proxy.id, upstream_id, owner_spec_id
+            ));
         }
         if let (Some(upstream_id), Some(subset_name)) = (
             proxy.upstream_id.as_deref(),
             proxy.upstream_subset.as_deref(),
         ) {
-            let subset_exists = if let Some(upstream) = batch_upstreams.get(upstream_id) {
-                upstream
-                    .subsets
-                    .as_ref()
-                    .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
-            } else {
-                match batch_reference_lookup(
-                    namespace,
-                    db.get_upstream(namespace, upstream_id).await,
-                ) {
-                    Ok(Some(upstream)) => upstream
+            let subset_exists = batch_upstreams
+                .get(upstream_id)
+                .copied()
+                .or(persisted_upstream.as_ref())
+                .is_some_and(|upstream| {
+                    upstream
                         .subsets
                         .as_ref()
-                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name)),
-                    Ok(None) => false,
-                    Err(response) => return Ok(response),
-                }
-            };
+                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
+                });
             if !subset_exists {
                 validation_errors.push(format!(
                     "Proxy '{}' references upstream_subset '{}' that is not defined on upstream_id '{}'",
@@ -10078,6 +10089,48 @@ async fn handle_batch_create(
                     ));
                 }
                 Err(response) => return Ok(response),
+            }
+        }
+
+        // Single-resource `openapi_validator` precondition (issue #7214): the
+        // target proxy must carry an attached API spec. A proxy created by
+        // this batch never can (batch strips `api_spec_id`), so only a
+        // persisted target can satisfy it.
+        if plugin_config.plugin_name == "openapi_validator" {
+            if plugin_config.scope != PluginScope::Proxy {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': openapi_validator requires scope 'proxy'",
+                    plugin_config.id
+                ));
+            } else {
+                match plugin_config.proxy_id.as_deref() {
+                    None => validation_errors.push(format!(
+                        "PluginConfig '{}': openapi_validator requires proxy_id",
+                        plugin_config.id
+                    )),
+                    Some(proxy_id) if batch_proxy_ids.contains(proxy_id) => {
+                        validation_errors.push(format!(
+                            "PluginConfig '{}': openapi_validator requires a proxy with an attached api_spec; proxy '{}' is created by this batch and cannot carry one",
+                            plugin_config.id, proxy_id
+                        ));
+                    }
+                    Some(proxy_id) => {
+                        match batch_reference_lookup(
+                            namespace,
+                            db.get_proxy(namespace, proxy_id).await,
+                        ) {
+                            Ok(Some(proxy)) if proxy.api_spec_id.is_none() => {
+                                validation_errors.push(format!(
+                                    "PluginConfig '{}': openapi_validator requires a proxy with an attached api_spec",
+                                    plugin_config.id
+                                ));
+                            }
+                            // A missing proxy is already reported above.
+                            Ok(_) => {}
+                            Err(response) => return Ok(response),
+                        }
+                    }
+                }
             }
         }
 
