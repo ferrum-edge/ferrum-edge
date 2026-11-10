@@ -35680,16 +35680,17 @@ mod tests {
                     .get("mesh_policies")
                     .and_then(|policies| policies.as_array())
                     .expect("mesh policies array");
-                // Ambient preparation deliberately carries the pre-filter policy
-                // candidates for the UDP source/destination authorization union.
-                // `MeshAuthz::from_config` keeps that superset for UDP, then
-                // cold-path filters its ordinary destination policy slice.
+                // A Sidecar slice carries only the selector policies that apply
+                // to its own workload (`app=api`). The `app=worker` neighbour's
+                // policy belongs to topologies that authorize other workloads
+                // (Ambient/ServiceWaypoint UDP, NodeWaypoint per-pod), not here
+                // (issue #7241).
                 assert_eq!(
                     policies
                         .iter()
                         .filter_map(|policy| policy.get("name").and_then(|name| name.as_str()))
                         .collect::<Vec<_>>(),
-                    vec!["api-only", "worker-only"]
+                    vec!["api-only"]
                 );
                 assert_eq!(
                     mesh_slice

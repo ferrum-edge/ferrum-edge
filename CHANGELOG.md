@@ -611,6 +611,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reject with 400, so the readiness or liveness probe failed after injection.
   The recorded `Host` now replaces the default (the first one wins, as for
   kubelet).
+- **Sidecar mesh slices no longer carry neighbours' selector policies**
+  (#7241). Every slice had been carrying each same-namespace
+  AuthorizationPolicy that selected any visible workload, a superset only the
+  Ambient, ServiceWaypoint and NodeWaypoint topologies use. On a Sidecar or
+  gateway slice an unrelated neighbour's enforcing selector policy could fail
+  `mesh_authz` construction on a shared-SPIFFE (`labels_ambiguous`) slice,
+  label-less subscribers logged a warning per neighbour policy, and every
+  subscriber's slice changed whenever any workload's policy did. Those slices
+  now keep only the policies that apply to their own workload.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

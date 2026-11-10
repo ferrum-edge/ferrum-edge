@@ -1562,17 +1562,32 @@ impl MeshSlice {
         // destination candidates come from the destination-visible workload
         // view and must remain present even when their pod UID was stripped at
         // the CP boundary or never existed (for example, WorkloadEntry).
+        //
+        // Only topologies that authorize traffic for OTHER workloads need this
+        // superset: Ambient / ServiceWaypoint (UDP source scoping) and
+        // NodeWaypoint (per-pod destination scoping). A Sidecar, gateway, or
+        // other single-workload slice keeps only the policies selecting its own
+        // workload (issue #7241): a neighbour's selector policy there is never
+        // enforced, can fail `mesh_authz` construction on a `labels_ambiguous`
+        // slice, and makes every subscriber's slice change when any
+        // namespace workload's policy does.
+        let carries_other_workload_policy_candidates =
+            request.ambient_udp_source_scoping || request.node_waypoint_capture_scoping;
         let ambient_udp_policy_candidates: Vec<(String, BTreeMap<String, String>)> =
-            ambient_udp_source_workloads
-                .iter()
-                .chain(workloads.iter())
-                .map(|workload| {
-                    (
-                        workload.namespace.clone(),
-                        labels_to_btree(&workload.selector.labels),
-                    )
-                })
-                .collect();
+            if carries_other_workload_policy_candidates {
+                ambient_udp_source_workloads
+                    .iter()
+                    .chain(workloads.iter())
+                    .map(|workload| {
+                        (
+                            workload.namespace.clone(),
+                            labels_to_btree(&workload.selector.labels),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
             if candidate_label_sets.is_empty() {
                 vec![&effective_labels]
