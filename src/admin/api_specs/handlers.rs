@@ -637,6 +637,7 @@ fn extract_error_code(e: &ExtractError) -> &'static str {
         ExtractError::SchemaTooDeep { .. } => "SchemaTooDeep",
         ExtractError::SchemaReferenceCycle { .. } => "SchemaReferenceCycle",
         ExtractError::SchemaTooLarge { .. } => "SchemaTooLarge",
+        ExtractError::UnsupportedOperationField { .. } => "UnsupportedOperationField",
     }
 }
 
@@ -667,7 +668,8 @@ fn extract_error_status(e: &ExtractError) -> StatusCode {
         | ExtractError::SchemaReference(_)
         | ExtractError::SchemaTooDeep { .. }
         | ExtractError::SchemaReferenceCycle { .. }
-        | ExtractError::SchemaTooLarge { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        | ExtractError::SchemaTooLarge { .. }
+        | ExtractError::UnsupportedOperationField { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 

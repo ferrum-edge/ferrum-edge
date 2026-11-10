@@ -415,3 +415,87 @@ async fn referenced_path_item_matches_at_runtime() {
         other => panic!("unknown operation must reject: {other:?}"),
     }
 }
+
+// ── OpenAPI 3.2 operation fields (issue #7201) ─────────────────────────────
+
+fn openapi_32_spec(paths: Value, components: Value) -> String {
+    let proxy: Value = serde_json::from_str(proxy_block()).expect("proxy block");
+    json!({
+        "openapi": "3.2.0",
+        "info": {"title": "Query API", "version": "1.0.0"},
+        "x-ferrum-proxy": proxy,
+        "components": components,
+        "paths": paths,
+    })
+    .to_string()
+}
+
+fn unsupported_location(error: ExtractError) -> String {
+    match error {
+        ExtractError::UnsupportedOperationField { location } => location,
+        other => panic!("expected UnsupportedOperationField, got: {other}"),
+    }
+}
+
+#[test]
+fn openapi_32_query_operation_is_refused_at_import() {
+    let spec = openapi_32_spec(
+        json!({
+            "/search": {
+                "get": {"responses": {"200": {"description": "ok"}}},
+                "query": {"responses": {"200": {"description": "ok"}}}
+            }
+        }),
+        json!({}),
+    );
+    assert_eq!(
+        unsupported_location(extract_err(&spec)),
+        "paths./search.query"
+    );
+}
+
+#[test]
+fn openapi_32_additional_operations_are_refused_at_import() {
+    let spec = openapi_32_spec(
+        json!({
+            "/items": {
+                "additionalOperations": {
+                    "LINK": {"responses": {"200": {"description": "ok"}}}
+                }
+            }
+        }),
+        json!({}),
+    );
+    assert_eq!(
+        unsupported_location(extract_err(&spec)),
+        "paths./items.additionalOperations"
+    );
+}
+
+#[test]
+fn openapi_32_query_operation_in_a_referenced_path_item_is_refused() {
+    let spec = openapi_32_spec(
+        json!({"/search": {"$ref": "#/components/pathItems/Search"}}),
+        json!({
+            "pathItems": {
+                "Search": {"query": {"responses": {"200": {"description": "ok"}}}}
+            }
+        }),
+    );
+    assert_eq!(
+        unsupported_location(extract_err(&spec)),
+        "components.pathItems.Search.query"
+    );
+}
+
+#[test]
+fn openapi_32_document_without_new_operation_fields_still_imports() {
+    let spec = openapi_32_spec(
+        json!({"/search": {"get": {"responses": {"200": {"description": "ok"}}}}}),
+        json!({}),
+    );
+    let (_bundle, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect("a 3.2 document using only supported methods must import");
+    assert_eq!(meta.version, "3.2.0");
+    assert_eq!(meta.operation_count, 1);
+}

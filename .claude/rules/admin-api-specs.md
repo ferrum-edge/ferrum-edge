@@ -46,7 +46,7 @@ paths:
 ## API Spec Management
 
 - API specs are admin-only metadata. They must never be loaded by gateway runtime.
-- Supported submissions are OpenAPI 2.0 and 3.0.x/3.1.x/3.2.x JSON or YAML.
+- Supported submissions are OpenAPI 2.0 and 3.0.x/3.1.x/3.2.x JSON or YAML. Path Items declaring the 3.2 `query` operation or `additionalOperations` are refused (422 `UnsupportedOperationField`); keep that refusal until the validator, MCP bridge, schema indexing and `operation_count` handle them.
 - `x-ferrum-proxy` is required. `x-ferrum-upstream` and `x-ferrum-plugins` are supported extensions.
 - Endpoints: `POST/PUT/GET/DELETE /api-specs[/{id}]`, `GET /api-specs/by-proxy/{proxy_id}`, and `GET /api-specs`.
 - DB and CP modes are read/write for specs. DP and file mode reject spec endpoints.
