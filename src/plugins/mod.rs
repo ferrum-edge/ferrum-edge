@@ -3450,11 +3450,12 @@ pub struct RequestContext {
     /// Populated at four points in the request path:
     /// 1. Buffered-collect sites (`Incoming::collect().await`): written once
     ///    with the final `body_bytes.len()` after collection completes.
-    /// 2. Streaming forward with size limit (`SizeLimitedIncoming`): written
-    ///    once after the backend request completes, from the cloned counter
-    ///    handle obtained via `SizeLimitedIncoming::bytes_seen_handle()`.
+    /// 2. Streaming forward with size limit (`SizeLimitedIncoming`): updated
+    ///    per polled frame through the counter shared at construction
+    ///    (`SizeLimitedIncoming::new_with_counter`).
     /// 3. Streaming forward without size limit (`CountingIncoming` wrapping
-    ///    the `Incoming` body): same handle-capture pattern.
+    ///    the `Incoming` body): same shared-counter pattern
+    ///    (`CountingIncoming::new_with_counter`).
     /// 4. Prebuffered bodies (populated earlier by plugins like
     ///    `request_mirror`): copied from the buffered `Bytes::len()`.
     ///
@@ -9881,8 +9882,8 @@ pub struct TransactionSummary {
     /// Accuracy by request type:
     /// * **Buffered requests** (plugins required the body, or retries were
     ///   configured): exact — populated from the collected body length after
-    ///   `Incoming::collect().await` (optionally via `SizeLimitedIncoming::bytes_seen()`
-    ///   when a size limit is in force).
+    ///   `Incoming::collect().await` (or through the counter shared with
+    ///   `SizeLimitedIncoming` when a size limit is in force).
     /// * **Streaming requests** (body forwarded frame-by-frame without
     ///   collection): exact — populated via `CountingIncoming`, which shares
     ///   an `Arc<AtomicU64>` between the forwarded body and the summary
