@@ -16193,24 +16193,19 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
     let metrics_source = include_str!("../../src/admin/metrics.rs");
 
     assert_eq!(schema["additionalProperties"], false);
-    assert_component_validity(
-        &spec,
-        "TcpConnectionThrottleConfig",
-        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
-        true,
-    );
-    assert_component_validity(
-        &spec,
-        "TcpConnectionThrottleConfig",
-        &json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
-        false,
-    );
-    assert_component_validity(
-        &spec,
-        "TcpConnectionThrottleConfig",
-        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
-        false,
-    );
+    // The residual sweep and its `cleanup_interval_seconds` knob were removed
+    // (issue #7152); schema and runtime both refuse the old key.
+    for removed in [
+        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
+    ] {
+        assert_component_validity(&spec, "TcpConnectionThrottleConfig", &removed, false);
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &removed)
+                .is_err(),
+            "runtime must refuse {removed}"
+        );
+    }
     assert_eq!(
         schema["properties"]["max_connections_per_key"]["maximum"],
         json!(u64::MAX)
@@ -16238,12 +16233,13 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
             text.contains("process-local"),
             "missing process-local scope"
         );
-        assert!(
-            text.contains("residual"),
-            "missing residual sweep semantics"
-        );
         assert!(text.contains("inline"), "missing inline removal semantics");
+        assert!(
+            text.contains("no background sweep"),
+            "missing the no-sweep contract"
+        );
     }
+    assert!(!source.contains("cleanup_interval_seconds"));
     assert!(schema_text.contains("UDP/DTLS"));
     assert!(plugin_docs.contains("attachment to any other protocol is rejected"));
     assert!(source.contains("DashMap::with_shard_amount"));

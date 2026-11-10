@@ -270,9 +270,9 @@ at construction without disclosing credentials.
 
 **Default limit:** No hard entry cap -- bounded by unique clients with active connections.
 
-**Config fields:** `max_connections_per_key` (required, controls the per-key connection limit, not the map size) and `cleanup_interval_seconds` (default `60`, `0` disables only the residual sweep).
+**Config fields:** `max_connections_per_key` (required, controls the per-key connection limit, not the map size) and `ipv6_prefix`.
 
-**Cleanup mechanism:** Each admission owns an opaque permit bound to the exact counter entry it incremented. Permit release decrements and removes a zero-count entry inline while holding the same DashMap entry guard used by admission. A configurable background sweep removes only residual zero-count entries; it cannot repair a missed positive decrement. `cleanup_interval_seconds: 0` disables only that residual sweep, not inline release/removal. Accounting state is shared across compatible cache generations by plugin namespace/config ID. Removing the policy stops its sweep and removes the state from the cache registry; old connection permits retain only that retired state until they release.
+**Cleanup mechanism:** Each admission owns an opaque permit bound to the exact counter entry it incremented. An entry is created at one connection, and the permit release that takes it to zero removes it inline while holding the same DashMap entry guard used by admission, so the map never holds a zero-count entry and there is no background sweep. Accounting state is shared across compatible cache generations by plugin namespace/config ID. Removing the policy removes the state from the cache registry; old connection permits retain only that retired state until they release.
 
 ### API Chargeback
 

@@ -28,6 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `tcp_connection_throttle`: `cleanup_interval_seconds` removed (#7152)
+
+The `tcp_connection_throttle` background sweep and its
+`cleanup_interval_seconds` field are gone. A counter entry is created at one
+connection and removed by the release that takes it to zero, under the same
+map entry guard, so the sweep never had a zero-count entry to remove. The
+field is now an unknown key: a config that still sets it, including
+`cleanup_interval_seconds: 0`, is refused at admission and fails file-mode
+startup. Delete the field before upgrading; connection accounting is
+unchanged.
+
 ### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`

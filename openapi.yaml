@@ -31098,6 +31098,8 @@ components:
         Enforcement is process-local, so each replica independently permits up
         to the configured limit and the deployment-wide allowance can be the
         limit multiplied by the number of replicas receiving the same identity.
+        A counter entry is removed inline by the permit release that takes it
+        to zero, so there is no background sweep.
         IP keys use the canonical client IP: IPv4 (including IPv4-mapped IPv6)
         is keyed per address, while native IPv6 sources are grouped to
         ipv6_prefix (default /64), so hosts in one /64 share a budget
@@ -31133,19 +31135,6 @@ components:
             clients are always keyed per address, and Consumer keys are
             unaffected. Independent of FERRUM_PER_IP_IPV6_PREFIX, which only
             groups the gateway-wide FERRUM_*_PER_IP caps.
-        cleanup_interval_seconds:
-          type: integer
-          format: uint64
-          default: 60
-          minimum: 0
-          maximum: 86400
-          description: >-
-            Interval in seconds between defensive background sweeps that remove
-            residual zero-count entries. Normal connection completion and
-            plugin-chain rejection release the exact admission permit and remove
-            its zero-count entry inline. The sweep never repairs a missed
-            positive decrement. `0` disables only the residual sweep; inline
-            permit release and removal remain enabled.
 
     AdaptiveConcurrencyConfig:
       type: object
