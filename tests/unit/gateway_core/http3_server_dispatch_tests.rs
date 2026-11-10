@@ -2617,8 +2617,10 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
         "refined streaming must exclude graceful close from the downgrade signal"
     );
 
-    // Buffered-request streaming body fault (second "during streaming" after
-    // the inline path — use the proxy_to_backend_h3_streaming function scope).
+    // The buffered-request streaming path keeps no relay copy of its own
+    // (issue #7190): it hands the committed response to the shared relay whose
+    // body and trailer downgrades are pinned above, and downgrades only its own
+    // pre-header dispatch failure.
     let buffered_req = src
         .split("async fn proxy_to_backend_h3_streaming(")
         .nth(1)
@@ -2627,17 +2629,19 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
         .next()
         .expect("bounded buffered-request streaming body");
     assert!(
-        buffered_req.contains("is_h3_transport_error_class(class)")
-            && buffered_req
-                .matches("mark_h3_unsupported(proxy, upstream_target)")
-                .count()
-                >= 2,
-        "buffered-request streaming body and trailer transport faults must downgrade"
+        buffered_req.contains("stream_h3_open_response_to_client("),
+        "buffered-request streaming must relay through the shared committed-response relay"
     );
     assert!(
-        buffered_req.matches("is_h3_graceful_close(&").count() >= 3,
-        "buffered-request streaming must exclude graceful close at the body \
-         recovery check and at both downgrade sites"
+        !buffered_req.contains("recv_data()") && !buffered_req.contains("recv_trailers"),
+        "buffered-request streaming must not keep its own body or trailer relay"
+    );
+    assert_eq!(
+        buffered_req
+            .matches("mark_h3_unsupported(proxy, upstream_target)")
+            .count(),
+        1,
+        "only the pre-header dispatch failure downgrades in the buffered-request path"
     );
 }
 
@@ -2791,19 +2795,20 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
         "streaming H3 must keep the hop-by-hop trailer strip"
     );
 
-    // This file holds FOUR streaming relays that cross the response-header
+    // This file holds THREE streaming relays that cross the response-header
     // policy boundary, and every one of them must capture pre-policy evidence:
-    // the three plain native/refined relays (the inline stream, the refined
-    // stream, and the buffered-request streaming helper) plus the native gRPC
-    // relay, which inlines its own trailer finish and is pinned separately
-    // below. Counting the total — not just the plain subset — is what makes a
-    // silently added fifth relay fail here instead of shipping ungoverned.
+    // the two plain native relays (the inline stream, and the committed-response
+    // relay the refined and buffered-request streaming paths share since issue
+    // #7190) plus the native gRPC relay, which inlines its own trailer finish
+    // and is pinned separately below. Counting the total — not just the plain
+    // subset — is what makes a silently added fourth relay fail here instead of
+    // shipping ungoverned.
     assert_eq!(
         src.matches("PrePolicyResponseHeaders::capture_for_streaming(")
             .count(),
-        4,
+        3,
         "every H3 streaming relay must capture its pre-policy response headers: \
-         three plain native/refined relays plus the native gRPC relay"
+         two plain native relays plus the native gRPC relay"
     );
     // The two families are told apart by the binding they produce, never by
     // position, so adding a relay of either kind moves exactly one count.
@@ -2814,15 +2819,15 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
     );
     assert_eq!(
         src.matches("H3StreamingTrailerPolicy {").count(),
-        3,
-        "every plain native/refined H3 streaming relay must bind the response \
+        2,
+        "every plain native H3 streaming relay must bind the response \
          trailer policy at its trailer frame"
     );
     let captures: Vec<&str> = src.split(PLAIN_STREAMING_CAPTURE).skip(1).collect();
     assert_eq!(
         captures.len(),
-        3,
-        "every plain native/refined H3 streaming relay must capture its \
+        2,
+        "every plain native H3 streaming relay must capture its \
          pre-policy response headers"
     );
     for region in captures {
@@ -3008,11 +3013,7 @@ fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
                 .expect("bounded streaming relay region")
         })
         .collect();
-    assert_eq!(
-        relays.len(),
-        3,
-        "three plain native/refined streaming relays"
-    );
+    assert_eq!(relays.len(), 2, "two plain native streaming relays");
     for relay in &relays {
         let map_write = relay
             .find(r#".entry("content-type".to_string())"#)
@@ -3064,7 +3065,7 @@ fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
         .collect();
     assert_eq!(
         flags.len(),
-        3,
+        2,
         "each streaming relay decides the synthesis for itself"
     );
     for tail in flags {
@@ -5251,18 +5252,19 @@ fn committed_native_h3_streaming_responses_reset_unless_a_finish_landed() {
     );
 }
 
-/// Issue #4125. The same fail-closed terminal, for the two H3 streaming relays
-/// that only BORROW their send half.
+/// Issue #4125. The same fail-closed terminal, for the H3 streaming relay that
+/// only BORROWS its send half.
 ///
-/// `stream_h3_open_response_to_client` and `proxy_to_backend_h3_streaming`
-/// receive `h3_stream: &mut RequestStream<..>` from the H3 request handler, so
-/// they cannot move it into the owning `CommittedH3ResponseStream` #4112 added.
-/// They get `BorrowedCommittedH3ResponseStream` instead: same inverted
+/// `stream_h3_open_response_to_client` receives
+/// `h3_stream: &mut RequestStream<..>` from the H3 request handler, so it
+/// cannot move it into the owning `CommittedH3ResponseStream` #4112 added. The
+/// refined and buffered-request streaming paths both relay through it (issue
+/// #7190). It gets `BorrowedCommittedH3ResponseStream` instead: same inverted
 /// predicate (reset UNLESS a `finish()` proved it returned `Ok`), same `Drop`
 /// backstop for a task dropped while parked in `send_data`, and the same
 /// explicit settle after the relay loop.
 ///
-/// Each relay has two authorized FIN-success sites: ordinary completion via
+/// The relay has two authorized FIN-success sites: ordinary completion via
 /// `finish_h3_response_with_backend_trailers` and the bodyless response branch.
 /// Both must pair their successful finish with a clean-completion latch; all
 /// failure, expiry and cancellation exits retain the fail-closed reset.
@@ -5332,14 +5334,11 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
     // The guard has to be armed BEFORE the HEADERS commit, not after it: the
     // commit's own `ClientWriteFailed` / expiry arms are inside the region a
     // partially written HEADERS frame can already have committed.
-    for relay_fn in [
-        "async fn stream_h3_open_response_to_client(",
-        "async fn proxy_to_backend_h3_streaming(",
-    ] {
+    for relay_fn in ["async fn stream_h3_open_response_to_client("] {
         let body = server
             .split(relay_fn)
             .nth(1)
-            .expect("both borrowing H3 streaming relays must still exist");
+            .expect("the borrowing H3 streaming relay must still exist");
         let pre_commit = body
             .split("commit_authorized_streaming_response_headers(")
             .next()
@@ -5356,8 +5355,21 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
         .collect();
     assert_eq!(
         guarded_relays.len(),
-        2,
-        "exactly the two borrowing H3 streaming relays may guard a committed send half"
+        1,
+        "exactly the one borrowing H3 streaming relay may guard a committed send half"
+    );
+    // The buffered-request streaming path keeps no relay copy (issue #7190).
+    let buffered_request_streaming = server
+        .split("async fn proxy_to_backend_h3_streaming(")
+        .nth(1)
+        .expect("buffered-request streaming function")
+        .split("\n}\n")
+        .next()
+        .expect("bounded buffered-request streaming function");
+    assert!(
+        buffered_request_streaming.contains("stream_h3_open_response_to_client(")
+            && !buffered_request_streaming.contains("BorrowedCommittedH3ResponseStream::new("),
+        "the buffered-request streaming path must relay through the shared guarded relay"
     );
     for relay in guarded_relays {
         let guarded = relay
@@ -5872,11 +5884,10 @@ fn native_plain_h3_streaming_relays_are_authorization_first_at_backend_eos() {
         .collect();
     assert_eq!(
         borrowed.len(),
-        2,
-        "exactly the two borrowing H3 streaming relays may guard a committed send half"
+        1,
+        "exactly the one borrowing H3 streaming relay may guard a committed send half"
     );
     assert_plain_relay_authorization_first(borrowed[0], "recv_stream.recv_data()");
-    assert_plain_relay_authorization_first(borrowed[1], "h3_resp.recv_stream.recv_data()");
 }
 
 fn assert_plain_relay_authorization_first(relay: &str, recv_data: &str) {

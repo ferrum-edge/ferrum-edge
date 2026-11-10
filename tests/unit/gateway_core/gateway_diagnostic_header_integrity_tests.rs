@@ -335,8 +335,9 @@ fn every_h3_response_finalize_site_writes_the_gateway_token() {
         production
             .matches("finalize_h3_response_gateway_headers(")
             .count(),
-        6,
-        "the definition plus the native buffered writer and the four streaming relays"
+        5,
+        "the definition plus the native buffered writer and the three streaming relays \
+         (the buffered-request path shares the refined relay since issue #7190)"
     );
     assert_eq!(
         cross

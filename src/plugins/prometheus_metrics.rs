@@ -159,7 +159,7 @@ fn unmatched_request_reason(phase: &str) -> &'static str {
 ///   drained, body error, or dropped mid-stream — and written into the summary
 ///   by [`crate::proxy::deferred_log::DeferredTransactionLogger`] at fire time.
 /// * HTTP/3 drives its QUIC send stream to completion synchronously inside
-///   `proxy_to_backend_h3_streaming`, so its summary sites read the flag off
+///   `stream_h3_open_response_to_client`, so its summary sites read the flag off
 ///   `H3StreamResult` without a deferred logger.
 ///
 /// Only downstream aborts are counted: a backend-side close mid-body maps to a
