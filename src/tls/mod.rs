@@ -1974,12 +1974,19 @@ pub fn load_mesh_server_identity(
     key_path: &str,
     cert_expiry_warning_days: u64,
 ) -> Result<Arc<MeshServerIdentity>, anyhow::Error> {
-    check_cert_expiry(cert_path, "mesh server TLS cert", cert_expiry_warning_days)?;
-
+    // Load the certificate once and check expiry on the bytes that will be
+    // served: a second read could fetch a provider source twice and check one
+    // rotation generation while storing another.
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
     let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)
         .map_err(|error| material_load_error("mesh server TLS cert", error))?;
+    check_cert_expiry_from_pem_bytes(
+        cert_material.bytes.expose_secret(),
+        "mesh server TLS cert",
+        &cert_material.display_source_id,
+        cert_expiry_warning_days,
+    )?;
     let key_material = load_material_blocking(&key_source, MaterialKind::Key)
         .map_err(|error| material_load_error("mesh server TLS private key", error))?;
 
