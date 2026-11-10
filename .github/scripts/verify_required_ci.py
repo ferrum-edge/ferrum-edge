@@ -291,7 +291,10 @@ DEDICATED_REQUIRED_CHECKS = {
         # fail-closed step so a later change cannot keep the check name while
         # dropping a producer, and pin the planner-verdict guards so an
         # unusable relevance output cannot be reported as success.
+        # GHSA-cgg3-3m23-23gx: `FIPS Feature Policy` is not itself required,
+        # so the aggregate must need it and fail unless it succeeded.
         "needs": {
+            "feature-policy",
             "fips-plan",
             "fips-compile",
             "fips-claimed-checks",
@@ -300,6 +303,7 @@ DEDICATED_REQUIRED_CHECKS = {
             "fips-test",
         },
         "contract": {
+            "if: needs.feature-policy.result != 'success'",
             "if: needs.fips-plan.result != 'success'",
             "needs.fips-plan.result == 'success' && "
             "needs.fips-plan.outputs.relevant != 'true' && "
