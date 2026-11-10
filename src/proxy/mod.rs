@@ -11648,6 +11648,7 @@ impl ProxyState {
             Arc::clone(&request_epoch),
             Arc::clone(&mesh_inbound_tls_policy),
             Arc::clone(&mesh_inbound_admission),
+            pool_shard_amount,
         ));
 
         let state = Self {
@@ -11671,7 +11672,7 @@ impl ProxyState {
                 // Pre-populate common HTTP status codes so the hot path uses
                 // DashMap::get() (shared read lock) instead of entry() (write lock).
                 // After warmup, virtually all requests hit the fast read path.
-                let map = dashmap::DashMap::with_capacity(16);
+                let map = dashmap::DashMap::with_capacity_and_shard_amount(16, pool_shard_amount);
                 for code in [
                     200u16, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502,
                     503, 504,
