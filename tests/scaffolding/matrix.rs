@@ -505,20 +505,6 @@ impl MatrixResponse {
             MatrixResponse::Grpc(r) => r.http_status,
         }
     }
-
-    /// Whether the response indicates a 5xx-class gateway error. For
-    /// gRPC, true when the effective grpc-status is
-    /// UNAVAILABLE/INTERNAL/UNKNOWN — the canonical mapping for
-    /// backend-side connection failures.
-    pub fn is_gateway_error(&self) -> bool {
-        match self {
-            MatrixResponse::Http(r) => r.status.is_server_error(),
-            MatrixResponse::Grpc(r) => {
-                let s = r.effective_grpc_status();
-                s == 14 || s == 13 || s == 2 // UNAVAILABLE, INTERNAL, UNKNOWN
-            }
-        }
-    }
 }
 
 /// Backend handle returned by the spawn helpers. Holds the running backend
