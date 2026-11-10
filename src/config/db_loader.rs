@@ -7665,7 +7665,13 @@ impl DatabaseStore {
         let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
         for proxy in proxies {
             for assoc in &proxy.plugins {
-                if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
+                // Proxy and plugin-config ids are unique per namespace only, so
+                // the dedupe key carries the namespace like `touched_proxies`.
+                if !seen.insert((
+                    proxy.namespace.as_str(),
+                    proxy.id.as_str(),
+                    assoc.plugin_config_id.as_str(),
+                )) {
                     continue;
                 }
                 let already_attached = sqlx::query(&assoc_exists_sql)
