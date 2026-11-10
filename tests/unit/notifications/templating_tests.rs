@@ -1,11 +1,11 @@
 //! Tests for the `${var}` template substitution helpers in
 //! `src/notifications/templating.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use ferrum_edge::notifications::templating::{
     render_template, render_template_bounded, render_template_json_string_escaped,
-    unknown_variables, validate_template,
+    validate_template,
 };
 
 fn vars(items: &[(&str, &str)]) -> HashMap<String, String> {
@@ -93,21 +93,6 @@ fn validate_template_accepts_balanced() {
 fn validate_template_rejects_unbalanced() {
     let err = validate_template("hello ${broken").unwrap_err();
     assert!(err.contains("unbalanced"));
-}
-
-#[test]
-fn unknown_variables_returns_only_unrecognized() {
-    let known: HashSet<&str> = ["rule_name", "proxy_name"].iter().copied().collect();
-    let unknown =
-        unknown_variables("a=${rule_name} b=${oops} c=${proxy_name} d=${typo}", &known).unwrap();
-    assert_eq!(unknown, vec!["oops".to_string(), "typo".to_string()]);
-}
-
-#[test]
-fn unknown_variables_dedups_repeats() {
-    let known: HashSet<&str> = HashSet::new();
-    let unknown = unknown_variables("${a} ${a} ${a}", &known).unwrap();
-    assert_eq!(unknown, vec!["a".to_string()]);
 }
 
 #[test]

@@ -386,7 +386,7 @@ fn abandon_reason_taxonomy_is_closed_and_partitioned() {
 #[tokio::test]
 async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
     let metrics = Arc::new(DeliveryMetrics::new());
-    let generation = DispatchGeneration::with_metrics(42, Arc::clone(&metrics));
+    let generation = DispatchGeneration::with_metrics(Arc::clone(&metrics));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let sem = Arc::new(Semaphore::new(0));
@@ -440,7 +440,7 @@ async fn semaphore_exhaustion_increments_backpressure_and_skips_send() {
 #[tokio::test]
 async fn pre_task_generation_rejection_is_visible_without_inflating_attempted() {
     let metrics = Arc::new(DeliveryMetrics::new());
-    let generation = DispatchGeneration::with_metrics(4242, Arc::clone(&metrics));
+    let generation = DispatchGeneration::with_metrics(Arc::clone(&metrics));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let settles = SettleLog::new();
@@ -498,7 +498,7 @@ async fn pre_task_generation_rejection_is_visible_without_inflating_attempted() 
 #[tokio::test]
 async fn transient_retry_then_success() {
     let metrics = Arc::new(DeliveryMetrics::new());
-    let generation = DispatchGeneration::with_metrics(7, Arc::clone(&metrics));
+    let generation = DispatchGeneration::with_metrics(Arc::clone(&metrics));
     let (addr, count, notify, server) = spawn_status_sequence_server(vec![503, 200]).await;
     let sem = Arc::new(Semaphore::new(1));
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
@@ -544,7 +544,7 @@ async fn transient_retry_then_success() {
 #[tokio::test]
 async fn permanent_failure_does_not_retry() {
     let metrics = Arc::new(DeliveryMetrics::new());
-    let generation = DispatchGeneration::with_metrics(8, Arc::clone(&metrics));
+    let generation = DispatchGeneration::with_metrics(Arc::clone(&metrics));
     let (addr, count, notify, server) = spawn_persistent_status_server(401).await;
     let sem = Arc::new(Semaphore::new(1));
     let channel = webhook_channel_to(format!("http://{addr}/notify"));
@@ -751,7 +751,7 @@ async fn spawn_stalled_endpoint(preface: Vec<u16>) -> StalledEndpoint {
 async fn reload_retirement_cancels_stalled_in_flight_dispatch_and_settles_abandoned_once() {
     let mut endpoint = spawn_stalled_endpoint(Vec::new()).await;
     let metrics = Arc::new(DeliveryMetrics::new());
-    let generation = DispatchGeneration::with_metrics(99, Arc::clone(&metrics));
+    let generation = DispatchGeneration::with_metrics(Arc::clone(&metrics));
     let sem = Arc::new(Semaphore::new(1));
     let addr = endpoint.addr;
     let channel = webhook_channel_to(format!("http://{addr}/slow"));
@@ -869,7 +869,7 @@ async fn reload_retirement_cancels_stalled_in_flight_dispatch_and_settles_abando
 async fn retirement_cancels_stalled_retry_attempt_after_transient_failure() {
     let mut endpoint = spawn_stalled_endpoint(vec![503]).await;
     let metrics = Arc::new(DeliveryMetrics::new());
-    let generation = DispatchGeneration::with_metrics(101, Arc::clone(&metrics));
+    let generation = DispatchGeneration::with_metrics(Arc::clone(&metrics));
     let settles = SettleLog::new();
     let addr = endpoint.addr;
 
@@ -943,7 +943,7 @@ async fn retirement_cancels_stalled_retry_attempt_after_transient_failure() {
 /// happens before the flag re-read, so a cancel racing the waiter is not lost.
 #[tokio::test]
 async fn generation_cancelled_future_resolves_without_polling_cadence() {
-    let generation = DispatchGeneration::new(5);
+    let generation = DispatchGeneration::new();
     let waiter = Arc::clone(&generation);
     let observed = tokio::spawn(async move {
         waiter.cancelled().await;
@@ -979,7 +979,7 @@ async fn generation_cancelled_future_resolves_without_polling_cadence() {
 #[tokio::test]
 async fn admit_then_cancel_before_transport_counts_attempted_under_body_start_contract() {
     let metrics = Arc::new(DeliveryMetrics::new());
-    let generation = DispatchGeneration::with_metrics(77, Arc::clone(&metrics));
+    let generation = DispatchGeneration::with_metrics(Arc::clone(&metrics));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let settles = SettleLog::new();
 
@@ -1081,7 +1081,7 @@ async fn hard_shutdown_deadline_aborts_admitted_notification_exactly_once() {
     let slot = Arc::new(DeliverySlot::new(0));
     let lifecycle_a_generation = slot.begin_cycle();
     let metrics = Arc::new(DeliveryMetrics::new());
-    let generation = DispatchGeneration::with_metrics(88, Arc::clone(&metrics));
+    let generation = DispatchGeneration::with_metrics(Arc::clone(&metrics));
     let settles = SettleLog::new();
 
     let (body_entered_tx, body_entered_rx) = oneshot::channel::<()>();
