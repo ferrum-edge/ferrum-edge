@@ -19,7 +19,7 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
@@ -838,10 +838,6 @@ struct McpEnvelope {
     raw_cancel_id: Option<Box<RawValue>>,
     method: Option<String>,
     params: Option<Value>,
-    #[allow(dead_code)] // Kept in the parsed envelope shape for response classification.
-    result: Option<Value>,
-    #[allow(dead_code)] // Kept in the parsed envelope shape for error-response classification.
-    error: Option<Value>,
     message_kind: McpMessageKind,
 }
 
@@ -1056,8 +1052,6 @@ struct ToolCatalogEntry {
     /// catalog read reports it.
     discovered_at: DateTime<Utc>,
     schema_hash: String,
-    #[allow(dead_code)] // Stored for description-only drift detection extensions.
-    description_hash: String,
 }
 
 impl ToolCatalogEntry {
@@ -1100,11 +1094,6 @@ struct PromptCatalogEntry {
     /// Nonstandard upstream-declared `argumentsSchema`, carried through
     /// unchanged for upstreams that publish one alongside `arguments`.
     arguments_schema: Option<Value>,
-    enabled: bool,
-    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
-    discovered_at: DateTime<Utc>,
-    #[allow(dead_code)] // Stored for prompt schema drift metadata extensions.
-    schema_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1116,11 +1105,6 @@ struct ResourceCatalogEntry {
     name: Option<String>,
     description: Option<String>,
     mime_type: Option<String>,
-    enabled: bool,
-    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
-    discovered_at: DateTime<Utc>,
-    #[allow(dead_code)] // Stored for resource drift metadata extensions.
-    uri_hash: String,
 }
 
 #[derive(Clone)]
@@ -1134,9 +1118,6 @@ struct ResourceTemplateCatalogEntry {
     mime_type: Option<String>,
     annotations: Option<Value>,
     icons: Option<Value>,
-    enabled: bool,
-    #[allow(dead_code)] // Stored for drift/operational metadata extensions.
-    discovered_at: DateTime<Utc>,
     uri_template_regex: Arc<Regex>,
 }
 
@@ -1546,8 +1527,6 @@ type SessionCatalogLocks = (Arc<RwLock<McpCatalog>>, Arc<Mutex<()>>);
 
 #[derive(Clone)]
 struct DownstreamMcpSession {
-    #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
-    downstream_session_id: String,
     protocol_version: String,
     client_info: Option<Value>,
     client_capabilities: Option<Value>,
@@ -1588,8 +1567,6 @@ struct ToolSchemaBaseline {
 
 #[derive(Debug, Clone)]
 struct UpstreamMcpSession {
-    #[allow(dead_code)] // Useful in snapshots/debug views; map key is used for lookup.
-    server_id: String,
     upstream_session_id: Option<String>,
     protocol_version: Option<String>,
     initialized: bool,
@@ -2174,7 +2151,7 @@ impl McpGateway {
         ctx.route_override_backend_scheme = Some(target.scheme);
         ctx.route_override_backend_host = Some(target.host.clone());
         ctx.route_override_backend_port = Some(target.port);
-        ctx.route_override_resolved_tls = Some(Arc::new(BackendTlsConfig::default_verify()));
+        ctx.route_override_resolved_tls = Some(Arc::clone(&DEFAULT_UPSTREAM_TLS));
         ctx.route_override_path = Some(target.path.clone());
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(target.authority.clone());
@@ -2987,7 +2964,6 @@ impl McpGateway {
                         (
                             server.server_id.clone(),
                             UpstreamMcpSession {
-                                server_id: server.server_id.clone(),
                                 upstream_session_id: None,
                                 protocol_version: None,
                                 initialized: false,
@@ -3000,7 +2976,6 @@ impl McpGateway {
                 self.session_store.insert(
                     downstream_session_id.clone(),
                     DownstreamMcpSession {
-                        downstream_session_id: downstream_session_id.clone(),
                         protocol_version,
                         client_info,
                         client_capabilities,
@@ -4383,9 +4358,7 @@ impl McpGateway {
                         families.entry("prompts").or_default().record_success();
                         last_good.insert((server.server_id.clone(), "prompts"));
                         for item in items {
-                            if let Some(entry) =
-                                self.prompt_entry_from_value(server, item, discovered_at)
-                            {
+                            if let Some(entry) = self.prompt_entry_from_value(server, item) {
                                 let public_name = entry.public_name.clone();
                                 insert_catalog_entry(
                                     &mut prompts,
@@ -4427,9 +4400,7 @@ impl McpGateway {
                         families.entry("resources").or_default().record_success();
                         last_good.insert((server.server_id.clone(), "resources"));
                         for item in items {
-                            if let Some(entry) =
-                                self.resource_entry_from_value(server, item, discovered_at)
-                            {
+                            if let Some(entry) = self.resource_entry_from_value(server, item) {
                                 let public_uri = entry.public_uri.clone();
                                 insert_catalog_entry(
                                     &mut resources,
@@ -4610,7 +4581,6 @@ impl McpGateway {
         let mut degraded: Vec<String> = Vec::new();
         let mut last_good: BTreeSet<(String, &'static str)> = BTreeSet::new();
         let mut stats = FamilyRefreshStats::default();
-        let discovered_at = Utc::now();
 
         if self.discovery.aggregate_resources {
             // Same bounded per-server fan-out as `refresh_catalog`; results are
@@ -4643,7 +4613,7 @@ impl McpGateway {
                         last_good.insert((server.server_id.clone(), "resource_templates"));
                         for item in items {
                             if let Some(entry) =
-                                self.resource_template_entry_from_value(server, item, discovered_at)
+                                self.resource_template_entry_from_value(server, item)
                             {
                                 resource_templates.insert(entry.public_uri_template.clone(), entry);
                             }
@@ -4751,12 +4721,9 @@ impl McpGateway {
                 return Err(error);
             }
         };
-        let discovered_at = Utc::now();
         let mut resource_templates = HashMap::new();
         for item in items {
-            if let Some(entry) =
-                self.resource_template_entry_from_value(server, item, discovered_at)
-            {
+            if let Some(entry) = self.resource_template_entry_from_value(server, item) {
                 resource_templates.insert(entry.public_uri_template.clone(), entry);
             }
         }
@@ -4822,7 +4789,6 @@ impl McpGateway {
             input_validator,
             output_validator,
             schema_hash,
-            description_hash,
         } = parts;
         let policy_action = self.policy.action_for_tool(&public_name);
         let explicitly_configured = self.policy.tools.contains_key(&public_name);
@@ -4886,7 +4852,6 @@ impl McpGateway {
             output_validator,
             discovered_at,
             schema_hash,
-            description_hash,
         }
     }
 
@@ -4967,7 +4932,6 @@ impl McpGateway {
         &self,
         server: &McpServerConfig,
         item: Value,
-        discovered_at: DateTime<Utc>,
     ) -> Option<PromptCatalogEntry> {
         let name = item.get("name")?.as_str()?.to_string();
         let public_name = namespaced(
@@ -4980,13 +4944,6 @@ impl McpGateway {
             _ => None,
         };
         let arguments_schema = item.get("argumentsSchema").cloned();
-        // Drift is tracked over the whole declared parameter surface, so a
-        // change to the standard `arguments` array is as visible as one to the
-        // nonstandard schema field.
-        let schema_hash = hash_value(&json!({
-            "arguments": arguments,
-            "argumentsSchema": arguments_schema,
-        }));
         Some(PromptCatalogEntry {
             public_name,
             upstream_name: name,
@@ -5002,9 +4959,6 @@ impl McpGateway {
                 .map(ToOwned::to_owned),
             arguments,
             arguments_schema,
-            enabled: true,
-            discovered_at,
-            schema_hash,
         })
     }
 
@@ -5012,12 +4966,10 @@ impl McpGateway {
         &self,
         server: &McpServerConfig,
         item: Value,
-        discovered_at: DateTime<Utc>,
     ) -> Option<ResourceCatalogEntry> {
         let upstream_uri = item.get("uri")?.as_str()?.to_string();
         let public_uri = public_resource_uri(&server.server_id, &upstream_uri);
         Some(ResourceCatalogEntry {
-            uri_hash: hash_str(&upstream_uri),
             public_uri,
             upstream_uri,
             server_id: server.server_id.clone(),
@@ -5034,8 +4986,6 @@ impl McpGateway {
                 .get("mimeType")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
-            enabled: true,
-            discovered_at,
         })
     }
 
@@ -5043,7 +4993,6 @@ impl McpGateway {
         &self,
         server: &McpServerConfig,
         item: Value,
-        discovered_at: DateTime<Utc>,
     ) -> Option<ResourceTemplateCatalogEntry> {
         let upstream_uri_template = item.get("uriTemplate")?.as_str()?.to_string();
         let uri_template_regex = match uri_template_regex(&upstream_uri_template) {
@@ -5083,8 +5032,6 @@ impl McpGateway {
                 .map(ToOwned::to_owned),
             annotations: item.get("annotations").cloned(),
             icons: item.get("icons").cloned(),
-            enabled: true,
-            discovered_at,
             uri_template_regex,
         })
     }
@@ -5241,8 +5188,7 @@ impl McpGateway {
             .prompts
             .values()
             .filter(|entry| {
-                entry.enabled
-                    && self.policy.action_for_prompt(&entry.public_name) == PolicyAction::Allow
+                self.policy.action_for_prompt(&entry.public_name) == PolicyAction::Allow
             })
             .map(prompt_entry_to_public_value)
             .collect();
@@ -5288,7 +5234,7 @@ impl McpGateway {
         let resources: Vec<Value> = catalog
             .resources
             .values()
-            .filter(|entry| entry.enabled && self.resource_listing_allowed(entry))
+            .filter(|entry| self.resource_listing_allowed(entry))
             .map(resource_entry_to_public_value)
             .collect();
         json_response(
@@ -5326,9 +5272,7 @@ impl McpGateway {
             .resource_templates
             .values()
             .filter(|entry| {
-                entry.enabled
-                    && self.policy.action_for_resource(&entry.public_uri_template)
-                        == PolicyAction::Allow
+                self.policy.action_for_resource(&entry.public_uri_template) == PolicyAction::Allow
             })
             .map(resource_template_entry_to_public_value)
             .collect();
@@ -6040,9 +5984,7 @@ impl McpGateway {
         }
         let mut template_bound = false;
         for entry in catalog.resource_templates.values().filter(|entry| {
-            entry.enabled
-                && entry.server_id == server_id
-                && entry.uri_template_regex.is_match(upstream_uri)
+            entry.server_id == server_id && entry.uri_template_regex.is_match(upstream_uri)
         }) {
             template_bound = true;
             let action = self.policy.action_for_resource(&entry.public_uri_template);
@@ -6281,8 +6223,6 @@ impl McpGateway {
                 raw_cancel_id: None,
                 method: None,
                 params: None,
-                result: None,
-                error: None,
                 message_kind: McpMessageKind::Notification,
             });
         // The forwarded body is the whole batch, not `route_envelope`, so no
@@ -6440,7 +6380,7 @@ impl McpGateway {
                 continue;
             }
 
-            self.emit_envelope_metadata(ctx, &envelope);
+            // `dispatch_post_envelope` stamps this member's envelope metadata.
             let result = self.dispatch_post_envelope(ctx, headers, &envelope).await;
             // Take this member's degraded set before the next iteration's reset
             // drops it, so the request-level summary is the union across members
@@ -8549,8 +8489,7 @@ impl Plugin for McpGateway {
             let result = unconverted_result(observed);
             return self.bridge_terminal(ctx, &result);
         }
-        let enforced =
-            self.enforce_final_response_body(ctx, response_status, response_headers, body);
+        let enforced = self.enforce_final_response_body(ctx, response_headers, body);
         if !matches!(enforced, PluginResult::Continue) {
             Self::settle_sse_stream_inline(ctx);
             return Self::correlate_gateway_terminal(ctx, enforced, body);
@@ -8619,7 +8558,6 @@ impl McpGateway {
     fn enforce_final_response_body(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
@@ -9405,9 +9343,11 @@ fn reverse_resource_uri(
     upstream_uri: &str,
 ) -> ReverseResourceUri {
     let mut matched_public_uri: Option<&str> = None;
-    for entry in catalog.resources.values().filter(|entry| {
-        entry.enabled && entry.server_id == server_id && entry.upstream_uri == upstream_uri
-    }) {
+    for entry in catalog
+        .resources
+        .values()
+        .filter(|entry| entry.server_id == server_id && entry.upstream_uri == upstream_uri)
+    {
         if matched_public_uri.is_some_and(|public_uri| public_uri != entry.public_uri.as_str()) {
             return ReverseResourceUri::Ambiguous;
         }
@@ -9421,7 +9361,7 @@ fn reverse_resource_uri(
     for entry in catalog
         .resource_templates
         .values()
-        .filter(|entry| entry.enabled && entry.server_id == server_id)
+        .filter(|entry| entry.server_id == server_id)
     {
         let Some(public_uri) = expand_public_resource_template(entry, upstream_uri) else {
             continue;
@@ -9507,17 +9447,19 @@ fn parse_mcp_envelope_value(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let params = object.get("params").cloned();
-    let result = object.get("result").cloned();
-    let error = object.get("error").cloned();
+    // Only the presence of `result` / `error` classifies the message; their
+    // values are forwarded in the body, never read here, so they are not copied.
+    let has_result = object.contains_key("result");
+    let has_error = object.contains_key("error");
     // JSON-RPC 2.0 forbids a message that is both a call and a reply. Such a
     // body would be classified as a reply yet dispatched by its method, so it
     // is refused rather than guessed at.
-    if object.contains_key("method") && (result.is_some() || error.is_some()) {
+    if object.contains_key("method") && (has_result || has_error) {
         return Err("JSON-RPC envelope must not mix method with result or error".to_string());
     }
-    let message_kind = if error.is_some() {
+    let message_kind = if has_error {
         McpMessageKind::ErrorResponse
-    } else if result.is_some() {
+    } else if has_result {
         McpMessageKind::Response
     } else if method.is_some() && id.is_none() {
         McpMessageKind::Notification
@@ -9533,8 +9475,6 @@ fn parse_mcp_envelope_value(
         raw_cancel_id: None,
         method,
         params,
-        result,
-        error,
         message_kind,
     })
 }
@@ -10518,7 +10458,6 @@ struct ToolDefinitionParts {
     input_validator: Arc<jsonschema::Validator>,
     output_validator: Option<Arc<jsonschema::Validator>>,
     schema_hash: String,
-    description_hash: String,
 }
 
 /// Session-independent catalog parts of one listed tool definition, or `None`
@@ -10596,7 +10535,6 @@ fn tool_definition_parts(
         .get("description")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let description_hash = hash_value(&Value::String(description.clone().unwrap_or_default()));
     Some(ToolDefinitionParts {
         public_name,
         upstream_name: name,
@@ -10611,7 +10549,6 @@ fn tool_definition_parts(
         input_validator,
         output_validator,
         schema_hash,
-        description_hash,
     })
 }
 
@@ -10818,9 +10755,7 @@ fn resource_template_route(catalog: &McpCatalog, public_uri: &str) -> Option<(St
         .resource_templates
         .values()
         .find(|entry| {
-            entry.enabled
-                && entry.server_id == server_id
-                && entry.uri_template_regex.is_match(&upstream_uri)
+            entry.server_id == server_id && entry.uri_template_regex.is_match(&upstream_uri)
         })
         .map(|entry| (entry.server_id.clone(), upstream_uri))
 }
@@ -10832,13 +10767,26 @@ fn hash_value(value: &Value) -> String {
     }
 }
 
+/// Verify-by-default backend TLS for every directly routed MCP upstream, built
+/// once so routing a request clones an `Arc` instead of allocating a config.
+static DEFAULT_UPSTREAM_TLS: LazyLock<Arc<BackendTlsConfig>> =
+    LazyLock::new(|| Arc::new(BackendTlsConfig::default_verify()));
+
 fn hash_str(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+/// Case-insensitive header lookup that prefers the lowercase map key. Every
+/// built-in caller passes a lowercase literal, so `name` is lowercased (one
+/// allocation) only when it actually contains an uppercase byte, such as an
+/// operator-configured session header name.
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
-    headers
-        .get(&name.to_ascii_lowercase())
+    let lowercase_hit = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        headers.get(&name.to_ascii_lowercase())
+    } else {
+        headers.get(name)
+    };
+    lowercase_hit
         .or_else(|| {
             headers
                 .iter()
@@ -10930,10 +10878,10 @@ fn optional_u64_from_object(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
-            .ok_or_else(|| format!("mcp_gateway: `{key}` must be a positive integer"))
+            .ok_or_else(|| format!("mcp_gateway: `{key}` must be a non-negative integer"))
             .map(Some),
         Some(other) => Err(format!(
-            "mcp_gateway: `{key}` must be a positive integer, got {other:?}",
+            "mcp_gateway: `{key}` must be a non-negative integer, got {other:?}",
             other = other.to_string()
         )),
     }

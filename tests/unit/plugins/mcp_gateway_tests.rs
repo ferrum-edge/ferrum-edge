@@ -1024,7 +1024,7 @@ fn configuration_diagnostics_preserve_schema_and_withhold_supplied_data() {
         (
             json!({"sessions": {"sse_keepalive_seconds": true}}),
             "`sse_keepalive_seconds`",
-            "must be a positive integer",
+            "must be a non-negative integer",
         ),
         (
             json!({"endpoint": {"path": "/mcp", "protocol_versions": ["v1", 987654321]}}),
