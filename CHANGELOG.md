@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Changed
+- **Core cleanups** (issue #7227). `/metrics` now emits each
+  `ferrum_log_sink_*` family as one HELP/TYPE/sample group instead of all
+  headers first and the samples interleaved per sink; series names, labels and
+  values are unchanged. `EnvConfig::default().log_level` is now `warn`,
+  matching the parse default and the docs.
 - **Operator diagnostics name the right setting and keep their useful detail**
   (issue #7229). `ferrum-edge health` now reports the numeric HTTP status
   (`Unhealthy: HTTP status 503`) instead of a quoted status line the startup

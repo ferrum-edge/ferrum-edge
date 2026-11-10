@@ -339,7 +339,7 @@ struct ListenerHandle {
 ///
 /// Must cover every input the builder bakes into the cached config: the
 /// verify flag, the effective CA (proxy-resolved or global fallback — same
-/// precedence as `BackendTlsConfigBuilder::custom_ca_path`), client cert/key,
+/// precedence as `crate::tls::backend::build_root_cert_store`), client cert/key,
 /// and the SAN allow-list (baked into the verifier). Fields are fingerprinted
 /// by *content* so in-place rotation (cert-manager rewriting the same path,
 /// or a secret backend serving new bytes under a stable URI) restarts the
