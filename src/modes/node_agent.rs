@@ -424,7 +424,6 @@ impl NodeAgentConfig {
             env_config.node_agent_proxy_mode,
             capture_config.outbound_port,
             env_config.node_agent_hbone_redirect_port,
-            DEFAULT_NODE_AGENT_SOCKET_PATH,
         )?;
 
         // In-netns capture is the default for NodeWaypoint: publish the per-pod
@@ -14118,7 +14117,6 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments,
         };
         let dir = tempfile::tempdir().expect("tempdir");
@@ -17765,7 +17763,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -17827,7 +17824,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
 
@@ -17952,7 +17948,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
 
@@ -18009,7 +18004,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -18072,7 +18066,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -18133,7 +18126,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
@@ -18216,7 +18208,6 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         assert_eq!(
@@ -18298,7 +18289,6 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: vec![CniValidAttachment {
                 container_id: "ctr-live".to_string(),
                 ifname: "eth0".to_string(),
@@ -18382,7 +18372,6 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         assert_eq!(
@@ -18456,7 +18445,6 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: vec![CniValidAttachment {
                 container_id: "ctr-live".to_string(),
                 ifname: "eth0".to_string(),
@@ -18569,7 +18557,6 @@ mod tests {
                 container_id: String::new(),
                 ifname: None,
                 netns_path: None,
-                args: HashMap::new(),
                 valid_attachments: Vec::new(),
             },
         );
@@ -18649,7 +18636,6 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: vec![CniValidAttachment {
                 container_id: "../escape".to_string(),
                 ifname: "eth0".to_string(),
@@ -18774,7 +18760,6 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         assert_eq!(
@@ -18900,7 +18885,6 @@ mod tests {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
 
@@ -19045,7 +19029,6 @@ mod tests {
                 container_id: String::new(),
                 ifname: None,
                 netns_path: None,
-                args: HashMap::new(),
                 valid_attachments: Vec::new(),
             },
         ) {

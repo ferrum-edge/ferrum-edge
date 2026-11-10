@@ -83,8 +83,6 @@
 //! resolver stays empty and the accept path fails closed — exactly the
 //! documented degraded behavior.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver;

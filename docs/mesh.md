@@ -3676,7 +3676,7 @@ Equal sequences must install **for identical content only**: reconnecting to the
 
 The Kubernetes domain's minimum-over-scopes watermark does not by itself guarantee that one `(authority, sequence)` names one content: a replica at scope watermarks `[110, 100]` and one at `[100, 100]` both publish `100`. Two layers close this:
 
-- **Producer.** At the Kubernetes overlay publication boundary, a reconcile that presents different mesh content at an equal revision keeps the previously accepted mesh and revision (non-mesh Gateway/API fields may still publish); the newest mesh publishes once the sequence advances. A retaining publication requests fresh convergence evidence from every watch scope (spaced by a per-scope 5 s floor) so retention stays brief.
+- **Producer.** At the Kubernetes overlay publication boundary, a reconcile that presents different mesh content at an equal revision keeps the previously accepted mesh and revision (non-mesh Gateway/API fields may still publish); the newest mesh publishes once the sequence advances. A retaining publication requests fresh convergence evidence from every watch scope (spaced by a per-scope 5 s floor) so retention stays brief. When refreshes cannot help — a scope that can never list, such as a newly installed CRD whose RBAC is missing — each scope doubles its spacing after every refresh that did not let the sequence advance, up to 300 s, and returns to 5 s once it advances, so a persistent evidence gap cannot keep every scope relisting every few seconds.
 - **Data plane.** The gate binds a deterministic semantic content identity (the canonical slice digest, ignoring `version` and `revision`) to every accepted and applied revision. An equal-revision candidate installs only when its identity matches, so ordinary reconnect replays — even from a different replica — install, while different content is quarantined as `divergent_content` and an uncomputable identity as `unidentified_content`. The identity is compared, never rendered.
 
 A **present but ill-formed** revision is distinct from an absent one and is refused (`malformed_revision`) even on bootstrap and on the xDS path; on the envelope, raw empty `config_authority` (the proto default) is absent, while non-empty whitespace is malformed. Absent revisions remain valid for unsequenced authorities.
@@ -3972,6 +3972,13 @@ the whole namespace — or, in the Istio root namespace, to `MeshWide` — so a
 resource meant to disable access logging for one gateway would disable it mesh
 wide. Scope it with a workload selector instead.
 
+**One metrics and one access-log entry per resource.** A workload has one
+metrics pipeline and one access-log pipeline, so the Kubernetes translator
+reads only `metrics[0]` and `accessLogging[0]`; every `tracing[]` entry is
+merged. Later `metrics[]` / `accessLogging[]` entries (typically per-provider
+overrides) are accepted but not enforced and are listed in
+`status.ferrum.translation.deferred_fields`.
+
 Each section (tracing, metrics, access logging) is merged independently. Within the same scope level, later resources win. Deterministic ordering is ensured by namespace/name tie-breaking.
 
 **Tracing configuration**:
@@ -4264,7 +4271,7 @@ Existing pods that still carry Ferrum as an ordinary `spec.containers` entry mus
 |---|---|
 | `explicit` (default) | No automatic capture; applications must explicitly route to the proxy |
 | `iptables` | Inject init container with `NET_ADMIN`/`NET_RAW` capabilities that sets up iptables rules to redirect traffic through the sidecar (inbound to 15006, outbound to 15001) |
-| `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path. **Build requirement:** real eBPF attachment needs a binary built with the Cargo `ebpf` feature (`cargo build --features ebpf`, Linux only; Docker `--target runtime-ebpf --build-arg FEATURES=cloud-secrets,ebpf`). The **default published image has no aya loader**: an eBPF-mode node-agent built without the feature refuses to start (`capture_state="unavailable"`, `ferrum_mesh_node_topology_degraded{reason="ebpf_feature_disabled"}`) rather than attaching nothing — see [Maturity and Support Status](#maturity-and-support-status) |
+| `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. **Build requirement:** real eBPF attachment needs a binary built with the Cargo `ebpf` feature (`cargo build --features ebpf`, Linux only; Docker `--target runtime-ebpf --build-arg FEATURES=cloud-secrets,ebpf`). The **default published image has no aya loader**: an eBPF-mode node-agent built without the feature refuses to start (`capture_state="unavailable"`, `ferrum_mesh_node_topology_degraded{reason="ebpf_feature_disabled"}`) rather than attaching nothing — see [Maturity and Support Status](#maturity-and-support-status) |
 
 #### UDP TPROXY capture
 
@@ -5132,9 +5139,10 @@ Example: `match: [{ uri: { prefix: "/api" }, authority: { prefix: "api." } }]` r
 VirtualService `retries` populate the emitted proxy's retry policy and are also projected onto each emitted `mesh_route_dispatch` rule as route-local `retry` (Ferrum `RetryConfig` after strict admission):
 
 - `attempts` -> `max_retries`
-- `retryOn` supports `5xx`, `gateway-error`, `connect-failure`, `reset`, `refused-stream`, `retriable-status-codes`, and numeric HTTP status codes (for example `503`); `retriable-4xx` is not recognized.
+- `retryOn` enforces `5xx`, `gateway-error`, `connect-failure`, `reset`, `refused-stream`, `retriable-status-codes`, and numeric HTTP status codes `100`-`599` (for example `503`). The other Istio policies (`retriable-4xx`, `retriable-headers`, `envoy-ratelimited`, `reset-before-request`, `http3-post-connect-failure`, and the gRPC `cancelled` / `deadline-exceeded` / `internal` / `resource-exhausted` / `unavailable`) are accepted, not enforced, and reported in `status.ferrum.translation.deferred_fields`. A token that is neither an Istio policy nor a status code in that range refuses the VirtualService (`FerrumAccepted=False`), as Istio's validation does.
 - When `retryOn` includes `retriable-status-codes`, `retriableStatusCodes` supplies the explicit status codes to retry (valid codes are 100 through 599).
-- `perTryTimeout` is not translated; the separate route-level `timeout` controls the backend read timeout.
+- `perTryTimeout` and `retryRemoteLocalities` are not translated and are reported in `deferred_fields`; the separate route-level `timeout` controls the backend read timeout.
+- Every `http[].route[]` entry needs a `destination` (Istio requires it); an entry without one refuses the VirtualService instead of silently dropping that share of a split.
 
 Route-local `retry` and destination `backend_tls` objects reject unknown keys at plugin admission (same fail-closed contract as `reject_unmatched` / `requires_node_waypoint_authz`). Shared proxy/upstream `RetryConfig` and `BackendTlsConfig` deserialization is not affected; only the mesh-route wire shapes are strict.
 

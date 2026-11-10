@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! cgroup v2 path resolution for Kubernetes pods.
 //!
 //! Kubernetes uses two cgroup drivers — `systemd` and `cgroupfs` — each
@@ -24,9 +23,10 @@ static RELAY_POD_CGROUP_PATH_MEMO: OnceLock<Mutex<Option<(String, String, PathBu
 /// `kubepods.slice` / `kubepods` layouts. On the kubeadm/kind systemd layout
 /// (`kubelet.slice/kubelet-kubepods.slice/...`, pinned by
 /// `resolve_pod_cgroup_path_finds_kubelet_slice_systemd_pod`) every call falls
-/// through to `discover_pod_cgroup_paths`, a breadth-first walk bounded at
-/// `POD_CGROUP_DISCOVERY_MAX_DIRS` directories that does not early-exit on a
-/// match. The NodeWaypoint relay reconcile runs every
+/// through to `discover_pod_cgroup_path`, a breadth-first walk bounded at
+/// `POD_CGROUP_DISCOVERY_MAX_DIRS` directories (it stops at the first match,
+/// but still reads every directory ahead of the pod). The NodeWaypoint relay
+/// reconcile runs every
 /// `UDP_CAPTURE_READINESS_POLL` (250 ms), so calling the uncached resolver
 /// there costs thousands of directory reads per second, forever, on a
 /// steady-state node.
@@ -96,9 +96,7 @@ pub fn resolve_pod_cgroup_path(cgroup_root: &str, pod_uid: &str) -> Option<PathB
         return Some(path);
     }
 
-    discover_pod_cgroup_paths(cgroup_root, pod_uid, &sanitized_uid)
-        .into_iter()
-        .find(|path| path.exists())
+    discover_pod_cgroup_path(cgroup_root, pod_uid, &sanitized_uid)
 }
 
 fn systemd_pod_cgroup_paths(cgroup_root: &str, sanitized_uid: &str) -> [PathBuf; 3] {
@@ -126,15 +124,19 @@ fn cgroupfs_pod_cgroup_paths(cgroup_root: &str, pod_uid: &str) -> [PathBuf; 3] {
 const POD_CGROUP_DISCOVERY_MAX_DEPTH: usize = 8;
 const POD_CGROUP_DISCOVERY_MAX_DIRS: usize = 4096;
 
-fn discover_pod_cgroup_paths(
+/// Breadth-first search for the pod's cgroup directory under `cgroup_root`.
+///
+/// Returns the first (shallowest, then directory-order) existing match, which
+/// is the only one [`resolve_pod_cgroup_path`] ever used, so the walk stops
+/// there instead of reading the rest of the tree on every enrollment.
+fn discover_pod_cgroup_path(
     cgroup_root: &str,
     pod_uid: &str,
     sanitized_uid: &str,
-) -> Vec<PathBuf> {
+) -> Option<PathBuf> {
     let root = Path::new(cgroup_root);
     let raw_cgroupfs = format!("pod{pod_uid}");
     let systemd_suffix = format!("pod{sanitized_uid}.slice");
-    let mut matches = Vec::new();
     let mut queue = VecDeque::new();
     queue.push_back((root.to_path_buf(), 0usize));
     let mut scanned = 0usize;
@@ -153,7 +155,11 @@ fn discover_pod_cgroup_paths(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == raw_cgroupfs || name.ends_with(&systemd_suffix));
         if name_matches {
-            matches.push(dir.clone());
+            // Re-checked like the fast paths: the directory can vanish
+            // between the parent's `read_dir` and here.
+            if dir.exists() {
+                return Some(dir);
+            }
             continue;
         }
         if depth >= POD_CGROUP_DISCOVERY_MAX_DEPTH {
@@ -171,7 +177,7 @@ fn discover_pod_cgroup_paths(
         }
     }
 
-    matches
+    None
 }
 
 /// Bounds for [`collect_cgroup_tree`]. Kubernetes pod cgroups nest only a
@@ -696,6 +702,28 @@ mod tests {
         assert_eq!(
             resolve_pod_cgroup_path(dir.path().to_str().unwrap(), "abc-def"),
             Some(path)
+        );
+    }
+
+    #[test]
+    fn pod_cgroup_discovery_stops_at_the_shallowest_match() {
+        // A shallower match wins and nothing below it is needed: the walk
+        // returns it instead of collecting every match in the tree.
+        let dir = tempfile::tempdir().unwrap();
+        let shallow = dir.path().join("kubelet.slice/podabc-def");
+        let deeper = dir
+            .path()
+            .join("kubelet.slice/kubelet-kubepods.slice/x.slice/kubelet-kubepods-podabc_def.slice");
+        std::fs::create_dir_all(&shallow).unwrap();
+        std::fs::create_dir_all(&deeper).unwrap();
+
+        assert_eq!(
+            discover_pod_cgroup_path(dir.path().to_str().unwrap(), "abc-def", "abc_def"),
+            Some(shallow)
+        );
+        assert_eq!(
+            discover_pod_cgroup_path(dir.path().to_str().unwrap(), "zzz", "zzz"),
+            None
         );
     }
 

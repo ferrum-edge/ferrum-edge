@@ -66,7 +66,6 @@ fn build_request(verb: RpcVerb) -> CniRpcRequest {
         container_id: "ctr-1".to_string(),
         ifname: Some("eth0".to_string()),
         netns_path: Some("/var/run/netns/cni-1".to_string()),
-        args: std::collections::HashMap::new(),
         valid_attachments: Vec::new(),
     }
 }
@@ -386,6 +385,52 @@ async fn cni_round_trip_surfaces_main_loop_error() {
     let _ = tokio::time::timeout(Duration::from_secs(2), listener).await;
 }
 
+/// The lifecycle verbs share `cni::install` with the node-agent, which logs
+/// through `tracing`. The CLI must route those diagnostics to stderr, or an
+/// operator never learns why the installer ignored a file on the node.
+#[cfg(unix)]
+#[test]
+fn ferrum_cni_uninstall_reports_install_module_diagnostics_on_stderr() {
+    let dir = tempdir().expect("tempdir");
+    let bin_dir = dir.path().join("opt-cni-bin");
+    let conf_dir = dir.path().join("etc-cni-net-d");
+    std::fs::create_dir_all(&bin_dir).expect("bin dir");
+    std::fs::create_dir_all(&conf_dir).expect("conf dir");
+    std::fs::write(
+        conf_dir.join(ferrum_edge::cni::install::OWNERSHIP_MANIFEST_FILE_NAME),
+        b"not json",
+    )
+    .expect("write corrupt ownership manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+        .arg("uninstall")
+        .env_remove("RUST_LOG")
+        .env_remove("READY_MARKER_PATH")
+        .env_remove("EXPECTED_OWNER")
+        .env_remove("EXPECTED_GENERATION")
+        .env("HOST_BIN_DIR", &bin_dir)
+        .env("HOST_CONF_DIR", &conf_dir)
+        .env("CONF_FILE_NAME", "00-ferrum.conflist")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ferrum-cni uninstall");
+
+    assert!(
+        output.status.success(),
+        "nothing was installed, so uninstall succeeds: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "lifecycle diagnostics must not reach stdout"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Ignoring unparseable CNI ownership manifest"),
+        "install-module warning must reach stderr, got: {stderr}"
+    );
+}
+
 /// Binary-level behavior: a rejected CHECK must fail the CNI invocation
 /// so kubelet can detect that the pod is not currently enrolled.
 #[tokio::test]
@@ -518,7 +563,6 @@ async fn cni_gc_round_trip_forwards_valid_attachments() {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: std::collections::HashMap::new(),
             valid_attachments: vec![CniValidAttachment {
                 container_id: "ctr-live".to_string(),
                 ifname: "eth0".to_string(),
@@ -692,7 +736,6 @@ fn cni_rpc_boundary_rejects_cross_verb_paths_and_identifiers() {
         container_id: String::new(),
         ifname: None,
         netns_path: None,
-        args: std::collections::HashMap::new(),
         valid_attachments: vec![CniValidAttachment {
             container_id: "ctr-live".to_string(),
             ifname: "eth0".to_string(),
@@ -716,11 +759,10 @@ fn cni_rpc_boundary_rejects_cross_verb_paths_and_identifiers() {
     unsafe_path.netns_path = Some("/var/run/netns/../host".to_string());
     assert!(unsafe_path.validate().is_err());
 
-    let mut oversized_args = build_request(RpcVerb::Add);
-    oversized_args.args = (0..65)
-        .map(|index| (format!("ARG_{index}"), "value".to_string()))
-        .collect();
-    assert!(oversized_args.validate().is_err());
+    // The request carries no free-form CNI argument map: an unknown wire
+    // field (an `args` object from any peer) is refused at decode.
+    let with_args = r#"{"verb":"add","network_name":"ferrum-mesh","pod_namespace":"demo","pod_name":"alpha","container_id":"ctr-1","ifname":"eth0","netns_path":"/var/run/netns/cni-1","args":{"K8S_POD_NAME":"alpha"},"valid_attachments":[]}"#;
+    assert!(serde_json::from_str::<CniRpcRequest>(with_args).is_err());
 }
 
 #[test]
@@ -854,7 +896,6 @@ async fn cni_status_round_trip_forwards_without_attachment_fields() {
         assert!(work.request.container_id.is_empty());
         assert!(work.request.ifname.is_none());
         assert!(work.request.netns_path.is_none());
-        assert!(work.request.args.is_empty());
         assert!(work.request.valid_attachments.is_empty());
         let _ = work.respond.send(CniRpcResponse::Ok);
     });
@@ -876,7 +917,6 @@ async fn cni_status_round_trip_forwards_without_attachment_fields() {
             container_id: String::new(),
             ifname: None,
             netns_path: None,
-            args: std::collections::HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let mut last_err = None;
@@ -1266,7 +1306,6 @@ fn cni_rpc_status_boundary_rejects_attachment_specific_fields() {
         container_id: String::new(),
         ifname: None,
         netns_path: None,
-        args: std::collections::HashMap::new(),
         valid_attachments: Vec::new(),
     };
     assert!(valid_status.validate().is_ok());
@@ -1317,7 +1356,6 @@ fn status_rpc_request() -> CniRpcRequest {
         container_id: String::new(),
         ifname: None,
         netns_path: None,
-        args: std::collections::HashMap::new(),
         valid_attachments: Vec::new(),
     }
 }

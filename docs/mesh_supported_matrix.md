@@ -117,7 +117,8 @@ authority before it can reach DNS or connection setup. A refused stream-family
 entry does **not** claim its listen port, so a following exact-host
 `ServiceEntry` on the same port still materializes.
 
-**`resolution: NONE` is currently handled identically to `DNS`.** Istio's
+**`resolution: NONE` is currently handled identically to `DNS`**, and so is
+`DNS_ROUND_ROBIN`. Istio's
 original-destination semantics for raw streams are not implemented; stream
 entries must declare exact hosts or use `resolution: STATIC` with `endpoints[]`.
 
@@ -196,6 +197,22 @@ section is canonical for the detail.
   bind the transform to. Single-destination routes apply it before the
   route-level `http[].headers` block, and a route-level `set` wins. See
   [Header Transforms](mesh.md#header-transforms).
+- **VS `http[].retries` `perTryTimeout` / `retryRemoteLocalities` and `retryOn`
+  policies outside Ferrum's retry model** (`retriable-4xx`, `retriable-headers`,
+  `envoy-ratelimited`, `reset-before-request`, `http3-post-connect-failure`,
+  gRPC status policies) — **Deferred**, reported in `deferred_fields`; the
+  enforced tokens still apply. A `retryOn` token that is neither an Istio policy
+  nor an HTTP status code refuses the VirtualService. See
+  [Retries](mesh.md#retries).
+- **`Telemetry` `metrics[]` / `accessLogging[]` entries after the first** —
+  **Deferred**, reported in `deferred_fields`: one metrics and one access-log
+  pipeline per workload, so only the first entry of each is translated (every
+  `tracing[]` entry is merged).
+- **`ServiceEntry` `endpoints[]` with no `address` but a `network`** (reached
+  through that network's gateway) — **Deferred**, skipped and reported in
+  `deferred_fields`. An endpoint with neither, a non-integer endpoint port, a
+  `ports[]` entry without an integer `number`, and an unknown `location` or
+  `resolution` refuse the ServiceEntry. `DNS_ROUND_ROBIN` resolves like `DNS`.
 
 **Supported within a stated boundary (Linux NodeWaypoint, Experimental)**
 

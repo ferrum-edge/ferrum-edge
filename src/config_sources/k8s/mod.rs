@@ -36,6 +36,10 @@ pub use istio::{MAX_L4_CANDIDATE_PROXIES, MAX_PROJECTED_L4_PROXIES};
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
 pub(crate) use istio::cors_policy_translatable;
+// Shared with the Istio status writer the same way: Istio-valid retry settings
+// the translator accepts without enforcing, and Telemetry entries past the
+// first translated one, are reported by the same predicates that decide them.
+pub(crate) use istio::{telemetry_deferred_fields, virtual_service_retry_deferred_fields};
 // Shared with the Istio status writer the same way: Sidecar `ingress[]`
 // classification used by resolution and deferred-field reporting is one
 // predicate, so modeled HTTP and stream listeners cannot be reported deferred.
@@ -50,10 +54,11 @@ pub(crate) use istio::{
 pub(crate) use istio::{SidecarOutboundPolicy, classify_sidecar_outbound_traffic_policy};
 // Shared with the Istio status writer the same way: the ServiceEntry UDP-port
 // classification used by translation/materialization (a `protocol: UDP` port is
-// classified `AppProtocol::Udp` and its egress materialization is deferred/inert
-// in F3 §3.3 stage 1) and by the status writer's deferred-field reporting is one
-// predicate, so a UDP ServiceEntry is never reported as fully accepted while its
-// egress lane is silently skipped.
+// classified `AppProtocol::Udp`; external UDP egress materializes only on the
+// EgressGateway allowlist and the Sidecar/Ambient STATIC-endpoint routes, issue
+// #3263) and by the status writer's deferred-field reporting is one predicate,
+// so a UDP ServiceEntry is never reported as fully accepted without its egress
+// conditions.
 pub(crate) use istio::service_entry_port_protocol_is_udp;
 // Same shared-predicate contract for the stream-family egress wildcard-host
 // refusal (issue #4535): a wildcard `spec.hosts[]` element with no declared
@@ -61,6 +66,9 @@ pub(crate) use istio::service_entry_port_protocol_is_udp;
 // dispatch concretizes the target per request instead), so the status writer
 // reports it as deferred through the SAME predicate rather than re-deriving it.
 pub(crate) use istio::service_entry_spec_has_unresolvable_stream_wildcard_host;
+// Same contract for address-less `endpoints[]` that name a `network`: skipped by
+// the translator and reported as deferred by the status writer.
+pub(crate) use istio::service_entry_endpoint_is_network_gateway_only;
 
 use std::collections::{HashMap, HashSet};
 
