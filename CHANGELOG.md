@@ -597,6 +597,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **Egress baggage stripping filters every spelling of the `baggage` header**
+  (GHSA-hq2p-8cgc-cg4v). On the HTTP/1.1, HTTP/2, native HTTP/3 and WebSocket
+  egress sites, the map-shaped strip filtered only one `baggage` key. When a
+  request-transforming plugin added a mixed-case `Baggage` header beside the
+  lowercase one, the second copy was forwarded with its reserved identity
+  members (`source.principal` and the other reserved prefixes) and any
+  configured-prefix members intact, and the next hop merges every baggage
+  field line. Every case-insensitive match is now filtered, as the
+  ordered-list sibling already did.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

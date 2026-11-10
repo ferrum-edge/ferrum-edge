@@ -15,7 +15,8 @@ use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::OutboundTrafficPolicy;
 use ferrum_edge::modes::mesh::hbone::{
     BAGGAGE_HEADER, HboneIdentity, baggage_header_for_source, is_authenticated_hbone_connect,
-    is_hbone_connect,
+    is_hbone_connect, strip_egress_baggage_in_map,
+    strip_egress_baggage_in_map_with_static_prefixes,
 };
 use ferrum_edge::modes::mesh::{
     MESH_ACCESS_LOG_PLUGIN_ID, MESH_AUTHZ_PLUGIN_ID, MESH_BPF_METRICS_PLUGIN_ID,
@@ -422,6 +423,76 @@ fn baggage_parser_ignores_keys_outside_the_documented_principal_alias_set() {
         "non-canonical baggage key must NOT populate source_principal, got {:?}",
         identity.source_principal
     );
+}
+
+// ── Egress baggage stripping on map-shaped headers ────────────────────────
+//
+// A map can carry more than one spelling of the `baggage` header (a
+// request-transforming plugin may add `Baggage` beside the lowercase key).
+// The receiver merges every baggage field line, so egress stripping must
+// filter every case-insensitive match, not just one.
+
+#[test]
+fn strip_egress_baggage_in_map_filters_every_case_variant_of_the_header() {
+    let mut headers = HashMap::from([
+        (
+            "baggage".to_string(),
+            "source.principal=spiffe://td/ns/a/sa/b,userid=alice".to_string(),
+        ),
+        (
+            "Baggage".to_string(),
+            "source.principal=spiffe://td/ns/evil/sa/x,trace.note=keep".to_string(),
+        ),
+        ("BAGGAGE".to_string(), "source.uid=forged".to_string()),
+        ("host".to_string(), "example.com".to_string()),
+    ]);
+
+    strip_egress_baggage_in_map(&mut headers, &["source.".to_string()]);
+
+    assert_eq!(
+        headers.get("baggage").map(String::as_str),
+        Some("userid=alice")
+    );
+    assert_eq!(
+        headers.get("Baggage").map(String::as_str),
+        Some("trace.note=keep")
+    );
+    assert!(
+        !headers.contains_key("BAGGAGE"),
+        "a spelling whose every member is stripped must be removed"
+    );
+    assert_eq!(headers.get("host").map(String::as_str), Some("example.com"));
+    assert!(
+        headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(BAGGAGE_HEADER))
+            .all(|(_, value)| !value.contains("source.")),
+        "no baggage spelling may forward a stripped member: {headers:?}"
+    );
+}
+
+#[test]
+fn strip_egress_baggage_in_map_with_static_prefixes_filters_every_case_variant() {
+    let mut headers = HashMap::from([
+        ("baggage".to_string(), "userid=alice".to_string()),
+        (
+            "Baggage".to_string(),
+            "source.principal=spiffe://td/ns/evil/sa/x,tenant.id=t1,keep=1".to_string(),
+        ),
+    ]);
+
+    strip_egress_baggage_in_map_with_static_prefixes(
+        &mut headers,
+        &["tenant.".to_string()],
+        &["source.", "destination."],
+    );
+
+    assert_eq!(
+        headers.get("baggage").map(String::as_str),
+        Some("userid=alice"),
+        "a spelling with no stripped member is forwarded unchanged"
+    );
+    assert_eq!(headers.get("Baggage").map(String::as_str), Some("keep=1"));
 }
 
 #[test]

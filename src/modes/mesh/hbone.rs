@@ -474,25 +474,35 @@ pub fn strip_egress_baggage_in_map_with_static_prefixes(
     });
 }
 
+/// Filter EVERY map key that names the `baggage` header, compared
+/// case-insensitively. A map can hold more than one spelling (`baggage` and
+/// `Baggage` after a request-transforming plugin adds a mixed-case header),
+/// and the receiver merges every baggage field line, so filtering only one
+/// key would forward reserved members in the other. Mirrors
+/// [`strip_egress_baggage_in_vec`], which filters every matching entry.
 fn apply_baggage_filter_in_map(
     headers: &mut std::collections::HashMap<String, String>,
     filter: impl Fn(&str) -> Option<String>,
 ) {
-    let Some(key) = baggage_header_key_in_map(headers) else {
-        return;
-    };
-    let Some(raw) = headers.get(&key) else {
-        return;
-    };
-    let raw_owned = raw.clone();
-    match filter(&raw_owned) {
-        Some(filtered) if filtered != raw_owned => {
-            headers.insert(key, filtered);
+    let keys: Vec<String> = headers
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case(BAGGAGE_HEADER))
+        .cloned()
+        .collect();
+    for key in keys {
+        let Some(raw) = headers.get(&key) else {
+            continue;
+        };
+        let raw_owned = raw.clone();
+        match filter(&raw_owned) {
+            Some(filtered) if filtered != raw_owned => {
+                headers.insert(key, filtered);
+            }
+            None => {
+                headers.remove(&key);
+            }
+            Some(_) => {}
         }
-        None => {
-            headers.remove(&key);
-        }
-        Some(_) => {}
     }
 }
 
@@ -506,18 +516,6 @@ pub fn has_baggage_header_in_map(headers: &std::collections::HashMap<String, Str
         || headers
             .keys()
             .any(|key| key.eq_ignore_ascii_case(BAGGAGE_HEADER))
-}
-
-fn baggage_header_key_in_map(
-    headers: &std::collections::HashMap<String, String>,
-) -> Option<String> {
-    if headers.contains_key(BAGGAGE_HEADER) {
-        return Some(BAGGAGE_HEADER.to_string());
-    }
-    headers
-        .keys()
-        .find(|key| key.eq_ignore_ascii_case(BAGGAGE_HEADER))
-        .cloned()
 }
 
 /// Apply [`filter_baggage_header`] in place to a `Vec<(String, String)>` of
