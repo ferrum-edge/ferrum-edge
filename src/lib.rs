@@ -16151,9 +16151,8 @@ pub mod _test_support {
 
     pub fn h3_plugin_protocol_for_request_for_test(
         flavor: crate::config::types::HttpFlavor,
-        grpc_web_request: bool,
     ) -> crate::plugins::ProxyProtocol {
-        crate::http3::server::h3_plugin_protocol_for_request(flavor, grpc_web_request)
+        crate::http3::server::h3_plugin_protocol_for_request(flavor)
     }
 
     pub fn udp_logging_should_replace_sender_on_resolve_for_test(

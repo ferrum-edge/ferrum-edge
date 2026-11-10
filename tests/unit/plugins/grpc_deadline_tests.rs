@@ -40,13 +40,15 @@ fn h3_grpc_web_requests_keep_the_http_protocol_key() {
     use ferrum_edge::config::types::HttpFlavor;
     use ferrum_edge::plugins::ProxyProtocol;
 
+    // Recognized gRPC-Web arrives on the Plain wire flavor, which keeps the
+    // HTTP protocol key; only native gRPC selects the gRPC key.
     assert_eq!(
-        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, true),
+        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain),
         ProxyProtocol::Http
     );
     assert_eq!(
-        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, false),
-        ProxyProtocol::Http
+        h3_plugin_protocol_for_request_for_test(HttpFlavor::Grpc),
+        ProxyProtocol::Grpc
     );
 }
 
