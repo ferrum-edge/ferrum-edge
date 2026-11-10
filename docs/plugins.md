@@ -6685,7 +6685,7 @@ Runs after `ai_federation` (4060) and before `ai_response_guard` (4075). A guard
 | `provider` | String | `"auto"` | LLM provider format |
 | `include_model` | Boolean | `true` | Extract model name into metadata |
 | `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately |
-| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (1–64 ASCII letters, digits, `.`, `_`, or `-`) |
+| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (1–64 ASCII letters, digits, `.`, `_`, or `-`). `ai_transcript_audit` and `ai_tool_governor` read only the default `ai_*` keys: with another prefix the audit record's `tokens` section and model/provider fields, and the governor's request-metadata model/provider fallback, stay empty |
 | `buffer_streaming_responses` | Boolean | `false` | Buffer `text/event-stream` responses and meter them after the full response is collected; this disables streaming delivery for those responses. Not required for SSE token accounting, which observes streams incrementally by default |
 | `cost_per_prompt_token` | Number or null | *(none)* | Prompt-token cost rate, from `0` through `18446744073709.55`; omission or `null` disables this rate |
 | `cost_per_completion_token` | Number or null | *(none)* | Completion-token cost rate, from `0` through `18446744073709.55`; omission or `null` disables this rate |

@@ -13443,6 +13443,19 @@ async fn mcp_roundtrip(
     final_body: &[u8],
     response: &Value,
 ) -> Vec<Value> {
+    let response = serde_json::to_vec(response).expect("serialize response");
+    mcp_roundtrip_raw(overrides, ctx, final_body, &response, &json_headers()).await
+}
+
+/// [`mcp_roundtrip`] with the client-visible response given as raw bytes and
+/// headers, for event-stream framings.
+async fn mcp_roundtrip_raw(
+    overrides: Value,
+    ctx: &mut RequestContext,
+    final_body: &[u8],
+    response: &[u8],
+    response_headers: &HashMap<String, String>,
+) -> Vec<Value> {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -13467,9 +13480,8 @@ async fn mcp_roundtrip(
     plugin
         .on_final_request_body_with_context(ctx, &headers, final_body)
         .await;
-    let response = serde_json::to_vec(response).expect("serialize response");
     plugin
-        .capture_final_response_body(ctx, 200, &json_headers(), &response)
+        .capture_final_response_body(ctx, 200, response_headers, response)
         .await;
     wait_for_records(&server).await
 }
@@ -13940,6 +13952,47 @@ async fn a_jsonrpc_error_outcome_is_an_error_for_retention() {
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["capture_reason"], "error");
     assert_eq!(records[0]["mcp"]["calls"][0]["error_code"], json!(-32001));
+}
+
+/// An MCP server may answer a `tools/call` with an event stream, framed with
+/// any WHATWG line terminator and optionally BOM-prefixed. The outcome parser
+/// must split it the way a client does (issue #7134): otherwise a JSON-RPC
+/// error is missed and `always_capture_on_error` drops the failed call.
+#[tokio::test]
+async fn mcp_event_stream_outcomes_accept_cr_and_bom_framing() {
+    // (label, leading BOM, line terminator)
+    let framings = [
+        ("CR", "", "\r"),
+        ("CRLF", "", "\r\n"),
+        ("BOM+LF", "\u{feff}", "\n"),
+    ];
+    for (label, bom, eol) in framings {
+        let request = mcp_call_value(json!(21), "pets.deletePet", json!({"petId": "7"}));
+        let mut ctx = mcp_ctx(&request);
+        let body = request.to_string();
+        // A progress notification precedes the answer, so the stream holds
+        // two events and the call is matched by id.
+        let stream = format!(
+            "{bom}event: message{eol}\
+             data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progress\":1}}}}{eol}{eol}\
+             event: message{eol}\
+             data: {{\"jsonrpc\":\"2.0\",\"id\":21,\"error\":{{\"code\":-32001,\"message\":\"x\"}}}}{eol}{eol}"
+        );
+        let overrides = json!({ "sampling": { "rate": 0.0, "always_capture_on_error": true } });
+        let records = mcp_roundtrip_raw(
+            overrides,
+            &mut ctx,
+            body.as_bytes(),
+            stream.as_bytes(),
+            &content_type_headers("text/event-stream"),
+        )
+        .await;
+        assert_eq!(records.len(), 1, "{label}: {records:?}");
+        assert_eq!(records[0]["capture_reason"], "error", "{label}");
+        let call = &records[0]["mcp"]["calls"][0];
+        assert_eq!(call["result"], "error", "{label}: {call}");
+        assert_eq!(call["error_code"], json!(-32001), "{label}: {call}");
+    }
 }
 
 #[tokio::test]

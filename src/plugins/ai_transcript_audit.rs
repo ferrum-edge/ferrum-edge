@@ -2835,12 +2835,7 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn stream_commit_selected(
-        &self,
-        ctx: &RequestContext,
-        _response_status: u16,
-        _content_type: Option<&str>,
-    ) -> bool {
+    fn stream_commit_selected(&self, ctx: &RequestContext) -> bool {
         if self.capture.streaming == StreamingCapture::Off || !flag(&ctx.metadata, MD_CANDIDATE) {
             return false;
         }
@@ -2881,14 +2876,8 @@ impl AiTranscriptAudit {
             || (response_status >= 400 && (self.sampling.always_on_error || sample_hit))
     }
 
-    fn stream_fail_closed_rejection(
-        &self,
-        ctx: &mut RequestContext,
-        response_status: u16,
-        response_headers: &HashMap<String, String>,
-    ) -> PluginResult {
-        let content_type = response_headers.get("content-type").map(String::as_str);
-        if !self.stream_commit_selected(ctx, response_status, content_type) {
+    fn stream_fail_closed_rejection(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.stream_commit_selected(ctx) {
             return PluginResult::Continue;
         }
 
@@ -5479,8 +5468,8 @@ impl Plugin for AiTranscriptAudit {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        response_status: u16,
-        response_headers: &mut HashMap<String, String>,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.active
             || !flag(&ctx.metadata, MD_CANDIDATE)
@@ -5535,8 +5524,7 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
         if self.capture.streaming != StreamingCapture::Off {
-            let stream_admission =
-                self.stream_fail_closed_rejection(ctx, response_status, response_headers);
+            let stream_admission = self.stream_fail_closed_rejection(ctx);
             if !matches!(stream_admission, PluginResult::Continue) {
                 return stream_admission;
             }
@@ -5882,7 +5870,7 @@ impl Plugin for AiTranscriptAudit {
             && self.staging.get(record_id).is_some_and(|staging| {
                 staging.commit_permit.is_some() && staging.commit_lease.is_some()
             });
-        if self.stream_commit_selected(ctx, response_status, content_type)
+        if self.stream_commit_selected(ctx)
             || self.stream_inspector_selected(ctx, response_status, content_type)
             || fallback_reservation
         {
@@ -6892,7 +6880,10 @@ fn jsonrpc_event_stream_responses(body: &[u8]) -> Vec<Value> {
     };
     let mut responses = Vec::new();
     let mut data = String::new();
-    for line in text.lines() {
+    // Same BOM policy and CR/LF/CRLF line splitting as the shared SSE parser:
+    // `str::lines` keeps a lone CR inside the line, so a CR-framed stream
+    // would otherwise parse as one unterminated event (issue #7134).
+    for line in sse_lines(strip_sse_boms(text)) {
         if line.is_empty() {
             push_event_stream_message(&mut data, &mut responses);
         } else if let Some(value) = line.strip_prefix("data:") {

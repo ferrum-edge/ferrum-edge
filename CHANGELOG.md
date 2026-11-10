@@ -611,6 +611,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provenance rule `response_caching` already uses (issue #3929); a
   client-supplied id is still a key dimension. A gateway-injected
   `traceparent` from `otel_tracing` is still bound.
+- **`ai_transcript_audit` reads MCP event-stream outcomes in every SSE
+  framing** (issue #7134). The MCP outcome parser split the response with
+  `str::lines` and matched a bare `data:` prefix, so a CR-terminated or
+  BOM-prefixed event stream yielded no JSON-RPC responses: a failed tool call
+  was not seen as failed, `always_capture_on_error` could drop it, and
+  `mcp.calls[].result` was absent. It now splits lines and strips BOMs like
+  the plugin's other SSE paths. The docs now state that `ai_transcript_audit`
+  and `ai_tool_governor` read `ai_token_metrics` output only under its
+  default `ai` metadata prefix.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
