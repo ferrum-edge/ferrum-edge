@@ -40354,7 +40354,7 @@ components:
                 type: [string, "null"]
                 minLength: 1
                 default: "2023-06-01"
-                description: "anthropic-version header value sent to Anthropic providers. Must be a non-empty valid HTTP header value; an explicit null means omission and keeps the default."
+                description: "anthropic providers only (a non-null value on any other provider_type is rejected, by this schema and at admission): anthropic-version header value sent to Anthropic providers. Must be a non-empty valid HTTP header value; an explicit null means omission and keeps the default."
               default_max_tokens:
                 type: [integer, "null"]
                 minimum: 1
@@ -40377,8 +40377,9 @@ components:
                   properties:
                     allow_plaintext:
                       const: true
-              # default_max_tokens is an Anthropic-only control: the constructor
-              # refuses a non-null value on every other provider_type.
+              # default_max_tokens and anthropic_version are Anthropic-only
+              # controls: the constructor refuses a non-null value on every
+              # other provider_type.
               - if:
                   required: [provider_type]
                   properties:
@@ -40388,6 +40389,8 @@ components:
                 then:
                   properties:
                     default_max_tokens:
+                      type: "null"
+                    anthropic_version:
                       type: "null"
 
     A2aGatewayConfig:

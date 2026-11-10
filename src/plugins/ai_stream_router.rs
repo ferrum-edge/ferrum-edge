@@ -1018,8 +1018,16 @@ impl AiStreamRouter {
             validate_provider_header_value(&name, "api_key", &api_key)?;
             let auth = build_auth(provider_type, api_key);
 
-            let anthropic_version = optional_str(pv, "anthropic_version")?
-                .unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.to_string());
+            let anthropic_version = optional_str(pv, "anthropic_version")?;
+            // Only Anthropic sends the header, so on any other provider the
+            // field would be silently inert (same rule as `default_max_tokens`).
+            if anthropic_version.is_some() && provider_type != ProviderType::Anthropic {
+                return Err(format!(
+                    "ai_stream_router: provider {name:?} `anthropic_version` is only supported for `anthropic` providers (no other provider type sends an `anthropic-version` header)"
+                ));
+            }
+            let anthropic_version =
+                anthropic_version.unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.to_string());
             // An explicit empty string is not omission (`null` is): it would
             // send an empty `anthropic-version` header on every request.
             if anthropic_version.is_empty() {

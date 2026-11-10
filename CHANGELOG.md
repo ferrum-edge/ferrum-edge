@@ -630,6 +630,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai_federation`, on every request. The claim-time `400` for a malformed
   `tools` list on Anthropic and Gemini routes now reports `param: "tools"`
   (`code: "invalid_tools"`) instead of `tool_choice`.
+- **`ai_stream_router` refuses `anthropic_version` on non-Anthropic
+  providers** (issue #7128). The field was parsed and validated for every
+  provider type but only ever sent to `anthropic` providers, so a value on
+  any other provider was silently inert. A non-null value there now fails
+  admission (and the OpenAPI schema), like `default_max_tokens`. Remove it
+  from such providers before upgrading.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

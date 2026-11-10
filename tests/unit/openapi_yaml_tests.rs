@@ -5449,6 +5449,7 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         }),
         provider_with(json!({"provider_type": "azure_openai"})),
         provider_with(json!({"provider_type": "openai", "default_max_tokens": null})),
+        provider_with(json!({"provider_type": "openai", "anthropic_version": null})),
         provider_with(json!({"provider_type": "anthropic", "default_max_tokens": 32000})),
         json!({
             "max_stream_bytes": 33554432,
@@ -5477,6 +5478,9 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         provider_with(json!({"provider_type": "openai_compatible", "default_max_tokens": 4096})),
         provider_with(json!({"provider_type": "azure_openai", "default_max_tokens": 4096})),
         provider_with(json!({"provider_type": "google_gemini", "default_max_tokens": 4096})),
+        // anthropic_version follows the same Anthropic-only rule.
+        provider_with(json!({"provider_type": "openai", "anthropic_version": "2023-06-01"})),
+        provider_with(json!({"provider_type": "google_gemini", "anthropic_version": "2023-06-01"})),
         json!({
             "max_stream_events": 10,
             "providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}]

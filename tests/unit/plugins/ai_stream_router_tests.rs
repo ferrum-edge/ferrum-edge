@@ -10170,6 +10170,56 @@ async fn test_explicit_anthropic_version_is_forwarded_unchanged() {
     );
 }
 
+/// `anthropic_version` is only sent to `anthropic` providers, so a value on any
+/// other provider type is refused like `default_max_tokens` (issue #7128);
+/// an explicit `null` still means omission.
+#[test]
+fn test_config_rejects_anthropic_version_on_other_provider_types() {
+    for (provider_type, endpoint, pattern) in [
+        (
+            "openai",
+            "https://api.openai.com/v1/chat/completions",
+            "gpt-*",
+        ),
+        (
+            "openai_compatible",
+            "https://llm.example.com/v1/chat/completions",
+            "llama-*",
+        ),
+        (
+            "azure_openai",
+            "https://example.openai.azure.com/openai/deployments/d/chat/completions",
+            "gpt-*",
+        ),
+        (
+            "google_gemini",
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
+            "gemini-*",
+        ),
+    ] {
+        let provider = |anthropic_version: Value| {
+            anthropic_provider(json!({
+                "provider_type": provider_type,
+                "endpoint": endpoint,
+                "model_patterns": [pattern],
+                "anthropic_version": anthropic_version,
+            }))
+        };
+        let err = AiStreamRouter::new(&provider(json!("2023-06-01")), http_client())
+            .err()
+            .expect("anthropic_version on a non-anthropic provider must fail admission");
+        assert!(err.contains("anthropic_version"), "{provider_type}: {err}");
+        assert!(
+            err.contains("only supported for `anthropic` providers"),
+            "{provider_type}: {err}"
+        );
+        assert!(
+            AiStreamRouter::new(&provider(Value::Null), http_client()).is_ok(),
+            "{provider_type}: an explicit null is omission"
+        );
+    }
+}
+
 #[test]
 fn test_config_rejects_wrong_typed_optional_provider_fields() {
     for (field, value) in [
