@@ -764,7 +764,8 @@ impl DnsCache {
     /// `MissedTickBehavior::Delay` so a slow cycle cannot burst catch-up ticks.
     pub const BACKGROUND_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
-    /// Wall-clock bound for one background (SWR or proactive) resolution.
+    /// Wall-clock bound for one background (SWR, proactive or failed-retry)
+    /// resolution.
     ///
     /// Hickory's default per-query timeout is 5s with 2 attempts (10s for one
     /// record type). This 15s ceiling covers one record type with margin while
@@ -772,7 +773,8 @@ impl DnsCache {
     /// `CACHE,SRV,A,CNAME`) from stalling a hostname for ~30s. A timeout is a
     /// failed refresh: the last known good success row is preserved and never
     /// rewritten or TTL-extended. The permit is released when the timeout
-    /// elapses; `tokio::time::timeout` cancels the hung lookup future.
+    /// elapses; `tokio::time::timeout` cancels the hung lookup future. For a
+    /// failed-retry lookup a timeout is a failed retry: error backoff advances.
     pub const BACKGROUND_REFRESH_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// Expose the configured backend egress policy for non-DNS backend target
@@ -2288,7 +2290,10 @@ impl DnsCache {
                         );
                     }
 
-                    match cache.timed_resolve(&hostname).await {
+                    // Same wall-clock bound as SWR/proactive refresh: a hung
+                    // lookup is a failed retry (backoff advances) instead of
+                    // stalling the whole cycle on hickory's per-type timeouts.
+                    match cache.refresh_resolve_with_timeout(&hostname).await {
                         Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                             let applied_ttl =
                                 cache.effective_ttl(native_ttl, per_proxy_ttl);
@@ -2557,10 +2562,10 @@ impl DnsCache {
         }
     }
 
-    /// Resolve for SWR or proactive background refresh. The test hook is
-    /// compiled out of release builds and is consulted only here — never on
-    /// the foreground `timed_resolve` path — so a hanging SWR/proactive
-    /// future cannot stall a synchronous lookup.
+    /// Resolve for SWR, proactive background refresh or the failed-retry
+    /// task. The test hook is compiled out of release builds and is consulted
+    /// only here — never on the foreground `timed_resolve` path — so a
+    /// hanging background future cannot stall a synchronous lookup.
     async fn refresh_resolve(
         &self,
         hostname: &str,
@@ -6407,6 +6412,51 @@ mod tests {
             handle
                 .await
                 .expect("shutdown must complete the refresh task");
+        }
+
+        /// Issue #7204: a hung failed-retry lookup is bounded by the same
+        /// wall-clock timeout as SWR/proactive refresh and counts as a failed
+        /// retry, so the cycle returns and error backoff advances.
+        #[tokio::test(start_paused = true)]
+        async fn failed_retry_timeout_advances_backoff_and_returns() {
+            let started = Arc::new(Notify::new());
+            let mut cache = DnsCache::new(DnsConfig {
+                error_ttl_seconds: 5,
+                stale_ttl_seconds: 3600,
+                max_concurrent_refreshes: 2,
+                failed_retry_interval_seconds: 10,
+                ..DnsConfig::default()
+            });
+            install_hanging_refresh_hook(
+                &mut cache,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                started.clone(),
+                1,
+            );
+            let cache = cache;
+            insert_error_entry(&cache, "hung.test", -1, 0, Duration::from_secs(1));
+
+            let handle = tokio::spawn({
+                let cache = cache.clone();
+                async move { cache.run_failed_retry_cycle().await }
+            });
+            started.notified().await;
+
+            tokio::time::advance(
+                DnsCache::BACKGROUND_REFRESH_RESOLVE_TIMEOUT + Duration::from_millis(1),
+            )
+            .await;
+            handle
+                .await
+                .expect("failed-retry cycle must return after the timeout");
+
+            let entry = cache.cache.get("hung.test").expect("error entry kept");
+            assert!(entry.is_error, "a timed-out retry must stay an error row");
+            assert_eq!(
+                entry.consecutive_failures, 1,
+                "a timed-out retry must advance error backoff"
+            );
         }
     }
 }
