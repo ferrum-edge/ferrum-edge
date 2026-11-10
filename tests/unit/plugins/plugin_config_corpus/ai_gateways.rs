@@ -83,7 +83,6 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                 "threshold": 0.8
             }],
             "privacy": {
-                "log_raw_text": false,
                 "include_snippet_hash": true,
                 "snippet_hash_salt": "corpus-snippet-salt"
             },

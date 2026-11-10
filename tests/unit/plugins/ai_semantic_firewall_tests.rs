@@ -242,9 +242,15 @@ fn invalid_configs_are_rejected() {
             "builtins": {"prompt_injection": true},
             "custom_rules": [{"id": "prompt_injection", "examples": ["x"]}]
         }),
+        // `privacy.log_raw_text` was a reserved placeholder; it is now an
+        // unknown key whatever its value (issue #7114).
         json!({
             "provider": provider("http://127.0.0.1:9/v1/embeddings"),
             "privacy": {"log_raw_text": true}
+        }),
+        json!({
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "privacy": {"log_raw_text": false}
         }),
         json!({
             "provider": {

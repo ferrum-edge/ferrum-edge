@@ -976,12 +976,6 @@ impl AiSemanticFirewall {
         };
 
         let privacy_object = optional_object(config, "privacy")?;
-        if optional_bool_in_object(privacy_object, "privacy", "log_raw_text")?.unwrap_or(false) {
-            return Err(
-                "ai_semantic_firewall: `privacy.log_raw_text` is reserved for future use and must be false"
-                    .to_string(),
-            );
-        }
         let snippet_hash_salt = match privacy_object {
             Some(obj) => optional_string_from_object(obj, "privacy", "snippet_hash_salt")?
                 .map(str::trim)
@@ -9518,7 +9512,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
         reject_unknown_keys(
             object,
             "config.privacy",
-            &["log_raw_text", "include_snippet_hash", "snippet_hash_salt"],
+            &["include_snippet_hash", "snippet_hash_salt"],
         )?;
     }
 

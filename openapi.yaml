@@ -34424,7 +34424,7 @@ components:
           format: uint64
           minimum: 0
           maximum: 18446744073709551615
-          default: 1024
+          default: 256
           description: >
             Size bound on the validation diagnostic written to
             openapi_validator.request_error / openapi_validator.response_error
@@ -38351,11 +38351,6 @@ components:
           type: object
           additionalProperties: false
           properties:
-            log_raw_text:
-              type: boolean
-              enum: [false]
-              default: false
-              description: Reserved for future explicit raw-text logging. true is rejected in this release.
             include_snippet_hash:
               type: boolean
               default: true

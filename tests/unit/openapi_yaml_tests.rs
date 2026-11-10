@@ -741,6 +741,22 @@ fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
     );
 }
 
+/// Issue #7114: `error_truncate_chars` only ever narrows the compiled-in
+/// diagnostic ceiling, so its documented default is that ceiling rather than a
+/// larger value the runtime would silently clamp.
+#[test]
+fn openapi_validator_error_truncate_default_is_the_diagnostic_ceiling() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let field = &spec["components"]["schemas"]["OpenapiValidatorConfig"]["properties"]["error_truncate_chars"];
+    assert_eq!(
+        field["default"],
+        json!(ferrum_edge::plugins::utils::validation_diagnostics::MAX_DIAGNOSTIC_CHARS)
+    );
+    let docs = include_str!("../../docs/openapi_validator.md");
+    assert!(docs.contains("| `error_truncate_chars` | `256` |"));
+}
+
 #[test]
 fn mtls_auth_schemas_match_runtime_contract() {
     let spec: serde_json::Value =

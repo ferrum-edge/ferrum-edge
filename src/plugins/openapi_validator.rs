@@ -66,7 +66,9 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// (with amplification checks off), so an arbitrary 64-bit value would let a
 /// small compressed body inflate without a meaningful bound.
 const MAX_BODY_BYTES_CEILING: usize = 64 * 1024 * 1024;
-const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
+/// Default `error_truncate_chars`: the compiled-in [`MAX_DIAGNOSTIC_CHARS`]
+/// ceiling, so the default is the value actually enforced (issue #7114).
+const DEFAULT_ERROR_TRUNCATE_CHARS: usize = MAX_DIAGNOSTIC_CHARS;
 /// Upper bound on stacked `Content-Encoding` layers decoded for validation.
 /// Matches the shared content-coding decoder used elsewhere in the gateway.
 const MAX_CONTENT_CODINGS: usize = 4;
