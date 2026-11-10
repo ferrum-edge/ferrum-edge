@@ -67,6 +67,7 @@ pub use jwks::{
     authorities_from_jwks, decoding_key_for_authority, jwks_document, published_authority_key_id,
     validate_published_authorities,
 };
+pub(crate) use validate::validate_jwt_svid_against_admitted;
 #[allow(unused_imports)]
 pub use validate::{ValidatedJwtSvid, validate_jwt_svid};
 
