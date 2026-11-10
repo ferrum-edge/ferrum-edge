@@ -597,6 +597,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **`ai_stream_router` Anthropic chunks carry the committed model**
+  (issue #7127). The Anthropic stream normalizer replaced the model it stamps
+  into every `chat.completion.chunk` with the provider's
+  `message_start.message.model`, so Anthropic routes echoed whatever the
+  endpoint reported while Gemini routes echoed the routed model. Both now
+  stamp the claim-committed model; the provider's report is ignored.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

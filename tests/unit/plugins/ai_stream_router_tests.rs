@@ -7175,6 +7175,18 @@ async fn forged_meta_anthropic_ctx(plugin: &AiStreamRouter) -> RequestContext {
     ctx
 }
 
+/// `ANTHROPIC_SSE` with a `message_start.message.model` that differs from the
+/// committed `claude-3-5-sonnet`, so a normalizer that adopted the provider's
+/// report would be visible.
+fn anthropic_sse_reporting_a_different_model() -> String {
+    let sse = ANTHROPIC_SSE.replace(
+        "\"model\":\"claude-3-5-sonnet\"",
+        "\"model\":\"provider-reported-model\"",
+    );
+    assert!(sse.contains("provider-reported-model"));
+    sse
+}
+
 #[tokio::test]
 async fn streaming_normalizer_identity_comes_from_the_private_claim() {
     let plugin = build(openai_and_anthropic_config());
@@ -7184,7 +7196,8 @@ async fn streaming_normalizer_identity_comes_from_the_private_claim() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("the owning instance must still install its normalizer");
     let mut collected = Vec::new();
-    let chunk = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    let sse = anthropic_sse_reporting_a_different_model();
+    let chunk = inspector.on_chunk(sse.as_bytes()).await;
     collected.extend_from_slice(&forwarded(chunk));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -7197,6 +7210,10 @@ async fn streaming_normalizer_identity_comes_from_the_private_claim() {
         !out.contains("forged-identity"),
         "a metadata rewrite must not change the generation identity: {out}"
     );
+    assert!(
+        !out.contains("provider-reported-model"),
+        "the provider's message_start model must not replace the committed model: {out}"
+    );
 }
 
 #[tokio::test]
@@ -7204,11 +7221,12 @@ async fn buffered_normalizer_identity_comes_from_the_private_claim() {
     let plugin = build(openai_and_anthropic_config());
     let mut ctx = forged_meta_anthropic_ctx(&plugin).await;
 
+    let sse = anthropic_sse_reporting_a_different_model();
     let buffered = plugin
         .normalize_response_body_with_context(
             &mut ctx,
             200,
-            ANTHROPIC_SSE.as_bytes(),
+            sse.as_bytes(),
             Some("text/event-stream"),
             &HashMap::new(),
         )
@@ -7218,6 +7236,7 @@ async fn buffered_normalizer_identity_comes_from_the_private_claim() {
 
     assert!(out.contains("\"model\":\"claude-3-5-sonnet\""), "{out}");
     assert!(!out.contains("forged-identity"), "{out}");
+    assert!(!out.contains("provider-reported-model"), "{out}");
 }
 
 #[tokio::test]

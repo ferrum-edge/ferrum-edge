@@ -5723,9 +5723,9 @@ impl AnthropicSseNormalizer {
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
                     self.stream_id = Some(id.to_string());
                 }
-                if let Some(m) = message.get("model").and_then(Value::as_str) {
-                    self.model = m.to_string();
-                }
+                // `message.model` is the provider's own report and is never
+                // stamped into normalized chunks: the client-visible identity is
+                // the claim-committed model, exactly as on Gemini routes.
                 // `output_tokens` here is a placeholder the terminal delta
                 // supersedes; only the input side is authoritative.
                 let start_usage =
