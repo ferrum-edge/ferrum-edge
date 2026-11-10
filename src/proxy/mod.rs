@@ -2623,16 +2623,6 @@ fn warn_if_h3_websocket_new_quic_idle_mismatch(
     );
 }
 
-/// Check if the request is a WebSocket upgrade request.
-///
-/// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
-/// String allocations on the hot path.
-///
-/// Validates the `Sec-WebSocket-Key` header format: RFC 6455 §4.1 requires it to
-/// be a base64-encoded 16-byte nonce (exactly 24 base64 characters). A malformed
-/// key causes the handshake to be treated as a non-WebSocket request, which the
-/// backend will handle as a regular HTTP request rather than proceeding with a
-/// broken upgrade.
 /// Check if the request is an HTTP/2 Extended CONNECT WebSocket request (RFC 8441).
 ///
 /// In HTTP/2, WebSocket upgrades use the CONNECT method with a `:protocol = "websocket"`
@@ -3463,28 +3453,6 @@ pub(crate) fn resolve_node_waypoint_capture_destination(
         }),
         mtls_mode,
     })
-}
-
-#[allow(dead_code)]
-fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
-    let headers = req.headers();
-    let connection = headers.get("connection").and_then(|v| v.to_str().ok());
-    let upgrade = headers.get("upgrade").and_then(|v| v.to_str().ok());
-    let sec_key = headers
-        .get("sec-websocket-key")
-        .and_then(|v| v.to_str().ok());
-    let sec_version = headers
-        .get("sec-websocket-version")
-        .and_then(|v| v.to_str().ok());
-
-    connection.is_some_and(|conn| {
-        // The Connection header can contain comma-separated values (e.g., "keep-alive, Upgrade").
-        // Split on commas and check each token case-insensitively without allocating.
-        conn.split(',')
-            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-    }) && upgrade.is_some_and(|up| up.eq_ignore_ascii_case("websocket"))
-        && sec_key.is_some_and(is_valid_websocket_key)
-        && (sec_version == Some("13"))
 }
 
 /// Validate that a `Sec-WebSocket-Key` value is a base64-encoded 16-byte nonce.
@@ -23367,27 +23335,6 @@ where
 
     debug!("WebSocket proxy connection closed for {}", proxy_id);
     Ok(())
-}
-
-/// Start the proxy HTTP listener with dual-path handling.
-#[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
-pub async fn start_proxy_listener(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), anyhow::Error> {
-    start_proxy_listener_with_tls(addr, state, shutdown, None).await
-}
-
-/// Start the proxy listener with optional TLS and client certificate verification.
-#[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
-pub async fn start_proxy_listener_with_tls(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-) -> Result<(), anyhow::Error> {
-    start_proxy_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
 }
 
 /// Run the proxy accept loop on a pre-bound `TcpListener`.
