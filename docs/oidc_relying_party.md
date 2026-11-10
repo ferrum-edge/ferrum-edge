@@ -29,7 +29,7 @@ config:
     post_login_default_path: "/"
 ```
 
-Plugin config values are literal: neither `client_auth.client_secret` nor `session.encryption_secret` reads an environment variable. Substitute real secrets (for example with your deployment tooling) before applying the config. Admission rejects the session placeholder above, and any unresolved `${NAME}` in a session secret, but a `${NAME}` client secret would be sent to the provider as written.
+Plugin config values are literal: neither `client_auth.client_secret` nor `session.encryption_secret` reads an environment variable. Substitute real secrets (for example with your deployment tooling) before applying the config. Admission rejects the session placeholder above, and any unresolved `${NAME}` placeholder in a session secret or in `client_auth.client_secret`, without echoing the value.
 
 Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery. Provider endpoints the gateway itself dials (`discovery_url`, `token_endpoint`, `userinfo_endpoint`, `jwks_uri`, and every discovered endpoint) must use HTTPS except for a loopback IP literal (`127.0.0.0/8` or `[::1]`); the name `localhost` does not qualify, because DNS overrides and the resolver decide where a name connects. Browser-followed URLs (`authorization_endpoint`, `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) and the `issuer` identifier keep the `localhost` development case, and a discovered plaintext endpoint must share the loopback IP-literal discovery origin.
 

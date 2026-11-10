@@ -190,7 +190,12 @@ fn is_denied_session_secret(secret: &str) -> bool {
     denied_exact || denied_substring
 }
 
-fn contains_unresolved_env_placeholder(secret: &str) -> bool {
+/// True when `secret` contains a `${NAME}` environment placeholder
+/// (`NAME` = `[A-Za-z_][A-Za-z0-9_]*`). Plugin config values are literal, so
+/// such a value would be stored and sent as written. Shared with the OAuth
+/// `client_auth.client_secret` admission in `oauth2_introspection` and
+/// `oidc_relying_party` (issue #7275).
+pub fn contains_unresolved_env_placeholder(secret: &str) -> bool {
     let bytes = secret.as_bytes();
     let mut offset = 0;
     while let Some(relative_start) = secret[offset..].find("${") {

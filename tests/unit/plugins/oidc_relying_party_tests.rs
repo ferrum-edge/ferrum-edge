@@ -4669,9 +4669,9 @@ fn the_documented_minimal_examples_pass_admission() {
     ] {
         let example = first_oidc_yaml_example(doc)
             .unwrap_or_else(|| panic!("{source} must document an oidc_relying_party example"));
-        // Plugin config is never environment-expanded, and admission does not
-        // screen `client_secret`, so a `${NAME}` value there would be sent to
-        // the provider verbatim (issue #7275).
+        // Plugin config is never environment-expanded, and admission refuses a
+        // `${NAME}` value in `client_secret` (issue #7275), so an
+        // environment-style example would not be admissible as written.
         assert!(
             !example.contains("client_secret: \"${"),
             "{source} example must not show an environment-style client_secret"
@@ -5067,6 +5067,36 @@ fn published_or_placeholder_session_secrets_are_rejected_for_both_fields() {
                 assert!(!diagnostics.contains(secret));
             }
         }
+    }
+}
+
+/// Issue #7275: plugin config is never environment-expanded, so a
+/// `client_auth.client_secret` written as `${NAME}` would be sent to the IdP
+/// verbatim and every token exchange would fail. Admission refuses it for both
+/// secret methods, as it already does for the session secrets, without echoing
+/// the value.
+#[test]
+fn env_placeholder_client_secret_is_rejected_for_both_secret_methods() {
+    for method in ["client_secret_basic", "client_secret_post"] {
+        for secret in ["${OIDC_CLIENT_SECRET}", "prefix-${CLIENT_SECRET}-suffix"] {
+            let mut config = base_config();
+            config["providers"][0]["client_auth"] =
+                json!({"method": method, "client_secret": secret});
+            let error = validate_plugin_config("oidc_relying_party", &config)
+                .expect_err("an env placeholder client_secret must be refused");
+            assert_eq!(
+                error,
+                "oidc_relying_party: `client_auth.client_secret` contains an unresolved \
+                 `${NAME}` placeholder; plugin config values are literal",
+                "method {method} produced an unexpected error"
+            );
+        }
+    }
+    for secret in ["literal-${-secret", "${9NOT_A_NAME}-secret"] {
+        let mut config = base_config();
+        config["providers"][0]["client_auth"]["client_secret"] = json!(secret);
+        validate_plugin_config("oidc_relying_party", &config)
+            .expect("ordinary client_secret text containing `${` must be admitted");
     }
 }
 
