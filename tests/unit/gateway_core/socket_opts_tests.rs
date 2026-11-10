@@ -356,3 +356,65 @@ async fn connect_with_socket_opts_refuses_unreachable() {
     let result = connect_with_socket_opts(addr).await;
     assert!(result.is_err());
 }
+
+// ── io_uring splice readiness wait (Linux, issue #7226) ────────────────
+
+#[cfg(target_os = "linux")]
+mod io_uring_readiness_wait {
+    use ferrum_edge::socket_opts::io_uring_splice::wait_fd_ready;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_descriptor_waits_until_the_deadline() {
+        let (reader, _writer) = UnixStream::pair().expect("socket pair");
+        let started = Instant::now();
+        assert!(!wait_fd_ready(reader.as_raw_fd(), libc::POLLIN, 50));
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(45),
+            "an idle relay must sleep until its deadline, not return at once: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn arriving_data_wakes_the_wait_before_the_deadline() {
+        let (reader, mut writer) = UnixStream::pair().expect("socket pair");
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            writer.write_all(b"x").expect("write");
+            writer
+        });
+        let started = Instant::now();
+        assert!(wait_fd_ready(reader.as_raw_fd(), libc::POLLIN, 10_000));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "readiness must wake the relay, not the deadline"
+        );
+        drop(sender.join().expect("sender"));
+    }
+
+    #[test]
+    fn shutdown_wakes_a_waiting_relay() {
+        let (reader, writer) = UnixStream::pair().expect("socket pair");
+        let fd = reader.as_raw_fd();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            // The parent cancels a relay with shutdown(SHUT_RDWR).
+            reader.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            (reader, writer)
+        });
+        let started = Instant::now();
+        assert!(wait_fd_ready(fd, libc::POLLIN, 10_000));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(closer.join().expect("closer"));
+    }
+
+    #[test]
+    fn writable_descriptor_is_ready_immediately() {
+        let (_reader, writer) = UnixStream::pair().expect("socket pair");
+        assert!(wait_fd_ready(writer.as_raw_fd(), libc::POLLOUT, 10_000));
+    }
+}
