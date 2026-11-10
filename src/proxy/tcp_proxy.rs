@@ -2299,6 +2299,31 @@ pub struct TcpListenerConfig {
     pub trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
+/// Clock-derived fields of a TCP disconnect summary (issue #2624).
+///
+/// `duration_ms` comes only from the process-monotonic connect `Instant`; the
+/// RFC 3339 stamps come only from the civil/UTC wall clocks, so a wall-clock
+/// step (NTP slew, VM resume) can move the rendered stamps but never clamp or
+/// inflate the duration. TCP is the parity baseline the WebSocket, UDP and
+/// DTLS summaries follow.
+pub(crate) struct StreamDisconnectClocks {
+    pub(crate) duration_ms: f64,
+    pub(crate) timestamp_connected: String,
+    pub(crate) timestamp_disconnected: String,
+}
+
+pub(crate) fn stream_disconnect_clocks(
+    connected_mono: Instant,
+    connected_wall_at: chrono::DateTime<chrono::Utc>,
+    disconnected_wall_at: chrono::DateTime<chrono::Utc>,
+) -> StreamDisconnectClocks {
+    StreamDisconnectClocks {
+        duration_ms: connected_mono.elapsed().as_millis() as f64,
+        timestamp_connected: connected_wall_at.to_rfc3339(),
+        timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
+    }
+}
+
 pub(crate) fn find_listener_proxy<'a>(
     config: &'a GatewayConfig,
     proxy_namespace: &str,
@@ -3137,7 +3162,6 @@ async fn run_tcp_accept_loop(
                     // awaiting disconnect observers, which may perform network I/O.
                     stream_ctx.release_admission_permits();
 
-                    let duration_ms = connected_at.elapsed().as_millis() as f64;
                     let final_proxy_id = stream_ctx.proxy_id.clone();
                     // Keep disconnect hooks/logging on the same epoch that
                     // admitted the connection. Long-lived TCP streams can span
@@ -3259,7 +3283,13 @@ async fn run_tcp_accept_loop(
                     };
 
                     if !plugins.is_empty() || error_class.is_some() {
-                        let disconnected_wall_at = chrono::Utc::now();
+                        // No await separates the end of the relay from here, so
+                        // the elapsed time is still the connection lifetime.
+                        let clocks = stream_disconnect_clocks(
+                            connected_at,
+                            connected_wall_at,
+                            chrono::Utc::now(),
+                        );
                         let consumer_username = if !plugins.is_empty() {
                             stream_ctx.effective_identity().map(str::to_owned)
                         } else {
@@ -3280,15 +3310,15 @@ async fn run_tcp_accept_loop(
                             backend_resolved_ip: result.backend.backend_resolved_ip,
                             protocol: backend_scheme.to_string(),
                             listen_port: port,
-                            duration_ms,
+                            duration_ms: clocks.duration_ms,
                             bytes_sent: bytes_in,
                             bytes_received: bytes_out,
                             connection_error: conn_error,
                             error_class,
                             disconnect_direction,
                             disconnect_cause,
-                            timestamp_connected: connected_wall_at.to_rfc3339(),
-                            timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
+                            timestamp_connected: clocks.timestamp_connected,
+                            timestamp_disconnected: clocks.timestamp_disconnected,
                             // TCP TLS termination and TLS passthrough both stash
                             // ClientHello/handshake SNI on stream_ctx; keep it on
                             // the disconnect summary for logging-sink parity with

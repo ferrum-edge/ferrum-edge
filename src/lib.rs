@@ -5490,41 +5490,25 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::find_listener_proxy(config, proxy_namespace, proxy_id).cloned()
     }
 
-    /// Mirror the TCP accept-loop disconnect summary contract: `duration_ms`
-    /// from process-monotonic `Instant`, RFC3339 connect/disconnect stamps
-    /// from civil/UTC wall clocks only. Used by parity regression tests for
-    /// issue #2624 (WebSocket/UDP/DTLS must match this split).
-    pub fn tcp_stream_summary_from_clocks_for_test(
+    /// The TCP accept loop's disconnect-summary clock fields
+    /// (`tcp_proxy::stream_disconnect_clocks`) as `(duration_ms,
+    /// timestamp_connected, timestamp_disconnected)`. Used by the issue #2624
+    /// parity regression tests (WebSocket/UDP/DTLS must match this split).
+    pub fn tcp_stream_disconnect_clocks_for_test(
         connected_mono: std::time::Instant,
         connected_wall_at: chrono::DateTime<chrono::Utc>,
         disconnected_wall_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::plugins::StreamTransactionSummary {
-        crate::plugins::StreamTransactionSummary {
-            plugin_trigger_decisions: Default::default(),
-            namespace: "ferrum".to_string(),
-            proxy_id: "tcp-proxy".to_string(),
-            proxy_lifecycle_generation: None,
-            proxy_name: Some("TCP Proxy".to_string()),
-            client_ip: "10.0.0.1".to_string(),
-            consumer_username: None,
-            auth_method: None,
-            backend_target: "10.0.0.2:9000".to_string(),
-            backend_resolved_ip: Some("10.0.0.2".to_string()),
-            protocol: "tcp".to_string(),
-            listen_port: 9000,
-            // Production: `connected_at.elapsed().as_millis() as f64`
-            duration_ms: connected_mono.elapsed().as_millis() as f64,
-            bytes_sent: 0,
-            bytes_received: 0,
-            connection_error: None,
-            error_class: None,
-            disconnect_direction: None,
-            disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
-            timestamp_connected: connected_wall_at.to_rfc3339(),
-            timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
-            sni_hostname: None,
-            metadata: Default::default(),
-        }
+    ) -> (f64, String, String) {
+        let clocks = crate::proxy::tcp_proxy::stream_disconnect_clocks(
+            connected_mono,
+            connected_wall_at,
+            disconnected_wall_at,
+        );
+        (
+            clocks.duration_ms,
+            clocks.timestamp_connected,
+            clocks.timestamp_disconnected,
+        )
     }
 
     /// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap a
@@ -6786,18 +6770,16 @@ pub mod _test_support {
         plugin.cache_keys_for_tests()
     }
 
-    /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
-    /// standalone counter so tests can prove a drift larger than the current
-    /// total saturates at `0` instead of wrapping to `usize::MAX`.
-    pub fn response_caching_sub_total_size(total: &std::sync::atomic::AtomicUsize, n: usize) {
-        use std::sync::atomic::Ordering;
-
-        if n == 0 {
-            return;
-        }
-        let _ = total.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(n))
-        });
+    /// Add `add` to, then subtract `sub` from, `response_caching`'s running
+    /// cache-size accountant through its production helpers, so tests can prove
+    /// a drift larger than the current total saturates at `0` instead of
+    /// wrapping to `usize::MAX`.
+    pub fn response_caching_adjust_total_size_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+        add: usize,
+        sub: usize,
+    ) {
+        plugin.adjust_total_size_for_tests(add, sub);
     }
 
     // ── plugins/rate-limit cleanup wrappers (#2316) ──────────────────────────
@@ -15989,71 +15971,6 @@ pub mod _test_support {
             crate::proxy::LoadBalancerConnectionGuard::new(None, None),
             crate::proxy::body::ReqwestResponseTrailers::drop_all(),
         ));
-        crate::proxy::body::inspected_streaming_body(rx)
-    }
-
-    /// H1/reqwest-style inspection seam: feed decoded body byte chunks through
-    /// a [`ResponseStreamInspector`] into the shared [`inspected_streaming_body`]
-    /// channel that production `run_response_inspection` uses.
-    ///
-    /// Pair with [`inspected_proxy_body_for_test`] (direct-H2 / native-H3
-    /// `run_proxy_body_response_inspection`) so external tests can prove an
-    /// attached inspector is driven on every HTTP body variant without standing
-    /// up a separate server framework.
-    pub fn inspected_byte_chunks_body_for_test(
-        chunks: Vec<bytes::Bytes>,
-        mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
-    ) -> crate::proxy::ProxyBody {
-        use crate::plugins::ResponseStreamAction;
-        use http_body::Frame;
-
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
-            for chunk in chunks {
-                if tx.is_closed() {
-                    return;
-                }
-                let action = tokio::select! {
-                    biased;
-                    _ = tx.closed() => return,
-                    action = inspector.on_chunk(&chunk) => action,
-                };
-                match action {
-                    ResponseStreamAction::Forward(out) => {
-                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                            return;
-                        }
-                    }
-                    ResponseStreamAction::Terminate(final_bytes) => {
-                        if let Some(fb) = final_bytes
-                            && !fb.is_empty()
-                        {
-                            let _ = tx.send(Ok(Frame::data(fb))).await;
-                        }
-                        return;
-                    }
-                }
-            }
-            let action = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                action = inspector.on_end() => action,
-            };
-            match action {
-                ResponseStreamAction::Forward(out) => {
-                    if !out.is_empty() {
-                        let _ = tx.send(Ok(Frame::data(out))).await;
-                    }
-                }
-                ResponseStreamAction::Terminate(final_bytes) => {
-                    if let Some(fb) = final_bytes
-                        && !fb.is_empty()
-                    {
-                        let _ = tx.send(Ok(Frame::data(fb))).await;
-                    }
-                }
-            }
-        });
         crate::proxy::body::inspected_streaming_body(rx)
     }
 

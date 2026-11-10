@@ -4219,27 +4219,30 @@ fn test_parse_http_date_accepts_all_rfc9110_formats() {
 /// saturating subtraction floors at 0 instead.
 #[test]
 fn test_sub_total_size_saturates_instead_of_wrapping() {
-    use ferrum_edge::_test_support::response_caching_sub_total_size as sub;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use ferrum_edge::_test_support::{
+        response_caching_adjust_total_size_for_test as adjust,
+        response_caching_current_total_size_for_test as total,
+    };
 
-    let total = AtomicUsize::new(100);
+    let plugin = default_plugin();
+    adjust(&plugin, 100, 0);
+    assert_eq!(total(&plugin), 100);
 
     // Subtracting more than the current total must floor at 0, not wrap.
-    sub(&total, 250);
+    adjust(&plugin, 0, 250);
     assert_eq!(
-        total.load(Ordering::Relaxed),
+        total(&plugin),
         0,
         "underflow must saturate at 0, not wrap to usize::MAX"
     );
 
     // Subtracting from 0 stays at 0.
-    sub(&total, 10);
-    assert_eq!(total.load(Ordering::Relaxed), 0);
+    adjust(&plugin, 0, 10);
+    assert_eq!(total(&plugin), 0);
 
     // Normal subtraction still works.
-    total.store(100, Ordering::Relaxed);
-    sub(&total, 40);
-    assert_eq!(total.load(Ordering::Relaxed), 60);
+    adjust(&plugin, 100, 40);
+    assert_eq!(total(&plugin), 60);
 }
 
 /// Finding #62: under many concurrent stores plus interleaved invalidations
