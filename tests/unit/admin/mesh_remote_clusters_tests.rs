@@ -105,7 +105,7 @@ fn entry(
 fn snapshot_with(entries: Vec<RemoteClusterEntry>) -> RemoteEndpointSnapshot {
     let mut clusters = HashMap::new();
     for e in entries {
-        clusters.insert(e.cluster_name.clone(), e);
+        clusters.insert(e.cluster_name.clone(), std::sync::Arc::new(e));
     }
     RemoteEndpointSnapshot { clusters }
 }

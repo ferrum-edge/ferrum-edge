@@ -225,7 +225,7 @@ impl RemoteClusterEntry {
 /// remote cluster name (`RemoteCluster.name` is validated unique).
 #[derive(Debug, Default, Clone)]
 pub struct RemoteEndpointSnapshot {
-    pub clusters: HashMap<String, RemoteClusterEntry>,
+    pub clusters: HashMap<String, Arc<RemoteClusterEntry>>,
 }
 
 impl RemoteEndpointSnapshot {
@@ -467,6 +467,9 @@ impl RemoteEndpointStore {
         // after `remove` had already cleared the cluster (the F6 race, widened
         // to the trust-withdrawal case). `outcome` is computed fresh on every
         // closure iteration so a CAS retry never carries a stale verdict.
+        // Entries are shared by `Arc`, so publishing a new snapshot copies one
+        // pointer per cluster, never another cluster's endpoint vectors.
+        let entry = Arc::new(entry);
         let mut outcome = RemoteInstallOutcome::Retired;
         self.inner.rcu(|current| {
             if !self.cluster_generation_matches(&name, task_generation) {
@@ -487,7 +490,7 @@ impl RemoteEndpointStore {
                 return Arc::clone(current);
             }
             let mut next = (**current).clone();
-            next.clusters.insert(name.clone(), entry.clone());
+            next.clusters.insert(name.clone(), Arc::clone(&entry));
             outcome = RemoteInstallOutcome::Installed;
             Arc::new(next)
         });
@@ -2640,7 +2643,7 @@ mod tests {
         let mut clusters = HashMap::new();
         clusters.insert(
             cluster.to_string(),
-            RemoteClusterEntry::new(
+            Arc::new(RemoteClusterEntry::new(
                 cluster.to_string(),
                 td("remote.local"),
                 Some("net2".to_string()),
@@ -2650,7 +2653,7 @@ mod tests {
                 None,
                 endpoints,
                 1,
-            ),
+            )),
         );
         RemoteEndpointSnapshot { clusters }
     }
@@ -3107,7 +3110,7 @@ mod tests {
         let mut clusters = HashMap::new();
         clusters.insert(
             "east".to_string(),
-            RemoteClusterEntry::new(
+            Arc::new(RemoteClusterEntry::new(
                 "east".to_string(),
                 td("remote.local"),
                 Some("net-a".to_string()),
@@ -3118,11 +3121,11 @@ mod tests {
                     services: vec![],
                 },
                 1,
-            ),
+            )),
         );
         clusters.insert(
             "west".to_string(),
-            RemoteClusterEntry::new(
+            Arc::new(RemoteClusterEntry::new(
                 "west".to_string(),
                 td("remote.local"),
                 Some("net-b".to_string()),
@@ -3133,7 +3136,7 @@ mod tests {
                     services: vec![],
                 },
                 1,
-            ),
+            )),
         );
         let snapshot = RemoteEndpointSnapshot { clusters };
         let candidate = MultiClusterConfig {
@@ -3588,6 +3591,48 @@ mod tests {
 
         store.remove("west");
         assert!(store.snapshot().is_empty());
+    }
+
+    /// Installing or removing one cluster must not deep-clone the others'
+    /// endpoint payloads (up to the per-cluster workload caps each): the new
+    /// snapshot shares every untouched entry by pointer.
+    #[test]
+    fn store_install_and_remove_share_untouched_cluster_entries() {
+        let entry = |name: &str, ip: &str| RemoteClusterEntry {
+            cluster_name: name.to_string(),
+            trust_domain: td("remote.local"),
+            network: None,
+            control_plane_url: None,
+            credential_ref: None,
+            endpoints: RemoteClusterEndpoints {
+                workloads: vec![workload(
+                    "spiffe://remote.local/ns/default/sa/a",
+                    "reviews",
+                    ip,
+                    None,
+                )],
+                services: vec![],
+            },
+            fetched_at: Arc::new(AtomicU64::new(1)),
+        };
+        let store = RemoteEndpointStore::new();
+        store.install_for_test(entry("west", "10.2.0.1"));
+        let before = store.snapshot();
+
+        store.install_for_test(entry("east", "10.3.0.1"));
+        let after_install = store.snapshot();
+        assert!(Arc::ptr_eq(
+            before.clusters.get("west").expect("west"),
+            after_install.clusters.get("west").expect("west retained"),
+        ));
+
+        store.remove("east");
+        let after_remove = store.snapshot();
+        assert!(!after_remove.clusters.contains_key("east"));
+        assert!(Arc::ptr_eq(
+            before.clusters.get("west").expect("west"),
+            after_remove.clusters.get("west").expect("west retained"),
+        ));
     }
 
     #[test]

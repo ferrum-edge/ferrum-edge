@@ -99,7 +99,7 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
     let mut clusters = HashMap::new();
     clusters.insert(
         "west".to_string(),
-        RemoteClusterEntry::new(
+        Arc::new(RemoteClusterEntry::new(
             "west".to_string(),
             td("remote.local"),
             Some("net2".to_string()),
@@ -109,7 +109,7 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
             None,
             endpoints,
             1,
-        ),
+        )),
     );
     RemoteEndpointSnapshot { clusters }
 }
