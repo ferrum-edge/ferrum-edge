@@ -763,8 +763,8 @@ preserve a fast `Tests` aggregate without starting the Rust/build matrix.
 Exceptions that always select full mode: anything under `vendor/` or
 `charts/`, `docs/prometheus_metrics.md` / `docs/prometheus_metric_contract.json`,
 and the dependency-governance docs (`docs/dependency-policy.md`,
-`docs/vendored-patch-lifecycle.json`, `docs/upstream-*`,
-`PRODUCTION_READINESS.md`); see `pr_ci_plan.py` `is_lightweight_path`.
+`docs/vendored-patch-lifecycle.json`, `docs/upstream-*`); see `pr_ci_plan.py`
+`is_lightweight_path`.
 Documentation-only changes never schedule a live datapath suite on a pull
 request.
 
@@ -3063,7 +3063,7 @@ policy already exists.
 
 Dev, test, and `pr-build` keep `panic = "unwind"` so the suite can observe
 `JoinError::is_panic()`. Those panic-recovery tests do not represent shipping
-behavior. See PRODUCTION_READINESS.md (*Deliberate decisions*) and
+behavior. See [docs/deliberate_decisions.md](deliberate_decisions.md) and
 `tests/unit/gateway_core/build_profile_panic_strategy_tests.rs`.
 
 ## How Releases Work
