@@ -54,6 +54,16 @@ silently to `RS256` / no `kid`; it now fails config load with
 value with the intended string (for example `"ES384"` instead of `["ES384"]`)
 or remove it before upgrading.
 
+### OAuth `client_secret` placeholders are refused (#7275)
+
+`oauth2_introspection` (`providers[].client_auth.client_secret`) and
+`oidc_relying_party` (`client_auth.client_secret`) now refuse a value that
+contains an unresolved `${NAME}` placeholder, for example
+`"${OIDC_CLIENT_SECRET}"`. Plugin config is never environment-expanded, so such
+a value was sent to the provider verbatim and every introspection or token
+exchange failed. Substitute the real secret (for example with your deployment
+tooling) before applying the config. Other text containing `${` is unaffected.
+
 ### `dp` mode refuses `FERRUM_DP_CP_GRPC_TOKEN_FILE` (#7273)
 
 A stock DP (`FERRUM_MODE=dp`) now fails `ferrum-edge validate` and startup when
