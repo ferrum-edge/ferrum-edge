@@ -945,11 +945,8 @@ impl CapsuleDecoder {
     /// 9297 §3.3 "closed in the middle of a capsule" predicate, which a skip in
     /// progress also satisfies.
     ///
-    /// `#[allow(dead_code)]` because the binary target compiles this module
-    /// tree separately from the library and only the external test crates read
-    /// this accessor; production asks the same question via
-    /// [`Self::finish_stream`].
-    #[allow(dead_code)]
+    /// Read by the external tests to bound decoder memory; production asks the
+    /// end-of-stream question through [`Self::finish_stream`].
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
     }
@@ -3113,7 +3110,7 @@ async fn relay(
     end
 }
 
-/// Log a receive-half teardown join and report whether the task PANICKED.
+/// Log a receive-half teardown join if the task PANICKED.
 ///
 /// This relay owns no send half, so a panic does not change what the client
 /// saw — it is logged, not promoted. A `cancelled` join is the acknowledgement
@@ -3124,19 +3121,16 @@ fn join_panicked(
     joined: Result<SessionEnd, tokio::task::JoinError>,
     relay: RelayDirection,
     proxy_id: &str,
-) -> bool {
-    match joined {
-        Ok(_) => false,
-        Err(error) if error.is_panic() => {
-            warn!(
-                proxy_id = %proxy_id,
-                relay = relay.as_str(),
-                reason = SessionEnd::RelayTaskFailed.as_str(),
-                "H3 CONNECT-UDP relay task panicked during teardown"
-            );
-            true
-        }
-        Err(_) => false,
+) {
+    if let Err(error) = joined
+        && error.is_panic()
+    {
+        warn!(
+            proxy_id = %proxy_id,
+            relay = relay.as_str(),
+            reason = SessionEnd::RelayTaskFailed.as_str(),
+            "H3 CONNECT-UDP relay task panicked during teardown"
+        );
     }
 }
 
