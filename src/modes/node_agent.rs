@@ -198,7 +198,6 @@ impl CaptureFailureOp {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NodeAgentConfig {
     pub node_name: String,
@@ -9273,7 +9272,6 @@ fn verify_failed_enrollment_cleanup_on_removal(
 /// disabled reconciler independently verifies the same closed pod-map posture,
 /// so removed pods must not lose their producer close handoff solely because
 /// the current process is no longer arming UDP capture.
-#[allow(dead_code)]
 pub fn handle_pod_removed(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,

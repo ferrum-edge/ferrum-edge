@@ -369,7 +369,6 @@ impl NodeLocalEnrolledDestinations {
 pub struct NodeLocalEnrolledDestinationsHandle(Option<Arc<NodeLocalEnrolledDestinations>>);
 
 impl NodeLocalEnrolledDestinationsHandle {
-    #[allow(dead_code)] // Serving runtimes install through the global slot; also an external test seam.
     pub fn new(index: Arc<NodeLocalEnrolledDestinations>) -> Self {
         Self(Some(index))
     }

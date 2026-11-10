@@ -339,7 +339,6 @@ impl MeshTopology {
     /// shared-listener topologies that need extra scoping beyond Ambient's
     /// single-workload identity.
     #[inline]
-    #[allow(dead_code)]
     pub fn is_waypoint(self) -> bool {
         matches!(self, Self::NodeWaypoint | Self::ServiceWaypoint)
     }
@@ -3936,7 +3935,6 @@ fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 fn gateway_config_from_mesh_slice(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
@@ -18902,7 +18900,6 @@ struct MeshInboundTlsReloadState {
 /// bundle is retained. See `build_mesh_inbound_spiffe_slot`'s F2 comment for
 /// the precise per-caller disposition.
 #[cfg(test)]
-#[allow(dead_code)]
 fn build_mesh_inbound_spiffe_slot(
     env_config: &EnvConfig,
     slice: Option<&MeshSlice>,
@@ -19133,7 +19130,6 @@ fn stage_mesh_inbound_spiffe_bundle_with_federation(
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 fn stage_gateway_runtime_spiffe_bundle(
     proxy_state: &ProxyState,
     slot: Option<&tls::SharedBundleSlot>,
@@ -19991,7 +19987,6 @@ enum StagedSpiffeBundle {
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-#[allow(dead_code)]
 fn plan_mesh_inbound_tls_reload(
     proxy_state: &ProxyState,
     runtime: &MeshRuntimeConfig,

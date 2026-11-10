@@ -337,7 +337,6 @@ pub fn install_test_bundle(handle: &SvidFetchHandle, bundle: SvidBundle) {
 /// Convert a bundle's notAfter into a duration-from-now (used by the fetch
 /// loop's bundle metrics). Returns `Duration::ZERO` for already-expired
 /// bundles.
-#[allow(dead_code)]
 pub(crate) fn time_until_expiry(bundle: &SvidBundle) -> Duration {
     use chrono::Utc;
     use x509_parser::prelude::*;
