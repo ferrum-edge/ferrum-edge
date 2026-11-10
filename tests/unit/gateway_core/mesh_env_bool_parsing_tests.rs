@@ -114,8 +114,7 @@ fn node_agent_rejects_an_unknown_mesh_topology() {
     // `ambiant` used to be read as "not ambient" and silently disabled the
     // Ambient registry and UDP readiness guard.
     let err = node_agent_config(Some("ambiant"), None)
-        .err()
-        .expect("an unknown topology must fail node-agent startup");
+        .expect_err("an unknown topology must fail node-agent startup");
     assert!(err.contains("FERRUM_MESH_TOPOLOGY"), "{err}");
 }
 
