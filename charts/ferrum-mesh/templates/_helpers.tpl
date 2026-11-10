@@ -358,6 +358,32 @@ Optional:
 {{- end -}}
 
 {{/*
+Render the injector mutating webhook namespaceSelector. User-provided
+matchExpressions are preserved, but the release namespace is always appended so
+an override of injector.namespaceSelector cannot re-enable admission on the
+chart's own namespace (issue #4155 bootstrap deadlock).
+*/}}
+{{- define "ferrum-mesh.renderInjectorWebhookNamespaceSelector" -}}
+{{- $user := .namespaceSelector | default dict -}}
+{{- $releaseNs := .Release.Namespace -}}
+{{- $exprs := $user.matchExpressions | default list -}}
+{{- $hasReleaseExclusion := false -}}
+{{- range $exprs -}}
+{{- if and (eq .key "kubernetes.io/metadata.name") (eq .operator "NotIn") (has $releaseNs .values) -}}
+{{- $hasReleaseExclusion = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $hasReleaseExclusion -}}
+{{- $exprs = append $exprs (dict "key" "kubernetes.io/metadata.name" "operator" "NotIn" "values" (list $releaseNs)) -}}
+{{- end -}}
+{{- $selector := dict "matchExpressions" $exprs -}}
+{{- if $user.matchLabels -}}
+{{- $_ := set $selector "matchLabels" $user.matchLabels -}}
+{{- end -}}
+{{- $selector | toYaml -}}
+{{- end -}}
+
+{{/*
 Release-bound node-proof generation for the Ambient UDP placement contract
 (issue #3809).
 
@@ -384,32 +410,6 @@ Both DaemonSets include this SAME helper so the ambient preflight and the
 node-agent's registry-synchronization publication can never disagree about
 which era a proof belongs to.
 */}}
-{{/*
-Render the injector mutating webhook namespaceSelector. User-provided
-matchExpressions are preserved, but the release namespace is always appended so
-an override of injector.namespaceSelector cannot re-enable admission on the
-chart's own namespace (issue #4155 bootstrap deadlock).
-*/}}
-{{- define "ferrum-mesh.renderInjectorWebhookNamespaceSelector" -}}
-{{- $user := .namespaceSelector | default dict -}}
-{{- $releaseNs := .Release.Namespace -}}
-{{- $exprs := $user.matchExpressions | default list -}}
-{{- $hasReleaseExclusion := false -}}
-{{- range $exprs -}}
-{{- if and (eq .key "kubernetes.io/metadata.name") (eq .operator "NotIn") (has $releaseNs .values) -}}
-{{- $hasReleaseExclusion = true -}}
-{{- end -}}
-{{- end -}}
-{{- if not $hasReleaseExclusion -}}
-{{- $exprs = append $exprs (dict "key" "kubernetes.io/metadata.name" "operator" "NotIn" "values" (list $releaseNs)) -}}
-{{- end -}}
-{{- $selector := dict "matchExpressions" $exprs -}}
-{{- if $user.matchLabels -}}
-{{- $_ := set $selector "matchLabels" $user.matchLabels -}}
-{{- end -}}
-{{- $selector | toYaml -}}
-{{- end -}}
-
 {{- define "ferrum-mesh.ambientUdpNodeProofGeneration" -}}
 {{- $env := default dict .Values.ambient.env -}}
 {{- $topology := replace "-" "_" (lower (trim (toString (index $env "FERRUM_MESH_TOPOLOGY")))) -}}
@@ -1001,13 +1001,6 @@ Reserved chart-managed env names that must not appear in a workload env map.
 {{- end -}}
 {{- end -}}
 
-{{- define "ferrum-mesh.shutdownAndMetricsReserved" -}}
-FERRUM_SHUTDOWN_DRAIN_SECONDS
-FERRUM_SHUTDOWN_PREDRAIN_SECONDS
-FERRUM_METRICS_BEARER_TOKEN
-FERRUM_METRICS_ALLOWED_CIDRS
-{{- end -}}
-
 {{/*
 Strictly validate one comma-separated allowlist against `CidrSet::parse_strict`.
 An empty string is "no allowlist" and is accepted; anything non-empty must parse
@@ -1213,9 +1206,9 @@ falls back to liveHandler exactly as renderProbes does).
 {{- fail "observability.metrics.podMonitor.enabled=true with ambient.enabled=true requires a non-zero ambient.admin.httpPort, or a non-zero ambient.admin.httpsPort with ambient.admin.tls configured, so Prometheus can scrape /metrics" -}}
 {{- end -}}
 {{- end -}}
-{{- if and $pmOn .Values.nodeAgent.enabled (.Values.nodeAgent.admin.enabled | default true) -}}
+{{- if and $pmOn .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled -}}
 {{- $naBind := .Values.nodeAgent.admin.bindAddress | default "127.0.0.1" -}}
-{{- $naPort := toString (.Values.nodeAgent.admin.port | default "19090") -}}
+{{- $naPort := toString .Values.nodeAgent.admin.port -}}
 {{- $naHttpsPort := toString (.Values.nodeAgent.admin.httpsPort | default "0") -}}
 {{- $naTls := include "ferrum-mesh.nodeAgentAdminTlsConfigured" (.Values.nodeAgent.admin.tls | default dict) -}}
 {{- $naHttpsActive := and (ne $naHttpsPort "0") $naTls -}}

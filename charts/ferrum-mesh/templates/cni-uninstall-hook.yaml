@@ -235,7 +235,7 @@ spec:
             - name: CLEANUP_DAEMONSET_NAME
               value: ferrum-mesh-cni-cleanup
             - name: CLEANUP_TIMEOUT_SECS
-              value: {{ default 300 $uninstall.timeoutSeconds | quote }}
+              value: {{ default 240 $uninstall.timeoutSeconds | quote }}
           securityContext:
             runAsUser: 65532
             runAsGroup: 65532
