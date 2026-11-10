@@ -2480,7 +2480,21 @@ async fn open_hbone_udp_relay_socket(
     state: &ProxyState,
     dest_addr: SocketAddr,
 ) -> Result<tokio::net::UdpSocket, HboneUdpSocketOpenError> {
-    if let Some(std_socket) = maybe_bind_pod_netns_udp_relay_socket(state, dest_addr)? {
+    // Finding the destination pod reads every registry entry, and binding
+    // inside its netns spawns and joins a `setns` thread: both block, so they
+    // run on the blocking pool rather than this request's runtime worker
+    // (issue #7170).
+    let registry_dir = state.env_config.mesh_node_waypoint_pod_registry_dir.clone();
+    let pod_netns_socket = tokio::task::spawn_blocking(move || {
+        maybe_bind_pod_netns_udp_relay_socket(&registry_dir, dest_addr)
+    })
+    .await
+    .map_err(|e| HboneUdpSocketOpenError {
+        phase: "hbone_udp_bind",
+        body: br#"{"error":"HBONE UDP pod-netns local socket failed"}"#,
+        message: e.to_string(),
+    })??;
+    if let Some(std_socket) = pod_netns_socket {
         return tokio::net::UdpSocket::from_std(std_socket).map_err(|e| HboneUdpSocketOpenError {
             phase: "hbone_udp_bind",
             body: br#"{"error":"HBONE UDP pod-netns socket adoption failed"}"#,
@@ -2513,13 +2527,11 @@ async fn open_hbone_udp_relay_socket(
 
 #[cfg(target_os = "linux")]
 fn maybe_bind_pod_netns_udp_relay_socket(
-    state: &ProxyState,
+    registry_dir: &str,
     dest_addr: SocketAddr,
 ) -> Result<Option<std::net::UdpSocket>, HboneUdpSocketOpenError> {
-    let Some(target) = registered_pod_target_for_udp_destination(
-        &state.env_config.mesh_node_waypoint_pod_registry_dir,
-        dest_addr.ip(),
-    ) else {
+    let Some(target) = registered_pod_target_for_udp_destination(registry_dir, dest_addr.ip())
+    else {
         return Ok(None);
     };
 
@@ -2534,7 +2546,7 @@ fn maybe_bind_pod_netns_udp_relay_socket(
 
 #[cfg(not(target_os = "linux"))]
 fn maybe_bind_pod_netns_udp_relay_socket(
-    _state: &ProxyState,
+    _registry_dir: &str,
     _dest_addr: SocketAddr,
 ) -> Result<Option<std::net::UdpSocket>, HboneUdpSocketOpenError> {
     Ok(None)
