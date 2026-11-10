@@ -72,6 +72,34 @@ fn runtime_metrics_stream_errors_increment() {
     assert_eq!(metrics.stream_errors_by_class.len(), 1);
 }
 
+/// Issue #7183: a raw-TCP relay that builds no stream summary (no stream
+/// plugin chain) records the same stream-error and RST counters a summary
+/// would.
+#[test]
+fn runtime_metrics_stream_end_matches_the_summary_counters() {
+    use ferrum_edge::plugins::Direction;
+
+    let metrics = RuntimeMetrics::new();
+    metrics.record_stream_end("relay-a", None, Some(Direction::BackendToClient));
+    assert!(metrics.stream_errors_by_class.is_empty());
+    assert!(metrics.tcp_rst_observed.is_empty());
+
+    metrics.record_stream_end("relay-a", Some(ErrorClass::ConnectionRefused), None);
+    assert_eq!(metrics.stream_errors_by_class.len(), 1);
+    assert!(
+        metrics.tcp_rst_observed.is_empty(),
+        "only a reset is an RST"
+    );
+
+    metrics.record_stream_end(
+        "relay-a",
+        Some(ErrorClass::ConnectionReset),
+        Some(Direction::BackendToClient),
+    );
+    assert_eq!(metrics.stream_errors_by_class.len(), 2);
+    assert_eq!(metrics.tcp_rst_observed.len(), 1);
+}
+
 #[test]
 fn runtime_metrics_snapshot_serializes_expected_top_level_shape() {
     let snapshot = ferrum_edge::runtime_metrics::build_snapshot("cp", None);
