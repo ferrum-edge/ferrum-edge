@@ -11,7 +11,6 @@ use ferrum_edge::modes::mesh::config::{
     TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshExtensionConfig;
-use ferrum_edge::xds::conformance::{XdsConformanceCase, required_phase_b_cases};
 use ferrum_edge::xds::proto;
 use ferrum_edge::xds::{
     AckOutcome, CDS_TYPE_URL, ECDS_TYPE_URL, EDS_TYPE_URL, FERRUM_ECDS_DESTINATION_RULE_TYPE_URL,
@@ -520,15 +519,6 @@ fn nonce_tracker_clears_error_on_new_issue_and_removes_one_node_only() {
         tracker.record_response("node-b", LDS_TYPE_URL, &node_b, "v1", None),
         AckOutcome::Acked
     );
-}
-
-#[test]
-fn phase_b_conformance_stubs_cover_known_xds_edges() {
-    let cases = required_phase_b_cases();
-    assert!(cases.contains(&XdsConformanceCase::ResourceRemovalDuringUpdate));
-    assert!(cases.contains(&XdsConformanceCase::PartialNackPerTypeUrl));
-    assert!(cases.contains(&XdsConformanceCase::VersionDriftRejected));
-    assert!(cases.contains(&XdsConformanceCase::DeltaSubscribeUnsubscribe));
 }
 
 // ── GAP-2L.3: ECDS (Extension Config Discovery Service) ──

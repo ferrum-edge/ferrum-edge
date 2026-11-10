@@ -35,8 +35,8 @@
 //! (DP side, `xds_client::reverse_translate`) both go through the
 //! [`MeshSliceCarrier`] enum here so the two halves cannot drift. Adding a new
 //! carried field is a single edit: add a variant + its `type_url` + its
-//! encode/decode arm, and the round-trip test in this module will fail until
-//! both halves are wired.
+//! encode/decode arm, and add it to the round-trip test in this module, which
+//! fails until both halves are wired.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1219,7 +1219,8 @@ mod tests {
     }
 
     /// Every carrier variant round-trips through its own `type_url` and JSON
-    /// bytes. If a future variant forgets to wire a decode arm, this fails.
+    /// bytes. The list is hand-maintained: a new variant must be added here
+    /// (and to `resource_names_are_unique_per_variant`) to be covered.
     #[test]
     fn slice_carrier_round_trip() {
         let carriers = vec![
@@ -1262,6 +1263,7 @@ mod tests {
                 "id": "istio-vs-l4-upstream-default-db-tcp-0"
             })]),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
+            MeshSliceCarrier::ExtAuthzProviders(Vec::new()),
             MeshSliceCarrier::VirtualServiceCorsPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),
@@ -1270,6 +1272,7 @@ mod tests {
             MeshSliceCarrier::ProxyConfigs(Vec::new()),
             MeshSliceCarrier::TrustBundles(sample_trust_bundle_set()),
             MeshSliceCarrier::OutboundTrafficPolicy(OutboundTrafficPolicy::RegistryOnly),
+            MeshSliceCarrier::SidecarOutboundTrafficPolicy(OutboundTrafficPolicy::AllowAny),
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
             MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
             MeshSliceCarrier::WaypointGatewayClass("istio-waypoint".to_string()),
@@ -1379,6 +1382,7 @@ mod tests {
             MeshSliceCarrier::ProxyConfigs(Vec::new()),
             MeshSliceCarrier::TrustBundles(sample_trust_bundle_set()),
             MeshSliceCarrier::OutboundTrafficPolicy(OutboundTrafficPolicy::AllowAny),
+            MeshSliceCarrier::SidecarOutboundTrafficPolicy(OutboundTrafficPolicy::RegistryOnly),
             MeshSliceCarrier::MultiCluster(MultiClusterConfig::default()),
             MeshSliceCarrier::SidecarEgressScope(MeshEgressScopeSnapshot::default()),
             MeshSliceCarrier::WaypointGatewayClass("ferrum-waypoint".to_string()),

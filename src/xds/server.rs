@@ -351,14 +351,6 @@ impl XdsAdsServer {
         AggregatedDiscoveryServiceServer::new(self)
     }
 
-    pub fn snapshot_cache(&self) -> Arc<XdsSnapshotCache> {
-        self.snapshot_cache.clone()
-    }
-
-    pub fn nonce_tracker(&self) -> Arc<XdsNonceTracker> {
-        self.nonce_tracker.clone()
-    }
-
     /// Verify the stream's bearer and return BOTH the tenant ceiling and the
     /// authenticated principal (JWT `sub`).
     ///
@@ -739,14 +731,6 @@ impl XdsAdsServer {
         )
     }
 
-    fn sotw_response(
-        &self,
-        snapshot: &XdsSnapshot,
-        subscription: &XdsSubscription,
-    ) -> DiscoveryResponse {
-        self.sotw_response_with_nonce_key(snapshot, subscription, &snapshot.node_id)
-    }
-
     fn sotw_response_with_nonce_key(
         &self,
         snapshot: &XdsSnapshot,
@@ -974,22 +958,6 @@ impl XdsAdsServer {
         )
     }
 
-    fn sotw_responses_for_stream_config_with_previous(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        stream_config: &XdsStreamConfig,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DiscoveryResponse>) {
-        self.sotw_responses_for_stream_config_with_previous_key(
-            node_id,
-            node_id,
-            subscriptions,
-            stream_config,
-            previous,
-        )
-    }
-
     fn sotw_responses_for_stream_config_with_previous_key(
         &self,
         cache_key: &str,
@@ -1207,27 +1175,6 @@ impl XdsAdsServer {
         )
     }
 
-    fn delta_response_for_request_with_fingerprint(
-        &self,
-        node_id: &str,
-        config: &GatewayConfig,
-        fingerprint: &XdsConfigFingerprint,
-        subscriptions: &mut HashMap<String, XdsSubscription>,
-        request: &DeltaDiscoveryRequest,
-        previous: Option<&XdsSnapshot>,
-    ) -> Option<(Arc<XdsSnapshot>, DeltaDiscoveryResponse)> {
-        let _ = self.record_and_log_delta_ack(node_id, request);
-        self.delta_response_for_request_with_fingerprint_without_ack(
-            node_id,
-            node_id,
-            config,
-            fingerprint,
-            subscriptions,
-            request,
-            previous,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn delta_response_for_request_with_fingerprint_without_ack(
         &self,
@@ -1346,56 +1293,6 @@ impl XdsAdsServer {
             config,
             &fingerprint,
             previous,
-        )
-    }
-
-    fn delta_responses_for_stream_config_with_previous(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        stream_config: &XdsStreamConfig,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        self.delta_responses_for_stream_config_with_previous_key(
-            node_id,
-            node_id,
-            subscriptions,
-            stream_config,
-            previous,
-        )
-    }
-
-    fn delta_responses_for_stream_config_with_previous_key(
-        &self,
-        cache_key: &str,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        stream_config: &XdsStreamConfig,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        self.delta_responses_for_subscriptions_from_config_with_fingerprint(
-            cache_key,
-            node_id,
-            subscriptions,
-            &stream_config.config,
-            &stream_config.fingerprint,
-            previous,
-        )
-    }
-
-    fn delta_responses_for_stream_config_with_previous_by_type(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        stream_config: &XdsStreamConfig,
-        previous_by_type: &HashMap<String, Arc<XdsSnapshot>>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        self.delta_responses_for_stream_config_with_previous_by_type_key(
-            node_id,
-            node_id,
-            subscriptions,
-            stream_config,
-            previous_by_type,
         )
     }
 
