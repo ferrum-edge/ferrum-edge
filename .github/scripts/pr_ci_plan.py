@@ -560,7 +560,6 @@ FULL_CI_GOVERNANCE_PATHS = frozenset(
     {
         "docs/dependency-policy.md",
         "docs/vendored-patch-lifecycle.json",
-        "PRODUCTION_READINESS.md",
     }
 )
 
@@ -639,13 +638,13 @@ LIVE_SUITE_SHARED_PATTERNS = (
 #
 # `tests/k8s/lib/` (kind.sh, spire.sh, live_assertions.sh,
 # native_probe_classify.py, spire_ambient_metrics.py) is the shared Kind/SPIRE
-# live harness; no ci.yml live job consumes it, so none of the three gates list
-# it. It is owned by node-waypoint-ebpf-live.yml, which gates it both in its
-# `pull_request.paths` (`tests/k8s/lib/**`) and in its trusted planner scoped
-# suite (ci_runtime_plan.py `node-waypoint-ebpf-live` lists `^tests/k8s/lib/`).
-# ambient-host-udp-live.yml's `live_suite_path_filter.py` additionally gates the
-# `live_assertions.sh` / `spire.sh` / `native_probe_classify.py` members, so the
-# shared harness is covered by both dedicated live workflows.
+# live harness. No ci.yml live job consumes it, so none of the three gates list
+# it. On a pull request it is deliberately non-sensitive for
+# `node-waypoint-ebpf-live` (that workflow has no `paths:` filter, and
+# `ci_runtime_plan.py` allowlists `tests/`); it runs there on every push to
+# `main`. The trusted `live_suite_path_filter.py` gates the `live_assertions.sh`
+# / `spire.sh` members for the multicluster federation / poller-partition suites
+# and those plus `native_probe_classify.py` for `mesh-e2e-sidecar-live.yml`.
 
 
 def compile_path_patterns(*pattern_groups: tuple[str, ...]) -> list[re.Pattern[str]]:
@@ -717,7 +716,7 @@ SHARED_FEATURE_JOB_PATTERNS = (
     r"^Cargo\.(?:toml|lock)$",
     r"^\.cargo/",
     r"^rust-toolchain\.toml$",
-    r"^build\.rs$",
+    r"^build(?:\.rs$|/)",
     r"^proto/",
     r"^vendor/",
 )
@@ -779,9 +778,12 @@ PKCS11_PATTERNS = [
 ]
 
 
-# Inputs that change what the Rust build graph compiles. Any of these forces
-# the complete compile-and-test lane (unit, lint, artifacts, functional,
-# integration) and, through the per-job groups below, every feature-gated job.
+# Inputs that change what the Rust build graph compiles. `build/` holds the
+# modules `build.rs` `include!`s (protoc preflight, plugin name / migration
+# export generators), so it is matched with `build.rs` everywhere the build
+# script is. Any of these forces the complete compile-and-test lane (unit,
+# lint, artifacts, functional, integration) and, through the per-job groups
+# below, every feature-gated job.
 RUST_BUILD_GRAPH_PATTERNS = (
     r"^\.github/workflows/ci\.yml$",
     r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker)/",
@@ -790,7 +792,7 @@ RUST_BUILD_GRAPH_PATTERNS = (
     r"^\.cargo/",
     r"^\.config/nextest\.toml$",
     r"^rust-toolchain\.toml$",
-    r"^build\.rs$",
+    r"^build(?:\.rs$|/)",
     r"^proto/",
     r"^vendor/",
     r"^ebpf/",
@@ -831,6 +833,8 @@ RUST_PATTERNS = [
         r"^ferrum\.conf$",
         r"^openapi\.yaml$",
         r"^deny\.toml$",
+        # `disallowed-methods` and other lint configuration read by the Lint job.
+        r"^clippy\.toml$",
     )
 ]
 
@@ -971,7 +975,6 @@ DEPENDENCY_AUDIT_PATTERNS = [
         r"^docs/dependency-policy\.md$",
         r"^docs/vendored-patch-lifecycle\.json$",
         r"^docs/upstream-",
-        r"^PRODUCTION_READINESS\.md$",
         r"^scripts/(?:check_advisory_expiry\.sh|check_vendored_patch_lifecycle\.py)$",
         r"^scripts/verify_dependency_security_chain\.py$",
         # The CORS PSL ancestor index parity gate (psl bumps arrive via
@@ -999,7 +1002,7 @@ STANDALONE_CARGO_PATTERNS = [
         r"(?:^|/)Cargo\.(?:toml|lock)$",
         r"(?:^|/)rust-toolchain(?:\.toml)?$",
         r"^\.cargo/",
-        r"^build\.rs$",
+        r"^build(?:\.rs$|/)",
         r"^proto/",
         r"^vendor/",
         r"^ebpf/ferrum-ebpf-common/",
@@ -1781,6 +1784,42 @@ def self_test() -> int:
             "pull_request",
             ["deny.toml"],
             {"run_dependency_audit": True, "run_rust": True},
+        ),
+        # Issue #7284: the modules `build.rs` `include!`s and the lint
+        # configuration must not leave every gate false (a no-CI merge).
+        (
+            "pull_request",
+            ["build/protoc_preflight.rs"],
+            {
+                "run_rust": True,
+                "run_artifacts": True,
+                "run_acme": True,
+                "run_conformance": True,
+                "run_service_integration": True,
+                "run_ebpf_userspace": True,
+                "run_platform_build": True,
+                "run_secrets_backends": True,
+                "run_pkcs11": True,
+                "run_standalone_cargo": True,
+                "run_ebpf_kernel_live": False,
+                "run_two_cluster_live": False,
+            },
+        ),
+        (
+            "merge_group",
+            ["build/plugin_migration_exports.rs"],
+            {"run_rust": True, "run_platform_build": True},
+        ),
+        (
+            "pull_request",
+            ["clippy.toml"],
+            rust_only,
+        ),
+        # A root file merely named like the build tree stays out of the lane.
+        (
+            "pull_request",
+            ["build.rs.md"],
+            {name: False for name in JOB_GATE_NAMES},
         ),
         (
             "pull_request",

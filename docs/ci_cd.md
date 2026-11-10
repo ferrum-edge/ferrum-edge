@@ -777,7 +777,7 @@ aggregate accepts a skipped job only when its gate was `false`:
 
 | Gate | Schedules | Pull-request trigger surface |
 |---|---|---|
-| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/` and the standalone benchmark workspaces under `tests/performance/`, other than the `PERFORMANCE_TREE_WORKSPACE_INPUTS` fixtures root-crate tests embed), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions |
+| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/` and the standalone benchmark workspaces under `tests/performance/`, other than the `PERFORMANCE_TREE_WORKSPACE_INPUTS` fixtures root-crate tests embed), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`/`build/`, `.config/nextest.toml`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `clippy.toml`, `ci.yml`, the Rust setup actions |
 | `run_artifacts` | Build Test Artifacts | `run_rust` or `run_helm` |
 | `run_acme` | ACME Feature Tests (`--features acme`, own job) | `src/tls/`, `tests/acme_dns01/`, `tests/unit/tls/`, build graph |
 | `run_conformance` | Mesh Conformance Tests | `tests/conformance/`, mesh/xDS/k8s translation modules, build graph |
@@ -1084,9 +1084,10 @@ same event guard as the other path-gated Helm/eBPF/secrets/PKCS jobs), empty or
 unavailable diffs, unclassifiable/unsafe changed paths, a missing or non-`true`
 `paths_classifiable` handshake from an old trusted-base planner, and edits to
 the gate-controller scripts force all of these gates on. Shared compile-graph
-inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs`, `proto/`,
-`rust-toolchain.toml`, `.cargo/`, `.github/workflows/ci.yml`, and the
-`setup-rust-ci` / `setup-sccache` / `setup-fast-linker` actions) also schedule
+inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs` and the `build/`
+modules it includes, `proto/`, `rust-toolchain.toml`, `.cargo/`,
+`.github/workflows/ci.yml`, and the `setup-rust-ci` / `setup-sccache` /
+`setup-fast-linker` actions) also schedule
 the Secret Backends and PKCS#11 jobs. Rust formatting and the integration-shard
 coverage contract also run as named steps in `CI Plan`, avoiding two additional
 runner allocations.

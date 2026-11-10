@@ -97,7 +97,7 @@ CONTROLLER_PATHS = frozenset(
 
 BUILD_GRAPH_PATTERNS = [
     re.compile(r"^Cargo\.(toml|lock)$"),
-    re.compile(r"^build\.rs$"),
+    re.compile(r"^build(?:\.rs$|/)"),
     re.compile(r"^proto/"),
     re.compile(r"^ebpf/"),
     re.compile(r"^\.cargo/"),
@@ -770,6 +770,9 @@ def self_test() -> int:
         ("pull_request", ["Cargo.toml"], "full", all_shards, False),
         ("pull_request", ["Cargo.lock"], "full", all_shards, False),
         ("pull_request", ["build.rs"], "full", all_shards, False),
+        # Issue #7284: the modules `build.rs` `include!`s are build-graph inputs.
+        ("pull_request", ["build/protoc_preflight.rs"], "full", all_shards, False),
+        ("merge_group", ["build/builtin_plugin_names.rs"], "full", all_shards, False),
         ("pull_request", ["proto/ferrum.proto"], "full", all_shards, False),
         ("pull_request", ["ebpf/src/main.rs"], "full", all_shards, False),
         ("pull_request", [".cargo/config.toml"], "full", all_shards, False),

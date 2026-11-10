@@ -53,7 +53,7 @@ SUITE_PATTERNS: dict[str, tuple[str, ...]] = {
         r"^rust-toolchain\.toml$",
         r"^\.cargo/",
         r"^vendor/",
-        r"^build\.rs$",
+        r"^build(?:\.rs$|/)",
         r"^src/fips/",
         r"^src/tls/",
         r"^src/dtls/",
@@ -119,12 +119,10 @@ KNOWN_SAFE_PATTERNS: tuple[str, ...] = (
     r"^README(\.|$)",
     r"^CONTRIBUTING",
     r"^LICENSE",
-    r"^COPYING",
-    r"^NOTICE",
     r"^AGENTS\.md$",
     r"^CLAUDE\.md$",
     # Any root-level SHOUTY Markdown document (ARCHITECTURE.md, CHANGELOG.md,
-    # CONFORMANCE.md, FEATURES.md, PRODUCTION_READINESS.md, WEBSOCKET.md, ...).
+    # CONFORMANCE.md, FEATURES.md, WEBSOCKET.md, ...).
     # `.dockerignore` excludes `*.md` and no Dockerfile stage COPYs one, so such
     # a file cannot reach either production image; it is not compiled, so it
     # cannot reach the FIPS build; and it is not a NodeWaypoint datapath input.
@@ -139,25 +137,27 @@ KNOWN_SAFE_PATTERNS: tuple[str, ...] = (
     r"^docs/",
     r"^charts/",
     r"^openapi\.yaml$",
-    r"^perftest/",
     r"^fuzz/",
     r"^examples/",
-    r"^deploy/",
     r"^scripts/",
     r"^\.agents/",
     r"^\.claude/",
-    r"^\.vscode/",
-    r"^\.cursor/",
-    r"^\.codex/",
     r"^\.github/",
+    # Benchmark write-ups and competitor configs, images, local compose
+    # stacks, the ClickHouse DDL (embedded only by Rust integration tests),
+    # and the ARM64 Cross configuration (read only by the Cross lanes): none
+    # reaches a production image, the FIPS build, or the NodeWaypoint datapath.
+    r"^comparison/",
+    r"^assets/",
+    r"^docker-compose[^/]*\.yml$",
+    r"^schemas/clickhouse/[^/]+\.sql$",
+    r"^Cross\.toml$",
     r"^Dockerfile",
     r"^ferrum\.conf$",
     r"^deny\.toml$",
     r"^\.dockerignore$",
     r"^\.gitignore$",
     r"^\.gitattributes$",
-    r"^\.editorconfig$",
-    r"^Makefile$",
 )
 
 # Production images dockerignore `tests/`, so those paths cannot change the
@@ -178,10 +178,13 @@ ORDINARY_COMPILE_SAFE_PATTERNS: tuple[str, ...] = (
     r"^rust-toolchain\.toml$",
     r"^\.cargo/",
     r"^vendor/",
-    r"^build\.rs$",
+    r"^build(?:\.rs$|/)",
     r"^proto/",
     r"^custom_plugins/",
     r"^ebpf/",
+    # Lint and test-runner configuration: compiled by nothing in an image.
+    r"^clippy\.toml$",
+    r"^\.config/nextest\.toml$",
 )
 
 # Compile-tier paths: relevant on a pull request, but only for the gate's
@@ -197,15 +200,18 @@ ORDINARY_COMPILE_SAFE_PATTERNS: tuple[str, ...] = (
 # clippy over the lib and test targets. `tests/k8s/` (shell harnesses) and
 # `tests/performance/` (standalone workspaces) are never compiled by the root
 # crate's targets and stay on the skip allowlist. `Cargo.*`, `vendor/`,
-# `.cargo/`, `rust-toolchain.toml`, and `build.rs` are already full-gate
-# patterns above.
+# `.cargo/`, `rust-toolchain.toml`, `build.rs`, and the `build/` modules it
+# `include!`s are already full-gate patterns above.
 SUITE_COMPILE_PATTERNS: dict[str, tuple[str, ...]] = {
     "fips-build": (
         r"^src/",
         r"^tests/(?!k8s/|performance/)",
-        r"^benches/",
         r"^proto/",
         r"^custom_plugins/",
+        # FIPS clippy reads the lint configuration and the FIPS test jobs read
+        # the nextest profile; compile tier is checked before the allowlist.
+        r"^clippy\.toml$",
+        r"^\.config/nextest\.toml$",
     ),
 }
 
@@ -538,7 +544,6 @@ def self_test() -> int:
         ("fips-build", ["tests/scaffolding/harness.rs"], True),
         ("fips-build", ["tests/fixtures/test_rsa_public.pem"], True),
         ("fips-build", ["tests/functional/functional_admin_test.rs"], True),
-        ("fips-build", ["benches/proxy_bench.rs"], True),
         ("fips-build", ["proto/ferrum.proto"], True),
         ("fips-build", ["custom_plugins/mod.rs"], True),
         # Trees the root crate's targets never compile stay skippable.
@@ -665,10 +670,28 @@ def self_test() -> int:
         ("node-waypoint-ebpf-live", ["custom_plugins/mod.rs"], False),
         ("node-waypoint-ebpf-live", ["README.md"], False),
         ("node-waypoint-ebpf-live", ["ARCHITECTURE.md"], False),
-        ("node-waypoint-ebpf-live", ["PRODUCTION_READINESS.md"], False),
+        ("node-waypoint-ebpf-live", ["FEATURES.md"], False),
         ("node-waypoint-ebpf-live", ["CHANGELOG.md"], False),
-        ("production-dockerfile-smoke", ["PRODUCTION_READINESS.md"], False),
-        ("fips-build", ["PRODUCTION_READINESS.md"], False),
+        ("production-dockerfile-smoke", ["FEATURES.md"], False),
+        ("fips-build", ["FEATURES.md"], False),
+        # Issue #7284: the `build/` modules `build.rs` `include!`s, the lint and
+        # nextest configuration, and tracked non-runtime trees.
+        ("production-dockerfile-smoke", ["build/protoc_preflight.rs"], False),
+        ("node-waypoint-ebpf-live", ["build/builtin_plugin_names.rs"], False),
+        ("fips-build", ["build/protoc_preflight.rs"], True),
+        ("fips-build", ["clippy.toml"], True),
+        ("fips-build", [".config/nextest.toml"], True),
+        ("production-dockerfile-smoke", ["clippy.toml"], False),
+        ("node-waypoint-ebpf-live", [".config/nextest.toml"], False),
+        ("node-waypoint-ebpf-live", ["comparison/README.md"], False),
+        ("node-waypoint-ebpf-live", ["assets/ferrum_edge.png"], False),
+        ("node-waypoint-ebpf-live", ["docker-compose.tls-test.yml"], False),
+        ("fips-build", ["docker-compose.yml"], False),
+        ("fips-build", ["schemas/clickhouse/charges.sql"], False),
+        ("production-dockerfile-smoke", ["Cross.toml"], False),
+        # A nested compose file or a non-SQL schema stays unknown and force-runs.
+        ("fips-build", ["deploy/docker-compose.yml"], True),
+        ("production-dockerfile-smoke", ["schemas/clickhouse/seed.csv"], True),
         # `src/ebpf/` is sensitive even for a README inside it (prefix match).
         ("node-waypoint-ebpf-live", ["src/ebpf/README.md"], True),
         ("production-dockerfile-smoke", ["src/ebpf/README.md"], False),
@@ -692,6 +715,9 @@ def self_test() -> int:
         ("fips-build", ["src/plugins/cors.rs", "src/tls/mod.rs"], SCOPE_FULL),
         ("fips-build", ["Cargo.lock"], SCOPE_FULL),
         ("fips-build", ["build.rs"], SCOPE_FULL),
+        ("fips-build", ["build/protoc_preflight.rs"], SCOPE_FULL),
+        ("fips-build", ["clippy.toml"], SCOPE_COMPILE),
+        ("fips-build", [".config/nextest.toml"], SCOPE_COMPILE),
         ("fips-build", ["src/plugins/cors.rs", "brand-new-crate/src/lib.rs"], SCOPE_FULL),
         ("fips-build", ["docs/ci_cd.md"], SCOPE_NONE),
         ("fips-build", ["tests/k8s/mesh_e2e_sidecar/run.sh"], SCOPE_NONE),

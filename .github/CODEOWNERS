@@ -22,10 +22,9 @@
 /scripts/update_vendor_integrity.sh         @jeremyjpj0916
 /.claude/rules/dependencies.md              @jeremyjpj0916
 
-# Release surface and the readiness document. The launch-readiness governance
+# Release surface. The launch-readiness governance
 # gate that used to re-check this list was removed; these paths keep owner
 # review on their own merits, since the release workflow publishes artifacts.
-/PRODUCTION_READINESS.md                    @jeremyjpj0916
 /.github/workflows/release.yml              @jeremyjpj0916
 # The `latest` / `main-<sha>` image publisher holds the same registry
 # credentials as the release workflow, so it and its contract verifier get the

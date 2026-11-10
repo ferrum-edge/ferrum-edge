@@ -1459,7 +1459,7 @@ def self_test() -> int:
             False,
         ),
         ("cni-lifecycle", ["docs/node_agent_security.md"], False),
-        ("cni-lifecycle", ["PRODUCTION_READINESS.md"], False),
+        ("cni-lifecycle", ["FEATURES.md"], False),
         ("cni-lifecycle", ["Cargo.lock"], False),
         ("cni-lifecycle", ["docs/ci_cd.md"], False),
         ("cni-lifecycle", ["src/modes/data_plane.rs"], False),
