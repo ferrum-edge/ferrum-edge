@@ -15289,3 +15289,64 @@ fn snapshot_same_identity_refresh_accumulates_without_new_admission() {
     assert_eq!(accumulator.retained_bytes_for_tests(), charged);
     assert_eq!(accumulator.total_call_count_for_tests(), 17);
 }
+
+/// Issue #7110: an unavailable plugin HTTP client (a failed CRL-generation
+/// rebuild, retried on the next call) is a local, transient condition. It must
+/// classify as `Retryable` — never `Permanent`, which spool replay treats as a
+/// destination rejection and dead-letters every row ClickHouse never saw — and
+/// it must be counted as a failed attempt. Inducing a failed CRL rebuild needs
+/// a live CRL rotation, so the classification is pinned over the source.
+#[test]
+fn unavailable_http_client_is_a_counted_retryable_delivery_outcome() {
+    let source = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    let start = source
+        .find("async fn post_json_each_row_bytes(")
+        .expect("post_json_each_row_bytes exists");
+    let end = start
+        + source[start..]
+            .find("cfg.http.execute(")
+            .expect("post_json_each_row_bytes sends through cfg.http.execute");
+    let preamble = &source[start..end];
+    assert!(
+        preamble.contains("client.get()") && preamble.contains("client.current()"),
+        "both client families must be resolved before the request is built"
+    );
+    assert!(
+        !preamble.contains("DeliveryOutcome::Permanent"),
+        "an unavailable client must not classify as a permanent rejection"
+    );
+    assert!(
+        preamble.contains("record_failure(FailureReason::Tls")
+            && preamble.contains("DeliveryOutcome::Retryable { message }"),
+        "an unavailable client must be counted and returned as retryable"
+    );
+}
+
+/// Issue #7112: in snapshot mode an HTTP charge refused by the accumulator's
+/// cardinality bound is spooled as an immediate overflow row. That row must
+/// carry the same normalized `grpc_status` the accumulator keys on (see
+/// `grpc_snapshot_bounds_non_standard_terminal_status_cardinality`), or one
+/// request class appears under two values exactly when the accumulator is
+/// under pressure. Driving a live snapshot lifecycle to its cardinality bound
+/// is out of reach of a unit test, so both producers are pinned to the one
+/// shared normalization over the source.
+#[test]
+fn snapshot_overflow_rows_use_the_accumulator_grpc_status_normalization() {
+    let source = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    let arm = source
+        .find("SnapshotRecordOutcome::OverflowImmediate => {")
+        .expect("snapshot overflow arm exists");
+    let arm_end = arm
+        + source[arm..]
+            .find("self.enqueue(event_from_http_summary(")
+            .expect("the immediate-export path follows the snapshot arm");
+    let arm_body = &source[arm..arm_end];
+    assert!(
+        arm_body.contains("snapshot_http_outcome(outcome)"),
+        "the overflow row must be built from the snapshot-normalized outcome"
+    );
+    assert!(
+        source.contains("grpc_status: snapshot_http_outcome(outcome).grpc_status,"),
+        "the accumulator identity must use the same normalization"
+    );
+}

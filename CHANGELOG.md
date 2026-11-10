@@ -59,6 +59,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **`body_validator` response-side rejections no longer describe the upstream
+  body** (advisory `GHSA-84xq-rr63-39pw`). A 502 `details` field used to carry
+  serde_json's line/column for an upstream body that did not parse, the
+  configured `response_required_fields` entry the upstream omitted, and the
+  descriptor path of a missing proto2 `required` field. These are now fixed
+  messages: `Response body is not valid JSON`, `Response body is missing a
+  required field`, and `Response message is missing a required protobuf
+  field`. Request-side rejections are unchanged.
+- **`openapi_validator` fails closed on multi-field form and multipart bodies
+  under a non-object schema** (advisory `GHSA-v3j5-v4vg-qg4w`). Such a schema
+  used to validate only whichever field a randomly hashed map yielded first,
+  so the validated field varied between requests and the others went
+  unchecked. A body with two or more distinct field or part names is now
+  rejected; a single field and an empty body convert as before.
+- **`mcp_gateway` bounds client identifiers in transaction metadata**
+  (advisory `GHSA-f5px-j9pq-7cxm`). `mcp.method`, `mcp.protocol_version`,
+  `mcp.public_tool_name` / `mcp.item_name`, and `mcp.resource_uri` /
+  `mcp.upstream_resource_uri` are recorded verbatim only up to 1024 bytes; a
+  longer value becomes its prefix plus `...sha256:` and the hex SHA-256 of the
+  whole value. A long tool name or templated resource URI previously pushed
+  the access-log record past `FERRUM_LOG_MAX_RECORD_BYTES`, and the record was
+  dropped.
+- **An unavailable plugin HTTP client no longer dead-letters chargeback rows**
+  (#7110). When a CRL-generation rebuild failed, `api_chargeback_sink`
+  classified the attempt as a permanent ClickHouse rejection, so spool replay
+  moved every row it touched into `.rejected.ndjson` evidence that is never
+  replayed. The attempt is now retryable and counted as a `tls` failure.
+  `loki_logging` likewise retries the attempt instead of discarding the
+  batch.
+- **`api_chargeback_sink` snapshot overflow rows carry the normalized
+  `grpc_status`** (#7112). A charge refused by the accumulator's cardinality
+  bound was exported with the raw backend status instead of the collapsed
+  sentinel the accumulated rows use.
+- **`api_chargeback` validates its config before claiming the process-global
+  registry** (#7109). A config with a bad currency, tunable, or pricing block
+  no longer creates the `/charges` registry singleton.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

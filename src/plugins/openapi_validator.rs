@@ -4601,6 +4601,16 @@ fn validate_multipart_boundary(boundary: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Fixed rejection for a form-urlencoded body that carries more than one field
+/// name under a non-object media schema.
+const NON_OBJECT_FORM_MULTIPLE_FIELDS: &str =
+    "Form body carries more than one field name for a non-object schema";
+
+/// Fixed rejection for a multipart body that carries more than one part name
+/// under a non-object media schema.
+const NON_OBJECT_MULTIPART_MULTIPLE_PARTS: &str =
+    "Multipart body carries more than one part name for a non-object schema";
+
 fn fields_to_schema_object(
     fields: HashMap<String, Vec<String>>,
     raw_fields: &HashMap<String, Vec<String>>,
@@ -4610,6 +4620,14 @@ fn fields_to_schema_object(
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema, conversion);
     if !(conversion.accepts_object(object_schema) || object_schema.get("properties").is_some()) {
+        // A non-object schema describes ONE value. With several field names
+        // there is no order-independent choice of which one to validate (the
+        // map is randomly hashed), and validating only one would let every
+        // other field through unchecked, so fail closed
+        // (`GHSA-v3j5-v4vg-qg4w`).
+        if fields.len() > 1 {
+            return Err(NON_OBJECT_FORM_MULTIPLE_FIELDS.to_string());
+        }
         let Some(values) = fields.values().next() else {
             return Ok(Value::Null);
         };
@@ -4982,6 +5000,11 @@ fn multipart_parts_to_schema_object(
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema, conversion);
     if !(conversion.accepts_object(object_schema) || object_schema.get("properties").is_some()) {
+        // Same rule as `fields_to_schema_object`: a non-object schema admits
+        // exactly one part name (`GHSA-v3j5-v4vg-qg4w`).
+        if parts.len() > 1 {
+            return Err(NON_OBJECT_MULTIPART_MULTIPLE_PARTS.to_string());
+        }
         let Some(values) = parts.values().next() else {
             return Ok(Value::Null);
         };

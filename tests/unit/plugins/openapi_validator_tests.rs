@@ -211,6 +211,87 @@ async fn multipart_exploded_free_form_object_and_nested_array_are_converted() {
     );
 }
 
+/// GHSA-v3j5-v4vg-qg4w: a non-object form or multipart schema describes one
+/// value. A body with a single field name is converted and validated; a body
+/// with several field names fails closed instead of validating whichever field
+/// the per-request hash map yields first.
+#[tokio::test]
+async fn non_object_form_and_multipart_schemas_admit_exactly_one_field_name() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/scalar",
+            "path_regex": "^/scalar$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {"type": "string", "const": "ok"},
+                    "multipart/form-data": {"type": "string", "const": "ok"}
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let form = content_type_headers("application/x-www-form-urlencoded");
+    let mut ctx = post_ctx("/scalar");
+    ctx.headers = form.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &form, b"a=ok")
+            .await,
+    );
+    let mut ctx = post_ctx("/scalar");
+    ctx.headers = form.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &form, b"a=bad")
+            .await,
+        Some(400),
+    );
+    // Every ordering of a conforming and a non-conforming field is refused,
+    // on every attempt.
+    for body in ["a=ok&b=bad", "b=bad&a=ok", "a=bad&b=ok", "a=ok&b=ok"] {
+        for _ in 0..8 {
+            let mut ctx = post_ctx("/scalar");
+            ctx.headers = form.clone();
+            assert_reject(
+                plugin
+                    .on_final_request_body_with_context(&mut ctx, &form, body.as_bytes())
+                    .await,
+                Some(400),
+            );
+        }
+    }
+
+    let multipart = content_type_headers("multipart/form-data; boundary=abc");
+    let single = concat!(
+        "--abc\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nok\r\n",
+        "--abc--\r\n"
+    );
+    let mut ctx = post_ctx("/scalar");
+    ctx.headers = multipart.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &multipart, single.as_bytes())
+            .await,
+    );
+    let two = concat!(
+        "--abc\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nok\r\n",
+        "--abc\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nbad\r\n",
+        "--abc--\r\n"
+    );
+    for _ in 0..8 {
+        let mut ctx = post_ctx("/scalar");
+        ctx.headers = multipart.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &multipart, two.as_bytes())
+                .await,
+            Some(400),
+        );
+    }
+}
+
 #[test]
 fn multiple_exploded_free_form_objects_are_rejected_as_ambiguous() {
     let result = OpenapiValidator::new(&json!({

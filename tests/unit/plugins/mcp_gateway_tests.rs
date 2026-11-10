@@ -1367,6 +1367,71 @@ async fn transparent_post_sets_direct_route_override_and_metadata() {
     );
 }
 
+/// The bounded form `mcp_gateway` records for a client identifier longer than
+/// 1024 bytes: the prefix, `...sha256:`, and the SHA-256 of the whole value.
+fn bounded_identifier(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{}...sha256:{}",
+        &value[..1024],
+        hex::encode(Sha256::digest(value.as_bytes()))
+    )
+}
+
+/// GHSA-f5px-j9pq-7cxm: client-supplied identifiers copied into log-allowlisted
+/// metadata are bounded, so one request cannot write a multiple of its body
+/// size into every log sink.
+#[tokio::test]
+async fn long_client_identifiers_are_bounded_in_metadata() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &transparent_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let long_method = format!("custom/{}", "m".repeat(5000));
+    let long_version = "v".repeat(5000);
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": long_method,
+        "params": {}
+    }));
+    headers.insert("mcp-protocol-version".to_string(), long_version.clone());
+
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata.get("mcp.method"),
+        Some(&bounded_identifier(&long_method))
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.protocol_version"),
+        Some(&bounded_identifier(&long_version))
+    );
+
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    // Written before the catalog lookup, so an unknown name is recorded too.
+    let long_name = format!("github.{}", "x".repeat(5000));
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": long_name, "arguments": {}}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let expected = bounded_identifier(&long_name);
+    assert_eq!(ctx.metadata.get("mcp.public_tool_name"), Some(&expected));
+    assert_eq!(ctx.metadata.get("mcp.item_name"), Some(&expected));
+}
+
 #[tokio::test]
 async fn aggregate_initialize_returns_synthetic_session_and_capabilities() {
     let server = start_mcp_catalog_server().await;

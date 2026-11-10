@@ -4550,6 +4550,41 @@ fn test_request_before_plugin_then_reload_honors_configured_shard_amount() {
     );
 }
 
+/// Issue #7109: a config that fails construction-time validation must not
+/// claim the process-global registry. The singleton is shared by every test in
+/// this binary, so the ordering is pinned over the constructor source: every
+/// currency, tunable, and pricing check precedes the owning resolve.
+#[test]
+fn construction_validates_config_before_claiming_the_global_registry() {
+    let source = include_str!("../../../src/plugins/api_chargeback.rs");
+    let start = source
+        .find("pub fn new_with_shard_amount(")
+        .expect("new_with_shard_amount exists");
+    let end = start
+        + source[start..]
+            .find("Ok(Self {")
+            .expect("constructor returns Self");
+    let body = &source[start..end];
+    let claim = body
+        .find("global_registry_with_shard_amount(shard_amount)")
+        .expect("constructor resolves the registry with the configured shard count");
+    for check in [
+        "reject_unknown_keys(",
+        "instance_currency(config)?",
+        "SharedRegistryTunables::from_config(config)?",
+        "PricingConfig::from_config(config, \"api_chargeback\")?",
+        "!pricing.has_any_pricing()",
+    ] {
+        let at = body
+            .find(check)
+            .unwrap_or_else(|| panic!("constructor runs {check}"));
+        assert!(
+            at < claim,
+            "{check} must run before the registry is claimed (issue #7109)"
+        );
+    }
+}
+
 /// Admin `GET /charges` must use the non-owning try path, not claim the
 /// registry with auto sharding.
 #[test]

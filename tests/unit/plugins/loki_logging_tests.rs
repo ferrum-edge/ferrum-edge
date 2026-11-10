@@ -1689,3 +1689,27 @@ fn startup_diagnostics_withhold_loki_config_keys_and_label_names() {
         assert!(!rendered.contains("987654321"), "{rendered}");
     }
 }
+
+/// Issue #7110 sibling: an unavailable plugin HTTP client is retried on the
+/// next call by the client itself, so a Loki attempt that cannot obtain one is
+/// retryable within the batch's retry budget rather than a terminal discard.
+#[test]
+fn unavailable_http_client_is_a_retryable_loki_attempt() {
+    let source = include_str!("../../../src/plugins/loki_logging.rs");
+    let start = source
+        .find("async fn send_batch_once(")
+        .expect("send_batch_once exists");
+    let end = start
+        + source[start..]
+            .find(".post(&cfg.endpoint_url)")
+            .expect("send_batch_once posts to the endpoint");
+    let preamble = &source[start..end];
+    assert!(
+        preamble.contains("LokiAttemptOutcome::Retryable(\"plugin HTTP client unavailable\""),
+        "an unavailable client must be a retryable attempt: {preamble}"
+    );
+    assert!(
+        !preamble.contains("LokiAttemptOutcome::Terminal"),
+        "an unavailable client must not discard the batch terminally: {preamble}"
+    );
+}

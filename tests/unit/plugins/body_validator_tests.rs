@@ -5467,6 +5467,81 @@ async fn proto2_initialization_failures_do_not_echo_payload_values() {
     );
 }
 
+/// GHSA-84xq-rr63-39pw: a response-side protobuf `required` miss carries a
+/// fixed diagnostic and never names the descriptor field the upstream omitted.
+#[tokio::test]
+async fn proto2_response_missing_required_field_does_not_name_the_field() {
+    let dir = proto2_descriptor_dir();
+    let config = json!({
+        "protobuf_descriptor_path": proto2_path(&dir),
+        "protobuf_response_type": "t2.Reply"
+    });
+    let plugin = BodyValidator::new(&config).expect("proto2 response config");
+    let headers = grpc_response_headers();
+    let mut ctx = grpc_ctx();
+    let result = plugin
+        .finalize_client_visible_response_body(&mut ctx, 200, &headers, &grpc_frame(&[]))
+        .await;
+    let body = reject_body(result);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("JSON rejection body");
+    assert_eq!(
+        parsed["details"], "Response message is missing a required protobuf field",
+        "{body}"
+    );
+    assert!(
+        !body.contains("status"),
+        "response rejection must not name the upstream's missing field: {body}"
+    );
+}
+
+/// GHSA-84xq-rr63-39pw: response-side JSON diagnostics never name a configured
+/// `response_required_fields` entry or the parser's line/column in an
+/// upstream body; the request side keeps both so a caller can fix its payload.
+#[tokio::test]
+async fn response_json_diagnostics_do_not_describe_the_upstream_body() {
+    let plugin = BodyValidator::new(&json!({
+        "required_fields": ["client_ref"],
+        "response_required_fields": ["internal_ledger_id"]
+    }))
+    .expect("required-fields config");
+    let headers = response_json_headers();
+
+    let mut ctx = make_response_ctx();
+    let body = reject_body(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, br#"{"id":1}"#)
+            .await,
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("JSON rejection body");
+    assert_eq!(
+        parsed["details"], "Response body is missing a required field",
+        "{body}"
+    );
+    assert!(!body.contains("internal_ledger_id"), "{body}");
+
+    let mut ctx = make_response_ctx();
+    let body = reject_body(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"{\n\"id\":")
+            .await,
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("JSON rejection body");
+    assert_eq!(
+        parsed["details"], "Response body is not valid JSON",
+        "{body}"
+    );
+    assert!(!body.contains("line"), "{body}");
+    assert!(!body.contains("column"), "{body}");
+
+    let mut ctx = make_json_ctx(r#"{"id":1}"#);
+    let mut request_headers = make_json_headers();
+    let body = reject_body(plugin.before_proxy(&mut ctx, &mut request_headers).await);
+    assert!(
+        body.contains("Missing required field: client_ref"),
+        "request-side rejection should name the configured field: {body}"
+    );
+}
+
 #[tokio::test]
 async fn proto3_descriptors_are_unaffected_by_initialization_checks() {
     // The proto3 fixture has no `required` cardinality, so an empty message

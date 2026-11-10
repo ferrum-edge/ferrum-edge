@@ -1828,8 +1828,6 @@ struct ParsedLimits {
 }
 
 fn parse_limits(object: &serde_json::Map<String, Value>) -> Result<ParsedLimits, String> {
-    reject_legacy_window_fields(object)?;
-
     let limits = object
         .get("limits")
         .ok_or_else(|| "rate_limiting: `limits` is required".to_string())?

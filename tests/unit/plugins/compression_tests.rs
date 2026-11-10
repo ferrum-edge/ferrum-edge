@@ -240,6 +240,12 @@ fn test_removed_disable_on_etag_config_rejected() {
         err.contains("disable_on_etag") && err.contains("removed"),
         "got: {err}"
     );
+    // Strong validators are preserved only by default; `weaken_strong_etag`
+    // opts into compressing them (issue #7113).
+    assert!(
+        err.contains("weaken_strong_etag") && !err.contains("always preserved"),
+        "the migration hint must point at the current ETag knob: {err}"
+    );
     assert!(
         !err.contains("unknown configuration key"),
         "removed-key diagnostic must win over the generic unknown-key gate: {err}"
