@@ -161,7 +161,7 @@ in startup resolve to the imported library modules. The version remains the
 library's Cargo-derived constant. Startup ordering, error handling, secret
 resolution, crypto initialization, runtime sizing, shutdown logic and test
 selections are unchanged. CI relevance rules and source-contract assertions
-continue to follow `src/gateway_entry.rs`. All seven sanitizer targets still
+continue to follow `src/gateway_entry.rs`. All fuzz targets still
 exercise the same library APIs. Their previous successful cold measurements
 predate the initial startup extraction and are not a controlled comparison with
 the enlarged library; new hosted evidence is required for this separation.
