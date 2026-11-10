@@ -1750,18 +1750,20 @@ fn every_plain_udp_setup_stage_runs_under_the_authorization_deadline() {
         .find("let first_datagram_allowed =")
         .expect("the bounded first-datagram policy stage");
     assert!(first_datagram > admit_at);
-    // The pending drain stops at expiry.
+    // The pending drain stops at expiry. It returns with the pending gate
+    // still armed rather than breaking out (GHSA-4wqw-qq7v-pwhp; pinned by
+    // `pending_drain_authorization_expiry_returns_with_the_gate_armed`).
     let drain_gate = new_session
-        .find("'drain: while let Some(batch) = take_pending_datagrams(")
-        .expect("the labeled pending-datagram drain");
-    let drain_break = new_session[drain_gate..]
-        .find("break 'drain;")
-        .expect("the drain's expiry break");
+        .find("while let Some(batch) = take_pending_datagrams(")
+        .expect("the pending-datagram drain");
+    let drain_expiry = new_session[drain_gate..]
+        .find("session.refuse_if_authorization_expired().is_some()")
+        .expect("the drain's expiry check");
     let drain_hook = new_session[drain_gate..]
         .find("udp_datagram_allowed(")
         .expect("the drain's per-datagram hook");
     assert!(
-        drain_break < drain_hook,
+        drain_expiry < drain_hook,
         "the pending-datagram drain must stop at expiry BEFORE running another hook"
     );
 
