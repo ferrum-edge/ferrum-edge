@@ -21,7 +21,7 @@ use rcgen::{
 use std::env;
 use tracing::{info, warn};
 
-use super::CaError;
+use super::{CaError, random_positive_serial_bytes};
 use crate::identity::spiffe::TrustDomain;
 
 /// Bootstrap configuration.
@@ -144,46 +144,4 @@ pub fn bootstrap_dev_root(config: BootstrapConfig) -> Result<BootstrappedRoot, C
         root_cert_pem: cert.pem(),
         root_key_pem: key_pair.serialize_pem(),
     })
-}
-
-fn random_positive_serial_bytes() -> Result<[u8; 8], CaError> {
-    use crate::fips::backend::rand::SecureRandom;
-
-    let rng = crate::fips::backend::rand::SystemRandom::new();
-    let mut serial_bytes = [0u8; 8];
-    rng.fill(&mut serial_bytes)
-        .map_err(|e| CaError::Internal(format!("rng failed: {e}")))?;
-    normalize_positive_serial_bytes(&mut serial_bytes);
-    Ok(serial_bytes)
-}
-
-fn normalize_positive_serial_bytes(serial_bytes: &mut [u8; 8]) {
-    serial_bytes[0] &= 0x7f;
-    if *serial_bytes == [0u8; 8] {
-        serial_bytes[7] = 1;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::normalize_positive_serial_bytes;
-
-    #[test]
-    fn serial_normalization_clears_sign_bit() {
-        let mut serial = [0xff, 0, 0, 0, 0, 0, 0, 1];
-
-        normalize_positive_serial_bytes(&mut serial);
-
-        assert_eq!(serial[0] & 0x80, 0);
-        assert_eq!(serial, [0x7f, 0, 0, 0, 0, 0, 0, 1]);
-    }
-
-    #[test]
-    fn serial_normalization_avoids_zero() {
-        let mut serial = [0x80, 0, 0, 0, 0, 0, 0, 0];
-
-        normalize_positive_serial_bytes(&mut serial);
-
-        assert_eq!(serial, [0, 0, 0, 0, 0, 0, 0, 1]);
-    }
 }

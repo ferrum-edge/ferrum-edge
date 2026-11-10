@@ -613,6 +613,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lacks the `FERRUM_POD_INBOUND_PORTS*` scope maps, as its comments and
   warning already described, instead of arming a classifier that every pod
   enrollment then fails to scope.
+- **The internal mesh CA fails an SVID issuance when the system RNG fails**
+  (#7268) instead of falling back to a process counter for the certificate
+  serial, which produced predictable serials that repeated across restarts.
+  The dev root bootstrap already failed this way; both now share one helper.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

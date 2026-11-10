@@ -231,3 +231,51 @@ impl std::fmt::Display for CaBackend {
         }
     }
 }
+
+/// Random positive 64-bit certificate serial from the system random source
+/// (`crate::fips::backend::rand`: ring, or AWS-LC under the `fips` feature).
+///
+/// RFC 5280 §4.1.2.2 requires a positive INTEGER: the high bit is cleared so
+/// every parser reads it as positive, and the all-zero serial is avoided. An
+/// RNG failure is returned, never replaced by a predictable fallback.
+pub(crate) fn random_positive_serial_bytes() -> Result<[u8; 8], CaError> {
+    use crate::fips::backend::rand::SecureRandom;
+
+    let rng = crate::fips::backend::rand::SystemRandom::new();
+    let mut serial_bytes = [0u8; 8];
+    rng.fill(&mut serial_bytes)
+        .map_err(|e| CaError::Internal(format!("rng failed: {e}")))?;
+    normalize_positive_serial_bytes(&mut serial_bytes);
+    Ok(serial_bytes)
+}
+
+fn normalize_positive_serial_bytes(serial_bytes: &mut [u8; 8]) {
+    serial_bytes[0] &= 0x7f;
+    if *serial_bytes == [0u8; 8] {
+        serial_bytes[7] = 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_positive_serial_bytes;
+
+    #[test]
+    fn serial_normalization_clears_sign_bit() {
+        let mut serial = [0xff, 0, 0, 0, 0, 0, 0, 1];
+
+        normalize_positive_serial_bytes(&mut serial);
+
+        assert_eq!(serial[0] & 0x80, 0);
+        assert_eq!(serial, [0x7f, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn serial_normalization_avoids_zero() {
+        let mut serial = [0x80, 0, 0, 0, 0, 0, 0, 0];
+
+        normalize_positive_serial_bytes(&mut serial);
+
+        assert_eq!(serial, [0, 0, 0, 0, 0, 0, 0, 1]);
+    }
+}
