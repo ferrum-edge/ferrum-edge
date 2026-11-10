@@ -59,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **A pipelined conflicting-`Content-Length` request no longer fails the
+  valid HTTP/1 requests queued ahead of it when the TCP read splits its head**
+  (#7179). The frontend framing guard decided whether to stop observing
+  without poisoning earlier heads from a hint it clears at the end of every
+  read, so a read boundary between the second `Content-Length` line and the
+  blank line made earlier pipelined requests fail with the fail-closed `400
+  "HTTP/1 request framing could not be verified"`. The head scanner now
+  carries that fact itself; the result no longer depends on segmentation.
 - **Gateway API HTTP/3 rebinds wait on the budget of the latest collision
   classification** (#7178). A QUIC bind that hit `EADDRINUSE` re-classified
   the collision after every attempt (in-process UDP handoff vs. this pass's
