@@ -296,8 +296,9 @@ impl Oauth2Introspection {
                 config = config.to_string()
             )
         })?;
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             config_obj,
+            "config",
             &[
                 "providers",
                 "scope_claim",
@@ -307,7 +308,7 @@ impl Oauth2Introspection {
                 "allow_provider_fanout",
                 "max_concurrent_introspections",
             ],
-            "oauth2_introspection",
+            "oauth2_introspection: `config`: ",
         )?;
         let allow_provider_fanout =
             optional_top_level_bool(config_obj, "allow_provider_fanout", "oauth2_introspection")?
@@ -361,8 +362,9 @@ impl Oauth2Introspection {
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
-            reject_unknown_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 prov_obj,
+                &format!("provider[{idx}]"),
                 &[
                     "introspection_endpoint",
                     "discovery_url",
@@ -390,7 +392,7 @@ impl Oauth2Introspection {
                     "discovery_refresh_interval_secs",
                     "accept_mtls_bound_tokens",
                 ],
-                &format!("oauth2_introspection: `provider[{idx}]`"),
+                &format!("oauth2_introspection: `provider[{idx}]`: "),
             )?;
 
             let endpoint = parse_url_field(prov_obj, "introspection_endpoint", idx)?;
@@ -1834,10 +1836,11 @@ fn parse_client_auth(
         })?,
         None => Map::new(),
     };
-    reject_unknown_keys(
+    crate::util::unknown_keys::reject_unknown_keys(
         &auth,
+        &format!("provider[{provider_idx}].client_auth"),
         &CLIENT_AUTH_STRING_FIELDS,
-        &format!("oauth2_introspection: `provider[{provider_idx}].client_auth`"),
+        &format!("oauth2_introspection: `provider[{provider_idx}].client_auth`: "),
     )?;
     // Every accepted `client_auth` key is a string, whether or not the selected
     // method reads it. Type-checking the whole object here — instead of only
@@ -2078,10 +2081,11 @@ fn parse_token_locations(
                     "oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}]` must be an object"
                 )
             })?;
-            reject_unknown_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 object,
+                &format!("provider[{provider_idx}].from_headers[{idx}]"),
                 &["name", "prefix"],
-                &format!("oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}]`"),
+                &format!("oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}]`: "),
             )?;
             let raw_name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
                 format!(
@@ -2131,17 +2135,6 @@ fn optional_claim_path(
         Some(value) => parse_claim_path_value(field, value, plugin),
         None => Ok(default_value.to_string()),
     }
-}
-
-fn reject_unknown_keys(
-    object: &Map<String, Value>,
-    allowed: &[&str],
-    path: &str,
-) -> Result<(), String> {
-    if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("{path} contains unknown field {unknown:?}"));
-    }
-    Ok(())
 }
 
 fn optional_top_level_bool(

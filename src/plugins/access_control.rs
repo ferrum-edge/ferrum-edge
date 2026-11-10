@@ -134,7 +134,12 @@ impl AccessControl {
         })?;
 
         reject_removed_ip_keys(object)?;
-        reject_unknown_keys(object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            ACCESS_CONTROL_CONFIG_KEYS,
+            "access_control: `config`: ",
+        )?;
         reject_explicitly_empty_allow_lists(object)?;
 
         let allowed = parse_string_set(
@@ -418,23 +423,15 @@ fn reject_removed_ip_keys(object: &serde_json::Map<String, Value>) -> Result<(),
 /// weaker-than-intended policy). Mirrors serde `deny_unknown_fields`. The
 /// removed legacy IP keys are handled separately by `reject_removed_ip_keys`
 /// with their own migration message.
-fn reject_unknown_keys(object: &serde_json::Map<String, Value>) -> Result<(), String> {
-    const KNOWN_KEYS: [&str; 7] = [
-        "allowed_consumers",
-        "disallowed_consumers",
-        "allowed_groups",
-        "disallowed_groups",
-        "allowed_external_identities",
-        "disallowed_external_identities",
-        "allow_authenticated_identity",
-    ];
-    for key in object.keys() {
-        if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("access_control: unknown config key {key:?}"));
-        }
-    }
-    Ok(())
-}
+const ACCESS_CONTROL_CONFIG_KEYS: &[&str] = &[
+    "allowed_consumers",
+    "disallowed_consumers",
+    "allowed_groups",
+    "disallowed_groups",
+    "allowed_external_identities",
+    "disallowed_external_identities",
+    "allow_authenticated_identity",
+];
 
 /// Refuse an allow-list that is present but empty.
 ///

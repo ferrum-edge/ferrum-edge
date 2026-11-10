@@ -530,8 +530,8 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     for (config, field, reason) in [
         (
             json!({"max_connections_per_key": 1, token: true}),
-            "tcp_connection_throttle",
-            "unknown config field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"max_connections_per_key": true}),

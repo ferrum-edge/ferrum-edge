@@ -194,14 +194,12 @@ impl IpRestriction {
         let object = config
             .as_object()
             .ok_or_else(|| "ip_restriction: config must be an object".to_string())?;
-        if let Some(unknown) = object
-            .keys()
-            .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
-        {
-            return Err(format!(
-                "ip_restriction: unknown configuration field {unknown:?}; allowed fields: `allow`, `deny`, `mode`"
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            CONFIG_KEYS,
+            "ip_restriction: `config`: ",
+        )?;
 
         let allow = IpRangeSet::compile(Self::parse_rule_list(object, "allow")?);
         let deny = IpRangeSet::compile(Self::parse_rule_list(object, "deny")?);

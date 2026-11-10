@@ -49,14 +49,13 @@ impl GrpcDeadline {
         if !config.is_object() {
             return Err("grpc_deadline: config must be an object".to_string());
         }
-        if let Some(object) = config.as_object()
-            && let Some(key) = object
-                .keys()
-                .find(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
-        {
-            return Err(format!(
-                "grpc_deadline: unknown configuration property in `config`: {key:?}"
-            ));
+        if let Some(object) = config.as_object() {
+            crate::util::unknown_keys::reject_unknown_keys(
+                object,
+                "config",
+                &ALLOWED_CONFIG_KEYS,
+                "grpc_deadline: `config`: ",
+            )?;
         }
 
         let max_deadline_ms = optional_u64(config, "max_deadline_ms")?;

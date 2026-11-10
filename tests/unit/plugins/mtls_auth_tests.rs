@@ -1293,7 +1293,10 @@ fn test_mtls_auth_rejects_unknown_allowed_issuer_field() {
     let err = MtlsAuth::new(&json!({"allowed_issuers": [{"issuer_cn": "CA"}]}))
         .err()
         .expect("unknown issuer field must be rejected");
-    assert!(err.contains("unsupported issuer field"), "got: {err}");
+    assert!(
+        err.contains("`allowed_issuers[0]`: unknown configuration key(s)"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -1339,7 +1342,10 @@ fn test_mtls_auth_rejects_unknown_top_level_field() {
     let error = MtlsAuth::new(&json!({"cert_field": "subject_cn", "typo": true}))
         .err()
         .expect("unknown top-level fields must fail closed");
-    assert!(error.contains("unsupported field \"typo\""), "got: {error}");
+    assert!(
+        error.contains("unknown configuration key(s): \"config.typo\""),
+        "got: {error}"
+    );
 }
 
 #[test]
@@ -1745,7 +1751,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let cases: &[(serde_json::Value, &[&str])] = &[
         (
             json!({"allowed_issuers": [{(canary): true}]}),
-            &["`allowed_issuers[0]`", "unsupported issuer field"],
+            &["`allowed_issuers[0]`", "unknown configuration key(s)"],
         ),
         (
             json!({"allowed_ca_fingerprints_sha256": [8675309]}),

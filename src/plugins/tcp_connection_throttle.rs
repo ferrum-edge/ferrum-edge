@@ -215,27 +215,16 @@ fn parse_config(config: &Value) -> Result<ParsedConfig, String> {
             .filter(|prefix| (1..=128).contains(prefix))
             .ok_or_else(|| IPV6_PREFIX_ERROR.to_string())?,
     };
-    reject_unknown_fields(object)?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        "config",
+        &["max_connections_per_key", "ipv6_prefix"],
+        "tcp_connection_throttle: `config`: ",
+    )?;
     Ok(ParsedConfig {
         max_connections_per_key,
         ipv6_prefix,
     })
-}
-
-fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let unknown: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|field| !matches!(*field, "max_connections_per_key" | "ipv6_prefix"))
-        .collect();
-    if unknown.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "tcp_connection_throttle: unknown config field(s): {:?}",
-            unknown.join(", ")
-        ))
-    }
 }
 
 fn parse_required_u64(object: &serde_json::Map<String, Value>, field: &str) -> Result<u64, String> {

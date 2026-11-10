@@ -605,7 +605,7 @@ fn unknown_security_control_fields_are_rejected() {
         let error = JwksAuth::new(&config, default_client())
             .err()
             .expect("unknown field must fail closed");
-        assert!(error.contains("unknown field"), "got: {error}");
+        assert!(error.contains("unknown configuration key"), "got: {error}");
     }
 }
 
@@ -5770,7 +5770,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let cases: &[(serde_json::Value, &[&str])] = &[
         (
             json!({"providers": [{(canary): true}]}),
-            &["`provider[0]`", "unknown field"],
+            &["`provider[0]`", "unknown configuration key(s)"],
         ),
         (
             json!({"providers": [{"jwks": {"keys": []}, "audiences": [8675309]}]}),

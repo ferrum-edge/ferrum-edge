@@ -477,7 +477,8 @@ fn test_transaction_debugger_rejects_unknown_keys_deterministically() {
     for (config, expected) in [
         (
             json!({"log_respnose_body": true}),
-            "transaction_debugger: unknown configuration keys at `config`: \"log_respnose_body\"",
+            "transaction_debugger: `config`: unknown configuration key(s): \"config.log_respnose_body\" \
+             (did you mean `log_response_body`?)",
         ),
         (
             json!({
@@ -485,11 +486,13 @@ fn test_transaction_debugger_rejects_unknown_keys_deterministically() {
                 "redacted_headers": [],
                 "a_unknown": false
             }),
-            "transaction_debugger: unknown configuration keys at `config`: \"a_unknown, z_unknown\"",
+            "transaction_debugger: `config`: unknown configuration key(s): \"config.a_unknown\", \
+             \"config.z_unknown\"",
         ),
         (
             json!({"schema_reff": "debug"}),
-            "transaction_debugger: unknown configuration keys at `config`: \"schema_reff\"",
+            "transaction_debugger: `config`: unknown configuration key(s): \"config.schema_reff\" \
+             (did you mean `schema_ref`?)",
         ),
     ] {
         assert_eq!(TransactionDebugger::new(&config).err().unwrap(), expected);
@@ -543,7 +546,7 @@ fn test_shared_validation_matches_transaction_debugger_config_surface() {
     .expect_err("shared validation must reject unknown keys");
     assert_eq!(
         unknown,
-        "transaction_debugger: unknown configuration keys at `config`: \"unknown\""
+        "transaction_debugger: `config`: unknown configuration key(s): \"config.unknown\""
     );
 }
 
@@ -2250,7 +2253,7 @@ fn startup_diagnostics_withhold_debugger_keys_and_capture_budgets() {
     for (config, context, hidden) in [
         (
             json!({"'diagnostic-secret-5594`\"\\\n": true}),
-            "unknown configuration keys at `config`",
+            "`config`: unknown configuration key(s)",
             "diagnostic-secret-5594",
         ),
         (

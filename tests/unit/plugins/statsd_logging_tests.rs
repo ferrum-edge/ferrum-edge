@@ -469,12 +469,9 @@ async fn test_statsd_logging_rejects_one_character_misspellings_of_every_key() {
         assert!(err.contains("unknown configuration key"), "got: {err}");
         assert!(err.contains(typo), "error must name the typo key: {err}");
         assert!(
-            err.contains("allowed keys"),
-            "error must list the allowed-key contract: {err}"
+            err.contains(&format!("did you mean `{canonical}`?")),
+            "error must suggest the intended key: {err}"
         );
-        for key in STATSD_LOGGING_CONFIG_KEYS {
-            assert!(err.contains(key), "missing allowed key {key} in: {err}");
-        }
 
         let shared = validate_plugin_config("statsd_logging", &config)
             .expect_err("shared admission must reject the same typo");

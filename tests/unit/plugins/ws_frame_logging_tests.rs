@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ferrum_edge::plugins::correlation_id::CorrelationId;
 use ferrum_edge::plugins::ws_frame_logging::{
-    DEFAULT_LOG_LEVEL, MAX_PAYLOAD_PREVIEW_BYTES, WS_FRAME_LOGGING_CONFIG_KEYS, WsFrameLogging,
+    DEFAULT_LOG_LEVEL, MAX_PAYLOAD_PREVIEW_BYTES, WsFrameLogging,
 };
 use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
@@ -356,9 +356,7 @@ fn test_creation_rejects_unknown_config_keys() {
         .expect("typo keys must be rejected");
     assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("log_levle"), "got: {err}");
-    for key in WS_FRAME_LOGGING_CONFIG_KEYS {
-        assert!(err.contains(key), "allowed-key list missing {key}: {err}");
-    }
+    assert!(err.contains("did you mean `log_level`?"), "got: {err}");
 
     let err = validate_plugin_config("ws_frame_logging", &json!({"payload_preview_byte": 64}))
         .expect_err("shared validation must reject unknown keys");

@@ -2138,9 +2138,9 @@ fn rejects_unknown_fields_at_every_config_boundary() {
         let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown field must be rejected");
-        let (path, field) = scope.rsplit_once('.').expect("field path");
+        let (path, _field) = scope.rsplit_once('.').expect("field path");
         assert!(error.contains(&format!("`{path}`")), "{error}");
-        assert!(error.contains(&format!("{field:?}")), "{error}");
+        assert!(error.contains(&format!("{scope:?}")), "{error}");
     }
 }
 
@@ -5185,7 +5185,10 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         "private_key_pem": canary
     });
     let cases: &[(serde_json::Value, &[&str])] = &[
-        (unknown_session, &["`session`", "unknown field"]),
+        (
+            unknown_session,
+            &["`session`", "unknown configuration key(s)"],
+        ),
         (invalid_store, &["`session.store`", "must be a string"]),
         (
             invalid_key,

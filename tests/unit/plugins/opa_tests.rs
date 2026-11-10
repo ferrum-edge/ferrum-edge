@@ -299,7 +299,7 @@ fn opa_rejects_unknown_security_sensitive_config_keys() {
             Ok(_) => panic!("unknown OPA key {typo} must be rejected"),
             Err(error) => error,
         };
-        assert!(error.contains("unknown config key"), "got: {error}");
+        assert!(error.contains("unknown configuration key"), "got: {error}");
         assert!(error.contains(typo), "got: {error}");
     }
 }

@@ -122,22 +122,6 @@ const STREAM_TAG_NATIVE: &[(&str, &str)] = &[
 
 const WS_TAG_NATIVE: &[(&str, &str)] = &[("proxy", "proxy_id")];
 
-fn reject_unknown_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let mut unknown: Vec<&str> = config
-        .keys()
-        .filter(|key| !STATSD_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "statsd_logging: `config`: unknown configuration key(s): {unknown:?}; allowed keys: `{}`",
-        STATSD_LOGGING_CONFIG_KEYS.join("`, `")
-    ))
-}
-
 /// Emit a `warn!` for any inline `schema:` keys that the statsd
 /// emitter does not honor. Only `rename`, `omit`, and `summary_type`
 /// have an effect — everything else (`static_fields`, `derived_fields`,
@@ -589,7 +573,12 @@ impl StatsdLogging {
                 STATSD_LOGGING_CONFIG_KEYS.join(", ")
             ));
         };
-        reject_unknown_config_keys(config_object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            STATSD_LOGGING_CONFIG_KEYS,
+            "statsd_logging: `config`: ",
+        )?;
 
         let raw_host = config
             .get("host")

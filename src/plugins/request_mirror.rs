@@ -283,7 +283,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use async_trait::async_trait;
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -303,7 +303,6 @@ use crate::proxy::headers::{
     SecondaryRequestHostPolicy, filter_secondary_request_headers,
     synthesize_grpc_te_trailers_if_needed,
 };
-use crate::util::unknown_keys::suggest_key;
 
 /// Authoritative closed set of top-level `request_mirror` configuration keys.
 ///
@@ -2105,7 +2104,12 @@ impl RequestMirror {
                 REQUEST_MIRROR_CONFIG_KEYS.join("`, `")
             )
         })?;
-        reject_unknown_request_mirror_keys(config_obj)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            REQUEST_MIRROR_CONFIG_KEYS,
+            "request_mirror: `config`: ",
+        )?;
 
         let raw_mirror_host = optional_string(config, "mirror_host")?
             .filter(|s| !s.is_empty())
@@ -2550,30 +2554,6 @@ impl RequestMirror {
     pub(crate) fn should_mirror_for_test(&self) -> bool {
         self.should_mirror()
     }
-}
-
-fn reject_unknown_request_mirror_keys(object: &Map<String, Value>) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .filter(|key| !REQUEST_MIRROR_CONFIG_KEYS.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    let details: Vec<String> = unknown
-        .into_iter()
-        .map(|key| match suggest_key(key, REQUEST_MIRROR_CONFIG_KEYS) {
-            Some(suggestion) => format!("{key:?} (did you mean `{suggestion}`?)"),
-            None => format!("{key:?}"),
-        })
-        .collect();
-    Err(format!(
-        "request_mirror: unknown configuration key(s): {}; allowed keys: `{}`",
-        details.join(", "),
-        REQUEST_MIRROR_CONFIG_KEYS.join("`, `")
-    ))
 }
 
 fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String> {

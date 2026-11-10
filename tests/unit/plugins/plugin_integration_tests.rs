@@ -529,7 +529,10 @@ async fn test_plugin_error_handling() {
     let error = create_plugin("jwt_auth", &json!({"invalid": "config"}))
         .err()
         .expect("jwt_auth must reject unknown config keys");
-    assert_eq!(error, "jwt_auth: unknown config key \"invalid\"");
+    assert_eq!(
+        error,
+        "jwt_auth: `config`: unknown configuration key(s): \"config.invalid\""
+    );
 }
 
 #[tokio::test]

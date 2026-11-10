@@ -3488,7 +3488,11 @@ fn proxy_scope_cache_keeps_same_id_proxies_in_two_namespaces_independent() {
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
     for (config, field, reason) in [
-        (json!({token: true}), "allowed keys", "unknown config key"),
+        (
+            json!({token: true}),
+            "`config`",
+            "unknown configuration key(s)",
+        ),
         (json!({"key_by": token}), "`key_by`", "unsupported"),
         (
             json!({"min_limit": true}),

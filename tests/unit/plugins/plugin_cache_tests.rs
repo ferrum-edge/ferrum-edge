@@ -7446,7 +7446,7 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
     assert!(
         error
             .to_string()
-            .contains("jwt_auth: unknown config key \"audience\""),
+            .contains("jwt_auth: `config`: unknown configuration key(s): \"config.audience\""),
         "unexpected reload error: {error}"
     );
 

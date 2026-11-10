@@ -472,7 +472,9 @@ fn test_unknown_config_key_rejected() {
     .expect("misspelled authorization key must fail closed");
 
     assert!(
-        error.contains("unknown config key \"required_group\""),
+        error.contains(
+            "unknown configuration key(s): \"config.required_group\" (did you mean `required_groups`?)"
+        ),
         "{error}"
     );
 }
@@ -3399,7 +3401,10 @@ async fn test_group_name_preparation_keeps_distinct_names_distinct() {
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
     let cases: &[(serde_json::Value, &[&str])] = &[
-        (json!({(canary): true}), &["unknown config key"]),
+        (
+            json!({(canary): true}),
+            &["unknown configuration key(s)", "`config`"],
+        ),
         (
             json!({"ldap_url": 8675309}),
             &["`ldap_url`", "must be a string"],

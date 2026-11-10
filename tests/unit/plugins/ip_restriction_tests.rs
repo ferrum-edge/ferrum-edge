@@ -1044,8 +1044,8 @@ fn unknown_keys_are_rejected_even_when_another_policy_list_is_valid() {
         let error = IpRestriction::new(&config)
             .err()
             .expect("unknown key must be rejected");
-        assert!(error.contains("unknown configuration field"), "{error}");
-        assert!(error.contains("`allow`, `deny`, `mode`"), "{error}");
+        assert!(error.contains("unknown configuration key"), "{error}");
+        assert!(error.contains("did you mean `"), "{error}");
     }
 }
 
@@ -1058,7 +1058,7 @@ fn shared_admin_and_config_admission_rejects_broadened_policy_shape() {
     let error = ferrum_edge::plugins::validate_plugin_config("ip_restriction", &config)
         .expect_err("shared plugin admission must reject the typo");
     assert!(
-        error.contains("unknown configuration field \"alow\""),
+        error.contains("unknown configuration key(s): \"config.alow\" (did you mean `allow`?)"),
         "{error}"
     );
 }
@@ -1225,7 +1225,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         ),
         (
             json!({(canary): true}),
-            &["unknown configuration field", "`allow`"],
+            &["unknown configuration key(s)", "`config`"],
         ),
         (
             json!({"allow": ["127.0.0.1"], "mode": 8675309}),

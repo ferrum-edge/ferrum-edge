@@ -84,14 +84,12 @@ impl TransactionLogSchema {
         let config_object = config.as_object().ok_or_else(|| {
             "transaction_log_schema: config must be an object containing `schemas`".to_string()
         })?;
-        for key in config_object.keys() {
-            if !TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.contains(&key.as_str()) {
-                return Err(format!(
-                    "transaction_log_schema: unknown config key {key:?} at `config` (valid keys: `{}`)",
-                    TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.join("`, `")
-                ));
-            }
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            TRANSACTION_LOG_SCHEMA_CONFIG_KEYS,
+            "transaction_log_schema: `config`: ",
+        )?;
         let schemas_value = config_object.get("schemas").ok_or_else(|| {
             "transaction_log_schema: `schemas` is required (an object mapping name -> schema definition)".to_string()
         })?;

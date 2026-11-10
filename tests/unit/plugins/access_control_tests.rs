@@ -345,7 +345,7 @@ async fn test_access_control_rejects_unknown_key_alone() {
         Ok(_) => panic!("unknown config key must be rejected"),
         Err(err) => err,
     };
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("allowed_consumer"), "got: {err}");
 }
 
@@ -363,7 +363,7 @@ async fn test_access_control_rejects_unknown_key_alongside_valid_key() {
         Ok(_) => panic!("unknown config key alongside a valid key must be rejected"),
         Err(err) => err,
     };
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("allowed_consumer"), "got: {err}");
 }
 
@@ -378,7 +378,10 @@ async fn test_access_control_rejects_misspelled_keys() {
             Ok(_) => panic!("misspelled key must be rejected: {typo}"),
             Err(err) => err,
         };
-        assert!(err.contains("unknown config key"), "got: {err} for {typo}");
+        assert!(
+            err.contains("unknown configuration key"),
+            "got: {err} for {typo}"
+        );
     }
 }
 
@@ -987,7 +990,10 @@ async fn test_access_control_stream_connect_disallowed_group() {
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let canary = "'SECURITY_DIAGNOSTIC_CANARY\"`\n\\payload";
     let cases: &[(serde_json::Value, &[&str])] = &[
-        (json!({(canary): true}), &["unknown config key"]),
+        (
+            json!({(canary): true}),
+            &["unknown configuration key(s)", "`config`"],
+        ),
         (
             json!({"allowed_consumers": [8675309]}),
             &["`allowed_consumers`", "must be strings"],

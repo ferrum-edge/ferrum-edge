@@ -458,7 +458,12 @@ impl LokiLogging {
                     .to_string(),
             );
         }
-        validate_known_config_fields(config_object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            LOKI_LOGGING_CONFIG_KEYS,
+            "loki_logging: `config`: ",
+        )?;
 
         let (endpoint_url, endpoint_hostname) =
             parse_http_endpoint(config, "loki_logging", http_client.backend_allow_ips())?;
@@ -662,20 +667,6 @@ fn validate_custom_header_name_lengths(config: &Value) -> Result<(), String> {
         return Err(format!(
             "loki_logging: custom_headers name is \"{}\" bytes; maximum is {LOKI_MAX_CUSTOM_HEADER_NAME_BYTES}",
             name.len()
-        ));
-    }
-    Ok(())
-}
-
-fn validate_known_config_fields(config: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let mut unknown = config
-        .keys()
-        .filter(|key| !LOKI_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
-        .collect::<Vec<_>>();
-    unknown.sort_unstable();
-    if let Some(key) = unknown.first() {
-        return Err(format!(
-            "loki_logging: unknown configuration field {key:?} at `config`"
         ));
     }
     Ok(())

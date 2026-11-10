@@ -1875,7 +1875,8 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
         panic!("misspelled ip_restriction allow list must reject reload");
     };
     assert!(errors.iter().any(|error| {
-        error.contains("ip_restriction") && error.contains("unknown configuration field \"alow\"")
+        error.contains("ip_restriction")
+            && error.contains("unknown configuration key(s): \"config.alow\"")
     }));
     assert_eq!(
         state.config.load().plugin_configs[0].config,

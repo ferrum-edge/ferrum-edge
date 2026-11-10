@@ -944,7 +944,10 @@ fn new_rejects_unknown_fields_at_every_config_layer() {
         let error = Oauth2Introspection::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown config key must fail closed");
-        assert!(error.contains("unknown field"), "unexpected error: {error}");
+        assert!(
+            error.contains("unknown configuration key"),
+            "unexpected error: {error}"
+        );
     }
 }
 
@@ -2712,7 +2715,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let cases: &[(serde_json::Value, &[&str])] = &[
         (
             json!({"providers": [{(canary): true}]}),
-            &["provider[0]", "unknown field"],
+            &["`provider[0]`", "unknown configuration key(s)"],
         ),
         (
             json!({"providers": [{

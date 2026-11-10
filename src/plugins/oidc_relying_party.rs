@@ -941,7 +941,12 @@ impl OidcRelyingParty {
                 config = config.to_string()
             )
         })?;
-        reject_unknown_fields(config_obj, CONFIG_FIELDS, "config")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            CONFIG_FIELDS,
+            "oidc_relying_party: `config`: ",
+        )?;
         let providers = config_obj
             .get("providers")
             .and_then(Value::as_array)
@@ -957,12 +962,22 @@ impl OidcRelyingParty {
         let provider_obj = providers[0]
             .as_object()
             .ok_or_else(|| "oidc_relying_party: `provider[0]` must be an object".to_string())?;
-        reject_unknown_fields(provider_obj, PROVIDER_FIELDS, "provider[0]")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            provider_obj,
+            "provider[0]",
+            PROVIDER_FIELDS,
+            "oidc_relying_party: `provider[0]`: ",
+        )?;
         let session_obj = config_obj
             .get("session")
             .and_then(Value::as_object)
             .ok_or_else(|| "oidc_relying_party: `session` object is required".to_string())?;
-        reject_unknown_fields(session_obj, SESSION_FIELDS, "session")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            session_obj,
+            "session",
+            SESSION_FIELDS,
+            "oidc_relying_party: `session`: ",
+        )?;
         let behavior_obj =
             match config_obj.get("behavior") {
                 Some(Value::Null) | None => None,
@@ -971,13 +986,23 @@ impl OidcRelyingParty {
                 })?),
             };
         if let Some(behavior_obj) = behavior_obj {
-            reject_unknown_fields(behavior_obj, BEHAVIOR_FIELDS, "behavior")?;
+            crate::util::unknown_keys::reject_unknown_keys(
+                behavior_obj,
+                "behavior",
+                BEHAVIOR_FIELDS,
+                "oidc_relying_party: `behavior`: ",
+            )?;
         }
         if let Some(client_auth) = provider_obj.get("client_auth") {
             let client_auth = client_auth.as_object().ok_or_else(|| {
                 "oidc_relying_party: `provider[0].client_auth` must be an object".to_string()
             })?;
-            reject_unknown_fields(client_auth, CLIENT_AUTH_FIELDS, "provider[0].client_auth")?;
+            crate::util::unknown_keys::reject_unknown_keys(
+                client_auth,
+                "provider[0].client_auth",
+                CLIENT_AUTH_FIELDS,
+                "oidc_relying_party: `provider[0].client_auth`: ",
+            )?;
         }
 
         let issuer = validate_url_string(
@@ -4053,22 +4078,6 @@ fn apply_verify_outcome(
             PluginResult::Continue
         }
     }
-}
-
-fn reject_unknown_fields(
-    config: &Map<String, Value>,
-    allowed: &[&str],
-    scope: &str,
-) -> Result<(), String> {
-    if let Some(field) = config
-        .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
-    {
-        return Err(format!(
-            "oidc_relying_party: unknown field {field:?} in `{scope}`"
-        ));
-    }
-    Ok(())
 }
 
 fn session_context_seed(

@@ -524,15 +524,12 @@ impl AiRequestGuard {
             return Err("ai_request_guard: config must be an object".to_string());
         };
 
-        if let Some(unknown) = config_object
-            .keys()
-            .find(|field| !CONFIG_FIELDS.contains(&field.as_str()))
-        {
-            return Err(format!(
-                "ai_request_guard: unknown config field {unknown:?}; allowed fields: `{}`",
-                CONFIG_FIELDS.join("`, `")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            CONFIG_FIELDS,
+            "ai_request_guard: `config`: ",
+        )?;
 
         let max_tokens_limit = optional_u64(config, "max_tokens_limit")?;
         let enforce_max_tokens = match optional_string(config, "enforce_max_tokens")?

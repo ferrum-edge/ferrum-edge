@@ -461,9 +461,12 @@ fn test_creation_rejects_all_unknown_keys_with_actionable_error() {
     .err()
     .expect("unknown config keys must be rejected");
 
-    assert!(error.contains("\"cache_ttl_second\""), "{error}");
-    assert!(error.contains("\"tls_no_verfy\""), "{error}");
-    assert!(error.contains("supported keys"), "{error}");
+    assert!(error.contains("\"config.cache_ttl_second\""), "{error}");
+    assert!(error.contains("\"config.tls_no_verfy\""), "{error}");
+    assert!(
+        error.contains("did you mean `cache_ttl_seconds`?"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1872,8 +1875,8 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     for (config, field, reason) in [
         (
             json!({token: true}),
-            "supported keys",
-            "unsupported configuration key",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (json!({"spec_url": token}), "`spec_url`", "not a valid URL"),
         (

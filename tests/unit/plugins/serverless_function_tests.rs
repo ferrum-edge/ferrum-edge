@@ -6978,13 +6978,13 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         ),
         (
             json!({token: true}),
-            "serverless_function",
-            "unknown configuration field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"provider": null, token: null}),
-            "serverless_function",
-            "unknown configuration field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"provider": token}),

@@ -266,12 +266,12 @@ fn reject_unknown_keys(config: &serde_json::Map<String, Value>) -> Result<(), St
         "hide_credentials",
         "algorithm",
     ];
-    for key in config.keys() {
-        if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("jwt_auth: unknown config key {key:?}"));
-        }
-    }
-    Ok(())
+    crate::util::unknown_keys::reject_unknown_keys(
+        config,
+        "config",
+        &KNOWN_KEYS,
+        "jwt_auth: `config`: ",
+    )
 }
 
 #[async_trait]

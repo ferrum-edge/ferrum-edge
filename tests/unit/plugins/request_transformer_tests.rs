@@ -1558,9 +1558,9 @@ async fn test_request_transformer_rejects_unknown_top_level_key() {
     }))
     .err()
     .expect("expected error for unknown top-level key");
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("runtime_overlay_scpoe"), "got: {err}");
-    assert!(err.contains("under `config`"), "got: {err}");
+    assert!(err.contains("`config`: unknown"), "got: {err}");
 }
 
 #[tokio::test]
@@ -1578,7 +1578,7 @@ async fn test_request_transformer_rejects_unknown_header_rule_key() {
     }))
     .err()
     .expect("expected error for unknown header rule key");
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("vaule"), "got: {err}");
     assert!(err.contains("config.rules[0]"), "got: {err}");
 }
@@ -2618,7 +2618,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({"rules": [{token: true}]}),
             "`config.rules[0]`",
-            "unknown config key",
+            "unknown configuration key",
         ),
         (
             json!({"rules": [{"target": 918273641}]}),

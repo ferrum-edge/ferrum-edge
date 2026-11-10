@@ -259,12 +259,12 @@ fn test_pricing_constructor_diagnostics_render_without_document_content() {
         (
             json!({"bandwidth_pricing": {(hostile): true}}),
             "`bandwidth_pricing`",
-            "unknown key",
+            "unknown configuration key(s)",
         ),
         (
             json!({"stream_connection_pricing": {(hostile): 918273641}}),
             "`stream_connection_pricing`",
-            "unknown key",
+            "unknown configuration key(s)",
         ),
         (
             json!({"pricing_tiers": [hostile]}),
@@ -584,7 +584,7 @@ fn test_bandwidth_pricing_rejects_unknown_key() {
         }
     });
     let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
-    assert!(err.contains("unknown key"));
+    assert!(err.contains("unknown configuration key"));
 }
 
 /// GHSA-8478: misspelled top-level pricing dimensions and unknown
