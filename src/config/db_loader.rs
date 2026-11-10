@@ -2319,6 +2319,36 @@ impl DatabaseStore {
         Ok(associations)
     }
 
+    /// One proxy's junction rows inside an open transaction. Deployment
+    /// preservation needs a single proxy's associations; loading the whole
+    /// namespace's junction while holding the admission row, change lock and
+    /// lease was redundant work (issue #7209).
+    async fn load_proxy_plugin_associations_for_proxy_tx(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        operation: &str,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<Vec<PluginAssociation>, anyhow::Error> {
+        let sql = self.q(
+            "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE namespace = ? AND proxy_id = ?",
+        );
+        let rows: Vec<AnyRow> = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(proxy_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| {
+                Self::proxy_plugin_association_query_error(operation, Some(namespace), e)
+            })?;
+
+        let mut associations = HashMap::with_capacity(1);
+        for row in &rows {
+            Self::push_proxy_plugin_association_row(&mut associations, row, operation)?;
+        }
+        Ok(associations.remove(proxy_id).unwrap_or_default())
+    }
+
     async fn load_proxy_plugin_associations_for_proxy_ids(
         &self,
         namespace: &str,
@@ -11239,17 +11269,15 @@ impl DatabaseStore {
         // rebuilt and hand-added links have survived the replacement.
         let (old_plugins, new_plugins) = if table == "proxies" {
             let previous = previous_proxy.ok_or(DeploymentGraphInvalid)?;
-            let mut associations = self
-                .load_proxy_plugin_associations_for_namespace_tx(
+            let associations = self
+                .load_proxy_plugin_associations_for_proxy_tx(
                     &previous.namespace,
+                    &previous.id,
                     "deployment preservation",
                     tx,
                 )
                 .await?;
-            (
-                previous.plugins.clone(),
-                associations.remove(&previous.id).unwrap_or_default(),
-            )
+            (previous.plugins.clone(), associations)
         } else {
             (Vec::new(), Vec::new())
         };
