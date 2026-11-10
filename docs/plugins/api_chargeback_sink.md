@@ -1038,25 +1038,21 @@ never evictable. Eviction applies the same ownership and stale-age test as
 reconciliation, so it can reclaim a crash-left temp but never unlink a peer
 generation's in-progress publish.
 
-### Migration and destination changes
+### Destination changes
 
 Ferrum never silently replays records it does not own to a newly configured
-destination. Two shapes are recognized and reported instead:
+destination. An **orphaned namespace** — a sibling `o<owner_digest>` directory
+left behind when the Ferrum namespace/ledger, ClickHouse endpoint, database, or
+table changed while the node id and plugin config id stayed the same — is
+reported instead.
 
-- **Pre-namespace (legacy) records** written directly under
-  `<spool.dir>/<node>/<YYYYMMDD>/`, which carry no ownership binding.
-- **Orphaned namespaces**: a sibling `o<owner_digest>` directory left behind when
-  the Ferrum namespace/ledger, ClickHouse endpoint, database, or table changed
-  while the node id and plugin config id stayed the same.
-
-Both are counted when the managed namespace is prepared (process start, or the
+Its records are counted when the managed namespace is prepared (process start, or the
 first tick after storage recovers) into `spool.unbound_files` /
 `spool.unbound_namespaces` in the status JSON, exported as
 `chargeback_sink_spool_unbound_files` and
 `chargeback_sink_spool_unbound_namespaces`, and logged with a rate-limited
 warning naming the counts and directories. The aggregate discovery pass shares
-one 100,000-entry traversal budget across the legacy tree and every sibling
-namespace; if that cap is reached, the warning sets `scan_truncated=true` and
+one 100,000-entry traversal budget across every sibling namespace; if that cap is reached, the warning sets `scan_truncated=true` and
 the exported counts are explicit lower bounds rather than performing unbounded
 work on a shared volume. They are **never** replayed, deleted, evicted, or
 rerouted. Reconciling them is an explicit operator action: either re-point the
