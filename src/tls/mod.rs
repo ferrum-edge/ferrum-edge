@@ -2438,9 +2438,16 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        crate::fips::base_crypto_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        // rustls asks on every ClientHello. The base provider is fixed at
+        // compile time, so resolve its schemes once instead of building a
+        // provider (and its suite and group `Vec`s) per handshake.
+        static SCHEMES: std::sync::LazyLock<Vec<rustls::SignatureScheme>> =
+            std::sync::LazyLock::new(|| {
+                crate::fips::base_crypto_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            });
+        SCHEMES.clone()
     }
 }
 
