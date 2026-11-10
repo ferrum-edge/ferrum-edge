@@ -4254,7 +4254,7 @@ pub struct EastWestGateway {
 /// Each DestinationRule targets a service host and carries connection pool
 /// settings, outlier detection, load balancer config, and optional subsets.
 /// The mesh runtime applies these onto matching `Upstream` entries during
-/// `prepare_gateway_config_for_mesh()`.
+/// mesh config preparation (`apply_destination_rules`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshDestinationRule {
     pub name: String,
