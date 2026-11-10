@@ -1,17 +1,15 @@
 //! SPIFFE Workload API gRPC client.
 //!
 //! Speaks to a SPIRE agent (or any other Workload API server) over a Unix
-//! domain socket. The default socket path follows the SPIFFE convention:
-//! `/run/spire/agent/agent.sock`. Operators may override via
-//! `FERRUM_MESH_WORKLOAD_API_SOCKET`.
+//! domain socket. The socket path is supplied by the caller (the mesh runtime
+//! uses `FERRUM_MESH_SPIRE_AGENT_SOCKET`, default
+//! `ca::spire::DEFAULT_SPIRE_AGENT_SOCKET`).
 //!
 //! The client exposes:
 //! - [`WorkloadApiClient::fetch_x509_svid_stream`] — long-lived stream
 //!   returning fresh [`SvidBundle`] values through a capacity-one /
 //!   latest-wins relay (slow consumers coalesce to newest state) plus a
 //!   oneshot that fires when the first bundle is ready.
-//! - [`WorkloadApiClient::fetch_x509_svid_once`] — convenience helper that
-//!   returns the FIRST bundle from the stream and drops the connection.
 
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
@@ -41,7 +39,8 @@ use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
 use std::collections::BTreeMap;
 
-/// Default Unix-socket path used when `FERRUM_MESH_WORKLOAD_API_SOCKET` is unset.
+/// Default Unix-socket path used by `FetchLoopConfig::default()`. The mesh
+/// runtime always supplies `FERRUM_MESH_SPIRE_AGENT_SOCKET` instead.
 pub const DEFAULT_WORKLOAD_API_SOCKET: &str = "/run/spire/agent/agent.sock";
 
 /// SPIFFE Workload API security header. Per the SPIFFE Workload Endpoint spec
@@ -227,17 +226,6 @@ impl WorkloadApiClient {
         });
 
         (out_rx.into_stream(), notify_rx)
-    }
-
-    /// Helper for callers that just want to grab the first SvidBundle and
-    /// move on. Production paths should keep the stream open and consume
-    /// rotations via [`fetch_x509_svid_stream`](Self::fetch_x509_svid_stream).
-    pub async fn fetch_x509_svid_once(&mut self) -> Result<SvidBundle, WorkloadApiClientError> {
-        let (mut stream, _) = self.fetch_x509_svid_stream(None).await?;
-        stream
-            .next()
-            .await
-            .ok_or_else(|| WorkloadApiClientError::Rpc("stream closed before first SVID".into()))?
     }
 
     /// Open the streaming `FetchJWTBundles` RPC and decode each response into

@@ -165,7 +165,6 @@ pub mod refusal {
     pub const FILESYSTEM_DATA_SOURCE: &str = "filesystem_data_source";
     pub const UNSUPPORTED_PEER_IDENTITY_MATCHER: &str = "unsupported_peer_identity_matcher";
     pub const UNPARSABLE_CLUSTER_NAME: &str = "unparsable_cluster_name";
-    pub const RESERVED_ENVOY_CLUSTER: &str = "reserved_envoy_cluster";
     pub const INBOUND_CLUSTER_NOT_MAPPED: &str = "inbound_cluster_not_mapped";
     pub const SUBSET_CLUSTER_UNSUPPORTED: &str = "subset_cluster_unsupported";
     pub const NON_KUBERNETES_SERVICE_HOST: &str = "non_kubernetes_service_host";

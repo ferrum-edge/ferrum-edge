@@ -13,7 +13,7 @@
 //! `resourceVersion` bump, or an ACME/Azure/managed version id for identical
 //! bytes, must not churn the SVID slot or backend pools.
 //!
-//! Three properties are load-bearing and must survive any refactor:
+//! Four properties are load-bearing and must survive any refactor:
 //!
 //! 1. **Generations never mix.** A change on any one source triggers one
 //!    reload of *all three* through

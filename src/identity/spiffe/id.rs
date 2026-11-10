@@ -26,9 +26,9 @@ use std::str::FromStr;
 
 use super::trust_domain::{TrustDomain, TrustDomainError};
 
-/// Maximum total length of a SPIFFE ID URI. Aligns with the spec's reference
-/// identifier limit (2048 bytes) but we cap it tighter so URI SAN encoding
-/// stays comfortably below any 4 KiB X.509 extension boundaries.
+/// Maximum total length of a SPIFFE ID URI: the spec's reference identifier
+/// limit (2048 bytes), which keeps URI SAN encoding comfortably below any
+/// 4 KiB X.509 extension boundaries.
 pub const MAX_SPIFFE_ID_LEN: usize = 2048;
 
 /// A validated SPIFFE ID.

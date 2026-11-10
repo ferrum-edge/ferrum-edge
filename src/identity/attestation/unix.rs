@@ -267,9 +267,3 @@ fn binary_fingerprint_linux(pid: i32) -> Result<Option<String>, AttestError> {
     }
     Ok(Some(hex::encode(hasher.finalize())))
 }
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-fn binary_fingerprint_linux(_pid: i32) -> Result<Option<String>, AttestError> {
-    Ok(None)
-}

@@ -1,9 +1,8 @@
 //! Ferrum's own internal certificate authority.
 //!
-//! Loads a root cert + key from disk (or via the existing `_VAULT` / `_AWS` /
-//! `_AZURE` / `_GCP` / `_FILE` / `_ENV` secret-resolution suffixes — the
-//! suffix machinery rewrites the named env var BEFORE we read it, so we
-//! simply read whatever is present at startup) and signs SVIDs against it.
+//! Built from an in-memory root cert + key (today only the dev bootstrap root
+//! from `bootstrap_dev_root`; no env var imports an external root) and signs
+//! SVIDs against it.
 //!
 //! ## Responsibilities
 //!
@@ -35,7 +34,6 @@ use rcgen::{
 };
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
-use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -44,8 +42,7 @@ use super::{
     SignedSvid,
 };
 use crate::identity::jwt_svid::{
-    DEFAULT_JWT_KEY_LIFETIME_SECS, JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig,
-    SharedJwtSvidSigner,
+    JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig, SharedJwtSvidSigner,
 };
 use crate::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
 use zeroize::Zeroizing;
@@ -97,42 +94,6 @@ pub struct InternalCaConfig {
     /// configured. Dev/test only — it breaks restart and multi-replica
     /// continuity, so it is never a default.
     pub allow_ephemeral_jwt_key: bool,
-}
-
-impl InternalCaConfig {
-    /// Convenience: load PEM-encoded root cert + key from two file paths.
-    pub fn from_paths(
-        cert_path: impl AsRef<Path>,
-        key_path: impl AsRef<Path>,
-        trust_domain: TrustDomain,
-    ) -> Result<Self, CaError> {
-        let root_cert_pem = std::fs::read_to_string(&cert_path).map_err(|e| {
-            CaError::Config(format!(
-                "failed to read root cert '{}': {}",
-                cert_path.as_ref().display(),
-                e
-            ))
-        })?;
-        let root_key_pem = std::fs::read_to_string(&key_path).map_err(|e| {
-            CaError::Config(format!(
-                "failed to read root key '{}': {}",
-                key_path.as_ref().display(),
-                e
-            ))
-        })?;
-        Ok(Self {
-            root_cert_pem,
-            root_key_pem,
-            trust_domain,
-            bundle_refresh_hint_secs: None,
-            default_svid_ttl_secs: DEFAULT_SVID_TTL_SECS,
-            max_svid_ttl_secs: MAX_SVID_TTL_SECS,
-            jwt_signing_key_pem: None,
-            jwt_retired_key_pems: Vec::new(),
-            jwt_key_lifetime_secs: DEFAULT_JWT_KEY_LIFETIME_SECS,
-            allow_ephemeral_jwt_key: false,
-        })
-    }
 }
 
 /// Internal CA implementing [`CertificateAuthority`].
@@ -533,8 +494,8 @@ fn ca_issue_error_marks_unhealthy(error: &CaError) -> bool {
     )
 }
 
-/// `rand` 0.10 is a dev dep but not a runtime dep here. We use the system
-/// random source available via `ring` (already in our deps).
+/// Random positive serial from the system random source via
+/// `crate::fips::backend::rand` (ring, or AWS-LC under the `fips` feature).
 ///
 /// RFC 5280 §4.1.2.2 requires serial numbers to be positive ASN.1 INTEGERs.
 /// The DER encoding of an INTEGER is sign-bit-sensitive: a high MSB makes
@@ -558,11 +519,6 @@ fn rand_u64() -> u64 {
         static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x7fff_ffff_ffff_ffff
     }
-}
-
-/// Convenience wrapper that returns the internal CA as a [`SharedCa`].
-pub fn shared_internal_ca(config: InternalCaConfig) -> Result<Arc<InternalCa>, CaError> {
-    Ok(Arc::new(InternalCa::new(config)?))
 }
 
 fn issued_cert_not_after(leaf_der: &[u8]) -> Result<DateTime<Utc>, CaError> {

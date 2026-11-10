@@ -1101,6 +1101,11 @@ fn remove_pin_if_present(pin_path: &str) -> Result<(), String> {
     }
 }
 
+/// aya identifies interfaces by C string; reject names with an interior NUL.
+fn interface_cstring(iface: &str) -> Result<CString, String> {
+    CString::new(iface).map_err(|_| format!("Interface name '{iface}' contains a NUL byte"))
+}
+
 /// Live-kernel verification (GAP-2M / connect-side datapath).
 ///
 /// These tests need a real Linux >= 5.7 kernel with cgroup v2 + bpffs and
@@ -1108,11 +1113,6 @@ fn remove_pin_if_present(pin_path: &str) -> Result<(), String> {
 /// `ebpf-live` CI job. CI sets `FERRUM_LIVE_TESTS_REQUIRED=1`, so prerequisite
 /// gaps fail there instead of passing as skips; local ad-hoc runs still
 /// self-skip when the kernel lacks the prerequisites.
-/// aya identifies interfaces by C string; reject names with an interior NUL.
-fn interface_cstring(iface: &str) -> Result<CString, String> {
-    CString::new(iface).map_err(|_| format!("Interface name '{iface}' contains a NUL byte"))
-}
-
 #[cfg(test)]
 mod live_kernel_tests {
     use super::AyaEbpfBackend;
@@ -1319,7 +1319,7 @@ mod live_kernel_tests {
     ///   capture-config round trip that gates the whole datapath.
     ///
     /// End-to-end packet steering is covered separately by
-    /// [`ingress_redirect_steers_a_real_tcp_flow_into_the_capture_listener`].
+    /// [`run_tc_ingress_redirect_datapath_phase`].
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn run_tc_ingress_redirect_lifecycle_phase() {
         use ferrum_ebpf_common::{

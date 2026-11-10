@@ -10,9 +10,8 @@
 //!
 //! This bridge runs inside the **mesh-proxy** (node-waypoint topology). It
 //! opens the pinned maps by path and mirrors their records into the
-//! [`NodeWaypointIdentityResolver`], giving `record_orig_dst4`/
-//! `record_orig_dst6` their first production caller (before this they had no
-//! caller and the resolver's cookie map was always empty).
+//! [`NodeWaypointIdentityResolver`]; it is the production caller of
+//! `record_orig_dst4`/`record_orig_dst6`.
 //!
 //! ## Connect-side vs accept-side cookie (GAP-2M bridge)
 //!
@@ -32,12 +31,12 @@
 //! lookup resolves the source identity without any change to this module.
 //!
 //! **Verification status:** CI compile-checks the kernel program
-//! (`build-ebpf`) and loads + attaches it on a real ≥5.7 kernel (`ebpf-live`).
-//! The full connect→capture→accept datapath (which would confirm the tuple
-//! byte-order and end-to-end resolution) is not exercised by CI and remains a
-//! live multi-pod-node verification step. A tuple/byte-order mismatch fails
-//! closed (no accept-side record written), never misattributes identity, so
-//! the unverified path is safe-by-construction. Pod-identity enrollment into
+//! (`build-ebpf`), loads + attaches it on a real ≥5.7 kernel and asserts a
+//! stamped `FERRUM_ORIG_DST4` record for a captured connection (`ebpf-live`),
+//! and exercises the multi-pod NodeWaypoint datapath in the
+//! `node-waypoint-ebpf-live` gate. A tuple/byte-order mismatch fails closed
+//! (no accept-side record written), never misattributes identity. Pod-identity
+//! enrollment into
 //! `identities_by_pod_uid` is wired: the resolver lazily enrolls
 //! `pod_uid` → identity by hash-joining the eBPF-stamped
 //! `(pod_uid, workload_spiffe_hash)` against the slice's

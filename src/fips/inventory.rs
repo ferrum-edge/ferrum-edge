@@ -44,7 +44,8 @@ pub enum Disposition {
     ModuleRoutable,
     /// Security-relevant, and *not* yet routed through the seam. Each of these
     /// must be moved onto the module or explicitly rejected before a FIPS
-    /// deployment claim is possible. See `docs/fips.md` §"Residual work".
+    /// deployment claim is possible. The register is asserted empty (see
+    /// `docs/fips.md` §"Source-level crypto inventory").
     PendingClassification,
     /// Cannot reach the module, and FIPS mode refuses the configuration that
     /// would perform it.
@@ -191,10 +192,11 @@ pub const INVENTORY: &[CryptoOperation] = &[
         rationale: "dimpl selects the aws-lc-rs backend for key agreement, signing, hashing, and \
                     record AEAD, so cargo feature unification does route those primitives onto \
                     the module — but its *random* values come from the `rand` crate's thread RNG \
-                    (src/rng.rs `SeededRng`), not the module DRBG that its own \
-                    crypto/aws_lc_rs/random.rs exposes. The DTLS handshake `Random` (src/types.rs, \
-                    both engines), the DTLS 1.2 HelloVerifyRequest cookie secret, and the DTLS 1.2 \
-                    explicit AES-GCM record nonce are all drawn that way, and docs/fips.md places \
+                    (dimpl's src/rng.rs `SeededRng`), not the module DRBG that its own \
+                    crypto/aws_lc_rs/random.rs exposes. The DTLS handshake `Random` (dimpl's \
+                    src/types.rs, both engines), the DTLS 1.2 HelloVerifyRequest cookie secret, \
+                    and the DTLS 1.2 explicit AES-GCM record nonce are all drawn that way, and \
+                    docs/fips.md places \
                     the DRBG inside the module boundary. Rather than claim a coverage this build \
                     cannot back, fips::policy refuses every DTLS surface — frontend \
                     FERRUM_DTLS_CERT_PATH/KEY_PATH, `backend_scheme: dtls` stream proxies, and \
@@ -500,7 +502,7 @@ pub const INVENTORY: &[CryptoOperation] = &[
     },
     CryptoOperation {
         operation: "WebSocket Sec-WebSocket-Accept SHA-1 digest",
-        location: "vendor/tungstenite (RFC 6455 handshake)",
+        location: "vendor/tungstenite-0.29.0-ferrum-patched (RFC 6455 handshake)",
         implementation: "sha1",
         disposition: Disposition::OutsideBoundary,
         rationale: "RFC 6455 defines this as a cache-poisoning guard over a fixed public GUID, \
