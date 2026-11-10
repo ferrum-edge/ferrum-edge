@@ -304,8 +304,9 @@ that same baseline. Thus one path, but never both, owns each pending delta.
 The periodic queue attempt may still be in flight during reload, but it uses
 the same event IDs as the durable spool rows, so aborting it cannot lose the
 delta and successful duplicate delivery cannot double-charge it. Repeated
-finalization is idempotent, and record hooks arriving after admission closes
-are ignored.
+finalization is idempotent. A record hook that arrives after admission closes
+(a request that outlived its generation) is not accumulated or spooled; each
+one is counted on `chargeback_sink_snapshot_late_charges_dropped_total`.
 
 Spool write failure leaves the generation unfinalized. After the bounded
 finalization deadline the sink reduces failed generations to a compact recovery

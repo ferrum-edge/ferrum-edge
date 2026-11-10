@@ -8025,6 +8025,51 @@ fn snapshot_cardinality_overflow_bounds_entries_and_preserves_protocol_dimension
     assert_eq!(events[1].protocol, "ws");
 }
 
+/// Issue #7112: a billable record hook that runs after its snapshot generation
+/// closed admission (a request that outlived a reload or shutdown) cannot be
+/// accumulated or spooled, so it is counted instead of vanishing silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_charges_after_admission_closes_are_counted() {
+    use ferrum_edge::_test_support::api_chargeback_sink_finalize_snapshot_for_test;
+
+    const LATE: &str = "chargeback_sink_snapshot_late_charges_dropped_total";
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("late-charge-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let before = prometheus_counter(&render_prometheus(), LATE);
+    plugin.log(&billable_summary("admitted-charge")).await;
+    assert_eq!(
+        prometheus_counter(&render_prometheus(), LATE),
+        before,
+        "an admitted charge is accumulated, not counted as late"
+    );
+
+    assert!(
+        api_chargeback_sink_finalize_snapshot_for_test(&plugin)
+            .await
+            .is_some(),
+        "finalization closes snapshot admission"
+    );
+    plugin.log(&billable_summary("late-charge")).await;
+    plugin.log(&billable_summary("late-charge-2")).await;
+    assert_eq!(
+        prometheus_counter(&render_prometheus(), LATE),
+        before + 2,
+        "every billable hook after admission closed is counted"
+    );
+    drop(plugin);
+}
+
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn repeated_reload_under_permanent_spool_failure_bounds_full_generations() {

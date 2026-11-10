@@ -2698,6 +2698,10 @@ struct SinkMetrics {
     snapshot_overflow_spooled_total: SinkCounter,
     snapshot_overflow_pending_total: SinkCounter,
     snapshot_cardinality_rejections_total: SinkCounter,
+    /// Snapshot charges whose record hook ran after this generation closed
+    /// snapshot admission (reload retirement or shutdown), so they were never
+    /// accumulated or spooled (issue #7112).
+    snapshot_late_charges_dropped_total: SinkCounter,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
@@ -2736,6 +2740,7 @@ impl Default for SinkMetrics {
             snapshot_overflow_spooled_total: SinkCounter::default(),
             snapshot_overflow_pending_total: SinkCounter::default(),
             snapshot_cardinality_rejections_total: SinkCounter::default(),
+            snapshot_late_charges_dropped_total: SinkCounter::default(),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
@@ -2799,6 +2804,8 @@ impl SinkMetrics {
             Some(&process.snapshot_overflow_pending_total);
         metrics.snapshot_cardinality_rejections_total.process =
             Some(&process.snapshot_cardinality_rejections_total);
+        metrics.snapshot_late_charges_dropped_total.process =
+            Some(&process.snapshot_late_charges_dropped_total);
         metrics.failure_reasons.network.process = Some(&process.failure_reasons.network);
         metrics.failure_reasons.http_4xx.process = Some(&process.failure_reasons.http_4xx);
         metrics.failure_reasons.http_5xx.process = Some(&process.failure_reasons.http_5xx);
@@ -3816,9 +3823,11 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
                 match lifecycle
                     .accumulator
                     .record_http(summary, consumer, outcome, charge)
@@ -3868,9 +3877,11 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
                 match lifecycle
                     .accumulator
                     .record_stream(summary, consumer, charge)
@@ -3919,9 +3930,11 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
                 match lifecycle
                     .accumulator
                     .record_websocket(summary, consumer, charge)
@@ -4334,6 +4347,9 @@ fn render_prometheus_for_sinks(
     let snapshot_cardinality_rejections = process
         .snapshot_cardinality_rejections_total
         .load(Ordering::Relaxed);
+    let snapshot_late_charges_dropped = process
+        .snapshot_late_charges_dropped_total
+        .load(Ordering::Relaxed);
     let mut any_snapshot = false;
 
     for runtime in sinks.values() {
@@ -4498,6 +4514,7 @@ fn render_prometheus_for_sinks(
         || snapshot_overflow_spooled > 0
         || snapshot_overflow_pending > 0
         || snapshot_cardinality_rejections > 0
+        || snapshot_late_charges_dropped > 0
     {
         output.push_str("# HELP chargeback_sink_snapshot_entries Snapshot accumulator identities retained in memory.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_entries gauge\n");
@@ -4528,6 +4545,12 @@ fn render_prometheus_for_sinks(
         output.push_str(&format!(
             "chargeback_sink_snapshot_cardinality_rejections_total {}\n",
             snapshot_cardinality_rejections
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_late_charges_dropped_total Snapshot charges dropped because their record hook ran after the generation closed snapshot admission (reload retirement or shutdown).\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_late_charges_dropped_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_late_charges_dropped_total {}\n",
+            snapshot_late_charges_dropped
         ));
     }
     output.push_str(
@@ -16418,6 +16441,18 @@ fn metadata_value<MS: std::hash::BuildHasher>(
 /// exhausted, the exact event is staged in the accumulator's bounded overflow
 /// instead; only when durable handoff *and* bounded staging both fail is a
 /// genuine cardinality loss recorded.
+/// Count a snapshot charge whose record hook ran after its generation closed
+/// snapshot admission. The generation's terminal delta has already been (or is
+/// being) finalized, so the charge is neither accumulated nor spooled; this
+/// fixed-cardinality counter is the only trace of it (issue #7112).
+fn record_late_snapshot_charge(lifecycle: &SnapshotLifecycle) {
+    lifecycle
+        .runtime
+        .metrics
+        .snapshot_late_charges_dropped_total
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEvent) {
     let runtime = &lifecycle.runtime;
     let metrics = &runtime.metrics;
