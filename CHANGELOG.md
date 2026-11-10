@@ -642,6 +642,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left an earlier rule's (or the operator's) `hash_on` in place, which still
   produced a per-request hash strategy; the upstream-level projection now
   clears it, as the per-port projection already did.
+- **One ServiceEntry with a long host no longer fails every EgressGateway
+  slice apply** (issue #7234). The EgressGateway proxy/upstream ids embed the
+  ServiceEntry namespace, name and host through an expanding encoder and had
+  no length check, so a long but valid host produced an id over the 254-byte
+  resource id limit and the whole slice was rejected (last-good retained, or
+  no start). That host/port is now skipped with a warning, without claiming
+  its stream listen port, and the other entries still materialize.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

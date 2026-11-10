@@ -12963,14 +12963,17 @@ fn build_http_egress_for_entry(
             continue;
         }
 
-        materialized_http_hosts.insert(host.clone());
-
         let upstream_id =
             mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port_spec.port);
+        let proxy_id = mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
+        if !egress_resource_ids_fit(entry, &proxy_id, &upstream_id) {
+            continue;
+        }
+
+        materialized_http_hosts.insert(host.clone());
 
         upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
 
-        let proxy_id = mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
         let proxy = egress_gateway_proxy(
             &proxy_id,
             host,
@@ -13108,22 +13111,28 @@ fn build_stream_egress_for_entry(
         return;
     }
 
-    materialized_stream_ports.insert(port_spec.port);
-
     let upstream_id = mesh_egress_upstream_id(
         &entry.namespace,
         &entry.name,
         representative_host,
         port_spec.port,
     );
-    upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
-
     let proxy_id = mesh_egress_proxy_id(
         &entry.namespace,
         &entry.name,
         representative_host,
         port_spec.port,
     );
+    // Checked before the port is claimed, so a skipped entry does not block a
+    // valid ServiceEntry on the same listen_port.
+    if !egress_resource_ids_fit(entry, &proxy_id, &upstream_id) {
+        return;
+    }
+
+    materialized_stream_ports.insert(port_spec.port);
+
+    upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
+
     let proxy = stream_egress_gateway_proxy(
         &proxy_id,
         representative_host,
@@ -13540,6 +13549,29 @@ fn stream_egress_gateway_proxy(
         updated_at: now,
         pending_limit_scope: None,
     }
+}
+
+/// Whether an EgressGateway proxy/upstream id pair fits the runtime resource-id
+/// bound. The ids embed the ServiceEntry namespace, name and host through an
+/// expanding encoder and do not start with `__mesh`, so
+/// `validate_runtime_resource_ids` applies `MAX_ID_LENGTH` to them: one
+/// over-long id would fail the whole slice apply. An entry host/port whose ids
+/// do not fit is skipped with a warning instead, like an over-long
+/// NodeWaypoint UDP listener id.
+fn egress_resource_ids_fit(entry: &ServiceEntry, proxy_id: &str, upstream_id: &str) -> bool {
+    let max = crate::config::types::MAX_ID_LENGTH;
+    if proxy_id.len() <= max && upstream_id.len() <= max {
+        return true;
+    }
+    warn!(
+        service_entry = %sanitize_startup_scalar(entry.name.to_string()),
+        namespace = %sanitize_startup_scalar(entry.namespace.to_string()),
+        field = "hosts[]",
+        "Skipping egress ServiceEntry host/port: its generated EgressGateway proxy/upstream id \
+         would exceed the resource id length limit. Shorten the ServiceEntry namespace, name \
+         or host"
+    );
+    false
 }
 
 fn mesh_egress_proxy_id(namespace: &str, name: &str, host: &str, port: u16) -> String {

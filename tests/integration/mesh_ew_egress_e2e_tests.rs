@@ -1114,6 +1114,107 @@ fn egress_gateway_materialises_distinct_proxies_per_external_entry() {
     assert_ne!(a_proxy.id, b_proxy.id, "distinct proxy IDs per entry");
 }
 
+/// A DNS-valid external host (four 60-character labels) whose generated
+/// EgressGateway ids exceed the 254-character resource id bound once the
+/// injective id encoder expands each `.`.
+fn overlong_egress_host() -> String {
+    let label = |c: char| std::iter::repeat_n(c, 60).collect::<String>();
+    format!(
+        "{}.{}.{}.{}.com",
+        label('a'),
+        label('b'),
+        label('c'),
+        label('d')
+    )
+}
+
+fn assert_ids_fit_the_resource_id_bound(prepared: &ferrum_edge::config::types::GatewayConfig) {
+    for id in prepared
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .chain(
+            prepared
+                .upstreams
+                .iter()
+                .map(|upstream| upstream.id.as_str()),
+        )
+    {
+        assert!(id.len() <= 254, "id {id:?} exceeds the resource id bound");
+    }
+}
+
+#[test]
+fn egress_gateway_skips_a_service_entry_whose_ids_would_be_overlong() {
+    // Issue #7234: one ServiceEntry with a long host used to produce ids the
+    // runtime validator rejects, failing the whole slice apply. It is skipped
+    // instead, and the other entries still materialize.
+    let long_host = overlong_egress_host();
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries
+        .push(external_service_entry("long", &long_host, 443));
+    mesh.service_entries.push(external_service_entry(
+        "payments",
+        "payments.example.com",
+        443,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+
+    let prepared = prepare_gateway_config_for_mesh(config, &egress_runtime()).expect("prepared");
+
+    assert_ids_fit_the_resource_id_bound(&prepared);
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .all(|proxy| !proxy.hosts.contains(&long_host)),
+        "the over-long entry must not materialize"
+    );
+    assert!(
+        prepared.proxies.iter().any(|proxy| proxy
+            .hosts
+            .iter()
+            .any(|host| host == "payments.example.com")),
+        "other ServiceEntries still materialize"
+    );
+}
+
+#[test]
+fn egress_gateway_skips_an_overlong_stream_entry_without_claiming_its_port() {
+    // The skipped stream entry must not consume its listen_port: a valid
+    // ServiceEntry on the same port still gets the listener.
+    let long_host = overlong_egress_host();
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "a-long",
+        &long_host,
+        5432,
+        AppProtocol::Tcp,
+    ));
+    mesh.service_entries.push(external_stream_service_entry(
+        "b-db",
+        "db.example.com",
+        5432,
+        AppProtocol::Tcp,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+
+    let prepared = prepare_gateway_config_for_mesh(config, &egress_runtime()).expect("prepared");
+
+    assert_ids_fit_the_resource_id_bound(&prepared);
+    let stream_proxies: Vec<&str> = prepared
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.listen_port == Some(5432))
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert_eq!(stream_proxies.len(), 1, "got {stream_proxies:?}");
+    assert!(
+        stream_proxies[0].contains("db_dot_example_dot_com"),
+        "the valid entry owns the port, got {stream_proxies:?}"
+    );
+}
+
 // ── T5-A: stream-family egress materialization ───────────────────────────
 
 fn external_stream_service_entry(
