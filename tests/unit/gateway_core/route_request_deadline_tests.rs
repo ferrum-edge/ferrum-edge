@@ -358,14 +358,15 @@ fn native_http3_relays_enforce_the_route_deadline() {
         server
             .matches("optional_sleep_elapsed(route_body_sleep.as_mut())")
             .count(),
-        3,
-        "the inline, refined, and buffered-request native relays must cut on the route deadline"
+        2,
+        "the inline relay and the shared committed-response relay (refined and \
+         buffered-request paths, issue #7190) must cut on the route deadline"
     );
     assert_eq!(
         server
             .matches("Err(H3TrailerFinishError::RouteDeadline) =>")
             .count(),
-        3,
+        2,
         "every trailer-finish site must cut on the route deadline"
     );
     assert_eq!(
@@ -707,7 +708,7 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
     let bridge = include_str!("../../../src/http3/cross_protocol.rs");
 
     // DATA / trailers / FIN: the shared seam, called with the route deadline.
-    for (file, source, seams) in [("server", server, 4), ("cross_protocol", bridge, 2)] {
+    for (file, source, seams) in [("server", server, 3), ("cross_protocol", bridge, 2)] {
         let calls: Vec<&str> = source
             .split("stream_util::await_authorized_response_write(\n")
             .skip(1)
@@ -760,7 +761,7 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
     );
     assert_eq!(
         trailer_cuts.len(),
-        3,
+        2,
         "every native relay must cut a trailer/FIN route expiry"
     );
     for arm in trailer_cuts {
@@ -774,7 +775,7 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
         .split("commit_authorized_streaming_response_headers(\n")
         .skip(1)
         .collect();
-    assert_eq!(commits.len(), 3, "update the HEADERS parity table");
+    assert_eq!(commits.len(), 2, "update the HEADERS parity table");
     for commit in commits {
         let args = commit.split(".await").next().unwrap_or_default();
         assert!(args.contains("route_body_deadline,"));
@@ -790,7 +791,7 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
         .filter(|arm| arm.contains("route_deadline_cut"))
         .count();
     assert_eq!(
-        header_cuts, 3,
+        header_cuts, 2,
         "every native HEADERS route expiry must be a route cut"
     );
     for arm in &header_arms {

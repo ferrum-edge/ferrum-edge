@@ -154,6 +154,13 @@ hyper, and the returned error is the gateway's own HTTP/2 reset (neither receive
 nor raised by h2 for a backend protocol violation). A backend reset that wins that race, a
 connection failure, and an I/O failure keep their status and their health charge.
 
+An HTTP/1.1 or HTTP/2 client upload streamed to a native HTTP/3 backend is classified by the H1/H2
+relayed-upload predicate (`upload_pump::client_upload_error_fault`), not by error text (issue
+#7187): a reset or `GOAWAY` the client sent, or a reset, aborted, or broken connection, is a client
+abort; any other read failure, and an HTTP/2 stream that ended without `END_STREAM`, is a malformed
+upload (`400`). An upload over the effective request-body limit is the typed `413` on every native
+HTTP/3 path.
+
 The `client_disconnect` class alone does not select the client-abort terminal, because that class
 also marks terminals the gateway chose while the client may still be connected. Each terminal keeps
 its own status:

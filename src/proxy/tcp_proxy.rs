@@ -423,6 +423,16 @@ pub(crate) const STREAM_ERR_CLIENT_TRUST_WITHDRAWN: &str =
 /// refused connection (…)` and `No matching SNI route for connection on
 /// port …`); this prefix is the shared `StreamSetupKind::prefix` token.
 pub(crate) const STREAM_ERR_SNI_ADMISSION_REFUSED: &str = "SNI-routed stream listener";
+/// L4 `stream_match` admission refused the connection before any backend was
+/// selected (issue #7185). Display of the two production emits is the
+/// operator-stable wording (`No matching L4 stream_match proxy on port …` and
+/// `Stream proxy … stream_match denied connection on port …`); this prefix is
+/// the shared `StreamSetupKind::prefix` token both contain.
+pub(crate) const STREAM_ERR_L4_ROUTE_REFUSED: &str = "stream_match";
+/// The backend failed the write of the inspected first bytes after a
+/// successful dial (issue #7185).
+pub(crate) const STREAM_ERR_BACKEND_FIRST_BYTES_FORWARD_FAILED: &str =
+    "failed forwarding inspected first bytes to backend";
 
 /// Typed opaque-TLS SNI peek refusal. Display is the operator-stable
 /// `"SNI-routed stream listener on port {port} refused connection ({reason})"`
@@ -441,6 +451,46 @@ pub(crate) fn sni_admission_refused_error(
         ),
     )
     .into()
+}
+
+/// Typed L4 `stream_match` refusal on an `__l4_{port}` group: no candidate
+/// matched (issue #7185). Display is the operator-stable
+/// `"No matching L4 stream_match proxy on port {port}"` wording.
+pub(crate) fn no_matching_l4_route_error(port: u16) -> anyhow::Error {
+    StreamSetupError::with_message(
+        StreamSetupKind::L4RouteRefused,
+        format!("No matching L4 stream_match proxy on port {port}"),
+    )
+    .into()
+}
+
+/// Typed L4 `stream_match` refusal for a single-listener proxy whose matcher
+/// denied the connection or is uncompiled (issue #7185). Display is the
+/// operator-stable `"Stream proxy {ns}/{id} stream_match denied connection on
+/// port {port}"` wording.
+pub(crate) fn l4_stream_match_denied_error(
+    proxy_namespace: &str,
+    proxy_id: &str,
+    port: u16,
+) -> anyhow::Error {
+    StreamSetupError::with_message(
+        StreamSetupKind::L4RouteRefused,
+        format!(
+            "Stream proxy {proxy_namespace}/{proxy_id} stream_match denied connection on port {port}"
+        ),
+    )
+    .into()
+}
+
+/// Typed inspected-prefix forward failure (issue #7185). Display is the
+/// operator-stable `"failed forwarding inspected first bytes to backend: {error}"`
+/// wording; the io error stays in the source chain so the classifier derives
+/// the post-wire class from it.
+pub(crate) fn backend_first_bytes_forward_error(error: std::io::Error) -> anyhow::Error {
+    let mut setup =
+        StreamSetupError::with_colon_detail(StreamSetupKind::BackendFirstBytesForward, &error);
+    setup.source = Some(Box::new(error));
+    setup.into()
 }
 
 /// Typed unmatched-SNI refusal (valid hello, no route, no catch-all).
@@ -4073,10 +4123,7 @@ async fn handle_tcp_connection_inner(
                     // absorbs is unroutable: close rather than pick a tenant.
                     no_matching_sni_route_error(stream_ctx.listen_port)
                 } else {
-                    anyhow::anyhow!(
-                        "No matching L4 stream_match proxy on port {}",
-                        stream_ctx.listen_port
-                    )
+                    no_matching_l4_route_error(stream_ctx.listen_port)
                 }
             })?;
             stream_ctx.proxy_namespace = matched.namespace.clone();
@@ -4116,9 +4163,10 @@ async fn handle_tcp_connection_inner(
             match proxy.compiled_stream_match.as_ref() {
                 Some(matcher) if matcher.matches(&evidence) => {}
                 _ => {
-                    return Err(anyhow::anyhow!(
-                        "Stream proxy {proxy_namespace}/{proxy_id} stream_match denied connection on port {}",
-                        stream_ctx.listen_port
+                    return Err(l4_stream_match_denied_error(
+                        proxy_namespace,
+                        proxy_id,
+                        stream_ctx.listen_port,
                     ));
                 }
             }
@@ -5860,9 +5908,7 @@ async fn handle_tcp_connection_inner(
                     // ticket as a failure instead of letting the probe guard
                     // release it neutrally on drop.
                     record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
-                    return Err(anyhow::anyhow!(
-                        "failed forwarding inspected first bytes to backend: {error}"
-                    ));
+                    return Err(backend_first_bytes_forward_error(error));
                 }
             }
             prefix.len() as u64

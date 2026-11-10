@@ -1142,7 +1142,9 @@ predecessor: registry-sync is retracted before the identity change, the stale
 identity is retracted before the replacement is published, and a fresh
 registry-sync marker is bound to exactly the new UID only after the current pod
 inventory is converged. A pipeline that already knows the
-value may set `FERRUM_K8S_NODE_UID` directly, which takes precedence. If neither
+value may set `FERRUM_K8S_NODE_UID` directly, which takes precedence. The mesh
+proxy's placement reader parses it the same way: a set but empty or malformed
+value resolves no identity and never falls back to the published file. If neither
 is available the node has no identity, and every recordless host adoption stays
 fail-closed.
 

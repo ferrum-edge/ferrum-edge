@@ -602,6 +602,11 @@ pub struct StreamListenerOverloadSnapshot {
     pub dtls_demux_sessions: Vec<DtlsDemuxSessionSnapshot>,
     /// Bounded frontend-DTLS material generation and convergence status.
     pub frontend_dtls_reload: FrontendDtlsReloadStatus,
+    /// The same bounded status for the owner-scoped mesh NodeWaypoint DTLS
+    /// slot (issue #7186). Kept separate from `frontend_dtls_reload`, which is
+    /// the ordinary operator slot a mesh generation never touches, so a
+    /// rejected mesh candidate is visible without blurring the two owners.
+    pub mesh_node_waypoint_dtls_reload: FrontendDtlsReloadStatus,
     /// Number of configured stream-listener resources that are not serving
     /// after the most recent `reconcile()` — hard bind failures PLUS listeners
     /// deferred/degraded for a config reason (e.g. waiting on frontend TLS
@@ -2350,8 +2355,8 @@ impl StreamListenerManager {
             .clone()
     }
 
-    /// Bounded redacted owner-scoped DTLS reload status.
-    #[allow(dead_code)] // Test / introspection surface.
+    /// Bounded redacted owner-scoped DTLS reload status, exposed on
+    /// `/overload` as `stream_listeners.mesh_node_waypoint_dtls_reload`.
     pub fn mesh_node_waypoint_dtls_reload_status(&self) -> FrontendDtlsReloadStatus {
         (**self.mesh_node_waypoint_dtls_reload_status.load()).clone()
     }
@@ -4299,6 +4304,7 @@ impl StreamListenerManager {
             dtls_demux_sessions_total,
             dtls_demux_sessions,
             frontend_dtls_reload: self.frontend_dtls_reload_status(),
+            mesh_node_waypoint_dtls_reload: self.mesh_node_waypoint_dtls_reload_status(),
             bind_failures_total: bind_failures.len(),
             bind_failures: bind_failures.as_ref().clone(),
         }

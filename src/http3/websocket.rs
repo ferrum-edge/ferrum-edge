@@ -174,6 +174,10 @@ const H3_WS_DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
 /// while still batching small frames.
 const H3_WS_SEND_PUMP_READ_BUFFER_BYTES: usize = 16 * 1024;
 const H3_WS_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(30);
+/// Bound on the receive pump's own exit after teardown signals it (issue
+/// #7188). The pump halts the client's request direction synchronously on the
+/// signal, so this only bounds a pump parked in a duplex write.
+const H3_WS_RECV_PUMP_HALT_GRACE: Duration = Duration::from_secs(1);
 
 struct AbortOnDropJoinHandle<T = ()> {
     handle: Option<tokio::task::JoinHandle<T>>,
@@ -183,19 +187,6 @@ impl<T> AbortOnDropJoinHandle<T> {
     fn new(handle: tokio::task::JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
-        }
-    }
-
-    fn abort(&self) {
-        if let Some(handle) = &self.handle {
-            handle.abort();
-        }
-    }
-
-    async fn abort_and_wait(mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-            let _ = handle.await;
         }
     }
 }
@@ -230,7 +221,7 @@ fn classify_h3_ws_send_error(error: &h3::error::StreamError) -> retry::ErrorClas
 /// keeps it distinguishable from a transport error. Every attribution is
 /// `BackendToClient` + `Write`: the pump only carries gateway→client bytes.
 /// Takes the handle out of `send_pump` once it resolves, so the caller's
-/// later [`wait_for_h3_ws_send_pump`] is a no-op instead of a second grace.
+/// later [`wait_for_h3_ws_pump`] is a no-op instead of a second grace.
 async fn settle_h3_ws_send_pump(
     proxy_id: &str,
     send_pump: &mut AbortOnDropJoinHandle<H3WsSendPumpOutcome>,
@@ -266,12 +257,13 @@ async fn settle_h3_ws_send_pump(
     ))
 }
 
-async fn wait_for_h3_ws_send_pump<T>(
+async fn wait_for_h3_ws_pump<T>(
     proxy_id: &str,
-    mut send_pump: AbortOnDropJoinHandle<T>,
+    pump: &'static str,
+    mut pump_handle: AbortOnDropJoinHandle<T>,
     drain_grace: Duration,
 ) {
-    let Some(mut handle) = send_pump.handle.take() else {
+    let Some(mut handle) = pump_handle.handle.take() else {
         return;
     };
     if tokio::time::timeout(drain_grace, &mut handle)
@@ -280,8 +272,9 @@ async fn wait_for_h3_ws_send_pump<T>(
     {
         warn!(
             proxy_id = %proxy_id,
-            drain_grace_seconds = drain_grace.as_secs(),
-            "H3 WS send pump drain grace expired; aborting pump"
+            pump,
+            drain_grace_ms = drain_grace.as_millis() as u64,
+            "H3 WS pump drain grace expired; aborting pump"
         );
         handle.abort();
         let _ = handle.await;
@@ -1768,21 +1761,41 @@ pub(crate) async fn handle_h3_websocket(
     // shared tungstenite framer inside `run_websocket_proxy`, which unmasks
     // compliant frames and rejects unmasked ones with the same 1002 close every
     // frontend emits.
+    //
+    // The gateway ends the session cleanly (a WebSocket close, the idle
+    // window, a drain) while the client's request direction may still be
+    // open. Teardown signals `recv_close` and the pump halts that direction
+    // with `STOP_SENDING(H3_NO_ERROR)` itself (issue #7188): dropping the half
+    // instead surfaces as `STOP_SENDING(0)`, which is not an HTTP/3 code, so
+    // the client would log a reset on a successful session. A cancelled
+    // `recv_data` leaves the stream halt-able (`stream_util::halt_request_body`).
+    let (recv_close_tx, mut recv_close_rx) = tokio::sync::oneshot::channel::<()>();
     let recv_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
-        loop {
-            match h3_recv.recv_data().await {
+        let gateway_closed = loop {
+            let received = tokio::select! {
+                biased;
+                _ = &mut recv_close_rx => break true,
+                received = h3_recv.recv_data() => received,
+            };
+            match received {
                 Ok(Some(chunk)) => {
                     let bytes = buf_into_bytes(chunk);
                     if bytes.is_empty() {
                         continue;
                     }
-                    if let Err(e) = pump_write.write_all(&bytes).await {
+                    let written = tokio::select! {
+                        biased;
+                        _ = &mut recv_close_rx => break true,
+                        written = pump_write.write_all(&bytes) => written,
+                    };
+                    if let Err(e) = written {
                         debug!(
                             proxy_id = %proxy_id_for_pumps,
                             "H3 WS recv pump: duplex write closed: {}",
                             e
                         );
-                        break;
+                        // The framer is gone: the session ended gateway-side.
+                        break true;
                     }
                 }
                 Ok(None) => {
@@ -1790,7 +1803,7 @@ pub(crate) async fn handle_h3_websocket(
                         proxy_id = %proxy_id_for_pumps,
                         "H3 WS recv pump: end of stream"
                     );
-                    break;
+                    break false;
                 }
                 Err(e) => {
                     debug!(
@@ -1798,9 +1811,12 @@ pub(crate) async fn handle_h3_websocket(
                         "H3 WS recv pump: stream error: {}",
                         e
                     );
-                    break;
+                    break false;
                 }
             }
+        };
+        if gateway_closed {
+            crate::http3::stream_util::halt_request_body(&mut h3_recv);
         }
         // Dropping pump_write signals EOF to the WS framer reading
         // from the other duplex half.
@@ -2011,14 +2027,14 @@ pub(crate) async fn handle_h3_websocket(
     // that exchanges close frames without closing the QUIC stream
     // would leave the recv pump pinned until quinn's idle timeout
     // expires (worst case: tens of seconds). We have no more user
-    // data to forward (the WS framer is gone), so abort the pump
-    // explicitly to release the QUIC stream resources promptly.
-    // `JoinHandle::abort()` is safe — the task owns only the recv
-    // half of the QUIC stream + the duplex write half; both will be
-    // dropped cleanly.
-    recv_pump.abort();
-    recv_pump.abort_and_wait().await;
-    wait_for_h3_ws_send_pump(&proxy.id, send_pump, H3_WS_PUMP_DRAIN_GRACE).await;
+    // data to forward (the WS framer is gone), so signal the pump to halt
+    // the client's request direction with `H3_NO_ERROR` and release the
+    // QUIC stream resources promptly (issue #7188). The abort stays as the
+    // bounded fallback, so a pump that cannot observe the signal still
+    // cannot outlive the session.
+    let _ = recv_close_tx.send(());
+    wait_for_h3_ws_pump(&proxy.id, "recv", recv_pump, H3_WS_RECV_PUMP_HALT_GRACE).await;
+    wait_for_h3_ws_pump(&proxy.id, "send", send_pump, H3_WS_PUMP_DRAIN_GRACE).await;
 
     // Drop guards explicitly so their `Drop` impl runs before the
     // info!() below — keeps the "session ended" log adjacent to the
@@ -2445,7 +2461,7 @@ mod tests {
         let guard = AbortOnDropJoinHandle::new(handle);
         started_rx.await.expect("task started");
 
-        wait_for_h3_ws_send_pump("test-proxy", guard, Duration::from_millis(5)).await;
+        wait_for_h3_ws_pump("test-proxy", "send", guard, Duration::from_millis(5)).await;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while std::time::Instant::now() < deadline {

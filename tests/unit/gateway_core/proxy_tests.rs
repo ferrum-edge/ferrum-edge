@@ -4499,12 +4499,14 @@ fn test_native_h3_streaming_upload_requires_h2_end_stream() {
         "the END_STREAM check must run before the backend stream is finished"
     );
     // A post-wire error leaves the reset guard incomplete, so it cancels the
-    // backend stream; the message maps to the 499 client-disconnect arm.
+    // backend stream. A reset hyper reported as a clean end carries no proof
+    // the client left, so it is the typed incomplete-upload fault (`400`),
+    // never the `499` client-abort terminal (issue #7187).
     let refusal = &forward[gate..finish];
     assert!(
-        refusal.contains("H3PoolError::post_wire(")
-            && refusal.contains("Client disconnected while sending request body"),
-        "a masked client reset must be a post-wire client disconnect"
+        refusal.contains("H3PoolError::client_request(")
+            && refusal.contains("H3ClientRequestFault::MalformedBody"),
+        "a masked client reset must be a typed post-wire incomplete upload"
     );
 }
 

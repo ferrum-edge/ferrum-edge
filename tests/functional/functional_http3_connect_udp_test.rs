@@ -860,6 +860,27 @@ async fn functional_h3_connect_udp_closes_live_tunnels_on_route_withdrawal() {
         .await
         .expect("a withdrawn destination must tear the live tunnel down");
 
+    // Issue #7188: the client's still-open request direction is halted with
+    // `STOP_SENDING(H3_NO_ERROR)`, never the `STOP_SENDING(0)` a dropped
+    // receive half produces. The client sees the code on its next write.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let stopped = loop {
+        match tunnel.send_datagram(b"after withdrawal").await {
+            Err(error) => break error.to_string(),
+            Ok(()) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the gateway never halted the client's request direction"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    assert!(
+        stopped.contains("H3_NO_ERROR"),
+        "a clean tunnel end must halt the request direction with H3_NO_ERROR: {stopped}"
+    );
+
     // The replacement destination is now the admitted one.
     let new_url = tunnel_url(https_port, "127.0.0.1", replacement.port);
     let mut reopened = None;

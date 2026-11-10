@@ -104,6 +104,8 @@ pub enum StreamSetupKind {
     AuthorizationExpired,   // admitting credential expired during post-admission setup (client-side, health-neutral)
     ClientTrustWithdrawn,   // frontend client-cert trust withdrawn during setup (client-side, health-neutral)
     SniAdmissionRefused,    // opaque-TLS SNI listener refused before any backend dial (gateway-local)
+    L4RouteRefused,         // L4 `stream_match` admission refused before any backend dial (gateway-local)
+    BackendFirstBytesForward, // backend failed the inspected-prefix write after the dial (backend-side, post-wire)
 }
 ```
 
@@ -131,6 +133,23 @@ unchanged (`SNI-routed stream listener on port … refused connection (…)` /
 typed kind so the word `refused` in that Display cannot match the substring
 fallback's `ConnectionRefused` token. The client still sees RST. No backend is
 selected, so the circuit breaker and passive health are not charged.
+
+L4 `stream_match` admission refusals (no `__l4_{port}` candidate matched, or a
+single-listener proxy's matcher denied or is uncompiled) are the same decision
+on an L4 listener and are typed as `StreamSetupKind::L4RouteRefused` with the
+same mapping: `DispatchPolicyRejected`, `gateway_policy`, `unknown` direction,
+no breaker or passive-health charge (issue #7185). Display wording is unchanged
+(`No matching L4 stream_match proxy on port …` / `Stream proxy … stream_match
+denied connection on port …`).
+
+When a first-bytes plugin inspected a prefix on a TLS-terminating TCP
+listener, a backend that accepts the dial and then fails the prefix write is
+typed as `StreamSetupKind::BackendFirstBytesForward`: `backend_error`,
+`backend_to_client`, and a breaker failure. Bytes may already have reached the
+backend, so its class comes from the retained io error classified as post-wire
+(a reset is `ConnectionReset`, never the pre-wire `ConnectionRefused`), with
+`RequestError` when the io error is not typed. Display wording is unchanged
+(`failed forwarding inspected first bytes to backend: …`).
 
 ### UDP setup failures that never publish a session
 

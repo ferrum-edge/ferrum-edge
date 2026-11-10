@@ -6905,11 +6905,6 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
             "async fn stream_h3_open_response_to_client(",
             "async fn run_h3_grpc_upload_pump(",
         ),
-        (
-            "proxy_to_backend_h3_streaming",
-            "async fn proxy_to_backend_h3_streaming(",
-            "async fn proxy_to_backend_h3(",
-        ),
     ] {
         let region = H3_SERVER_SOURCE
             .split(marker)
@@ -6928,6 +6923,20 @@ fn every_native_h3_streaming_response_headers_write_uses_the_shared_helper() {
             "{name} still awaits send_response unbounded"
         );
     }
+    // The buffered-request streaming path writes no HEADERS of its own: it hands
+    // the committed response to the shared relay above (issue #7190).
+    let buffered_request_streaming = H3_SERVER_SOURCE
+        .split("async fn proxy_to_backend_h3_streaming(")
+        .nth(1)
+        .expect("buffered-request streaming present")
+        .split("async fn proxy_to_backend_h3(")
+        .next()
+        .expect("buffered-request streaming bounded");
+    assert!(
+        buffered_request_streaming.contains("stream_h3_open_response_to_client(")
+            && !buffered_request_streaming.contains("send_response("),
+        "the buffered-request streaming path must relay through the shared helper"
+    );
 
     let sse_writer = H3_SERVER_SOURCE
         .split("async fn send_h3_aggregate_sse_response(")

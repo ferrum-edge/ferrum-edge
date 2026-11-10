@@ -860,8 +860,9 @@ impl<S: SendStream<Bytes>> Drop for CommittedH3ResponseStream<S> {
 /// difference is that it holds `&mut RequestStream` instead of owning it, for
 /// the relays whose send half arrives as a borrow from the H3 request handler
 /// and so cannot be moved into the owning guard without re-shaping their
-/// signatures. `stream_h3_open_response_to_client` and
-/// `proxy_to_backend_h3_streaming` are those relays.
+/// signatures. `stream_h3_open_response_to_client` is that relay; the
+/// buffered-request streaming path (`proxy_to_backend_h3_streaming`) hands its
+/// response to it rather than keeping a copy (issue #7190).
 ///
 /// The terminal is a RESET unless [`Self::record_clean_finish`] proved a
 /// downstream `finish()` returned `Ok` *and* [`Self::abort_committed`] has not

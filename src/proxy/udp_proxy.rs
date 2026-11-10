@@ -172,10 +172,12 @@ pub struct UdpProxyMetrics {
     /// DTLS demux peers tracked by the frontend DTLS server. Includes peers
     /// that have not completed the handshake yet.
     pub dtls_demux_sessions: Arc<AtomicU64>,
+    // Listener-local accounting below is internal (issue #7186): it backs
+    // tests and in-process diagnostics and is not an exported Prometheus or
+    // admin metric. Operators read UDP traffic through the stream transaction
+    // summaries and `ferrum_stream_*` metrics instead.
     pub total_sessions: AtomicU64,
-    pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
-    pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
     /// Client→backend datagrams dropped because a session's bounded
     /// `on_udp_datagram` ingress queue was full or closed. Fail-closed:
@@ -2121,6 +2123,31 @@ fn is_udp_dtls_idle_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UdpDtlsIdleTimeout>().is_some()
 }
 
+/// The backend leg of a DTLS-terminating frontend session failed (a backend
+/// UDP receive error, or the backend DTLS association ended) while the client
+/// was still being served (issue #7186). Attributed `BackendError` /
+/// `BackendToClient` like the plain-UDP reply task's backend receive error; the
+/// class comes from the wrapped cause, classified post-wire.
+#[derive(Debug)]
+pub(crate) struct DtlsBackendRelayFailure(pub(crate) anyhow::Error);
+
+impl std::fmt::Display for DtlsBackendRelayFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DTLS backend receive failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for DtlsBackendRelayFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let cause: &(dyn std::error::Error + 'static) = self.0.as_ref();
+        Some(cause)
+    }
+}
+
+fn is_dtls_backend_relay_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DtlsBackendRelayFailure>().is_some()
+}
+
 struct UdpSessionSlotReservation {
     metrics: Arc<UdpProxyMetrics>,
     active: bool,
@@ -4038,7 +4065,6 @@ pub async fn start_udp_listener_holding_port(
                 #[cfg(target_os = "linux")]
                 {
                     let mut batch_dgrams_in: u64 = 0;
-                    let mut batch_bytes_in: u64 = 0;
                     let mut batch_dgrams_out: u64 = 0;
                     let mut batch_bytes_out: u64 = 0;
                     let batch_limit = adaptive_buffer.get_batch_limit(&proxy_namespace, &proxy_id);
@@ -4096,7 +4122,6 @@ pub async fn start_udp_listener_holding_port(
                                                 let end = (offset + seg).min(data.len());
                                                 let chunk = &data[offset..end];
                                                 batch_dgrams_in += 1;
-                                                batch_bytes_in += chunk.len() as u64;
 
                                                 let result = process_datagram(
                                                     chunk,
@@ -4145,7 +4170,6 @@ pub async fn start_udp_listener_holding_port(
 
                                     // Non-GRO path (single datagram).
                                     batch_dgrams_in += 1;
-                                    batch_bytes_in += data.len() as u64;
 
                                     let result = process_datagram(
                                         data,
@@ -4199,9 +4223,7 @@ pub async fn start_udp_listener_holding_port(
                             &proxy_id,
                             batch_dgrams_in,
                         );
-                        udp_count!(ListenerCounterUpdates, 4);
-                        metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
-                        metrics.bytes_in.fetch_add(batch_bytes_in, Ordering::Relaxed);
+                        udp_count!(ListenerCounterUpdates, 2);
                         metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
                         metrics.bytes_out.fetch_add(batch_bytes_out, Ordering::Relaxed);
                     }
@@ -4235,7 +4257,6 @@ pub async fn start_udp_listener_holding_port(
 
                 // Batch-local metric accumulators — flushed to atomics once per batch.
                 let mut batch_dgrams_in: u64 = 1;
-                let mut batch_bytes_in: u64 = len as u64;
                 let mut batch_dgrams_out: u64 = 0;
                 let mut batch_bytes_out: u64 = 0;
 
@@ -4355,7 +4376,6 @@ pub async fn start_udp_listener_holding_port(
                                                 let end = (offset + seg).min(data.len());
                                                 let chunk = &data[offset..end];
                                                 batch_dgrams_in += 1;
-                                                batch_bytes_in += chunk.len() as u64;
 
                                                 let result = process_datagram(
                                                     chunk,
@@ -4404,7 +4424,6 @@ pub async fn start_udp_listener_holding_port(
 
                                     // Non-GRO path (single datagram).
                                     batch_dgrams_in += 1;
-                                    batch_bytes_in += data.len() as u64;
 
                                     let result = process_datagram(
                                         data,
@@ -4481,7 +4500,6 @@ pub async fn start_udp_listener_holding_port(
                                 }
 
                                 batch_dgrams_in += 1;
-                                batch_bytes_in += len2 as u64;
 
                                 let result = process_datagram(
                                     &buf[..len2],
@@ -4532,9 +4550,7 @@ pub async fn start_udp_listener_holding_port(
                 adaptive_buffer.record_batch_cycle(&proxy_namespace, &proxy_id, batch_dgrams_in);
 
                 // Flush batched metrics to atomics once.
-                udp_count!(ListenerCounterUpdates, 4);
-                metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
-                metrics.bytes_in.fetch_add(batch_bytes_in, Ordering::Relaxed);
+                udp_count!(ListenerCounterUpdates, 2);
                 metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
                 metrics.bytes_out.fetch_add(batch_bytes_out, Ordering::Relaxed);
             }
@@ -6735,6 +6751,9 @@ pub(crate) fn dtls_disconnect_cause(
     if is_dtls_authorization_expired(error) {
         return DisconnectCause::RecvError;
     }
+    if is_dtls_backend_relay_failure(error) {
+        return DisconnectCause::BackendError;
+    }
 
     if let Some(setup_err) = find_stream_setup_error(error) {
         return setup_err.kind.disconnect_cause();
@@ -6775,6 +6794,9 @@ pub(crate) fn dtls_disconnect_direction(
     // Same client-side attribution as the setup-phase typed kind.
     if is_dtls_authorization_expired(error) {
         return Direction::ClientToBackend;
+    }
+    if is_dtls_backend_relay_failure(error) {
+        return Direction::BackendToClient;
     }
     if let Some(setup_err) = find_stream_setup_error(error) {
         return setup_err.kind.direction();
@@ -8175,11 +8197,6 @@ async fn handle_dtls_client_inner(
             let admission_datagram = first_application_datagram;
             first_application_datagram = false;
 
-            metrics_fwd.datagrams_in.fetch_add(1, Ordering::Relaxed);
-            metrics_fwd
-                .bytes_in
-                .fetch_add(len as u64, Ordering::Relaxed);
-
             // Run per-datagram plugins before forwarding. Each awaited hook is
             // itself an authorization boundary: a blocked plugin cannot commit
             // an application datagram after the credential expires.
@@ -8285,13 +8302,19 @@ async fn handle_dtls_client_inner(
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    if e != "no backend socket available" {
-                        debug!(
-                            proxy_id = %proxy_id_fwd,
-                            "DTLS client→backend send failed: {}", e
-                        );
+                    if e == "no backend socket available" {
+                        break;
                     }
-                    break;
+                    // A backend send error is per-datagram, as on plain UDP:
+                    // drop this datagram and keep the session (issue #7186).
+                    // The datagram is not counted and does not refresh idle
+                    // activity. A backend leg that is gone for good ends its
+                    // receive half, which reports the typed backend failure.
+                    debug!(
+                        proxy_id = %proxy_id_fwd,
+                        "DTLS client→backend send failed; datagram dropped: {}", e
+                    );
+                    continue;
                 }
                 Err(DtlsRelayInterrupt::TrustWithdrawn) => {
                     return Err(dtls_trust_withdrawn_error());
@@ -8334,20 +8357,25 @@ async fn handle_dtls_client_inner(
             // supervisor's abort lands.
             let received = within_dtls_trust_fence(&b2c_trust, async {
                 if let Some(ref dtls) = backend_dtls {
-                    dtls.recv().await.ok()
+                    dtls.recv().await.map(Some)
                 } else if let Some(ref sock) = backend_udp {
-                    match sock.recv(&mut buf).await {
-                        Ok(n) => Some(buf[..n].to_vec()),
-                        Err(_) => None,
-                    }
+                    sock.recv(&mut buf)
+                        .await
+                        .map(|n| Some(buf[..n].to_vec()))
+                        .map_err(anyhow::Error::from)
                 } else {
-                    None
+                    Ok(None)
                 }
             })
             .await;
             let data = match received {
-                Ok(Some(data)) => data,
-                Ok(None) => break,
+                Ok(Ok(Some(data))) => data,
+                Ok(Ok(None)) => break,
+                // The backend leg failed or its DTLS association ended while
+                // the client was still served: a backend-side termination,
+                // exactly as the plain-UDP reply task records it, never a
+                // graceful close (issue #7186).
+                Ok(Err(error)) => return Err(DtlsBackendRelayFailure(error).into()),
                 Err(DtlsTrustWithdrawn) => {
                     b2c_trust.record_fenced_once();
                     return Err(dtls_trust_withdrawn_error());
@@ -8370,11 +8398,6 @@ async fn handle_dtls_client_inner(
                 return Err(udp_datagram_policy_changed_error());
             }
             let len = data.len();
-
-            metrics_rev.datagrams_in.fetch_add(1, Ordering::Relaxed);
-            metrics_rev
-                .bytes_in
-                .fetch_add(len as u64, Ordering::Relaxed);
 
             // Amplification factor check for DTLS path — cumulative remaining
             // budget, same contract as plain UDP.

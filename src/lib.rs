@@ -5257,6 +5257,24 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::no_matching_sni_route_error(port)
     }
 
+    /// Production typed emits for the two L4 `stream_match` refusals and the
+    /// failed inspected-prefix forward (issue #7185).
+    pub fn no_matching_l4_route_error_for_test(port: u16) -> anyhow::Error {
+        crate::proxy::tcp_proxy::no_matching_l4_route_error(port)
+    }
+
+    pub fn l4_stream_match_denied_error_for_test(
+        proxy_namespace: &str,
+        proxy_id: &str,
+        port: u16,
+    ) -> anyhow::Error {
+        crate::proxy::tcp_proxy::l4_stream_match_denied_error(proxy_namespace, proxy_id, port)
+    }
+
+    pub fn backend_first_bytes_forward_error_for_test(error: std::io::Error) -> anyhow::Error {
+        crate::proxy::tcp_proxy::backend_first_bytes_forward_error(error)
+    }
+
     pub fn pre_copy_disconnect_cause_for_test(
         error: &anyhow::Error,
         class: &crate::retry::ErrorClass,
@@ -12812,6 +12830,16 @@ pub mod _test_support {
                 DtlsReplyDatagramCommitForTest::TrustWithdrawn
             }
         }
+    }
+
+    /// Classify a DTLS-frontend session that ended because its backend leg
+    /// failed, exactly as the reply task wraps the backend receive error and
+    /// the accept loop derives the disconnect summary (issue #7186).
+    pub fn dtls_backend_relay_failure_for_test(
+        cause: anyhow::Error,
+    ) -> DtlsAuthorizationExpiryForTest {
+        let error: anyhow::Error = crate::proxy::udp_proxy::DtlsBackendRelayFailure(cause).into();
+        classify_dtls_session_failure_for_test(&error, 0, crate::plugins::MetadataMap::default())
     }
 
     /// Settle a RELAY-phase DTLS authorization expiry exactly as the session
