@@ -597,6 +597,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **Mesh inbound fail-closed errors name the missing identity** (#7238). A mesh
+  inbound listener with no server identity under the default PERMISSIVE mode
+  was reported as "PERMISSIVE … would accept unauthenticated plaintext
+  alongside TLS", although no TLS was served. The warning and the
+  `FERRUM_MESH_PRODUCTION_MODE=true` startup refusal now say the listener has
+  no usable TLS server identity and list the remedies (gateway SVID files,
+  `FERRUM_MESH_CA_BACKEND`, or the frontend TLS cert and key). The STRICT
+  error lists the same three sources instead of only the frontend cert.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

@@ -19513,7 +19513,10 @@ fn load_mesh_frontend_tls(
     let Some(server_identity) = server_identity else {
         if mtls_mode == config::MtlsMode::Strict {
             return Err(anyhow::anyhow!(
-                "Mesh PeerAuthentication STRICT requires FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH"
+                "Mesh PeerAuthentication STRICT requires a TLS server identity: set \
+                 FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, \
+                 FERRUM_MESH_CA_BACKEND, or FERRUM_FRONTEND_TLS_CERT_PATH and \
+                 FERRUM_FRONTEND_TLS_KEY_PATH"
             ));
         }
         return Ok(None);
@@ -19738,6 +19741,21 @@ fn decide_mesh_inbound_fail_closed(trigger: bool, production: bool) -> MeshInbou
     }
 }
 
+/// Why a mesh inbound termination listener resolved to no `ServerConfig`
+/// (plaintext). Only DISABLE is a PeerAuthentication choice; any other mode got
+/// here because `load_mesh_frontend_tls` had no server identity to serve.
+fn mesh_inbound_plaintext_reason(mode: config::MtlsMode) -> &'static str {
+    if mode == config::MtlsMode::Disable {
+        "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE termination \
+         listener would accept unauthenticated plaintext"
+    } else {
+        "the inbound mTLS/HBONE termination listener resolved to no usable TLS server identity \
+         (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, \
+         FERRUM_MESH_CA_BACKEND, or FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would \
+         accept unauthenticated plaintext"
+    }
+}
+
 fn mesh_inbound_mode_accepts_plaintext(mode: config::MtlsMode) -> bool {
     matches!(
         mode,
@@ -19815,17 +19833,12 @@ fn enforce_mesh_inbound_fail_closed(
     // config. PERMISSIVE with a valid config historically starts in production
     // and remains TLS-only there; do not turn its optional client certificate
     // posture into a new startup failure.
-    let reason: &str = if mtls_mode == config::MtlsMode::Disable {
-        "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE termination \
-         listener would accept unauthenticated plaintext"
-    } else if mtls_mode == config::MtlsMode::Permissive {
-        "PeerAuthentication resolved to PERMISSIVE, so the inbound mTLS/HBONE termination \
-         listener would accept unauthenticated plaintext alongside TLS"
-    } else {
-        "the inbound mTLS/HBONE termination listener resolved to no usable TLS server identity \
-         (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, or \
-         FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would accept unauthenticated plaintext"
-    };
+    //
+    // The reason follows the cause. `load_mesh_frontend_tls` returns no
+    // `ServerConfig` only for DISABLE or when no server identity is available
+    // (STRICT without one is already a hard error there), so every non-DISABLE
+    // trigger here is a missing identity, whatever the mode.
+    let reason = mesh_inbound_plaintext_reason(mtls_mode);
     match decide_mesh_inbound_fail_closed(frontend_tls.is_none(), production) {
         MeshInboundFailClosed::Ok => {
             crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
@@ -38971,10 +38984,18 @@ mod tests {
         )
         .expect_err("strict mTLS must require cert and key material");
 
-        assert!(
-            err.to_string()
-                .contains("PeerAuthentication STRICT requires")
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("PeerAuthentication STRICT requires"), "{msg}");
+        for remedy in [
+            "FERRUM_GATEWAY_SVID_CERT_PATH",
+            "FERRUM_MESH_CA_BACKEND",
+            "FERRUM_FRONTEND_TLS_CERT_PATH",
+        ] {
+            assert!(
+                msg.contains(remedy),
+                "STRICT error must name {remedy}: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -39307,6 +39328,40 @@ mod tests {
             false, // dev
         )
         .expect("dev tolerates a plaintext inbound listener with a warning");
+    }
+
+    #[test]
+    fn enforce_mesh_inbound_fail_closed_blames_missing_identity_not_permissive_mode() {
+        // `load_mesh_frontend_tls` returns no ServerConfig for a non-DISABLE mode
+        // only when there is no server identity, so a PERMISSIVE trigger must name
+        // the identity remedies (including the CA backend), not claim TLS is being
+        // served alongside plaintext.
+        let runtime = test_mesh_runtime_config();
+        let err = enforce_mesh_inbound_fail_closed(
+            &runtime,
+            &EnvConfig::default(),
+            config::MtlsMode::Permissive,
+            None,
+            None,
+            true,
+        )
+        .expect_err("production must refuse a no-identity inbound termination listener");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no usable TLS server identity")
+                && msg.contains("FERRUM_GATEWAY_SVID_CERT_PATH")
+                && msg.contains("FERRUM_MESH_CA_BACKEND")
+                && msg.contains("FERRUM_FRONTEND_TLS_CERT_PATH"),
+            "refusal must name the missing identity and its remedies: {msg}"
+        );
+        assert!(
+            !msg.contains("PERMISSIVE") && !msg.contains("alongside TLS"),
+            "refusal must not blame the PeerAuthentication mode: {msg}"
+        );
+        assert!(
+            mesh_inbound_plaintext_reason(config::MtlsMode::Disable).contains("DISABLE"),
+            "DISABLE keeps its mode-specific reason"
+        );
     }
 
     #[test]
