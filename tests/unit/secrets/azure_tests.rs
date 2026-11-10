@@ -1,8 +1,7 @@
 //! Tests for Azure Key Vault secret resolution and reference grammar.
 
-use ferrum_edge::secrets::{
-    azure_apply_tls_version_option, azure_parse_keyvault_reference, resolve_secret,
-};
+use super::resolve_env_secret;
+use ferrum_edge::secrets::{azure_apply_tls_version_option, azure_parse_keyvault_reference};
 
 use crate::unit::env_lock::with_env_vars_async;
 
@@ -17,7 +16,7 @@ fn test_azure_ref_conflict_with_direct_value() {
             ),
         ],
         || async {
-            let result = resolve_secret("FERRUM_TEST_AZURE_A").await;
+            let result = resolve_env_secret("FERRUM_TEST_AZURE_A").await;
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("Multiple secret sources"));

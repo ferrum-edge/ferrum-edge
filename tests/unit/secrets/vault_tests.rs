@@ -3,13 +3,13 @@
 //! These test the reference parsing and env var detection logic.
 //! Actual Vault connectivity tests require a running Vault server.
 
-use ferrum_edge::secrets::resolve_secret;
+use super::resolve_env_secret;
 
 use crate::unit::env_lock::with_env_vars_async;
 
 #[test]
 fn test_vault_ref_detected() {
-    // When _VAULT is set, resolve_secret should detect it as a vault source
+    // When _VAULT is set, startup resolution should detect it as a vault source
     // (will fail at fetch time since no Vault server, but should not return None)
     with_env_vars_async(
         &[
@@ -18,7 +18,7 @@ fn test_vault_ref_detected() {
             ("VAULT_TOKEN", "test-token"),
         ],
         || async {
-            let result = resolve_secret("FERRUM_TEST_VAULT_A").await;
+            let result = resolve_env_secret("FERRUM_TEST_VAULT_A").await;
             // Should fail with a connection error, not return None
             assert!(result.is_err());
             let err = result.unwrap_err();
@@ -39,7 +39,7 @@ fn test_vault_ref_conflict_with_direct_value() {
             ("FERRUM_TEST_VAULT_B_VAULT", "secret/data/app#key"),
         ],
         || async {
-            let result = resolve_secret("FERRUM_TEST_VAULT_B").await;
+            let result = resolve_env_secret("FERRUM_TEST_VAULT_B").await;
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("Multiple secret sources"));
@@ -52,7 +52,7 @@ fn test_vault_missing_vault_addr() {
     with_env_vars_async(
         &[("FERRUM_TEST_VAULT_C_VAULT", "secret/data/app#key")],
         || async {
-            let result = resolve_secret("FERRUM_TEST_VAULT_C").await;
+            let result = resolve_env_secret("FERRUM_TEST_VAULT_C").await;
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("VAULT_ADDR"));
@@ -68,7 +68,7 @@ fn test_vault_missing_vault_token() {
             ("VAULT_ADDR", "http://127.0.0.1:8200"),
         ],
         || async {
-            let result = resolve_secret("FERRUM_TEST_VAULT_D").await;
+            let result = resolve_env_secret("FERRUM_TEST_VAULT_D").await;
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("VAULT_TOKEN"));
@@ -85,7 +85,7 @@ fn test_vault_invalid_reference_format() {
             ("VAULT_TOKEN", "test-token"),
         ],
         || async {
-            let result = resolve_secret("FERRUM_TEST_VAULT_E").await;
+            let result = resolve_env_secret("FERRUM_TEST_VAULT_E").await;
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("Invalid Vault KV v2 reference"));

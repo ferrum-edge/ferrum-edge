@@ -8,7 +8,8 @@
 //! `set_var` here racing a `getenv` there, which is exactly what Rust 2024's
 //! unsafe-env contract forbids.
 
-use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_secret};
+use super::resolve_env_secret;
+use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -16,44 +17,31 @@ use tempfile::NamedTempFile;
 use crate::unit::env_lock::{EnvGuard, with_env_vars_async};
 
 #[test]
-fn test_resolve_secret_from_env_var() {
-    with_env_vars_async(&[("FERRUM_TEST_SECRET_A", "my-secret-value")], || async {
-        let result = resolve_secret("FERRUM_TEST_SECRET_A").await;
-        let resolved = result.unwrap().unwrap();
-        assert_eq!(resolved.value, "my-secret-value");
-        assert_eq!(resolved.source, "env");
-    });
-}
-
-#[test]
-fn test_resolve_secret_from_file() {
+fn test_resolve_env_secret_from_file() {
     let mut tmp = NamedTempFile::new().unwrap();
     writeln!(tmp, "file-secret-value").unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
 
     with_env_vars_async(&[("FERRUM_TEST_SECRET_B_FILE", &path)], || async {
-        let result = resolve_secret("FERRUM_TEST_SECRET_B").await;
-        let resolved = result.unwrap().unwrap();
-        assert_eq!(resolved.value, "file-secret-value");
-        assert!(resolved.source.starts_with("file:"));
+        let resolved = resolve_env_secret("FERRUM_TEST_SECRET_B").await;
+        assert_eq!(resolved.unwrap().as_deref(), Some("file-secret-value"));
     });
 }
 
 #[test]
-fn test_resolve_secret_file_trims_trailing_whitespace() {
+fn test_resolve_env_secret_file_trims_trailing_whitespace() {
     let mut tmp = NamedTempFile::new().unwrap();
     write!(tmp, "secret-with-trailing  \n\n").unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
 
     with_env_vars_async(&[("FERRUM_TEST_SECRET_C_FILE", &path)], || async {
-        let result = resolve_secret("FERRUM_TEST_SECRET_C").await;
-        let resolved = result.unwrap().unwrap();
-        assert_eq!(resolved.value, "secret-with-trailing");
+        let resolved = resolve_env_secret("FERRUM_TEST_SECRET_C").await;
+        assert_eq!(resolved.unwrap().as_deref(), Some("secret-with-trailing"));
     });
 }
 
 #[test]
-fn test_resolve_secret_both_env_and_file_errors() {
+fn test_resolve_env_secret_both_env_and_file_errors() {
     let mut tmp = NamedTempFile::new().unwrap();
     writeln!(tmp, "file-value").unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
@@ -64,7 +52,7 @@ fn test_resolve_secret_both_env_and_file_errors() {
             ("FERRUM_TEST_SECRET_D_FILE", &path),
         ],
         || async {
-            let result = resolve_secret("FERRUM_TEST_SECRET_D").await;
+            let result = resolve_env_secret("FERRUM_TEST_SECRET_D").await;
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("Multiple secret sources"));
@@ -341,18 +329,18 @@ fn test_resolve_all_env_secrets_ignores_non_secret_file_suffix_config() {
 }
 
 #[test]
-fn test_resolve_secret_neither_set() {
+fn test_resolve_env_secret_neither_set() {
     with_env_vars_async(&[], || async {
-        let result = resolve_secret("FERRUM_TEST_SECRET_NONE").await;
+        let result = resolve_env_secret("FERRUM_TEST_SECRET_NONE").await;
         assert!(result.unwrap().is_none());
     });
 }
 
 #[test]
-fn test_resolve_secret_file_not_found() {
+fn test_resolve_env_secret_file_not_found() {
     let missing = "/nonexistent/path/to/secret";
     with_env_vars_async(&[("FERRUM_TEST_SECRET_E_FILE", missing)], || async {
-        let result = resolve_secret("FERRUM_TEST_SECRET_E").await;
+        let result = resolve_env_secret("FERRUM_TEST_SECRET_E").await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Failed to read"));
@@ -364,13 +352,13 @@ fn test_resolve_secret_file_not_found() {
 }
 
 #[test]
-fn test_resolve_secret_file_empty() {
+fn test_resolve_env_secret_file_empty() {
     let tmp = NamedTempFile::new().unwrap();
     // File is empty (0 bytes)
     let path = tmp.path().to_str().unwrap().to_string();
 
     with_env_vars_async(&[("FERRUM_TEST_SECRET_F_FILE", &path)], || async {
-        let result = resolve_secret("FERRUM_TEST_SECRET_F").await;
+        let result = resolve_env_secret("FERRUM_TEST_SECRET_F").await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("empty"));
@@ -378,23 +366,22 @@ fn test_resolve_secret_file_empty() {
 }
 
 #[test]
-fn test_resolve_secret_empty_env_var_ignored() {
+fn test_resolve_env_secret_empty_env_var_ignored() {
     with_env_vars_async(&[("FERRUM_TEST_SECRET_G", "")], || async {
-        let result = resolve_secret("FERRUM_TEST_SECRET_G").await;
+        let result = resolve_env_secret("FERRUM_TEST_SECRET_G").await;
         assert!(result.unwrap().is_none());
     });
 }
 
 #[test]
-fn test_resolve_secret_file_preserves_internal_whitespace() {
+fn test_resolve_env_secret_file_preserves_internal_whitespace() {
     let mut tmp = NamedTempFile::new().unwrap();
     writeln!(tmp, "secret with spaces").unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
 
     with_env_vars_async(&[("FERRUM_TEST_SECRET_H_FILE", &path)], || async {
-        let result = resolve_secret("FERRUM_TEST_SECRET_H").await;
-        let resolved = result.unwrap().unwrap();
-        assert_eq!(resolved.value, "secret with spaces");
+        let resolved = resolve_env_secret("FERRUM_TEST_SECRET_H").await;
+        assert_eq!(resolved.unwrap().as_deref(), Some("secret with spaces"));
     });
 }
 
@@ -587,12 +574,12 @@ fn test_resolve_all_env_secrets_refuses_non_regular_file_source() {
     );
 }
 
-/// Single-key / runtime `_FILE` callers share the same detached reader. Cover
-/// that path independently so a regression that only breaks `resolve_secret`
-/// cannot hide behind the startup-batch test.
+/// The runtime direct-reference `file` caller shares the same detached reader.
+/// Cover that path independently so a regression that only breaks
+/// `resolve_external_reference` cannot hide behind the startup-batch test.
 #[cfg(unix)]
 #[test]
-fn test_resolve_secret_refuses_non_regular_file_source() {
+fn test_resolve_external_reference_refuses_non_regular_file_source() {
     assert_non_regular_file_source_fails_immediately_and_tears_down(
         "FERRUM_TEST_SECRET_BLOCKED_ONE_FILE",
         "FERRUM_TEST_SECRET_BLOCKED_ONE",
@@ -601,7 +588,13 @@ fn test_resolve_secret_refuses_non_regular_file_source() {
                 .enable_all()
                 .build()
                 .unwrap();
-            match rt.block_on(resolve_secret("FERRUM_TEST_SECRET_BLOCKED_ONE")) {
+            let fifo_path = std::env::var("FERRUM_TEST_SECRET_BLOCKED_ONE_FILE")
+                .expect("the helper set the FIFO source");
+            match rt.block_on(resolve_external_reference(
+                "file",
+                &fifo_path,
+                "FERRUM_TEST_SECRET_BLOCKED_ONE",
+            )) {
                 Ok(_) => Ok(()),
                 Err(err) => Err(err),
             }
@@ -610,14 +603,14 @@ fn test_resolve_secret_refuses_non_regular_file_source() {
 }
 
 #[test]
-fn test_resolve_secret_rejects_unsupported_cloud_suffixes() {
+fn test_resolve_env_secret_rejects_unsupported_gcp_suffix() {
     with_env_vars_async(
         &[(
             "FERRUM_TEST_SECRET_UNSUPPORTED_GCP",
             "projects/x/secrets/y/versions/latest",
         )],
         || async {
-            let result = resolve_secret("FERRUM_TEST_SECRET_UNSUPPORTED").await;
+            let result = resolve_env_secret("FERRUM_TEST_SECRET_UNSUPPORTED").await;
             #[cfg(not(feature = "secrets-gcp"))]
             {
                 match result {

@@ -55,14 +55,6 @@ const AZURE_CA_BUNDLE_LABEL: &str = "Azure Key Vault TLS";
 const KEYVAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const KEYVAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Check if the `{key}_AZURE` env var is set and non-empty.
-/// Returns the Azure Key Vault secret URL
-/// (e.g. `https://<vault>.vault.azure.net/secrets/<name>`) if so.
-pub fn resolve_ref(key: &str) -> Option<String> {
-    let azure_key = format!("{}_AZURE", key);
-    env::var(&azure_key).ok().filter(|s| !s.is_empty())
-}
-
 /// A secret value fetched from Azure Key Vault, with the version the service
 /// actually returned when available.
 #[derive(Debug, Clone)]

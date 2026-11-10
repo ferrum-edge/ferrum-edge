@@ -3,7 +3,7 @@
 //! These test the reference parsing and env var detection logic.
 //! Actual AWS connectivity tests require AWS credentials.
 
-use ferrum_edge::secrets::resolve_secret;
+use super::resolve_env_secret;
 
 use crate::unit::env_lock::with_env_vars_async;
 
@@ -15,7 +15,7 @@ fn test_aws_ref_conflict_with_direct_value() {
             ("FERRUM_TEST_AWS_A_AWS", "my-secret-name"),
         ],
         || async {
-            let result = resolve_secret("FERRUM_TEST_AWS_A").await;
+            let result = resolve_env_secret("FERRUM_TEST_AWS_A").await;
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(err.contains("Multiple secret sources"));

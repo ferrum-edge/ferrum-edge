@@ -14,7 +14,6 @@ mod azure;
 #[cfg(any(feature = "secrets-azure", feature = "secrets-vault"))]
 mod ca_bundle;
 pub mod credential_file;
-pub mod env;
 pub mod file;
 #[cfg(feature = "secrets-gcp")]
 mod gcp;
@@ -41,7 +40,7 @@ pub(crate) fn split_reference_field(reference: &str) -> (&str, Option<&str>) {
 #[allow(unused_imports)]
 pub use registry::{
     EXTERNAL_SECRET_SUFFIXES, ResolvedEnvSecrets, ResolvedSecret, external_source_configured,
-    resolve_all_env_secrets, resolve_external_reference, resolve_secret,
+    resolve_all_env_secrets, resolve_external_reference,
 };
 
 pub(crate) use registry::resolve_selected_env_secrets;
@@ -838,7 +837,7 @@ const MAX_REFERENCE_FORMS: usize = 5;
 ///   and keeps only the identifier, and
 ///   `secrets::registry::SecretBackend::source` renders the completed fetch as
 ///   `<provider>:<identifier>` — one colon, no `//`, which is the shape a
-///   single-key `resolve_secret`/`resolve_external_reference` caller reports.
+///   `resolve_external_reference` caller reports.
 ///   (TLS material no longer carries that string: `load_secret_material` now
 ///   stamps `MaterializedMaterial`'s `display_source_id` with the provider-only
 ///   `CertSourceUri::redacted_source_id()`, so a PEM-parse failure prints
@@ -1324,7 +1323,7 @@ mod derivation_tests {
     fn provider_source_rendering_of_a_uri_is_derived() {
         // `SecretBackend::source` renders the completed fetch with one colon
         // and no `//`. TLS material now stamps the provider-only redacted id
-        // instead, but single-key callers still report this shape, so the
+        // instead, but direct-reference callers still report this shape, so the
         // derivation must keep covering it.
         let forms = derive_reference_forms("vault://secret/data/gw#cert");
         assert!(forms.contains(&"vault:secret/data/gw#cert".to_string()));

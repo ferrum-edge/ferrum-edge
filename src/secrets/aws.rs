@@ -7,15 +7,6 @@
 //! - `AWS_REGION` or `AWS_DEFAULT_REGION` — region where the secret is stored
 //! - EC2 instance profile, ECS task role, or EKS IRSA are used automatically
 
-use std::env;
-
-/// Check if the `{key}_AWS` env var is set and non-empty.
-/// Returns the AWS secret ARN or name (optionally with `#json_key`) if so.
-pub fn resolve_ref(key: &str) -> Option<String> {
-    let aws_key = format!("{}_AWS", key);
-    env::var(&aws_key).ok().filter(|s| !s.is_empty())
-}
-
 /// Reusable AWS Secrets Manager client for batch secret resolution.
 /// Created once and shared across multiple AWS secret fetches.
 pub struct AwsClientWrapper {

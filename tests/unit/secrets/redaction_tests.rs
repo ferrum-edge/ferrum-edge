@@ -102,7 +102,7 @@ const NULL_VALUE: &str = "null";
 /// A TLS source URI. A successful fetch is reported back by
 /// `SecretBackend::source` as `<provider>:<identifier>` — one colon, no `//` —
 /// and that rewritten string, not the value as materialized, is what a
-/// single-key `resolve_secret`/`resolve_external_reference` caller echoes.
+/// `resolve_external_reference` caller echoes.
 ///
 /// TLS material itself no longer carries it: `load_secret_material` stamps the
 /// provider-only `redacted_source_id()` into `MaterializedMaterial`'s
