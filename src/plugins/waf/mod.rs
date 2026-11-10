@@ -1425,7 +1425,7 @@ impl Waf {
             ctx.ensure_waf_metadata_initialized();
             if let Some(previous_highest) = ctx
                 .waf_metadata_value("waf.severity")
-                .and_then(parse_severity)
+                .and_then(|severity| parse_severity(severity).ok())
             {
                 highest = highest.max(previous_highest);
             }
