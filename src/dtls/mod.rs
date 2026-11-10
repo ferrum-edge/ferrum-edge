@@ -2918,7 +2918,6 @@ impl DtlsServer {
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, peer_addr) = batch.datagram(i);
-                                    let data = data.to_vec();
                                     // The WHOLE captured local destination is
                                     // carried forward, not just its interface
                                     // index: the address half is this session's
@@ -2994,8 +2993,7 @@ impl DtlsServer {
                 return Ok(());
             }
 
-            let data = buf[..len].to_vec();
-            self.dispatch_datagram(peer_addr, data, None).await;
+            self.dispatch_datagram(peer_addr, &buf[..len], None).await;
         }
     }
 
@@ -3011,17 +3009,21 @@ impl DtlsServer {
     /// here: it can neither be attributed to a source workload nor answered from
     /// the address the client addressed, so it is dropped before any session
     /// state is allocated or delivered.
+    ///
+    /// The datagram is borrowed from the receive buffer and the (decoded)
+    /// payload is copied exactly once, only when it is delivered to a session
+    /// or starts one; refused datagrams allocate nothing (issue #7207).
     async fn dispatch_datagram(
         &self,
         peer_addr: SocketAddr,
-        data: Vec<u8>,
+        datagram: &[u8],
         reply_local: Option<crate::socket_opts::PktinfoLocal>,
     ) {
         // Datagram client-address boundary (issue #3289).
         let (data, forwarded_client) = match self.limits.datagram_client_address.as_ref() {
-            None => (data, None),
-            Some(gate) => match gate.decode(&data, &peer_addr) {
-                Ok(decoded) => (decoded.payload.to_vec(), decoded.forwarded),
+            None => (datagram, None),
+            Some(gate) => match gate.decode(datagram, &peer_addr) {
+                Ok(decoded) => (decoded.payload, decoded.forwarded),
                 Err(error) => {
                     let _ = record_datagram_metadata_refusal(
                         &self.datagram_client_address_warn,
@@ -3104,7 +3106,7 @@ impl DtlsServer {
             // freezing demux — handshakes, retransmits, everything — for
             // EVERY peer on the listener. Dropping the datagram is correct
             // UDP semantics; DTLS retransmission recovers the loss.
-            match tx.try_send(data) {
+            match tx.try_send(data.to_vec()) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     trace!(
@@ -3134,14 +3136,14 @@ impl DtlsServer {
                     }
                 }
             }
-        } else if dtls_datagram_opens_session(&data) {
+        } else if dtls_datagram_opens_session(data) {
             // New client — spawn a session driver. Only the initial fragment
             // of a ClientHello starts a handshake: spawning reserves a
             // `max_sessions` slot, allocates four channels, and holds the
             // slot for the handshake timeout, so later handshake records
             // (a refused peer's Certificate/Finished retransmits) and
             // scanner garbage must not reach it.
-            self.spawn_session(peer_addr, data, reply_local, forwarded_client);
+            self.spawn_session(peer_addr, data.to_vec(), reply_local, forwarded_client);
         } else {
             trace!(
                 client = %peer_addr,

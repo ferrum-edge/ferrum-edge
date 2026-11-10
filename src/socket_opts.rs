@@ -821,6 +821,40 @@ pub fn set_udp_gro(_fd: i32, _enable: bool) -> std::io::Result<()> {
 
 // ── UDP GSO (Generic Segmentation Offload) ─────────────────────────────
 
+/// Bytes reserved for one `sendmsg` control block: an `IPV6_PKTINFO` cmsg
+/// plus a `UDP_SEGMENT` cmsg is `CMSG_SPACE(20) + CMSG_SPACE(2)` = 64 bytes on
+/// 64-bit Linux (48 on 32-bit), the largest block the send helpers build.
+#[cfg(target_os = "linux")]
+const SEND_CMSG_BUF_LEN: usize = 64;
+
+/// Stack control-message buffer for the UDP send helpers.
+///
+/// The zero-length `cmsghdr` array gives the buffer `cmsghdr` alignment, which
+/// `CMSG_FIRSTHDR`/`CMSG_NXTHDR` require, without a per-`sendmsg` heap
+/// allocation (issue #7207; the kTLS path follows the same rule).
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct SendCmsgBuf {
+    _align: [libc::cmsghdr; 0],
+    bytes: [u8; SEND_CMSG_BUF_LEN],
+}
+
+#[cfg(target_os = "linux")]
+impl SendCmsgBuf {
+    /// A zeroed buffer, refusing a control block larger than it can hold.
+    fn zeroed_for(len: usize) -> std::io::Result<Self> {
+        if len > SEND_CMSG_BUF_LEN {
+            return Err(std::io::Error::other(
+                "UDP send control block exceeds the stack cmsg buffer",
+            ));
+        }
+        Ok(Self {
+            _align: [],
+            bytes: [0u8; SEND_CMSG_BUF_LEN],
+        })
+    }
+}
+
 /// Enable `UDP_SEGMENT` (GSO) for batched UDP sending (Linux 4.18+ only).
 ///
 /// Allows sending multiple datagrams in a single `sendmsg()` call by specifying
@@ -850,14 +884,14 @@ pub fn send_with_gso(
     // Build control message for UDP_SEGMENT (GSO segment size).
     // cmsg layout: cmsg_hdr + u16 segment_size
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
+    let mut cmsg_buf = SendCmsgBuf::zeroed_for(cmsg_space)?;
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = dest as *const libc::sockaddr_storage as *mut libc::c_void;
     msg.msg_namelen = dest_len;
     msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_control = cmsg_buf.bytes.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = cmsg_space;
 
     // Fill in the cmsg header and data.
@@ -1716,15 +1750,16 @@ pub fn send_with_pktinfo(
     } else {
         0
     };
-    let mut cmsg_buf = vec![0u8; pktinfo_space + gso_space];
+    let cmsg_space = pktinfo_space + gso_space;
+    let mut cmsg_buf = SendCmsgBuf::zeroed_for(cmsg_space)?;
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = dest as *const libc::sockaddr_storage as *mut libc::c_void;
     msg.msg_namelen = dest_len;
     msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len();
+    msg.msg_control = cmsg_buf.bytes.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space;
 
     // First cmsg: pktinfo.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
@@ -4529,5 +4564,25 @@ mod original_dst_live_tests {
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, DIAL_PORT))),
             "an accepted REDIRECTed connection must report the pre-NAT destination"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod send_cmsg_buf_tests {
+    use super::{SEND_CMSG_BUF_LEN, SendCmsgBuf};
+
+    /// The stack control buffer must be `cmsghdr`-aligned and hold the
+    /// largest block the send helpers build (IPv6 pktinfo + UDP_SEGMENT).
+    #[test]
+    fn send_cmsg_buf_is_aligned_and_fits_the_largest_block() {
+        assert!(std::mem::align_of::<SendCmsgBuf>() >= std::mem::align_of::<libc::cmsghdr>());
+        let largest = unsafe {
+            libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize
+                + libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize
+        };
+        assert!(largest <= SEND_CMSG_BUF_LEN, "largest={largest}");
+        let buf = SendCmsgBuf::zeroed_for(largest).expect("largest block fits");
+        assert!(buf.bytes.iter().all(|byte| *byte == 0));
+        assert!(SendCmsgBuf::zeroed_for(SEND_CMSG_BUF_LEN + 1).is_err());
     }
 }

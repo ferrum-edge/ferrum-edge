@@ -47,7 +47,7 @@ paths:
                     type: boolean
 ```
 
-The importer generates a proxy-scoped `openapi_validator` plugin, resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
+The importer generates a proxy-scoped `openapi_validator` plugin from the `get`, `put`, `post`, `delete`, `options`, `head`, `patch`, and `trace` operations (a document declaring the OpenAPI 3.2 `query` operation or `additionalOperations` is refused at import with HTTP 422 `UnsupportedOperationField`), resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
 This example validates `POST /orders`: the Paths key `/` is mounted under `listen_path: /orders`, and the Paths-key root yields the listen prefix itself.
 

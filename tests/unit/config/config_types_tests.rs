@@ -2444,15 +2444,20 @@ fn test_jwt_secret_policy_is_wired_into_every_boundary() {
     // Admin create/update, the credential endpoints, and batch admission.
     let after_validate = CRUD
         .split("async fn after_validate(")
-        .find(|section| section.contains("hmac_consumer_candidate_errors(db, namespace, resource)"))
+        .find(|section| {
+            section
+                .contains("consumer_credential_candidate_errors(db, namespace, resource, checks)")
+        })
         .expect("Consumer after_validate");
-    assert!(after_validate.contains("jwt_consumer_candidate_errors(db, namespace, resource)"));
+    assert!(after_validate.contains("jwt: resource.has_credential(\"jwt\")"));
+    assert!(after_validate.contains("hmac: resource.has_credential(\"hmac_auth\")"));
     let persist = ADMIN
         .split("async fn persist_consumer_update(")
         .nth(1)
         .expect("persist_consumer_update");
     let persist = &persist[..persist.find("\n}\n").expect("function end")];
-    assert!(persist.contains("ensure_jwt_consumer_candidate("));
+    assert!(persist.contains("ensure_consumer_credential_candidate("));
+    assert!(persist.contains("jwt: !consumer.credential_entries(\"jwt\").is_empty()"));
     assert!(
         ADMIN.contains(".validate_unique_jwt_credentials_for_consumers(&jwt_batch_consumer_ids)")
     );

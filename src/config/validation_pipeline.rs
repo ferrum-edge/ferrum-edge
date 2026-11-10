@@ -124,33 +124,45 @@ pub(crate) struct RejectedPluginConfig {
 /// limiter, so it needs no special case.
 pub(crate) fn collect_rejecting_plugin_config_errors(
     config: &GatewayConfig,
-    compression_policy: crate::config::CompressionAdmissionPolicy,
+    http_client: &crate::plugins::PluginHttpClient,
 ) -> Vec<RejectedPluginConfig> {
-    collect_plugin_config_errors(config, false, compression_policy)
+    collect_plugin_config_errors(config, false, http_client)
+}
+
+/// The one plugin-construction client a validation sweep uses.
+///
+/// Backend egress policy is node-local environment configuration. An
+/// admitting CP whose `FERRUM_BACKEND_ALLOW_IPS` differs from the serving
+/// node's must not refuse a row over an address policy it does not own, so
+/// validation screens SCHEMA and construction only; the serving mode still
+/// applies its own egress screen when it builds the cache. Construction
+/// still routes through the policy-carrying DNS resolver instead of the
+/// cache-less OS-DNS client (#6651): constructor side-effect fetches get the
+/// same screened resolution as the runtime client. It carries the real-IP
+/// header like the runtime client, so every validator in the sweep sees the
+/// same construction inputs.
+///
+/// Built once per sweep and shared by the transaction-log graph validator,
+/// the construction gate and the composition check (issue #7209): each
+/// client owns its own DNS cache, and CP delta admission runs the sweep per
+/// namespace per accepted batch.
+fn validation_http_client(
+    compression_policy: crate::config::CompressionAdmissionPolicy,
+) -> crate::plugins::PluginHttpClient {
+    crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
+        BackendEgressPolicy::unrestricted(),
+    )
+    .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+    .with_compression_admission_policy(compression_policy)
 }
 
 fn collect_plugin_config_errors(
     config: &GatewayConfig,
     optional_fail_open_only: bool,
-    compression_policy: crate::config::CompressionAdmissionPolicy,
+    http_client: &crate::plugins::PluginHttpClient,
 ) -> Vec<RejectedPluginConfig> {
-    // Backend egress policy is node-local environment configuration. An
-    // admitting CP whose `FERRUM_BACKEND_ALLOW_IPS` differs from the serving
-    // node's must not refuse a row over an address policy it does not own, so
-    // this gate screens SCHEMA and construction only; the serving mode still
-    // applies its own egress screen when it builds the cache.
+    // Unrestricted for the reason on `validation_http_client`.
     let backend_allow_ips = BackendEgressPolicy::unrestricted();
-    // Built once for the whole sweep: `validate_plugin_config_with_policy`
-    // would construct a fresh validation client (and its DNS cache) per plugin
-    // config, and CP delta admission runs this on every accepted batch.
-    // The policy stays unrestricted for the reason above, but construction
-    // still routes through the policy-carrying DNS resolver instead of the
-    // cache-less OS-DNS client (#6651): constructor side-effect fetches get
-    // the same screened resolution as the runtime client.
-    let http_client =
-        crate::plugins::PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
-            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-            .with_compression_admission_policy(compression_policy);
 
     let mut rejected = Vec::new();
     for (index, plugin_config) in config.plugin_configs.iter().enumerate() {
@@ -240,7 +252,8 @@ pub(crate) fn quarantine_unconstructible_plugin_configs(config: &mut GatewayConf
         // and surface the configuration error instead.
         Err(error) => return vec![error],
     };
-    let rejected = collect_plugin_config_errors(config, true, compression_policy);
+    let rejected =
+        collect_plugin_config_errors(config, true, &validation_http_client(compression_policy));
     if rejected.is_empty() {
         return Vec::new();
     }
@@ -309,14 +322,10 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     if let Err(found) = config.validate_plugin_references() {
         errors.extend(found);
     }
-    if let Err(found) = crate::plugins::transaction_log_schema::validate_config_graph(
-        config,
-        &crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
-            BackendEgressPolicy::unrestricted(),
-        )
-        .with_compression_admission_policy(compression_policy),
-        false,
-    ) {
+    let http_client = validation_http_client(compression_policy);
+    if let Err(found) =
+        crate::plugins::transaction_log_schema::validate_config_graph(config, &http_client, false)
+    {
         errors.extend(found);
     }
     // Serving modes reject malformed fail-closed plugins while staging the
@@ -327,18 +336,13 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     // freezes every DP on its last-known-good cache — with no acknowledgement
     // on the server-streaming `ConfigSync.Subscribe` to show it.
     errors.extend(
-        collect_rejecting_plugin_config_errors(config, compression_policy)
+        collect_rejecting_plugin_config_errors(config, &http_client)
             .into_iter()
             .map(|rejected| rejected.message),
     );
-    if let Err(found) = crate::plugin_cache::validate_plugin_security_composition_candidate(
-        config,
-        &crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
-            BackendEgressPolicy::unrestricted(),
-        )
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-        .with_compression_admission_policy(compression_policy),
-    ) {
+    if let Err(found) =
+        crate::plugin_cache::validate_plugin_security_composition_candidate(config, &http_client)
+    {
         errors.push(found);
     }
     if let Err(found) = crate::plugin_cache::validate_tcp_connection_throttle_attachments(config) {

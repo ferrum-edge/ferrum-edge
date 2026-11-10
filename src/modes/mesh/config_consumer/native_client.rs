@@ -216,7 +216,8 @@ pub async fn start_native_mesh_client_with_shutdown(
             tls_reload.as_ref(),
             &cp_urls,
             &mut last_tls_revision,
-        );
+        )
+        .await;
 
         let cp_url = &cp_urls[current_cp_index];
         let mut stream_shutdown_rx = shutdown_rx.clone();

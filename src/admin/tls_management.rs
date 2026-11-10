@@ -813,6 +813,7 @@ pub(super) async fn handle_finalize_acme_order(
             ),
             dns_cache,
             finalization,
+            no_challenges_provisioned: !order.has_challenge_records(),
         };
         let challenge_type = match acme_order_challenge_type(&order) {
             Ok(challenge_type) => challenge_type,
@@ -2399,7 +2400,11 @@ fn acme_order_challenge_type(order: &AcmeOrderRecord) -> Result<AcmeChallengeTyp
         }
         challenge_type = Some(AcmeChallengeType::Dns01);
     }
-    challenge_type.ok_or_else(|| "ACME order does not contain any challenges".to_string())
+    // No challenge records: every authorization was already valid when the
+    // order was prepared (issue #7195), so none needs answering and the
+    // completion type is immaterial — completion refuses any pending
+    // authorization for such an order.
+    Ok(challenge_type.unwrap_or(AcmeChallengeType::Http01))
 }
 
 /// Mirror an order's account credentials into the shared account store.

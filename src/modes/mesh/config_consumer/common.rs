@@ -1,7 +1,7 @@
 use tonic::transport::{Certificate, Identity};
 
 pub use crate::grpc::dp_client::wait_optional_tls_reload;
-use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, build_dp_grpc_tls_config};
+use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, rebuild_dp_grpc_tls_config};
 pub use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs};
 #[cfg(test)]
 pub(crate) use crate::util::backoff::{BACKOFF_MAX_SECS, jittered_backoff_with_entropy};
@@ -54,7 +54,7 @@ pub async fn wait_for_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bo
     }
 }
 
-pub fn refresh_dp_grpc_tls_config_if_changed(
+pub async fn refresh_dp_grpc_tls_config_if_changed(
     tls_config: &mut Option<DpGrpcTlsConfig>,
     tls_reload: Option<&DpGrpcTlsReload>,
     cp_urls: &[String],
@@ -69,7 +69,8 @@ pub fn refresh_dp_grpc_tls_config_if_changed(
     }
 
     *last_tls_revision = revision;
-    match build_dp_grpc_tls_config(&reload.env_config, cp_urls, reload.label) {
+    // Material loads block; run them off the Tokio worker (issue #7205).
+    match rebuild_dp_grpc_tls_config(reload, cp_urls).await {
         Ok(next_config) => {
             *tls_config = next_config;
             tracing::info!(

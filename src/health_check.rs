@@ -42,9 +42,7 @@ use crate::load_balancer::{
 };
 use crate::tls::backend::SanAllowListVerifier;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
-use crate::tls::{
-    CrlList, SharedCrlList, backend_client_config_builder, build_server_verifier_with_crls,
-};
+use crate::tls::{SharedCrlList, backend_client_config_builder, build_server_verifier_with_crls};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -336,6 +334,9 @@ fn next_consecutive_generation(generation: u64) -> u64 {
 
 /// Health state for a single target.
 struct TargetHealth {
+    /// Active-probe success streak. Passive checks never maintain it: a
+    /// passive success needs no streak (issue #7207), so the per-response
+    /// success path stays write-free on this cache line.
     consecutive_successes: AtomicU32,
     /// Native windowed-mode consecutive-failure counter. Not the ejection
     /// decision in that mode (the failure ring is); kept so a success can
@@ -654,8 +655,15 @@ impl Default for ActiveUnhealthyTargets {
 
 impl ActiveUnhealthyTargets {
     pub fn new() -> Self {
+        Self::with_shard_amount(crate::util::sharding::pool_shard_amount(0))
+    }
+
+    /// Construct with an explicit `DashMap` shard amount. Production passes
+    /// `pool_shard_amount(env_config.pool_shard_amount)`: load balancers read
+    /// this map on every target selection.
+    pub fn with_shard_amount(shard_amount: usize) -> Self {
         Self {
-            map: DashMap::new(),
+            map: DashMap::with_shard_amount(shard_amount),
             id: ACTIVE_UNHEALTHY_TARGETS_IDS.fetch_add(1, Ordering::Relaxed),
             generation: AtomicU64::new(0),
         }
@@ -1256,6 +1264,17 @@ impl HealthChecker {
         Self::with_pool_config_and_shared_crls(pool_config, dns_cache, empty_shared_crl_list())
     }
 
+    /// Re-shard the gateway-wide hot maps (active-unhealthy targets, read per
+    /// target selection; passive health, read per proxied response) with the
+    /// operator's `FERRUM_POOL_SHARD_AMOUNT`, per the hot-path `DashMap` rule.
+    /// Call right after construction, before the maps are shared or started.
+    pub fn with_hot_map_shard_amount(mut self, shard_amount: usize) -> Self {
+        self.active_unhealthy_targets =
+            Arc::new(ActiveUnhealthyTargets::with_shard_amount(shard_amount));
+        self.passive_health = Arc::new(DashMap::with_shard_amount(shard_amount));
+        self
+    }
+
     /// Production constructor: inherit pool settings, DNS cache, and the
     /// same [`SharedCrlList`] backend data-path pools already hold.
     pub fn with_pool_config_and_shared_crls(
@@ -1271,7 +1290,9 @@ impl HealthChecker {
         Self {
             active_unhealthy_targets: Arc::new(ActiveUnhealthyTargets::new()),
             active_target_states: Arc::new(DashMap::new()),
-            passive_health: Arc::new(DashMap::new()),
+            passive_health: Arc::new(DashMap::with_shard_amount(
+                crate::util::sharding::pool_shard_amount(0),
+            )),
             default_http_client: client,
             active_check_handles: Mutex::new(Vec::new()),
             active_check_aborts: Mutex::new(Vec::new()),
@@ -1334,7 +1355,9 @@ impl HealthChecker {
         Self {
             active_unhealthy_targets: Arc::new(ActiveUnhealthyTargets::new()),
             active_target_states: Arc::new(DashMap::new()),
-            passive_health: Arc::new(DashMap::new()),
+            passive_health: Arc::new(DashMap::with_shard_amount(
+                crate::util::sharding::pool_shard_amount(0),
+            )),
             default_http_client: client,
             active_check_handles: Mutex::new(Vec::new()),
             active_check_aborts: Mutex::new(Vec::new()),
@@ -1797,6 +1820,14 @@ impl HealthChecker {
         } else {
             self.build_upstream_health_client(tls, active.use_tls, None)
         };
+        // gRPC probes share one TLS client configuration across ticks and
+        // targets, built here next to the HTTP probe client (issue #7205).
+        // Non-gRPC probes never read it.
+        let grpc_probe_tls = if matches!(active.probe_type, HealthProbeType::Grpc) {
+            self.build_upstream_grpc_probe_tls(tls, active.use_tls)
+        } else {
+            GrpcProbeTls::Plaintext
+        };
 
         let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(targets.len());
         let mut new_aborts: Vec<AbortHandle> = Vec::with_capacity(targets.len());
@@ -1815,7 +1846,13 @@ impl HealthChecker {
                 upstream_generation,
                 upstream_generation_cell: Arc::clone(&gen_cell),
             };
-            let handle = self.start_active_check(start, active, target_client.as_ref(), tls);
+            let handle = self.start_active_check(
+                start,
+                active,
+                target_client.as_ref(),
+                tls,
+                &grpc_probe_tls,
+            );
             new_aborts.push(handle.abort_handle());
             new_handles.push(handle);
         }
@@ -2185,8 +2222,6 @@ impl HealthChecker {
             };
 
             if connection_error || config.unhealthy_status_codes.contains(&status_code) {
-                state.consecutive_successes.store(0, Ordering::Relaxed);
-
                 if config.consecutive_error_mode {
                     let (my_generation, my_streak) = state.record_consecutive_failure();
                     if let Some(hook) = hooks.after_failure_count.as_mut() {
@@ -2315,7 +2350,6 @@ impl HealthChecker {
                     }
                 }
             } else {
-                state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
                 if config.consecutive_error_mode {
                     let retired_generation = state.record_consecutive_success();
                     if let Some(hook) = hooks.after_success_reset.as_mut() {
@@ -2354,22 +2388,20 @@ impl HealthChecker {
                         state.consecutive_failures.store(0, Ordering::Relaxed);
                     }
 
+                    // One success restores a windowed-mode ejection.
                     if proxy_state.unhealthy.contains_key(buf.as_str()) {
-                        let successes = state.consecutive_successes.load(Ordering::Relaxed);
-                        if successes >= 1 {
-                            info!(
-                                "Passive health check: marking target {} as healthy again for proxy {}",
-                                buf.as_str(), proxy_id
+                        info!(
+                            "Passive health check: marking target {} as healthy again for proxy {}",
+                            buf.as_str(),
+                            proxy_id
+                        );
+                        if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str()) {
+                            state.lock_recent_failures().clear();
+                            self.reset_latency_after_passive_recovery(
+                                namespace,
+                                &ejection.upstream_id,
+                                target,
                             );
-                            if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str())
-                            {
-                                state.lock_recent_failures().clear();
-                                self.reset_latency_after_passive_recovery(
-                                    namespace,
-                                    &ejection.upstream_id,
-                                    target,
-                                );
-                            }
                         }
                     }
                 }
@@ -2811,6 +2843,26 @@ impl HealthChecker {
         )
     }
 
+    /// Build the gRPC probe transport for an upstream. TLS material is read
+    /// once here, not on every probe tick or DNS candidate.
+    fn build_upstream_grpc_probe_tls(
+        &self,
+        tls_config: &BackendTlsConfig,
+        use_tls: bool,
+    ) -> GrpcProbeTls {
+        build_grpc_probe_tls(
+            use_tls,
+            tls_config,
+            self.global_tls_ca_bundle_path.as_deref(),
+            HealthCheckClientIdentityPaths {
+                cert: &self.global_backend_tls_client_cert_path,
+                key: &self.global_backend_tls_client_key_path,
+            },
+            self.global_tls_no_verify,
+            self.shared_crls.load_full().as_slice(),
+        )
+    }
+
     /// Start an active health check background task for a target.
     fn start_active_check(
         &self,
@@ -2818,6 +2870,7 @@ impl HealthChecker {
         config: &ActiveHealthCheck,
         upstream_client: Option<&Arc<reqwest::Client>>,
         tls_config: &BackendTlsConfig,
+        grpc_probe_tls: &GrpcProbeTls,
     ) -> tokio::task::JoinHandle<()> {
         // Destructure by value: taking `start` by reference would bind
         // `target` as `&&UpstreamTarget`, and `target.clone()` below would
@@ -2886,7 +2939,6 @@ impl HealthChecker {
             .as_deref()
             .and_then(|hex| hex::decode(hex).ok())
             .unwrap_or_default();
-        let use_tls = config.use_tls;
         let grpc_service_name = config.grpc_service_name.clone().unwrap_or_default();
 
         let probe_target = target.clone();
@@ -2894,11 +2946,7 @@ impl HealthChecker {
         let upstream_namespace_owned = upstream_namespace.to_owned();
         let upstream_id_owned = upstream_id.to_owned();
         let probe_tls_config = tls_config.clone();
-        let probe_global_ca = self.global_tls_ca_bundle_path.clone();
-        let probe_global_cert = self.global_backend_tls_client_cert_path.clone();
-        let probe_global_key = self.global_backend_tls_client_key_path.clone();
-        let probe_no_verify = self.global_tls_no_verify;
-        let probe_crls = self.shared_crls.load_full();
+        let grpc_probe_tls = grpc_probe_tls.clone();
         // Screen the probe target against the backend egress policy so active
         // health checks never dial a denied address (an SSRF/port-scan vector via
         // the health probe). reqwest skips the resolver for IP literals and the
@@ -3035,14 +3083,9 @@ impl HealthChecker {
                                                     &host,
                                                     port,
                                                     timeout,
-                                                    use_tls,
                                                     &grpc_service_name,
                                                     &probe_tls_config,
-                                                    probe_global_ca.as_deref(),
-                                                    probe_global_cert.as_deref(),
-                                                    probe_global_key.as_deref(),
-                                                    probe_no_verify,
-                                                    probe_crls.clone(),
+                                                    &grpc_probe_tls,
                                                 )
                                                 .await
                                             }
@@ -3074,14 +3117,9 @@ impl HealthChecker {
                                             &host,
                                             port,
                                             timeout,
-                                            use_tls,
                                             &grpc_service_name,
                                             &probe_tls_config,
-                                            probe_global_ca.as_deref(),
-                                            probe_global_cert.as_deref(),
-                                            probe_global_key.as_deref(),
-                                            probe_no_verify,
-                                            probe_crls.as_slice(),
+                                            &grpc_probe_tls,
                                         )
                                         .await
                                     }
@@ -3506,38 +3544,26 @@ async fn udp_probe_candidates(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn grpc_probe_candidates(
     candidates: &crate::dns::ResolvedAddresses,
     host: &str,
     port: u16,
     timeout: Duration,
-    use_tls: bool,
     service_name: &str,
     tls_config: &BackendTlsConfig,
-    global_ca_path: Option<&str>,
-    global_cert_path: Option<&str>,
-    global_key_path: Option<&str>,
-    global_no_verify: bool,
-    crls: CrlList,
+    transport: &GrpcProbeTls,
 ) -> ProbeOutcome {
     match crate::dns::connect_candidates(candidates, port, timeout, |addr| {
         let dial_addr = addr.ip().to_string();
-        let crls = crls.clone();
         async move {
             let outcome = grpc_probe(
                 host,
                 &dial_addr,
                 port,
                 timeout,
-                use_tls,
                 service_name,
                 tls_config,
-                global_ca_path,
-                global_cert_path,
-                global_key_path,
-                global_no_verify,
-                crls.as_slice(),
+                transport,
             )
             .await;
             if outcome.success {
@@ -3563,25 +3589,24 @@ async fn grpc_probe_candidates(
 
 /// gRPC health probe — performs a unary grpc.health.v1.Health/Check RPC.
 ///
-/// When `use_tls` is true, the probe configures TLS using the upstream's
-/// `BackendTlsConfig` (client certs, CA bundle, verify flag) so that health
-/// checks authenticate to backends the same way proxy traffic does.
-#[allow(clippy::too_many_arguments)]
+/// `transport` is built once per probe spawn by [`build_grpc_probe_tls`] from
+/// the upstream's `BackendTlsConfig` (client certs, CA bundle, verify flag),
+/// so health checks authenticate to backends the same way proxy traffic does
+/// without re-reading TLS material on every tick. `tls_config` supplies only
+/// the TLS server name here.
 async fn grpc_probe(
     host: &str,
     dial_addr: &str,
     port: u16,
     timeout: Duration,
-    use_tls: bool,
     service_name: &str,
     tls_config: &BackendTlsConfig,
-    global_ca_path: Option<&str>,
-    global_cert_path: Option<&str>,
-    global_key_path: Option<&str>,
-    global_no_verify: bool,
-    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    transport: &GrpcProbeTls,
 ) -> ProbeOutcome {
-    let scheme = if use_tls { "https" } else { "http" };
+    let scheme = match transport {
+        GrpcProbeTls::Plaintext => "http",
+        GrpcProbeTls::Ready(_) | GrpcProbeTls::Unavailable(_) => "https",
+    };
     // Dial the pre-screened address (`dial_addr` = the resolved IP from the
     // health loop) so tonic does not re-resolve `host` and risk a split-DNS /
     // rebind to a denied address between the egress screen and the dial. TLS
@@ -3609,94 +3634,46 @@ async fn grpc_probe(
         }
     };
 
-    if use_tls && let Err(error) = refuse_probe_tls_if_refused(tls_config) {
-        debug!("gRPC health probe: {} for {}:{}", error, host, port);
-        return ProbeOutcome::failure(format!("grpc connect failed: {error}"));
-    }
-
-    let skip_verify = use_tls
-        && (!tls_config.verify_server_cert
-            || (global_no_verify && tls_config.allows_global_no_verify()));
-
-    if skip_verify && !tls_config.san_allow_list.is_empty() {
-        warn!(
-            san_allow_list_entries = tls_config.san_allow_list.len(),
-            "gRPC health probe: backend TLS SAN allow-list is configured but \
-             certificate verification is disabled; SAN allow-list will not be enforced"
-        );
-    }
-
-    // Skip-verify uses rustls `NoVerifier` because tonic's ClientTlsConfig
-    // has no skip-verify API. Verified TLS (with or without a SAN allow-list)
-    // uses the same rustls connector so probes share the data-path CRL policy;
-    // tonic's ClientTlsConfig cannot attach Ferrum's shared CRL snapshot.
-    let channel = if skip_verify {
-        match build_grpc_probe_channel_no_verify(
-            &endpoint,
-            host,
-            timeout,
-            tls_config,
-            global_ca_path,
-            global_cert_path,
-            global_key_path,
-        )
-        .await
-        {
-            Ok(ch) => ch,
-            Err(e) => {
-                let is_exhaustion = crate::retry::is_port_exhaustion(e.as_ref())
-                    || crate::retry::is_port_exhaustion_message(&e.to_string());
-                if is_exhaustion {
-                    tracing::error!(
-                        "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
-                        host,
-                        port,
-                        e
-                    );
-                } else {
-                    debug!(
-                        "gRPC health probe: connect failed for {}:{}: {}",
-                        host, port, e
-                    );
+    let channel = match transport {
+        GrpcProbeTls::Unavailable(reason) => {
+            debug!(
+                "gRPC health probe: TLS client unavailable for {}:{}: {}",
+                host, port, reason
+            );
+            return ProbeOutcome::failure(format!("grpc connect failed: {reason}"));
+        }
+        GrpcProbeTls::Ready(client_config) => {
+            match connect_grpc_probe_tls_channel(
+                &endpoint,
+                host,
+                timeout,
+                tls_config,
+                Arc::clone(client_config),
+            )
+            .await
+            {
+                Ok(ch) => ch,
+                Err(e) => {
+                    let is_exhaustion = crate::retry::is_port_exhaustion(e.as_ref())
+                        || crate::retry::is_port_exhaustion_message(&e.to_string());
+                    if is_exhaustion {
+                        tracing::error!(
+                            "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
+                            host,
+                            port,
+                            e
+                        );
+                    } else {
+                        debug!(
+                            "gRPC health probe: TLS connect failed for {}:{}: {}",
+                            host, port, e
+                        );
+                    }
+                    return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
                 }
-                return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
             }
         }
-    } else if use_tls {
-        match build_grpc_probe_channel_verified(
-            &endpoint,
-            host,
-            timeout,
-            tls_config,
-            global_ca_path,
-            global_cert_path,
-            global_key_path,
-            crls,
-        )
-        .await
-        {
-            Ok(ch) => ch,
-            Err(e) => {
-                let is_exhaustion = crate::retry::is_port_exhaustion(e.as_ref())
-                    || crate::retry::is_port_exhaustion_message(&e.to_string());
-                if is_exhaustion {
-                    tracing::error!(
-                        "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
-                        host,
-                        port,
-                        e
-                    );
-                } else {
-                    debug!(
-                        "gRPC health probe: TLS connect failed for {}:{}: {}",
-                        host, port, e
-                    );
-                }
-                return ProbeOutcome::failure(format!("grpc connect failed: {e}"));
-            }
-        }
-    } else {
-        match tokio::time::timeout(timeout, endpoint.connect()).await {
+        GrpcProbeTls::Plaintext => match tokio::time::timeout(timeout, endpoint.connect()).await {
             Ok(Ok(ch)) => ch,
             Ok(Err(e)) => {
                 let err_ref: &(dyn std::error::Error + 'static) = &e;
@@ -3721,7 +3698,7 @@ async fn grpc_probe(
                 debug!("gRPC health probe: connect timed out for {}:{}", host, port);
                 return ProbeOutcome::failure("grpc connect timed out");
             }
-        }
+        },
     };
 
     let mut client = grpc_health_v1::health_client::HealthClient::new(channel);
@@ -3749,35 +3726,107 @@ async fn grpc_probe(
     }
 }
 
-/// Build a tonic gRPC channel with TLS verification disabled (NoVerifier).
+/// gRPC probe transport, built once per probe spawn (issue #7205).
 ///
-/// Tonic's `ClientTlsConfig` doesn't expose a skip-verify API, so we build
-/// the rustls `ClientConfig` directly (same pattern as `grpc_proxy.rs`) and
-/// use `connect_with_connector` to provide a custom TLS connector.
-#[allow(clippy::too_many_arguments)]
-async fn build_grpc_probe_channel_no_verify(
-    endpoint: &tonic::transport::Endpoint,
-    host: &str,
-    timeout: Duration,
+/// Material is read when probes are (re)spawned — the same point the HTTP
+/// probe client is built — never on each tick or DNS candidate, so both probe
+/// types pick up rotated TLS material at the same moment.
+#[derive(Clone)]
+enum GrpcProbeTls {
+    /// h2c: no TLS material is involved, like the h2c gRPC data path.
+    Plaintext,
+    /// TLS client configuration shared by every tick and candidate.
+    Ready(Arc<rustls::ClientConfig>),
+    /// The TLS client configuration could not be built; every probe fails
+    /// closed with this reason without dialing.
+    Unavailable(String),
+}
+
+/// Build the gRPC probe transport for one probe spawn. A TLS build failure is
+/// logged once and fails every probe closed, like
+/// [`accept_health_check_client`] does for HTTP probes.
+fn build_grpc_probe_tls(
+    use_tls: bool,
     tls_config: &BackendTlsConfig,
     global_ca_path: Option<&str>,
-    global_cert_path: Option<&str>,
-    global_key_path: Option<&str>,
-) -> Result<tonic::transport::Channel, Box<dyn std::error::Error + Send + Sync>> {
-    use rustls::pki_types::ServerName;
-    use tokio_rustls::TlsConnector;
+    global_identity: HealthCheckClientIdentityPaths<'_>,
+    global_no_verify: bool,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+) -> GrpcProbeTls {
+    if !use_tls {
+        return GrpcProbeTls::Plaintext;
+    }
+    match build_grpc_probe_client_config(
+        tls_config,
+        global_ca_path,
+        global_identity,
+        global_no_verify,
+        crls,
+    ) {
+        Ok(client_config) => GrpcProbeTls::Ready(Arc::new(client_config)),
+        Err(reason) => {
+            tracing::error!(
+                "Fail-closed: gRPC health-probe TLS client unavailable ({reason}); affected gRPC health probes will report unhealthy"
+            );
+            GrpcProbeTls::Unavailable(reason)
+        }
+    }
+}
+
+/// Build the rustls client configuration a TLS gRPC probe dials with.
+///
+/// Skip-verify uses rustls `NoVerifier` because tonic's ClientTlsConfig has no
+/// skip-verify API. Verified TLS (with or without a SAN allow-list) uses the
+/// data path's server verifier so probes share the data-path CRL policy;
+/// tonic's ClientTlsConfig cannot attach Ferrum's shared CRL snapshot.
+/// Blocking: reads TLS material.
+fn build_grpc_probe_client_config(
+    tls_config: &BackendTlsConfig,
+    global_ca_path: Option<&str>,
+    global_identity: HealthCheckClientIdentityPaths<'_>,
+    global_no_verify: bool,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+) -> Result<rustls::ClientConfig, String> {
+    refuse_probe_tls_if_refused(tls_config).map_err(|error| error.to_string())?;
+
+    let skip_verify = !tls_config.verify_server_cert
+        || (global_no_verify && tls_config.allows_global_no_verify());
+    if !skip_verify {
+        let verifier = build_probe_server_verifier(tls_config, global_ca_path, crls)
+            .map_err(|error| error.to_string())?;
+        let client_auth = load_probe_rustls_client_auth(tls_config, global_identity)
+            .map_err(|error| error.to_string())?;
+        let mut client_config =
+            probe_rustls_client_config(verifier, client_auth).map_err(|error| error.to_string())?;
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+        crate::tls::apply_client_session_resumption(&mut client_config, None, crls);
+        return Ok(client_config);
+    }
+
+    if !tls_config.san_allow_list.is_empty() {
+        warn!(
+            san_allow_list_entries = tls_config.san_allow_list.len(),
+            "gRPC health probe: backend TLS SAN allow-list is configured but \
+             certificate verification is disabled; SAN allow-list will not be enforced"
+        );
+    }
 
     // Build root cert store (still needed for mTLS client auth builder)
-    let ca_path = tls_config.effective_ca_source(global_ca_path);
-    let root_store = if let Some(ca_path) = ca_path {
-        load_probe_tls_root_store(ca_path, "gRPC health probe CA").map_err(std::io::Error::other)?
+    let root_store = if let Some(ca_path) = tls_config.effective_ca_source(global_ca_path) {
+        load_probe_tls_root_store(ca_path, "gRPC health probe CA")?
     } else {
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
 
     // Build client config with optional mTLS
-    let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
-    let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
+    let cert_path = tls_config
+        .client_cert_path
+        .as_deref()
+        .or(global_identity.cert.as_deref());
+    let key_path = tls_config
+        .client_key_path
+        .as_deref()
+        .or(global_identity.key.as_deref());
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
     let mut client_config = match (cert_path, key_path) {
         (Some(cert_path), Some(key_path)) => {
@@ -3785,27 +3834,26 @@ async fn build_grpc_probe_channel_no_verify(
                 cert_path,
                 MaterialKind::Cert,
                 "gRPC health probe client cert",
-            )
-            .map_err(std::io::Error::other)?;
+            )?;
             let key_source = CertSource::parse(key_path, MaterialKind::Key);
-            let key_material =
-                load_material_blocking(&key_source, MaterialKind::Key).map_err(|error| {
-                    std::io::Error::other(format!("gRPC health probe client key: {error}"))
-                })?;
+            let key_material = load_material_blocking(&key_source, MaterialKind::Key)
+                .map_err(|error| format!("gRPC health probe client key: {error}"))?;
             let key = crate::tls::parse_pem_private_key(
                 key_material.bytes.expose_secret(),
                 "gRPC health probe client key",
                 &key_material.display_source_id,
             )
-            .map_err(std::io::Error::other)?;
-            builder.with_client_auth_cert(certs, key)?
+            .map_err(|error| error.to_string())?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|error| error.to_string())?
         }
         (None, None) => builder.with_no_client_auth(),
         _ => {
-            return Err(std::io::Error::other(
-                "gRPC health probe mTLS client certificate and private key must be configured together",
-            )
-            .into());
+            return Err(
+                "gRPC health probe mTLS client certificate and private key must be configured together"
+                    .to_string(),
+            );
         }
     };
 
@@ -3814,12 +3862,26 @@ async fn build_grpc_probe_channel_no_verify(
         .dangerous()
         .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
     client_config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(client_config)
+}
 
-    let tls_connector = TlsConnector::from(Arc::new(client_config));
-    // Same effective backend TLS identity the verifying branch uses: the
-    // configured `backend_tls_sni` override when present, else the target host.
-    // Only the server NAME changes — the socket still goes to the pre-screened
-    // address in `uri`, and tonic's `origin` still carries the real authority.
+/// Dial a TLS gRPC probe channel with a prebuilt client configuration.
+///
+/// The server name is the configured `backend_tls_sni` override when present,
+/// else the target host. Only the server NAME changes — the socket still goes
+/// to the pre-screened address in the endpoint URI, and tonic's `origin` still
+/// carries the real authority.
+async fn connect_grpc_probe_tls_channel(
+    endpoint: &tonic::transport::Endpoint,
+    host: &str,
+    timeout: Duration,
+    tls_config: &BackendTlsConfig,
+    client_config: Arc<rustls::ClientConfig>,
+) -> Result<tonic::transport::Channel, Box<dyn std::error::Error + Send + Sync>> {
+    use rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
+
+    let tls_connector = TlsConnector::from(client_config);
     let host_owned = probe_tls_server_name(tls_config, host).to_string();
 
     let connector = tower::service_fn(move |uri: http::Uri| {
@@ -3833,64 +3895,6 @@ async fn build_grpc_probe_channel_no_verify(
             let tcp = tokio::net::TcpStream::connect(&addr).await?;
             // Fail closed on an unusable server name rather than handshaking
             // with whatever rustls would otherwise infer.
-            let server_name = ServerName::try_from(host)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-            let tls = tls_connector.connect(server_name, tcp).await?;
-            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tls))
-        }
-    });
-
-    let channel =
-        tokio::time::timeout(timeout, endpoint.connect_with_connector(connector)).await??;
-    Ok(channel)
-}
-
-/// Build a tonic gRPC channel that verifies the peer with the same rustls
-/// server verifier the data path uses (shared CRL policy, SAN wrapping when
-/// configured). Tonic's `ClientTlsConfig` cannot attach that snapshot.
-#[allow(clippy::too_many_arguments)]
-async fn build_grpc_probe_channel_verified(
-    endpoint: &tonic::transport::Endpoint,
-    host: &str,
-    timeout: Duration,
-    tls_config: &BackendTlsConfig,
-    global_ca_path: Option<&str>,
-    global_cert_path: Option<&str>,
-    global_key_path: Option<&str>,
-    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
-) -> Result<tonic::transport::Channel, Box<dyn std::error::Error + Send + Sync>> {
-    use rustls::pki_types::ServerName;
-    use tokio_rustls::TlsConnector;
-
-    let verifier = build_probe_server_verifier(tls_config, global_ca_path, crls)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let cert_owned = global_cert_path.map(str::to_string);
-    let key_owned = global_key_path.map(str::to_string);
-    let client_auth = load_probe_rustls_client_auth(
-        tls_config,
-        HealthCheckClientIdentityPaths {
-            cert: &cert_owned,
-            key: &key_owned,
-        },
-    )
-    .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let mut client_config = probe_rustls_client_config(verifier, client_auth)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    client_config.alpn_protocols = vec![b"h2".to_vec()];
-    crate::tls::apply_client_session_resumption(&mut client_config, None, crls);
-
-    let tls_connector = TlsConnector::from(Arc::new(client_config));
-    let host_owned = probe_tls_server_name(tls_config, host).to_string();
-
-    let connector = tower::service_fn(move |uri: http::Uri| {
-        let tls_connector = tls_connector.clone();
-        let host = host_owned.clone();
-        async move {
-            let addr = format_probe_socket_addr(
-                uri.host().unwrap_or("127.0.0.1"),
-                uri.port_u16().unwrap_or(443),
-            );
-            let tcp = tokio::net::TcpStream::connect(&addr).await?;
             let server_name = ServerName::try_from(host)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             let tls = tls_connector.connect(server_name, tcp).await?;
@@ -4815,7 +4819,6 @@ fn recover_due_passive_ejections_inner(
                 if current.consecutive_generation.is_none() {
                     state.consecutive_failures.store(0, Ordering::Release);
                 }
-                state.consecutive_successes.store(0, Ordering::Relaxed);
                 state.lock_recent_failures().clear();
             }
 
@@ -4963,19 +4966,25 @@ pub async fn grpc_probe_for_test(
     service_name: &str,
 ) -> bool {
     let default_tls = BackendTlsConfig::default_verify();
+    let transport = build_grpc_probe_tls(
+        use_tls,
+        &default_tls,
+        None,
+        HealthCheckClientIdentityPaths {
+            cert: &None,
+            key: &None,
+        },
+        false,
+        &[],
+    );
     grpc_probe(
         host,
         host,
         port,
         timeout,
-        use_tls,
         service_name,
         &default_tls,
-        None,
-        None,
-        None,
-        false,
-        &[],
+        &transport,
     )
     .await
     .success
@@ -5341,19 +5350,25 @@ mod tests {
             } else {
                 Vec::new()
             };
+            let transport = build_grpc_probe_tls(
+                use_tls,
+                &tls,
+                None,
+                HealthCheckClientIdentityPaths {
+                    cert: &None,
+                    key: &None,
+                },
+                false,
+                &crls,
+            );
             let result = grpc_probe(
                 original_host,
                 dial,
                 port,
                 Duration::from_secs(3),
-                use_tls,
                 "screened-control",
                 &tls,
-                None,
-                None,
-                None,
-                false,
-                &crls,
+                &transport,
             )
             .await;
             let _ = stop.send(());
@@ -5479,18 +5494,17 @@ mod tests {
         tls_config.client_cert_path = Some(cert_path.to_string_lossy().into_owned());
         tls_config.client_key_path = Some(key_path.to_string_lossy().into_owned());
         tls_config.verify_server_cert = false;
-        let endpoint = tonic::transport::Endpoint::from_static("https://127.0.0.1:9");
 
-        let error = build_grpc_probe_channel_no_verify(
-            &endpoint,
-            "localhost",
-            Duration::from_millis(50),
+        let error = build_grpc_probe_client_config(
             &tls_config,
             None,
-            None,
-            None,
+            HealthCheckClientIdentityPaths {
+                cert: &None,
+                key: &None,
+            },
+            false,
+            &[],
         )
-        .await
         .expect_err("a malformed client-chain record must fail before dialing")
         .to_string();
         assert!(
@@ -5498,6 +5512,77 @@ mod tests {
             "got: {error}"
         );
         assert!(error.contains("record #2"), "got: {error}");
+    }
+
+    /// Issue #7207: the gateway-wide hot maps follow the hot-path `DashMap`
+    /// sizing rule and honour the operator shard override.
+    #[test]
+    fn hot_map_shard_amount_resizes_gateway_wide_maps() {
+        use dashmap::Map;
+        let checker = HealthChecker::default()
+            .with_hot_map_shard_amount(crate::util::sharding::pool_shard_amount(4));
+        assert_eq!(checker.active_unhealthy_targets.map._shard_count(), 4);
+        assert_eq!(checker.passive_health._shard_count(), 4);
+        let default = HealthChecker::default();
+        assert_eq!(
+            default.active_unhealthy_targets.map._shard_count(),
+            crate::util::sharding::pool_shard_amount(0)
+        );
+    }
+
+    /// Issue #7205: the gRPC probe transport is built once per spawn. A
+    /// TLS build failure becomes a fail-closed transport that reports every
+    /// probe unhealthy without dialing, and a plaintext probe reads no TLS
+    /// material at all.
+    #[tokio::test]
+    async fn grpc_probe_tls_is_built_once_and_fails_closed() {
+        ensure_crypto_provider();
+        let no_identity = HealthCheckClientIdentityPaths {
+            cert: &None,
+            key: &None,
+        };
+        let refused = BackendTlsConfig::refused();
+        assert!(matches!(
+            build_grpc_probe_tls(false, &refused, None, no_identity, false, &[]),
+            GrpcProbeTls::Plaintext
+        ));
+        let transport = build_grpc_probe_tls(true, &refused, None, no_identity, false, &[]);
+        let GrpcProbeTls::Unavailable(reason) = &transport else {
+            panic!("a refused destination must not get a gRPC probe TLS client");
+        };
+        assert!(reason.contains("refused"), "got: {reason}");
+
+        // Port 9 is never contacted: the probe fails before dialing.
+        let outcome = grpc_probe(
+            "localhost",
+            "127.0.0.1",
+            9,
+            Duration::from_millis(50),
+            "",
+            &refused,
+            &transport,
+        )
+        .await;
+        assert!(!outcome.success);
+        let failure = outcome.failure.expect("failure reason");
+        assert!(
+            failure.starts_with("grpc connect failed: "),
+            "got: {failure}"
+        );
+        assert!(failure.contains("refused"), "got: {failure}");
+
+        let verified = build_grpc_probe_tls(
+            true,
+            &BackendTlsConfig::default_verify(),
+            None,
+            no_identity,
+            false,
+            &[],
+        );
+        let GrpcProbeTls::Ready(client_config) = &verified else {
+            panic!("webpki-rooted probe TLS must build");
+        };
+        assert_eq!(client_config.alpn_protocols, vec![b"h2".to_vec()]);
     }
 
     #[tokio::test]
@@ -5518,18 +5603,17 @@ mod tests {
         tls_config.client_cert_path = Some(cert_path.to_string_lossy().into_owned());
         tls_config.client_key_path = Some(key_path.to_string_lossy().into_owned());
         tls_config.verify_server_cert = false;
-        let endpoint = tonic::transport::Endpoint::from_static("https://127.0.0.1:9");
 
-        let error = build_grpc_probe_channel_no_verify(
-            &endpoint,
-            "localhost",
-            Duration::from_millis(50),
+        let error = build_grpc_probe_client_config(
             &tls_config,
             None,
-            None,
-            None,
+            HealthCheckClientIdentityPaths {
+                cert: &None,
+                key: &None,
+            },
+            false,
+            &[],
         )
-        .await
         .expect_err("an all-malformed client chain must fail before dialing")
         .to_string();
         assert!(error.contains("record #1"), "got: {error}");

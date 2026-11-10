@@ -1438,6 +1438,14 @@ impl AcmeCertificateRecord {
 }
 
 impl AcmeOrderRecord {
+    /// Whether preparation recorded any challenge. An order whose
+    /// authorizations were all already valid records none (issue #7195).
+    pub fn has_challenge_records(&self) -> bool {
+        !self.http01_challenges.is_empty()
+            || !self.tls_alpn01_challenges.is_empty()
+            || !self.dns01_challenges.is_empty()
+    }
+
     pub fn new(input: AcmeOrderInput) -> Result<Self, AcmeError> {
         validate_acme_domains(&input.domains)?;
         if let Some(certificate_id) = input.certificate_id.as_deref() {
@@ -3023,13 +3031,16 @@ pub(crate) fn plan_renewal_order(
 /// whatever `FERRUM_ACME_RENEWAL_CHALLENGE_TYPE` happens to say now: an operator
 /// who switched types between the crash and the takeover would otherwise have
 /// the successor poll authorizations it never provisioned. Exactly one non-empty
-/// challenge family is a usable answer; zero families and two or more families
-/// are both explicit failures. Diagnostics name the order id only — never a
-/// token, key authorization, or credential.
+/// challenge family is a usable answer; two or more families are an explicit
+/// failure. `None` means the order recorded no challenge at all, which
+/// preparation produces when every authorization was already valid (issue
+/// #7195): such an order needs no challenge type, and completion refuses any
+/// pending authorization it meets. Diagnostics name the order id only — never
+/// a token, key authorization, or credential.
 #[cfg(any(feature = "acme", test))]
 pub(crate) fn infer_persisted_challenge_type(
     order: &AcmeOrderRecord,
-) -> Result<AcmeRenewalChallengeType, AcmeError> {
+) -> Result<Option<AcmeRenewalChallengeType>, AcmeError> {
     let families = [
         (
             AcmeRenewalChallengeType::Http01,
@@ -3046,12 +3057,8 @@ pub(crate) fn infer_persisted_challenge_type(
     ];
     let mut present = families.iter().filter(|(_, populated)| *populated);
     match (present.next(), present.next()) {
-        (Some((challenge_type, _)), None) => Ok(*challenge_type),
-        (None, _) => Err(AcmeError::InvalidId(format!(
-            "ACME order {} has no persisted challenge records, so its challenge type cannot be \
-             determined; not resuming it",
-            order.id
-        ))),
+        (Some((challenge_type, _)), None) => Ok(Some(*challenge_type)),
+        (None, _) => Ok(None),
         (Some(_), Some(_)) => Err(AcmeError::InvalidId(format!(
             "ACME order {} has more than one persisted challenge family, so its challenge type is \
              ambiguous; not resuming it",
@@ -3676,7 +3683,10 @@ pub(crate) async fn resume_persisted_renewal_order(
     order: AcmeOrderRecord,
     config: &AcmeRenewalSchedulerConfig,
 ) -> Result<bool, AcmeError> {
-    let challenge_type = infer_persisted_challenge_type(&order)?;
+    let inferred_challenge_type = infer_persisted_challenge_type(&order)?;
+    // An order with no challenge records needs none (every authorization was
+    // already valid); completion fails closed on any pending authorization.
+    let challenge_type = inferred_challenge_type.unwrap_or(config.challenge_type);
     // Fail before any side effect if the persisted order cannot actually be
     // driven. `complete_prepared_renewal_order` checks both again; checking here
     // keeps a hopeless resume from re-presenting DNS-01 records first.
@@ -3716,7 +3726,7 @@ pub(crate) async fn resume_persisted_renewal_order(
         "resuming a persisted ACME renewal order under a newly acquired claim"
     );
 
-    if challenge_type == AcmeRenewalChallengeType::Dns01 {
+    if inferred_challenge_type == Some(AcmeRenewalChallengeType::Dns01) {
         let Some(command) = config.dns01_hook_command.as_deref() else {
             tracing::warn!(
                 certificate_id = %certificate.id,
@@ -4041,6 +4051,7 @@ async fn complete_prepared_renewal_order(
         poll_timeout: config.poll_timeout,
         dns_cache: config.dns_cache.clone(),
         finalization,
+        no_challenges_provisioned: !order.has_challenge_records(),
     };
     match challenge_type {
         AcmeRenewalChallengeType::Http01 => client::complete_http01_order(complete_config).await,
@@ -4260,6 +4271,12 @@ pub mod client {
         /// order's own CSR has no safe move left, so callers must resolve the
         /// persisted material (or fail closed) before they can build this.
         pub finalization: super::AcmeOrderFinalization,
+        /// The order was prepared with no challenge because every
+        /// authorization was already valid (issue #7195). A pending
+        /// authorization then means challenge records were lost, so
+        /// completion fails closed instead of answering a challenge nothing
+        /// provisioned.
+        pub no_challenges_provisioned: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -4783,6 +4800,14 @@ pub mod client {
             endpoint_policy
                 .validate_endpoint(&authorization_url, "authorization URL")
                 .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+            // A CA may reuse an authorization that is already valid (RFC 8555
+            // §7.1.3); it lists only the challenge that validated it and needs
+            // none now. Terminal authorizations fail closed (issue #7195).
+            if authorization_completion_action(authorization.status)?
+                == AuthorizationCompletionAction::Skip
+            {
+                continue;
+            }
             let Some(challenge) = authorization.challenge(challenge_type.clone()) else {
                 return Err(AcmeClientError::InvalidRequest(format!(
                     "ACME authorization does not offer {challenge_name}"
@@ -5023,6 +5048,13 @@ pub mod client {
                                 == AuthorizationCompletionAction::Skip
                             {
                                 continue;
+                            }
+                            if config.no_challenges_provisioned {
+                                return Err(AcmeClientError::InvalidRequest(
+                                    "ACME order has a pending authorization but no provisioned \
+                                     challenge; not answering it"
+                                        .to_string(),
+                                ));
                             }
                             let Some(mut challenge) =
                                 authorization.challenge(challenge_type.clone())
@@ -5674,6 +5706,7 @@ pub mod client {
                 poll_timeout: Duration::from_secs(1),
                 dns_cache: default_acme_dns_cache(),
                 finalization: test_finalization(),
+                no_challenges_provisioned: false,
             };
             let error = complete_order(config, ChallengeType::Http01, "http-01")
                 .await
@@ -5709,6 +5742,7 @@ pub mod client {
                 poll_timeout: Duration::from_secs(1),
                 dns_cache: default_acme_dns_cache(),
                 finalization: corrupt_finalization(),
+                no_challenges_provisioned: false,
             };
             let error = complete_order(config, ChallengeType::Http01, "http-01")
                 .await

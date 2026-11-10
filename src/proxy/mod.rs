@@ -11365,7 +11365,10 @@ impl ProxyState {
             &global_pool_config,
             dns_cache.clone(),
             shared_crls.clone(),
-        );
+        )
+        .with_hot_map_shard_amount(crate::util::sharding::pool_shard_amount(
+            env_config_arc.pool_shard_amount,
+        ));
         health_checker.set_global_tls_config(
             env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.backend_tls_client_cert_path.clone(),
@@ -11437,15 +11440,20 @@ impl ProxyState {
                 )
             })?;
 
-        let adaptive_buffer = Arc::new(crate::adaptive_buffer::AdaptiveBufferTracker::new(
-            env_config_arc.adaptive_buffer_enabled,
-            env_config_arc.adaptive_batch_limit_enabled,
-            env_config_arc.adaptive_buffer_ewma_alpha,
-            env_config_arc.adaptive_buffer_min_size,
-            env_config_arc.adaptive_buffer_max_size,
-            env_config_arc.adaptive_buffer_default_size,
-            env_config_arc.adaptive_batch_limit_default,
-        ));
+        let adaptive_buffer = Arc::new(
+            crate::adaptive_buffer::AdaptiveBufferTracker::new(
+                env_config_arc.adaptive_buffer_enabled,
+                env_config_arc.adaptive_batch_limit_enabled,
+                env_config_arc.adaptive_buffer_ewma_alpha,
+                env_config_arc.adaptive_buffer_min_size,
+                env_config_arc.adaptive_buffer_max_size,
+                env_config_arc.adaptive_buffer_default_size,
+                env_config_arc.adaptive_batch_limit_default,
+            )
+            .with_shard_amount(crate::util::sharding::pool_shard_amount(
+                env_config_arc.pool_shard_amount,
+            )),
+        );
 
         let overload = Arc::new(crate::overload::OverloadState::new());
 

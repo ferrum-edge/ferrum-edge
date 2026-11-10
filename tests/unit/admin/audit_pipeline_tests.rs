@@ -790,6 +790,89 @@ fn a_live_generation_owns_its_instance_directory_exclusively() {
     assert_eq!(second.status().metrics.unknown_outcome_total, 0);
 }
 
+/// Issue #7200: a sibling that is still building its instance tree (under the
+/// staging name, before the locked rename) is never mistaken for an abandoned
+/// generation, and a generation's own tree is only visible once it is locked.
+#[cfg(unix)]
+#[test]
+fn a_sibling_still_staging_its_instance_is_never_claimed() {
+    let dir = TempDir::new().expect("temp dir");
+    let staging = dir
+        .path()
+        .join("instances")
+        .join(format!(".staging-{}", Uuid::new_v4()));
+    for sub in ["prepared", "pending", "tmp"] {
+        std::fs::create_dir_all(staging.join(sub)).expect("stage a sibling tree");
+    }
+
+    let spool = AuditSpool::open(
+        dir.path().to_path_buf(),
+        Uuid::new_v4().to_string(),
+        TEST_DESTINATION.to_string(),
+        64,
+        8,
+    )
+    .expect("spool opens");
+    let report = spool.claim_abandoned();
+
+    assert!(staging.is_dir(), "a fresh staging tree is left alone");
+    assert!(
+        !staging.join("owner.lock").exists(),
+        "the claimer never creates a lock inside a sibling's staging tree"
+    );
+    assert_eq!(report.live_instances, 0);
+    let own = dir.path().join("instances").join(spool.generation());
+    assert!(own.join("owner.lock").is_file());
+    assert!(
+        !dir.path()
+            .join("instances")
+            .join(format!(".staging-{}", spool.generation()))
+            .exists(),
+        "the generation's tree was renamed into place"
+    );
+}
+
+/// Issue #7200: processes starting together on one spool root each end up
+/// owning a usable instance; none claims or removes a sibling's tree.
+#[cfg(unix)]
+#[test]
+fn concurrent_spool_opens_and_claims_never_steal_a_sibling() {
+    let dir = TempDir::new().expect("temp dir");
+    let root = dir.path().to_path_buf();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let root = root.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let spool = AuditSpool::open(
+                    root,
+                    Uuid::new_v4().to_string(),
+                    TEST_DESTINATION.to_string(),
+                    64,
+                    8,
+                )
+                .expect("every concurrent open succeeds");
+                spool.claim_abandoned();
+                spool
+            })
+        })
+        .collect();
+    let spools: Vec<AuditSpool> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("open thread"))
+        .collect();
+    for spool in &spools {
+        let own = root.join("instances").join(spool.generation());
+        for sub in ["prepared", "pending", "tmp"] {
+            assert!(own.join(sub).is_dir(), "{sub} survives sibling claims");
+        }
+        assert!(own.join("owner.lock").is_file());
+    }
+    assert_eq!(instance_dirs(&root).len(), spools.len());
+}
+
 #[test]
 fn a_prior_generation_replays_as_explicit_unknown_outcome() {
     let dir = TempDir::new().expect("temp dir");

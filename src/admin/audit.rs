@@ -1570,6 +1570,27 @@ impl AuditPipeline {
         );
     }
 
+    /// Account for an event recorded in a mode with no configuration database
+    /// (for example a mesh operational action) and no durable spool: there is
+    /// no sink at all, so the event is lost. Distinct from
+    /// [`Self::note_shutdown_memory_loss`] so operators are not told a
+    /// shutdown interrupted delivery when none happened (issue #7200).
+    fn note_no_database_memory_loss(&self, record: &SpooledAuditRecord) {
+        self.metrics
+            .dropped_no_spool
+            .fetch_add(1, Ordering::Relaxed);
+        self.mark_unavailable(AuditUnavailableReason::NoDurableSpool);
+        self.evidence_lost.store(true, Ordering::Relaxed);
+        self.mark_degraded(AuditUnavailableReason::NoDurableSpool);
+        error!(
+            audit_event_id = %record.id(),
+            surface = "audit_no_database",
+            reason = AuditUnavailableReason::NoDurableSpool.as_str(),
+            "Admin audit event recorded in a mode with no configuration database, and no \
+             durable audit spool is configured; the event was not retained"
+        );
+    }
+
     /// Account for a finalized memory-only record that could not enter a live
     /// delivery queue. The event has no durable representation, so returning a
     /// successful handoff would be a silent audit gap.
@@ -3035,9 +3056,10 @@ pub async fn record_without_database(
         if pipeline.spool.is_some() {
             Ok(())
         } else {
-            pipeline.note_shutdown_memory_loss(&record);
+            pipeline.note_no_database_memory_loss(&record);
             Err(anyhow!(
-                "admin audit event {} could not be retained after delivery admission closed",
+                "admin audit event {} could not be retained: no configuration database and no \
+                 durable spool in this mode",
                 event_id
             ))
         }

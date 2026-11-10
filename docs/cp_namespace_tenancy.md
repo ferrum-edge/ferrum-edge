@@ -278,6 +278,11 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
   signature**. It authorizes nothing on its own.
 - `namespaces` is the **ceiling**, fixed by CP configuration. A token's `ns`
   claim intersects it; the bearer can only narrow.
+- When the CP scope is a single namespace or an explicit
+  `FERRUM_CP_NAMESPACES` list (not `*`), a served namespace that no credential
+  binds is logged as a warning at startup and on
+  every reload that changes the bundle. It is not a refusal: data planes in
+  that namespace cannot subscribe until a credential is bound to it.
 - Material comes from exactly one of `public_key_pem`, `public_key_path`,
   `secret`, `secret_env`, or `secret_path`. Asymmetric algorithms
   (`RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512`/`ES256`/`ES384`/`EdDSA`) are
@@ -436,7 +441,7 @@ has a finite default.
 `cp_dp_trust` object, and `/metrics` carries the `ferrum_cp_dp_trust_*`
 families. Both are fixed-cardinality: booleans, counters, seconds, the closed
 reason set above (plus `reader_unavailable`, `reload_reader_failed`,
-`reload_read_timed_out`, `scope_validation_failed`, and `worker_exited`).
+`reload_read_timed_out`, and `worker_exited`).
 Nothing more on Prometheus: no path, `kid`, namespace, token, key byte, or
 generation identifier. Admin-JWT-authenticated health additionally carries
 `active_generation`, a replica-stable HMAC-SHA-256 of the private configuration

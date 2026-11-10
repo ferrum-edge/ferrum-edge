@@ -17432,7 +17432,6 @@ components:
               reader_unavailable,
               reload_reader_failed,
               reload_read_timed_out,
-              scope_validation_failed,
               worker_exited,
             ]
           description: Closed-set reason currently blocking rotation.
@@ -45009,6 +45008,7 @@ components:
             - SchemaTooDeep
             - SchemaReferenceCycle
             - SchemaTooLarge
+            - UnsupportedOperationField
           description: |
             Machine-readable error discriminant.
 
@@ -45040,6 +45040,8 @@ components:
             - `SchemaTooLarge` — reference expansion exceeded the per-expansion or cumulative
               per-document materialized-node / byte budget, or the generated operation table
               exceeded the generated-config byte ceiling
+            - `UnsupportedOperationField` — a Path Item declares an OpenAPI 3.2 `query`
+              operation or `additionalOperations`, which the importer does not support
         details:
           type: string
           description: |

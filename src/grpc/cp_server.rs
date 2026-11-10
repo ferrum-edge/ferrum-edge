@@ -946,36 +946,109 @@ impl CpGrpcServer {
         config: &GatewayConfig,
         namespace: &str,
     ) -> GatewayConfig {
-        let mut filtered = config.clone();
-        Self::filter_non_mesh_config_to_namespace(&mut filtered, namespace);
+        let mut filtered = Self::clone_non_mesh_config_for_namespace(config, namespace);
         if let Some(mesh) = filtered.mesh.as_mut() {
             Self::filter_mesh_config_to_namespace(mesh, namespace);
         }
         filtered
     }
 
-    fn filter_non_mesh_config_to_namespace(config: &mut GatewayConfig, namespace: &str) {
-        config.proxies.retain(|p| p.namespace == namespace);
-        config.consumers.retain(|c| c.namespace == namespace);
-        config.plugin_configs.retain(|pc| pc.namespace == namespace);
-        config.upstreams.retain(|u| u.namespace == namespace);
-        // The Gateway-listener TLS classification is namespace-qualified, so it
-        // carries other tenants' namespace names and listener-port topology.
-        // Prune it at this PRIMARY authorization boundary — the DP-side filter
-        // is defense in depth, not the place a tenant's port map stops being
-        // serialized to another tenant's subscriber.
-        config
-            .http_tls_listen_ports
-            .retain(|(entry_namespace, _)| entry_namespace == namespace);
-        // Namespace-keyed trust records are tenant material. Pruning them at
-        // this PRIMARY authorization boundary means no later step — projection,
-        // serialization, error text, or a future addition — can observe another
-        // tenant's roots on this subscriber's path (issue #3727).
-        config
-            .gateway_trust_bundles
-            .retain(|record| record.namespace == namespace);
-        config.known_namespaces = vec![namespace.to_string()];
-        filter_frontend_tls_sources_to_namespace(config, namespace);
+    /// Clone `config` with every namespace-partitioned collection reduced to
+    /// `namespace`, cloning only the matching elements (issue #7208).
+    ///
+    /// The result is identical to cloning the whole multi-namespace config and
+    /// then `retain`ing one namespace — element order is preserved — but a CP
+    /// serving many namespaces no longer copies every other tenant's proxies,
+    /// consumers, plugins and upstreams per subscriber. The exhaustive
+    /// destructuring makes a new `GatewayConfig` field a compile error here, so
+    /// it cannot silently bypass the tenant boundary. `mesh` is cloned whole;
+    /// callers filter it for their request shape.
+    fn clone_non_mesh_config_for_namespace(
+        config: &GatewayConfig,
+        namespace: &str,
+    ) -> GatewayConfig {
+        let GatewayConfig {
+            version,
+            proxies,
+            consumers,
+            plugin_configs,
+            upstreams,
+            loaded_at,
+            known_namespaces: _,
+            frontend_tls_cert_path,
+            frontend_tls_key_path,
+            frontend_tls_source_namespace,
+            frontend_tls_certificate_sources,
+            trust_bundles,
+            gateway_trust_bundles,
+            quarantined_plugin_configs,
+            quarantined_jwt_shared_secrets,
+            mesh,
+            http_tls_listen_ports,
+            mesh_revision,
+            node_waypoint_udp_steer_destinations,
+            node_waypoint_udp_destination_routes,
+            k8s_mesh_overlay,
+        } = config;
+        let mut filtered = GatewayConfig {
+            version: version.clone(),
+            proxies: proxies
+                .iter()
+                .filter(|p| p.namespace == namespace)
+                .cloned()
+                .collect(),
+            consumers: consumers
+                .iter()
+                .filter(|c| c.namespace == namespace)
+                .cloned()
+                .collect(),
+            plugin_configs: plugin_configs
+                .iter()
+                .filter(|pc| pc.namespace == namespace)
+                .cloned()
+                .collect(),
+            upstreams: upstreams
+                .iter()
+                .filter(|u| u.namespace == namespace)
+                .cloned()
+                .collect(),
+            loaded_at: *loaded_at,
+            known_namespaces: vec![namespace.to_string()],
+            frontend_tls_cert_path: frontend_tls_cert_path.clone(),
+            frontend_tls_key_path: frontend_tls_key_path.clone(),
+            frontend_tls_source_namespace: frontend_tls_source_namespace.clone(),
+            frontend_tls_certificate_sources: frontend_tls_certificate_sources.clone(),
+            trust_bundles: trust_bundles.clone(),
+            // Namespace-keyed trust records are tenant material. Pruning them at
+            // this PRIMARY authorization boundary means no later step —
+            // projection, serialization, error text, or a future addition — can
+            // observe another tenant's roots on this subscriber's path (issue
+            // #3727).
+            gateway_trust_bundles: gateway_trust_bundles
+                .iter()
+                .filter(|record| record.namespace == namespace)
+                .cloned()
+                .collect(),
+            quarantined_plugin_configs: quarantined_plugin_configs.clone(),
+            quarantined_jwt_shared_secrets: quarantined_jwt_shared_secrets.clone(),
+            mesh: mesh.clone(),
+            // The Gateway-listener TLS classification is namespace-qualified, so
+            // it carries other tenants' namespace names and listener-port
+            // topology. Prune it at this PRIMARY authorization boundary — the
+            // DP-side filter is defense in depth, not the place a tenant's port
+            // map stops being serialized to another tenant's subscriber.
+            http_tls_listen_ports: http_tls_listen_ports
+                .iter()
+                .filter(|(entry_namespace, _)| entry_namespace == namespace)
+                .cloned()
+                .collect(),
+            mesh_revision: mesh_revision.clone(),
+            node_waypoint_udp_steer_destinations: node_waypoint_udp_steer_destinations.clone(),
+            node_waypoint_udp_destination_routes: node_waypoint_udp_destination_routes.clone(),
+            k8s_mesh_overlay: k8s_mesh_overlay.clone(),
+        };
+        filter_frontend_tls_sources_to_namespace(&mut filtered, namespace);
+        filtered
     }
 
     /// Resolve what this subscriber's snapshot should say about trust
@@ -1083,8 +1156,7 @@ impl CpGrpcServer {
         scope: &CpScope,
         bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
-        let mut filtered = config.clone();
-        Self::filter_non_mesh_config_to_namespace(&mut filtered, &request.namespace);
+        let mut filtered = Self::clone_non_mesh_config_for_namespace(config, &request.namespace);
         if let Some(mesh) = filtered.mesh.as_mut() {
             Self::filter_mesh_config_to_request(
                 mesh,
@@ -3558,6 +3630,81 @@ mod tests {
         assert_eq!(filtered.proxies.len(), 1);
         assert_eq!(filtered.proxies[0].namespace, "ns-a");
         assert_eq!(filtered.proxies[0].id, "p-a");
+    }
+
+    /// Issue #7208: the per-resource partition clone must produce exactly what
+    /// cloning the whole config and `retain`ing one namespace produced.
+    #[test]
+    fn namespace_partition_clone_matches_clone_then_retain() {
+        use crate::config::types::*;
+        let proxy = |id: &str, ns: &str| {
+            serde_json::from_value::<Proxy>(serde_json::json!({
+                "id": id,
+                "namespace": ns,
+                "backend_host": "example.com",
+                "backend_port": 443,
+            }))
+            .expect("proxy fixture should deserialize")
+        };
+        let consumer = |id: &str, ns: &str| {
+            serde_json::from_value::<Consumer>(serde_json::json!({
+                "id": id,
+                "namespace": ns,
+                "username": id,
+            }))
+            .expect("consumer fixture should deserialize")
+        };
+        let upstream = |id: &str, ns: &str| {
+            serde_json::from_value::<Upstream>(serde_json::json!({
+                "id": id,
+                "namespace": ns,
+                "targets": [{"host": "10.0.0.1", "port": 80}],
+            }))
+            .expect("upstream fixture should deserialize")
+        };
+        let mut config = GatewayConfig {
+            version: CURRENT_CONFIG_VERSION.to_string(),
+            loaded_at: Utc::now(),
+            proxies: vec![
+                proxy("p-b1", "ns-b"),
+                proxy("p-a1", "ns-a"),
+                proxy("p-b2", "ns-b"),
+                proxy("p-a2", "ns-a"),
+            ],
+            consumers: vec![consumer("c-a", "ns-a"), consumer("c-b", "ns-b")],
+            upstreams: vec![upstream("u-b", "ns-b"), upstream("u-a", "ns-a")],
+            known_namespaces: vec!["ns-a".to_string(), "ns-b".to_string()],
+            quarantined_plugin_configs: vec!["q-1".to_string()],
+            ..Default::default()
+        };
+        config
+            .http_tls_listen_ports
+            .insert(("ns-a".to_string(), 8443));
+        config
+            .http_tls_listen_ports
+            .insert(("ns-b".to_string(), 9443));
+
+        let mut expected = config.clone();
+        expected.proxies.retain(|p| p.namespace == "ns-a");
+        expected.consumers.retain(|c| c.namespace == "ns-a");
+        expected.plugin_configs.retain(|pc| pc.namespace == "ns-a");
+        expected.upstreams.retain(|u| u.namespace == "ns-a");
+        expected
+            .http_tls_listen_ports
+            .retain(|(entry_namespace, _)| entry_namespace == "ns-a");
+        expected
+            .gateway_trust_bundles
+            .retain(|record| record.namespace == "ns-a");
+        expected.known_namespaces = vec!["ns-a".to_string()];
+        filter_frontend_tls_sources_to_namespace(&mut expected, "ns-a");
+
+        let filtered = CpGrpcServer::filter_config_to_namespace(&config, "ns-a");
+        assert_eq!(
+            serde_json::to_value(&filtered).expect("serialize filtered"),
+            serde_json::to_value(&expected).expect("serialize expected"),
+        );
+        let ids: Vec<&str> = filtered.proxies.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["p-a1", "p-a2"], "element order is preserved");
     }
 
     /// The Gateway-listener TLS classification is tenant topology: it names

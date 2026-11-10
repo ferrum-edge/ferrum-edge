@@ -345,6 +345,10 @@ struct LiveEntry {
     /// excludes the observability-only version and ordering revision.
     projection: Option<ProjectionContext>,
     desired_content_digest: Option<[u8; 32]>,
+    /// [`RegistryState::desired_epoch`] of the reconcile that last decided
+    /// this row's desired state. A publication whose projection finished
+    /// after a newer reconcile already decided the row is discarded.
+    desired_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -455,6 +459,9 @@ struct RegistryState {
     /// Wall clock of the last snapshot publication, used only to bound
     /// fan-out coalescing. `None` until the first publication.
     last_published_at: Option<DateTime<Utc>>,
+    /// Monotonic counter taken by every desired-state reconcile, in the order
+    /// the reconciles observed published configs.
+    desired_epoch: u64,
 }
 
 /// Bounded per-authenticated-DP slice-version drift registry. Every mutation,
@@ -608,6 +615,7 @@ impl MeshSliceDriftRegistry {
             return Err(MeshSliceDriftAdmitError::CardinalityExceeded);
         }
         let now = connected_at;
+        let desired_epoch = state.desired_epoch;
         state.entries.insert(
             registry_key.to_string(),
             LiveEntry {
@@ -631,6 +639,7 @@ impl MeshSliceDriftRegistry {
                 session_token: session_token.clone(),
                 projection,
                 desired_content_digest,
+                desired_epoch,
             },
         );
         self.publish_locked(&mut state, Utc::now());
@@ -697,17 +706,56 @@ impl MeshSliceDriftRegistry {
     /// reload or unrelated namespace mutation leaves desired untouched because
     /// the content digest ignores `MeshSlice.version` and `revision`, matching
     /// `MeshSlice::content_eq`.
+    ///
+    /// The per-row projections (filter, normalize, slice build, canonical JSON,
+    /// SHA-256) run WITHOUT the registry lock, so stream sends and status
+    /// reports are not stalled behind a fleet-wide re-projection (issue
+    /// #7208). The rows are snapshotted under the lock with an epoch, and the
+    /// results are applied under the lock only to rows still on the same
+    /// session that no newer reconcile has decided, so a slow publication can
+    /// never overwrite a newer desired state.
     pub fn reconcile_desired(&self, config: &GatewayConfig, at: DateTime<Utc>) -> usize {
+        let (epoch, rows) = {
+            let mut state = self.state_locked();
+            state.desired_epoch = state.desired_epoch.wrapping_add(1);
+            let rows: Vec<(String, String, ProjectionContext)> = state
+                .entries
+                .iter()
+                .filter_map(|(key, entry)| {
+                    entry.projection.as_ref().map(|projection| {
+                        (key.clone(), entry.session_token.clone(), projection.clone())
+                    })
+                })
+                .collect();
+            (state.desired_epoch, rows)
+        };
+        let projected: Vec<_> = rows
+            .into_iter()
+            .map(|(key, session_token, projection)| {
+                (key, session_token, project_desired(&projection, config))
+            })
+            .collect();
+
         let mut state = self.state_locked();
         let mut changed = 0usize;
         let mut skipped = 0usize;
-        for entry in state.entries.values_mut() {
+        for (key, session_token, outcome) in projected {
+            let Some(entry) = state.entries.get_mut(&key) else {
+                continue;
+            };
+            if entry.session_token != session_token || entry.desired_epoch > epoch {
+                continue;
+            }
+            entry.desired_epoch = epoch;
             // One entry whose projection cannot be represented must not abort
             // reconciliation for the rest of the fleet, and must not leave
             // already-mutated rows unpublished.
-            match reconcile_entry_desired(entry, config, at) {
-                Ok(true) => changed += 1,
-                Ok(false) => {}
+            match outcome {
+                Ok(desired) => {
+                    if apply_desired(entry, desired, at) {
+                        changed += 1;
+                    }
+                }
                 Err(_) => skipped += 1,
             }
         }
@@ -751,10 +799,22 @@ impl MeshSliceDriftRegistry {
             return false;
         }
         let config = config.load_full();
-        let outcome = reconcile_entry_desired(entry, config.as_ref(), at);
+        let outcome = entry
+            .projection
+            .as_ref()
+            .map(|projection| project_desired(projection, config.as_ref()));
+        // This reconcile observed the newest published config, so any
+        // publication projection still in flight is older than it.
+        state.desired_epoch = state.desired_epoch.wrapping_add(1);
+        let epoch = state.desired_epoch;
+        let Some(entry) = state.entries.get_mut(node_id) else {
+            return false;
+        };
+        entry.desired_epoch = epoch;
         let changed = match outcome {
-            Ok(changed) => changed,
-            Err(error) => {
+            None => false,
+            Some(Ok(desired)) => apply_desired(entry, desired, at),
+            Some(Err(error)) => {
                 warn!(
                     field = error.field_name(),
                     "Failed to re-reconcile mesh slice desired state at subscribe time"
@@ -865,13 +925,31 @@ impl MeshSliceDriftRegistry {
         // the now-disconnected row. Neither ordering can strand old desired
         // content after a newer config was published.
         let config = config.load_full();
-        // A projection failure must still leave the row marked disconnected
-        // and published; only the desired watermark is skipped.
-        if let Err(error) = reconcile_entry_desired(entry, config.as_ref(), now) {
-            warn!(
-                field = error.field_name(),
-                "Skipped mesh slice desired reconciliation while finalizing a disconnect"
-            );
+        let outcome = entry
+            .projection
+            .as_ref()
+            .map(|projection| project_desired(projection, config.as_ref()));
+        // This observed the newest published config: any publication
+        // projection still in flight is older and must not overwrite it.
+        state.desired_epoch = state.desired_epoch.wrapping_add(1);
+        let epoch = state.desired_epoch;
+        if let Some(entry) = state.entries.get_mut(node_id) {
+            entry.desired_epoch = epoch;
+            // A projection failure must still leave the row marked
+            // disconnected and published; only the desired watermark is
+            // skipped.
+            match outcome {
+                None => {}
+                Some(Ok(desired)) => {
+                    apply_desired(entry, desired, now);
+                }
+                Some(Err(error)) => {
+                    warn!(
+                        field = error.field_name(),
+                        "Skipped mesh slice desired reconciliation while finalizing a disconnect"
+                    );
+                }
+            }
         }
         self.publish_locked(&mut state, now);
     }
@@ -997,14 +1075,12 @@ impl MeshSliceDriftRegistry {
     }
 }
 
-fn reconcile_entry_desired(
-    entry: &mut LiveEntry,
+/// Project one row's desired slice from `config`: its content digest and
+/// version. Pure and lock-free; the caller applies it with [`apply_desired`].
+fn project_desired(
+    projection: &ProjectionContext,
     config: &GatewayConfig,
-    at: DateTime<Utc>,
-) -> Result<bool, MeshSliceDriftAdmitError> {
-    let Some(projection) = entry.projection.as_ref() else {
-        return Ok(false);
-    };
+) -> Result<([u8; 32], String), MeshSliceDriftAdmitError> {
     let mut filtered = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
         config,
         &projection.request,
@@ -1016,13 +1092,20 @@ fn reconcile_entry_desired(
     let slice = MeshSlice::from_gateway_config(&filtered, projection.request.clone());
     validate_version(&slice.version)?;
     let digest = slice_content_digest(&slice)?;
+    Ok((digest, slice.version))
+}
+
+/// Apply a projected desired state. Returns `true` when the content changed;
+/// a version-only change keeps the existing desired watermark.
+fn apply_desired(entry: &mut LiveEntry, desired: ([u8; 32], String), at: DateTime<Utc>) -> bool {
+    let (digest, version) = desired;
     if entry.desired_content_digest == Some(digest) {
-        return Ok(false);
+        return false;
     }
     entry.desired_content_digest = Some(digest);
-    entry.desired_version = Some(slice.version);
+    entry.desired_version = Some(version);
     entry.desired_at = Some(at);
-    Ok(true)
+    true
 }
 
 fn evict_oldest_disconnected(entries: &mut HashMap<String, LiveEntry>) -> bool {
