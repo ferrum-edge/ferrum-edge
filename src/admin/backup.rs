@@ -59,7 +59,10 @@ fn decode_backup_query_component(raw: &str) -> Result<String, BackupResourcesQue
                 let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2)) else {
                     return Err(BackupResourcesQueryMalformed);
                 };
-                let (Some(high), Some(low)) = (hex_nibble(*high), hex_nibble(*low)) else {
+                let (Some(high), Some(low)) = (
+                    crate::util::hex_nibble(*high),
+                    crate::util::hex_nibble(*low),
+                ) else {
                     return Err(BackupResourcesQueryMalformed);
                 };
                 decoded.push((high << 4) | low);
@@ -76,16 +79,6 @@ fn decode_backup_query_component(raw: &str) -> Result<String, BackupResourcesQue
         return Err(BackupResourcesQueryMalformed);
     }
     Ok(decoded)
-}
-
-/// Value of one hexadecimal digit, or `None` when `byte` is not one.
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Parse the optional `resources` query parameter.
