@@ -5122,11 +5122,19 @@ ENV_OPTION = (
     rf"{ASSIGNMENT_VALUE})"
 )
 ENV_PREFIX = rf"(?:{TOOL_PATH_PREFIX}env(?:\s+{ENV_OPTION})*\s+)"
+# Whether an option word takes a separate operand depends on the wrapper
+# (`sudo -E` takes none, `sudo -D dir` and `ionice -c 3` do, `stdbuf -o L` does,
+# `exec -a name` does), and an option this layer has never heard of may take
+# one too. A shared operand list consumed the executable after `sudo -E` and
+# put an option operand in the executable slot after `ionice -c 3`
+# (GHSA-q636-fxjc-3r78). Every short or long option is therefore allowed to
+# take the next word as an operand OR to stand alone, and the regex engine's
+# backtracking tries both readings, so a Cross executable behind either one is
+# still found.
 WRAPPER_OPTION = (
     r"(?:--(?=\s)|"
-    r"-[nupgEC]\s+[^\s]+|"
-    r"--(?:user|group|chdir|niceness|priority|signal|kill-after)"
-    r"(?:=[^\s]+|\s+[^\s]+)|"
+    r"-[A-Za-z]\s+[^\s]+|"
+    r"--[A-Za-z][A-Za-z0-9-]*(?:=[^\s]+|\s+[^\s]+)|"
     r"--?[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?|"
     r"[0-9]+(?:\.[0-9]+)?[smhd]?)"
 )
@@ -9195,6 +9203,82 @@ def rustup_run_operand(tokens: tuple[str, ...], index: int) -> int | None:
 # that spelling too only widens the executable slot, so this stays fail-closed.
 ASSIGNMENT_PARSING_WRAPPERS = frozenset({"sudo", "time"})
 
+# Options that take a separate operand word, per wrapper (GHSA-q636-fxjc-3r78).
+# A single shared set made `sudo -E`, `sudo -n` and `time -p` swallow the
+# executable as an operand, and left `ionice -c 3`, `exec -a name`,
+# `stdbuf -o L`, `sudo -D dir`, `sudo -h host`, `sudo -T 30` and `sudo -R dir`
+# putting their operand in the executable slot. The sets come from each
+# tool's documented synopsis (sudo(8), nice(1), ionice(1), timeout(1),
+# stdbuf(1), bash `exec`, GNU time(1)); `command`, `nohup` and `setsid` take no
+# operand-bearing options. `-s` is `timeout --signal` but `sudo -s` runs a
+# shell, which is why the sets are scoped per wrapper.
+WRAPPER_OPTION_OPERANDS: dict[str, frozenset[str]] = {
+    "command": frozenset(),
+    "exec": frozenset({"-a"}),
+    "ionice": frozenset(
+        {"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid",
+         "--pgid", "--uid"}
+    ),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "nohup": frozenset(),
+    "setsid": frozenset(),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "sudo": frozenset(
+        {"-u", "-g", "-p", "-C", "-h", "-r", "-t", "-T", "-U", "-D", "-R",
+         "--user", "--group", "--prompt", "--close-from", "--host", "--role",
+         "--type", "--command-timeout", "--other-user", "--chdir", "--chroot"}
+    ),
+    "time": frozenset({"-f", "-o", "--format", "--output"}),
+    "timeout": frozenset({"-k", "-s", "--kill-after", "--signal"}),
+}
+# Documented options that take no operand. An option in neither set is
+# unknown: the token walk reads it as standing alone, and
+# `wrapper_option_operand_variants` adds the reading in which it consumes the
+# next word, so the executable behind either reading is analysed.
+WRAPPER_OPTION_FLAGS: dict[str, frozenset[str]] = {
+    "command": frozenset({"-p"}),
+    "exec": frozenset({"-c", "-l"}),
+    "ionice": frozenset({"-t", "--ignore"}),
+    "nice": frozenset(),
+    "nohup": frozenset(),
+    "setsid": frozenset({"-c", "-f", "-w", "--ctty", "--fork", "--wait"}),
+    "stdbuf": frozenset(),
+    "sudo": frozenset(
+        {"-A", "-B", "-b", "-E", "-e", "-H", "-i", "-K", "-k", "-l", "-N",
+         "-n", "-P", "-S", "-s", "-V", "-v", "--askpass", "--bell",
+         "--background", "--preserve-env", "--edit", "--set-home", "--login",
+         "--remove-timestamp", "--reset-timestamp", "--list", "--no-update",
+         "--non-interactive", "--preserve-groups", "--stdin", "--shell",
+         "--version", "--validate"}
+    ),
+    "time": frozenset({"-p", "-a", "-q", "-v", "--append", "--portability",
+                       "--quiet", "--verbose"}),
+    "timeout": frozenset({"-v", "--foreground", "--preserve-status",
+                          "--verbose"}),
+}
+
+
+def wrapper_option_width(wrapper: str, option: str) -> int:
+    """Return how many words a wrapper option occupies on the default reading.
+
+    A short-option cluster (`-Eu root`, `-nE`) is read letter by letter: an
+    operand-taking letter with text after it carries its operand inline, and
+    one in the last position takes the next word. `--name=value` is always
+    self-contained. Unknown options stand alone here; the alternative reading
+    is supplied as a separate scan variant.
+    """
+
+    operands = WRAPPER_OPTION_OPERANDS.get(wrapper, frozenset())
+    if option in operands:
+        return 2
+    if option.startswith("--") or "=" in option:
+        return 1
+    if len(option) > 2 and option.startswith("-"):
+        for position, letter in enumerate(option[1:], start=1):
+            if f"-{letter}" in operands:
+                return 2 if position == len(option) - 1 else 1
+    return 1
+
 
 def skip_wrapper_prefixes(
     tokens: tuple[str, ...],
@@ -9232,29 +9316,9 @@ def skip_wrapper_prefixes(
         "time",
         "timeout",
     }
-    option_operands = {
-        "-C",
-        "-E",
-        "-g",
-        "-k",
-        "-n",
-        "-p",
-        "-S",
-        "-u",
-        "--chdir",
-        "--group",
-        "--kill-after",
-        "--niceness",
-        "--priority",
-        "--signal",
-        "--user",
-    }
-    # `-s` is `timeout --signal` in short form, but `sudo -s` runs a shell and
-    # takes no operand, so it is scoped to the wrapper that documents it rather
-    # than added to the shared set. Without it,
-    # `timeout -s TERM 30 target/evil.sh` consumed `TERM` as the mandatory
-    # duration and handed the command slot to `30`.
-    wrapper_option_operands = {"timeout": {"-s"}}
+    # Operand-taking options are per wrapper (`WRAPPER_OPTION_OPERANDS`):
+    # `timeout -s TERM 30 target/evil.sh` must consume `TERM` while `sudo -s`
+    # takes nothing, and `sudo -E` must not swallow the executable.
     while index < len(tokens) and (
         tool_name(tokens[index]) in wrappers or tool_name(tokens[index]) == "rustup"
     ):
@@ -9281,14 +9345,8 @@ def skip_wrapper_prefixes(
             if option == "--":
                 index += 1
                 break
-            if option in option_operands or option in wrapper_option_operands.get(
-                wrapper,
-                frozenset(),
-            ):
-                index += 2
-                continue
             if option.startswith("-"):
-                index += 1
+                index += wrapper_option_width(wrapper, option)
                 continue
             break
         if wrapper == "timeout":
@@ -11516,11 +11574,77 @@ def brace_expansion_variants(value: str) -> tuple[str, ...]:
                 )
                 if len(expanded) > 256:
                     # A deliberately explosive shell expansion is an unknown
-                    # executable surface and therefore fails closed.
-                    return tuple([*dict.fromkeys(variants), "cross"])
+                    # executable surface and therefore fails closed. The bare
+                    # word `cross` is not a surface any consumer reports, so the
+                    # overflow must hand back a whole Cross command
+                    # (GHSA-q636-fxjc-3r78: eight two-way groups ahead of
+                    # `cr{o,x}ss build` hid the dispatch).
+                    return tuple([*dict.fromkeys(variants), WHOLE_CROSS_COMMAND])
         variants = list(dict.fromkeys(expanded))
         if not changed:
             return tuple(variants)
+
+
+# At most this many unknown wrapper options on one line are read both ways;
+# beyond it the line is an unknown executable surface and fails closed.
+MAXIMUM_AMBIGUOUS_WRAPPER_OPTIONS = 4
+
+
+def wrapper_option_operand_variants(line: str) -> tuple[str, ...]:
+    """Read every unknown wrapper option as also consuming the next word.
+
+    The token walk reads an option it has no table entry for as standing alone
+    (`WRAPPER_OPTION_FLAGS` / `WRAPPER_OPTION_OPERANDS`). If the wrapper in fact
+    takes an operand for it, the real executable is one word later, so each
+    combination of those options is also offered with the option and its
+    operand removed. Removing words never creates a dispatch the shell would
+    not perform under one of the two readings.
+    """
+
+    if not any(wrapper in line for wrapper in WRAPPER_OPTION_OPERANDS):
+        return ()
+    words = list(re.finditer(r"[^\s;&|()]+", line))
+    ambiguous: list[tuple[int, int]] = []
+    position = 0
+    while position < len(words):
+        wrapper = tool_name(words[position].group())
+        if wrapper not in WRAPPER_OPTION_OPERANDS:
+            position += 1
+            continue
+        position += 1
+        while position < len(words):
+            option = words[position].group()
+            if option == "--" or not option.startswith("-"):
+                break
+            width = wrapper_option_width(wrapper, option)
+            known = (
+                option in WRAPPER_OPTION_OPERANDS[wrapper]
+                or option in WRAPPER_OPTION_FLAGS[wrapper]
+                or option.startswith("--") and "=" in option
+            )
+            if (
+                not known
+                and width == 1
+                and position + 1 < len(words)
+                and not words[position + 1].group().startswith("-")
+            ):
+                ambiguous.append(
+                    (words[position].start(), words[position + 1].end())
+                )
+            position += width
+    if not ambiguous:
+        return ()
+    if len(ambiguous) > MAXIMUM_AMBIGUOUS_WRAPPER_OPTIONS:
+        return (WHOLE_CROSS_COMMAND,)
+    variants: list[str] = []
+    for mask in range(1, 1 << len(ambiguous)):
+        text = line
+        for bit in reversed(range(len(ambiguous))):
+            if mask & (1 << bit):
+                start, end = ambiguous[bit]
+                text = text[:start] + text[end:]
+        variants.append(text)
+    return tuple(variants)
 
 
 def scan_variants(
@@ -11557,6 +11681,7 @@ def scan_variants(
         )
     variants.extend(ansi_c_quoted_variants(line))
     variants.extend(word_splitting_variants(line))
+    variants.extend(wrapper_option_operand_variants(line))
     collapsed = quote_stripped_command_scan_text(line)
     if collapsed != line:
         variants.append(collapsed)
@@ -23974,6 +24099,120 @@ pre_build = []
                 f"'timeout {signal_option}' resolved the wrong word as its "
                 "command operand"
             )
+    # GHSA-q636-fxjc-3r78: wrapper options are per wrapper, and an option the
+    # tables do not know is read both ways. Every prefix below must still
+    # expose an interpreter-embedded Cross dispatch to both workflow scans.
+    def q636_workflow(run_line: str) -> str:
+        return (
+            "name: Wrapper option fixture\n"
+            "on: [push]\n"
+            "permissions:\n"
+            "  contents: read\n"
+            "jobs:\n"
+            "  fixture:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - run: |\n"
+            f"          {run_line}\n"
+        )
+
+    q636_base = {"base.yml": q636_workflow("echo ok")}
+
+    def q636_reported(run_line: str) -> tuple[bool, bool]:
+        proposed = {**q636_base, "fixture.yml": q636_workflow(run_line)}
+        return (
+            bool(scan_workflow_collection_cross_surfaces(proposed, "q636 fixture")),
+            bool(
+                scan_pr_workflow_collection_cross_surfaces(
+                    q636_base, proposed, "q636 fixture"
+                )
+            ),
+        )
+
+    q636_payloads = (
+        f"perl -e 'system(\"cross build --target {TARGET}\")'",
+        f"python3 -c 'import os; os.system(\"cross build --target {TARGET}\")'",
+        f"node -e 'require(\"child_process\").execSync(\"cross build --target {TARGET}\")'",
+    )
+    for q636_prefix in (
+        "",
+        "sudo ",
+        "sudo -E ",
+        "sudo -n ",
+        "sudo -nE ",
+        "sudo -Eu root ",
+        "sudo -u root ",
+        "sudo -D /tmp ",
+        "sudo -h host ",
+        "sudo -T 30 ",
+        "sudo -R /srv ",
+        "sudo --chroot=/srv ",
+        "sudo --unlisted-option value ",
+        "nice -n 5 ",
+        "ionice -c 3 ",
+        "exec -a name ",
+        "stdbuf -oL ",
+        "stdbuf -o L ",
+        "time -p ",
+        "timeout -k 5 30 ",
+        "setsid -w ",
+    ):
+        for q636_payload in q636_payloads:
+            if q636_reported(q636_prefix + q636_payload) != (True, True):
+                failures.append(
+                    f"an interpreter-embedded Cross dispatch behind "
+                    f"{q636_prefix.strip() or 'no wrapper'!r} escaped a workflow scan"
+                )
+    for q636_line, q636_operand in (
+        ("sudo -E scripts/evil.sh", "scripts/evil.sh"),
+        ("sudo -n scripts/evil.sh", "scripts/evil.sh"),
+        ("sudo -D /tmp scripts/evil.sh", "scripts/evil.sh"),
+        ("ionice -c 3 scripts/evil.sh", "scripts/evil.sh"),
+        ("exec -a name scripts/evil.sh", "scripts/evil.sh"),
+        ("stdbuf -o L scripts/evil.sh", "scripts/evil.sh"),
+        ("time -p scripts/evil.sh", "scripts/evil.sh"),
+        ("sudo -Eu root scripts/evil.sh", "scripts/evil.sh"),
+    ):
+        q636_tokens = shell_tokens(q636_line)
+        if q636_tokens is None:
+            failures.append(f"{q636_line!r} did not tokenize")
+            continue
+        q636_index, q636_dispatches, _ = skip_wrapper_prefixes(q636_tokens, 0)
+        if not q636_dispatches or q636_index >= len(q636_tokens) or (
+            q636_tokens[q636_index] != q636_operand
+        ):
+            failures.append(
+                f"{q636_line!r} resolved the wrong word as its command operand"
+            )
+    # Brace overflow: eight two-way groups ahead of `cr{o,x}ss` push the
+    # expansion past 256 variants, which must fail closed as a whole Cross
+    # command; seven groups stay under the bound and a benign seven-group line
+    # is not reported.
+    q636_groups = " ".join(["{a,b}"] * 8)
+    if q636_reported(
+        f"echo {q636_groups}; cr{{o,x}}ss build --target {TARGET}"
+    ) != (True, True):
+        failures.append("an eight-group brace overflow hid a Cross dispatch")
+    if q636_reported(f"echo {q636_groups}; echo x{{c,d}}") != (True, True):
+        failures.append("a nine-group brace overflow did not fail closed")
+    q636_seven = " ".join(["{a,b}"] * 7)
+    if q636_reported(
+        f"echo {q636_seven}; cr{{o,x}}ss build --target {TARGET}"
+    ) != (True, True):
+        failures.append("a seven-group brace expansion hid a Cross dispatch")
+    if q636_reported(f"echo {q636_seven}; echo done") != (False, False):
+        failures.append("a benign seven-group brace expansion was reported")
+    if WHOLE_CROSS_COMMAND not in brace_expansion_variants(
+        q636_groups + " cr{o,x}ss"
+    ):
+        failures.append("brace overflow must return a whole Cross command")
+    if wrapper_option_operand_variants(
+        "sudo --a 1 --b 2 --c 3 --d 4 --e 5 run"
+    ) != (WHOLE_CROSS_COMMAND,):
+        failures.append(
+            "more ambiguous wrapper options than the bound must fail closed"
+        )
+
     # The benign control keeps the same option shape with nothing in a command
     # slot behind it.
     if CROSS_COMMAND_CONTEXT.search(
