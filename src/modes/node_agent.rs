@@ -1240,16 +1240,22 @@ pub async fn run(
         )
         .await
     } else {
-        let backend = create_backend(&config, &metrics)?;
-        run_with_backend(
-            backend,
-            &config,
-            metrics,
-            &shutdown_tx,
-            startup_ready,
-            cni_config,
-        )
-        .await
+        // A backend failure takes the common tail below like every other exit,
+        // so the admin listeners are shut down and joined (#2372, #3704).
+        match create_backend(&config, &metrics) {
+            Ok(backend) => {
+                run_with_backend(
+                    backend,
+                    &config,
+                    metrics,
+                    &shutdown_tx,
+                    startup_ready,
+                    cni_config,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
     };
 
     shutdown_tx.shutdown();
