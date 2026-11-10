@@ -807,7 +807,7 @@ async fn oversized_discovery_document_is_rejected_before_deserialization() {
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() {
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
@@ -879,7 +879,7 @@ async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() 
 async fn failed_discovery_replacement_retires_unpublished_candidate_store() {
     use ferrum_edge::plugins::utils::jwks_cache::cached_refresh_state;
 
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
     let original_path = unique_jwks_path("original-jwks");
@@ -3611,7 +3611,7 @@ async fn discovery_resolved_after_publication_becomes_active_without_another_rel
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
     let (discovery_url, jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let plugin = JwksAuth::new(
@@ -3668,7 +3668,7 @@ async fn staged_discovery_is_withheld_until_commit_and_a_rejected_generation_lea
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
     let (discovery_url, _jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let build = || {
@@ -3752,7 +3752,7 @@ async fn shared_discovery_uri_relaxes_only_after_the_stricter_generation_retires
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
     let (discovery_url, jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let build = |max_stale_secs: u64| {
@@ -5182,7 +5182,7 @@ fn bearer_ctx(token: &str) -> RequestContext {
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn rotated_signing_key_verifies_without_waiting_out_the_refresh_interval() {
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let (server, jwks_uri) = rotating_jwks_endpoint().await;
     let plugin = JwksAuth::new(
         &json!({
@@ -5236,7 +5236,7 @@ async fn rotated_signing_key_verifies_without_waiting_out_the_refresh_interval()
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn tokens_without_a_kid_never_trigger_an_on_demand_refetch() {
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let (server, jwks_uri) = rotating_jwks_endpoint().await;
     let plugin = JwksAuth::new(
         &json!({
@@ -6426,7 +6426,7 @@ fn clock_skew_seconds_is_bounded_at_admission() {
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn discovery_follows_a_jwks_uri_migration_without_reload() {
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let original_public = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let migrated_private = include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem");
     let migrated_public = include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem");
@@ -6685,7 +6685,7 @@ async fn wait_for_active_uri(plugin: &JwksAuth, uri: &str) {
 async fn rediscovery_retires_a_superseded_uri_captured_by_publication() {
     use ferrum_edge::plugins::utils::jwks_cache::{cached_refresh_state, clear_jwks_cache};
 
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
     let server = wiremock::MockServer::start().await;
     let (discovery_url, first_uri, second_uri) = mount_migrating_discovery(&server).await;
@@ -6730,7 +6730,7 @@ async fn rediscovery_retires_a_superseded_uri_captured_by_publication() {
 async fn rediscovery_keeps_a_superseded_uri_a_co_tenant_still_uses() {
     use ferrum_edge::plugins::utils::jwks_cache::{cached_refresh_state, clear_jwks_cache};
 
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
     let server = wiremock::MockServer::start().await;
     let (discovery_url, first_uri, second_uri) = mount_migrating_discovery(&server).await;
