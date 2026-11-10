@@ -794,7 +794,7 @@ export FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE="managed://ocsp-responses/edge-o
 export FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true
 ```
 
-JWKS-capable plugin fields can reference `managed://jwks/{id}#jwks` once the plugin accepts `CertSource` JWKS material.
+No setting or plugin field reads JWKS records yet: `jwks_auth` takes only `jwks_uri`, inline `jwks`, or discovery, and no field accepts a `managed://jwks/{id}#jwks` source. A stored JWKS record is kept and listed but has no runtime effect (issue #7277).
 
 `DELETE` returns `409 Conflict` when the current runtime/config inventory still references the record.
 
