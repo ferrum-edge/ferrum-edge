@@ -4149,6 +4149,7 @@ mod tests {
         let request = |host: &str, path: &str| MeshAuthzRequest {
             host: Some(host.to_string()),
             path: Some(path.to_string()),
+            protocol: MeshAuthzProtocol::Http,
             ..MeshAuthzRequest::default()
         };
 
