@@ -54,11 +54,6 @@ EXTERNAL_ACTION = re.compile(
     r"uses:\s*(?P<action>(?!\./)[^@\s]+)@(?P<ref>[^\s#]+)",
     re.IGNORECASE,
 )
-APPROVED_SETUP = (
-    "./.github/actions/setup-rust-ci",
-    "./.github/actions/setup-sccache",
-    "./.github/actions/setup-fast-linker",
-)
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
 PUBLISHED_BASELINE_DATE = re.compile(r"\bPublished \d{4}-\d{2}-\d{2}\b")
 PUBLISHED_BASELINE_STATUS = re.compile(
@@ -388,7 +383,6 @@ def check_workflow(text: str, failures: list[str]) -> None:
     require("workflow_dispatch:" in text, "workflow_dispatch trigger required", failures)
     require("runs-on: ubuntu-26.04" in text, "collection must pin runs-on ubuntu-26.04", failures)
     require("BENCH_RUNNER_CLASS: ubuntu-26.04" in text, "BENCH_RUNNER_CLASS must be ubuntu-26.04", failures)
-    require("ubuntu-26.04" in text, "default runner class must be ubuntu-26.04", failures)
     require("inputs:\n      runner:" not in text and "runner:" not in _workflow_inputs_block(text), "arbitrary runner input must be removed", failures)
     require(
         "runs-on: self-hosted" not in text.lower()
@@ -490,9 +484,7 @@ def check_workflow(text: str, failures: list[str]) -> None:
             failures,
         )
 
-    for setup in APPROVED_SETUP:
-        if setup == "./.github/actions/setup-rust-ci":
-            require(setup in text, "must use setup-rust-ci", failures)
+    require("./.github/actions/setup-rust-ci" in text, "must use setup-rust-ci", failures)
 
     mesh_step = _named_step(text, "Collect mesh Criterion microbenchmarks")
     hbone_step = _named_step(text, "Collect HBONE E2E baselines (3+ repetitions)")
@@ -659,7 +651,7 @@ def check_scripts(failures: list[str]) -> None:
         "interval probes must expose begin/end snapshots",
         failures,
     )
-    require('"mesh"' in health or "mesh" in health, "runner health script must accept mesh Criterion probes", failures)
+    require('"mesh"' in health, "runner health script must accept mesh Criterion probes", failures)
     require("--self-test" in health, "runner health script must provide hosted self-tests", failures)
     require(
         "parse failure cannot become healthy evidence" in health,

@@ -319,7 +319,7 @@ def validate_signal_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "not numeric run-id comparison" in production or "not numeric run-id" in production,
+        "not numeric run-id" in production,
         "signal must not treat numeric run-id ordering as generation order",
         failures,
     )
@@ -364,9 +364,7 @@ def validate_helper_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        'NAMESPACE_FENCE_RETRY_MESSAGE: &str =\n    "Namespace mutation is temporarily unavailable; retry later"'
-        in text
-        or '"Namespace mutation is temporarily unavailable; retry later"' in text,
+        '"Namespace mutation is temporarily unavailable; retry later"' in text,
         "helper must pin the documented namespace-fence message",
         failures,
     )
@@ -405,7 +403,7 @@ def validate_harness_text(name: str, text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        ".post(format!(\"{}/batch\"" not in text and '.post(format!("{}/batch"' not in text,
+        '.post(format!("{}/batch"' not in text,
         f"{name} must not call POST /batch outside the shared helper",
         failures,
     )
@@ -458,13 +456,13 @@ def validate_repository_contract(failures: list[str]) -> None:
         load = LOAD_PATH.read_text(encoding="utf-8")
         validate_harness_text("load harness", load, failures)
         validate_load_consumer_separation(load, failures)
-    if CI_CD_PATH.is_file():
-        ci_cd = CI_CD_PATH.read_text(encoding="utf-8")
-        require(
-            "scaling-gate-freshness.yml" in ci_cd,
-            "docs/ci_cd.md must record the scaling-gate freshness workflow",
-            failures,
-        )
+    # A missing docs/ci_cd.md is a failure, not a silent skip (issue #7282).
+    ci_cd = CI_CD_PATH.read_text(encoding="utf-8") if CI_CD_PATH.is_file() else ""
+    require(
+        "scaling-gate-freshness.yml" in ci_cd,
+        "docs/ci_cd.md must record the scaling-gate freshness workflow",
+        failures,
+    )
 
 
 def self_test() -> int:

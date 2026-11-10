@@ -22,7 +22,7 @@ FORBIDDEN_INSTALL_PATTERNS = (
     re.compile(
         r"https://github\.com/ferrum-edge/ferrum-edge/releases/latest(?=[\"')])"
     ),
-    re.compile(r"ferrum-edge-x86_64-unknown-linux-gnu\.tar\.gz"),
+    # Also covers the `ferrum-edge-`-prefixed spelling.
     re.compile(r"x86_64-unknown-linux-gnu\.tar\.gz"),
 )
 LINUX_X86_64_BINARY = "ferrum-edge-linux-x86_64"

@@ -1918,8 +1918,7 @@ def main() -> int:
                 planner_errors.append(
                     "ci.yml job gates must include merge_group alongside pull_request"
                 )
-            if 'EVENT_NAME" = "merge_group"' not in workflow_yml and \
-               '"$EVENT_NAME" = "merge_group"' not in workflow_yml:
+            if '"$EVENT_NAME" = "merge_group"' not in workflow_yml:
                 planner_errors.append(
                     "ci.yml planner must handle merge_group base/head selection"
                 )

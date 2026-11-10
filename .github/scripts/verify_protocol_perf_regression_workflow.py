@@ -347,7 +347,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        'runs-on: ubuntu-26.04' in text or "runs-on: ubuntu-26.04" in text,
+        "runs-on: ubuntu-26.04" in text,
         "workflow must document/use ubuntu-26.04 runner class",
         failures,
     )

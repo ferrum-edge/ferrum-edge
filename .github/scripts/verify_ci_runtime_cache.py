@@ -715,9 +715,7 @@ def check_node_waypoint_live_job(
     require(bool(live_job), f"{source} node-waypoint-ebpf-live job is missing", failures)
     require(
         "node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}"
-        in plan_job
-        or "node_waypoint_relevant: ${{ steps.filter.outputs.node_waypoint_relevant }}"
-        in workflow,
+        in plan_job,
         f"{source} plan job must expose node_waypoint_relevant as a job output",
         failures,
     )
@@ -789,8 +787,7 @@ def check_node_waypoint_live_job(
         failures,
     )
     require(
-        'ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}' in live_job
-        or "ferrum_mesh_bpf_drops_total" in live_job,
+        'ferrum_mesh_bpf_drops_total{reason="exclude_port_hit"}' in live_job,
         f"{source} live job must still assert a real BPF bypass metric",
         failures,
     )
@@ -1262,7 +1259,7 @@ def check_credential_absence_assertion(
             failures,
         )
     require(
-        '[ -n "${!var:-}" ]' in text or "[ -n \"${!var:-}\" ]" in text,
+        '[ -n "${!var:-}" ]' in text,
         f"{source} must test credential presence via ${{!var:-}} without "
         "printing values",
         failures,
@@ -3959,7 +3956,7 @@ def check_cache_save_preparation(
         failures,
     )
     require(
-        'if [ ! -d "$out" ]' in step or "if [ ! -d \"$out\" ]" in step,
+        'if [ ! -d "$out" ]' in step,
         f"{source} cache-save preparation must fail when the fresh export is absent",
         failures,
     )
@@ -4360,7 +4357,10 @@ def check_common_trust(text: str, source: str, failures: list[str]) -> None:
     )
     require(
         "ACTIONS_RUNTIME_TOKEN" not in text
-        or "GITHUB_ENV" not in text.split("ACTIONS_RUNTIME_TOKEN", 1)[-1][:400],
+        or all(
+            "GITHUB_ENV" not in segment[:400]
+            for segment in text.split("ACTIONS_RUNTIME_TOKEN")[1:]
+        ),
         f"{source} must not export ACTIONS_RUNTIME_TOKEN into GITHUB_ENV",
         failures,
     )
@@ -4881,7 +4881,7 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "target: runtime" in default_job or "target: runtime\n" in default_job,
+        re.search(r"(?m)^\s*target: runtime$", default_job) is not None,
         "default production-image job must build the ordinary runtime target",
         failures,
     )
@@ -5074,7 +5074,7 @@ def check_shared_actions(failures: list[str]) -> None:
         failures,
     )
     require(
-        "SCCACHE_CACHE_SIZE=2G" in sccache or "SCCACHE_CACHE_SIZE=2G" in sccache,
+        "SCCACHE_CACHE_SIZE=2G" in sccache,
         "setup-sccache must keep the 2 GiB local cache cap",
         failures,
     )
@@ -5184,7 +5184,7 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "save-if: false" in ci_cd or "save-if: false" in ci_cd.replace("`", ""),
+        "save-if: false" in ci_cd.replace("`", ""),
         "docs/ci_cd.md must document that FIPS clippy/test rust-cache does not save",
         failures,
     )
@@ -5311,62 +5311,9 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         "docs/ci_cd.md must describe the FIPS CI cache trust boundary",
         failures,
     )
-    require(
-        "save-if" in ci_cd,
-        "docs/ci_cd.md must document rust-cache save-if so fork PRs cannot save",
-        failures,
-    )
-    require(
-        "fips-producer" in ci_cd
-        and "github.sha" in ci_cd
-        and "run_attempt" in ci_cd,
-        "docs/ci_cd.md must document the exact producer cache key",
-        failures,
-    )
-    require(
-        "fips-producer-handoff" in ci_cd
-        and "inter-run" in ci_cd.lower()
-        and "artifact" in ci_cd.lower()
-        and "evict" in ci_cd.lower()
-        and "deletes" in ci_cd.lower()
-        and "zstd" in ci_cd.lower()
-        and "executable modes" in ci_cd.lower(),
-        "docs/ci_cd.md must document the immutable FIPS inter-run artifact, "
-        "mode-preserving payload, cache eviction, and rerun deletion boundary",
-        failures,
-    )
-    require(
-        "fips-test-build" in ci_cd,
-        "docs/ci_cd.md must document the FIPS test-binary producer job",
-        failures,
-    )
-    require(
-        "fips-test-binaries-<run_id>-*" in ci_cd
-        and "newest attempt" in ci_cd.lower()
-        and "failed-job rerun" in ci_cd.lower()
-        and "flattens" in ci_cd.lower()
-        and "fips-producer-identity" in ci_cd
-        and "fips-test-identity" in ci_cd,
-        "docs/ci_cd.md must document attempt-wildcard FIPS test-artifact "
-        "selection for failed-job reruns, one-match flattening, and internal "
-        "attempt identity",
-        failures,
-    )
-    require(
-        "mozilla-actions/sccache-action" in ci_cd,
-        "docs/ci_cd.md must name the rejected sccache installer",
-        failures,
-    )
-    require(
-        "shared-key" in ci_cd and "ignored" in ci_cd.lower(),
-        "docs/ci_cd.md must document pinned rust-cache shared-key vs ignored key",
-        failures,
-    )
-    require(
-        "--lib" in coverage and "--test unit_tests" in coverage,
-        "coverage lib-unit shard must still collect lib and unit_tests coverage",
-        failures,
-    )
+    # The FIPS producer, handoff, test-artifact, installer and shared-key doc
+    # contracts are asserted once above (issue #7282 removed a second, weaker
+    # copy); the lib-unit coverage command is pinned exactly below.
     lib_unit = coverage
     require(
         _COVERAGE_UNIT_TESTS_COMMAND_RE.search(lib_unit)
@@ -5515,6 +5462,22 @@ def self_test() -> int:
             f"({fork_failures})",
             failures,
         )
+    token_export_failures: list[str] = []
+    check_common_trust(
+        "permissions:\n  contents: read\n"
+        "jobs:\n  a:\n    steps:\n"
+        "      - run: echo ACTIONS_RUNTIME_TOKEN is not exported here\n"
+        + "      - run: true\n" * 20
+        + '      - run: echo "ACTIONS_RUNTIME_TOKEN=$T" >> "$GITHUB_ENV"\n',
+        "self-test",
+        token_export_failures,
+    )
+    require(
+        any("ACTIONS_RUNTIME_TOKEN" in item for item in token_export_failures),
+        "self-test: a later ACTIONS_RUNTIME_TOKEN export must be caught, not only "
+        "the first occurrence",
+        failures,
+    )
     coverage_workflow = read_pinned(COVERAGE_WORKFLOW)
     require(
         _COVERAGE_UNIT_TESTS_COMMAND_RE.search(coverage_workflow) is not None,
@@ -8980,7 +8943,7 @@ def self_test() -> int:
             "    steps:\n"
             "      - run: kind create cluster --name demo\n"
             "      - run: tests/k8s/node_waypoint_ebpf_live/run.sh\n"
-            "      - run: echo ferrum_mesh_bpf_drops_total\n"
+            "      - run: echo 'ferrum_mesh_bpf_drops_total{reason=\"exclude_port_hit\"}'\n"
             "        if: always()\n"
         )
 
