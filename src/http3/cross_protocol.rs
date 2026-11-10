@@ -438,7 +438,10 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
-        route_deadline_cut: false,
+        // The response stream termination hooks must see the route cut, so a
+        // plugin-side breaker (`ai_federation`) settles it neutrally rather
+        // than as a provider `ReadWriteTimeout`.
+        route_deadline_cut: true,
     }
 }
 
@@ -4337,7 +4340,7 @@ where
                                     current_cb_target_key.as_deref(),
                                     401,
                                     false,
-                                    None,
+                                    Some(ErrorClass::ClientDisconnect),
                                     cb_probe.settle(),
                                     false,
                                     backend_start.elapsed(),
@@ -4726,7 +4729,7 @@ where
                                 current_cb_target_key.as_deref(),
                                 401,
                                 false,
-                                None,
+                                Some(ErrorClass::ClientDisconnect),
                                 cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
@@ -5319,7 +5322,7 @@ where
                                 current_cb_target_key.as_deref(),
                                 401,
                                 false,
-                                None,
+                                Some(ErrorClass::ClientDisconnect),
                                 cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
@@ -6034,7 +6037,7 @@ where
                             current_cb_target_key.as_deref(),
                             401,
                             false,
-                            None,
+                            Some(ErrorClass::ClientDisconnect),
                             cb_probe.settle(),
                             false,
                             backend_start.elapsed(),
@@ -6182,7 +6185,7 @@ where
                             current_cb_target_key.as_deref(),
                             413,
                             false,
-                            None,
+                            Some(ErrorClass::RequestBodyTooLarge),
                             cb_probe.settle(),
                             false,
                             backend_start.elapsed(),
