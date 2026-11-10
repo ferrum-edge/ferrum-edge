@@ -270,6 +270,23 @@ app.kubernetes.io/managed-by: {{ $ctx.Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{/* "true" when a bind address is loopback: empty (the runtime's loopback
+     default), any 127/8 IPv4 literal, or any spelling of IPv6 ::1
+     (0:0:0:0:0:0:0:1, [::1], ...). The address is parsed, not prefix-matched,
+     so an expanded IPv6 loopback is not mistaken for a routable bind. Same rule
+     as ferrum-mesh.isLoopbackBind. */}}
+{{- define "ferrum-gateway.isLoopbackBind" -}}
+{{- $bind := . | toString | trim | trimPrefix "[" | trimSuffix "]" -}}
+{{- $v4 := include "ferrum-gateway.ipv4ToInt" $bind -}}
+{{- if eq $bind "" -}}
+true
+{{- else if ne $v4 "" -}}
+{{- if eq (div ($v4 | int64) 16777216 | int) 127 -}}true{{- end -}}
+{{- else if eq (include "ferrum-gateway.ipv6Hextets" $bind) "0,0,0,0,0,0,0,1" -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{/* Convert a validated IPv4 literal to its unsigned 32-bit integer value. */}}
 {{- define "ferrum-gateway.ipv4ToInt" -}}
 {{- $v := . | toString -}}
@@ -812,7 +829,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- fail (printf "cp.grpcBindAddress=%q is not an IP literal: the runtime parses FERRUM_CP_GRPC_LISTEN_ADDR as an IP:port socket address and rejects hostnames (localhost, ferrum-cp, ...) at boot. Use an IP literal — 0.0.0.0 or :: to expose the CP gRPC listener, or 127.0.0.1/::1 for a loopback bind." $cpBind) -}}
 {{- end -}}
 {{- $cpGrpcPort := include "ferrum-gateway.cpGrpcPort" . -}}
-{{- $cpLoopback := or (hasPrefix "127." $cpBindHost) (eq $cpBindHost "::1") -}}
+{{- $cpLoopback := include "ferrum-gateway.isLoopbackBind" $cpBindHost -}}
 {{- $cpGrpcTls := $tlsAll.cpGrpc | default dict -}}
 {{- $cpGrpcTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $cpGrpcTls "certSource" "FERRUM_CP_GRPC_TLS_CERT_SOURCE" "keySource" "FERRUM_CP_GRPC_TLS_KEY_SOURCE") -}}
 {{- if and (ne ($cpGrpcPort | toString) "0") (not $cpLoopback) (not $cpGrpcTlsSet) (not $grpc.allowPlaintext) -}}
@@ -909,8 +926,7 @@ Validation: fail render on missing/unsafe configuration.
 {{- if and $bind (not (include "ferrum-gateway.isIpLiteral" $bind)) -}}
 {{- fail (printf "admin.bindAddress=%q is not an IP literal: the binary requires FERRUM_ADMIN_BIND_ADDRESS to parse as an IP address (e.g. 127.0.0.1, ::1, 0.0.0.0, ::) and exits otherwise. Use an IP literal, not a hostname." $bind) -}}
 {{- end -}}
-{{- $normalizedBind := $bind | trimPrefix "[" | trimSuffix "]" -}}
-{{- $loopback := or (eq $normalizedBind "") (eq $normalizedBind "::1") (regexMatch "^127\\." $normalizedBind) -}}
+{{- $loopback := include "ferrum-gateway.isLoopbackBind" $bind -}}
 {{- $adminHttpPort := include "ferrum-gateway.adminHttpPort" . -}}
 {{- $adminSvc := $admin.service | default dict -}}
 {{- if and $adminSvc.enabled $loopback -}}
@@ -1014,7 +1030,15 @@ Validation: fail render on missing/unsafe configuration.
      too. Both default the pod's grace period upward rather than silently
      truncating the shutdown. */}}
 {{- $preStop := int (.Values.shutdownPreStopSeconds | default 0) -}}
-{{- if and (gt $preStop 0) (semverCompare "<1.29.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- $kubeMajor := atoi (regexReplaceAll "[^0-9].*$" (.Capabilities.KubeVersion.Major | toString) "") -}}
+{{- $kubeMinor := atoi (regexReplaceAll "[^0-9].*$" (.Capabilities.KubeVersion.Minor | toString) "") -}}
+{{/* helm template without --kube-version advertises 1.20.0. That sentinel is
+     not a real cluster; skip it so GitOps/client renders still emit the 1.29+
+     SleepAction default. --kube-version 1.28.0 and real <1.29 clusters fail.
+     Same rule as ferrum-mesh.validateSleepActionSupported. */}}
+{{- $helmTemplateDefaultKube := and (eq $kubeMajor 1) (eq $kubeMinor 20) -}}
+{{- $sleepUnsupported := and (not $helmTemplateDefaultKube) (or (lt $kubeMajor 1) (and (eq $kubeMajor 1) (lt $kubeMinor 29))) -}}
+{{- if and (gt $preStop 0) $sleepUnsupported -}}
 {{- $probes := .Values.probes | default dict -}}
 {{- $readiness := $probes.readiness | default dict -}}
 {{- $failureThreshold := int ($readiness.failureThreshold | default 3) -}}
@@ -1025,7 +1049,13 @@ Validation: fail render on missing/unsafe configuration.
 {{- $preDrain := int (.Values.shutdownPreDrainSeconds | default 0) -}}
 {{- $minGrace := add $preStop (add $preDrain $shutdownBudget) -}}
 {{- $grace := .Values.terminationGracePeriodSeconds -}}
-{{- if and (not (kindIs "invalid" $grace)) (lt (int $grace) $minGrace) -}}
+{{/* A null grace period renders an empty terminationGracePeriodSeconds, so the
+     pod gets Kubernetes' 30s default, below every possible minimum. Same rule as
+     ferrum-mesh.validateShutdown. */}}
+{{- if kindIs "invalid" $grace -}}
+{{- fail (printf "terminationGracePeriodSeconds is required (minimum %d = preStop %ds + preDrain %ds + shutdown budget %ds)" $minGrace $preStop $preDrain $shutdownBudget) -}}
+{{- end -}}
+{{- if lt (int $grace) $minGrace -}}
 {{- fail (printf "terminationGracePeriodSeconds (%d) must be at least %d (preStop %ds + preDrain %ds + shutdown budget %ds, where the shutdown budget is drain %ds + transport pool 6s + background 5s + audit %ds + observability 2s + finalizer slack 5s); a null shutdownDrainSeconds uses the binary's 30s default" (int $grace) $minGrace $preStop $preDrain $shutdownBudget $effectiveDrain $auditBudget) -}}
 {{- end -}}
 {{- include "ferrum-gateway.validateMetrics" . -}}
@@ -1261,8 +1291,7 @@ fail_closed
 {{- if $sm.enabled -}}
 {{- $admin := .Values.admin | default dict -}}
 {{- $bind := $admin.bindAddress | default "" -}}
-{{- $normalizedBind := $bind | trimPrefix "[" | trimSuffix "]" -}}
-{{- $loopback := or (eq $normalizedBind "") (eq $normalizedBind "::1") (regexMatch "^127\\." $normalizedBind) -}}
+{{- $loopback := include "ferrum-gateway.isLoopbackBind" $bind -}}
 {{- $adminSvc := $admin.service | default dict -}}
 {{- if not $adminSvc.enabled -}}
 {{- fail "metrics.serviceMonitor.enabled=true requires admin.service.enabled=true so Prometheus can reach /metrics through the admin ClusterIP Service; the chart does not auto-expose admin on the pod IP" -}}
