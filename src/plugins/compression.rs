@@ -2563,7 +2563,9 @@ impl Plugin for CompressionPlugin {
         // (the monotonic request-global HIT marker) — including legacy identity
         // responses that omit `Vary: Accept-Encoding` (#2355) — so auth/policy
         // rejections keep their original status.
-        let on_rejection = ctx.metadata.contains_key(crate::proxy::REJECTION_RESPONSE_METADATA_KEY);
+        let on_rejection = ctx
+            .metadata
+            .contains_key(crate::proxy::REJECTION_RESPONSE_METADATA_KEY);
 
         // Settle this instance's share of the chain-wide negotiation decision
         // before any early return below, so a hard-skipping or ineligible
