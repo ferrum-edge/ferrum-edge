@@ -6666,6 +6666,22 @@ impl GeminiStreamNormalizer {
     }
 
     fn interpret_json_object(&mut self, raw: &str, out: &mut NormalizedSseOut) -> bool {
+        self.interpret_json_object_or_fail(
+            raw,
+            "upstream provider sent a malformed Gemini JSON event; stream terminated",
+            out,
+        )
+    }
+
+    /// [`Self::interpret_json_object`] with the diagnostic a JSON parse
+    /// failure reports, so an unterminated EOF event keeps the stable
+    /// trailing-data label instead of the complete-event one.
+    fn interpret_json_object_or_fail(
+        &mut self,
+        raw: &str,
+        malformed_message: &'static str,
+        out: &mut NormalizedSseOut,
+    ) -> bool {
         if json_nesting_depth(raw) > MAX_SSE_EVENT_JSON_DEPTH {
             self.emit_upstream_error(
                 "upstream provider sent a Gemini event with excessive JSON nesting; stream terminated",
@@ -6677,10 +6693,7 @@ impl GeminiStreamNormalizer {
         let event: Value = match serde_json::from_str(raw) {
             Ok(value) => value,
             Err(_) => {
-                self.emit_upstream_error(
-                    "upstream provider sent a malformed Gemini JSON event; stream terminated",
-                    out,
-                );
+                self.emit_upstream_error(malformed_message, out);
                 self.finish(StreamTerminal::UpstreamFailure, out);
                 return true;
             }
@@ -7039,6 +7052,60 @@ impl GeminiStreamNormalizer {
         Ok(())
     }
 
+    /// Classify one SSE event's raw bytes. The JSON payload is carried as an
+    /// owned string so it can be interpreted without holding a borrow of the
+    /// buffer across mutation.
+    fn sse_frame_outcome(raw: &[u8]) -> FrameOutcome {
+        match extract_sse_event_result(raw) {
+            Ok((_event_name, None)) => FrameOutcome::Ignore,
+            Ok((_event_name, Some(data))) if data == "[DONE]" => FrameOutcome::Ignore,
+            Ok((_event_name, Some(data))) => FrameOutcome::Event(Value::String(data)),
+            Err(_) => FrameOutcome::Fail(
+                "upstream provider sent a malformed SSE event; stream terminated",
+            ),
+        }
+    }
+
+    /// Transcode the final SSE event a provider ended without its blank-line
+    /// terminator. Same EOF rule as `AnthropicSseNormalizer::finish_stream`
+    /// (issue #7128): the event is interpreted under the ordinary bounds, and
+    /// one that cannot be read reports the stable trailing-data diagnostic.
+    /// Whether the stream then succeeded is still decided by the caller's
+    /// terminal `finishReason` check. Returns whether the stream terminated.
+    fn finish_trailing_sse_event(&mut self, out: &mut NormalizedSseOut) -> bool {
+        const TRAILING: &str =
+            "upstream provider ended the Gemini stream with malformed trailing data";
+        if self.unread_len() > MAX_SSE_EVENT_BYTES {
+            self.fail_bound(
+                "upstream provider sent an oversized SSE event; stream terminated",
+                out,
+            );
+            return true;
+        }
+        if self.events_seen >= self.limits.max_events {
+            self.fail_bound(
+                "upstream provider SSE stream exceeded the event count limit; stream terminated",
+                out,
+            );
+            return true;
+        }
+        let outcome = Self::sse_frame_outcome(&self.buf[self.cursor..]);
+        self.events_seen = self.events_seen.saturating_add(1);
+        self.clear_buffer();
+        let terminate = match outcome {
+            FrameOutcome::Ignore => false,
+            FrameOutcome::Event(Value::String(data)) => {
+                self.interpret_json_object_or_fail(&data, TRAILING, out)
+            }
+            FrameOutcome::Event(_) | FrameOutcome::Fail(_) => {
+                self.emit_upstream_error(TRAILING, out);
+                self.finish(StreamTerminal::UpstreamFailure, out);
+                true
+            }
+        };
+        self.normalized_output_exceeded(out, terminate) || terminate
+    }
+
     fn drain_sse(&mut self, out: &mut NormalizedSseOut) -> bool {
         loop {
             let end = {
@@ -7067,22 +7134,7 @@ impl GeminiStreamNormalizer {
                 return true;
             }
             let start = self.cursor;
-            let raw = &self.buf[start..end];
-            let outcome = match extract_sse_event_result(raw) {
-                Ok((_event_name, None)) => FrameOutcome::Ignore,
-                Ok((_event_name, Some(data))) => {
-                    if data == "[DONE]" {
-                        FrameOutcome::Ignore
-                    } else {
-                        // Interpret immediately via a owned String to avoid
-                        // holding a borrow across mutation.
-                        FrameOutcome::Event(Value::String(data))
-                    }
-                }
-                Err(_) => FrameOutcome::Fail(
-                    "upstream provider sent a malformed SSE event; stream terminated",
-                ),
-            };
+            let outcome = Self::sse_frame_outcome(&self.buf[start..end]);
             self.set_cursor(end);
             self.scan_cursor = end;
             self.events_seen = self.events_seen.saturating_add(1);
@@ -7317,7 +7369,17 @@ impl GeminiStreamNormalizer {
         if self.unread_len() > 0 {
             let trailing = &self.buf[self.cursor..];
             let only_ws = trailing.iter().all(u8::is_ascii_whitespace);
-            if !only_ws {
+            if only_ws {
+                self.clear_buffer();
+            } else if self.framing == GeminiFraming::Sse {
+                // A final SSE event without the blank-line terminator is
+                // transcoded, as the Anthropic normalizer does.
+                if self.finish_trailing_sse_event(out) {
+                    return;
+                }
+            } else {
+                // JSON framing: complete values were already drained, so a
+                // non-whitespace remainder is an incomplete value.
                 self.emit_upstream_error(
                     "upstream provider ended the Gemini stream with malformed trailing data",
                     out,
@@ -7326,7 +7388,6 @@ impl GeminiStreamNormalizer {
                 let _ = self.normalized_output_exceeded(out, true);
                 return;
             }
-            self.clear_buffer();
         }
         match self.json_array_state {
             GeminiJsonArrayState::ExpectFirstValueOrEnd

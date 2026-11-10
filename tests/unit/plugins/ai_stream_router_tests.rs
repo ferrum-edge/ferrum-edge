@@ -8476,6 +8476,49 @@ async fn test_gemini_malformed_and_oversized_events_fail_closed() {
     }
 }
 
+/// Issue #7128: Gemini and Anthropic share one EOF rule. A final SSE event
+/// the provider ended without its blank-line terminator is transcoded, so a
+/// backend that omits the last `\n\n` still completes successfully; an
+/// unterminated event that cannot be read keeps the stable trailing-data
+/// diagnostic, and an unterminated non-terminal event is still a premature
+/// EOF.
+#[tokio::test]
+async fn test_gemini_unterminated_final_sse_event_is_transcoded() {
+    let terminated = run_gemini_normalizer(4096, GEMINI_SSE, "text/event-stream").await;
+    for suffix_len in [1, 2] {
+        let body = &GEMINI_SSE[..GEMINI_SSE.len() - suffix_len];
+        for chunk_size in [5, 4096] {
+            let out = run_gemini_normalizer(chunk_size, body, "text/event-stream").await;
+            assert_eq!(
+                strip_created(&out),
+                strip_created(&terminated),
+                "suffix {suffix_len}, chunk {chunk_size}"
+            );
+            assert!(!out.contains("upstream_error"), "{out}");
+            assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+            assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+        }
+    }
+
+    let truncated = concat!(
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\"",
+    );
+    let out = run_gemini_normalizer(4096, truncated, "text/event-stream").await;
+    assert!(out.contains("malformed trailing data"), "{out}");
+    assert!(!out.contains("malformed Gemini JSON event"), "{out}");
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+
+    let non_terminal = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hi\"}]}}]}";
+    let out = run_gemini_normalizer(4096, non_terminal, "text/event-stream").await;
+    assert!(out.contains("\"content\":\"Hi\""), "{out}");
+    assert!(
+        out.contains("before every candidate reached a terminal finishReason"),
+        "{out}"
+    );
+    assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");
+}
+
 #[tokio::test]
 async fn test_gemini_reload_config_still_selects_provider() {
     let plugin = build(gemini_config());
