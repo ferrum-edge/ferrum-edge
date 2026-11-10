@@ -1778,25 +1778,36 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     }
 
     if !MESH_FEDERATION_LAST_SUCCESS.is_empty() {
+        // One snapshot feeds both families, so each is emitted as one group
+        // (HELP, TYPE, then all of its samples) from the same key set.
+        let samples: Vec<(String, u64)> = MESH_FEDERATION_LAST_SUCCESS
+            .iter()
+            .map(|entry| {
+                (
+                    escape_label_value(entry.key()),
+                    entry.value().load(Ordering::Relaxed),
+                )
+            })
+            .collect();
         output.push_str(
             "# HELP ferrum_mesh_federation_last_success_timestamp_seconds Unix timestamp of last successful SPIFFE federation poll.\n",
         );
         output.push_str("# TYPE ferrum_mesh_federation_last_success_timestamp_seconds gauge\n");
-        output.push_str(
-            "# HELP ferrum_mesh_federation_bundle_age_seconds Age of the cached federated trust bundle, in seconds.\n",
-        );
-        output.push_str("# TYPE ferrum_mesh_federation_bundle_age_seconds gauge\n");
-        for entry in MESH_FEDERATION_LAST_SUCCESS.iter() {
-            let last = entry.value().load(Ordering::Relaxed);
-            let trust_domain = escape_label_value(entry.key());
+        for (trust_domain, last) in &samples {
             output.push_str(&format!(
                 "ferrum_mesh_federation_last_success_timestamp_seconds{{trust_domain=\"{}\"{}}} {}\n",
                 trust_domain, gateway_ns_label, last
             ));
+        }
+        output.push_str(
+            "# HELP ferrum_mesh_federation_bundle_age_seconds Age of the cached federated trust bundle, in seconds.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_federation_bundle_age_seconds gauge\n");
+        for (trust_domain, last) in &samples {
             // Age clamps to 0 when the cached "last" timestamp is somehow in the
             // future (clock skew on a restart). Saturating subtraction keeps the
             // gauge non-negative for a Prometheus `gauge` type.
-            let age = now.saturating_sub(last);
+            let age = now.saturating_sub(*last);
             output.push_str(&format!(
                 "ferrum_mesh_federation_bundle_age_seconds{{trust_domain=\"{}\"{}}} {}\n",
                 trust_domain, gateway_ns_label, age
@@ -1837,24 +1848,35 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     }
 
     if !MESH_REMOTE_DISCOVERY_LAST_SUCCESS.is_empty() {
+        // One snapshot feeds both families, so each is emitted as one group
+        // (HELP, TYPE, then all of its samples) from the same key set.
+        let samples: Vec<(String, String, u64)> = MESH_REMOTE_DISCOVERY_LAST_SUCCESS
+            .iter()
+            .map(|entry| {
+                (
+                    escape_label_value(&entry.key().cluster),
+                    escape_label_value(&entry.key().trust_domain),
+                    entry.value().load(Ordering::Relaxed),
+                )
+            })
+            .collect();
         output.push_str(
             "# HELP ferrum_mesh_remote_discovery_last_success_timestamp_seconds Unix timestamp of last successful remote-cluster endpoint discovery poll.\n",
         );
         output
             .push_str("# TYPE ferrum_mesh_remote_discovery_last_success_timestamp_seconds gauge\n");
-        output.push_str(
-            "# HELP ferrum_mesh_remote_discovery_endpoint_age_seconds Age of the cached remote-cluster endpoints, in seconds.\n",
-        );
-        output.push_str("# TYPE ferrum_mesh_remote_discovery_endpoint_age_seconds gauge\n");
-        for entry in MESH_REMOTE_DISCOVERY_LAST_SUCCESS.iter() {
-            let last = entry.value().load(Ordering::Relaxed);
-            let cluster = escape_label_value(&entry.key().cluster);
-            let trust_domain = escape_label_value(&entry.key().trust_domain);
+        for (cluster, trust_domain, last) in &samples {
             output.push_str(&format!(
                 "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
                 cluster, trust_domain, gateway_ns_label, last
             ));
-            let age = now.saturating_sub(last);
+        }
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_endpoint_age_seconds Age of the cached remote-cluster endpoints, in seconds.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_remote_discovery_endpoint_age_seconds gauge\n");
+        for (cluster, trust_domain, last) in &samples {
+            let age = now.saturating_sub(*last);
             output.push_str(&format!(
                 "ferrum_mesh_remote_discovery_endpoint_age_seconds{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
                 cluster, trust_domain, gateway_ns_label, age
