@@ -16,6 +16,10 @@
 //! outbound backend connections.
 
 pub mod acme;
+#[cfg(test)]
+mod acme_final_publication_tests;
+#[cfg(test)]
+mod acme_renewal_resume_tests;
 pub mod backend;
 pub mod client_trust;
 pub mod crl_policy;
@@ -23,10 +27,6 @@ pub mod events;
 pub mod frontend_reload;
 pub mod inventory;
 pub mod inventory_cache;
-#[cfg(test)]
-mod acme_final_publication_tests;
-#[cfg(test)]
-mod acme_renewal_resume_tests;
 // Renewal-lease coordination is consumed by the `acme`-feature renewal
 // scheduler and by external tests; the default (no-`acme`) build compiles it
 // unused, so suppress dead-code warnings for the whole module.
@@ -44,11 +44,11 @@ pub mod shared_store;
 #[cfg(test)]
 mod shared_store_tests;
 pub mod source;
+#[allow(dead_code)]
+pub mod spiffe;
 #[cfg(test)]
 mod store_atomicity_tests;
 pub(crate) mod store_dir;
-#[allow(dead_code)]
-pub mod spiffe;
 
 pub use client_trust::{
     ClientTrustAdmission, ClientTrustMaterial, ClientTrustScope, ClientTrustSession,

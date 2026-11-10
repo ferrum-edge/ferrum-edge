@@ -2970,8 +2970,11 @@ mod tests {
         config.known_namespaces.push("ferrum".to_string());
         let side_channel = config.trust_bundles.as_deref().expect("trust bundle");
         let side_channel_authority = side_channel.local.x509_authorities[0].clone();
-        let record_authority =
-            config.gateway_trust_bundles[0].bundle.local.x509_authorities[0].clone();
+        let record_authority = config.gateway_trust_bundles[0]
+            .bundle
+            .local
+            .x509_authorities[0]
+            .clone();
 
         let json = CpGrpcServer::config_json_for_dp(&config).expect("DP config should serialize");
         let value: serde_json::Value =
@@ -3003,8 +3006,11 @@ mod tests {
             gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
         };
-        let record_authority =
-            config.gateway_trust_bundles[0].bundle.local.x509_authorities[0].clone();
+        let record_authority = config.gateway_trust_bundles[0]
+            .bundle
+            .local
+            .x509_authorities[0]
+            .clone();
         let (tx, mut rx) = broadcast::channel(1);
 
         CpGrpcServer::broadcast_update(&tx, &config);
