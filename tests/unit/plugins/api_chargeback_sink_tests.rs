@@ -15321,3 +15321,32 @@ fn unavailable_http_client_is_a_counted_retryable_delivery_outcome() {
         "an unavailable client must be counted and returned as retryable"
     );
 }
+
+/// Issue #7112: in snapshot mode an HTTP charge refused by the accumulator's
+/// cardinality bound is spooled as an immediate overflow row. That row must
+/// carry the same normalized `grpc_status` the accumulator keys on (see
+/// `grpc_snapshot_bounds_non_standard_terminal_status_cardinality`), or one
+/// request class appears under two values exactly when the accumulator is
+/// under pressure. Driving a live snapshot lifecycle to its cardinality bound
+/// is out of reach of a unit test, so both producers are pinned to the one
+/// shared normalization over the source.
+#[test]
+fn snapshot_overflow_rows_use_the_accumulator_grpc_status_normalization() {
+    let source = include_str!("../../../src/plugins/api_chargeback_sink.rs");
+    let arm = source
+        .find("SnapshotRecordOutcome::OverflowImmediate => {")
+        .expect("snapshot overflow arm exists");
+    let arm_end = arm
+        + source[arm..]
+            .find("self.enqueue(event_from_http_summary(")
+            .expect("the immediate-export path follows the snapshot arm");
+    let arm_body = &source[arm..arm_end];
+    assert!(
+        arm_body.contains("snapshot_http_outcome(outcome)"),
+        "the overflow row must be built from the snapshot-normalized outcome"
+    );
+    assert!(
+        source.contains("grpc_status: snapshot_http_outcome(outcome).grpc_status,"),
+        "the accumulator identity must use the same normalization"
+    );
+}

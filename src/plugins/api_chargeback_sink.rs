@@ -3824,12 +3824,15 @@ impl Plugin for ApiChargebackSink {
                 {
                     SnapshotRecordOutcome::Accumulated => {}
                     SnapshotRecordOutcome::OverflowImmediate => {
+                        // The overflow row carries the same `grpc_status` the
+                        // accumulator keys on, so one request class never
+                        // appears under two values (issue #7112).
                         spool_snapshot_overflow_event(
                             lifecycle,
                             event_from_http_summary(
                                 summary,
                                 consumer,
-                                outcome,
+                                snapshot_http_outcome(outcome),
                                 charge,
                                 &self.config,
                                 &self.node_id,
@@ -15227,7 +15230,7 @@ impl SnapshotAccumulator {
             route_id: metadata_value(&summary.metadata, &["route_id"]),
             status_code: outcome.status_code,
             http_status_code: Some(outcome.http_status_code),
-            grpc_status: outcome.grpc_status.map(normalize_snapshot_grpc_status),
+            grpc_status: snapshot_http_outcome(outcome).grpc_status,
             protocol: infer_http_protocol(summary),
         };
         self.record(meta, charge)
@@ -16873,6 +16876,17 @@ fn bound_string(value: &str, max_len: usize) -> String {
 /// usernames, display names, or route identifiers.
 fn bound_key_field(value: &str, max_len: usize) -> String {
     crate::plugins::chargeback::bounded_billing_identity(value, max_len).into_owned()
+}
+
+/// Snapshot-mode view of an HTTP billing outcome: a non-standard gRPC status
+/// collapses to [`GRPC_STATUS_OTHER_SENTINEL`]. Both the accumulated row and an
+/// overflow row spooled under cardinality pressure use it, so their
+/// `grpc_status` values agree.
+fn snapshot_http_outcome(outcome: HttpBillingOutcome) -> HttpBillingOutcome {
+    HttpBillingOutcome {
+        grpc_status: outcome.grpc_status.map(normalize_snapshot_grpc_status),
+        ..outcome
+    }
 }
 
 fn normalize_snapshot_grpc_status(status: u32) -> u32 {
