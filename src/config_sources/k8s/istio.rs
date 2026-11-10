@@ -1910,9 +1910,10 @@ fn translate_traffic_policy(
 ) -> Result<MeshTrafficPolicy, K8sTranslateError> {
     let tcp = value.get("connectionPool").and_then(|cp| cp.get("tcp"));
 
-    let connect_timeout_ms = tcp
-        .and_then(|tcp| string_field(tcp, "connectTimeout"))
-        .and_then(parse_istio_duration_ms);
+    let connect_timeout_ms = match tcp.and_then(|tcp| tcp.get("connectTimeout")) {
+        Some(raw) => Some(parse_tcp_connect_timeout_ms(object, raw)?),
+        None => None,
+    };
 
     let max_connections = tcp
         .map(|tcp| translate_tcp_max_connections(object, tcp))
@@ -2381,6 +2382,34 @@ fn parse_http_idle_timeout_ms(object: &K8sObject, raw: &str) -> Result<u64, K8sT
 /// other than 0 are rejected because the proxy field is whole-second
 /// granular. Values above `MAX_TCP_IDLE_TIMEOUT` (24h) are rejected so the
 /// K8s surface stays consistent with the admin admit-path validator.
+/// `connectionPool.tcp.connectTimeout` lands on the proxy's
+/// `backend_connect_timeout_ms` (or a per-port override of it), which config
+/// validation bounds to `1..=MAX_TIMEOUT_MS`. Refuse anything outside that
+/// range here, like the sibling durations, rather than silently dropping an
+/// unparseable value (which kept the default timeout while reporting the
+/// resource Accepted) or emitting a value the data plane refuses.
+fn parse_tcp_connect_timeout_ms(object: &K8sObject, raw: &Value) -> Result<u64, K8sTranslateError> {
+    let ms = raw
+        .as_str()
+        .and_then(parse_istio_duration_ms)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                "trafficPolicy.connectionPool.tcp.connectTimeout is not a valid Istio duration",
+            )
+        })?;
+    if ms == 0 || ms > MAX_TIMEOUT_MS {
+        return Err(invalid_resource(
+            object,
+            format!(
+                "trafficPolicy.connectionPool.tcp.connectTimeout must be between 1ms and \
+                 {MAX_TIMEOUT_MS}ms"
+            ),
+        ));
+    }
+    Ok(ms)
+}
+
 fn parse_tcp_idle_timeout_seconds(object: &K8sObject, raw: &str) -> Result<u64, K8sTranslateError> {
     let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
         invalid_resource(
@@ -3761,7 +3790,7 @@ fn parse_l4_match_arm(
     m: &Value,
     kind: &str,
     vs_gateways: &[String],
-) -> Result<Option<crate::proxy::stream_match::StreamMatchArm>, K8sTranslateError> {
+) -> Result<crate::proxy::stream_match::StreamMatchArm, K8sTranslateError> {
     use crate::proxy::stream_match::{
         MAX_STREAM_MATCH_GATEWAY_LENGTH, MAX_STREAM_MATCH_GATEWAYS, MAX_STREAM_MATCH_LABELS,
         StreamMatchArm, canonicalize_gateway_name, valid_kubernetes_label_key,
@@ -3909,7 +3938,7 @@ fn parse_l4_match_arm(
         vs_gateways.to_vec()
     };
 
-    Ok(Some(arm))
+    Ok(arm)
 }
 
 fn parse_l4_cidr_list(
@@ -3973,14 +4002,8 @@ fn parse_l4_cidr_list(
     Ok(out)
 }
 
-fn attach_l4_stream_match(
-    proxy: &mut Proxy,
-    arm: Option<crate::proxy::stream_match::StreamMatchArm>,
-) {
-    if let Some(arm) = arm {
-        proxy.stream_match =
-            Some(crate::proxy::stream_match::StreamMatchCriteria { arms: vec![arm] });
-    }
+fn attach_l4_stream_match(proxy: &mut Proxy, arm: crate::proxy::stream_match::StreamMatchArm) {
+    proxy.stream_match = Some(crate::proxy::stream_match::StreamMatchCriteria { arms: vec![arm] });
 }
 
 /// Resolve L4 (`tcp[]`/`tls[]`) route destinations into Ferrum backends.
@@ -5166,7 +5189,7 @@ fn virtual_service_routes(
             };
 
         let retry = route_retry_config(http);
-        let timeout_ms = route_timeout_ms(http);
+        let timeout_ms = route_timeout_ms(object, http)?;
 
         let match_count = route_candidates.len();
         for (match_index, (listen_path, force_terminate_current)) in
@@ -5293,7 +5316,6 @@ fn virtual_service_routes(
                     rewrite: route_rewrite_value.as_ref(),
                     redirect: route_redirect_value.as_ref(),
                 },
-                false,
             );
 
             let mut proxy = proxy_for_route(RouteProxySpec {
@@ -5827,9 +5849,24 @@ fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
         .map(|code| code as u16)
 }
 
-fn route_timeout_ms(http: &Value) -> Option<u64> {
-    let raw = string_field(http, "timeout")?;
-    parse_istio_duration_ms(raw).map(|ms| ms.min(MAX_TIMEOUT_MS))
+/// `http[].timeout`, clamped to `MAX_TIMEOUT_MS`. An absent timeout leaves the
+/// route timeout disabled (Istio's default); a present value that is not a
+/// valid Istio duration is refused, because treating it as absent would turn a
+/// typo into a disabled route timeout while reporting the resource Accepted.
+fn route_timeout_ms(object: &K8sObject, http: &Value) -> Result<Option<u64>, K8sTranslateError> {
+    let Some(raw) = http.get("timeout").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let ms = raw
+        .as_str()
+        .and_then(parse_istio_duration_ms)
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                "VirtualService http[].timeout is not a valid Istio duration",
+            )
+        })?;
+    Ok(Some(ms.min(MAX_TIMEOUT_MS)))
 }
 
 /// Project an Istio `VirtualService.http[].rewrite` block into the per-rule

@@ -174,16 +174,6 @@ fn discover_pod_cgroup_paths(
     matches
 }
 
-/// Build the expected cgroup path for a given QoS class (for testing/validation).
-pub fn cgroup_path_for_qos(cgroup_root: &str, pod_uid: &str, qos_class: &str) -> PathBuf {
-    match qos_class {
-        "Guaranteed" => Path::new(cgroup_root).join(format!("kubepods/pod{pod_uid}")),
-        "Burstable" => Path::new(cgroup_root).join(format!("kubepods/burstable/pod{pod_uid}")),
-        "BestEffort" => Path::new(cgroup_root).join(format!("kubepods/besteffort/pod{pod_uid}")),
-        _ => Path::new(cgroup_root).join(format!("kubepods/pod{pod_uid}")),
-    }
-}
-
 /// Bounds for [`collect_cgroup_tree`]. Kubernetes pod cgroups nest only a
 /// level or two deep (the pod slice plus a `.scope`/dir per container, plus
 /// the pause container), so these are generous; they exist solely to keep a
@@ -675,30 +665,6 @@ mod cgroup_detach_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cgroup_path_for_qos_guaranteed() {
-        let path = cgroup_path_for_qos("/sys/fs/cgroup", "abc-123", "Guaranteed");
-        assert_eq!(path, PathBuf::from("/sys/fs/cgroup/kubepods/podabc-123"));
-    }
-
-    #[test]
-    fn cgroup_path_for_qos_burstable() {
-        let path = cgroup_path_for_qos("/sys/fs/cgroup", "abc-123", "Burstable");
-        assert_eq!(
-            path,
-            PathBuf::from("/sys/fs/cgroup/kubepods/burstable/podabc-123")
-        );
-    }
-
-    #[test]
-    fn cgroup_path_for_qos_besteffort() {
-        let path = cgroup_path_for_qos("/sys/fs/cgroup", "abc-123", "BestEffort");
-        assert_eq!(
-            path,
-            PathBuf::from("/sys/fs/cgroup/kubepods/besteffort/podabc-123")
-        );
-    }
 
     #[test]
     fn resolve_pod_cgroup_path_nonexistent() {

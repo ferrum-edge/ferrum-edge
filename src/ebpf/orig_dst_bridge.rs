@@ -191,8 +191,11 @@ mod production {
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                // A dropped shutdown sender (`changed()` is `Err`) is a
+                // shutdown too: `changed()` would otherwise complete
+                // immediately on every iteration and spin this loop.
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         info!("Node-waypoint orig-dst bridge shutting down");
                         // Drop the fallback so the resolver no longer references
                         // these maps once this task (and the maps) go away.
@@ -351,8 +354,9 @@ mod production {
                 _ = tokio::time::sleep(backoff) => {
                     backoff = (backoff * 2).min(BACKOFF_MAX);
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                // A dropped shutdown sender ends the wait instead of spinning.
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         return WaitOutcome::Shutdown;
                     }
                 }

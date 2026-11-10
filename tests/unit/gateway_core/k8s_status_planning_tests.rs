@@ -2744,3 +2744,58 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
         "malformed present from + missing to must grant nothing in status"
     );
 }
+
+#[test]
+fn rejected_gateway_listeners_report_translation_failed_not_unsupported_protocol() {
+    // A plain HTTP listener on a Gateway that failed translation must name
+    // that cause on every listener condition (as the listener's `Accepted`
+    // already does), not `UnsupportedProtocol` (issue #7261).
+    let objects = base_objects_with_routes(0);
+    let gateway = objects
+        .iter()
+        .find(|object| object.kind == "Gateway")
+        .expect("fixture gateway");
+    let conflicts = gateway_api_route_conflicts(&objects, &options());
+    let (translation, mut errors) =
+        ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(
+            &objects,
+            options(),
+        )
+        .expect("primary translation");
+    errors.insert(
+        ferrum_edge::config_sources::k8s::K8sResourceKey::from_object(gateway),
+        ferrum_edge::config_sources::k8s::K8sTranslateError::InvalidResource {
+            kind: "Gateway".to_string(),
+            namespace: gateway.metadata.namespace.clone(),
+            name: gateway.metadata.name.clone(),
+            message: "synthetic gateway rejection".to_string(),
+        },
+    );
+    let reuse = StatusTranslationReuse::from_owned(translation, errors);
+    let planned = plan_gateway_api_status_updates_budgeted(
+        &objects,
+        options(),
+        &conflicts,
+        Default::default(),
+        Some(&reuse),
+        StatusPlanBudget::unlimited(0),
+    );
+    let gateway_status = &planned
+        .updates
+        .iter()
+        .find(|update| update.kind == "Gateway")
+        .expect("gateway status planned")
+        .status;
+    for condition_type in ["Accepted", "ResolvedRefs", "Programmed"] {
+        assert_eq!(
+            condition_status(gateway_status, condition_type),
+            Some("False"),
+            "{condition_type}: {gateway_status}"
+        );
+        assert_eq!(
+            condition_reason(gateway_status, condition_type),
+            Some("TranslationFailed"),
+            "{condition_type}: {gateway_status}"
+        );
+    }
+}

@@ -42,10 +42,7 @@ fn ferrum_listenerset_status_message(message: &str) -> String {
 
 /// Collect ListenerSets from a snapshot, resolving parent Gateways from the
 /// same snapshot. Call after Gateway listener policies are indexed.
-pub(crate) fn collect_listenersets_from_snapshot(
-    acc: &mut K8sAccumulator,
-    objects: &[&K8sObject],
-) -> Result<(), K8sTranslateError> {
+pub(crate) fn collect_listenersets_from_snapshot(acc: &mut K8sAccumulator, objects: &[&K8sObject]) {
     let gateways: HashMap<(String, String), &K8sObject> = objects
         .iter()
         .filter(|object| object.kind == "Gateway")
@@ -66,17 +63,16 @@ pub(crate) fn collect_listenersets_from_snapshot(
         if object.kind != "ListenerSet" || !includes_object_namespace(&acc.options, object) {
             continue;
         }
-        collect_one_listenerset(acc, object, &gateways)?;
+        collect_one_listenerset(acc, object, &gateways);
     }
     finalize_listenerset_conflicts(acc, objects);
-    Ok(())
 }
 
 fn collect_one_listenerset(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
     gateways: &HashMap<(String, String), &K8sObject>,
-) -> Result<(), K8sTranslateError> {
+) {
     let resource = K8sResourceKey::from_object(object);
     let Some(parent_ref) = object.spec.get("parentRef") else {
         record_listenerset_status(
@@ -91,7 +87,7 @@ fn collect_one_listenerset(
             "Invalid",
             "ListenerSet spec.parentRef is required",
         );
-        return Ok(());
+        return;
     };
 
     let parent = match parse_parent_gateway_ref(object, parent_ref) {
@@ -100,7 +96,7 @@ fn collect_one_listenerset(
             record_listenerset_status(
                 acc, resource, None, false, false, "Invalid", &message, false, "Invalid", &message,
             );
-            return Ok(());
+            return;
         }
     };
 
@@ -117,7 +113,7 @@ fn collect_one_listenerset(
             "ParentNotProgrammed",
             "ListenerSet parentRef does not select a Ferrum-managed Gateway",
         );
-        return Ok(());
+        return;
     };
 
     if !allowed_listeners_permits(acc, gateway, object) {
@@ -133,7 +129,7 @@ fn collect_one_listenerset(
             "Invalid",
             "Gateway spec.allowedListeners does not permit this ListenerSet",
         );
-        return Ok(());
+        return;
     }
 
     let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
@@ -149,7 +145,7 @@ fn collect_one_listenerset(
             "Invalid",
             "ListenerSet spec.listeners must be a non-empty array",
         );
-        return Ok(());
+        return;
     };
     if listeners.is_empty() {
         record_listenerset_status(
@@ -164,7 +160,7 @@ fn collect_one_listenerset(
             "Invalid",
             "ListenerSet spec.listeners must be a non-empty array",
         );
-        return Ok(());
+        return;
     }
     if listeners.len() > MAX_LISTENERSET_LISTENERS {
         record_listenerset_status(
@@ -179,7 +175,7 @@ fn collect_one_listenerset(
             "Invalid",
             "ListenerSet spec.listeners must contain at most 64 listeners",
         );
-        return Ok(());
+        return;
     }
     if listenerset_listener_names_are_duplicated(listeners) {
         record_listenerset_status(
@@ -194,7 +190,7 @@ fn collect_one_listenerset(
             "Invalid",
             "ListenerSet spec.listeners[].name values must be unique",
         );
-        return Ok(());
+        return;
     }
 
     let mut saw_valid_listener = false;
@@ -308,7 +304,6 @@ fn collect_one_listenerset(
             "Every ListenerSet listener was invalid or unsupported"
         },
     );
-    Ok(())
 }
 
 /// Apply Gateway→ListenerSet precedence and mark conflicted listeners.

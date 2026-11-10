@@ -392,14 +392,18 @@ pub(super) fn translate(
 /// (Gateway API marks the field implementation-specific).
 const DEFAULT_SESSION_NAME: &str = "ferrum-session";
 
-/// Accepted/rejected BackendLB / XBackendTraffic policy attachment for a Service.
+/// Accepted BackendLB / XBackendTraffic policy attachment for a Service.
+///
+/// Only an accepted policy is recorded: an invalid one is refused by
+/// [`collect_backend_lb_policy`] and never reaches the accumulator, so a route
+/// whose backend Service carries only an invalid policy gets no Service-level
+/// session persistence.
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayBackendSessionPolicy {
     pub resource: K8sResourceKey,
     pub creation_timestamp: Option<DateTime<Utc>>,
-    /// `Ok(None)` = policy accepted but carries no `sessionPersistence`.
-    /// `Err` = field-specific rejection reason.
-    pub session: Result<Option<GatewaySessionPersistence>, String>,
+    /// `None` = policy accepted but carries no `sessionPersistence`.
+    pub session: Option<GatewaySessionPersistence>,
 }
 
 fn backend_lb_policy_kinds(kind: &str) -> bool {
@@ -514,7 +518,7 @@ pub(super) fn collect_backend_lb_policy(
             .creation_timestamp
             .as_deref()
             .and_then(parse_k8s_timestamp),
-        session: Ok(session),
+        session,
     };
 
     // Remember the policy's FULL Service target set. Precedence below is
@@ -902,35 +906,23 @@ fn resolve_rule_session_persistence(
         let Some(policy) = acc.gateway_api_backend_session_policies.get(key) else {
             continue;
         };
-        match &policy.session {
-            Ok(Some(session)) => {
-                if let Some((ref prior_key, ref existing)) = resolved {
-                    if existing != session {
-                        return Err(invalid_resource(
-                            object,
-                            format!(
-                                "backendRefs target Services with conflicting \
-                                 BackendLB/XBackendTraffic sessionPersistence \
-                                 (Service {:?}/{:?} vs Service {:?}/{:?})",
-                                prior_key.0, prior_key.1, key.0, key.1
-                            ),
-                        ));
-                    }
-                } else {
-                    resolved = Some((key.clone(), session.clone()));
-                }
-            }
-            Ok(None) => {}
-            Err(message) => {
+        let Some(session) = &policy.session else {
+            continue;
+        };
+        if let Some((ref prior_key, ref existing)) = resolved {
+            if existing != session {
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "backend Service {:?}/{:?} has rejected session policy \
-                         {:?}/{:?}: {message}",
-                        key.0, key.1, policy.resource.namespace, policy.resource.name
+                        "backendRefs target Services with conflicting \
+                         BackendLB/XBackendTraffic sessionPersistence \
+                         (Service {:?}/{:?} vs Service {:?}/{:?})",
+                        prior_key.0, prior_key.1, key.0, key.1
                     ),
                 ));
             }
+        } else {
+            resolved = Some((key.clone(), session.clone()));
         }
     }
     Ok(resolved.map(|(_, session)| scope_cookie_session_to_route(object, rule_index, session)))
@@ -1021,7 +1013,7 @@ pub(crate) fn backend_lb_policy_conflict_losers<'a>(
                     .creation_timestamp
                     .as_deref()
                     .and_then(parse_k8s_timestamp),
-                session: Ok(None),
+                session: None,
             },
             targets,
         ));
@@ -5751,6 +5743,7 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
                     ensure_url_rewrite_filter(object, rule, rule_index, &location, payload_object)?;
                 }
                 Some("RequestRedirect") => {
+                    ensure_request_redirect_target(object, &location, payload_object)?;
                     if let Some(path) = payload_object.get("path") {
                         let modifier = PathModifierFilter::RequestRedirect;
                         ensure_path_modifier(object, rule, rule_index, &location, modifier, path)?;
@@ -6237,6 +6230,49 @@ fn ensure_url_rewrite_filter(
     };
     let modifier = PathModifierFilter::UrlRewrite;
     ensure_path_modifier(object, rule, rule_index, location, modifier, path)
+}
+
+/// Validate the `scheme` and `hostname` of one admitted `RequestRedirect`
+/// before any rule materializes.
+///
+/// Upstream's CRD restricts `scheme` to the `http` / `https` enum and
+/// `hostname` to a `PreciseHostname`; both are copied into the route's
+/// `mesh_route_dispatch` redirect. The plugin rejects a bad value only at
+/// construction, where it would fail the whole plugin-cache build rather than
+/// this one route, so Ferrum refuses the route here (`Invalid`), exactly as
+/// `ensure_url_rewrite_filter` does for `urlRewrite.hostname`. A file/CP-delivered
+/// object never passed through the API server's validation.
+fn ensure_request_redirect_target(
+    object: &K8sObject,
+    location: &str,
+    redirect: &serde_json::Map<String, Value>,
+) -> Result<(), K8sTranslateError> {
+    if let Some(scheme) = redirect.get("scheme")
+        && !matches!(scheme.as_str(), Some("http" | "https"))
+    {
+        return Err(invalid_resource(
+            object,
+            format!("{location}.requestRedirect.scheme must be `http` or `https`"),
+        ));
+    }
+    if let Some(hostname) = redirect.get("hostname") {
+        let hostname = hostname.as_str().filter(|value| !value.is_empty());
+        let Some(hostname) = hostname else {
+            return Err(invalid_resource(
+                object,
+                format!("{location}.requestRedirect.hostname must be a non-empty string"),
+            ));
+        };
+        if !is_precise_gateway_hostname(hostname) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.requestRedirect.hostname must be a precise hostname without a wildcard or port"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The filter carrying an `HTTPPathModifier`: `URLRewrite` rebases the path
