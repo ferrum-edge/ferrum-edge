@@ -260,9 +260,9 @@ const REDACTED_HOST_PLACEHOLDER: &str = "redacted-host";
 /// error string, or retained diagnostic metadata. Callers keep the complete
 /// URL only for the actual network request.
 ///
-/// `loki_logging::redacted_endpoint_url` and
-/// `otel_tracing::redacted_endpoint_url` delegate here so every HTTP-backed
-/// sink renders one identical form.
+/// Every HTTP-backed sink (`loki_logging` and `ws_logging` directly,
+/// `otel_tracing::redacted_endpoint_url` by delegation) renders this one
+/// identical form.
 pub fn redacted_endpoint_url(endpoint: &Url) -> String {
     let host = endpoint.host_str().unwrap_or(REDACTED_HOST_PLACEHOLDER);
     let port = endpoint

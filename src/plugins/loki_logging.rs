@@ -358,7 +358,7 @@ impl LokiLogging {
                     .to_string(),
             );
         }
-        let endpoint_url_for_logs = redacted_endpoint_url(&parsed_endpoint);
+        let endpoint_url_for_logs = super::utils::redacted_endpoint_url(&parsed_endpoint);
         let gzip = optional_bool(config, "gzip")?.unwrap_or(true);
 
         // Parse static labels from config.
@@ -651,15 +651,6 @@ fn next_loki_emitter_id() -> Result<String, String> {
         value.push(HEX[(byte & 0x0f) as usize] as char);
     }
     Ok(value)
-}
-
-/// Structurally redacted collector URL for diagnostics (path/query omitted).
-///
-/// Delegates to the shared sink helper so every HTTP-backed log sink renders
-/// one identical form. Retained as a named item because Loki's flush config and
-/// unit tests refer to it directly.
-pub(crate) fn redacted_endpoint_url(endpoint: &url::Url) -> String {
-    super::utils::redacted_endpoint_url(endpoint)
 }
 
 fn is_valid_loki_label_name(name: &str) -> bool {
