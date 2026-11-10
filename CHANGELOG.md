@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Changed
+- **Operator diagnostics name the right setting and keep their useful detail**
+  (issue #7229). `ferrum-edge health` now reports the numeric HTTP status
+  (`Unhealthy: HTTP status 503`) instead of a quoted status line the startup
+  renderer withheld. TLS and DTLS key-exchange group errors and the TLS policy
+  log line name `FERRUM_TLS_KEY_EXCHANGE_GROUPS` instead of the
+  `FERRUM_TLS_CURVES` alias. Unreadable Gateway multi-certificate material
+  reports the field label and failure class only, like the single-certificate
+  loader. A MeshSubscribe peer that omits its version is told CP and data
+  planes must run the same build.
 - **V001 baseline: namespace-scoped credential index and structured MySQL
   duplicate-index check** (issue #7228). `idx_consumer_credential_index_consumer_id`
   now covers `(namespace, consumer_id)`, matching its foreign key and the
