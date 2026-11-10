@@ -28,7 +28,11 @@ fn option_values_with_delimiters_round_trip() {
 
     let rendered = source.to_config_value();
     let reparsed = CertSource::parse(rendered.clone(), MaterialKind::Cert);
-    assert_eq!(options(&reparsed), decoded, "rendered options must round-trip");
+    assert_eq!(
+        options(&reparsed),
+        decoded,
+        "rendered options must round-trip"
+    );
     assert_eq!(reparsed.to_config_value(), rendered, "rendering is stable");
 }
 
