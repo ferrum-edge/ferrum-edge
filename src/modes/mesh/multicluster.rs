@@ -70,8 +70,9 @@ use crate::modes::mesh::config_consumer::common::{
     BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
     next_backoff_secs as common_next_backoff_secs,
 };
+use crate::modes::mesh::config_consumer::update_validation::MeshUpdateRejectReason;
 use crate::modes::mesh::revision::{
-    MeshRevisionContentIdentity, MeshRevisionGate, MeshRevisionPolicy,
+    MeshRevisionContentIdentity, MeshRevisionGate, MeshRevisionPolicy, MeshRevisionRejectReason,
 };
 
 /// Backoff bounds shared with [`super::federation`] and
@@ -686,8 +687,85 @@ pub trait RemoteServiceSource: Send + Sync {
     /// Fetch the remote cluster's current service endpoints. Returns `Err` on
     /// any transport / auth / decode failure so the poll loop keeps the
     /// last-good snapshot and backs off.
-    async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String>;
+    async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure>;
 }
+
+/// Why one remote-discovery poll failed (issue #7245). A closed set, so the
+/// poll loop can log the cause as fixed labels: the underlying transport,
+/// status and decode errors can carry remote-control-plane-supplied text, so
+/// they are never rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteDiscoveryFailure {
+    /// No discovery credential is resolved for the cluster.
+    MissingCredential,
+    /// The control-plane URL cannot be used as a gRPC endpoint.
+    InvalidUrl,
+    /// The client TLS configuration could not be applied.
+    TlsConfig,
+    /// The transport connection to the remote control plane failed.
+    Connect,
+    /// The remote-discovery JWT or its request metadata could not be built.
+    Credential,
+    /// The `MeshSubscribe` call was refused (for example authentication).
+    SubscribeFailed,
+    /// The `MeshSubscribe` stream failed while being read.
+    StreamError,
+    /// The stream ended before delivering a slice.
+    StreamClosed,
+    /// The poll did not complete within the request timeout.
+    Timeout,
+    /// A response failed the shared `MeshConfigUpdate` binding/content rules.
+    UpdateRejected(MeshUpdateRejectReason),
+    /// The remote slice carries more workloads than one cluster may contribute.
+    WorkloadCap,
+    /// The remote slice carries more services than one cluster may contribute.
+    ServiceCap,
+    /// The per-cluster revision gate refused the candidate.
+    RevisionRejected(MeshRevisionRejectReason),
+}
+
+impl RemoteDiscoveryFailure {
+    /// Fixed label for the failure class.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::MissingCredential => "missing_credential",
+            Self::InvalidUrl => "invalid_url",
+            Self::TlsConfig => "tls_config",
+            Self::Connect => "connect",
+            Self::Credential => "credential",
+            Self::SubscribeFailed => "subscribe_failed",
+            Self::StreamError => "stream_error",
+            Self::StreamClosed => "stream_closed",
+            Self::Timeout => "timeout",
+            Self::UpdateRejected(_) => "update_rejected",
+            Self::WorkloadCap => "workload_cap",
+            Self::ServiceCap => "service_cap",
+            Self::RevisionRejected(_) => "revision_rejected",
+        }
+    }
+
+    /// The bounded rejection reason for a gate refusal, `"none"` otherwise.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::UpdateRejected(reason) => reason.as_metric_label(),
+            Self::RevisionRejected(reason) => reason.as_metric_label(),
+            _ => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteDiscoveryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UpdateRejected(_) | Self::RevisionRejected(_) => {
+                write!(f, "{}: {}", self.kind(), self.reason())
+            }
+            _ => f.write_str(self.kind()),
+        }
+    }
+}
+
+impl std::error::Error for RemoteDiscoveryFailure {}
 
 /// Locality tag applied to a remote workload that carries no locality of its
 /// own, so it still tiers BELOW the local source region in the priority-tier
@@ -1767,7 +1845,7 @@ async fn remote_discovery_loop(
 
         let attempt_started_at = std::time::Instant::now();
         let result = source.fetch().await.and_then(|mut candidate| {
-            validate_remote_endpoints(&ctx.cluster_name, &candidate.endpoints)?;
+            validate_remote_endpoints(&candidate.endpoints)?;
             enforce_remote_trust_domain(
                 &mut candidate.endpoints,
                 &ctx.trust_domain,
@@ -1787,7 +1865,7 @@ async fn remote_discovery_loop(
             ctx.revision_gate
                 .admit(candidate.revision.as_ref(), content, chrono::Utc::now())
                 .map_err(|rejection| {
-                    format!("remote MeshSubscribe revision rejected: {rejection}")
+                    RemoteDiscoveryFailure::RevisionRejected(rejection.reason())
                 })?;
             Ok((candidate, content))
         });
@@ -1884,11 +1962,12 @@ async fn remote_discovery_loop(
                 let elapsed = attempt_started_at.elapsed();
                 (true, ctx.config.poll_interval.saturating_sub(elapsed))
             }
-            Err(_) => {
+            Err(failure) => {
                 warn!(
                     cluster = %crate::startup::sanitize_startup_scalar(&ctx.cluster_name),
                     control_plane = %crate::startup::sanitize_startup_scalar(&url_for_logs),
-                    error = "remote endpoint fetch or admission failed",
+                    failure = %failure.kind(),
+                    reason = %failure.reason(),
                     "Remote-cluster endpoint discovery failed; keeping last-good endpoints if any"
                 );
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_remote_discovery_poll_failure(
@@ -2044,22 +2123,13 @@ fn enforce_remote_trust_domain(
 }
 
 fn validate_remote_endpoints(
-    cluster_name: &str,
     endpoints: &RemoteClusterEndpoints,
-) -> Result<(), String> {
+) -> Result<(), RemoteDiscoveryFailure> {
     if endpoints.workloads.len() > REMOTE_MAX_WORKLOADS_PER_CLUSTER {
-        return Err(format!(
-            "remote cluster {cluster_name:?} returned {} workloads (max \
-             {REMOTE_MAX_WORKLOADS_PER_CLUSTER})",
-            endpoints.workloads.len()
-        ));
+        return Err(RemoteDiscoveryFailure::WorkloadCap);
     }
     if endpoints.services.len() > REMOTE_MAX_SERVICES_PER_CLUSTER {
-        return Err(format!(
-            "remote cluster {cluster_name:?} returned {} services (max \
-             {REMOTE_MAX_SERVICES_PER_CLUSTER})",
-            endpoints.services.len()
-        ));
+        return Err(RemoteDiscoveryFailure::ServiceCap);
     }
     Ok(())
 }
@@ -2133,7 +2203,7 @@ impl NativeRemoteSource {
 
 #[async_trait]
 impl RemoteServiceSource for NativeRemoteSource {
-    async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
+    async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure> {
         let slice = fetch_remote_slice(
             &self.control_plane_url,
             &self.node_id,
@@ -2161,27 +2231,20 @@ impl RemoteServiceSource for NativeRemoteSource {
 pub fn native_source_factory(ctx: &RemoteClusterPollContext) -> Arc<dyn RemoteServiceSource> {
     match ctx.config.jwt_secret.clone() {
         Some(secret) => Arc::new(NativeRemoteSource::new(ctx, secret)),
-        None => Arc::new(MissingSecretSource {
-            cluster_name: ctx.cluster_name.clone(),
-        }),
+        None => Arc::new(MissingSecretSource),
     }
 }
 
-/// Sentinel source used when no discovery credential is resolved. Always errors
-/// so the poll loop logs + backs off instead of dialing unauthenticated.
-struct MissingSecretSource {
-    cluster_name: String,
-}
+/// Sentinel source used when no discovery credential is resolved. Always fails
+/// with [`RemoteDiscoveryFailure::MissingCredential`] so the poll loop logs +
+/// backs off instead of dialing unauthenticated (set `discovery_credential_ref`
+/// and `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS`).
+struct MissingSecretSource;
 
 #[async_trait]
 impl RemoteServiceSource for MissingSecretSource {
-    async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
-        Err(format!(
-            "remote cluster {:?} has no discovery credential resolved; cannot authenticate to \
-             the remote control plane (set discovery_credential_ref + \
-             FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS)",
-            self.cluster_name
-        ))
+    async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure> {
+        Err(RemoteDiscoveryFailure::MissingCredential)
     }
 }
 
@@ -2204,7 +2267,7 @@ async fn fetch_remote_slice(
     audience: &str,
     tls_config: Option<&DpGrpcTlsConfig>,
     request_timeout: Duration,
-) -> Result<crate::modes::mesh::slice::MeshSlice, String> {
+) -> Result<crate::modes::mesh::slice::MeshSlice, RemoteDiscoveryFailure> {
     use crate::grpc::proto::MeshSubscribeRequest;
     use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
     use crate::modes::mesh::config_consumer::common::tonic_tls_config;
@@ -2217,7 +2280,7 @@ async fn fetch_remote_slice(
 
     let attempt = async {
         let mut endpoint = Channel::from_shared(control_plane_url.to_string())
-            .map_err(|_| "invalid control_plane_url".to_string())?
+            .map_err(|_| RemoteDiscoveryFailure::InvalidUrl)?
             .connect_timeout(Duration::from_secs(10));
         if let Some(tls) = tls_config {
             let mut client_tls = tonic_tls_config(tls);
@@ -2228,12 +2291,12 @@ async fn fetch_remote_slice(
             }
             endpoint = endpoint
                 .tls_config(client_tls)
-                .map_err(|e| format!("remote CP TLS config: {e}"))?;
+                .map_err(|_| RemoteDiscoveryFailure::TlsConfig)?;
         }
         let channel = endpoint
             .connect()
             .await
-            .map_err(|e| format!("connect to remote CP: {e}"))?;
+            .map_err(|_| RemoteDiscoveryFailure::Connect)?;
         // Bind the token to the TARGET CLUSTER, not just to the credential:
         // issuer + expiry + signature cannot express "this token is for
         // cluster B", so a shared secret used by B and C made B's token valid
@@ -2253,10 +2316,10 @@ async fn fetch_remote_slice(
         let auth_token = jwt_secret
             .mint_async(node_id, Some(namespace), Some(audience))
             .await
-            .map_err(|e| format!("mint remote CP JWT: {e}"))?;
+            .map_err(|_| RemoteDiscoveryFailure::Credential)?;
         let token: MetadataValue<_> = format!("Bearer {auth_token}")
             .parse()
-            .map_err(|e| format!("build auth metadata: {e}"))?;
+            .map_err(|_| RemoteDiscoveryFailure::Credential)?;
         #[allow(clippy::result_large_err)]
         let mut client =
             MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
@@ -2286,31 +2349,32 @@ async fn fetch_remote_slice(
         let mut stream = client
             .mesh_subscribe(request)
             .await
-            .map_err(|e| format!("remote MeshSubscribe failed: {e}"))?
+            .map_err(|_| RemoteDiscoveryFailure::SubscribeFailed)?
             .into_inner();
         while let Some(update) = stream
             .message()
             .await
-            .map_err(|e| format!("remote MeshSubscribe stream error: {e}"))?
+            .map_err(|_| RemoteDiscoveryFailure::StreamError)?
         {
             if update.heartbeat {
                 // Heartbeats carry no slice, but they still ride the CP
                 // compatibility contract — the same gate the local native
                 // consumer applies to every frame.
-                validate_update_ferrum_version(&update.ferrum_version, consumer)
-                    .map_err(|rejection| format!("remote MeshSubscribe rejected: {rejection}"))?;
+                validate_update_ferrum_version(&update.ferrum_version, consumer).map_err(
+                    |rejection| RemoteDiscoveryFailure::UpdateRejected(rejection.reason()),
+                )?;
                 continue;
             }
             let slice = validate_mesh_config_update(&update, &expected, consumer)
-                .map_err(|rejection| format!("remote MeshSubscribe rejected: {rejection}"))?;
+                .map_err(|rejection| RemoteDiscoveryFailure::UpdateRejected(rejection.reason()))?;
             return Ok(slice);
         }
-        Err("remote MeshSubscribe stream closed before delivering a slice".to_string())
+        Err(RemoteDiscoveryFailure::StreamClosed)
     };
 
     tokio::time::timeout(request_timeout, attempt)
         .await
-        .map_err(|_| "remote MeshSubscribe timed out".to_string())?
+        .map_err(|_| RemoteDiscoveryFailure::Timeout)?
 }
 
 #[cfg(test)]
@@ -2370,13 +2434,13 @@ mod tests {
     }
 
     struct OnePollSource {
-        response: Mutex<Option<Result<RemoteDiscoveryCandidate, String>>>,
+        response: Mutex<Option<Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure>>>,
         shutdown: watch::Sender<bool>,
     }
 
     #[async_trait]
     impl RemoteServiceSource for OnePollSource {
-        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
+        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure> {
             self.shutdown.send(true).unwrap();
             self.response.lock().unwrap().take().unwrap()
         }
@@ -2433,7 +2497,9 @@ mod tests {
                         },
                         revision: None,
                     }),
-                    Err("bare UNREGISTERED_provider 'unbalanced\" response".to_string()),
+                    Err(RemoteDiscoveryFailure::UpdateRejected(
+                        MeshUpdateRejectReason::NodeIdMismatch,
+                    )),
                 ] {
                     let (shutdown, receiver) = watch::channel(false);
                     let source = Arc::new(OnePollSource {
@@ -2450,7 +2516,9 @@ mod tests {
             "Spawning remote-cluster endpoint discovery",
             "Installed remote-cluster endpoints",
             "workloads=1",
-            "remote endpoint fetch or admission failed",
+            "Remote-cluster endpoint discovery failed",
+            "failure=update_rejected",
+            "reason=node_id_mismatch",
             "control_plane=<redacted scalar>",
             "poll_interval_seconds=<redacted scalar>",
             "max_stale_seconds=<redacted scalar>",
@@ -4301,15 +4369,15 @@ mod tests {
     }
 
     struct MockSource {
-        responses: Mutex<Vec<Result<RemoteClusterEndpoints, String>>>,
+        responses: Mutex<Vec<Result<RemoteClusterEndpoints, RemoteDiscoveryFailure>>>,
     }
 
     #[async_trait]
     impl RemoteServiceSource for MockSource {
-        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
+        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure> {
             let mut responses = self.responses.lock().expect("lock");
             if responses.is_empty() {
-                return Err("no more mock responses".to_string());
+                return Err(RemoteDiscoveryFailure::StreamClosed);
             }
             responses
                 .remove(0)
@@ -4336,7 +4404,7 @@ mod tests {
                     )],
                     services: vec![],
                 }),
-                Err("transient".to_string()),
+                Err(RemoteDiscoveryFailure::Connect),
             ]),
         });
 
@@ -5234,7 +5302,7 @@ mod tests {
 
         // The same preparation the poll loop performs before admission.
         let prepare = |mut candidate: RemoteDiscoveryCandidate| {
-            validate_remote_endpoints(&ctx.cluster_name, &candidate.endpoints)
+            validate_remote_endpoints(&candidate.endpoints)
                 .expect("the stub endpoints are structurally valid");
             enforce_remote_trust_domain(
                 &mut candidate.endpoints,
@@ -5359,7 +5427,7 @@ mod tests {
             .await
             .expect_err("a token signed with the wrong secret must be rejected by the remote CP");
         assert!(
-            err.contains("MeshSubscribe failed"),
+            err == RemoteDiscoveryFailure::SubscribeFailed,
             "expected a remote-rejection error, got: {err}"
         );
 
@@ -5382,7 +5450,7 @@ mod tests {
             .await
             .expect_err("a stream that closes after only a heartbeat must error");
         assert!(
-            err.contains("closed before delivering a slice"),
+            err == RemoteDiscoveryFailure::StreamClosed,
             "expected a stream-closed error, got: {err}"
         );
 
@@ -5409,7 +5477,7 @@ mod tests {
             .await
             .expect_err("a remote that never sends a slice must time out");
         assert!(
-            err.contains("timed out"),
+            err == RemoteDiscoveryFailure::Timeout,
             "expected a timeout error, got: {err}"
         );
 
@@ -5438,7 +5506,7 @@ mod tests {
             .await
             .expect_err("a slice bound to another node must not be imported");
         assert!(
-            err.contains("node_id_mismatch"),
+            err == RemoteDiscoveryFailure::UpdateRejected(MeshUpdateRejectReason::NodeIdMismatch),
             "expected a node-binding rejection, got: {err}"
         );
 
@@ -5467,7 +5535,9 @@ mod tests {
             .await
             .expect_err("a slice for another namespace must not be imported");
         assert!(
-            err.contains("namespace_mismatch"),
+            err == RemoteDiscoveryFailure::UpdateRejected(
+                MeshUpdateRejectReason::NamespaceMismatch
+            ),
             "expected a namespace-binding rejection, got: {err}"
         );
 
@@ -5491,7 +5561,9 @@ mod tests {
             .await
             .expect_err("a desynced version envelope must not be imported");
         assert!(
-            err.contains("envelope_version_mismatch"),
+            err == RemoteDiscoveryFailure::UpdateRejected(
+                MeshUpdateRejectReason::EnvelopeVersionMismatch
+            ),
             "expected an envelope-version rejection, got: {err}"
         );
 
@@ -5516,7 +5588,9 @@ mod tests {
             .await
             .expect_err("an unversioned remote response must not be imported");
         assert!(
-            err.contains("missing_ferrum_version"),
+            err == RemoteDiscoveryFailure::UpdateRejected(
+                MeshUpdateRejectReason::MissingFerrumVersion
+            ),
             "expected a missing-version rejection, got: {err}"
         );
 
@@ -5541,7 +5615,9 @@ mod tests {
             .await
             .expect_err("an incompatible remote CP must not be imported from");
         assert!(
-            err.contains("incompatible_ferrum_version"),
+            err == RemoteDiscoveryFailure::UpdateRejected(
+                MeshUpdateRejectReason::IncompatibleFerrumVersion
+            ),
             "expected an incompatible-version rejection, got: {err}"
         );
 
