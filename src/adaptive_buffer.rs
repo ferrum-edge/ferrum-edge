@@ -200,6 +200,15 @@ pub struct AdaptiveBufferTracker {
 }
 
 impl AdaptiveBufferTracker {
+    /// Re-shard the per-proxy state map with the operator's
+    /// `FERRUM_POOL_SHARD_AMOUNT` (`pool_shard_amount(env_config.pool_shard_amount)`).
+    /// The map is read and written per connection, so it follows the hot-path
+    /// `DashMap` sizing rule. Call before the tracker records anything.
+    pub fn with_shard_amount(mut self, shard_amount: usize) -> Self {
+        self.state = DashMap::with_shard_amount(shard_amount);
+        self
+    }
+
     /// Create a new tracker with the given configuration.
     ///
     /// `alpha_fp` is clamped to `[1, 999]`. `min_buffer_size` and `max_buffer_size`
@@ -222,7 +231,7 @@ impl AdaptiveBufferTracker {
         let default_batch_limit = default_batch_limit.max(1);
 
         Self {
-            state: DashMap::new(),
+            state: DashMap::with_shard_amount(crate::util::sharding::pool_shard_amount(0)),
             alpha_fp,
             min_buffer_size,
             max_buffer_size,
@@ -416,6 +425,23 @@ mod tests {
         assert_eq!(select_tier(999, &BATCH_TIER_THRESHOLDS), 2);
         assert_eq!(select_tier(1000, &BATCH_TIER_THRESHOLDS), 3);
         assert_eq!(select_tier(50000, &BATCH_TIER_THRESHOLDS), 3);
+    }
+
+    /// Issue #7207: the per-connection state map follows the hot-path
+    /// `DashMap` sizing rule and honours the operator shard override.
+    #[test]
+    fn with_shard_amount_resizes_the_state_map() {
+        use dashmap::Map;
+        let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64)
+            .with_shard_amount(crate::util::sharding::pool_shard_amount(4));
+        assert_eq!(tracker.state._shard_count(), 4);
+        tracker.record_connection("ns", "proxy", 100_000);
+        assert!(tracker.get_buffer_size("ns", "proxy") >= 8192);
+        let default = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
+        assert_eq!(
+            default.state._shard_count(),
+            crate::util::sharding::pool_shard_amount(0)
+        );
     }
 
     #[test]

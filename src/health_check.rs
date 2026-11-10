@@ -655,8 +655,15 @@ impl Default for ActiveUnhealthyTargets {
 
 impl ActiveUnhealthyTargets {
     pub fn new() -> Self {
+        Self::with_shard_amount(crate::util::sharding::pool_shard_amount(0))
+    }
+
+    /// Construct with an explicit `DashMap` shard amount. Production passes
+    /// `pool_shard_amount(env_config.pool_shard_amount)`: load balancers read
+    /// this map on every target selection.
+    pub fn with_shard_amount(shard_amount: usize) -> Self {
         Self {
-            map: DashMap::new(),
+            map: DashMap::with_shard_amount(shard_amount),
             id: ACTIVE_UNHEALTHY_TARGETS_IDS.fetch_add(1, Ordering::Relaxed),
             generation: AtomicU64::new(0),
         }
@@ -1257,6 +1264,17 @@ impl HealthChecker {
         Self::with_pool_config_and_shared_crls(pool_config, dns_cache, empty_shared_crl_list())
     }
 
+    /// Re-shard the gateway-wide hot maps (active-unhealthy targets, read per
+    /// target selection; passive health, read per proxied response) with the
+    /// operator's `FERRUM_POOL_SHARD_AMOUNT`, per the hot-path `DashMap` rule.
+    /// Call right after construction, before the maps are shared or started.
+    pub fn with_hot_map_shard_amount(mut self, shard_amount: usize) -> Self {
+        self.active_unhealthy_targets =
+            Arc::new(ActiveUnhealthyTargets::with_shard_amount(shard_amount));
+        self.passive_health = Arc::new(DashMap::with_shard_amount(shard_amount));
+        self
+    }
+
     /// Production constructor: inherit pool settings, DNS cache, and the
     /// same [`SharedCrlList`] backend data-path pools already hold.
     pub fn with_pool_config_and_shared_crls(
@@ -1272,7 +1290,9 @@ impl HealthChecker {
         Self {
             active_unhealthy_targets: Arc::new(ActiveUnhealthyTargets::new()),
             active_target_states: Arc::new(DashMap::new()),
-            passive_health: Arc::new(DashMap::new()),
+            passive_health: Arc::new(DashMap::with_shard_amount(
+                crate::util::sharding::pool_shard_amount(0),
+            )),
             default_http_client: client,
             active_check_handles: Mutex::new(Vec::new()),
             active_check_aborts: Mutex::new(Vec::new()),
@@ -1335,7 +1355,9 @@ impl HealthChecker {
         Self {
             active_unhealthy_targets: Arc::new(ActiveUnhealthyTargets::new()),
             active_target_states: Arc::new(DashMap::new()),
-            passive_health: Arc::new(DashMap::new()),
+            passive_health: Arc::new(DashMap::with_shard_amount(
+                crate::util::sharding::pool_shard_amount(0),
+            )),
             default_http_client: client,
             active_check_handles: Mutex::new(Vec::new()),
             active_check_aborts: Mutex::new(Vec::new()),
@@ -5490,6 +5512,22 @@ mod tests {
             "got: {error}"
         );
         assert!(error.contains("record #2"), "got: {error}");
+    }
+
+    /// Issue #7207: the gateway-wide hot maps follow the hot-path `DashMap`
+    /// sizing rule and honour the operator shard override.
+    #[test]
+    fn hot_map_shard_amount_resizes_gateway_wide_maps() {
+        use dashmap::Map;
+        let checker = HealthChecker::default()
+            .with_hot_map_shard_amount(crate::util::sharding::pool_shard_amount(4));
+        assert_eq!(checker.active_unhealthy_targets.map._shard_count(), 4);
+        assert_eq!(checker.passive_health._shard_count(), 4);
+        let default = HealthChecker::default();
+        assert_eq!(
+            default.active_unhealthy_targets.map._shard_count(),
+            crate::util::sharding::pool_shard_amount(0)
+        );
     }
 
     /// Issue #7205: the gRPC probe transport is built once per spawn. A
