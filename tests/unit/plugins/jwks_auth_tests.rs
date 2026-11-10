@@ -527,6 +527,61 @@ fn dpop_replay_lane_uses_published_default_capacity() {
     assert_eq!(plugin.dpop_replay_modes(), vec![Some("process")]);
 }
 
+/// `sync_mode` and `dpop_replay_scope` admit exactly the published enum
+/// spellings (issue #7151). The shared parsers trim and lowercase, so without
+/// the wire-form screen `"REDIS"` or `" Shared "` would pass the constructor
+/// while the `JwksAuthConfig` schema rejects them.
+#[test]
+fn sync_mode_and_dpop_replay_scope_admit_only_the_published_spellings() {
+    let with_sync_mode = |mode: serde_json::Value| {
+        JwksAuth::new(
+            &json!({
+                "providers": [{"jwks": {"keys": []}, "issuer": "https://idp.example.com"}],
+                "sync_mode": mode
+            }),
+            default_client(),
+        )
+    };
+    assert!(with_sync_mode(json!("local")).is_ok());
+    for mode in [json!("REDIS"), json!(" redis"), json!("Local")] {
+        let err = with_sync_mode(mode.clone())
+            .err()
+            .unwrap_or_else(|| panic!("sync_mode {mode} must be rejected"));
+        assert!(
+            err.contains("`sync_mode` must be exactly `local` or `redis`"),
+            "{err}"
+        );
+    }
+    let err = with_sync_mode(json!(1))
+        .err()
+        .expect("non-string sync_mode");
+    assert!(err.contains("`sync_mode` must be a string"), "{err}");
+
+    let with_scope = |scope: &str| {
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks": {"keys": []},
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": scope
+                }]
+            }),
+            default_client(),
+        )
+    };
+    assert!(with_scope("process").is_ok());
+    for scope in ["PROCESS", " process ", " Shared ", "SHARED"] {
+        let err = with_scope(scope)
+            .err()
+            .unwrap_or_else(|| panic!("dpop_replay_scope {scope:?} must be rejected"));
+        assert!(
+            err.contains("`provider[0].dpop_replay_scope` must be exactly `process` or `shared`"),
+            "{err}"
+        );
+    }
+}
+
 #[test]
 fn unknown_security_control_fields_are_rejected() {
     for config in [
