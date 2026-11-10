@@ -85,7 +85,7 @@ pub use summary_log_budget::{
     JSON_ARRAY_FRAMING_BYTES, QueuedSummaryPayload, admit_http_summary, admit_stream_summary,
     assemble_json_array, assemble_ndjson, json_array_len,
 };
-// Re-exported for external unit tests; unused inside the binary target.
+// Re-exported for external unit tests.
 #[allow(unused_imports)]
 pub use log_helpers::{
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT,

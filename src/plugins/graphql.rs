@@ -152,7 +152,6 @@ pub struct GraphqlPlugin {
 static NEXT_GRAPHQL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl GraphqlPlugin {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }

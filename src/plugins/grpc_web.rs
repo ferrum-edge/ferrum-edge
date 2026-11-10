@@ -2060,7 +2060,6 @@ pub(crate) fn request_was_translated(ctx: &RequestContext) -> bool {
 /// have used). On Accept failure the request Content-Type canonical form is
 /// retained so other gateway errors still have a browser-safe shape; the
 /// `grpc_web` plugin itself fails closed with `406` when translation is enabled.
-#[allow(dead_code)] // Called through `_test_support` in special test-hook builds.
 pub(crate) fn retain_client_content_type_for_errors(ctx: &mut RequestContext, content_type: &str) {
     if !is_grpc_web_content_type(content_type) {
         return;
@@ -4131,7 +4130,6 @@ fn trailing_trailer_suffix_start(data: &[u8]) -> Option<usize> {
 ///
 /// Single O(n) scan: identify the contiguous trailer-frame suffix at EOS and
 /// truncate once. Malformed streams leave `data` untouched and return `false`.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
     let Some(start) = trailing_trailer_suffix_start(data) else {
         return false;

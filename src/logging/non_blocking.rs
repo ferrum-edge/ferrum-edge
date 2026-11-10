@@ -458,7 +458,6 @@ impl NonBlockingSink {
     /// bytes cannot vouch that any key in them is tracing-envelope structure.
     /// This stays the only public byte entrypoint so that provenance cannot be
     /// asserted from outside; `write_bytes_from` is deliberately not exposed.
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn try_write_bytes(&self, bytes: &[u8]) -> EnqueueResult {
         self.write_bytes_from(bytes, LogRecordSource::Dynamic)
     }

@@ -71,7 +71,6 @@ pub fn set_ip_bind_address_no_port(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ip_bind_address_no_port(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(()) // No-op on non-Linux
 }
@@ -101,7 +100,6 @@ pub fn set_socket_mark(fd: std::os::unix::io::RawFd, mark: u32) -> std::io::Resu
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_socket_mark(_fd: i32, _mark: u32) -> std::io::Result<()> {
     Ok(())
 }
@@ -379,7 +377,6 @@ pub fn set_tcp_fastopen_server(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_tcp_fastopen_server(_fd: i32, _queue_len: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -412,7 +409,6 @@ pub fn set_tcp_fastopen_client(fd: std::os::unix::io::RawFd) -> std::io::Result<
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_tcp_fastopen_client(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -635,7 +631,6 @@ fn apply_pooled_tcp_keepalive_cfg(
 /// Used to compute Bandwidth-Delay Product (BDP) for optimal buffer sizing
 /// on long-lived TCP stream connections. BDP = (rtt_us / 1_000_000) × cwnd × mss.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct TcpConnectionInfo {
     /// Smoothed round-trip time in microseconds (SRTT).
     pub rtt_us: u32,
@@ -666,7 +661,6 @@ impl TcpConnectionInfo {
 /// Returns RTT, congestion window, and MSS for BDP-optimal buffer sizing.
 /// Linux 2.6+ only. No-op on non-Linux (returns `None`).
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 pub fn get_tcp_info(fd: std::os::unix::io::RawFd) -> Option<TcpConnectionInfo> {
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
@@ -690,7 +684,6 @@ pub fn get_tcp_info(fd: std::os::unix::io::RawFd) -> Option<TcpConnectionInfo> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn get_tcp_info(_fd: i32) -> Option<TcpConnectionInfo> {
     None
 }
@@ -771,9 +764,6 @@ pub fn socket_send_queue_bytes(_fd: i32) -> std::io::Result<u64> {
     ))
 }
 
-// Reached from the binary only through `BackendSocketHandle`, whose production
-// callers are per-request transports; with none active it is test-support only.
-#[allow(dead_code)]
 /// Whether [`socket_send_queue_bytes`] can answer at all on this build target.
 ///
 /// Callers use it to skip installing the sampler entirely rather than paying a
@@ -811,7 +801,6 @@ pub fn set_so_busy_poll(fd: std::os::unix::io::RawFd, busy_poll_us: u32) -> std:
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_so_busy_poll(_fd: i32, _busy_poll_us: u32) -> std::io::Result<()> {
     Ok(())
 }
@@ -843,7 +832,6 @@ pub fn set_so_prefer_busy_poll(fd: std::os::unix::io::RawFd, enable: bool) -> st
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_so_prefer_busy_poll(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(())
 }
@@ -859,7 +847,6 @@ pub fn set_so_prefer_busy_poll(_fd: i32, _enable: bool) -> std::io::Result<()> {
 ///
 /// No-op on non-Linux platforms.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // GRO infrastructure ready but not active (recv_from lacks cmsg)
 pub fn set_udp_gro(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Result<()> {
     // UDP_GRO = 104 (Linux 5.0+)
     const UDP_GRO: libc::c_int = 104;
@@ -881,7 +868,6 @@ pub fn set_udp_gro(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Resul
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_udp_gro(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(())
 }
@@ -951,7 +937,6 @@ pub fn send_with_gso(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn send_with_gso(
     _fd: i32,
     _data: &[u8],
@@ -996,7 +981,6 @@ pub fn extract_gro_segment_size(msg: &libc::msghdr) -> Option<u16> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn extract_gro_segment_size(_msg: &()) -> Option<u16> {
     None
 }
@@ -1058,13 +1042,11 @@ pub fn set_ipv6_recvpktinfo(fd: std::os::unix::io::RawFd) -> std::io::Result<()>
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ip_pktinfo(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ipv6_recvpktinfo(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -1236,7 +1218,6 @@ pub fn enable_ingress_pktinfo(
 /// Non-Linux builds have no `IP_PKTINFO` ingress-interface channel at all, so
 /// a listener that depends on it fails closed here rather than starting.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn enable_ingress_pktinfo(
     _fd: i32,
     local: std::net::SocketAddr,
@@ -1361,7 +1342,6 @@ pub fn set_udp_dont_fragment(fd: std::os::unix::io::RawFd, is_ipv4: bool) -> std
     not(any(target_os = "linux", target_os = "android")),
     not(target_vendor = "apple")
 ))]
-#[allow(dead_code)]
 pub fn set_udp_dont_fragment(_fd: std::os::unix::io::RawFd, _is_ipv4: bool) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1371,7 +1351,6 @@ pub fn set_udp_dont_fragment(_fd: std::os::unix::io::RawFd, _is_ipv4: bool) -> s
 
 /// Fail-closed arm for non-Unix targets. See the Unix arm above.
 #[cfg(not(unix))]
-#[allow(dead_code)]
 pub fn set_udp_dont_fragment(_fd: i32, _is_ipv4: bool) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1381,7 +1360,6 @@ pub fn set_udp_dont_fragment(_fd: i32, _is_ipv4: bool) -> std::io::Result<()> {
 
 /// Fixed diagnostic for the unsupported-target arms of
 /// [`set_udp_dont_fragment`]. Named so the message cannot drift between them.
-#[allow(dead_code)]
 pub const UDP_DONT_FRAGMENT_UNSUPPORTED_MESSAGE: &str =
     "no do-not-fragment socket option is available on this build target";
 
@@ -1482,7 +1460,6 @@ pub fn extract_pktinfo_local_addr(msg: &libc::msghdr) -> Option<PktinfoLocal> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn extract_pktinfo_local_addr(_msg: &()) -> Option<PktinfoLocal> {
     None
 }
@@ -1560,13 +1537,11 @@ pub fn set_ipv6_transparent(fd: std::os::unix::io::RawFd) -> std::io::Result<()>
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ip_transparent(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ipv6_transparent(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -1612,7 +1587,6 @@ pub fn set_scoped_reply_transparent(
 /// steering datapath is Linux-only, so a scoped listener refuses to start here
 /// rather than serving a one-way datapath.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_scoped_reply_transparent(_fd: i32, _ipv6: bool) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1678,13 +1652,11 @@ pub fn set_ipv6_recvorigdstaddr(fd: std::os::unix::io::RawFd) -> std::io::Result
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ip_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn set_ipv6_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -1735,7 +1707,6 @@ pub fn extract_origdst(msg: &libc::msghdr) -> Option<std::net::SocketAddr> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn extract_origdst(_msg: &()) -> Option<std::net::SocketAddr> {
     None
 }
@@ -1867,7 +1838,6 @@ pub fn send_with_pktinfo(
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn send_with_pktinfo(
     _fd: i32,
     _data: &[u8],
@@ -1913,7 +1883,6 @@ pub fn is_udp_pktinfo_available() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn is_udp_pktinfo_available() -> bool {
     false
 }
@@ -2939,34 +2908,28 @@ pub mod ktls {
         Chacha20Poly1305,
     }
 
-    #[allow(dead_code)]
     pub fn enable_ktls(_fd: i32, _params: &KtlsParams) -> std::io::Result<bool> {
         Ok(false)
     }
 
-    #[allow(dead_code)]
     pub fn is_ktls_available() -> bool {
         false
     }
 
-    #[allow(dead_code)]
     pub fn is_ktls_aes128gcm_available() -> bool {
         false
     }
 
-    #[allow(dead_code)]
     pub fn is_ktls_aes256gcm_available() -> bool {
         false
     }
 
-    #[allow(dead_code)]
     pub fn is_ktls_chacha20_poly1305_available() -> bool {
         false
     }
 
     /// Same shape as the Linux accessor so callers (notably the live-kernel
     /// gate's failure message) need no `cfg`.
-    #[allow(dead_code)]
     pub fn ktls_availability_diagnostic() -> String {
         "kTLS is Linux-only: aes128=false aes256=false chacha20=false".to_string()
     }
@@ -2974,12 +2937,10 @@ pub mod ktls {
     /// No kernel TLS ULP exists off Linux, so no record sequence number can be
     /// observed. Reporting `false` keeps the confidentiality-limit gate
     /// fail-closed on every non-Linux build.
-    #[allow(dead_code)]
     pub fn is_ktls_record_seq_observable(_cipher: KtlsCipher) -> bool {
         false
     }
 
-    #[allow(dead_code)]
     pub fn read_ktls_record_seq(
         _fd: i32,
         _cipher: KtlsCipher,
@@ -3420,7 +3381,6 @@ pub mod io_uring_splice {
 
 #[cfg(not(target_os = "linux"))]
 pub mod io_uring_splice {
-    #[allow(dead_code)]
     pub fn check_io_uring_available() -> bool {
         false
     }
@@ -3429,16 +3389,13 @@ pub mod io_uring_splice {
     /// that produced them. `is_write_side = false` for all non-Linux stubs.
     /// `bytes_so_far` is always 0 on the stub (no transfer occurs).
     #[derive(Debug)]
-    #[allow(dead_code)] // Fields are consumed only by the Linux splice path.
     pub struct SpliceError {
         pub is_write_side: bool,
         pub bytes_so_far: u64,
         pub source: std::io::Error,
     }
 
-    #[allow(dead_code)]
     pub const BACKEND_READ_TIMEOUT_MSG: &str = "backend read inactivity timeout";
-    #[allow(dead_code)]
     pub const BACKEND_WRITE_TIMEOUT_MSG: &str = "backend write inactivity timeout";
 
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -3483,7 +3440,6 @@ pub fn is_tcp_fastopen_available() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn is_tcp_fastopen_available() -> bool {
     false
 }
@@ -3514,7 +3470,6 @@ pub fn is_udp_gro_available() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn is_udp_gro_available() -> bool {
     false
 }
@@ -3545,7 +3500,6 @@ pub fn is_udp_gso_available() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
 pub fn is_udp_gso_available() -> bool {
     false
 }

@@ -447,7 +447,6 @@ pub struct AiRateLimiter {
 }
 
 impl AiRateLimiter {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -764,7 +763,6 @@ impl AiRateLimiter {
     /// API; external tests use it to assert that two instances never share a
     /// reservation-lifecycle metadata key.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn instance_id_for_test(&self) -> u64 {
         self.instance_id
     }
@@ -772,7 +770,6 @@ impl AiRateLimiter {
     /// The instance-scoped `ctx.metadata` key for one reservation-lifecycle
     /// base name (see the [`meta`] module). Not a production API.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn metadata_key_for_test(&self, base: &str) -> String {
         format!("{base}#{}", self.instance_id)
     }
@@ -4121,7 +4118,7 @@ impl StreamAccountingPermit {
     }
 
     /// Live inspector count. Test/diagnostic accessor.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
+    #[allow(dead_code)] // used only by tests/
     fn active() -> usize {
         ACTIVE_STREAM_ACCOUNTING.load(Ordering::Relaxed)
     }
@@ -4136,14 +4133,12 @@ impl Drop for StreamAccountingPermit {
 /// Live inspector count backing the aggregate stream-accounting bound.
 /// Test-only observability; not a production API.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn active_stream_accounting_for_test() -> usize {
     StreamAccountingPermit::active()
 }
 
 /// Process-wide ceiling on concurrent streaming token accounting. Test-only.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn max_concurrent_stream_accounting_for_test() -> usize {
     MAX_CONCURRENT_STREAM_ACCOUNTING
 }

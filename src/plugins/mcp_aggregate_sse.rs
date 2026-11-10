@@ -487,7 +487,6 @@ impl StreamIdentity {
 
     /// Canonical text form. Internal/equality use only — callers must not log
     /// it, because it is a verbatim client-controlled JSON-RPC id.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn canonical(&self) -> &str {
         match self {
             Self::Text(value) | Self::Number(value) => value,
@@ -1014,10 +1013,6 @@ impl SessionState {
     /// already returned by the cancel), and a retention/encoding refusal
     /// completes it anyway so the caller's inline answer is the identity's one
     /// terminal outcome and its capacity is returned exactly once.
-    // Kept as the direct-publication primitive for library consumers and the
-    // external broker contract suite. The ferrum-edge binary's private module
-    // copy uses the later two-phase reservation path exclusively.
-    #[allow(dead_code)]
     fn publish_terminal(
         &self,
         admission: &StreamAdmission,
@@ -1350,22 +1345,18 @@ impl AggregateSseBroker {
         }
     }
 
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn bounds(&self) -> &AggregateSseBounds {
         &self.bounds
     }
 
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn is_retired(&self) -> bool {
         self.retired.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
@@ -1447,7 +1438,6 @@ impl AggregateSseBroker {
 
     /// Drop broker sessions idle for at least `ttl`, returning how many were
     /// reclaimed.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn reap_idle(&self, ttl: Duration) -> usize {
         let now = Instant::now();
         let mut wakers = Vec::new();
@@ -1582,7 +1572,6 @@ impl AggregateSseBroker {
     /// The two are separate budgets by design ([`ReservationBudget`]): only the
     /// deliverable one is a promise the ring was admitted against, and only it
     /// is counted by deliverable admission and by every direct publication.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn outstanding_reservations(&self, session_id: &str) -> Option<(usize, usize)> {
         let state = self.session_state(session_id)?;
         let inner = state.lock();
@@ -1859,9 +1848,6 @@ impl AggregateSseStream {
     /// `EventFramingInvalid` mean the caller must answer this POST inline.
     /// Either way the identity is terminal afterwards and its capacity has been
     /// returned exactly once.
-    // Public library primitive exercised by the external broker contract suite;
-    // the ferrum-edge binary itself publishes governed responses in two phases.
-    #[allow(dead_code)]
     pub fn publish_encoded(&self, encoded: &[u8]) -> Result<u64, AggregateSseError> {
         if self.0.settled.swap(true, Ordering::AcqRel) {
             // A second terminal attempt on one lease is a duplicate response,
@@ -2402,7 +2388,6 @@ impl AggregateSseBody {
     /// Retained payload bytes still owned by this body's session. External
     /// regressions use this to prove teardown releases history even when the
     /// body itself deliberately remains alive like a stalled transport.
-    #[allow(dead_code)]
     pub fn retained_session_bytes_for_test(&self) -> usize {
         self.session.lock().history_bytes
     }

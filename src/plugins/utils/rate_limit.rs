@@ -723,7 +723,6 @@ pub struct RedisLimiter<A: RateLimitAlgorithm> {
 }
 
 impl<A: RateLimitAlgorithm> RedisLimiter<A> {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(
         plugin_name: &str,
         config: &Value,
@@ -1216,7 +1215,6 @@ where
     }
 
     /// Number of still-live semantic generations retained for `identity`.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     fn live_generations(&self, identity: &str) -> usize {
         let mut guard = self.locked();
         prune_dead_generations(&mut guard);
@@ -1450,7 +1448,6 @@ fn local_limiter_fingerprint(
 
 /// Number of retained live generations for one policy identity. Test-only
 /// lifecycle probe; production code never inspects the registry.
-#[allow(dead_code)] // used only by external tests; dead in binary test target
 pub(crate) fn shared_local_limiter_generations_for_test<A>(
     namespace: &str,
     plugin_name: &str,
@@ -1815,7 +1812,6 @@ where
     /// Seed or refresh a local/fallback key at a controllable instant.
     ///
     /// Test-support only: production admission always uses wall-clock `check`.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn check_local_at(&self, key: K, op: &A::Op, now: Instant) -> RateLimitOutcome {
         match self {
             Self::Local(local) => local.check_at(key, op, now),
@@ -2056,21 +2052,18 @@ impl SlidingWindow {
 
     /// Fixed upper bound on retained aggregate buckets for any key/window.
     #[inline]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub const fn bucket_capacity() -> usize {
         SLIDING_WINDOW_BUCKET_COUNT
     }
 
     /// Number of aggregate bucket slots retained (always [`bucket_capacity`]).
     #[inline]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn retained_buckets(&self) -> usize {
         self.buckets.len()
     }
 
     /// Admissions currently counted inside the live window.
     #[inline]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn counted_requests(&self) -> u64 {
         self.total
     }
@@ -3117,7 +3110,6 @@ const MAX_TOKEN_WINDOW_ENTRIES: usize = 1_024;
 
 /// [`MAX_TOKEN_WINDOW_ENTRIES`] for external bounded-history tests.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by external tests; dead in binary test target
 pub const fn max_token_window_entries_for_test() -> usize {
     MAX_TOKEN_WINDOW_ENTRIES
 }
@@ -3403,7 +3395,6 @@ impl TokenUsageWindow {
     /// records stop growing as completed requests increase, without standing up
     /// a live workload.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn retained_records_for_test(&self) -> (usize, usize) {
         (
             self.entries.len(),

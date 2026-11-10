@@ -148,7 +148,6 @@ impl TransactionLogSchema {
     /// All schemas declared by this plugin instance. Used by tests; future
     /// loader code can call this to publish schemas explicitly when the
     /// validation-mode `register_named` no-op is undesirable.
-    #[allow(dead_code)]
     pub fn schemas(&self) -> &HashMap<String, Arc<SummarySchema>> {
         &self.schemas
     }

@@ -169,32 +169,27 @@ pub struct NodeWaypointUdpDestinationTable {
 }
 
 impl NodeWaypointUdpDestinationTable {
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn listen_port(&self) -> u16 {
         self.listen_port
     }
 
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn len(&self) -> usize {
         self.routes.len()
     }
 
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
 
     /// Sorted owning proxy identities, for diagnostics and tests.
-    #[allow(dead_code)] // External unit tests / diagnostics.
     pub fn owners(&self) -> Vec<NamespacedResourceId> {
         let mut owners: Vec<NamespacedResourceId> = self
             .routes
@@ -207,7 +202,6 @@ impl NodeWaypointUdpDestinationTable {
     }
 
     /// Sorted canonical destinations, for diagnostics and tests.
-    #[allow(dead_code)] // External unit tests / diagnostics.
     pub fn destinations(&self) -> Vec<IpAddr> {
         let mut destinations: Vec<IpAddr> = self.routes.keys().copied().collect();
         destinations.sort();
@@ -300,14 +294,12 @@ impl NodeWaypointUdpDestinationRouter {
     }
 
     /// Current accepted table snapshot.
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn snapshot(&self) -> Arc<NodeWaypointUdpDestinationTable> {
         self.table.load_full()
     }
 
     /// Total refusals observed by this router (bounded counter, no labels).
-    #[allow(dead_code)] // External unit tests / diagnostics.
     #[inline]
     pub fn refusals(&self) -> u64 {
         self.refusals.load(Ordering::Relaxed)

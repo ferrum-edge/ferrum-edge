@@ -1233,7 +1233,6 @@ impl HealthChecker {
     /// probes inherit the gateway's pool settings, DNS cache, and admitted
     /// CRL generation. Kept for tests and integration code that constructs
     /// `HealthChecker` without a full config. Uses an empty shared CRL list.
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -1248,10 +1247,6 @@ impl HealthChecker {
     /// Test-safe: uses an empty shared CRL list. Production startup must call
     /// [`Self::with_pool_config_and_shared_crls`] with the admitted generation
     /// already published to backend pools.
-    // This module is compiled into both the library and binary targets. The
-    // constructor is exercised by external integration tests through the
-    // library, but is intentionally unused by the production binary.
-    #[allow(dead_code)]
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
         Self::with_pool_config_and_shared_crls(pool_config, dns_cache, empty_shared_crl_list())
     }
@@ -1365,7 +1360,6 @@ impl HealthChecker {
     }
 
     /// Start health checks for all upstreams in the config.
-    #[allow(dead_code)]
     pub fn start(&self, config: &GatewayConfig) {
         self.start_with_shutdown(config, None);
     }
@@ -2484,7 +2478,6 @@ impl HealthChecker {
     /// `active_unhealthy_targets` for observability), hence
     /// `#[allow(dead_code)]`.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn active_task_count(&self) -> usize {
         match self.active_check_aborts.lock() {
             Ok(g) => g.iter().filter(|a| !a.is_finished()).count(),
@@ -2494,14 +2487,12 @@ impl HealthChecker {
 
     /// Test-only count of per-upstream probe generation cells.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn upstream_probe_generation_len_for_test(&self) -> usize {
         self.upstream_probe_generation.len()
     }
 
     /// Test-only view of whether one active-probe state key is present.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn has_active_target_state_for_test(&self, key: &str) -> bool {
         self.active_target_states.contains_key(key)
     }
@@ -2509,7 +2500,6 @@ impl HealthChecker {
     /// Test-only count of timestamps stored in the per-target passive
     /// failure ring. Used to prove the hard cap holds after many failures.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn passive_recent_failure_len_for_test(
         &self,
         namespace: &str,
@@ -2528,7 +2518,6 @@ impl HealthChecker {
     /// Test-only allocated slot count of the per-target passive failure ring.
     /// Zero before the first failure; the cap after the ring is sized.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn passive_recent_failure_slot_cap_for_test(
         &self,
         namespace: &str,
@@ -2548,7 +2537,6 @@ impl HealthChecker {
     /// Consecutive-mode reads the packed streak; native windowed-mode reads
     /// the dedicated counter (packed state stays 0).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn consecutive_failures_for_test(
         &self,
         namespace: &str,
@@ -2573,7 +2561,6 @@ impl HealthChecker {
     /// Test-only packed consecutive-mode `(generation, streak)` for one target.
     /// Missing state is `(0, 0)`, matching a never-touched packed word.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn consecutive_packed_state_for_test(
         &self,
         namespace: &str,
@@ -2595,11 +2582,8 @@ impl HealthChecker {
     /// Deterministic external unit tests backdate `recover_at_tick_ms` and call
     /// this without sleeping the background scanner. The scanner itself invokes
     /// [`recover_due_passive_ejections_inner`] on cloned `Arc`s because the
-    /// spawned task cannot hold `&self`. The binary target still treats unused
-    /// `pub` methods as dead code, hence the narrow allow (same pattern as
-    /// [`Self::active_task_count`]).
+    /// spawned task cannot hold `&self`.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn recover_due_passive_ejections(&self) {
         recover_due_passive_ejections_inner(
             &self.passive_health,
@@ -2611,7 +2595,6 @@ impl HealthChecker {
 
     /// Deterministic-clock recovery pass used by external unit tests.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn recover_due_passive_ejections_at_for_test(&self, monotonic_now_ms: u64) {
         recover_due_passive_ejections_inner(
             &self.passive_health,
@@ -2625,7 +2608,6 @@ impl HealthChecker {
     /// snapshotted and before generation-checked removal, so a newer
     /// publication can be installed without a timing sleep.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn recover_due_passive_ejections_with_after_scan_hook_for_test(
         &self,
         hook: &mut dyn FnMut(),
@@ -2646,7 +2628,6 @@ impl HealthChecker {
     /// same DashMap entry lock, so the hook observes the old remove-before-retire
     /// gap without a timing sleep: map vacant, packed already advanced.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn recover_due_passive_ejections_with_after_consecutive_remove_hook_for_test(
         &self,
         hook: &mut dyn FnMut(),
@@ -4224,9 +4205,6 @@ fn build_probe_server_verifier(
 
 /// Test helper: build the probe server verifier with an explicit CRL snapshot.
 #[doc(hidden)]
-// External integration tests reach this through the library target; the same
-// source module is also compiled into the binary where that export is unused.
-#[allow(dead_code)]
 pub fn build_probe_server_verifier_for_test(
     tls_config: &BackendTlsConfig,
     global_ca_path: Option<&str>,
@@ -4903,8 +4881,7 @@ fn active_probe_timer(target_key: &str, interval: Duration) -> tokio::time::Inte
 
 /// Test-only accessors for the active-probe tick source (issue #4518).
 #[doc(hidden)]
-// Reached only from external unit tests; the bin target sees no caller.
-#[allow(dead_code)]
+// Reached only from external unit tests.
 pub mod probe_timer_for_test {
     use std::time::Duration;
 
@@ -4922,7 +4899,6 @@ pub mod probe_timer_for_test {
 /// Public wrapper around [`http_probe`] for use in unit/integration tests.
 /// Returns the probe verdict and its failure reason, if any.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn http_probe_for_test(
     client: &reqwest::Client,
     url: &str,
@@ -4939,7 +4915,6 @@ pub async fn http_probe_for_test(
 
 /// Test wrapper that returns at the header-time verdict without waiting for the body drain.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn http_probe_verdict_for_test(
     client: &reqwest::Client,
     url: &str,
@@ -4954,7 +4929,6 @@ pub async fn http_probe_verdict_for_test(
 
 /// Public wrapper around [`grpc_probe`] for use in unit/integration tests.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn grpc_probe_for_test(
     host: &str,
     port: u16,

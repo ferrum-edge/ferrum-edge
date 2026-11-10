@@ -323,13 +323,11 @@ impl H3RetainedUpload {
     }
 
     /// Bytes collected so far. External-test seam.
-    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn collected_len(&self) -> usize {
         self.collector.len()
     }
 
     /// Capacity the charge currently covers. External-test seam.
-    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.collector.reserved_bytes()
     }

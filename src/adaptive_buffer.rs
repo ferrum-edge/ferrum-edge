@@ -328,7 +328,6 @@ impl AdaptiveBufferTracker {
     /// Record an inter-arrival jitter measurement for a UDP session.
     /// Jitter is |actual_interval - expected_interval| in microseconds.
     /// Used to adapt UDP buffers for real-time traffic (VoIP, gaming).
-    #[allow(dead_code)] // Wired into UDP proxy path incrementally.
     pub fn record_jitter(&self, namespace: &str, proxy_id: &str, jitter_us: u64) {
         if !self.buffer_enabled {
             return;

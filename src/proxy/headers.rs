@@ -46,8 +46,6 @@ macro_rules! define_header_name_set {
 }
 
 define_header_name_set! {
-    // Public inventory is consumed by library tests, not the binary target.
-    #[allow(dead_code)]
     /// Closed set of lowercase names stripped by
     /// [`is_backend_request_strip_header`]. Secondary-request builders call that
     /// predicate directly; this const is the shared inventory for docs/tests.
@@ -323,8 +321,6 @@ pub fn is_gateway_assertion_header(name: &str) -> bool {
 }
 
 define_header_name_set! {
-    // Public inventory is consumed by library tests, not the binary target.
-    #[allow(dead_code)]
     /// Closed set of lowercase proxy-owned forwarding identity headers stripped
     /// before Ferrum regenerates them on primary dispatch (and before secondary
     /// request builders copy the materialised map).
@@ -2178,7 +2174,6 @@ impl GatewayOwnedResponseHeaders {
     /// [`Self::insert`] at the point of each builder write; this name-driven
     /// form exists so external tests can reach the real name-to-variant mapping
     /// through [`crate::_test_support`] rather than restating it.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
     pub(crate) fn from_names(names: &[String]) -> Self {
         let mut owned = Self::default();
         for name in names {

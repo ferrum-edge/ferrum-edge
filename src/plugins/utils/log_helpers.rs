@@ -489,7 +489,6 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
 /// echoes an endpoint credential. The observability sinks covered by advisory
 /// GHSA-8594-2xhc-8g38 use [`handle_http_batch_response_redacted`], which
 /// takes an already-redacted error string.
-#[allow(dead_code)] // No in-binary caller remains; used by tests/unit/plugins/
 pub async fn handle_http_batch_response(
     plugin_label: &str,
     plugin_name: &'static str,

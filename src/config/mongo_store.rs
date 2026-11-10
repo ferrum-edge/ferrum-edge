@@ -2196,7 +2196,6 @@ mod inner {
         /// Builds a driver `Client` against empty hosts (no live MongoDB). Used
         /// by external unit tests through `_test_support` to prove Admin /
         /// admission publication gating without network I/O.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub fn new_unconnected_for_test(failover_urls: Vec<String>) -> Result<Self, anyhow::Error> {
             let settings = MongoConnSettings {
                 database_name: "test".to_string(),
@@ -2251,7 +2250,6 @@ mod inner {
 
         /// Publish a synthetic connection bundle through the production
         /// publication helper (Admin + admission fail-fast gates).
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub async fn try_publish_reconnected_bundle_for_test(
             &self,
             database_name: &str,
@@ -2275,7 +2273,6 @@ mod inner {
 
         /// Admission-generation read pin used by external tests to simulate an
         /// in-flight mTLS DNS admission without talking to MongoDB.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub async fn acquire_connection_generation_pin_for_test(
             &self,
         ) -> tokio::sync::OwnedRwLockReadGuard<()> {
@@ -2283,7 +2280,6 @@ mod inner {
         }
 
         /// Active database name from the published connection bundle.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub fn published_database_name_for_test(&self) -> String {
             self.db().name().to_string()
         }
@@ -3301,7 +3297,6 @@ mod inner {
         /// Test seam: retain a fence for `namespace` exactly as an uncertain
         /// single-call guard's Drop does, handing over a real generation read
         /// pin so tests can prove the pin is released while the fence stays.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub async fn retain_mtls_dns_admission_fence_for_test(&self, namespace: &str, owner: &str) {
             let generation_guard = self.connection_generation.clone().read_owned().await;
             self.admission_fences.retain(
@@ -3316,7 +3311,6 @@ mod inner {
         /// Test seam: register a live multi-step persistent pin (holding the
         /// generation read pin). `uncertain` marks a borrowed mutation whose
         /// outcome is unknown; `false` models a settled owner about to release.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub async fn insert_persistent_admission_pin_for_test(
             &self,
             namespace: &str,
@@ -3339,7 +3333,6 @@ mod inner {
 
         /// Test seam: the fail-closed fence gate admission runs under its
         /// generation read pin (no I/O).
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub fn ensure_mtls_dns_admission_unfenced_for_test(
             &self,
             namespace: &str,
@@ -3350,7 +3343,6 @@ mod inner {
         /// Test seam: apply one exit-probe outcome to every retained fence on
         /// `namespace` through the production decision. Returns how many
         /// entries were cleared.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub fn apply_mtls_dns_admission_fence_probe_for_test(
             &self,
             namespace: &str,
@@ -20875,7 +20867,7 @@ pub use inner::{
 // timeout-precedence application, identity reservation rollback/release
 // accounting, and the incremental `config_changes` decoder. Everything else
 // stays module-private in `inner`.
-#[allow(unused_imports)] // The binary target has no `_test_support` consumer.
+#[allow(unused_imports)] // Only `_test_support` names some of these re-exports.
 pub(crate) use inner::{
     MongoConfigChangeOp, MongoConfigChangeRecord, apply_mongo_timeout_overrides,
     consumer_identity_adoption_failure_release_values, decode_mongo_config_change_record,

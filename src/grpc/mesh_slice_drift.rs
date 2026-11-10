@@ -490,7 +490,6 @@ impl MeshSliceDriftRegistry {
     #[doc(hidden)]
     // `main.rs` compiles a private copy of the module graph while external
     // integration tests consume the library copy of this public helper.
-    #[allow(dead_code)]
     pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             state: Mutex::new(RegistryState::default()),
@@ -507,7 +506,6 @@ impl MeshSliceDriftRegistry {
     /// projection. Intended for focused registry callers; production
     /// MeshSubscribe uses [`Self::open_projected_session`].
     // Public integration-test helper; see `with_max_entries`.
-    #[allow(dead_code)]
     pub fn open_session(
         &self,
         node_id: &str,
@@ -654,7 +652,6 @@ impl MeshSliceDriftRegistry {
     /// Record a sent version for focused registry tests/callers that do not
     /// retain a production projection.
     // Public integration-test helper; see `with_max_entries`.
-    #[allow(dead_code)]
     pub fn record_sent(
         &self,
         node_id: &str,
@@ -826,7 +823,6 @@ impl MeshSliceDriftRegistry {
 
     /// Mark a matching opaque session disconnected; retain until reaper expiry.
     // Public integration-test helper; see `with_max_entries`.
-    #[allow(dead_code)]
     pub fn mark_disconnected(&self, node_id: &str, session_token: &str, now: DateTime<Utc>) {
         let mut state = self.state_locked();
         let Some(entry) = state.entries.get_mut(node_id) else {
@@ -906,13 +902,11 @@ impl MeshSliceDriftRegistry {
     }
 
     /// Number of identities in the latest immutable registry snapshot.
-    #[allow(dead_code)] // Public library API exercised by external test targets.
     pub fn len(&self) -> usize {
         self.snapshot.load().summary.tracked
     }
 
     /// Whether the latest immutable registry snapshot tracks no identities.
-    #[allow(dead_code)] // Public library API exercised by external test targets.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -1393,7 +1387,6 @@ fn append_mesh_slice_drift_summary_metrics(
 #[doc(hidden)]
 // Public integration-test helper; the production path calls the private
 // append function directly through `render_mesh_slice_drift_metrics`.
-#[allow(dead_code)]
 pub fn render_mesh_slice_drift_summary_metrics(
     output: &mut String,
     summary: &MeshSliceDriftSummary,

@@ -1111,7 +1111,6 @@ pub fn load_frontend_tls_candidate_from_paths(
 /// Existing path strings are parsed as [`CertSource::Path`]. Inline PEM is
 /// accepted without writing temporary files, and `file://` URIs share the same
 /// file loader.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources(
     cert_source: &CertSource,
@@ -1136,10 +1135,6 @@ pub fn load_tls_config_with_client_auth_from_sources(
     )
 }
 
-// Retained as the source-typed projection of the frontend loader. Live callers
-// go through `load_frontend_tls_candidate`, so the bin target sees this only
-// from `tests/`.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     cert_source: &CertSource,
@@ -2450,10 +2445,6 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// When `crls` is non-empty, CRL revocation checking is enabled with the shared
 /// policy in [`crl_policy`], the same one used by H1/H2 frontend mTLS, the mesh
 /// operator-CA path, backend server verification, SPIFFE, and DTLS.
-// Verifier-only projection. Production callers need the paired trust identity
-// and use `build_client_cert_verifier_candidate`, so the bin target sees this
-// only from `tests/`.
-#[allow(dead_code)]
 pub fn build_client_cert_verifier(
     ca_bundle_path: &str,
     crls: &[CertificateRevocationListDer<'static>],

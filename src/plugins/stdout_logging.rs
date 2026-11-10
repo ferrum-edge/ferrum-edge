@@ -213,7 +213,6 @@ impl StdoutLogging {
     /// Hidden test helper so external unit tests can assert handshake
     /// method/status/original-path without going through stdout.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests; dead in the binary target
     pub fn project_ws_disconnect(ctx: &WsDisconnectContext) -> TransactionSummary {
         transaction_summary_from_ws_disconnect(ctx)
     }

@@ -2038,7 +2038,6 @@ impl ResponseCaching {
     ///
     /// Exposed for tests so they can assert the size accounting never
     /// underflow-wraps under concurrent stores/invalidations (finding #62).
-    #[allow(dead_code)]
     pub(crate) fn current_total_size_for_tests(&self) -> usize {
         self.total_size.load(Ordering::Relaxed)
     }
@@ -2052,7 +2051,6 @@ impl ResponseCaching {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn vary_index_snapshot_for_tests(&self) -> Vec<(String, Vec<String>)> {
         let _guard = self.accounting_guard();
         self.vary_index
@@ -2061,7 +2059,6 @@ impl ResponseCaching {
             .collect()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn cache_keys_for_tests(&self) -> Vec<String> {
         let _guard = self.accounting_guard();
         self.cache.iter().map(|entry| entry.key().clone()).collect()
@@ -2096,7 +2093,6 @@ impl ResponseCaching {
     ///
     /// Routed through `_test_support` so external tests can validate cache
     /// freshness and Age arithmetic deterministically without pausing the runtime.
-    #[allow(dead_code)]
     pub(crate) fn advance_clock_for_tests(&self, duration: Duration) {
         let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         let _ =

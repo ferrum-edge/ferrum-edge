@@ -1129,7 +1129,6 @@ impl GrpcConnectionPool {
     /// external integration/unit tests can verify pool-key partitioning
     /// behavior (e.g., GAP-3B subset partitioning regression guard in
     /// `tests/unit/gateway_core/pool_key_tests.rs`).
-    #[allow(dead_code)]
     pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         Self::pool_key_owned(proxy)
     }
@@ -1140,7 +1139,6 @@ impl GrpcConnectionPool {
     /// `pool_key_for_warmup` is this with `svid_generation = None` and
     /// `PoolConfig::default()`. Runtime `get_sender` uses the pool manager's
     /// global instead of reconstructing `PoolConfig` a second time.
-    #[allow(dead_code)] // exercised from unit/integration tests
     pub fn pool_key_with_global(
         proxy: &Proxy,
         svid_generation: Option<u64>,
@@ -1151,7 +1149,6 @@ impl GrpcConnectionPool {
 
     /// TLS-config cache key (no host/port). Used by unit tests to prove two
     /// endpoints sharing trust material reuse one `ClientConfig`.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn tls_config_cache_key_for_warmup(proxy: &Proxy, svid_generation: Option<u64>) -> String {
         backend_tls_config_cache_key(
             &proxy.resolved_tls,
@@ -1195,7 +1192,6 @@ impl GrpcConnectionPool {
         self.pool.manager().tls_configs.retain_keys(&live_tls_keys);
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn insert_rr_counter_for_tests(&self, key: impl Into<String>) {
         self.rr_counters
             .insert(key.into(), Arc::new(AtomicUsize::new(0)));
@@ -1205,7 +1201,6 @@ impl GrpcConnectionPool {
     /// post-insert stale-generation removal. Used by integration tests to
     /// prove insert-before-retire and retire-before-insert without a live
     /// backend handshake.
-    #[allow(dead_code)] // exercised from integration tests
     pub fn get_or_seed_rr_counter_for_tests(
         &self,
         key: &str,
@@ -1219,14 +1214,12 @@ impl GrpcConnectionPool {
         )
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn rr_counter_len(&self) -> usize {
         self.rr_counters.len()
     }
 
     /// Shard keys currently backed off after a failed affinity or spill
     /// create.
-    #[allow(dead_code)] // exercised from integration tests
     pub fn shard_create_backoff_len(&self) -> usize {
         self.shard_create_backoff.failures.len()
     }
@@ -1498,12 +1491,10 @@ impl GrpcConnectionPool {
         })
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn contains_rr_counter(&self, key: &str) -> bool {
         self.rr_counters.contains_key(key)
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().tls_configs
     }
@@ -4254,7 +4245,6 @@ impl<'a> GrpcDispatchTransport<'a> {
     ///
     /// `None` (no LB-selected target) keeps the direct pool: the proxy's own
     /// backend host is the destination and no mesh tag exists to honor.
-    #[allow(dead_code)] // External integration tests call this; production uses for_target_with_hbone_context.
     pub fn for_target(
         grpc_pool: &'a GrpcConnectionPool,
         mesh_mtls_pool: &'a crate::proxy::mesh_mtls_pool::MeshMtlsConnectionPool,
@@ -4377,7 +4367,6 @@ impl<'a> GrpcDispatchTransport<'a> {
     /// Authenticated frontend workload identity asserted on HBONE CONNECT.
     /// `None` for non-HBONE transports, and for HBONE when the frontend did not
     /// authenticate a mesh peer (the pool then falls back to the gateway SVID).
-    #[allow(dead_code)] // External unit/integration tests read this diagnostic; the binary target does not.
     pub fn asserted_source_identity(&self) -> Option<&crate::identity::SpiffeId> {
         match self {
             Self::Hbone(hbone) => hbone.asserted_source_identity.as_ref(),

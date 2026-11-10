@@ -89,7 +89,6 @@ fn grown_decode_capacity(current_capacity: usize, filled: usize, limit: usize) -
 /// actual encoded/intermediate lengths instead of hardcoding block counts, so a
 /// change to the growth rule or to a codec's output size fails with a precise
 /// arithmetic explanation rather than looking like a flaky budget assertion.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn projected_decode_output_capacity(decoded_len: usize, limit: usize) -> usize {
     let mut capacity = 0usize;
     let mut filled = 0usize;

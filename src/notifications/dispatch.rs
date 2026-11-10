@@ -147,7 +147,6 @@ static JITTER_SEED: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
 ///
 /// Legacy helper for non-plugin callers. Uses process-global metrics and a
 /// one-shot anonymous generation so tasks still participate in shutdown drain.
-#[allow(dead_code)]
 pub fn dispatch(
     notification: Arc<Notification>,
     targets: &[Arc<NotificationChannel>],

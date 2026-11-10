@@ -227,7 +227,6 @@ impl CooldownGate {
 
     /// Whether any `(rule, channel)` map currently holds a row for `proxy_id`
     /// under any ownership generation.
-    #[allow(dead_code)] // Used by external test crate and admin/debug helpers.
     pub fn contains_proxy(&self, proxy_id: &str) -> bool {
         self.last_sent.iter().any(|entry| {
             entry
@@ -238,7 +237,6 @@ impl CooldownGate {
     }
 
     /// Whether any `(rule, channel)` map holds a row for `(proxy_id, generation)`.
-    #[allow(dead_code)] // Used by external test crate.
     pub fn contains_proxy_generation(&self, proxy_id: &str, ownership_generation: u64) -> bool {
         self.last_sent.iter().any(|entry| {
             entry
@@ -444,7 +442,6 @@ impl RecoveryGate {
     ///
     /// The dispatch path itself calls [`Self::evaluate_state`] with the state
     /// it already read; this lookup form serves tests and debugging.
-    #[allow(dead_code)] // Used by external test crate.
     pub fn evaluate(
         &self,
         rule_id: u32,
@@ -857,7 +854,6 @@ impl RecoveryGate {
     /// Returns the current state for the given (rule, proxy, generation)
     /// triple, or `None` if no observation has been recorded yet. Useful for
     /// tests and admin debugging.
-    #[allow(dead_code)] // Used by external test crate and future admin debug surface.
     pub fn current_state(
         &self,
         rule_id: u32,
@@ -938,7 +934,6 @@ impl RecoveryGate {
 
     /// Whether any rule map currently holds a row for `proxy_id` under any
     /// ownership generation.
-    #[allow(dead_code)] // Used by external test crate and admin/debug helpers.
     pub fn contains_proxy(&self, proxy_id: &str) -> bool {
         self.state.iter().any(|entry| {
             entry
@@ -949,7 +944,6 @@ impl RecoveryGate {
     }
 
     /// Whether any rule map holds a row for `(proxy_id, generation)`.
-    #[allow(dead_code)] // Used by external test crate.
     pub fn contains_proxy_generation(&self, proxy_id: &str, ownership_generation: u64) -> bool {
         self.state.iter().any(|entry| {
             entry

@@ -121,7 +121,6 @@ pub struct WsRateLimiting {
 impl WsRateLimiting {
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -285,7 +284,6 @@ impl WsRateLimiting {
     /// Charge one frame against the local token bucket at `now` and report
     /// whether it was admitted. Deterministic (no wall-clock sleep) mirror of
     /// the frame budget for stable-state coverage. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn charge_frame_locally_at_for_test(
         &self,
         connection_id: u64,
@@ -301,7 +299,6 @@ impl WsRateLimiting {
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_connection_at_for_test(&self, connection_id: u64, now: Instant) {
         let _ = self.limiter.check_local_at(
             WsRateLimitKey::Connection(connection_id),
@@ -312,7 +309,6 @@ impl WsRateLimiting {
 
     /// Attempt to seed one local/fallback key through the production atomic
     /// capacity gate. Returns false only for a previously unseen key at cap.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_connection_at_with_cap_for_test(
         &self,
         connection_id: u64,
@@ -368,7 +364,6 @@ impl WsRateLimiting {
         apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
     }
 
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn contains_connection_for_test(&self, connection_id: u64) -> bool {
         self.limiter
             .contains_local_key(&WsRateLimitKey::Connection(connection_id))

@@ -556,26 +556,22 @@ struct HeartbeatCounters {
 
 impl HeartbeatProgress {
     /// Extensions handed to the blocking pool since the keeper started.
-    #[allow(dead_code)]
     pub fn started(&self) -> u64 {
         self.0.started.load(Ordering::SeqCst)
     }
 
     /// Extensions the loop has awaited to completion.
-    #[allow(dead_code)]
     pub fn settled(&self) -> u64 {
         self.0.settled.load(Ordering::SeqCst)
     }
 
     /// Whether an extension has been started and not yet awaited back.
-    #[allow(dead_code)]
     pub fn extension_in_flight(&self) -> bool {
         self.started() > self.settled()
     }
 
     /// Whether shutdown has already asked the heartbeat loop to stop. Set
     /// before the join is awaited, so it is true for the whole settling window.
-    #[allow(dead_code)]
     pub fn stop_requested(&self) -> bool {
         self.0.stop_requested.load(Ordering::SeqCst)
     }
@@ -632,7 +628,6 @@ impl RenewalLeaseKeeper {
 
     /// Heartbeat progress, which outlives the keeper so shutdown settlement can
     /// be checked after [`Self::finish`] has consumed it.
-    #[allow(dead_code)]
     pub fn heartbeat_progress(&self) -> HeartbeatProgress {
         self.progress.clone()
     }

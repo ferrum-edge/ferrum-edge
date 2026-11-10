@@ -337,10 +337,6 @@ pub fn autodetect_format(body: &[u8]) -> SpecFormat {
 ///
 /// `(bundle, metadata)` on success, or an [`ExtractError`] describing the
 /// first problem encountered.
-// The binary target compiles this public library module privately and uses the
-// policy-aware entry point directly; integration tests retain this compatibility
-// entry point for the default fail-closed behavior.
-#[allow(dead_code)]
 pub fn extract(
     body: &[u8],
     declared_format: Option<SpecFormat>,

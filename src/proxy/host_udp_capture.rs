@@ -432,19 +432,16 @@ impl HostUdpIdentityIndex {
         self.by_ifindex.store(Arc::new(HashMap::new()));
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.by_ifindex.load().len()
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Per-datagram admission check: one lock-free snapshot load, one hash lookup,
     /// one address comparison, and one `Arc` retain for the authorized binding.
-    #[allow(dead_code)] // Library test seam; the binary uses `authorized_binding` directly.
     pub fn authorize(
         &self,
         ingress_ifindex: Option<u32>,
@@ -479,7 +476,6 @@ impl HostUdpIdentityIndex {
     }
 
     /// Resolve attested evidence from one authorization snapshot.
-    #[allow(dead_code)] // Library test seam; the binary retains the authorized binding instead.
     pub fn identity_for(
         &self,
         ingress_ifindex: Option<u32>,
@@ -535,7 +531,6 @@ impl HostUdpListenerHandle {
     }
 
     /// A handle with no task, for backends (and tests) that do not spawn one.
-    #[allow(dead_code)]
     pub fn detached(stop: watch::Sender<bool>) -> Self {
         Self { stop, task: None }
     }
@@ -1020,7 +1015,6 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
 
     /// Override the bounded wait for the node-agent's gate-close acknowledgement
     /// (tests use a short window; production uses [`GATE_CLOSE_ACK_TIMEOUT`]).
-    #[allow(dead_code)]
     pub fn with_gate_close_timeout(mut self, timeout: Duration) -> Self {
         self.gate_close_timeout = timeout;
         self
@@ -1752,7 +1746,6 @@ impl ProxyHostUdpBackend {
     }
 
     /// Override the sysfs root used for interface-index lookups (tests).
-    #[allow(dead_code)]
     pub fn with_sysfs_net(mut self, path: PathBuf) -> Self {
         self.sysfs_net = path;
         self

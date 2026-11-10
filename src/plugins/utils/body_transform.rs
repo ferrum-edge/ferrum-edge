@@ -139,7 +139,6 @@ fn child_mut<'a>(parent: &'a mut Value, segment: &str) -> Option<&'a mut Value> 
 /// segments are object keys. `\\.` is treated as a literal `.` in a key.
 /// Returns `None` if any segment along the path is missing or the parent node
 /// is not an object/array (or index is out of bounds).
-#[allow(dead_code)]
 pub fn get_nested_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let path = CompiledPath::parse(path);
     get_nested_value_compiled(root, &path)
@@ -159,7 +158,6 @@ fn get_nested_value_compiled<'a>(root: &'a Value, path: &CompiledPath) -> Option
 /// Returns `true` if the value was successfully set, `false` if an
 /// unreachable node was encountered (non-object intermediate, out-of-bounds
 /// array index, or array index that can't be parsed).
-#[allow(dead_code)]
 pub fn set_nested_value(root: &mut Value, path: &str, value: Value) -> bool {
     let path = CompiledPath::parse(path);
     set_nested_value_inner(root, &path, value).is_ok()
@@ -222,7 +220,6 @@ fn set_nested_value_inner(
 ///
 /// Returns the removed value if it existed, `None` otherwise. For arrays,
 /// uses `Vec::remove` which shifts subsequent elements.
-#[allow(dead_code)]
 pub fn remove_nested_value(root: &mut Value, path: &str) -> Option<Value> {
     let path = CompiledPath::parse(path);
     remove_nested_value_compiled(root, &path)
@@ -369,7 +366,6 @@ fn insert_into_array_at(
 /// container (only possible when `new_path` is a strict prefix of `old_path`
 /// and the intermediate we depended on was replaced mid-operation — an
 /// API-misuse edge case). We log a warning and return `false`.
-#[allow(dead_code)]
 pub fn rename_nested_field(root: &mut Value, old_path: &str, new_path: &str) -> bool {
     let old_path_compiled = CompiledPath::parse(old_path);
     let new_path_compiled = CompiledPath::parse(new_path);

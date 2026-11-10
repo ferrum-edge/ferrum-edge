@@ -540,7 +540,6 @@ impl CertSource {
         Self::Path(PathBuf::from(raw))
     }
 
-    #[allow(dead_code)]
     pub fn from_path(path: impl Into<PathBuf>) -> Self {
         Self::Path(path.into())
     }
@@ -551,7 +550,6 @@ impl CertSource {
         matches!(self, Self::Uri(uri) if uri.scheme == SourceScheme::System)
     }
 
-    #[allow(dead_code)]
     pub fn kind(&self) -> MaterialKind {
         match self {
             Self::Path(_) | Self::InlinePem(_) => MaterialKind::Unknown,

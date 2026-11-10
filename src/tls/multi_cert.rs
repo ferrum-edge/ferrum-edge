@@ -254,7 +254,6 @@ fn select_compatible_certified_key(
 /// previous one. Serving a partial set would silently answer some hostnames
 /// with the fallback certificate — a name mismatch the operator never asked
 /// for — so a broken certificate is a rejected snapshot, not a degraded one.
-#[allow(dead_code)] // Public integration-test entry point; production binds an explicit scope.
 pub fn load_gateway_multi_cert_tls_config(
     certificates: &[GatewayCertificateInput],
     client_ca_bundle_path: Option<&str>,

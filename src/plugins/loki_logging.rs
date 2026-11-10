@@ -78,9 +78,7 @@ pub const LOKI_DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const LOKI_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
 // Retain sink-local exports for OpenAPI/runtime parity tests. Production uses
 // the authoritative shared constants directly.
-#[allow(dead_code)]
 pub const LOKI_MAX_RETRIES: u64 = MAX_BATCH_RETRIES;
-#[allow(dead_code)]
 pub const LOKI_MAX_RETRY_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
 pub const LOKI_MAX_CUSTOM_HEADER_NAME_BYTES: usize = u16::MAX as usize;
 
@@ -328,9 +326,6 @@ impl LokiLogging {
     /// `ceiling`. External tests pass their own leaked ceiling so end-to-end
     /// reservation-ownership assertions stay exact while other tests in the same
     /// binary reserve against the process-global counter.
-    // The binary target only calls `new`; external tests reach this through
-    // `_test_support`.
-    #[allow(dead_code)]
     pub(crate) fn new_with_ceiling(
         config: &Value,
         http_client: PluginHttpClient,
@@ -864,7 +859,6 @@ pub(crate) struct LokiProvisionalAdmissionProbe {
 /// reservation is refused — serialization and label construction must not run.
 /// On success the provisional lease shrinks to the exact retained size and is
 /// fully released when the returned lease drops.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_loki_provisional_admission_for_test(
     ceiling: &'static RetainedByteCeiling,
     buffer_max_bytes: usize,
@@ -963,7 +957,6 @@ pub(crate) struct LokiMaterializationProbe {
 /// `distinct_label_sets` is the attacker-controlled dimension: a hostile client
 /// can manufacture a new dynamic label set per entry, which is exactly what the
 /// old grouping representation scaled with.
-#[allow(dead_code)] // reached only from the probes below
 fn probe_loki_batch_for_test(
     budget: &LokiByteBudget,
     entry_count: usize,
@@ -1001,7 +994,6 @@ fn probe_loki_batch_for_test(
 /// Queues `entry_count` entries of `line_bytes` each, spread over
 /// `distinct_label_sets` label sets, through a real [`LokiByteBudget`] bound to
 /// `ceiling`, then materializes the wire body while those leases are still held.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_loki_batch_materialization_for_test(
     ceiling: &'static RetainedByteCeiling,
     entry_count: usize,
@@ -1064,7 +1056,6 @@ pub(crate) fn probe_loki_batch_materialization_for_test(
 /// of `entry_count` entries spread over `distinct_label_sets` label sets
 /// produces, so an external test can pin stream grouping, per-stream entry
 /// order, and timestamp monotonicity with many distinct label sets.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_loki_payload_json_for_test(
     entry_count: usize,
     distinct_label_sets: usize,

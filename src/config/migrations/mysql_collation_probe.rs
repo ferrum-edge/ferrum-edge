@@ -46,9 +46,7 @@ pub struct LiveColumnCollation {
 /// identity column still carries an explicit `COLLATE utf8mb4_0900_bin`, so
 /// warning on `TABLE_COLLATION` alone would false-positive on healthy schemas.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Consumed by the external `tests/` crate. `src/lib.rs` and `src/main.rs` both
-// declare the full module tree, so in the BIN target this has no caller and
-// `-D dead-code` would reject it.
+// Consumed by the external `tests/` crate.
 #[allow(dead_code)]
 pub struct LiveTableCollation {
     pub table_name: String,
@@ -325,10 +323,6 @@ pub fn identity_bearing_columns() -> &'static [IdentityBearingColumn] {
     ]
 }
 
-// Consumed by the external `tests/` crate. `src/lib.rs` and `src/main.rs` both
-// declare the full module tree, so in the BIN target this has no caller and
-// `-D dead-code` would reject it.
-#[allow(dead_code)]
 fn identity_tables() -> BTreeSet<&'static str> {
     identity_bearing_columns().iter().map(|c| c.table).collect()
 }
@@ -375,9 +369,7 @@ pub fn find_stale_column_collations(
 /// A stale table default is reported even when every inventoried column is
 /// already correct — future `ADD COLUMN` without an explicit `COLLATE` would
 /// inherit the wrong default.
-// Consumed by the external `tests/` crate. `src/lib.rs` and `src/main.rs` both
-// declare the full module tree, so in the BIN target this has no caller and
-// `-D dead-code` would reject it.
+// Consumed by the external `tests/` crate.
 #[allow(dead_code)]
 pub fn find_stale_table_collations(
     live_tables: &[LiveTableCollation],
@@ -405,9 +397,7 @@ pub fn find_stale_table_collations(
 }
 
 /// Merge column + table findings and dedupe by `(table, column)`.
-// Consumed by the external `tests/` crate. `src/lib.rs` and `src/main.rs` both
-// declare the full module tree, so in the BIN target this has no caller and
-// `-D dead-code` would reject it.
+// Consumed by the external `tests/` crate.
 #[allow(dead_code)]
 pub fn merge_stale_collation_findings(
     column_findings: Vec<StaleCollationFinding>,

@@ -1380,7 +1380,6 @@ pub enum UdpDatagramDirection {
 /// on the proxy opts in via `requires_udp_datagram_hooks()`. Fired in both
 /// directions: client→backend (before forwarding) and backend→client (before
 /// relaying the response to the client).
-#[allow(dead_code)]
 pub struct UdpDatagramContext<'a> {
     /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
     /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
@@ -5799,7 +5798,6 @@ impl RequestContext {
         let _ = self.compression_response_buffer_permit.take();
     }
 
-    #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
     pub(crate) fn compression_ownership_for_test(&self) -> (Option<u64>, Option<u64>) {
         (
             self.compression_request_decode_owner,
@@ -6251,12 +6249,9 @@ impl RequestContext {
     /// Whether the final request-body representation was decoded from a content
     /// coding rather than received as plaintext.
     ///
-    /// `#[allow(dead_code)]`: claiming plugins now take the owned handle above
-    /// (which answers the same question by returning `None`), so the only
-    /// remaining callers are external tests (through `_test_support`), and a
-    /// `pub` item reachable solely from `tests/` is dead in the separately
-    /// compiled binary unit.
-    #[allow(dead_code)]
+    /// Claiming plugins now take the owned handle above (which answers the
+    /// same question by returning `None`), so the only remaining callers are
+    /// external tests (through `_test_support`).
     pub fn final_request_body_was_decoded(&self) -> bool {
         self.governed_request_body_plaintext.is_some()
     }
@@ -8823,10 +8818,7 @@ impl Drop for CompletionNotifyingInspector {
 /// scan) is now used only by external test crates; every gateway hot path resolves
 /// the capability through the `PluginCache` and calls
 /// [`create_response_stream_inspector_for_enabled_plugins`] directly.
-/// `#[allow(dead_code)]` because the binary target recompiles the source without
-/// those test crates, so it sees no caller.
 #[doc(hidden)]
-#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn create_response_stream_inspector(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -14460,7 +14452,6 @@ pub trait Plugin: Any + Send + Sync {
 /// [`create_plugin_with_http_client_and_config_id`] with the stable plugin-config
 /// resource id. Direct construction here uses a validation-only default
 /// identity.
-#[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
     let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
     create_plugin_with_http_client(
@@ -14948,11 +14939,9 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// are screened against the configured backend egress policy. This bare
 /// variant remains a `pub` entrypoint for external test crates that only need
 /// shape validation of endpoint-less plugins (e.g. `cors`,
-/// `transaction_log_schema`). `#[allow(dead_code)]` because the binary target
-/// recompiles the source without those test crates, so it sees no caller.
+/// `transaction_log_schema`).
 ///
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
-#[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
     let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
     validate_plugin_config_with_http_client(
@@ -15406,9 +15395,8 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("fault_injection", PluginFailurePolicy::KeepLastKnownGood),
 ];
 
-// Keep documentation/parity inventory linked in both the library crate (consumed
-// by integration tests) and the binary crate (same sources, separate compilation).
-// Length equality is a cheap compile-time guard; name set-equality remains in tests.
+// Keep documentation/parity inventory linked in the library crate (consumed by
+// integration tests). Length equality is a cheap compile-time guard; name set-equality remains in tests.
 const _: () = {
     assert!(BUILTIN_PLUGIN_PARITY_META.len() == BUILTIN_PLUGIN_REGISTRATIONS.len());
     let _: fn(&str) -> Option<&'static BuiltinPluginParityMeta> = builtin_plugin_parity_meta;

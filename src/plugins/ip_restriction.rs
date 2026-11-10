@@ -530,7 +530,6 @@ fn is_canonical_ipv4_literal(literal: &str, ipv4: std::net::Ipv4Addr) -> bool {
 ///
 /// This string-based API is preserved for external callers and tests. Runtime
 /// plugin hooks use the context-cached typed client IP and compiled range set.
-#[allow(dead_code)]
 pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
     let client_ip = crate::util::client_identity::parse_canonical_client_ip(client_ip);
     match (client_ip, parse_rule(rule)) {

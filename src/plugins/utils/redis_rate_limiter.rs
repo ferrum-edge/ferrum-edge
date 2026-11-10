@@ -2237,7 +2237,6 @@ fn pause_shared_replay_apply_for_test() {
 /// unit tests use this to deterministically reproduce the previously dangerous
 /// transition/global-publish reordering.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn arm_shared_replay_apply_pause_for_test() {
     REPLAY_HEALTH_APPLY_PAUSE_ENTERED.store(0, Ordering::Release);
     REPLAY_HEALTH_APPLY_PAUSE_ARMED.store(true, Ordering::Release);
@@ -2245,14 +2244,12 @@ pub fn arm_shared_replay_apply_pause_for_test() {
 
 /// Disarm the apply-pause gate so a paused transition can proceed.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn disarm_shared_replay_apply_pause_for_test() {
     REPLAY_HEALTH_APPLY_PAUSE_ARMED.store(false, Ordering::Release);
 }
 
 /// Number of transitions currently (or previously) paused at the tear point.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn shared_replay_apply_pause_entered_for_test() -> usize {
     REPLAY_HEALTH_APPLY_PAUSE_ENTERED.load(Ordering::Acquire)
 }
@@ -2260,7 +2257,6 @@ pub fn shared_replay_apply_pause_entered_for_test() -> usize {
 /// Whether the shared-replay transition lock is currently held. External tests
 /// use this to prove a transition spans the tear point under the lock.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn shared_replay_transition_lock_held_for_test() -> bool {
     SHARED_REPLAY_TRANSITION_LOCK.try_lock().is_err()
 }
@@ -3088,7 +3084,6 @@ pub struct SharedReplayRegistrationSample {
 
 impl SharedReplayRegistrationSample {
     /// Whether this sample observed a reachable backend.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn available(self) -> bool {
         self.available
     }
@@ -3665,7 +3660,6 @@ impl RedisRateLimitClient {
     /// The probe itself needs a live server, so this is how coverage proves a
     /// consumer asked for the prerequisite — the exact distinction between a
     /// deployment that must grant `+time` and one that must not be forced to.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn requires_server_clock_for_test(&self) -> bool {
         self.requires_server_clock()
     }
@@ -3676,7 +3670,6 @@ impl RedisRateLimitClient {
     /// The screen itself needs a live server, so this is how coverage proves a
     /// consumer asked for the prerequisite at construction — the exact
     /// distinction `GHSA-26gf-943w-w5x8` turned on.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn requires_no_eviction_screen_for_test(&self) -> bool {
         self.requires_no_eviction()
     }
@@ -3690,7 +3683,6 @@ impl RedisRateLimitClient {
     /// a cache/counter client reports "usable" without publishing a verdict —
     /// otherwise this helper would prove something the production path does
     /// not do.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn apply_memory_policy_screen_for_test(&self, screen: MemoryPolicyScreen) -> bool {
         if !self.requires_no_eviction() {
             return true;
@@ -3812,7 +3804,6 @@ impl RedisRateLimitClient {
     /// Mark Redis unavailable (test support). Arming the recovery checker is
     /// part of [`Self::mark_unavailable`] itself, so this exercises the same
     /// transition production error paths take.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn mark_unavailable_for_test(&self) {
         self.mark_unavailable();
     }
@@ -3820,7 +3811,6 @@ impl RedisRateLimitClient {
     /// Prove an unsupported Cluster topology the way a racing task would
     /// (test support), so concurrency coverage can land the rejection at an
     /// exact point in another operation's lifecycle.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn mark_topology_unsupported_for_test(&self) {
         self.mark_topology_unsupported("test-injected cluster topology proof");
     }
@@ -3829,7 +3819,6 @@ impl RedisRateLimitClient {
     /// (test support), so admission coverage can land a recovery at a chosen
     /// point without a live server. Returns `false` when the topology is
     /// terminal and nothing was written.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn publish_reachable_for_test(&self) -> bool {
         self.availability.publish_reachable()
     }
@@ -3842,7 +3831,6 @@ impl RedisRateLimitClient {
     /// Attaching does not move the packed health word; only a later
     /// [`Self::publish_shared_replay_registration_sample_for_test`] or a
     /// transition notify publishes counts.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn capture_shared_replay_registration_sample_for_test(
         &self,
     ) -> SharedReplayRegistrationSample {
@@ -3857,7 +3845,6 @@ impl RedisRateLimitClient {
     /// A sample whose epoch is older than a notification that already landed
     /// is rejected, which is the proof that the packed health word cannot stay
     /// permanently stale after the last registration/availability race settles.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn publish_shared_replay_registration_sample_for_test(
         &self,
         sample: SharedReplayRegistrationSample,
@@ -3870,7 +3857,6 @@ impl RedisRateLimitClient {
 
     /// What a failover health observer reads from this client's shared
     /// availability signal — the same `Arc` the observer holds (test support).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn observer_sees_available_for_test(&self) -> bool {
         self.availability_signal().is_available()
     }
@@ -3879,19 +3865,16 @@ impl RedisRateLimitClient {
     ///
     /// True only when verification is on and a configured bundle loaded. False
     /// when no CA path was set or when `tls_no_verify` skipped the load.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn uses_exclusive_ca_bundle_for_test(&self) -> bool {
         self.tls_ca_bundle_pem.is_some()
     }
 
     /// Whether the background recovery checker has been started (test support).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn health_checker_started_for_test(&self) -> bool {
         self.health_checker_started.load(Ordering::Relaxed)
     }
 
     /// Abort handle for the background recovery checker, when started (tests).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn health_checker_abort_for_test(&self) -> Option<AbortHandle> {
         self.health_checker_abort
             .lock()
@@ -3900,13 +3883,11 @@ impl RedisRateLimitClient {
     }
 
     /// Configured pool cardinality (`redis_pool_size`).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn pool_size_for_test(&self) -> usize {
         self.pool.len()
     }
 
     /// Number of pool slots that currently hold an established connection.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn cached_pool_cardinality_for_test(&self) -> usize {
         self.pool
             .slots
@@ -3916,13 +3897,11 @@ impl RedisRateLimitClient {
     }
 
     /// Round-robin slot indexes that the next `count` hot-path selections would use.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn select_slot_indexes_for_test(&self, count: usize) -> Vec<usize> {
         (0..count).map(|_| self.select_slot_index()).collect()
     }
 
     /// Lazily establish every pool slot. Returns how many slots connected.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub async fn warm_pool_for_test(&self) -> usize {
         let mut established = 0usize;
         for idx in 0..self.pool.len() {
@@ -3934,13 +3913,11 @@ impl RedisRateLimitClient {
     }
 
     /// Clear every cached pool slot (same path as reconnect clearing).
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn clear_pool_for_test(&self) {
         self.clear_connection();
     }
 
     /// Establish (or reuse) one round-robin pooled connection for tests.
-    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_cached_for_test(&self) -> bool {
         self.get_connection().await.is_some()
     }
@@ -3952,13 +3929,11 @@ impl RedisRateLimitClient {
     /// `ConnectionManager`. The pooled helper's return type is the compile-time
     /// pin; reintroducing a transparently reconnecting manager fails either this
     /// string check or the `slot.connection.store(..)` assignment.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn cached_pool_connection_type_name_for_test() -> &'static str {
         std::any::type_name::<redis::aio::MultiplexedConnection>()
     }
 
     /// Establish a dedicated non-reconnecting multiplexed connection for tests.
-    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_dedicated_for_test(&self) -> bool {
         self.get_dedicated_connection().await.is_some()
     }
@@ -3970,7 +3945,6 @@ impl RedisRateLimitClient {
     /// `ConnectionManager`. The production helper's return type is the
     /// compile-time pin; changing it to a reconnecting manager fails either
     /// this string check or the assignment in `get_dedicated_connection`.
-    #[allow(dead_code)] // public support used by the external unit-test target
     pub fn dedicated_watch_connection_type_name_for_test() -> &'static str {
         std::any::type_name::<redis::aio::MultiplexedConnection>()
     }
@@ -3981,7 +3955,6 @@ impl RedisRateLimitClient {
     /// (inner `AsyncConnectionConfig` + defensive outer connect bound, then a
     /// `PING` bounded by the same `connect_timeout`). DNS screening still
     /// happens first and remains outside the connection timeout.
-    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn health_check_connect_for_test(&self) -> bool {
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
@@ -4008,7 +3981,6 @@ impl RedisRateLimitClient {
     }
 
     /// Connection-timeout duration installed into redis-rs configs (tests).
-    #[allow(dead_code)] // public support used by the external integration-test target
     pub fn connection_timeout_for_test(&self) -> Duration {
         self.connect_timeout()
     }
@@ -6628,7 +6600,6 @@ impl RedisRateLimitClient {
     /// Test support only: coverage that asserts a counter after a refusal waits
     /// for this to reach zero instead of racing the detached task. Admission
     /// never reads it.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn pending_compensations_for_test(&self) -> usize {
         self.pending_compensations.load(Ordering::Acquire)
     }

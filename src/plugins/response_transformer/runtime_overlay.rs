@@ -29,7 +29,6 @@ pub type GateSnapshot = runtime_bool_gate::BoolGateSnapshot;
 /// The live published gate map. Provenance/observability only; see the
 /// `request_transformer` counterpart for why no plugin phase consults it and why
 /// the `#[allow(dead_code)]` is required.
-#[allow(dead_code)]
 pub fn current_gates() -> GateSnapshot {
     runtime_bool_gate::current_snapshot(&GATES)
 }
@@ -56,7 +55,6 @@ pub fn scope_gates(overlay: &MeshRuntimeOverlay) -> HashMap<String, bool> {
 /// Same contract as
 /// [`crate::plugins::request_transformer::runtime_overlay::reset_for_test`].
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn reset_for_test() {
     runtime_bool_gate::reset(&GATES);
 }

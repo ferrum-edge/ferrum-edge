@@ -698,14 +698,12 @@ where
 
 /// The bounded slices a buffered native-H3 request body is written in, in
 /// order. Reached through `crate::_test_support`.
-#[allow(dead_code)]
 pub(crate) fn h3_buffered_body_chunks_for_test(body: bytes::Bytes) -> Vec<bytes::Bytes> {
     H3BufferedBodyChunks::new(body).collect()
 }
 
 /// The slice size each buffered native-H3 write is bounded at. Reached through
 /// `crate::_test_support`.
-#[allow(dead_code)]
 pub(crate) const fn h3_buffered_send_chunk_bytes() -> usize {
     H3_BUFFERED_SEND_CHUNK_BYTES
 }
@@ -719,7 +717,6 @@ pub(crate) const fn h3_buffered_send_chunk_bytes() -> usize {
 /// `per_chunk_delay_ms` is how long each simulated write takes, and a body whose
 /// TOTAL write time far exceeds `backend_write_timeout_ms` still completes as
 /// long as no single write does.
-#[allow(dead_code)]
 pub(crate) async fn drive_h3_buffered_body_send_for_test(
     body: bytes::Bytes,
     backend_write_timeout_ms: u64,
@@ -2200,7 +2197,6 @@ impl Http3PoolManager {
 }
 
 impl Http3ConnectionPool {
-    #[allow(dead_code)] // Used by tests and standalone H3 callers without shared SVID rotation state.
     pub fn new(env_config: Arc<crate::config::EnvConfig>, dns_cache: crate::dns::DnsCache) -> Self {
         Self::new_with_svid_generation(env_config, dns_cache, Arc::new(AtomicU64::new(0)))
     }
@@ -2301,7 +2297,6 @@ impl Http3ConnectionPool {
 
     /// Pool key — includes TLS-differentiating fields (CA, mTLS, verify).
     /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
-    #[allow(dead_code)] // Public test/helper surface; runtime paths use generation-aware methods.
     pub fn pool_key(proxy: &Proxy, index: usize) -> String {
         let mut key = String::with_capacity(128);
         Self::write_pool_key(&mut key, proxy, index);
@@ -2323,7 +2318,6 @@ impl Http3ConnectionPool {
         );
     }
 
-    #[allow(dead_code)] // Paired with pool_key_for_target() for external tests/helpers.
     fn write_pool_key_with_host(
         buf: &mut String,
         host: &str,
@@ -2388,7 +2382,6 @@ impl Http3ConnectionPool {
     /// a capability probed through one proxy's resolver / cert material
     /// could be served by a pooled QUIC connection originated by a
     /// different proxy.
-    #[allow(dead_code)] // Public test/helper surface; runtime paths use generation-aware methods.
     pub fn pool_key_for_target(proxy: &Proxy, host: &str, port: u16, index: usize) -> String {
         let mut key = String::with_capacity(128);
         Self::write_pool_key_with_host(&mut key, host, port, proxy, index);

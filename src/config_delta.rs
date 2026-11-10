@@ -30,7 +30,6 @@ use crate::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope, P
 ///
 /// Path-keyed routes and host-only routes use different cache keys, so callers
 /// that need targeted invalidation can inspect them separately.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct AffectedRoutes {
     pub listen_paths: Vec<String>,
@@ -257,7 +256,6 @@ impl ConfigDelta {
     }
 
     /// Collect routing identities affected by proxy changes.
-    #[allow(dead_code)]
     pub fn affected_routes(&self, old_config: &GatewayConfig) -> AffectedRoutes {
         let mut listen_paths = Vec::new();
         let mut host_only_hosts = Vec::new();

@@ -427,13 +427,11 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     }
 
     /// Configured whole-document byte ceiling for this store handle.
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn max_document_bytes(&self) -> usize {
         self.max_document_bytes
     }
 
     /// Fixed store kind used for observability.
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn store_kind(&self) -> TlsPersistentStoreKind {
         self.store_kind
     }

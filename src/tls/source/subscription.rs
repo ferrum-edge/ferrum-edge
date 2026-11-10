@@ -82,7 +82,6 @@ impl WatchedMaterialSource {
         }
     }
 
-    #[allow(dead_code)]
     pub fn source_id(&self) -> String {
         self.source.source_id()
     }
@@ -106,12 +105,10 @@ pub struct MaterialSetFingerprint {
 }
 
 impl MaterialSetFingerprint {
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -246,7 +243,6 @@ fn clamp_poll_interval(interval: Duration) -> Duration {
 }
 
 /// Fingerprint all configured sources using their material bytes.
-#[allow(dead_code)] // External unit tests; reload paths use material_set_fingerprint_with.
 pub fn material_set_fingerprint(
     sources: &[WatchedMaterialSource],
 ) -> Result<MaterialSetFingerprint, MaterialError> {

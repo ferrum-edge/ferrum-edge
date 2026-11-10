@@ -266,7 +266,6 @@ impl DeliverySlot {
     /// registered against it. The new override applies to the next generation.
     /// A drained generation is replaced immediately, which is what lets a
     /// second in-process serve deliver again.
-    #[allow(dead_code)] // Used by external lifecycle tests; production calls `initialize_with_limits`.
     pub fn initialize(&self, pool_shard_override: usize) {
         self.initialize_with_limits(pool_shard_override, self.max_tasks.load(Ordering::Acquire));
     }
@@ -316,32 +315,27 @@ impl DeliverySlot {
     }
 
     /// Generation id currently admitting delivery work.
-    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the field directly.
     pub fn current_generation(&self) -> u64 {
         self.current.load().generation
     }
 
     /// Configured aggregate task admission budget for the current generation.
-    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the lifecycle field in `render_prometheus`.
     pub fn max_tasks(&self) -> usize {
         self.current.load().max_tasks
     }
 
     /// Tasks currently held in the registry for the current generation.
-    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads `tasks.len()` in `render_prometheus`.
     pub fn active_tasks(&self) -> usize {
         self.current.load().tasks.len()
     }
 
     /// Reserved admission permits for the current generation (registry plus
     /// in-flight spawn handoff).
-    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the atomic in `render_prometheus`.
     pub fn admitted_tasks(&self) -> u64 {
         self.current.load().admitted_tasks.load(Ordering::Acquire)
     }
 
     /// Aggregate rejected-task count for the current generation.
-    #[allow(dead_code)] // Used by external lifecycle tests; the bin uses `rejected_task_count()` in `render_prometheus`.
     pub fn rejected_tasks(&self) -> u64 {
         self.current.load().rejected_task_count()
     }
@@ -351,7 +345,6 @@ impl DeliverySlot {
     /// The aggregate `rejected_tasks` counter also covers closed-admission and
     /// no-runtime rejects, so operators cannot use it alone to tell whether
     /// `FERRUM_LOG_DELIVERY_MAX_TASKS` is the limiting factor.
-    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the atomic in `render_prometheus`.
     pub fn capacity_rejected_tasks(&self) -> u64 {
         self.current.load().capacity_rejection_count()
     }
@@ -426,7 +419,6 @@ impl DeliverySlot {
     /// Hidden test seam only: external paused-time regressions use the signal
     /// as a causal barrier instead of polling admission or relying on scheduler
     /// order. Production callers use [`Self::shutdown`].
-    #[allow(dead_code)] // Used by external lifecycle tests; production callers use `shutdown`.
     #[doc(hidden)]
     pub async fn shutdown_with_admission_closed_for_test(
         &self,
@@ -1181,7 +1173,6 @@ impl DeliveryWorkerControl {
         }
     }
 
-    #[allow(dead_code)] // Used by explicit sink finalizers and lifecycle tests.
     pub async fn wait_finished(&self) -> bool {
         loop {
             let finished = self.finished_notify.notified();

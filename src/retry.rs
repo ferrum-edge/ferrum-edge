@@ -237,12 +237,6 @@ pub const LOOP_DETECTED_STATUS: u16 = 508;
 /// Header spelling is independent of `ferrum_requests_total{error_class}`
 /// and of access-log `error_class` (those use [`ErrorClass::as_str`] plus
 /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`]).
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
     OBS_CONNECTION_FAILURE,
     OBS_BACKEND_TIMEOUT,
@@ -261,12 +255,6 @@ pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
 /// stays selectable and agrees with its `X-Gateway-Error` header. Combined
 /// with [`ErrorClass::ALL`] they are the closed HTTP metrics label set
 /// (bound: [`HTTP_METRICS_ERROR_CLASS_BOUND`]).
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
     OBS_CIRCUIT_BREAKER_OPEN,
     OBS_OVERLOAD,
@@ -285,12 +273,6 @@ pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
 /// on the coarser nine-token [`HTTP_OBSERVABILITY_ERROR_CLASSES`] set;
 /// map each granular class to its header token with
 /// [`x_gateway_error_token_for_class`].
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub const HTTP_METRICS_ERROR_CLASS_BOUND: usize = 25;
 
 /// Map a backend-path HTTP status plus the pre-wire flag onto the closed
@@ -316,9 +298,7 @@ pub fn http_observability_error_class(connection_error: bool, status: u16) -> Op
 ///
 /// The dispatch paths derive the header from `BackendResponse` state rather
 /// than from a class, so this mapping exists for the external `tests/` crate
-/// to assert the granular-to-coarse relationship in one place. `tests/` is a
-/// separate crate, so the `ferrum-edge` binary target sees it as dead.
-#[allow(dead_code)]
+/// to assert the granular-to-coarse relationship in one place.
 #[inline]
 pub fn x_gateway_error_token_for_class(class: ErrorClass) -> &'static str {
     if !request_reached_wire(class) {
@@ -350,12 +330,6 @@ pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
 /// Intern a candidate `X-Gateway-Error` token. Values outside the closed
 /// nine-token header set are rejected rather than forwarded.
 #[inline]
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub fn intern_http_observability_error_class(value: &str) -> Option<&'static str> {
     HTTP_OBSERVABILITY_ERROR_CLASSES
         .iter()
@@ -368,12 +342,6 @@ pub fn intern_http_observability_error_class(value: &str) -> Option<&'static str
 /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`]. Header-only tokens such as
 /// `connection_failure` are rejected.
 #[inline]
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub fn intern_http_metrics_error_class(value: &str) -> Option<&'static str> {
     for class in ErrorClass::ALL {
         if class.as_str() == value {
@@ -1921,7 +1889,6 @@ pub struct BackendResponse {
 
 impl BackendResponse {
     /// Returns the buffered body bytes, or an empty slice for streaming responses.
-    #[allow(dead_code)]
     pub fn body_bytes(&self) -> &[u8] {
         match &self.body {
             ResponseBody::Buffered(b) => b,

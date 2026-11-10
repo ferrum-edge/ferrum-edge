@@ -598,7 +598,6 @@ impl UsageStreamExtractor {
 
     /// Bytes currently retained by the parser. Test/diagnostic accessor for the
     /// bounded-retention guarantee.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn retained_bytes(&self) -> usize {
         self.carry.len() + self.event.retained_bytes()
     }

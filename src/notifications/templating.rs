@@ -229,7 +229,6 @@ fn truncate_string_to_budget(out: &mut String, budget: usize) {
 /// at plugin construction time without aborting startup.
 ///
 /// Returns `Err` on unbalanced `${`.
-#[allow(dead_code)] // Public helper for callers that want a one-shot
 // "did the operator typo a placeholder?" check at construction.
 pub fn unknown_variables(template: &str, known: &HashSet<&str>) -> Result<Vec<String>, String> {
     let mut unknown = Vec::new();

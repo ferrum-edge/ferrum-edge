@@ -40,7 +40,6 @@ thread_local! {
 ///
 /// **Zero allocation**: Returns `[u8; 29]` (Copy) instead of String.
 /// Callers can pass this directly to `HeaderValue::from_bytes()` without allocating.
-#[allow(dead_code)] // Public API for response Date header injection
 #[inline]
 pub fn get_cached_date_bytes() -> [u8; HTTP_DATE_LEN] {
     let now = SystemTime::now();
@@ -73,7 +72,6 @@ pub fn get_cached_date_bytes() -> [u8; HTTP_DATE_LEN] {
 /// let date = ferrum_edge::date_cache::get_cached_date();
 /// assert!(date.contains("GMT"));
 /// ```
-#[allow(dead_code)] // Public API for response Date header injection
 pub fn get_cached_date() -> String {
     let bytes = get_cached_date_bytes();
     // HTTP Date format is always valid ASCII, so from_utf8 cannot fail.

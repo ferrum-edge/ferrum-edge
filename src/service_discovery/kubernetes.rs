@@ -138,7 +138,6 @@ impl KubernetesDiscoverer {
     }
 
     /// Create a new discoverer with a custom API base URL (for testing).
-    #[allow(dead_code)]
     pub fn with_api_url(mut self, url: String) -> Self {
         self.api_url_override = Some(url);
         self
@@ -146,7 +145,6 @@ impl KubernetesDiscoverer {
 
     /// Override the service-account token path (for testing projected rotation
     /// and fail-closed credential boundaries without touching the host path).
-    #[allow(dead_code)]
     pub fn with_sa_token_path(mut self, path: String) -> Self {
         self.sa_token_path_override = Some(path);
         self

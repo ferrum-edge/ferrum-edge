@@ -134,7 +134,6 @@ impl BoolGateSnapshot {
     /// its configuration on the cold path and resolved at construction
     /// (GHSA-83rc-23c9-3g9x). Retained for the published-state assertions in
     /// `tests/`, which the binary build path does not consume.
-    #[allow(dead_code)]
     pub fn gate(&self, scope: &str) -> Option<bool> {
         self.inner.gates.get(scope).copied()
     }

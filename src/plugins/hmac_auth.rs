@@ -1372,7 +1372,6 @@ impl HmacAuth {
     /// publishes a process readiness dependency or arms a Redis recovery task.
     /// Live readiness is published from
     /// [`crate::plugins::Plugin::commit_background_tasks`].
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::build(config, None, None)
     }
@@ -1706,14 +1705,12 @@ impl HmacAuth {
 
     /// Configured signing profile (test support).
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn signing_profile(&self) -> HmacSigningProfile {
         self.profile
     }
 
     /// Replay-authority mode (`None` under the legacy v1 profile). Test support.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn replay_mode(&self) -> Option<&'static str> {
         self.replay_authority.as_ref().map(|a| a.mode())
     }
@@ -1721,7 +1718,6 @@ impl HmacAuth {
     /// Whether this instance's shared Redis recovery checker has been armed.
     /// Test support for proving construction stays detached until commit.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn shared_replay_recovery_started_for_test(&self) -> bool {
         self.replay_authority
             .as_ref()
@@ -1732,7 +1728,6 @@ impl HmacAuth {
     /// visibility for the domain-isolation and reload/replica convergence
     /// contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn replay_marker_digest(&self, consumer_id: &str, nonce: &str) -> Option<[u8; 32]> {
         self.replay_domain.as_ref().map(|domain| {
             domain
@@ -2342,7 +2337,6 @@ impl HmacAuth {
     /// The RFC 9421 signature base this policy would verify for `ctx`, with
     /// no policy checks applied. Test support for RFC 9421 Appendix B vectors.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn rfc9421_signature_base_for_test(ctx: &RequestContext) -> Result<String, String> {
         match parse_rfc9421_signature(ctx) {
             Ok(Some(parsed)) => Ok(parsed.base),

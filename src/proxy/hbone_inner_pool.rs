@@ -658,7 +658,6 @@ impl HboneInnerH1Checkout {
     /// The drain generation this lease is bound to. Exposed for the external
     /// fence regression tests.
     #[inline]
-    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
     pub fn drain_generation(&self) -> u64 {
         self.generation
     }
@@ -1092,7 +1091,6 @@ impl HboneInnerConnectionPool {
 
     /// Check-ins and publications a retirement fenced out. Exposed for the
     /// external fence regression tests.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
     pub fn fenced_checkins(&self) -> u64 {
         self.fenced_checkins.load(Ordering::Relaxed)
     }

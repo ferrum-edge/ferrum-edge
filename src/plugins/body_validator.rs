@@ -1373,7 +1373,6 @@ impl BodyValidator {
     /// Request-side gRPC protobuf validation of `body` in the framing named by
     /// `content_type`, against an explicitly bound aggregate budget, reduced to
     /// a fixed outcome label.
-    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn protobuf_request_outcome_in(
         &self,
         grpc_path: &str,

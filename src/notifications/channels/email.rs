@@ -108,7 +108,6 @@ const DEFAULT_BODY_TEMPLATE: &str = "${body}\n\n${fields}";
 
 /// Template variables this channel adds on top of the generic notification
 /// variables exported by [`super::NOTIFICATION_TEMPLATE_VARS`].
-#[allow(dead_code)] // Documented surface; consumed by docs/tests, not by main.rs.
 pub const EMAIL_TEMPLATE_VARS: &[&str] = &["fields"];
 
 /// Authoritative closed key set for a `type: email` channel definition.

@@ -409,7 +409,6 @@ impl ProxyAlerts {
     /// Run the ownership portion of the background lifecycle sweep without
     /// waiting for its one-minute cadence.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn sweep_lifecycle_ownership_for_test(&self) {
         self.core.retain_published_proxy_generations();
     }
@@ -417,7 +416,6 @@ impl ProxyAlerts {
     /// Run the background lifecycle re-evaluation once at an injected
     /// monotonic `now_ms`, without waiting for its cadence.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn reevaluate_incidents_at_for_test(&self, now_ms: u64) {
         self.core.reevaluate_idle_incidents(now_ms, Utc::now());
     }
@@ -425,7 +423,6 @@ impl ProxyAlerts {
     /// Stop the background lifecycle task so a deterministic test that injects
     /// monotonic timestamps owns every re-evaluation itself.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn stop_lifecycle_task_for_test(&self) {
         if let Some(task) = self.lifecycle_task.get() {
             task.abort();
@@ -435,7 +432,6 @@ impl ProxyAlerts {
     /// Whether the background lifecycle task is still running (`None` until
     /// `commit_background_tasks` started it on a Tokio runtime).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn lifecycle_task_finished_for_test(&self) -> Option<bool> {
         self.lifecycle_task
             .get()
@@ -446,7 +442,6 @@ impl ProxyAlerts {
     /// a test can prove the background task does not keep a dropped instance
     /// (and its channels/credentials) alive.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn core_alive_probe_for_test(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
         let core = Arc::downgrade(&self.core);
         Box::new(move || core.strong_count() > 0)
@@ -456,7 +451,6 @@ impl ProxyAlerts {
     /// injected monotonic `now_ms` (quiet hours ignored). Ownership checks
     /// match the production `log()` / disconnect hooks.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn handle_sample_at_for_test(&self, sample: SampleInput<'_>, now_ms: u64) {
         let Some(proxy_id) = sample.proxy_id() else {
             return;
@@ -480,7 +474,6 @@ impl ProxyAlerts {
 
     /// Hold the cold-path retention lock for deterministic serialization tests.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn with_retention_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
         let _guard = self.core.retention_guard();
         f()
@@ -488,7 +481,6 @@ impl ProxyAlerts {
 
     /// Whether the retention lock is free (`true`) or held (`false`).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn try_retention_lock_for_test(&self) -> bool {
         self.core.retention_lock.try_lock().is_ok()
     }
@@ -497,7 +489,6 @@ impl ProxyAlerts {
     /// must already hold [`Self::with_retention_lock_for_test`] when proving
     /// the commit/sweep serialization contract.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn publish_proxy_generations_for_test(
         &self,
         active_proxy_generations: &HashMap<&str, u64>,
@@ -515,9 +506,6 @@ impl ProxyAlerts {
     /// test can observe retirement and drain *after* the plugin itself has been
     /// dropped (the reload boundary this contract is about).
     #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
     pub fn dispatch_generation_for_test(&self) -> Arc<DispatchGeneration> {
         Arc::clone(&self.core.dispatch_generation)
     }
@@ -526,9 +514,6 @@ impl ProxyAlerts {
     /// deterministic external test can assert producer state settled after the
     /// plugin was dropped.
     #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
     pub fn recovery_gate_for_test(&self) -> Arc<RecoveryGate> {
         self.core
             .rules
@@ -540,9 +525,6 @@ impl ProxyAlerts {
 
     /// In-flight dispatch count for this instance generation.
     #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
     pub fn dispatch_in_flight_for_test(&self) -> usize {
         self.core.dispatch_generation.in_flight()
     }
@@ -550,9 +532,6 @@ impl ProxyAlerts {
     /// Current recovery state of the rule's first channel for deterministic
     /// external delivery tests.
     #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
     pub fn recovery_state_for_test(
         &self,
         rule_id: u32,
@@ -569,7 +548,6 @@ impl ProxyAlerts {
     /// Current recovery state of `rule_id` on the channel configured as
     /// `channel_name` (per-channel lifecycle).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn recovery_state_for_channel_for_test(
         &self,
         rule_id: u32,
@@ -590,9 +568,6 @@ impl ProxyAlerts {
 
     /// Try to reserve one cooldown seat for deterministic external tests.
     #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn try_acquire_cooldown_for_test(
         &self,

@@ -3784,7 +3784,6 @@ impl http_body::Body for DirectH1RequestBody {
 ///
 /// Reached only through `crate::_test_support`, which the binary target does
 /// not compile, so it is dead code there.
-#[allow(dead_code)]
 pub(crate) fn poll_upload_cancel_once(
     cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> UploadCancelSignal {
@@ -5070,7 +5069,6 @@ impl<S: FrameSource> Coalescing<S> {
     ///
     /// Reached only through `crate::_test_support`, so the issue #5040
     /// laziness contract is asserted on the production adapter.
-    #[allow(dead_code)]
     pub(crate) fn buffer_state_name(&self) -> &'static str {
         self.buffer.state_name()
     }

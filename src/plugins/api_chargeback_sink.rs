@@ -372,7 +372,6 @@ fn invalidate_status_cache_in(cache: &ArcSwap<Option<(Instant, String)>>) -> boo
 /// `(empty_cell_store_skipped, populated_cell_cleared)`. A test-owned cell keeps
 /// the assertion exact while other tests render the process-global cache.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_status_cache_invalidation_for_tests() -> (bool, bool) {
     let cache: ArcSwap<Option<(Instant, String)>> = ArcSwap::from_pointee(None);
     let before = cache.load_full();
@@ -1480,14 +1479,12 @@ impl ChargeEventProjection {
 
     /// The compiled schema. Test-visible so parity assertions can inspect it.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn schema(&self) -> &SummarySchema {
         &self.schema
     }
 
     /// Worst-case extra bytes one projected row costs.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn row_overhead_bytes(&self) -> usize {
         self.row_overhead_bytes
     }
@@ -1496,7 +1493,6 @@ impl ChargeEventProjection {
 /// Resolve and compile a charge-event projection straight from a raw plugin
 /// config. Test-facing mirror of what the constructor does.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn compile_charge_event_projection(
     config: &Value,
 ) -> Result<Option<ChargeEventProjection>, String> {
@@ -2997,7 +2993,6 @@ impl ClickHouseHttpClient {
 }
 
 impl ApiChargebackSink {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(
         raw_config: &Value,
         http_client: PluginHttpClient,
@@ -3432,7 +3427,6 @@ impl ApiChargebackSink {
     /// process-global accepted-generation registry. Staging
     /// (`start_background_tasks`) must leave this false; only
     /// [`Plugin::commit_background_tasks`] publishes ownership.
-    #[allow(dead_code)] // lifecycle tests observe pre/post-commit publication
     pub fn owns_active_sink(&self) -> bool {
         let Some(runtime) = self.runtime.get() else {
             return false;
@@ -3444,25 +3438,19 @@ impl ApiChargebackSink {
     }
 
     /// Accepted observability generation for this instance, if activated.
-    #[allow(dead_code)] // multi-instance lifecycle tests assert exact-generation removal
     pub fn active_generation(&self) -> Option<u64> {
         self.runtime.get().map(|runtime| runtime.generation)
     }
 
     /// Stable plugin-config id used for observability identity.
-    #[allow(dead_code)] // multi-instance lifecycle tests assert exact-id removal
     pub fn plugin_config_id(&self) -> &str {
         &self.plugin_config_id
     }
 
-    // The library's hidden test-support module calls this accessor; the binary
-    // compiles this module separately and cannot observe that use.
-    #[allow(dead_code)]
     pub(crate) fn snapshot_accumulator_for_tests(&self) -> Option<Arc<SnapshotAccumulator>> {
         self.snapshot_accumulator.get().cloned()
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn finalize_snapshot_for_tests(&self) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         Some(
@@ -3472,7 +3460,6 @@ impl ApiChargebackSink {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn finalize_snapshot_with_held_admission_for_tests(
         &self,
         timeout: Duration,
@@ -3482,14 +3469,12 @@ impl ApiChargebackSink {
         Some(lifecycle.finalize_attempt(Instant::now() + timeout).await)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn snapshot_finalized_for_tests(&self) -> Option<bool> {
         self.snapshot_lifecycle
             .get()
             .map(|lifecycle| lifecycle.finalized.load(Ordering::Acquire))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn snapshot_generation_registered_for_tests(&self) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         let generations = match active_snapshot_finalizations().lock() {
@@ -3506,7 +3491,6 @@ impl ApiChargebackSink {
     }
 
     /// Force Full→Compact transfer for adversarial recovery tests.
-    #[allow(dead_code)]
     pub(crate) fn force_compact_snapshot_finalization_for_tests(&self) -> bool {
         let Some(lifecycle) = self.snapshot_lifecycle.get() else {
             return false;
@@ -3517,13 +3501,11 @@ impl ApiChargebackSink {
     }
 
     /// True when this generation is retained as compact durable recovery.
-    #[allow(dead_code)]
     pub(crate) fn snapshot_compact_recovery_registered_for_tests(&self) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         Some(compact_recovery_for_generation(lifecycle.generation).is_some())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn emit_snapshot_tick_for_tests(&self) -> Option<Result<usize, String>> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         Some(emit_periodic_snapshot(
@@ -3537,7 +3519,6 @@ impl ApiChargebackSink {
 
     /// Drive one snapshot cardinality overflow charge through the non-blocking
     /// delivery path for tests. Returns false when no snapshot lifecycle exists.
-    #[allow(dead_code)]
     pub(crate) fn spool_snapshot_overflow_for_tests(&self, event: ChargeEvent) -> bool {
         let Some(lifecycle) = self.snapshot_lifecycle.get() else {
             return false;
@@ -3548,7 +3529,6 @@ impl ApiChargebackSink {
 
     /// Abort the owned spool-delivery worker so tests can prove queued snapshot
     /// overflow ownership re-stages on teardown before durable processing.
-    #[allow(dead_code)]
     pub(crate) fn abort_spool_delivery_for_tests(&self) -> bool {
         let Some(runtime) = self.runtime.get() else {
             return false;
@@ -3562,7 +3542,6 @@ impl ApiChargebackSink {
 
     /// Snapshot overflow counters `(spooled, pending, cardinality_rejections)`
     /// for the live generation; lets tests poll async durable-handoff outcomes.
-    #[allow(dead_code)]
     pub(crate) fn snapshot_overflow_counters_for_tests(&self) -> Option<(u64, u64, u64)> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         let metrics = &lifecycle.runtime.metrics;
@@ -3582,7 +3561,6 @@ impl ApiChargebackSink {
     /// Prove compaction refuses while an admission guard is held and succeeds
     /// after the admitted hook drains. Returns
     /// `(refused_while_admitted, compacted_after_drain)`.
-    #[allow(dead_code)]
     pub(crate) fn compact_refuses_while_admitted_then_succeeds_for_tests(
         &self,
     ) -> Option<(bool, bool)> {
@@ -3604,7 +3582,6 @@ impl ApiChargebackSink {
     /// Prove Full→Compact refuses while an async overflow delivery can still
     /// stage back into the accumulator, then succeeds after delivery ownership
     /// drains.
-    #[allow(dead_code)]
     pub(crate) fn compact_refuses_while_overflow_delivery_then_succeeds_for_tests(
         &self,
     ) -> Option<(bool, bool)> {
@@ -3628,7 +3605,6 @@ impl ApiChargebackSink {
     /// after the attempt. A correct refusal reports
     /// `(false, <what was staged>, true)`: the generation kept the staged
     /// overflow it borrowed and kept its retry mechanism.
-    #[allow(dead_code)]
     pub(crate) fn compact_projection_shortfall_for_tests(&self) -> Option<(bool, usize, bool)> {
         let lifecycle = self.snapshot_lifecycle.get()?;
         lifecycle.commit();
@@ -3660,7 +3636,6 @@ impl ApiChargebackSink {
     /// correct observation is `(true, true)`. One mutex guards both directions,
     /// so this equally proves an emission cannot enter compaction's
     /// prepare→publish interval.
-    #[allow(dead_code)]
     pub(crate) fn compact_excluded_by_emission_lock_for_tests(
         &self,
         hold: Duration,
@@ -3999,7 +3974,6 @@ pub fn render_prometheus() -> String {
 /// on-disk inventory. Status/Prometheus scrapes never call this; external tests
 /// use it after planting files outside the writer path.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn reconcile_active_spool_usage_for_tests() {
     for runtime in active_sinks().load_full().values() {
         if let Some(spool) = runtime.spool.as_ref() {
@@ -4013,7 +3987,6 @@ pub fn reconcile_active_spool_usage_for_tests() {
 /// External tests use this to prove status/Prometheus rendering itself does not
 /// perform the walk.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn active_spool_inventory_walks_for_tests() -> u64 {
     active_sinks()
         .load_full()
@@ -5358,7 +5331,6 @@ fn replay_split_len(len: usize, batch_size: usize) -> usize {
 /// retained-byte reservation, which is exactly the uncharged materialization
 /// [`materialize_json_each_row`] exists to prevent. External unit tests use it
 /// to build expected wire bytes.
-#[allow(dead_code)]
 pub fn serialize_json_each_row(batch: &[ChargeEvent]) -> Result<String, String> {
     serialize_json_each_row_projected(batch, None)
 }
@@ -5368,7 +5340,6 @@ pub fn serialize_json_each_row(batch: &[ChargeEvent]) -> Result<String, String> 
 /// External unit tests use this to assert that a projected wire representation
 /// matches the operator's schema while the native shape is unchanged.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn serialize_json_each_row_projected(
     batch: &[ChargeEvent],
     projection: Option<&ChargeEventProjection>,
@@ -6361,7 +6332,6 @@ fn spool_owner_digest(fields: &[&str]) -> String {
 /// [`SpoolManager::for_tests_with_owner_and_faults`]; the binary crate never
 /// builds them, so clippy's dead-code lint is expected there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SpoolFsFault {
     None,
     FileSync,
@@ -6528,7 +6498,6 @@ fn republish_final_path_as_peer(final_path: &Path) {
 /// Contents written by [`republish_final_path_as_peer`]; asserted by tests that
 /// check a peer publication survived another writer's rollback.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub const PEER_REPUBLISH_MARKER: &[u8] = b"{\"peer_republished\":true}\n";
 
 #[allow(dead_code)] // reachable only through the test-only faulted constructors
@@ -6715,7 +6684,6 @@ fn spool_claim_lease_secs(config: &ApiChargebackSinkConfig) -> u64 {
 }
 
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn spool_claim_lease_secs_for_tests(config: &ApiChargebackSinkConfig) -> u64 {
     spool_claim_lease_secs(config)
 }
@@ -7058,7 +7026,6 @@ fn claim_stage_error(stage: &'static str, error: ClaimMutationError) -> ClaimMut
 /// is what keeps an authorization loss out of the release path.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // external unit tests only
 pub enum ClaimMutationOutcomeForTests {
     Unauthorized(String),
     Retryable(String),
@@ -7160,7 +7127,6 @@ fn dir_identity(_meta: &fs::Metadata) -> Option<DirIdentity> {
 /// Mirrors the fields production derives from the accepted plugin config so
 /// external tests can build sibling instances without a live ClickHouse.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // constructed only by the test-only entry points below
 pub struct SpoolOwnerSpec<'a> {
     pub node_id: &'a str,
     pub plugin_config_id: &'a str,
@@ -7699,14 +7665,12 @@ impl SpoolManager {
         Ok(())
     }
 
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests(cfg: SpoolSettings, node_id: &str) -> Result<Self, String> {
         Self::for_tests_with_owner(cfg, &default_test_spool_owner_spec(node_id), 1)
     }
 
     /// [`Self::for_tests`] bound to a test-owned retained-byte ceiling.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_ceiling(
         cfg: SpoolSettings,
         node_id: &str,
@@ -7724,7 +7688,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_owner(
         cfg: SpoolSettings,
         spec: &SpoolOwnerSpec<'_>,
@@ -7734,7 +7697,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_owner_and_faults(
         cfg: SpoolSettings,
         spec: &SpoolOwnerSpec<'_>,
@@ -7757,7 +7719,6 @@ impl SpoolManager {
     /// stale-temp and claim-lease horizons, so age-gated stranded-claim
     /// reporting is exercised without wall-clock sleeps.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn for_tests_with_owner_faults_and_ages(
         cfg: SpoolSettings,
         spec: &SpoolOwnerSpec<'_>,
@@ -7817,7 +7778,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn namespace_root_for_tests(&self) -> &Path {
         &self.namespace_root
     }
@@ -7827,31 +7787,26 @@ impl SpoolManager {
     /// External tests use it to plant a crashed holder's stale record and to
     /// assert that restart reconciliation clears it.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn source_credit_record_path_for_tests(&self) -> PathBuf {
         self.source_credit_path()
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn owner_tag_for_tests(&self) -> &str {
         self.owner.tag.as_ref()
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn generation_for_tests(&self) -> u64 {
         self.generation
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn prepare_live_storage_for_tests(&self) -> Result<(), String> {
         self.prepare_live_storage()
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn namespace_root_path_for_tests(
         spool_dir: &Path,
         spec: &SpoolOwnerSpec<'_>,
@@ -7860,13 +7815,11 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn owner_tag_of_spec_for_tests(spec: &SpoolOwnerSpec<'_>) -> String {
         spec.to_owner().tag.to_string()
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn encode_spool_path_component_for_tests(raw: &str) -> Result<String, String> {
         encode_spool_path_component(raw, "n")
     }
@@ -7874,7 +7827,6 @@ impl SpoolManager {
     /// Exercise the lexical containment guard that every managed create,
     /// rename, and unlink runs before touching the filesystem.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn ensure_path_within_root_for_tests(root: &Path, candidate: &Path) -> Result<(), String> {
         ensure_path_within_root(root, candidate)
     }
@@ -7882,7 +7834,6 @@ impl SpoolManager {
     /// Renew a held claim onto an explicit lease deadline so the rename half of
     /// the claim protocol is covered deterministically.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn renew_claim_at_for_tests(
         &self,
         claim: &mut SpoolClaimHandle,
@@ -7901,7 +7852,6 @@ impl SpoolManager {
     /// deterministically that an authorization loss stays
     /// [`ClaimMutationOutcomeForTests::Unauthorized`] and mutates nothing.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn probe_renew_claim_at_for_tests(
         &self,
         claim: &mut SpoolClaimHandle,
@@ -7917,7 +7867,6 @@ impl SpoolManager {
     /// Claim one replay candidate, returning `None` when another owner,
     /// generation, or process won the atomic rename first.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn claim_replay_file_for_tests(&self, path: &Path) -> Result<Option<PathBuf>, String> {
         let _guard = self.lock_spool_mutation()?;
         Ok(self
@@ -7929,7 +7878,6 @@ impl SpoolManager {
     /// Claim one replay candidate and keep the live-path lease held for the
     /// caller so tests can model an in-flight delivery across other operations.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn hold_replay_claim_for_tests(
         &self,
         path: &Path,
@@ -7939,7 +7887,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn release_inflight_claim_for_tests(
         &self,
         claim: &SpoolClaimHandle,
@@ -7951,13 +7898,11 @@ impl SpoolManager {
 
     /// Exercise the pure claim-marker parser without authorizing a rename.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn claim_restore_path_for_tests(claim: &Path) -> Result<PathBuf, String> {
         spool_claim_restore_path(claim)
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn list_owned_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
         self.list_owned_spool_files()
     }
@@ -7968,21 +7913,18 @@ impl SpoolManager {
     /// to prove status/Prometheus scrapes read maintained counters rather than
     /// performing the walk themselves.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn reconcile_cached_usage_for_tests(&self) -> Result<SpoolStats, String> {
         self.reconcile_cached_usage()
     }
 
     /// Lock-light view of the maintained owned-file/byte gauges.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn cached_stats_for_tests(&self) -> SpoolStats {
         self.cached_stats()
     }
 
     /// How many owned-spool inventory walks this manager has performed.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn inventory_walks_for_tests(&self) -> u64 {
         self.usage.inventory_walks.load(Ordering::Relaxed)
     }
@@ -7992,7 +7934,6 @@ impl SpoolManager {
     /// External tests use this to assert multi-file reclaim is driven by one
     /// inventory/sort pass rather than a per-deletion rescan.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn evict_until_can_admit_for_tests(
         &self,
         incoming_len: u64,
@@ -8002,7 +7943,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn list_owned_spool_files_with_entry_limit_for_tests(
         &self,
         max_entries: usize,
@@ -8015,7 +7955,6 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn list_replayable_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
         self.list_replayable_spool_files()
     }
@@ -8023,20 +7962,17 @@ impl SpoolManager {
     /// Register one managed path as live for this process, as an in-progress
     /// write or delivery would.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn hold_live_spool_path_for_tests(path: &Path) -> LiveSpoolPathGuard {
         LiveSpoolPathGuard::new(path.to_path_buf())
     }
 
     /// Build the generation-owned temp name `write_events` would use.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn write_temp_path_for_tests(&self, final_path: &Path) -> Result<PathBuf, String> {
         spool_write_temp_path(final_path, self.generation)
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn unbound_record_counts_for_tests(&self) -> (u64, u64) {
         (
             self.metrics.spool_unbound_files.load(Ordering::Relaxed),
@@ -8050,7 +7986,6 @@ impl SpoolManager {
     /// entry budget. External tests use this to prove sibling namespaces share
     /// one bound rather than each receiving a fresh traversal allowance.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn scan_unbound_records_with_entry_limit_for_tests(
         &self,
         max_entries: usize,
@@ -8230,7 +8165,6 @@ impl SpoolManager {
     /// ceiling_used_after_drop)`. Read `RetainedByteCeiling::high_water` around
     /// the call to observe the coexisting JSON + compressed peak.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn probe_spool_artifact_materialization_for_tests(
         &self,
         events: &[ChargeEvent],
@@ -8551,7 +8485,6 @@ impl SpoolManager {
 
     /// Full owned-spool inventory for external tests that need on-disk truth.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn scan_stats_for_tests(&self) -> Result<SpoolStats, String> {
         Ok(self.inventory_owned_spool_files()?.stats)
     }
@@ -9501,7 +9434,6 @@ impl ReplayClaimOutcome {
     /// Collapse to the simple claimed/contended shape used by the test seams,
     /// where an unpinnable candidate is reported as an ordinary refusal instead
     /// of being isolated by the replay loop.
-    #[allow(dead_code)] // external unit tests only
     fn into_claimed(self) -> Result<Option<SpoolClaimHandle>, String> {
         match self {
             Self::Claimed(claim) => Ok(Some(claim)),
@@ -9541,7 +9473,6 @@ impl SpoolClaimHandle {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn claim_path_for_tests(&self) -> &Path {
         &self.path
     }
@@ -9551,7 +9482,6 @@ impl SpoolClaimHandle {
     /// External tests use this to prove exclusivity directly: across N managers
     /// and N claims of one namespace, exactly one claim can hold it.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn holds_source_credit_for_tests(&self) -> bool {
         self.credit.is_some()
     }
@@ -9559,7 +9489,6 @@ impl SpoolClaimHandle {
     /// Reserved byte count of the held credit, or `0` when this claim holds
     /// none.
     #[doc(hidden)]
-    #[allow(dead_code)] // external unit tests only
     pub fn source_credit_bytes_for_tests(&self) -> u64 {
         match self.credit.as_ref() {
             Some(reservation) => reservation.reserved_bytes,
@@ -9569,7 +9498,6 @@ impl SpoolClaimHandle {
 }
 
 /// Default owner identity used by the simple test constructor.
-#[allow(dead_code)] // external unit tests only
 fn default_test_spool_owner_spec(node_id: &str) -> SpoolOwnerSpec<'_> {
     SpoolOwnerSpec {
         node_id,
@@ -11115,7 +11043,6 @@ fn spool_regular_file_len(path: &Path) -> Option<u64> {
 /// path, so the frame carries the decompressed size — but without the ceiling
 /// reservation that makes the production path safe. Tests use it to predict
 /// on-disk sizes; production must never call it.
-#[allow(dead_code)] // external unit tests only
 fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec<u8>, String> {
     match compression {
         SpoolCompression::Zstd => {
@@ -11138,7 +11065,6 @@ fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec
 /// External tests use this to model a planted frame whose truthful declared
 /// size would exceed the replay ratio. Production must never call it.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn encode_spool_bytes_without_ratio_padding_for_tests(bytes: &[u8]) -> Result<Vec<u8>, String> {
     zstd::bulk::compress(bytes, 0)
         .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}"))
@@ -11150,7 +11076,6 @@ pub fn encode_spool_bytes_without_ratio_padding_for_tests(bytes: &[u8]) -> Resul
 /// This is the legacy / foreign-archive shape replay must still accept by
 /// falling back to the ratio clamp; no production path produces it.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn encode_spool_bytes_without_content_size_for_tests(
     bytes: &[u8],
     compression: SpoolCompression,
@@ -11253,7 +11178,6 @@ fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
 /// against other chargeback-sink tests that publish ACTIVE_SINKS, and ignore
 /// every point whose namespace root is not their own spool.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
     if let Ok(mut slot) = spool_write_hook_slot().lock() {
         *slot = hook;
@@ -11295,7 +11219,6 @@ fn spool_walk_hook_slot() -> &'static Mutex<Option<SpoolWalkHookForTests>> {
 /// Tests must clear the hook before finishing (including panic paths) and
 /// ignore every invocation whose entry path is outside their own spool root.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn set_spool_walk_hook_for_tests(hook: Option<SpoolWalkHookForTests>) {
     if let Ok(mut slot) = spool_walk_hook_slot().lock() {
         *slot = hook;
@@ -11321,7 +11244,6 @@ fn spool_replay_hook_slot() -> &'static Mutex<Option<SpoolReplayHookForTests>> {
 /// Tests must clear the hook before finishing (including panic paths) and
 /// ignore every invocation whose claimed path is outside their own spool root.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn set_spool_replay_hook_for_tests(hook: Option<SpoolReplayHookForTests>) {
     if let Ok(mut slot) = spool_replay_hook_slot().lock() {
         *slot = hook;
@@ -11369,7 +11291,6 @@ impl Drop for SpoolWriteHookAfterGuard {
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn encode_spool_bytes_for_tests(
     bytes: &[u8],
     compression: SpoolCompression,
@@ -12591,7 +12512,6 @@ fn decode_zstd_bounded(reader: impl Read, limit: usize, path: &Path) -> Result<V
 /// Decode-only helper for external unit tests. The returned `String` outlives
 /// its ceiling reservation, which is exactly why production never uses this
 /// shape: [`decode_spool_artifact`] keeps the charge for the buffer's life.
-#[allow(dead_code)]
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
     decode_spool_artifact(path, process_ceiling())
         .map(ReservedSpoolArtifact::into_text)
@@ -12599,14 +12519,12 @@ pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_artifact_byte_limit_for_tests() -> u64 {
     SPOOL_MAX_ARTIFACT_BYTES
 }
 
 /// Reserved capacity of the 413 split worklist.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_split_worklist_max_entries_for_tests() -> usize {
     SPOOL_SPLIT_WORKLIST_MAX_ENTRIES
 }
@@ -12614,7 +12532,6 @@ pub fn spool_split_worklist_max_entries_for_tests() -> usize {
 /// `(row_bytes, rows_per_artifact, batch_bytes, isolation_attempts)` hard
 /// streaming replay limits for deterministic external regression tests.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_streaming_limits_for_tests() -> (usize, usize, usize, usize) {
     (
         SPOOL_MAX_ROW_BYTES,
@@ -12630,7 +12547,6 @@ pub fn spool_streaming_limits_for_tests() -> (usize, usize, usize, usize) {
 /// the streaming decoder is constructed. The trailing bytes are intentionally
 /// not a complete frame body — header inspection happens first.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn encode_zstd_declaring_content_size_for_tests(declared_size: u64) -> Vec<u8> {
     // Magic (little-endian 0xFD2FB528) + Frame_Header_Descriptor with
     // FCS_Size=3 (8-byte content size) and Single_Segment=1 (no Window_Descriptor).
@@ -12643,7 +12559,6 @@ pub fn encode_zstd_declaring_content_size_for_tests(declared_size: u64) -> Vec<u
 /// tests. Returns the six defensive refusal diagnostics exercised by the
 /// extracted helpers that guard batch assembly and row decoding.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_streaming_spool_reader_defensive_paths_for_tests(
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<[String; 6], String> {
@@ -12693,7 +12608,6 @@ pub fn probe_streaming_spool_reader_defensive_paths_for_tests(
 /// Returns the three refusal diagnostics for an empty range, an out-of-range
 /// start, and an inverted retained byte range.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_streaming_replay_batch_range_errors_for_tests(
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<[String; 3], String> {
@@ -12752,7 +12666,6 @@ pub fn probe_streaming_replay_batch_range_errors_for_tests(
 /// fail-closed diagnostic. External tests use this to prove the two-pass reader
 /// cannot deliver a different same-shape artifact through a path swap.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_streaming_replay_path_swap_for_tests(
     path: &Path,
     replacement: &Path,
@@ -12782,7 +12695,6 @@ pub fn probe_streaming_replay_path_swap_for_tests(
 /// External tests only: proves the empty-publish refusal keeps the authoritative
 /// source claim intact rather than inventing an empty rejected artifact.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_empty_dead_letter_publish_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12797,7 +12709,6 @@ pub fn probe_empty_dead_letter_publish_for_tests(
 /// the empty payload, so whatever survives this call is exactly what `open`'s
 /// authorization decided.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_empty_dead_letter_publish_with_identity_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12827,7 +12738,6 @@ pub struct PinnedClaimIdentityForTests(PinnedClaimArtifact);
 /// A pathname that is missing or not a regular file yields the unpinned state,
 /// which authorizes no destructive step at all.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn pin_dead_letter_claim_identity_for_tests(path: &Path) -> PinnedClaimIdentityForTests {
     PinnedClaimIdentityForTests(PinnedClaimArtifact::pin_path(path))
 }
@@ -12836,7 +12746,6 @@ pub fn pin_dead_letter_claim_identity_for_tests(path: &Path) -> PinnedClaimIdent
 /// append/admission protocol. External concurrency tests use this to isolate
 /// the filesystem transaction from HTTP failure classification.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12856,7 +12765,6 @@ pub fn publish_dead_letter_payload_for_tests(
 /// use it to prove that two managers sharing one namespace cannot both spend
 /// source-replacement capacity.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_for_claim_for_tests(
     spool: &SpoolManager,
     claim: &SpoolClaimHandle,
@@ -12886,7 +12794,6 @@ pub fn publish_dead_letter_payload_for_claim_for_tests(
 /// regression that collapses capacity checks into authorization alone cannot
 /// hide behind an earlier Unauthorized return.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_dead_letter_source_credit_bytes_for_tests(
     spool: &SpoolManager,
     claim_path: &Path,
@@ -12903,7 +12810,6 @@ pub fn probe_dead_letter_source_credit_bytes_for_tests(
 /// publish. Both explicit cleanup and the final replacing rename must refuse the
 /// substitute before the optional prior payload is planted.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_with_identity_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12924,7 +12830,6 @@ pub fn publish_dead_letter_payload_with_identity_for_tests(
 /// Returns the published path and the usage snapshot taken after the prior was
 /// planted and accounted, immediately before publish replaces it.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn publish_dead_letter_payload_replacing_prior_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -12984,7 +12889,6 @@ fn single_row_replay_batch_for_tests(
 /// finalization boundary.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // external unit tests only
 pub enum DeadLetterHandoffStageForTests {
     /// After the writer opened its temp, before the first row is admitted or
     /// appended.
@@ -13000,7 +12904,6 @@ pub enum DeadLetterHandoffStageForTests {
 /// the initial claim rename, so the probe carries the same authorization
 /// capability production does.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_dead_letter_handoff_interference_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -13068,7 +12971,6 @@ fn publish_dead_letter_payload_inner_for_tests(
 /// Callers pass the payload bytes they already published so this probe does not
 /// re-stat or re-read the on-disk file solely to rebuild the metadata record.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn write_dead_letter_meta_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -13093,7 +12995,6 @@ pub fn write_dead_letter_meta_for_tests(
 /// substitution model: a claim pathname holding a different regular file must
 /// not authorize unlinking a completed `.rejected.meta` sibling.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn write_dead_letter_meta_with_identity_for_tests(
     spool: &SpoolManager,
     source_path: &Path,
@@ -13139,7 +13040,6 @@ pub fn write_dead_letter_meta_with_identity_for_tests(
 
 /// Bytes one spool line-index / worklist entry occupies.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_index_entry_bytes_for_tests() -> usize {
     SPOOL_INDEX_ENTRY_BYTES
 }
@@ -13155,7 +13055,6 @@ pub fn spool_index_entry_bytes_for_tests() -> usize {
 /// the pending set, a failed retry restores every pending delta, and the
 /// reservation is released exactly once when the recovery is dropped.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn probe_compact_recovery_retry_for_tests(
     ceiling: &'static RetainedByteCeiling,
     events: Vec<ChargeEvent>,
@@ -13207,7 +13106,6 @@ pub fn probe_compact_recovery_retry_for_tests(
 /// injects the process ceiling.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct SharedSpoolBatchCloneProbe {
     pub clone_bytes: usize,
     pub ceiling_used_baseline: usize,
@@ -13228,7 +13126,6 @@ pub struct SharedSpoolBatchCloneProbe {
 /// into the real delivery worker, allowing external tests to exercise both
 /// admission and refusal without perturbing the process-global ceiling.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn probe_shared_spool_batch_clone_for_tests(
     spool: Arc<SpoolManager>,
     events: Vec<ChargeEvent>,
@@ -13368,7 +13265,6 @@ impl CompactRecoveryProbe {
 /// Build a compact recovery backed by a real spool for deterministic external
 /// concurrency tests.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn compact_recovery_probe_for_tests(
     ceiling: &'static RetainedByteCeiling,
     events: Vec<ChargeEvent>,
@@ -13401,13 +13297,11 @@ pub fn compact_recovery_probe_for_tests(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn spool_decompression_limit_for_tests(encoded_len: u64) -> u64 {
     spool_decompression_limit(encoded_len)
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn replay_spool_once_for_tests(
     spool: &SpoolManager,
     insert_url: &str,
@@ -13416,7 +13310,6 @@ pub async fn replay_spool_once_for_tests(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn replay_spool_once_with_batch_size_for_tests(
     spool: &SpoolManager,
     insert_url: &str,
@@ -13429,7 +13322,6 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
 /// refusal assertions stay exact while other tests in the same binary reserve
 /// against the process-global counter.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn replay_spool_once_with_ceiling_for_tests(
     spool: &SpoolManager,
     insert_url: &str,
@@ -13455,7 +13347,6 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
 /// Returns `(reserved_bound, ceiling_used_while_body_held, ceiling_used_after_drop)`,
 /// or `Err` when the ceiling refused the body before it was serialized.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn probe_charge_body_materialization_for_tests(
     ceiling: &'static RetainedByteCeiling,
     batch: &[ChargeEvent],
@@ -13467,7 +13358,6 @@ pub fn probe_charge_body_materialization_for_tests(
 /// so a schema's reservation bound can be asserted to still precede — and cover
 /// — the projected serialization.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn probe_charge_body_materialization_with_projection_for_tests(
     ceiling: &'static RetainedByteCeiling,
     batch: &[ChargeEvent],
@@ -13494,7 +13384,6 @@ pub fn probe_charge_body_materialization_with_projection_for_tests(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
     // Status-only helper for non-success paths. HTTP 200/204 durable success
     // additionally requires a complete empty acknowledgement body with no
@@ -13516,7 +13405,6 @@ pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
 /// `X-ClickHouse-Exception-Code` never appear in returned labels or messages
 /// beyond bounded reason classes.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn classify_clickhouse_acknowledgement_for_tests(
     status: u16,
     body: Option<&[u8]>,
@@ -13533,7 +13421,6 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
 /// `X-ClickHouse-Exception-Code` header value (`None` = header absent), so the
 /// transient/permanent exception-code split is covered for both carriers.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn classify_clickhouse_acknowledgement_with_header_for_tests(
     status: u16,
     body: Option<&[u8]>,
@@ -13575,7 +13462,6 @@ pub fn classify_clickhouse_acknowledgement_with_header_for_tests(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn clickhouse_insert_url_for_tests(config: &ApiChargebackSinkConfig) -> Result<String, String> {
     let base = Url::parse(&config.clickhouse.url)
         .map_err(|err| format!("invalid ClickHouse URL: {err}"))?;
@@ -13583,7 +13469,6 @@ pub fn clickhouse_insert_url_for_tests(config: &ApiChargebackSinkConfig) -> Resu
 }
 
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn write_private_file_atomically_for_tests(
     tmp_path: &Path,
     final_path: &Path,
@@ -13596,7 +13481,6 @@ pub fn write_private_file_atomically_for_tests(
 
 /// Exercise the durable-write contract with one step forced to fail.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn write_private_file_atomically_with_fault_for_tests(
     tmp_path: &Path,
     final_path: &Path,
@@ -15122,9 +15006,6 @@ impl SnapshotAccumulator {
         self.overflow_deliveries_in_flight.load(Ordering::Acquire)
     }
 
-    // External adversarial tests assert the hard byte ceiling is never crossed;
-    // the binary target compiles this module separately and cannot observe them.
-    #[allow(dead_code)]
     pub fn retained_bytes_for_tests(&self) -> usize {
         self.retained_bytes()
     }
@@ -15132,14 +15013,12 @@ impl SnapshotAccumulator {
     /// Bytes this accumulator currently charges to the process-wide ceiling.
     /// External tests assert it tracks the per-instance counter exactly, so N
     /// instances cannot multiply past the shared ceiling.
-    #[allow(dead_code)]
     pub fn process_retained_bytes_for_tests(&self) -> usize {
         self.process_retained.held()
     }
 
     /// Release every process-wide charge as `Drop` would, without consuming the
     /// accumulator. External tests use it to assert exact release.
-    #[allow(dead_code)]
     pub fn clear_for_compaction_for_tests(&self) {
         self.clear_for_compaction();
     }
@@ -15392,7 +15271,6 @@ impl SnapshotAccumulator {
         true
     }
 
-    #[allow(dead_code)]
     pub fn stage_overflow_event_for_tests(&self, event: ChargeEvent) -> bool {
         self.stage_overflow_event(event)
     }
@@ -15404,7 +15282,6 @@ impl SnapshotAccumulator {
     /// Tests set `ceiling.max()` to the staged charge before calling this. A
     /// correct take keeps the ceiling saturated, so the competing byte is
     /// refused and restoration cannot need a second admission.
-    #[allow(dead_code)]
     pub fn probe_taken_overflow_ownership_for_tests(
         &self,
         ceiling: &'static RetainedByteCeiling,
@@ -15500,9 +15377,6 @@ impl SnapshotAccumulator {
             .checked_add(identities.checked_mul(per_event_extra)?)
     }
 
-    // External integration tests exercise the public accumulator contract;
-    // the separately compiled binary cannot observe those call sites.
-    #[allow(dead_code)]
     pub fn compute_deltas(
         &self,
         config: &ApiChargebackSinkConfig,
@@ -15560,7 +15434,6 @@ impl SnapshotAccumulator {
     // Only the external `compute_deltas` test contract still commits a whole
     // `PreparedSnapshot`; production moves the projection apart and commits the
     // emitted totals directly.
-    #[allow(dead_code)]
     fn commit_prepared(&self, prepared: &PreparedSnapshot) {
         self.commit_emitted_totals(&prepared.emitted_totals);
     }
@@ -15603,7 +15476,6 @@ impl SnapshotAccumulator {
         }
     }
 
-    #[allow(dead_code)]
     pub fn cleanup_stale_for_tests(&self, stale_entry_ttl_secs: u64) -> usize {
         self.cleanup_stale(unix_timestamp_seconds(), stale_entry_ttl_secs)
     }
@@ -15671,7 +15543,6 @@ impl SnapshotAccumulator {
         removed
     }
 
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_for_test(
         &self,
@@ -15704,7 +15575,6 @@ impl SnapshotAccumulator {
     /// Record a charge and report whether it was accumulated (`true`) or spilled
     /// to durable overflow (`false`). Adversarial concurrency tests tally the
     /// two outcomes to prove no charge is double-counted or silently dropped.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_accumulated_for_test(
         &self,
@@ -15739,7 +15609,6 @@ impl SnapshotAccumulator {
 
     /// Sum of accumulated `call_count` across every live identity. Equals the
     /// number of accumulated records in a test that seeds one call per record.
-    #[allow(dead_code)]
     pub fn total_call_count_for_tests(&self) -> u64 {
         self.entries
             .iter()
@@ -15748,7 +15617,6 @@ impl SnapshotAccumulator {
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn record_http_for_test(
         &self,
         summary: &TransactionSummary,
@@ -16713,7 +16581,6 @@ fn snapshot_metadata_retained_bytes(meta: &SnapshotMetadata) -> usize {
 /// budget tests: `(charged, field_bytes)` for an identity built from the given
 /// string fields.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn snapshot_identity_retained_bytes_for_tests(
     namespace: &str,
     consumer: &str,

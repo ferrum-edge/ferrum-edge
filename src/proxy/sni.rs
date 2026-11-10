@@ -1682,7 +1682,6 @@ fn u24_to_usize(data: &[u8]) -> usize {
 /// Every listener path resolves through
 /// [`resolve_proxy_by_sni_in_epoch`], which takes namespace-qualified
 /// candidates.
-#[allow(dead_code)] // Public test/library helper; runtime uses the RequestEpoch-indexed variant.
 pub fn resolve_proxy_by_sni<'a>(
     sni: Option<&str>,
     proxy_ids: &'a [String],

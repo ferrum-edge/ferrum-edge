@@ -409,7 +409,6 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
     }
 
     /// Whether [`Self::commit`] has already released this worker.
-    #[allow(dead_code)] // External lifecycle tests observe pre/post-publication state.
     pub fn is_committed(&self) -> bool {
         self.committed.load(Ordering::Acquire)
     }
@@ -467,7 +466,6 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
     /// Non-blocking send. Compatibility wrapper: `true` only when the item was
     /// admitted to the bounded channel. Prefer [`Self::try_send_outcome`] when
     /// diversion, full-buffer drops, and shutdown must be distinguished.
-    #[allow(dead_code)] // Retained compatibility API exercised by the external unit-test crate.
     pub fn try_send(&self, item: T) -> bool {
         self.try_send_outcome(item).as_bool()
     }
@@ -698,12 +696,10 @@ impl<T: Send + Sync + 'static> DeferredBatchingLogger<T> {
         }
     }
 
-    #[allow(dead_code)] // External lifecycle tests observe staged activation.
     pub fn is_started(&self) -> bool {
         self.logger.get().is_some()
     }
 
-    #[allow(dead_code)] // Test/support consumers inspect the staged logger directly.
     pub fn get(&self) -> Option<&BatchingLogger<T>> {
         self.logger.get()
     }
@@ -770,7 +766,6 @@ impl<T: Send + Sync + 'static> DeferredBatchingLogger<T> {
     }
 
     /// Whether the staged logger has been released by [`Self::commit`].
-    #[allow(dead_code)] // External lifecycle tests observe pre/post-publication state.
     pub fn is_committed(&self) -> bool {
         self.logger.get().is_some_and(BatchingLogger::is_committed)
     }

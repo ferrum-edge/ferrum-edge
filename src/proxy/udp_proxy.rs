@@ -5890,7 +5890,6 @@ pub(crate) fn fail_dtls_listener_on_recv_loop_exit(
 /// [`start_dtls_frontend_listener`]. This seam lets external tests drive
 /// panic/error/shutdown classification with synthetic tasks without a
 /// production panic or socket fault injector.
-#[allow(dead_code)] // Intentionally exposed via library `_test_support`; unused by the binary target.
 pub(crate) async fn supervise_dtls_recv_loop_task(
     mut server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -10530,7 +10529,7 @@ fn mono_millis_precise() -> u64 {
 /// (`forward_client_datagram_to_backend`, `enqueue_session_hook_datagram`,
 /// `spawn_session_hook_ingress_worker`) rather than a restatement of them. It
 /// exists so the coverage under `tests/` can be external instead of inline.
-#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+#[allow(dead_code)] // Library test seam
 pub struct UdpAuthorizationSessionProbe {
     session: Arc<UdpSession>,
     metrics: Arc<UdpProxyMetrics>,
@@ -10873,7 +10872,6 @@ impl UdpAuthorizationSessionProbe {
 
 /// The verdict [`UdpEgressWriterProbe`] observed for one client→backend
 /// datagram, mirroring the private [`UdpEgressAdmission`].
-#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UdpEgressAdmissionForTest {
     /// Written straight from the borrowed receive buffer.
@@ -10891,7 +10889,7 @@ pub enum UdpEgressAdmissionForTest {
 /// Parking is a flag plus a `Notify`, never a sleep, so "the healthy session
 /// progressed while the other was blocked" is a scheduling fact the test
 /// decides rather than a timing race.
-#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+#[allow(dead_code)] // Library test seam
 struct UdpEgressSendGate {
     /// Payloads the writer actually committed, in the order it sent them.
     committed: std::sync::Mutex<Vec<Vec<u8>>>,
@@ -10948,7 +10946,7 @@ impl UdpEgressSendGate {
 /// writer ([`spawn_session_egress_writer`]) — never a restatement of them. Only
 /// the backend send itself is injectable, so a parked send stands in for a
 /// socket waiting on writability or a DTLS driver round trip without a sleep.
-#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+#[allow(dead_code)] // Library test seam
 pub struct UdpEgressWriterProbe {
     session: Arc<UdpSession>,
     metrics: Arc<UdpProxyMetrics>,

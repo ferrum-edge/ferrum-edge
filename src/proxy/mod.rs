@@ -72,7 +72,7 @@ pub mod hbone_inner_pool;
 pub mod hbone_pool;
 mod hbone_proxy;
 #[allow(unused_imports)]
-// Used by external tests; unused in the separately compiled bin target.
+// Re-exported for `_test_support`.
 pub(crate) use hbone_proxy::settle_hbone_backend_connect_circuit_breaker_outcome;
 pub mod headers;
 pub mod hop_limit;
@@ -122,7 +122,7 @@ pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
 pub(crate) mod request_headers;
 #[allow(unused_imports)]
-// Used by external tests; unused in the separately compiled bin target.
+// Re-exported for `_test_support`.
 pub(crate) use mesh_tcp_egress::connection_balancer as mesh_tcp_egress_connection_balancer;
 mod mesh_tcp_inbound;
 pub mod mesh_trust_registry;
@@ -8172,7 +8172,6 @@ pub struct ProxyState {
     /// reload that rebuilds `PluginHttpClient` — the plugin factory
     /// reads the live Arc via the http_client; the field itself is
     /// retained as a lifetime anchor and observability surface.
-    #[allow(dead_code)]
     pub bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     /// Per-destination open-connection limiter enforcing DestinationRule
     /// `connectionPool.tcp.maxConnections` across EVERY backend transport
@@ -11917,7 +11916,6 @@ impl ProxyState {
     /// Production route lookup exposed narrowly for external generation-race
     /// regression tests. Both HTTP and HTTP/3 use the same epoch-bound helper.
     #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn find_proxy_on_frontend_for_test(
         &self,
         host: Option<&str>,
@@ -11940,7 +11938,6 @@ impl ProxyState {
     /// connection that `listener` accepted, exactly as the H1/H2 and H3
     /// request paths route it (issue #5921).
     #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn find_proxy_on_gateway_listener_for_test(
         &self,
         host: Option<&str>,
@@ -15136,7 +15133,6 @@ impl ProxyState {
     /// no-op candidates (`Unchanged`) from validation/build rejections
     /// (`Rejected`). The DB poller relies on this to avoid advancing
     /// `last_poll_at` on rejection — see `src/modes/database.rs`.
-    #[allow(dead_code)] // Integration-test seam; DB mode uses the topology-fenced entry point.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
@@ -21611,7 +21607,6 @@ impl<S> WsActivityIo<S> {
     }
 
     /// Access the wrapped transport (socket-option tweaks, tests).
-    #[allow(dead_code)] // Used by library consumers and external unit tests; the binary tree has no caller.
     pub fn get_ref(&self) -> &S {
         &self.inner
     }
@@ -34690,7 +34685,6 @@ fn attach_auth_rejection_set_cookie(
 /// per-proxy OpenAI-envelope flag. `tests/` is a separate crate, so this is
 /// unreachable from the `ferrum-edge` binary target and would otherwise be
 /// reported as dead code there.
-#[allow(dead_code)]
 pub async fn run_authentication_phase(
     auth_mode: AuthMode,
     auth_plugins: &[Arc<dyn Plugin>],
@@ -34915,7 +34909,6 @@ pub fn apply_trusted_forwarded_request_scheme(
 }
 
 /// Handle a single proxy request.
-#[allow(dead_code)] // Public test/library entry point; listeners use the port-aware wrapper below.
 pub async fn handle_proxy_request(
     req: Request<Incoming>,
     state: ProxyState,
@@ -55493,7 +55486,6 @@ fn reqwest_response_can_carry_trailers(response: &reqwest::Response) -> bool {
 /// Test seam (issue #5760): whether the reqwest relay would treat `response`
 /// as able to carry a trailer section, and therefore capture response-policy
 /// evidence for it. Reached only through `crate::_test_support`.
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
 pub(crate) fn reqwest_response_can_carry_trailers_for_test(response: &reqwest::Response) -> bool {
     reqwest_response_can_carry_trailers(response)
 }
@@ -55550,7 +55542,6 @@ fn buffered_response_body(
 /// names a late gateway terminal: `"deadline"`, `"capacity"`, or
 /// `"representation"`), and the body the builder then emits. Reached only
 /// through `crate::_test_support`.
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn buffered_response_body_for_test(
     inbound_carries_response_trailers: bool,
@@ -55600,7 +55591,6 @@ fn buffered_response_carries_backend_trailers(
 /// (`eager = false`) or the eager small-body collector (`eager = true`) over
 /// `response` and report the retained body and trailer section. Reached only
 /// through `crate::_test_support`.
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
 pub(crate) async fn collect_reqwest_buffered_response_for_test(
     response: reqwest::Response,
     eager: bool,
