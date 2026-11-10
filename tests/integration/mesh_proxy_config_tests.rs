@@ -464,8 +464,13 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
         K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
     };
     use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::config_consumer::xds_client::{
+        XdsClientConfig, reverse_translate_xds_snapshot,
+    };
     use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
-    use ferrum_edge::xds::{MeshSliceCarrier, apply_carrier, build_slice_carriers};
+    use ferrum_edge::xds::{
+        MeshSliceCarrier, build_slice_carriers, translate_mesh_slice_to_snapshot,
+    };
 
     let proxy_config = K8sObject {
         api_version: "networking.istio.io/v1beta1".to_string(),
@@ -530,24 +535,32 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
     assert_eq!(resolved.concurrency, Some(4));
     assert_eq!(resolved.image.as_deref(), Some("distroless"));
 
-    let carriers = build_slice_carriers(&native);
-    let proxy_carrier = carriers
-        .iter()
-        .find(|c| matches!(c, MeshSliceCarrier::ProxyConfigs(_)))
-        .expect("native slice must emit ProxyConfigsCarrier");
-    let encoded = proxy_carrier
-        .encode_value()
-        .expect("ProxyConfigsCarrier encodes");
-    let decoded = MeshSliceCarrier::decode(proxy_carrier.type_url(), &encoded)
-        .expect("decode succeeds")
-        .expect("recognized ProxyConfigs carrier");
+    assert!(
+        build_slice_carriers(&native)
+            .iter()
+            .any(|c| matches!(c, MeshSliceCarrier::ProxyConfigs(_))),
+        "native slice must emit ProxyConfigsCarrier"
+    );
 
-    let mut xds_equivalent = MeshSlice {
+    // Rebuild through the DP's production xDS path (SotW accumulator +
+    // reverse translation), not a hand-rolled carrier fold.
+    let dp_config = XdsClientConfig {
+        cp_urls: Vec::new(),
         node_id: native.node_id.clone(),
+        cluster: String::new(),
         namespace: native.namespace.clone(),
-        ..Default::default()
+        workload_spiffe_id: native.workload_spiffe_id.clone(),
+        waypoint_name: native.waypoint_name.clone(),
+        ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
+        stream_channel_capacity: 1,
+        primary_retry_secs: 0,
+        connect_timeout_seconds: 0,
+        labels: native.labels.clone(),
     };
-    apply_carrier(&mut xds_equivalent, decoded);
+    let xds_equivalent =
+        reverse_translate_xds_snapshot(&translate_mesh_slice_to_snapshot(&native), &dp_config)
+            .expect("the DP rebuilds the xDS-carried slice");
     assert_eq!(
         xds_equivalent.proxy_configs, native.proxy_configs,
         "xDS ProxyConfigsCarrier must recover the same proxy_configs as native"

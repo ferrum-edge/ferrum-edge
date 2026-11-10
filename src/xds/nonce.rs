@@ -12,7 +12,6 @@ struct NonceKey {
 struct NonceState {
     last_issued_nonce: String,
     last_version: String,
-    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +57,6 @@ impl XdsNonceTracker {
             NonceState {
                 last_issued_nonce: nonce.clone(),
                 last_version: version.to_string(),
-                last_error: None,
             },
         );
         nonce
@@ -80,7 +78,7 @@ impl XdsNonceTracker {
             node_id: node_id.to_string(),
             type_url: type_url.to_string(),
         };
-        let Some(mut state) = self.states.get_mut(&key) else {
+        let Some(state) = self.states.get(&key) else {
             return AckOutcome::UnknownNonce;
         };
 
@@ -96,12 +94,12 @@ impl XdsNonceTracker {
         }
 
         if let Some(message) = error_message {
-            // Bound the peer-supplied NACK message at the boundary so both the
-            // stored `last_error` and the value surfaced to the server's warn
-            // lines stay bounded regardless of input length (issue #4813).
-            let message = super::bounded_xds_log_value(message);
-            state.last_error = Some(message.clone());
-            return AckOutcome::Nacked { message };
+            // Bound the peer-supplied NACK message at the boundary so the value
+            // surfaced to the server's warn lines stays bounded regardless of
+            // input length (issue #4813).
+            return AckOutcome::Nacked {
+                message: super::bounded_xds_log_value(message),
+            };
         }
 
         if !version_info.is_empty() && version_info != state.last_version {
@@ -111,17 +109,7 @@ impl XdsNonceTracker {
             };
         }
 
-        state.last_error = None;
         AckOutcome::Acked
-    }
-
-    pub fn last_error(&self, node_id: &str, type_url: &str) -> Option<String> {
-        self.states
-            .get(&NonceKey {
-                node_id: node_id.to_string(),
-                type_url: type_url.to_string(),
-            })
-            .and_then(|state| state.last_error.clone())
     }
 
     pub fn remove_node(&self, node_id: &str) {
@@ -188,11 +176,10 @@ mod tests {
             tracker.record_response("node-a", "type-a", &nonce, "v1", None),
             AckOutcome::Acked
         );
-        assert_eq!(tracker.last_error("node-a", "type-a"), None);
     }
 
     #[test]
-    fn hostile_megabyte_nack_message_is_bounded_in_outcome_and_state() {
+    fn hostile_megabyte_nack_message_is_bounded_in_the_outcome() {
         let tracker = XdsNonceTracker::new();
         let nonce = tracker.issue_nonce("node-a", "type-a", "v1");
         let hostile = "n".repeat(1024 * 1024);
@@ -208,10 +195,5 @@ mod tests {
             message.len()
         );
         assert!(message.ends_with("(truncated)"));
-
-        let stored = tracker
-            .last_error("node-a", "type-a")
-            .expect("NACK message is stored as the last error");
-        assert_eq!(stored, message);
     }
 }

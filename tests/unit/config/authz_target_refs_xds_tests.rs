@@ -1,9 +1,9 @@
 //! External xDS round-trip coverage for AuthorizationPolicy `targetRefs`
 //! (issue #3226 / PR #3602).
 //!
-//! Drives the real CP encode (`translate_mesh_slice_to_snapshot` /
-//! `build_slice_carriers`) → ECDS TypedExtensionConfig wire → DP decode
-//! (`MeshSliceCarrier::decode` / `apply_carrier`) path, then proves that an
+//! Drives the real CP encode (`translate_mesh_slice_to_snapshot`) → xDS wire →
+//! DP rebuild (`reverse_translate_xds_snapshot`: the production SotW
+//! accumulator and reverse translation) path, then proves that an
 //! xDS-recovered slice enforces exactly what a natively-built one does:
 //!
 //! * a `GatewayClass` policy attaches only on an exact class stamp;
@@ -22,6 +22,9 @@ use ferrum_edge::modes::mesh::config::{
     MeshRule, MeshService, PolicyAction, PolicyScope, PolicyTargetAttachment, WaypointAttachment,
     Workload, WorkloadSelector,
 };
+use ferrum_edge::modes::mesh::config_consumer::xds_client::{
+    XdsClientConfig, reverse_translate_xds_snapshot,
+};
 use ferrum_edge::modes::mesh::policy::{
     MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization_policies,
 };
@@ -29,13 +32,11 @@ use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
-use ferrum_edge::xds::proto;
 use ferrum_edge::xds::{
-    ECDS_TYPE_URL, FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL,
-    MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES, MAX_WAYPOINT_GATEWAY_CLASS_LEN, MeshSliceCarrier,
-    apply_carrier, build_slice_carriers, translate_mesh_slice_to_snapshot,
+    FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES,
+    MAX_WAYPOINT_GATEWAY_CLASS_LEN, MeshSliceCarrier, build_slice_carriers,
+    translate_mesh_slice_to_snapshot,
 };
-use prost::Message;
 use serde_json::json;
 
 const WAYPOINT: &str = "reviews-waypoint";
@@ -75,49 +76,28 @@ fn waypoint_slice(class: Option<&str>, policies: Vec<MeshPolicy>) -> MeshSlice {
     }
 }
 
-/// Recover a slice from a CP snapshot the same way the DP folds ECDS carriers,
-/// then stamp `waypoint_name` from the DP client config (name rides Node
-/// metadata; class rides the dedicated carrier).
+/// Rebuild a slice from a CP snapshot through the DP's production xDS path, as
+/// the waypoint DP named by `waypoint_name` (the name rides Node metadata; the
+/// class rides the dedicated carrier).
 fn recover_from_snapshot(
     snapshot: &ferrum_edge::xds::XdsSnapshot,
     waypoint_name: Option<&str>,
 ) -> Result<MeshSlice, String> {
-    let mut recovered = MeshSlice {
+    let config = XdsClientConfig {
+        cp_urls: Vec::new(),
         node_id: "wp-node".to_string(),
+        cluster: String::new(),
         namespace: NS.to_string(),
+        workload_spiffe_id: None,
         waypoint_name: waypoint_name.map(str::to_string),
-        version: snapshot.version.clone(),
-        ..MeshSlice::default()
+        ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
+        stream_channel_capacity: 1,
+        primary_retry_secs: 0,
+        connect_timeout_seconds: 0,
+        labels: Default::default(),
     };
-    let mut class_seen = false;
-    for resource in snapshot.resources(ECDS_TYPE_URL) {
-        let typed = proto::TypedExtensionConfig::decode(resource.value.as_slice())
-            .map_err(|e| format!("TypedExtensionConfig decode: {e}"))?;
-        let Some(inner) = typed.typed_config.as_ref() else {
-            continue;
-        };
-        match MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
-            Ok(Some(carrier @ MeshSliceCarrier::WaypointGatewayClass(_))) => {
-                if class_seen {
-                    return Err(
-                        "duplicate WaypointGatewayClass carrier; exactly one authoritative value required"
-                            .to_string(),
-                    );
-                }
-                class_seen = true;
-                apply_carrier(&mut recovered, carrier);
-            }
-            Ok(Some(carrier)) => apply_carrier(&mut recovered, carrier),
-            Ok(None) => {}
-            Err(e) => {
-                return Err(format!(
-                    "carrier decode failed for '{}': {e}",
-                    inner.type_url
-                ));
-            }
-        }
-    }
-    Ok(recovered)
+    reverse_translate_xds_snapshot(snapshot, &config)
 }
 
 async fn gateway_class_policy_enforced(slice: &MeshSlice) -> bool {
@@ -273,35 +253,30 @@ async fn xds_round_trip_mixed_target_refs_do_not_broaden_to_sibling_destination(
 /// than silently dropping the policy into allow-by-default.
 #[test]
 fn missing_gateway_class_carrier_refuses_an_enforcing_class_policy() {
-    let native = waypoint_slice(
-        Some("istio-waypoint"),
-        vec![gateway_class_deny_policy("istio-waypoint")],
-    );
-    let carriers: Vec<_> = build_slice_carriers(&native)
-        .into_iter()
-        .filter(|c| !matches!(c, MeshSliceCarrier::WaypointGatewayClass(_)))
-        .collect();
-    let mut recovered = MeshSlice {
-        node_id: native.node_id.clone(),
-        namespace: native.namespace.clone(),
-        waypoint_name: native.waypoint_name.clone(),
-        mesh_policies: native.mesh_policies.clone(),
-        ..MeshSlice::default()
-    };
-    for carrier in carriers {
-        apply_carrier(&mut recovered, carrier);
-    }
+    // A producer that knows no class for this waypoint emits no class carrier.
+    let native = waypoint_slice(None, vec![gateway_class_deny_policy("istio-waypoint")]);
     assert!(
-        recovered.waypoint_gateway_class.is_none(),
-        "missing carrier must not invent a class stamp"
+        !build_slice_carriers(&native)
+            .iter()
+            .any(|c| matches!(c, MeshSliceCarrier::WaypointGatewayClass(_))),
+        "a class-less slice must not emit a class carrier"
     );
 
-    let error = MeshAuthz::new(&json!({ "mesh_slice": recovered }))
+    let error = recover_from_snapshot(&translate_mesh_slice_to_snapshot(&native), Some(WAYPOINT))
+        .expect_err("an enforcing class policy without its class carrier must refuse the slice");
+    assert!(
+        error.contains("no authoritative WaypointGatewayClass carrier"),
+        "unexpected refusal: {error}"
+    );
+
+    // The refusal is what keeps a hand-built recovery from degrading either:
+    // the request-path plugin refuses the same class-less slice.
+    let refusal = MeshAuthz::new(&json!({ "mesh_slice": native }))
         .err()
         .expect("an enforcing class policy without its class stamp must refuse the slice");
     assert!(
-        error.contains("no authoritative waypoint gateway class"),
-        "unexpected refusal: {error}"
+        refusal.contains("no authoritative waypoint gateway class"),
+        "unexpected refusal: {refusal}"
     );
 }
 

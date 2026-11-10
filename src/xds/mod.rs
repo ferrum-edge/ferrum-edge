@@ -110,7 +110,7 @@ pub use carrier::{
     FERRUM_ECDS_WAYPOINT_GATEWAY_CLASS_TYPE_URL, FERRUM_ECDS_WORKLOADS_TYPE_URL,
     MAX_SERVICE_WAYPOINT_BOUND_REF_LEN, MAX_SERVICE_WAYPOINT_BOUND_SERVICES_CARRIER_BYTES,
     MAX_WAYPOINT_GATEWAY_CLASS_CARRIER_BYTES, MAX_WAYPOINT_GATEWAY_CLASS_LEN, MeshSliceCarrier,
-    apply_carrier, build_slice_carriers,
+    build_slice_carriers,
 };
 #[allow(unused_imports)]
 pub use nonce::{AckOutcome, XdsNonceTracker};
