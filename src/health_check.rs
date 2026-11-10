@@ -5774,16 +5774,64 @@ mod tests {
             .expect("fallback client without DNS cache should build");
     }
 
-    #[test]
-    fn build_health_check_client_returns_usable_client() {
-        // Sanity check the happy path: build with a DNS cache and verify
-        // the returned client can issue a request (we send to an unroutable
-        // address; the DNS lookup is what matters here, not the eventual
-        // connect failure).
-        let dns_cache = DnsCache::new(DnsConfig::default());
-        let pool_config = PoolConfig::default();
-        let _client = build_health_check_client(&pool_config, Some(dns_cache), false)
+    #[tokio::test]
+    async fn build_health_check_client_resolves_through_cache_and_keeps_redirects() {
+        // `.invalid` cannot resolve through system DNS, so the probe reaches
+        // this listener only through the supplied cache's static override. The
+        // listener answers with a redirect to a metadata address; the probe
+        // client must surface the 3xx rather than follow it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind health-check client test listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let hostname = "health-check-probe-client-resolver.invalid";
+        let dns_cache = DnsCache::new(DnsConfig {
+            global_overrides: std::collections::HashMap::from([(
+                hostname.to_string(),
+                "127.0.0.1".to_string(),
+            )]),
+            ..DnsConfig::default()
+        });
+        let client = build_health_check_client(&PoolConfig::default(), Some(dns_cache), false)
             .expect("health-check client should build");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                .await
+                .expect("health-check client connection timed out")
+                .expect("accept health-check client connection");
+            let mut method_prefix = [0u8; 4];
+            socket
+                .read_exact(&mut method_prefix)
+                .await
+                .expect("read health-check request method");
+            assert_eq!(&method_prefix, b"GET ");
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write health-check redirect response");
+        });
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            client
+                .get(format!("http://{hostname}:{port}/health"))
+                .send(),
+        )
+        .await
+        .expect("health-check request timed out")
+        .expect("probe client must resolve the override-only hostname");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FOUND,
+            "health probes must not follow redirects"
+        );
+        server
+            .await
+            .expect("health-check client test server failed");
     }
 
     #[tokio::test]
