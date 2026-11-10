@@ -4113,6 +4113,47 @@ async fn streaming_jsonrpc_termination_before_inspector_end_does_not_emit_metada
     assert!(matches!(end, ResponseStreamAction::Forward(ref bytes) if bytes.is_empty()));
 }
 
+/// Issue #7116: a client disconnect ends the stream without `on_end`; the
+/// inspector still reports the events it completed before it was dropped.
+#[tokio::test]
+async fn streaming_jsonrpc_disconnect_reports_partial_observation() {
+    let plugin = plugin(json!({}));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&plugin)];
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-stream",
+        "method": "message/stream"
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("detected 2xx A2A SSE response should attach an inspector");
+    let complete = b"data: {\"jsonrpc\":\"2.0\",\"result\":{\"taskId\":\"task-9\"}}\n\n";
+    let cut_off = b"data: {\"jsonrpc\":\"2.0\",\"result\":{\"taskId\":\"task-10\"}}";
+    for chunk in [&complete[..], &cut_off[..]] {
+        assert!(matches!(
+            inspector.on_chunk(chunk).await,
+            ResponseStreamAction::Forward(_)
+        ));
+    }
+    drop(inspector);
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(0))
+        .await;
+    assert_eq!(
+        ctx.metadata.get("a2a.stream_events").map(String::as_str),
+        Some("1"),
+        "only the event completed before the disconnect is counted"
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.task_id").map(String::as_str),
+        Some("task-9")
+    );
+}
+
 #[tokio::test]
 async fn streaming_jsonrpc_observation_omits_absent_optional_metadata() {
     let plugin = plugin(json!({}));
