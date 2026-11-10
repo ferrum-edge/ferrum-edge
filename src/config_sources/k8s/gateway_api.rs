@@ -4911,11 +4911,6 @@ fn ensure_route_parent_refs_allowed(
     Ok(())
 }
 
-#[allow(dead_code)] // Kept for callers that need the narrower ListenerSet predicate.
-fn parent_ref_is_listenerset(parent_ref: &Value) -> bool {
-    parent_ref_listener_parent_kind(parent_ref) == Some(GatewayApiListenerParentKind::ListenerSet)
-}
-
 fn parent_ref_is_attachable_parent(parent_ref: &Value) -> bool {
     parent_ref_listener_parent_kind(parent_ref).is_some()
 }

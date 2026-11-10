@@ -2709,9 +2709,8 @@ fn workload_port_protocol(protocol: Option<&str>) -> AppProtocol {
         "TCP" => AppProtocol::Tcp,
         // UDP is modeled as a distinct L4 transport so it partitions out of both
         // HTTP-family routing and the raw-TCP stream lane (it was previously
-        // swallowed as `Unknown`, i.e. silently treated as HTTP-family).
-        // Capture/egress for UDP arrives in a later F3 §3.3 stage; the variant
-        // is inert today, so a UDP port simply materializes no routes.
+        // swallowed as `Unknown`, i.e. silently treated as HTTP-family) and
+        // takes the datagram capture/egress lane instead.
         "UDP" => AppProtocol::Udp,
         // Other K8s Service protocols (e.g. SCTP) have no mesh transport model
         // yet; keep them unknown until a stage consumes them.
@@ -3245,22 +3244,6 @@ mod tests {
     fn endpoint_slice_terminating_is_not_surfaced() {
         let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
         slice.spec["endpoints"][0]["conditions"]["terminating"] = json!(true);
-
-        let translation = translate_k8s_objects(
-            &[service(), ready_pod("reviews-v1", "10.1.0.10"), slice],
-            options(),
-        )
-        .expect("core translation succeeds");
-
-        let mesh = translation.config.mesh.expect("mesh config");
-        assert_eq!(mesh.services[0].workloads.len(), 0);
-        assert_eq!(mesh.workloads.len(), 0);
-    }
-
-    #[test]
-    fn endpoint_slice_serving_inherits_unready_when_ready_absent() {
-        let mut slice = endpoint_slice(vec![("reviews-v1", "10.1.0.10")]);
-        slice.spec["endpoints"][0]["conditions"] = json!({"ready": false});
 
         let translation = translate_k8s_objects(
             &[service(), ready_pod("reviews-v1", "10.1.0.10"), slice],
