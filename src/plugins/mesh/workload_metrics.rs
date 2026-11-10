@@ -743,10 +743,17 @@ impl WorkloadMetrics {
         if self.should_ensure_http_trace_context(&ctx.metadata, probe)
             && !trace_owned_by_otel_tracing(ctx)
         {
-            if !probe.has_valid_traceparent() {
-                import_b3_trace_metadata(&mut ctx.metadata, probe);
+            let imported_b3 = !probe.has_valid_traceparent()
+                && import_b3_trace_metadata(&mut ctx.metadata, probe);
+            let ensured = ensure_trace_metadata(&mut ctx.metadata, headers);
+            // A traceparent this call built carries a fresh gateway span id:
+            // record it as gateway-minted so retained-result partitions can
+            // omit it while it is forwarded unchanged (issue #7130).
+            if (imported_b3 || ensured)
+                && let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER).cloned()
+            {
+                ctx.stage_gateway_minted_traceparent(traceparent);
             }
-            ensure_trace_metadata(&mut ctx.metadata, headers);
             ctx.claim_gateway_trace_owner(
                 crate::plugins::otel_tracing::GatewayTraceOwner::WorkloadMetrics,
             );
@@ -3309,27 +3316,31 @@ fn b3_sampling_state(value: &str) -> Option<bool> {
     }
 }
 
+/// Returns whether a `traceparent` was built from the B3 context (under a
+/// fresh gateway span id).
 fn import_b3_trace_metadata<MS: std::hash::BuildHasher>(
     metadata: &mut HashMap<String, String, MS>,
     probe: &TraceHeaderProbe<'_>,
-) {
+) -> bool {
     if metadata.contains_key(TRACEPARENT_HEADER) {
-        return;
+        return false;
     }
     if let Some(value) = probe.b3 {
-        if let Some(context) = parse_b3_single_trace_context(value) {
-            import_b3_trace_context(metadata, context.trace_id, context.span_id);
-        }
-        return;
+        let Some(context) = parse_b3_single_trace_context(value) else {
+            return false;
+        };
+        import_b3_trace_context(metadata, context.trace_id, context.span_id);
+        return true;
     }
     let Some(trace_id) = probe.x_b3_traceid.and_then(normalize_b3_trace_id) else {
-        return;
+        return false;
     };
     let Some(parent_span_id) = probe.x_b3_spanid.and_then(normalize_b3_span_id) else {
-        return;
+        return false;
     };
 
     import_b3_trace_context(metadata, trace_id, parent_span_id);
+    true
 }
 
 fn import_b3_trace_context<MS: std::hash::BuildHasher>(

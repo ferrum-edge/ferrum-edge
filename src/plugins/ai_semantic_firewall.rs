@@ -1375,11 +1375,24 @@ impl AiSemanticFirewall {
         PluginResult::Continue
     }
 
+    /// Whether request-side rules inspect request bodies. When false, the only
+    /// request-body work is the streaming policy, and no body digest is used.
+    fn inspects_request_rules(&self) -> bool {
+        self.inspect_request && self.has_request_rules
+    }
+
+    /// Apply the streaming policy, then the request rules, to one parsed
+    /// request body. `request_hash` is the caller's SHA-256 hex of the exact
+    /// body bytes (issue #7132): the final hook already computed it for its
+    /// unchanged-body skip, and `before_proxy` computes it while it still
+    /// borrows the buffered body, so neither caller copies the body or hashes
+    /// it twice. Callers pass `None` only when [`Self::inspects_request_rules`]
+    /// is false, where no digest is recorded.
     async fn inspect_request_json(
         &self,
         ctx: &mut RequestContext,
         json: &Value,
-        body: &[u8],
+        request_hash: Option<String>,
         was_governed: bool,
     ) -> PluginResult {
         let streaming_result = self.apply_streaming_request_policy(ctx, json);
@@ -1387,13 +1400,22 @@ impl AiSemanticFirewall {
             return streaming_result;
         }
 
-        if !self.inspect_request || !self.has_request_rules {
+        if !self.inspects_request_rules() {
             return PluginResult::Continue;
         }
+        let Some(request_hash) = request_hash else {
+            // Unreachable by the caller contract above. Fail closed rather
+            // than inspect without recording what was inspected.
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                "missing_buffered_body",
+            );
+        };
 
         let segments = extract_request_segments(json, &self.engine.extraction);
         if segments.len() > MAX_INSPECTED_SEGMENTS {
-            self.set_request_hash(ctx, sha256_hex_bytes(body));
+            self.set_request_hash(ctx, request_hash);
             return self.engine.handle_uninspectable_body(
                 ctx,
                 Direction::Request,
@@ -1405,7 +1427,7 @@ impl AiSemanticFirewall {
                 || !self.engine.allow_topics.is_empty()
                 || looks_like_governed_request_json(json)
             {
-                self.set_request_hash(ctx, sha256_hex_bytes(body));
+                self.set_request_hash(ctx, request_hash);
                 self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Request,
@@ -1420,7 +1442,7 @@ impl AiSemanticFirewall {
             };
         }
 
-        self.set_request_hash(ctx, sha256_hex_bytes(body));
+        self.set_request_hash(ctx, request_hash);
 
         let outcome = self
             .engine
@@ -1457,9 +1479,10 @@ impl AiSemanticFirewall {
         &self,
         ctx: &mut RequestContext,
         content_type: &str,
-        body: &[u8],
+        digest: BodyDigest<'_>,
         was_governed: bool,
     ) -> PluginResult {
+        let body = digest.body;
         let event_stream = is_event_stream_content_type(content_type);
         let ndjson_stream = is_ndjson_stream_content_type(content_type);
         let amazon_eventstream = is_amazon_eventstream_content_type(content_type);
@@ -1484,7 +1507,7 @@ impl AiSemanticFirewall {
             if (!fully_parsed && (was_governed || streaming_inspection_requested))
                 || (segments.is_empty() && streaming_inspection_requested)
             {
-                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                self.set_response_hash(ctx, digest.into_hex());
                 return self.engine.handle_uninspectable_buffered_stream(ctx);
             }
             segments
@@ -1495,7 +1518,7 @@ impl AiSemanticFirewall {
             if !was_governed && !self.governed_stream_armed(ctx) {
                 return PluginResult::Continue;
             }
-            self.set_response_hash(ctx, sha256_hex_bytes(body));
+            self.set_response_hash(ctx, digest.into_hex());
             return self.engine.handle_uninspectable_buffered_stream(ctx);
         } else if ndjson_stream {
             // Only a stream answering a governed AI request (or a body this
@@ -1508,7 +1531,7 @@ impl AiSemanticFirewall {
             let (segments, fully_parsed) =
                 reassemble_ndjson_response_segments(body, &self.engine.extraction);
             if !fully_parsed || (segments.is_empty() && armed) {
-                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                self.set_response_hash(ctx, digest.into_hex());
                 return self.engine.handle_uninspectable_buffered_stream(ctx);
             }
             segments
@@ -1527,7 +1550,7 @@ impl AiSemanticFirewall {
                             PluginResult::Continue
                         };
                     }
-                    self.set_response_hash(ctx, sha256_hex_bytes(body));
+                    self.set_response_hash(ctx, digest.into_hex());
                     return self.engine.handle_uninspectable_body(
                         ctx,
                         Direction::Response,
@@ -1544,18 +1567,18 @@ impl AiSemanticFirewall {
                 let (segments, fully_inspectable) =
                     reassemble_json_frame_array_segments(frames, &self.engine.extraction);
                 if !fully_inspectable || segments.is_empty() {
-                    self.set_response_hash(ctx, sha256_hex_bytes(body));
+                    self.set_response_hash(ctx, digest.into_hex());
                     return self.engine.handle_uninspectable_buffered_stream(ctx);
                 }
                 if segments.len() > MAX_INSPECTED_SEGMENTS {
-                    self.set_response_hash(ctx, sha256_hex_bytes(body));
+                    self.set_response_hash(ctx, digest.into_hex());
                     return self.engine.handle_uninspectable_body(
                         ctx,
                         Direction::Response,
                         "too_many_segments",
                     );
                 }
-                return self.evaluate_response_segments(ctx, body, segments).await;
+                return self.evaluate_response_segments(ctx, digest, segments).await;
             }
             let mut segments = Vec::new();
             extract_response_segments_from_json(
@@ -1565,7 +1588,7 @@ impl AiSemanticFirewall {
                 &mut segments,
             );
             if segments.is_empty() && looks_like_governed_response_json(&json) {
-                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                self.set_response_hash(ctx, digest.into_hex());
                 return self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Response,
@@ -1577,7 +1600,7 @@ impl AiSemanticFirewall {
 
         if segments.is_empty() {
             return if was_governed {
-                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                self.set_response_hash(ctx, digest.into_hex());
                 self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Response,
@@ -1588,7 +1611,7 @@ impl AiSemanticFirewall {
             };
         }
         if segments.len() > MAX_INSPECTED_SEGMENTS {
-            self.set_response_hash(ctx, sha256_hex_bytes(body));
+            self.set_response_hash(ctx, digest.into_hex());
             return self.engine.handle_uninspectable_body(
                 ctx,
                 Direction::Response,
@@ -1596,7 +1619,7 @@ impl AiSemanticFirewall {
             );
         }
 
-        self.evaluate_response_segments(ctx, body, segments).await
+        self.evaluate_response_segments(ctx, digest, segments).await
     }
 
     /// Record the inspected representation and run the response engine over
@@ -1604,10 +1627,10 @@ impl AiSemanticFirewall {
     async fn evaluate_response_segments(
         &self,
         ctx: &mut RequestContext,
-        body: &[u8],
+        digest: BodyDigest<'_>,
         segments: Vec<TextSegment>,
     ) -> PluginResult {
-        self.set_response_hash(ctx, sha256_hex_bytes(body));
+        self.set_response_hash(ctx, digest.into_hex());
 
         let outcome = self
             .engine
@@ -1777,9 +1800,9 @@ impl FirewallEngine {
             .rule_embedding_index(provider, plugin_http_call_ns, proxy_hops)
             .await?;
 
-        let segment_inputs: Vec<String> = candidate_segments
+        let segment_inputs: Vec<&str> = candidate_segments
             .iter()
-            .map(|segment| segment.text.clone())
+            .map(|segment| segment.text.as_str())
             .collect();
         let segment_embeddings = self
             .embed_texts(provider, &segment_inputs, plugin_http_call_ns, proxy_hops)
@@ -1862,14 +1885,14 @@ impl FirewallEngine {
         let mut rule_ranges = Vec::new();
         for rule in &self.rules {
             let start = inputs.len();
-            inputs.extend(rule.examples.iter().cloned());
+            inputs.extend(rule.examples.iter().map(String::as_str));
             rule_ranges.push((rule.id.clone(), start, inputs.len()));
         }
 
         let mut allow_ranges = Vec::new();
         for topic in &self.allow_topics {
             let start = inputs.len();
-            inputs.extend(topic.examples.iter().cloned());
+            inputs.extend(topic.examples.iter().map(String::as_str));
             allow_ranges.push((topic.id.clone(), start, inputs.len()));
         }
 
@@ -1899,7 +1922,7 @@ impl FirewallEngine {
     async fn embed_texts(
         &self,
         provider: &ProviderConfig,
-        texts: &[String],
+        texts: &[&str],
         plugin_http_call_ns: &AtomicU64,
         proxy_hops: Option<u8>,
     ) -> Result<Vec<EmbeddingVector>, String> {
@@ -1961,7 +1984,7 @@ impl FirewallEngine {
     async fn embed_batch(
         &self,
         provider: &ProviderConfig,
-        texts: &[String],
+        texts: &[&str],
         plugin_http_call_ns: &AtomicU64,
         proxy_hops: Option<u8>,
     ) -> Result<Vec<EmbeddingVector>, String> {
@@ -2723,9 +2746,11 @@ impl Plugin for AiSemanticFirewall {
                 .engine
                 .handle_uninspectable_body(ctx, Direction::Request, "empty_body");
         }
-        let body = buffered.clone();
-
-        let json: Value = match serde_json::from_slice(strip_json_bom(body.as_bytes())) {
+        // Parse and hash while the buffered body is still borrowed from
+        // `ctx.metadata`, instead of copying the body to end that borrow
+        // (issue #7132). The digest is computed only when request rules will
+        // record it.
+        let json: Value = match serde_json::from_slice(strip_json_bom(buffered.as_bytes())) {
             Ok(json) => json,
             Err(_) => {
                 // A body that is not even JSON under a non-JSON label cannot be
@@ -2740,7 +2765,10 @@ impl Plugin for AiSemanticFirewall {
                 );
             }
         };
-        self.inspect_request_json(ctx, &json, body.as_bytes(), false)
+        let request_hash = self
+            .inspects_request_rules()
+            .then(|| sha256_hex_bytes(buffered.as_bytes()));
+        self.inspect_request_json(ctx, &json, request_hash, false)
             .await
     }
 
@@ -2810,7 +2838,8 @@ impl Plugin for AiSemanticFirewall {
                 );
             }
         };
-        self.inspect_request_json(ctx, &json, body, was_governed)
+        // Reuse the digest the unchanged-body skip above already computed.
+        self.inspect_request_json(ctx, &json, Some(final_hash), was_governed)
             .await
     }
 
@@ -3141,7 +3170,7 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        self.inspect_response_bytes(ctx, content_type, body, false)
+        self.inspect_response_bytes(ctx, content_type, BodyDigest::of(body), false)
             .await
     }
 
@@ -3233,7 +3262,12 @@ impl Plugin for AiSemanticFirewall {
                 content_type
             };
             return self
-                .inspect_response_bytes(ctx, decoded_content_type, &decoded, was_governed)
+                .inspect_response_bytes(
+                    ctx,
+                    decoded_content_type,
+                    BodyDigest::precomputed(&decoded, decoded_hash),
+                    was_governed,
+                )
                 .await;
         }
 
@@ -3258,8 +3292,13 @@ impl Plugin for AiSemanticFirewall {
                 .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
         }
 
-        self.inspect_response_bytes(ctx, content_type, body, was_governed)
-            .await
+        self.inspect_response_bytes(
+            ctx,
+            content_type,
+            BodyDigest::precomputed(body, raw_hash),
+            was_governed,
+        )
+        .await
     }
 }
 
@@ -8555,21 +8594,29 @@ fn push_segment(
     });
 }
 
+/// Drop repeated `(direction, kind, json_path, text)` segments, keeping the
+/// first. Keys borrow the segments (issue #7132), so no extracted text is
+/// copied to deduplicate it.
 fn dedupe_segments(segments: Vec<TextSegment>) -> Vec<TextSegment> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-    for segment in segments {
-        let key = (
-            segment.direction.as_str().to_string(),
-            segment.kind.as_str().to_string(),
-            segment.json_path.clone().unwrap_or_default(),
-            segment.text.clone(),
-        );
-        if seen.insert(key) {
-            deduped.push(segment);
-        }
-    }
-    deduped
+    let keep: Vec<bool> = {
+        let mut seen = HashSet::with_capacity(segments.len());
+        segments
+            .iter()
+            .map(|segment| {
+                seen.insert((
+                    segment.direction.as_str(),
+                    segment.kind.as_str(),
+                    segment.json_path.as_deref().unwrap_or_default(),
+                    segment.text.as_str(),
+                ))
+            })
+            .collect()
+    };
+    segments
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(segment, keep)| keep.then_some(segment))
+        .collect()
 }
 
 /// Compiled-in lexical fast path for a BUILT-IN rule pack. Keyed on the typed
@@ -9361,6 +9408,32 @@ fn sanitize_provider_error(error: &str) -> String {
         "embedding response invalid".to_string()
     } else {
         "embedding provider error".to_string()
+    }
+}
+
+/// An inspected body and its SHA-256 hex digest, computed at most once per
+/// hook (issue #7132). The final-body hooks hand in the digest their
+/// unchanged-body skip already computed; `on_response_body` computes it only
+/// on a path that records it.
+struct BodyDigest<'a> {
+    body: &'a [u8],
+    hex: Option<String>,
+}
+
+impl<'a> BodyDigest<'a> {
+    fn of(body: &'a [u8]) -> Self {
+        Self { body, hex: None }
+    }
+
+    fn precomputed(body: &'a [u8], hex: String) -> Self {
+        Self {
+            body,
+            hex: Some(hex),
+        }
+    }
+
+    fn into_hex(self) -> String {
+        self.hex.unwrap_or_else(|| sha256_hex_bytes(self.body))
     }
 }
 

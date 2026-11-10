@@ -2269,7 +2269,8 @@ impl ResponseCaching {
                     if ctx.is_gateway_minted_request_header(request_headers, header, value) =>
                 {
                     // Omit only the minted per-request value (a generated
-                    // correlation id or published rate-limit telemetry). The
+                    // correlation id, the trace owner's minted `traceparent`,
+                    // or published rate-limit telemetry). The
                     // name stays in the origin/operator Vary contract; treating
                     // presence as absent keeps two minted values on one entry.
                     hasher.bool_value("vary_present", false);

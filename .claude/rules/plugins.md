@@ -93,7 +93,11 @@ paths:
   `respect_no_cache` is enabled), and zero-length `Content-Length`
   framing — and a gateway-minted `correlation_id` header whose live value still
   matches private request provenance (issue #3929; `ai_semantic_cache` omits
-  it under the same rule, issue #7130). Client-supplied correlation
+  it under the same rule, issue #7130), and the `traceparent` the gateway
+  trace owner (`otel_tracing` / trace-enabled `workload_metrics`) minted with
+  a fresh span id (`RequestContext::stage_gateway_minted_traceparent`, staged
+  at mint time, never decided from the plugin-writable `traceparent` metadata
+  key). Client-supplied correlation
   values remain origin-visible dimensions; do not globally ignore `x-request-id`
   or trust a client-spoofable metadata/header marker. The `x-ratelimit-*` values
   `rate_limiting` (`expose_headers: true`, priority 2900) forwards are the other

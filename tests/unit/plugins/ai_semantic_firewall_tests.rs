@@ -10282,6 +10282,68 @@ async fn builtin_tool_abuse_keeps_its_tool_segment_context_gate() {
     assert_reject(rejected, Some(403));
 }
 
+/// Issue #7132: the final response hook reuses the digest its unchanged-body
+/// skip computed. An unchanged final body is skipped without another
+/// embedding call, and a changed one is inspected again.
+#[tokio::test]
+async fn final_response_hash_skip_reuses_the_inspected_digest() {
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&json!({
+        "inspect": {"request": false, "response": true},
+        "on_error": "reject",
+        "provider": provider(&format!("{}/v1/embeddings", server.uri())),
+        "builtins": disabled_builtins_with("response_leakage")
+    }));
+    let completion = |content: &str| {
+        serde_json::to_vec(&json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]
+        }))
+        .unwrap()
+    };
+    async fn embedding_calls(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    let body = completion("A harmless governed reply.");
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut ctx = create_test_context();
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await,
+    );
+    let inspected = embedding_calls(&server).await;
+    assert!(inspected > 0, "the first pass must embed the response");
+
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+    );
+    assert_eq!(
+        embedding_calls(&server).await,
+        inspected,
+        "an unchanged final body must be hash-skipped"
+    );
+
+    let changed = completion("A different harmless governed reply.");
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &changed)
+            .await,
+    );
+    assert!(
+        embedding_calls(&server).await > inspected,
+        "a changed final body must be inspected again"
+    );
+    // The changed body's digest is now the recorded one.
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &changed)
+            .await,
+    );
+}
+
 /// Every embedding call — the rule index built for the first request and the
 /// request's own segments — carries the request's gateway hop count
 /// (`received + 1`) as exactly one `X-Ferrum-Hops` field line, so an embedding

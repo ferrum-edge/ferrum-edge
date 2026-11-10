@@ -3495,6 +3495,119 @@ fn request_for_provider(provider: &str, request: &Value) -> Value {
     request
 }
 
+/// Issue #7125: the tool list is parsed once at admission and every native
+/// adapter renders its declarations from that parse. Each adapter must still
+/// carry the exact name, description, and schema, omit an absent description,
+/// and substitute the empty object schema for omitted `parameters`.
+#[test]
+fn native_adapters_render_tool_declarations_from_the_admitted_parse() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+    });
+    let empty_schema = json!({"type": "object", "properties": {}});
+    let request = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "get_weather", "description": "Get weather", "parameters": schema}
+            },
+            {"type": "function", "function": {"name": "ping"}}
+        ]
+    });
+    test_helpers::validate_openai_request_test(&request).unwrap();
+
+    let declarations = |provider: &str| -> Vec<Value> {
+        let (_, _, bytes) =
+            test_helpers::translate_request_test(provider, &request, "model-x", &json!({}))
+                .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        match provider {
+            "anthropic" => body["tools"].as_array().unwrap().clone(),
+            "google_gemini" => body["tools"][0]["functionDeclarations"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            "aws_bedrock" => body["toolConfig"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["toolSpec"].clone())
+                .collect(),
+            other => panic!("unexpected provider {other}"),
+        }
+    };
+
+    let anthropic = declarations("anthropic");
+    assert_eq!(
+        anthropic,
+        vec![
+            json!({"name": "get_weather", "description": "Get weather", "input_schema": schema}),
+            json!({"name": "ping", "input_schema": empty_schema}),
+        ]
+    );
+    let gemini = declarations("google_gemini");
+    assert_eq!(
+        gemini,
+        vec![
+            json!({"name": "get_weather", "description": "Get weather", "parameters": schema}),
+            json!({"name": "ping", "parameters": empty_schema}),
+        ]
+    );
+    let bedrock = declarations("aws_bedrock");
+    assert_eq!(
+        bedrock,
+        vec![
+            json!({"name": "get_weather", "description": "Get weather", "inputSchema": {"json": schema}}),
+            json!({"name": "ping", "inputSchema": {"json": empty_schema}}),
+        ]
+    );
+
+    // A direct translation still refuses a malformed tool list.
+    let mut malformed = request.clone();
+    malformed["tools"][1]["function"]["parameters"] = json!("not an object");
+    for provider in ["anthropic", "google_gemini", "aws_bedrock"] {
+        let error =
+            test_helpers::translate_request_test(provider, &malformed, "model-x", &json!({}))
+                .expect_err("malformed parameters must be refused");
+        assert!(error.contains("tools[1].function.parameters"), "{error}");
+    }
+}
+
+/// Issue #7125: Anthropic and Cohere read their endpoint from the same URL
+/// template as every other provider, so an operator `base_url` and the
+/// built-in default both reach the translated request.
+#[test]
+fn anthropic_and_cohere_urls_come_from_the_provider_url_template() {
+    let request = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+    for (provider, default) in [
+        ("anthropic", "https://api.anthropic.com/v1/messages"),
+        ("cohere", "https://api.cohere.com/v2/chat"),
+    ] {
+        let (url, _, _) =
+            test_helpers::translate_request_test(provider, &request, "model-x", &json!({}))
+                .unwrap();
+        assert_eq!(url, default, "{provider}");
+        let custom = "https://llm-gateway.example.test/v1/chat";
+        let (url, _, _) = test_helpers::translate_request_test(
+            provider,
+            &request,
+            "model-x",
+            &json!({"base_url": custom}),
+        )
+        .unwrap();
+        assert_eq!(url, custom, "{provider}");
+        assert_eq!(
+            test_helpers::build_provider_url_for_test(provider, &json!({"base_url": custom}), "m")
+                .unwrap(),
+            custom
+        );
+    }
+}
+
 #[test]
 fn native_adapters_preserve_tool_call_state_and_scalar_stop() {
     let request = tool_round_trip_request(json!("DONE"));
@@ -10384,6 +10497,48 @@ async fn streaming_gateway_local_pre_header_refusals_are_circuit_neutral() {
             test_helpers::circuit_is_closed_for_test(&plugin, 0),
             Some(true),
             "{class:?}: a gateway-local refusal must not open the circuit"
+        );
+    }
+}
+
+/// Issue #7125: a claimed stream marks the provider operation completed only
+/// when the provider answered with headers or may have executed the request.
+/// A dispatch that never reached the wire stays retry-safe, exactly as the
+/// buffered path's pre-wire failure does.
+#[tokio::test]
+async fn streaming_external_operation_marker_follows_dispatch_provenance() {
+    const COMPLETED: &str = "ferrum:external_operation_completed";
+    for (dispatch, status, completed) in [
+        (Some((ErrorClass::ConnectionRefused, false)), 502, false),
+        (Some((ErrorClass::ConnectionTimeout, false)), 504, false),
+        (
+            Some((ErrorClass::DispatchPolicyRejected, false)),
+            502,
+            false,
+        ),
+        (Some((ErrorClass::ReadWriteTimeout, true)), 504, true),
+        (Some((ErrorClass::ClientDisconnect, true)), 499, true),
+        (None, 200, true),
+        (None, 429, true),
+    ] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        assert!(!ctx.metadata.contains_key(COMPLETED));
+        record_backend_dispatch_outcome_for_test(
+            &mut ctx,
+            dispatch.map(|(class, _)| class),
+            dispatch.is_some_and(|(_, on_wire)| on_wire),
+        );
+        let mut response_headers = HashMap::new();
+        response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        plugin
+            .after_proxy(&mut ctx, status, &mut response_headers)
+            .await;
+        assert_eq!(
+            ctx.metadata.get(COMPLETED).map(String::as_str),
+            completed.then_some("true"),
+            "{dispatch:?} {status}"
         );
     }
 }

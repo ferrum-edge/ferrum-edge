@@ -62,8 +62,11 @@ use super::{Plugin, PluginResult, RequestContext};
 static NEXT_RESPONSE_GUARD_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// JSON object keys that are structural metadata (IDs, timestamps, model
-/// names, roles, etc.) and must never be redacted, even in `ScanMode::All`.
-/// This protects timestamps and IDs that may incidentally match PII regexes.
+/// names, roles, etc.). In `ScanMode::All` a scalar held directly by one of
+/// them at the root of a response body or SSE event is neither redacted nor
+/// detected (issue #7129): detection, redaction, and the residual re-scan all
+/// see the same view, so a Unix-seconds `created` that happens to match
+/// `phone_us` cannot make `reject` / `warn` fire on every completion.
 const STRUCTURAL_KEY_COUNT: usize = 17;
 const STRUCTURAL_KEYS: [&str; STRUCTURAL_KEY_COUNT] = [
     "id",
@@ -1371,6 +1374,14 @@ impl AiResponseGuard {
     /// valid UTF-8 (the body still parsed via `from_slice`), in which case only
     /// the decoded pass runs.
     ///
+    /// Both passes exclude top-level structural scalar values, the carve-out
+    /// redaction and the residual re-scan apply (issue #7129): the decoded
+    /// pass skips them (their keys are still scanned) and the raw pass runs
+    /// over the body with those value bytes masked. The masked copy is built
+    /// only when the unmasked raw pass hit something, so a clean body pays no
+    /// copy; a body whose root cannot be walked keeps the unmasked hits (fail
+    /// closed).
+    ///
     /// Accepted trade-off: because pass 1 evaluates each decoded value in
     /// isolation, an *anchored* custom `blocked_pattern` (e.g. `^done$`) that an
     /// operator authored against the whole serialized body will additionally fire
@@ -1390,14 +1401,16 @@ impl AiResponseGuard {
         // Pass 1: decoded tokens, plus decoded tool/function-argument tokens
         // so scan-all keeps parity with content mode on nested JSON escapes.
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
-        collect_decoded_json_strings(json, &mut texts);
+        collect_decoded_json_strings_outside_structural(json, &mut texts);
         collect_decoded_argument_tokens(json, &mut texts);
         for text in &texts {
             self.mark_hits(text.as_ref(), &mut hit);
         }
         // Pass 2: raw serialized body (cross-token / contextual / duplicate-key).
         if let Some(raw) = raw {
-            self.mark_hits(raw, &mut hit);
+            self.mark_raw_hits_outside_structural(raw, &mut hit, |raw| {
+                mask_json_top_level_structural_scalars(raw, json)
+            });
         }
         let mut detected = Vec::new();
         for (idx, &h) in hit.iter().enumerate() {
@@ -1406,6 +1419,30 @@ impl AiResponseGuard {
             }
         }
         detected
+    }
+
+    /// Raw/contextual detection pass over `raw` with top-level structural
+    /// scalar values masked by `mask` (the residual re-scan's view). The
+    /// unmasked body is scanned first; only when it hit a pattern is the
+    /// masked copy built and scanned instead, so the common clean body costs
+    /// no copy. When `mask` cannot walk the body the unmasked hits stand.
+    fn mark_raw_hits_outside_structural(
+        &self,
+        raw: &str,
+        hit: &mut [bool],
+        mask: impl FnOnce(&str) -> Option<String>,
+    ) {
+        let mut raw_hit = vec![false; hit.len()];
+        self.mark_hits(raw, &mut raw_hit);
+        if raw_hit.iter().any(|&h| h)
+            && let Some(masked) = mask(raw)
+        {
+            raw_hit.fill(false);
+            self.mark_hits(&masked, &mut raw_hit);
+        }
+        for (slot, raw_slot) in hit.iter_mut().zip(raw_hit) {
+            *slot |= raw_slot;
+        }
     }
 
     /// `ScanMode::All` SSE detection: the union of decoded parsed frames and a
@@ -1437,7 +1474,7 @@ impl AiResponseGuard {
         let mut hit = vec![false; self.detection_pattern_count];
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
         for frame in frames {
-            collect_decoded_json_strings(frame, &mut texts);
+            collect_decoded_json_strings_outside_structural(frame, &mut texts);
             collect_decoded_argument_tokens(frame, &mut texts);
         }
         for text in &texts {
@@ -1452,7 +1489,11 @@ impl AiResponseGuard {
             self.mark_hits(text, &mut hit);
         }
         if let Some(raw) = raw {
-            self.mark_hits(raw, &mut hit);
+            self.mark_raw_hits_outside_structural(
+                raw,
+                &mut hit,
+                mask_sse_top_level_structural_scalars,
+            );
         }
         let mut detected = Vec::new();
         for (idx, &h) in hit.iter().enumerate() {
@@ -5581,9 +5622,36 @@ fn write_pattern_replaced(
 fn blank_top_level_structural_scalars(value: &mut Value) {
     if let Value::Object(map) = value {
         for (key, value) in map.iter_mut() {
-            if STRUCTURAL_KEYS.contains(&key.as_str()) && (value.is_string() || value.is_number()) {
+            if is_top_level_structural_scalar(key, value) {
                 *value = Value::String(String::new());
             }
+        }
+    }
+}
+
+/// Whether `value`, held by `key` directly in a root response/event object, is
+/// a structural scalar (`STRUCTURAL_KEYS`) that scan-all detection, redaction,
+/// and the residual re-scan all leave alone.
+fn is_top_level_structural_scalar(key: &str, value: &Value) -> bool {
+    STRUCTURAL_KEYS.contains(&key) && (value.is_string() || value.is_number())
+}
+
+/// [`collect_decoded_json_strings`] over the residual scan's view of one
+/// response body or SSE event: a top-level structural scalar value is skipped
+/// (exactly what [`blank_top_level_structural_scalars`] blanks), while its key
+/// and every nested occurrence of a structural key name are still collected.
+fn collect_decoded_json_strings_outside_structural<'a>(
+    value: &'a Value,
+    texts: &mut Vec<Cow<'a, str>>,
+) {
+    let Value::Object(map) = value else {
+        collect_decoded_json_strings(value, texts);
+        return;
+    };
+    for (key, value) in map {
+        texts.push(Cow::Borrowed(key.as_str()));
+        if !is_top_level_structural_scalar(key, value) {
+            collect_decoded_json_strings(value, texts);
         }
     }
 }
@@ -5994,16 +6062,8 @@ fn mask_sse_event_structural_scalars(lines: &[&str]) -> Result<Option<String>, (
     // for attacker-controlled events with many data lines or root members.
     let mut mask = vec![false; joined.len()];
     for span in spans.into_iter().flatten() {
-        let bytes = joined.as_bytes();
-        let (start, end) = if span.end > span.start + 1
-            && bytes.get(span.start) == Some(&b'"')
-            && bytes.get(span.end - 1) == Some(&b'"')
-        {
-            (span.start + 1, span.end - 1)
-        } else {
-            (span.start, span.end)
-        };
-        mask.get_mut(start..end).ok_or(())?.fill(true);
+        let range = structural_mask_range(joined.as_bytes(), span);
+        mask.get_mut(range).ok_or(())?.fill(true);
     }
 
     let mut output = String::with_capacity(lines.iter().map(|line| line.len()).sum());
@@ -6021,6 +6081,39 @@ fn mask_sse_event_structural_scalars(lines: &[&str]) -> Result<Option<String>, (
         output.push_str(std::str::from_utf8(&bytes).map_err(|_| ())?);
     }
     Ok(Some(output))
+}
+
+/// The bytes of one structural scalar span to mask: a string keeps its quotes
+/// (so the surrounding JSON stays well-formed), a number is masked whole.
+fn structural_mask_range(bytes: &[u8], span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    if span.end > span.start + 1
+        && bytes.get(span.start) == Some(&b'"')
+        && bytes.get(span.end - 1) == Some(&b'"')
+    {
+        span.start + 1..span.end - 1
+    } else {
+        span
+    }
+}
+
+/// Mask top-level structural scalar values in a buffered JSON body with
+/// spaces, the raw-pass view scan-all detection shares with the SSE residual
+/// scan. Duplicate members, whitespace, and every other byte are unchanged.
+/// `None` when the root object cannot be walked, so the caller keeps the
+/// unmasked result (fail closed).
+fn mask_json_top_level_structural_scalars(raw: &str, json: &Value) -> Option<String> {
+    let spans = top_level_structural_scalar_spans(raw, json)?;
+    if spans.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut bytes = raw.as_bytes().to_vec();
+    for span in spans.into_iter().flatten() {
+        let range = structural_mask_range(raw.as_bytes(), span);
+        bytes.get_mut(range)?.fill(b' ');
+    }
+    // Every byte of a masked span is replaced, so a multi-byte character is
+    // never split.
+    String::from_utf8(bytes).ok()
 }
 
 /// Mask structural scalar spans across a complete buffered SSE body. Any
