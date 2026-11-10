@@ -183,6 +183,56 @@ fn mongo_backup_restore_api_specs_methods_exist() {
     );
 }
 
+/// Issue #7211: the MongoDB full load must run the same warn-level validation
+/// passes as the SQL full load, so `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` and the
+/// backend egress policy take effect on MongoDB too. Both loaders are scanned
+/// for the same pass list, and the Mongo passes must read the store's
+/// configured values rather than defaults.
+#[test]
+fn mongo_full_load_runs_sql_warn_validation_passes() {
+    fn load_body(source: &'static str, start: &str, end: &str) -> &'static str {
+        let start = source.find(start).expect("full-load function");
+        let body = &source[start..];
+        let end = body.find(end).expect("function following the full load");
+        &body[..end]
+    }
+    let mongo = load_body(
+        MONGO_STORE_SOURCE,
+        "async fn load_full_config_for_purpose(",
+        "async fn load_deployment_snapshot(",
+    );
+    let sql = load_body(
+        include_str!("../../../src/config/db_loader.rs"),
+        "pub async fn load_full_config_for_purpose(",
+        "pub async fn load_namespace_snapshot(",
+    );
+    for pass in [
+        ".validate_all_fields_with_ip_policy(",
+        "self.cert_expiry_warning_days,",
+        ".validate_hosts(ValidationAction::Warn)",
+        ".validate_unique_consumer_identities(ValidationAction::Warn)",
+        ".validate_unique_consumer_credentials(ValidationAction::Warn)",
+        ".validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)",
+    ] {
+        assert!(sql.contains(pass), "SQL full load lost {pass}");
+        assert!(mongo.contains(pass), "MongoDB full load is missing {pass}");
+    }
+    let rejecting = mongo
+        .find("collect_rejecting_runtime_config_errors(&config)")
+        .expect("rejecting validation");
+    let field_pass = mongo
+        .find(".validate_all_fields_with_ip_policy(")
+        .expect("field pass");
+    let plugin_pass = mongo
+        .find(".validate_plugin_configs(&self.backend_allow_ips")
+        .expect("plugin pass");
+    assert!(
+        field_pass < rejecting && rejecting < plugin_pass,
+        "SQL order: field/host warnings before the rejecting contract, plugin-config \
+         warnings after it"
+    );
+}
+
 /// Namespace enumeration must scan gateway_trust_bundles so a trust-only
 /// namespace is still discovered by CP/admin listing (issue #3727 / PR #3782).
 /// Paginated listing reuses `list_namespaces()`, so covering the merge is enough.

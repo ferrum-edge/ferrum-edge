@@ -64,6 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped the delta-poll block, so CP operators never saw it although
   `docs/admin_metrics.md` documents it for `cp`. It is now attached in both
   `database` and `cp` modes.
+- **MongoDB full loads run the SQL loader's warn-level validation** (#7211).
+  On MongoDB, `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` and the backend egress
+  policy had no effect at config load: no near-expiry or unreadable backend
+  certificate warnings, and no host, consumer-uniqueness, egress-policy or
+  plugin-config warnings. The MongoDB full load now runs the same warning
+  passes, in the same order, as the SQL full load. Nothing new is rejected.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then
