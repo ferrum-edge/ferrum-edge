@@ -4916,7 +4916,7 @@ FERRUM_MODE=file \
 | Database schema (post-freeze tagged releases) | Yes (versioned forward migrations) | No (old binary cannot read new schema) |
 | Config file format (build-out) | No — update the config shape and validate | No compatibility guarantee |
 | gRPC protocol (CP↔DP) | No — CP and DP must run the same build (any other build is rejected at Subscribe) | No — same build required |
-| Admin API | Generally stable | Check release notes |
+| Admin API | No compatibility guarantee during build-out ([support policy](support_policy.md#what-is-stable-enough-to-build-on-today)); changes are visible through the `openapi.yaml` parity gate | Check release notes |
 
 ### Downtime Expectations
 
@@ -4951,4 +4951,4 @@ after rollout for saturation, oversize, writer, flush, and drain failures.
 
 ### Logging Metadata Redaction
 
-Transaction metadata is redacted at serialization time before any built-in logger sink writes it. Keys matching built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, or `token` now serialize as `[REDACTED]`; use `FERRUM_LOG_REDACT_METADATA_KEYS` to add operator-specific substrings. The in-memory metadata map is unchanged for plugin logic.
+Transaction metadata is redacted at serialization time before any built-in logger sink writes it, and redaction fails closed: a value is logged only under a reviewed built-in key or a name listed in `FERRUM_LOG_SAFE_METADATA_KEYS`; every other value serializes as `[REDACTED]` (see [Metadata values are redacted unless allowlisted](#metadata-values-are-redacted-unless-allowlisted-issue-6619)). Built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, or `token`, and any operator-specific substrings in `FERRUM_LOG_REDACT_METADATA_KEYS`, always win over the allowlist. The in-memory metadata map is unchanged for plugin logic.
