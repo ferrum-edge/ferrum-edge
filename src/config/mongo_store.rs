@@ -11897,7 +11897,8 @@ mod inner {
                                             let still_referenced = this
                                                 .proxies()
                                                 .count_documents(mongodb::bson::doc! {
-                                                    "upstream_id": uid.as_str()
+                                                    "upstream_id": uid.as_str(),
+                                                    "namespace": namespace.as_str(),
                                                 })
                                                 .session(&mut *s)
                                                 .await?
@@ -13531,9 +13532,10 @@ mod inner {
                                     Box::pin(async move {
                                         let count = this
                                             .proxies()
-                                            .count_documents(
-                                                doc! { "upstream_id": upstream_id.as_str() },
-                                            )
+                                            .count_documents(doc! {
+                                                "upstream_id": upstream_id.as_str(),
+                                                "namespace": namespace.as_str(),
+                                            })
                                             .session(&mut *s)
                                             .await?;
                                         let mut deleted_namespace = None;
