@@ -1602,13 +1602,13 @@ async fn correlation_id_composition_populates_generated_and_preserved_approval_r
 }
 
 #[tokio::test]
-async fn approval_request_ids_prefer_canonical_then_legacy_custom_metadata() {
+async fn approval_request_ids_prefer_canonical_then_custom_request_id_metadata() {
+    // Canonical correlation state wins; custom-only chains fall back to the
+    // `request_id` metadata key only. The pre-rename `correlation_id`
+    // metadata spelling is not read (#7303), so a context carrying only that
+    // key sends an empty `request_id`.
     let server = MockServer::start().await;
-    for request_id in [
-        "canonical-approval-id",
-        "custom-request-id",
-        "custom-correlation-id",
-    ] {
+    for request_id in ["canonical-approval-id", "custom-request-id", ""] {
         Mock::given(method("POST"))
             .and(path("/approve"))
             .and(body_string_contains(format!(
@@ -1631,11 +1631,11 @@ async fn approval_request_ids_prefer_canonical_then_legacy_custom_metadata() {
     assert_continue(correlation.on_request_received(&mut canonical_ctx).await);
     canonical_ctx.metadata.insert(
         ferrum_edge::plugins::REQUEST_ID_METADATA_KEY.to_string(),
-        "spoofed-legacy-request-id".to_string(),
+        "spoofed-custom-request-id".to_string(),
     );
     canonical_ctx.metadata.insert(
         "correlation_id".to_string(),
-        "spoofed-legacy-correlation-id".to_string(),
+        "spoofed-custom-correlation-id".to_string(),
     );
 
     let mut request_id_ctx = create_test_context();
@@ -1645,13 +1645,13 @@ async fn approval_request_ids_prefer_canonical_then_legacy_custom_metadata() {
     );
     request_id_ctx.metadata.insert(
         "correlation_id".to_string(),
-        "lower-priority-custom-correlation-id".to_string(),
+        "ignored-custom-correlation-id".to_string(),
     );
 
     let mut correlation_id_ctx = create_test_context();
     correlation_id_ctx.metadata.insert(
         "correlation_id".to_string(),
-        "custom-correlation-id".to_string(),
+        "ignored-custom-correlation-id".to_string(),
     );
 
     let mut governor_config = approval_config(&format!("{}/approve", server.uri()));

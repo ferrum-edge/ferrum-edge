@@ -2227,10 +2227,10 @@ impl AiToolGovernor {
         let request_id = ctx
             .canonical_correlation_id()
             .or_else(|| {
-                [super::REQUEST_ID_METADATA_KEY, "correlation_id"]
-                    .into_iter()
-                    .filter_map(|key| ctx.metadata.get(key).map(String::as_str))
-                    .find(|value| !value.is_empty())
+                ctx.metadata
+                    .get(super::REQUEST_ID_METADATA_KEY)
+                    .map(String::as_str)
+                    .filter(|value| !value.is_empty())
             })
             .unwrap_or_default();
         CorrelationMeta {
