@@ -45558,6 +45558,7 @@ async fn handle_proxy_request_inner(
                             &request_xff_append_ip,
                             ctx.request_is_secure,
                             &bytes_sent_observed,
+                            inbound_version,
                         )
                     }),
                 )
@@ -49886,6 +49887,7 @@ async fn proxy_to_backend_mesh_retry(
     xff_append_ip: &str,
     request_is_secure: bool,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
+    inbound_version: hyper::Version,
 ) -> (
     retry::BackendResponse,
     Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -50011,6 +50013,7 @@ async fn proxy_to_backend_mesh_retry(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
+            inbound_version,
         )
     } else {
         boxed_proxy_to_backend_mesh_mtls(
@@ -50033,6 +50036,7 @@ async fn proxy_to_backend_mesh_retry(
             route_request_body_limit,
             route_response_body_limit,
             None,
+            inbound_version,
         )
     };
     let (response, _, request_body_exceeded) = mesh_dispatch.await;
@@ -50139,6 +50143,7 @@ fn boxed_proxy_to_backend_hbone<'a>(
     ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
     route_request_body_limit: Option<usize>,
     route_response_body_limit: Option<usize>,
+    inbound_version: hyper::Version,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
     Box::pin(async move {
         proxy_to_backend_hbone(
@@ -50160,6 +50165,7 @@ fn boxed_proxy_to_backend_hbone<'a>(
             ctx_bytes_sent_observed,
             route_request_body_limit,
             route_response_body_limit,
+            inbound_version,
         )
         .await
     })
@@ -50252,6 +50258,7 @@ fn boxed_proxy_to_backend_mesh_mtls<'a>(
     route_request_body_limit: Option<usize>,
     route_response_body_limit: Option<usize>,
     unix_socket_path: Option<&'a str>,
+    inbound_version: hyper::Version,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
     Box::pin(async move {
         proxy_to_backend_mesh_mtls(
@@ -50274,6 +50281,7 @@ fn boxed_proxy_to_backend_mesh_mtls<'a>(
             route_request_body_limit,
             route_response_body_limit,
             unix_socket_path,
+            inbound_version,
         )
         .await
     })
@@ -50385,6 +50393,7 @@ fn boxed_proxy_to_backend_mesh_retry<'a>(
     xff_append_ip: &'a str,
     request_is_secure: bool,
     ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    inbound_version: hyper::Version,
 ) -> BoxedMeshRetryDispatchFuture<'a> {
     Box::pin(proxy_to_backend_mesh_retry(
         state,
@@ -50403,6 +50412,7 @@ fn boxed_proxy_to_backend_mesh_retry<'a>(
         xff_append_ip,
         request_is_secure,
         ctx_bytes_sent_observed,
+        inbound_version,
     ))
 }
 
@@ -50492,6 +50502,8 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
             xff_append_ip,
             request_is_secure,
             &request_ctx.bytes_sent_observed,
+            // The client spoke HTTP/3, as on every other H3 bridge (issue #7165).
+            hyper::Version::HTTP_3,
         )
         .await;
     h3_mesh_buffered_retry_response(
@@ -51498,6 +51510,7 @@ fn boxed_proxy_to_backend_unix<'a>(
     ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
     effective_request_body_size_limit: usize,
     effective_max_response_body_size_bytes: usize,
+    inbound_version: hyper::Version,
 ) -> BoxedBackendDispatchFuture<'a> {
     Box::pin(proxy_to_backend_unix(
         state,
@@ -51519,6 +51532,7 @@ fn boxed_proxy_to_backend_unix<'a>(
         ctx_bytes_sent_observed,
         effective_request_body_size_limit,
         effective_max_response_body_size_bytes,
+        inbound_version,
     ))
 }
 
@@ -51553,6 +51567,7 @@ fn boxed_proxy_to_backend_unix_h2c<'a>(
     route_request_body_limit: Option<usize>,
     route_response_body_limit: Option<usize>,
     unix_socket_path: Option<&'a str>,
+    inbound_version: hyper::Version,
 ) -> BoxedBackendDispatchFuture<'a> {
     Box::pin(proxy_to_backend_mesh_mtls(
         state,
@@ -51574,6 +51589,7 @@ fn boxed_proxy_to_backend_unix_h2c<'a>(
         route_request_body_limit,
         route_response_body_limit,
         unix_socket_path,
+        inbound_version,
     ))
 }
 
@@ -51972,6 +51988,7 @@ async fn proxy_to_backend(
                 route_request_body_limit,
                 route_response_body_limit,
                 Some(socket_path),
+                inbound_version,
             )
             .await
         } else {
@@ -52000,6 +52017,7 @@ async fn proxy_to_backend(
                 ctx_bytes_sent_observed,
                 effective_max_request_body_size_bytes,
                 effective_max_response_body_size_bytes,
+                inbound_version,
             )
             .await
         };
@@ -52080,6 +52098,7 @@ async fn proxy_to_backend(
                 ctx_bytes_sent_observed,
                 route_request_body_limit,
                 route_response_body_limit,
+                inbound_version,
             )
         })
         .await;
@@ -52220,6 +52239,7 @@ async fn proxy_to_backend(
                 route_response_body_limit,
                 // SVID-mTLS transport, not a unix socket.
                 None,
+                inbound_version,
             )
         })
         .await;
@@ -61000,6 +61020,7 @@ async fn proxy_to_backend_hbone(
     // rather than at the generally larger global allowance
     // (`GHSA-xrfj-852f-645j`).
     route_response_body_limit: Option<usize>,
+    inbound_version: hyper::Version,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -61374,6 +61395,7 @@ async fn proxy_to_backend_hbone(
         cross_cluster,
         checkout,
         inner_plan.as_ref(),
+        inbound_version,
     )
     .await
 }
@@ -61409,6 +61431,7 @@ fn boxed_proxy_to_backend_hbone_after_ready<'a>(
     cross_cluster: bool,
     checkout: hbone_inner_pool::HboneInnerH1Checkout,
     inner_plan: Option<&'a HboneInnerDispatchPlan<'a>>,
+    inbound_version: hyper::Version,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
     Box::pin(async move {
         proxy_to_backend_hbone_after_ready(
@@ -61433,6 +61456,7 @@ fn boxed_proxy_to_backend_hbone_after_ready<'a>(
             cross_cluster,
             checkout,
             inner_plan,
+            inbound_version,
         )
         .await
     })
@@ -61461,6 +61485,7 @@ async fn proxy_to_backend_hbone_after_ready(
     cross_cluster: bool,
     mut checkout: hbone_inner_pool::HboneInnerH1Checkout,
     inner_plan: Option<&HboneInnerDispatchPlan<'_>>,
+    inbound_version: hyper::Version,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -61687,7 +61712,9 @@ async fn proxy_to_backend_hbone_after_ready(
             host,
         );
     }
-    if let Some(ref via) = state.via_header_http2 {
+    // The received-protocol is the client's own hop (RFC 9110 §7.6.3), not
+    // this pool's backend protocol (issue #7165).
+    if let Some(via) = via_header_for_inbound_version(state, inbound_version) {
         insert_outbound_header_or_warn(
             &mut parts.headers,
             &proxy.id,
@@ -62561,6 +62588,7 @@ async fn proxy_to_backend_unix(
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     effective_request_body_size_limit: usize,
     effective_max_response_body_size_bytes: usize,
+    inbound_version: hyper::Version,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -62838,7 +62866,9 @@ async fn proxy_to_backend_unix(
             host,
         );
     }
-    if let Some(ref via) = state.via_header_http11 {
+    // The received-protocol is the client's own hop (RFC 9110 §7.6.3), not
+    // this pool's backend protocol (issue #7165).
+    if let Some(via) = via_header_for_inbound_version(state, inbound_version) {
         insert_outbound_header_or_warn(
             &mut parts.headers,
             &proxy.id,
@@ -63420,6 +63450,7 @@ async fn proxy_to_backend_unix(
     _ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     _effective_request_body_size_limit: usize,
     _effective_max_response_body_size_bytes: usize,
+    _inbound_version: hyper::Version,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -63581,6 +63612,7 @@ async fn proxy_to_backend_mesh_mtls(
     // socket's containment allowlist, file type, owner uid, and mode are its
     // identity boundary instead.
     unix_socket_path: Option<&str>,
+    inbound_version: hyper::Version,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -64117,6 +64149,7 @@ async fn proxy_to_backend_mesh_mtls(
         request_body_limit,
         effective_max_response_body_size_bytes,
         client_grpc_deadline_at,
+        inbound_version,
     )
     .await
 }
@@ -64178,6 +64211,7 @@ fn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(
     request_body_limit: usize,
     effective_max_response_body_size_bytes: usize,
     client_grpc_deadline_at: Option<tokio::time::Instant>,
+    inbound_version: hyper::Version,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
     Box::pin(async move {
         proxy_to_backend_mesh_mtls_after_ready(
@@ -64205,6 +64239,7 @@ fn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(
             request_body_limit,
             effective_max_response_body_size_bytes,
             client_grpc_deadline_at,
+            inbound_version,
         )
         .await
     })
@@ -64236,6 +64271,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     request_body_limit: usize,
     effective_max_response_body_size_bytes: usize,
     client_grpc_deadline_at: Option<tokio::time::Instant>,
+    inbound_version: hyper::Version,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -64561,7 +64597,9 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             host,
         );
     }
-    if let Some(ref via) = state.via_header_http2 {
+    // The received-protocol is the client's own hop (RFC 9110 §7.6.3), not
+    // this pool's backend protocol (issue #7165).
+    if let Some(via) = via_header_for_inbound_version(state, inbound_version) {
         insert_outbound_header_or_warn(
             &mut parts.headers,
             &proxy.id,
@@ -65670,7 +65708,9 @@ async fn proxy_to_backend_http2(
             host,
         );
     }
-    if let Some(ref via) = state.via_header_http2 {
+    // The received-protocol is the client's own hop (RFC 9110 §7.6.3), not
+    // this pool's backend protocol (issue #7165).
+    if let Some(via) = via_header_for_inbound_version(state, parts.version) {
         insert_outbound_header_or_warn(
             &mut parts.headers,
             &proxy.id,
