@@ -1415,8 +1415,7 @@ pub struct StreamListenerManager {
     node_waypoint_udp_listener_generation: AtomicU64,
     /// Serving-owner fence: shutdown clears this under the listener-map lock
     /// before retracting so a bind-success watcher cannot republish after
-    /// teardown. Lock order is listener map, then the steering mutex; a
-    /// listener task joined under the map lock must not await that map.
+    /// teardown. Lock order is listener map, then the steering mutex.
     node_waypoint_udp_steering_open: Arc<AtomicBool>,
     /// Test fence: bind-watch after `started`, before the listener-map lock.
     node_waypoint_udp_steer_before_map_hold:
@@ -3780,10 +3779,10 @@ impl StreamListenerManager {
                         exited_for_exit.store(true, Ordering::Release);
                     }
                     if owner_for_exit && let Some(steering) = node_waypoint_udp_steering {
-                        // Do not await the listener map here: reconcile joins this
-                        // task while holding that lock. A helper observes the
-                        // non-serving mark and generation fence once the owner
-                        // releases.
+                        // Retract from a helper task so this listener task never
+                        // blocks its own exit on the listener map. The helper
+                        // observes the non-serving mark and generation fence once
+                        // the owner releases.
                         tokio::spawn(async move {
                             retract_owned_node_waypoint_udp_listener(
                                 &listeners_for_exit,
@@ -4768,9 +4767,9 @@ async fn await_stream_listener_shutdown(listener_key: &str, handle: ListenerHand
             join_handle.abort();
             // Bound the post-abort join too. Abort only takes effect at the
             // task's next await point, so a task wedged in synchronous code
-            // would otherwise hang this await — and reconcile holds the
-            // listeners mutex, so a single wedged listener would deadlock
-            // every future reconcile. Giving up here is safe: reconcile never
+            // would otherwise hang this await — and reconcile holds
+            // `reconcile_serial` across this await, so a single wedged listener
+            // would block every future reconcile. Giving up here is safe: reconcile never
             // crashes, and if the old socket is still held the replacement's
             // bind probe fails and skips only the conflicting proxy until the
             // next reconcile.

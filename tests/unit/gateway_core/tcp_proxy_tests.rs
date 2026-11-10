@@ -2479,7 +2479,7 @@ async fn test_bidirectional_copy_graceful_reclassification_preserves_byte_counts
 
 // ── Phase 1 grace-window reclassification (raw-kind precision) ──────────────
 //
-// The drain-path tests above exercise `drain_half_close_copy`, which sees
+// The drain-path tests above exercise `drain_half_close_direction`, which sees
 // the raw `io::ErrorKind` directly. These tests target the *other* half
 // of the fix: the Phase 1 grace-window paths (lines ~2174 / ~2221 of
 // `bidirectional_copy`). Those paths fire when one direction errors first,
