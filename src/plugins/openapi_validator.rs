@@ -754,10 +754,6 @@ pub struct OpenapiValidator {
     /// instance's whole lifetime.
     ops_by_method: Vec<(String, OperationBucket)>,
     has_any_request_schema: bool,
-    /// At least one operation declares `request_required`. Presence enforcement
-    /// is independent of any declared media type, so a document that declares a
-    /// required body with an empty content map still has to buffer.
-    has_any_required_request_body: bool,
     has_any_response_schema: bool,
     bypass_paths: Option<RegexSet>,
     bypass_methods: HashSet<String>,
@@ -856,13 +852,11 @@ impl OpenapiValidator {
 
         let mut grouped_ops: AHashMap<String, Vec<(String, OperationEntry)>> = AHashMap::new();
         let mut has_any_request_schema = false;
-        let mut has_any_required_request_body = false;
         let mut has_any_response_schema = false;
         let mut has_any_parameters = false;
         for (index, operation) in operations.iter().enumerate() {
             let parsed = parse_operation(operation, index, schema_draft)?;
             has_any_request_schema |= parsed.entry.has_request_schema();
-            has_any_required_request_body |= parsed.entry.request_required;
             has_any_response_schema |= parsed.entry.has_response_schema();
             has_any_parameters |= !parsed.entry.parameters.is_empty();
             grouped_ops
@@ -914,7 +908,6 @@ impl OpenapiValidator {
             ));
         }
         if !has_any_request_schema
-            && !has_any_required_request_body
             && !has_any_response_schema
             && !has_any_parameters
             && !fail_on_unknown_operation
@@ -992,7 +985,6 @@ impl OpenapiValidator {
             response_content_types,
             ops_by_method,
             has_any_request_schema,
-            has_any_required_request_body,
             has_any_response_schema,
             bypass_paths,
             bypass_methods,
@@ -1323,12 +1315,6 @@ impl OpenapiValidator {
         validator_for_content_type(&operation.request_validators, content_type)
     }
 
-    /// Whether this operation carries anything for the request contract to
-    /// enforce: a declared media schema, or a declared presence requirement.
-    fn operation_has_request_contract(operation: &OperationEntry) -> bool {
-        operation.has_request_schema() || operation.request_required
-    }
-
     /// Record that THIS instance took its request-contract decision in the
     /// client phase, so its backend-final fallback stays inert. Keyed by the
     /// process-unique instance ID: sibling instances never share the entry.
@@ -1391,8 +1377,10 @@ impl OpenapiValidator {
         // has taken no request-contract decision and must remain eligible for
         // the backend-final fallback if a later before_proxy rewrite selects
         // one of its request-contract operations.
+        // `request_required` is refused without a request-body schema, so an
+        // operation without one has no request contract at all.
         let operation = matched.entry;
-        if !Self::operation_has_request_contract(operation) {
+        if !operation.has_request_schema() {
             return PluginResult::Continue;
         }
         self.mark_decided(ctx, phase);
@@ -1410,11 +1398,6 @@ impl OpenapiValidator {
             } else {
                 PluginResult::Continue
             };
-        }
-        if !operation.has_request_schema() {
-            // Presence-only declaration: a nonempty body satisfies it and the
-            // document declares no media entry to select.
-            return PluginResult::Continue;
         }
         let content_type = header_value(headers, "content-type");
         if validator_for_content_type(&operation.request_validators, content_type).is_none() {
@@ -1663,9 +1646,7 @@ impl Plugin for OpenapiValidator {
     }
 
     fn requires_request_body_buffering(&self) -> bool {
-        self.active()
-            && self.validate_request
-            && (self.has_any_request_schema || self.has_any_required_request_body)
+        self.active() && self.validate_request && self.has_any_request_schema
     }
 
     /// The client contract is decided before `before_proxy`, so the buffer has
@@ -1700,7 +1681,7 @@ impl Plugin for OpenapiValidator {
             return false;
         }
         self.operation_for_context(ctx)
-            .is_some_and(|matched| Self::operation_has_request_contract(matched.entry))
+            .is_some_and(|matched| matched.entry.has_request_schema())
     }
 
     async fn validate_client_request_body_contract(
