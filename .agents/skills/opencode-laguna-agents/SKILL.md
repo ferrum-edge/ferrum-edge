@@ -1,5 +1,5 @@
 ---
-name: opencode-agents
+name: opencode-laguna-agents
 description: Dispatch and orchestrate local opencode laguna-s-2.1 agents via the opencode CLI harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to opencode or laguna-s workers, run multiple opencode agents, resume interrupted opencode runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
@@ -110,7 +110,7 @@ for a separate review-bot pass unless explicitly assigned. After the final reque
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
 skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
 grok-agents, muse-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
+opencode-laguna-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
 workers.
 ```
 

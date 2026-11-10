@@ -137,7 +137,7 @@ for a separate review-bot pass unless explicitly assigned. After the final reque
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
 skills or scripts (including astra-agents, sol-agents, luna-agents, opus-agents, fable-5-1-agents,
 grok-agents, muse-agents, composer-agents, qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not manually spawn
+opencode-laguna-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not manually spawn
 nested workers.
 Codex-managed automatic delegation is permitted only when the controller explicitly selected `ultra`.
 ```

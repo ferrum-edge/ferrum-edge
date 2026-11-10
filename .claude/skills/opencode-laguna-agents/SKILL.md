@@ -1,5 +1,5 @@
 ---
-name: opencode-agents
+name: opencode-laguna-agents
 description: Dispatch and orchestrate local opencode laguna-s-2.1 subagents via the opencode CLI harness for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Use when the user asks Claude to spawn opencode/laguna-s agents on issues, PRs, review findings, or red CI.
 ---
 
