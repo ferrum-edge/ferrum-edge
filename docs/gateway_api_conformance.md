@@ -1150,9 +1150,12 @@ partial server-side apply would still replace the entire list and could remove
 another controller's parent entries. Ferrum instead follows the upstream
 read-modify-write requirement: it reads the freshest status, preserves every
 non-Ferrum parent, replaces only Ferrum-owned parents, and includes that read's
-`metadata.resourceVersion` in the merge patch. A `409 Conflict` triggers a
-refetch, re-merge, and jittered retry (up to five attempts); exhaustion leaves
-the resource for the next reconcile rather than writing stale status.
+`metadata.resourceVersion` in the merge patch. A live read with an empty or
+absent `resourceVersion` refuses the write and fails the batch, exactly as on
+the SSA path, so an unguarded merge patch is never sent. A `409 Conflict`
+triggers a refetch, re-merge, and jittered retry (up to five attempts);
+exhaustion leaves the resource for the next reconcile rather than writing stale
+status.
 
 `Programmed=True` on a Gateway is additionally gated on the serving data-plane
 Service having a ready EndpointSlice endpoint when
