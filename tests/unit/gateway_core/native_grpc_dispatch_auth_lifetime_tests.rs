@@ -2299,7 +2299,9 @@ fn native_h3_cold_connect_bound_keeps_dns_outside_and_quic_h3_readiness_inside()
         "async fn create_or_get_target_sender_with_connect_deadline(",
     ] {
         let body = source_region(client, creator, "\n    }\n");
-        assert!(body.contains("boxed_h3_future(|| {"));
+        // Whitespace-insensitive: rustfmt puts a short creation closure on
+        // one line (`boxed_h3_future(|| self.create_connection(..))`).
+        assert!(compact_code(body).contains("boxed_h3_future(||"));
         assert!(body.contains("self.create_or_get_sender(key, connect_at, create).await"));
     }
     assert_eq!(
