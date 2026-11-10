@@ -2697,7 +2697,16 @@ where
                         // select arm so the watcher keeps running instead of
                         // spinning on an immediately-ready closed receiver.
                         cni_work_open = false;
-                        debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
+                        if *shutdown_rx.borrow() {
+                            debug!("CNI work queue closed during shutdown");
+                        } else {
+                            // With the chained conflist installed, ADD fails
+                            // closed while no listener serves the socket, so
+                            // this is a node-wide pod-creation outage (#7253).
+                            error!(
+                                "Node-agent CNI listener is not serving; CNI ADD on this node fails closed until the node-agent is restarted"
+                            );
+                        }
                     }
                 }
             }

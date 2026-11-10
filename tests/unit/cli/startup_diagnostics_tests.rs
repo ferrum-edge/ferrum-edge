@@ -395,7 +395,14 @@ async fn cni_startup_failures_withhold_paths_and_keep_watcher_fallback() {
             );
         }
         let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(output.contains("kube-rs watcher"), "{output}");
+        // A dead listener must not be reported as a harmless fallback: with
+        // the chained conflist installed, CNI ADD fails closed (#7253).
+        assert!(!output.contains("kube-rs watcher"), "{output}");
+        assert!(
+            output.contains("CNI ADD on this node fails closed")
+                || output.contains("serves no CNI calls until restarted"),
+            "{output}"
+        );
         let reason = if failure == "owner" {
             "ownership_conflict"
         } else {
