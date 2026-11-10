@@ -4346,6 +4346,10 @@ impl DatabaseStore {
         .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
             .await?;
+        // Compact once per touched namespace after every change row is
+        // written, not once per plugin (issue #7209).
+        let mut compact_namespaces: BTreeSet<String> = BTreeSet::new();
+        compact_namespaces.insert(namespace.to_string());
         for (plugin_id, plugin_namespace) in proxy_scoped_plugins {
             self.record_config_change_tx(
                 &mut tx,
@@ -4355,10 +4359,12 @@ impl DatabaseStore {
                 "delete",
             )
             .await?;
-            self.compact_config_changes_tx(&mut tx, &plugin_namespace)
+            compact_namespaces.insert(plugin_namespace);
+        }
+        for compact_namespace in &compact_namespaces {
+            self.compact_config_changes_tx(&mut tx, compact_namespace)
                 .await?;
         }
-        self.compact_config_changes_tx(&mut tx, namespace).await?;
         tx.commit().await?;
 
         self.check_slow_query("delete_proxy", start);
@@ -7225,6 +7231,27 @@ impl DatabaseStore {
         operation: &str,
     ) -> Result<(), anyhow::Error> {
         self.lock_config_change_sequence_tx(tx, namespace).await?;
+        self.insert_config_change_row_tx(tx, namespace, resource_type, resource_id, operation)
+            .await
+    }
+
+    /// Insert one change row WITHOUT taking the namespace change-sequence
+    /// lock.
+    ///
+    /// Only for callers that already hold [`Self::lock_config_change_sequences_tx`]
+    /// for `namespace` in this transaction (the batch insert helpers, whose
+    /// callers lock every item's namespace in sorted order first). Re-taking
+    /// the lock per row cost an upsert plus `SELECT ... FOR UPDATE` (or an
+    /// SQLite `UPDATE`) for every one of up to thousands of rows (issue
+    /// #7209). Everyone else uses [`Self::record_config_change_tx`].
+    async fn insert_config_change_row_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        resource_type: &str,
+        resource_id: &str,
+        operation: &str,
+    ) -> Result<(), anyhow::Error> {
         sqlx::query(&self.q("INSERT INTO config_changes \
              (namespace, resource_type, resource_id, operation, created_at) \
              VALUES (?, ?, ?, ?, ?)"))
@@ -7665,8 +7692,14 @@ impl DatabaseStore {
                         .await?;
                 }
             }
-            self.record_config_change_tx(&mut *tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
-                .await?;
+            self.insert_config_change_row_tx(
+                &mut *tx,
+                &proxy.namespace,
+                "proxy",
+                &proxy.id,
+                "upsert",
+            )
+            .await?;
             touched_namespaces.insert(proxy.namespace.clone());
         }
 
@@ -7772,7 +7805,7 @@ impl DatabaseStore {
                     .bind(namespace)
                     .execute(&mut **tx)
                     .await?;
-                self.record_config_change_tx(&mut *tx, namespace, "proxy", proxy_id, "upsert")
+                self.insert_config_change_row_tx(&mut *tx, namespace, "proxy", proxy_id, "upsert")
                     .await?;
             }
         }
@@ -7865,7 +7898,7 @@ impl DatabaseStore {
                 .await?;
             self.insert_consumer_identity_index_tx(&mut *tx, consumer)
                 .await?;
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &consumer.namespace,
                 "consumer",
@@ -7988,10 +8021,16 @@ impl DatabaseStore {
                     .bind(&pc.id)
                     .execute(&mut **tx)
                     .await?;
-                self.record_config_change_tx(&mut *tx, &pc.namespace, "proxy", proxy_id, "upsert")
-                    .await?;
+                self.insert_config_change_row_tx(
+                    &mut *tx,
+                    &pc.namespace,
+                    "proxy",
+                    proxy_id,
+                    "upsert",
+                )
+                .await?;
             }
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &pc.namespace,
                 "plugin_config",
@@ -8112,7 +8151,7 @@ impl DatabaseStore {
                 .bind(upstream.updated_at.to_rfc3339())
                 .execute(&mut **tx)
                 .await?;
-            self.record_config_change_tx(
+            self.insert_config_change_row_tx(
                 &mut *tx,
                 &upstream.namespace,
                 "upstream",
