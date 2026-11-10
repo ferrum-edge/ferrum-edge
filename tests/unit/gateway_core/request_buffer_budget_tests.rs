@@ -688,7 +688,7 @@ fn every_request_body_publication_fails_closed() {
         let handling: String = publication.chars().take(1_200).collect();
         assert!(
             handling.contains("request_buffer_capacity_backend_response(")
-                || handling.contains("build_request_buffer_capacity_response(")
+                || handling.contains("RequestBodyReadRefusal::BufferCapacity")
                 || handling.contains("boxed_finalize_request_buffer_capacity_rejection("),
             "a request-body publication must answer the capacity terminal when the budget \
              cannot cover the body"
@@ -1555,6 +1555,21 @@ fn every_request_buffer_capacity_refusal_selects_the_gateway_capacity_terminal()
         4,
         "both native-gRPC collects, the split transform and the mixed publication"
     );
+    // The early and pre-dispatch collectors' capacity refusals share one
+    // reject-pipeline helper, which marks before the terminal finalizer runs
+    // its reject hooks (issue #7163).
+    let early = proxy
+        .split("fn boxed_finalize_request_body_read_refusal<'a>(")
+        .nth(1)
+        .expect("early request-body refusal helper")
+        .split("\n}\n")
+        .next()
+        .expect("bounded helper");
+    let marked = early
+        .find(MARK)
+        .expect("the capacity refusal marks the terminal");
+    let finalizer = early.find(TERMINAL).expect("the terminal finalizer");
+    assert!(marked < finalizer);
     // Dispatch-stage refusals reach the response pipeline as a backend
     // response, which marks them before any response hook.
     let dispatch = proxy
@@ -1626,4 +1641,69 @@ fn a_dispatch_stage_capacity_terminal_takes_the_gateway_terminal_hook_path() {
         .next()
         .expect("bounded factory");
     assert!(factory.contains("Box::pin(async move {"));
+}
+
+/// Issue #7163: every early (authenticate / authorize / before_proxy) and
+/// pre-dispatch request-body size, timeout and capacity refusal runs the same
+/// reject pipeline as the terminal collector: reject-path hooks, header policy,
+/// gRPC / gRPC-Web shaping and a transaction log under its own phase, counted
+/// once. No collector answers one with a bare or pre-built response any more.
+#[test]
+fn early_request_body_read_refusals_share_the_terminal_reject_pipeline() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    for retired in [
+        "fn build_request_body_too_large_response(",
+        "fn build_request_buffer_capacity_response(",
+        "record_request(&state, 413);",
+    ] {
+        assert!(
+            !proxy.contains(retired),
+            "`{retired}` answered a body refusal outside the reject pipeline"
+        );
+    }
+    for phase in [
+        "request_body_refused_before_authenticate",
+        "request_body_refused_before_authorize",
+        "request_body_refused_before_before_proxy",
+        "request_body_refused_before_dispatch",
+    ] {
+        let calls = proxy
+            .split("boxed_finalize_request_body_read_refusal(")
+            .skip(1)
+            .filter(|call| {
+                call.split(".await);")
+                    .next()
+                    .is_some_and(|args| args.contains(&format!("\"{phase}\",")))
+            })
+            .count();
+        assert!(calls >= 3, "{phase}: size, capacity and timeout refusals");
+    }
+    let finalizer = proxy
+        .split("async fn finalize_terminal_request_body_read_rejection(")
+        .nth(1)
+        .expect("terminal request-body refusal finalizer")
+        .split("\n}\n")
+        .next()
+        .expect("bounded finalizer");
+    for step in [
+        "rejection_phase: &'static str,",
+        "finalize_reject_response_with_after_proxy_hooks_and_commit_policy(",
+        "log_rejected_request_with_path(",
+        "ctx.terminal_record.mark_counted();",
+        "record_request(state,",
+    ] {
+        assert!(finalizer.contains(step), "the finalizer must use `{step}`");
+    }
+    let diagnostic = include_str!("../../../src/diagnostic_ref.rs");
+    for phase in [
+        "\"request_body_refused_before_authenticate\"",
+        "\"request_body_refused_before_authorize\"",
+        "\"request_body_refused_before_before_proxy\"",
+        "\"request_body_refused_before_dispatch\"",
+    ] {
+        assert!(
+            diagnostic.contains(phase),
+            "{phase} must be a compiled-in rejection phase"
+        );
+    }
 }

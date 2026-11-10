@@ -1320,7 +1320,13 @@ have their own phases: `invalid_backend_path` (a `500` when the matched route an
 target cannot form a backend path), `websocket_upgrade_unavailable` (a `500`
 when an upgrade request carries no upgrade handle), and
 `mesh_transport_dispatch_required` (the native HTTP/3 `502` for a target that
-needs mesh transport). A rejection decided before any proxy matched (an inbound
+needs mesh transport). On HTTP/1.1 and HTTP/2 a request body refused while it
+is buffered (`413` too large, `408` read timeout, `503` buffer capacity) is
+logged as `request_body_refused_before_authenticate`, `_before_authorize`,
+`_before_before_proxy` or `_before_dispatch` by the collector that refused it,
+or `on_final_request_body` by the terminal one; every one of them runs the
+reject-path `after_proxy` hooks and response-header policy. A rejection decided
+before any proxy matched (an inbound
 HBONE relay-synthesis refusal) is logged under the gateway's serving namespace
 (`FERRUM_NAMESPACE`). Gateway-generated gRPC
 errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
