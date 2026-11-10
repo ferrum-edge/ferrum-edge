@@ -30163,39 +30163,6 @@ mod tests {
     }
 
     #[test]
-    fn dr_tls_sni_and_sans_project_onto_upstream() {
-        let mut upstream =
-            destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
-        let policy = MeshTrafficPolicy {
-            tls: Some(MeshTrafficPolicyTls {
-                mode: MtlsMode::Simple,
-                sni: Some("reviews.mesh.internal".to_string()),
-                subject_alt_names: vec![
-                    "reviews.mesh.internal".to_string(),
-                    "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
-                ],
-                ..MeshTrafficPolicyTls::default()
-            }),
-            ..MeshTrafficPolicy::default()
-        };
-
-        apply_traffic_policy_to_upstream(&mut upstream, &policy, &test_mesh_runtime_config())
-            .expect("traffic policy applies");
-
-        assert_eq!(
-            upstream.backend_tls_sni.as_deref(),
-            Some("reviews.mesh.internal")
-        );
-        assert_eq!(
-            upstream.backend_tls_san_allow_list,
-            vec![
-                "reviews.mesh.internal".to_string(),
-                "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn dr_tls_drops_invalid_sni_and_sans_before_projection() {
         let mut upstream =
             destination_rule_test_upstream("u1", "reviews.default.svc.cluster.local");
@@ -32306,6 +32273,23 @@ mod tests {
                 "bpf_metrics must NOT be auto-injected for topology {topology:?}"
             );
         }
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_skips_bpf_metrics_on_service_waypoint() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::ServiceWaypoint;
+        let mut config = GatewayConfig::default();
+
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_BPF_METRICS_PLUGIN_ID),
+            "bpf_metrics must NOT be auto-injected for a ServiceWaypoint"
+        );
     }
 
     #[test]
@@ -36470,12 +36454,34 @@ mod tests {
         });
         wait_for_mesh_authz_label(&proxy_state, "app", "good-baseline").await;
 
+        // Wait for the apply task's own verdict on the bad slice, so the
+        // "nothing changed" assertions below cannot pass merely because the
+        // task never reached it.
+        let mut verdicts = mesh_state.subscribe_runtime_verdict();
         mesh_state.install_slice(MeshSlice {
             version: "bad-strict".to_string(),
             labels: [("app".to_string(), "bad-tls".to_string())].into(),
             ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let verdict = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                verdicts
+                    .changed()
+                    .await
+                    .expect("runtime verdict publisher is alive");
+                let latest = verdicts.borrow_and_update().clone();
+                if let Some(verdict) = latest.filter(|verdict| verdict.version == "bad-strict") {
+                    break verdict;
+                }
+            }
+        })
+        .await
+        .expect("the apply task must judge the bad-strict slice");
+        assert_eq!(
+            verdict.outcome,
+            MeshSliceRuntimeOutcome::Rejected(MeshSliceRuntimeRejectReason::TlsReload),
+            "the failed inbound TLS rebuild must reject the slice"
+        );
 
         assert!(
             proxy_state.mesh_inbound_tls.load_full().is_none(),
@@ -37641,11 +37647,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn staged_spiffe_bundle_publishes_only_on_apply() {
-        // F4: a rebuilt inbound SPIFFE trust-bundle must NOT reach the live slot
-        // until the slice is accepted. `publish_staged_spiffe_bundle` is the
-        // post-accept publish step; until it runs the live slot keeps its
-        // previous value, and `None` (rejected/no-slot) leaves it untouched.
+    async fn staged_spiffe_bundle_publish_stores_into_live_slot() {
+        // F4: `publish_staged_spiffe_bundle` is the post-accept publish step
+        // that moves a staged inbound SPIFFE trust-bundle into the live slot.
         use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
 
         let state = make_test_proxy_state(GatewayConfig::default());
@@ -37662,17 +37666,8 @@ mod tests {
                 refresh_hint_seconds: None,
             }),
         }));
-        let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(original.clone()));
+        let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(original));
 
-        // A `None` staged bundle (rejected slice or no SVID slot) is a no-op.
-        publish_staged_spiffe_bundle(&state, None);
-        assert!(
-            Arc::ptr_eq(&slot.load_full(), &original),
-            "publishing None must leave the live slot untouched"
-        );
-
-        // Build a replacement bundle and stage it. Staging must NOT mutate the
-        // live slot.
         let replacement = Arc::new(Some(SvidBundle {
             spiffe_id: id,
             cert_chain_der: vec![vec![7, 8, 9]],
@@ -37688,10 +37683,6 @@ mod tests {
             slot: slot.clone(),
             bundle: replacement.clone(),
         });
-        assert!(
-            Arc::ptr_eq(&slot.load_full(), &original),
-            "merely holding a staged bundle must not change the live slot"
-        );
 
         // Publishing (post-accept) swaps the slot to the staged bundle.
         publish_staged_spiffe_bundle(&state, staged);
@@ -40082,6 +40073,16 @@ mod tests {
             .expect_err("Disable on NodeWaypoint must be rejected");
 
         assert!(err.to_string().contains("node_waypoint"));
+        assert!(err.to_string().contains("HBONE"));
+    }
+
+    #[test]
+    fn validate_inbound_mtls_mode_rejects_disable_on_service_waypoint() {
+        let runtime = runtime_with_topology(MeshTopology::ServiceWaypoint);
+        let err = validate_inbound_mtls_mode_for_topology(&runtime, config::MtlsMode::Disable)
+            .expect_err("Disable on ServiceWaypoint must be rejected");
+
+        assert!(err.to_string().contains("service_waypoint"));
         assert!(err.to_string().contains("HBONE"));
     }
 

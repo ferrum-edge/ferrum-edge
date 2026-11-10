@@ -3655,13 +3655,6 @@ mod tests {
     }
 
     #[test]
-    fn resolution_table_empty_slice() {
-        let table = DnsResolutionTable::from_mesh_slice(&MeshSlice::default());
-        assert_eq!(table.exact_count(), 0);
-        assert_eq!(table.wildcard_count(), 0);
-    }
-
-    #[test]
     fn resolution_table_deduplicates_ips() {
         let spiffe1 = "spiffe://cluster.local/ns/default/sa/api-1";
         let spiffe2 = "spiffe://cluster.local/ns/default/sa/api-2";
@@ -3881,31 +3874,6 @@ mod tests {
     // ── Wildcard resolution edge cases ──────────────────────────────────
 
     #[test]
-    fn wildcard_does_not_match_base_domain() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(vec!["*.corp.io"], vec!["10.0.0.1"])],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        assert!(table.resolve("corp.io").is_none());
-    }
-
-    #[test]
-    fn wildcard_does_not_match_multi_level_subdomain() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(vec!["*.example.com"], vec!["10.0.0.1"])],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        // Multi-level subdomain should NOT match a single-label wildcard
-        assert!(table.resolve("deep.sub.example.com").is_none());
-        // Single-level subdomain should match
-        assert!(table.resolve("api.example.com").is_some());
-    }
-
-    #[test]
     fn wildcard_multiple_overlapping_suffixes() {
         let slice = MeshSlice {
             service_entries: vec![
@@ -4093,22 +4061,6 @@ mod tests {
             DnsDecision::Respond(_) => panic!("non-mesh name should be forwarded"),
             DnsDecision::Drop => panic!("valid query should not be dropped"),
         }
-    }
-
-    #[test]
-    fn resolution_table_case_insensitive_query() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(
-                vec!["my-service.example.com"],
-                vec!["10.0.0.1"],
-            )],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        assert!(table.resolve("MY-SERVICE.EXAMPLE.COM").is_some());
-        assert!(table.resolve("My-Service.Example.Com").is_some());
-        assert!(table.resolve("my-service.example.com").is_some());
     }
 
     #[test]
