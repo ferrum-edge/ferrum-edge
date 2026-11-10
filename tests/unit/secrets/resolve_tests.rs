@@ -9,7 +9,7 @@
 //! unsafe-env contract forbids.
 
 use super::resolve_env_secret;
-use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference};
+use ferrum_edge::secrets::resolve_all_env_secrets;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -590,14 +590,12 @@ fn test_resolve_external_reference_refuses_non_regular_file_source() {
                 .unwrap();
             let fifo_path = std::env::var("FERRUM_TEST_SECRET_BLOCKED_ONE_FILE")
                 .expect("the helper set the FIFO source");
-            match rt.block_on(resolve_external_reference(
+            rt.block_on(ferrum_edge::secrets::resolve_external_reference(
                 "file",
                 &fifo_path,
                 "FERRUM_TEST_SECRET_BLOCKED_ONE",
-            )) {
-                Ok(_) => Ok(()),
-                Err(err) => Err(err),
-            }
+            ))
+            .map(|_| ())
         },
     );
 }
