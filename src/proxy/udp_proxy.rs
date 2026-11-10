@@ -5790,34 +5790,16 @@ fn spawn_session_cleanup(
                     }
 
                     for (session_key, expired_session) in &expired {
-                        if let Some((_, session)) =
-                            sessions.remove_if(session_key, |_, v| Arc::ptr_eq(v, expired_session))
+                        if let Some(session) =
+                            remove_idle_udp_session(&sessions, session_key, expired_session)
                         {
-                            // Mark the session expired BEFORE we let go of
-                            // any reference. The recv-loop fast path may
-                            // hold a `last_client` Arc to this session
-                            // that survives the map removal; the flag is
-                            // how that path notices it must re-create.
-                            session
-                                .expired
-                                .store(true, std::sync::atomic::Ordering::Release);
                             // Close DTLS connection if active
                             if let Some(ref dtls) = session.dtls_conn {
                                 let _ = dtls.close().await;
                             }
-                            // Signal plain-UDP backend reply tasks to stop even
-                            // when no backend datagram arrives to wake recv().
-                            // notify_one stores a permit so the wakeup cannot be
-                            // lost if the reply task has not registered yet.
-                            signal_udp_reply_task_stop(
-                                &session.stop_reply_task,
-                                session.stop_notify.as_ref(),
-                            );
-                            session.close_hook_ingress();
+                            release_idle_udp_session(&session, &metrics);
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
-                            session.release_session_guards();
-                            metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                             debug!(
                                 proxy_id = %proxy_id,
                                 client = %udp_client_log_addr(session_key.client),
@@ -7270,6 +7252,119 @@ pub(crate) fn udp_authorization_disconnect_classification() -> (
         crate::plugins::DisconnectCause::RecvError,
         Direction::ClientToBackend,
     )
+}
+
+/// Settled disconnect attribution for a UDP session teardown:
+/// `(message, error class, cause, direction)`.
+type UdpDisconnectError = (
+    String,
+    crate::retry::ErrorClass,
+    crate::plugins::DisconnectCause,
+    Direction,
+);
+
+/// The disconnect-summary fields a reply-task exit settles:
+/// `(connection_error, error_class, disconnect_cause, disconnect_direction)`.
+type UdpReplyExitSummaryFields = (
+    Option<String>,
+    Option<crate::retry::ErrorClass>,
+    Option<crate::plugins::DisconnectCause>,
+    Option<Direction>,
+);
+
+/// Authorization attribution for a backend reply task's exit.
+///
+/// Taken from the session's own settlement LATCH rather than from which select
+/// arm broke the loop (issue #3816): the client→backend direction and the
+/// hook-ingress worker can both observe the expiry first and then wake the
+/// reply task through the ordinary stop signal, which is indistinguishable
+/// from an idle-cleanup stop at that point. The latch IS the record of the
+/// decision, so the summary reports it whichever direction saw it. A genuine
+/// backend or client-write failure that already broke the loop keeps its own
+/// attribution — that failure really is what ended the session.
+fn attribute_udp_reply_task_exit(
+    session: &UdpSession,
+    disconnect_error: Option<UdpDisconnectError>,
+) -> Option<UdpDisconnectError> {
+    if disconnect_error.is_none() && session.observed_authorization_termination().is_some() {
+        return Some(udp_authorization_disconnect_classification());
+    }
+    disconnect_error
+}
+
+/// The backend reply task's exit teardown, after its DTLS close: mark this
+/// generation expired, close its hook ingress, remove ONLY this generation
+/// from the session map, and release its guards and the active-session gauge
+/// exactly once. Returns the disconnect-summary fields when this call owned
+/// the removal, `None` when the idle cleanup (or a newer generation's
+/// teardown) already did. Shared by production and
+/// [`UdpAuthorizationSessionProbe`] so the probe cannot drift from it.
+fn settle_udp_reply_task_exit(
+    sessions: &SessionMap,
+    session_key: &UdpSessionKey,
+    session: &Arc<UdpSession>,
+    metrics: &UdpProxyMetrics,
+    disconnect_error: Option<UdpDisconnectError>,
+) -> Option<UdpReplyExitSummaryFields> {
+    // Mark expired BEFORE removal so the recv-loop's `last_client`
+    // fast-path cache (which checks only this flag) stops forwarding
+    // through the dead session and re-creates one. The flag is on THIS
+    // generation's Arc, so a newer session re-created at the same client
+    // address is unaffected.
+    session
+        .expired
+        .store(true, std::sync::atomic::Ordering::Release);
+    session.close_hook_ingress();
+    // Only decrement active_sessions if we actually removed THIS session
+    // (the cleanup task may have already removed and decremented it, or a
+    // newer session may have been re-created at the same client address —
+    // identity-aware removal must not evict that newer generation).
+    sessions.remove_if(session_key, |_, v| Arc::ptr_eq(v, session))?;
+    session.release_session_guards();
+    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    Some(match disconnect_error {
+        Some((message, error_class, cause, direction)) => (
+            Some(message),
+            Some(error_class),
+            Some(cause),
+            Some(direction),
+        ),
+        None => (
+            None,
+            None,
+            Some(crate::plugins::DisconnectCause::GracefulShutdown),
+            None,
+        ),
+    })
+}
+
+/// Identity-aware idle removal shared by the cleanup task and
+/// [`UdpAuthorizationSessionProbe`]: removes ONLY `expected` (a session
+/// re-created at the same client address after the scan is a newer, still-live
+/// generation) and marks it expired before any reference is released, so the
+/// recv-loop's `last_client` fast path notices it must re-create.
+fn remove_idle_udp_session(
+    sessions: &SessionMap,
+    session_key: &UdpSessionKey,
+    expected: &Arc<UdpSession>,
+) -> Option<Arc<UdpSession>> {
+    let (_, session) = sessions.remove_if(session_key, |_, v| Arc::ptr_eq(v, expected))?;
+    session
+        .expired
+        .store(true, std::sync::atomic::Ordering::Release);
+    Some(session)
+}
+
+/// The rest of an idle removal, after the DTLS close: stop the plain-UDP
+/// backend reply task even when no backend datagram arrives to wake `recv()`
+/// (`notify_one` stores a permit, so the wakeup cannot be lost if the task has
+/// not registered yet), close hook ingress, and release the session's guards
+/// and the active-session gauge.
+fn release_idle_udp_session(session: &UdpSession, metrics: &UdpProxyMetrics) {
+    signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+    session.close_hook_ingress();
+    session.release_session_guards();
+    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Outcome of one authorization-bounded backend-reply receive.
@@ -10127,63 +10222,22 @@ async fn create_session(
                 .fetch_add(batch_bytes, Ordering::Relaxed);
         }
         // Session's backend receiver exited — remove session.
-        //
-        // Authorization attribution is taken from the session's own settlement
-        // LATCH rather than from which select arm broke the loop (issue
-        // #3816): the client→backend direction and the hook-ingress worker can
-        // both observe the expiry first and then wake this task through the
-        // ordinary stop signal, which is indistinguishable from an idle-cleanup
-        // stop at this point. The latch IS the record of the decision, so the
-        // summary reports it whichever direction saw it. A genuine backend or
-        // client-write failure that already broke the loop keeps its own
-        // attribution — that failure really is what ended the session.
-        if disconnect_error.is_none()
-            && reply_session.observed_authorization_termination().is_some()
-        {
-            disconnect_error = Some(udp_authorization_disconnect_classification());
-        }
+        let disconnect_error = attribute_udp_reply_task_exit(&reply_session, disconnect_error);
         // Close DTLS connection if active
         if let Some(ref dtls) = reply_dtls {
             dtls.close().await;
         }
-        // Mark expired BEFORE removal so the recv-loop's `last_client`
-        // fast-path cache (which checks only this flag) stops forwarding
-        // through the dead session and re-creates one. The flag is on THIS
-        // generation's Arc, so a newer session re-created at the same client
-        // address is unaffected.
-        reply_session
-            .expired
-            .store(true, std::sync::atomic::Ordering::Release);
-        reply_session.close_hook_ingress();
-        // Only decrement active_sessions if we actually removed THIS session
-        // (the cleanup task may have already removed and decremented it, or a
-        // newer session may have been re-created at the same client address —
-        // identity-aware removal must not evict that newer generation).
-        if reply_sessions
-            .remove_if(&session_key, |_, v| Arc::ptr_eq(v, &reply_session))
-            .is_some()
+        if let Some((connection_error, error_class, disconnect_cause, disconnect_direction)) =
+            settle_udp_reply_task_exit(
+                &reply_sessions,
+                &session_key,
+                &reply_session,
+                &reply_metrics,
+                disconnect_error,
+            )
         {
-            reply_session.release_session_guards();
-            reply_metrics
-                .active_sessions
-                .fetch_sub(1, Ordering::Relaxed);
             let disconnected_ms = coarse_epoch_millis();
             let disconnected_wall_at = chrono::Utc::now();
-            let (connection_error, error_class, disconnect_cause, disconnect_direction) =
-                match disconnect_error {
-                    Some((message, error_class, cause, direction)) => (
-                        Some(message),
-                        Some(error_class),
-                        Some(cause),
-                        Some(direction),
-                    ),
-                    None => (
-                        None,
-                        None,
-                        Some(crate::plugins::DisconnectCause::GracefulShutdown),
-                        None,
-                    ),
-                };
             emit_udp_stream_disconnect(
                 &reply_plugins,
                 UdpDisconnectContext {
@@ -10746,37 +10800,20 @@ impl UdpAuthorizationSessionProbe {
         (live, cache.is_some())
     }
 
-    /// Run the production teardown the backend reply task performs at exit:
-    /// authorization attribution from the latch, mark expired, close the
-    /// hook-ingress channel, identity-aware removal of ONLY this generation,
-    /// and a single overload / active-session release. Returns the disconnect
-    /// summary when this call owned the removal.
+    /// Run the production teardown the backend reply task performs at exit
+    /// ([`attribute_udp_reply_task_exit`] + [`settle_udp_reply_task_exit`]; a
+    /// probe session has no DTLS connection to close in between). Returns the
+    /// disconnect summary when this call owned the removal.
     pub fn run_reply_task_exit_teardown(&self) -> Option<crate::plugins::StreamTransactionSummary> {
-        let terminated = self.session.observed_authorization_termination().is_some();
-        self.session
-            .expired
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.session.close_hook_ingress();
-        let removed = self
-            .sessions
-            .remove_if(&self.session_key, |_, v| Arc::ptr_eq(v, &self.session))
-            .is_some();
-        if !removed {
-            return None;
-        }
-        self.session.release_session_guards();
-        self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-        let mut connection_error = None;
-        let mut error_class = None;
-        let mut disconnect_cause = None;
-        let mut disconnect_direction = None;
-        if terminated {
-            let (message, class, cause, direction) = udp_authorization_disconnect_classification();
-            connection_error = Some(message);
-            error_class = Some(class);
-            disconnect_cause = Some(cause);
-            disconnect_direction = Some(direction);
-        }
+        let disconnect_error = attribute_udp_reply_task_exit(&self.session, None);
+        let (connection_error, error_class, disconnect_cause, disconnect_direction) =
+            settle_udp_reply_task_exit(
+                &self.sessions,
+                &self.session_key,
+                &self.session,
+                &self.metrics,
+                disconnect_error,
+            )?;
         Some(build_udp_stream_summary(UdpDisconnectContext {
             namespace: &self.session.proxy_namespace,
             proxy_id: &self.session.proxy_id,
@@ -10793,22 +10830,16 @@ impl UdpAuthorizationSessionProbe {
         }))
     }
 
-    /// Remove this generation the way the idle-cleanup task does, so a
+    /// Remove this generation the way the idle-cleanup task does
+    /// ([`remove_idle_udp_session`] + [`release_idle_udp_session`]), so a
     /// simultaneous idle expiry and authorization expiry can be raced.
     pub fn run_idle_cleanup_removal(&self) -> bool {
-        let Some((_, session)) = self
-            .sessions
-            .remove_if(&self.session_key, |_, v| Arc::ptr_eq(v, &self.session))
+        let Some(session) =
+            remove_idle_udp_session(&self.sessions, &self.session_key, &self.session)
         else {
             return false;
         };
-        session
-            .expired
-            .store(true, std::sync::atomic::Ordering::Release);
-        signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
-        session.close_hook_ingress();
-        session.release_session_guards();
-        self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        release_idle_udp_session(&session, &self.metrics);
         true
     }
 
