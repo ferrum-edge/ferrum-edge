@@ -28,6 +28,61 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### ferrum-mesh chart value removals (#7297, #7299)
+
+Two `charts/ferrum-mesh` values are removed. The values schema rejects them, so
+an install or upgrade that still sets them fails at `helm template`.
+
+- `ambient.inboundPort`, `ambient.outboundPort` and `ambient.hbonePort` only
+  declared container ports; the proxy never listened on them (#7297). The
+  `outbound`, `inbound` and `hbone` container ports are now derived from the
+  listen addresses the proxy binds. **Operator action:** move a non-default
+  port into `ambient.env` as `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` (default
+  `127.0.0.1:15001`), `FERRUM_MESH_INBOUND_LISTEN_ADDR` (default
+  `0.0.0.0:15006`) or `FERRUM_MESH_HBONE_LISTEN_ADDR` (default
+  `0.0.0.0:15008`), and delete the `*Port` value.
+- `crds.adoptExisting` was a confirmation flag for adopting the
+  `UDPResponseAmplificationPolicy` CRD installed by the former `crds/`
+  directory (#7299). Helm's own ownership check already refuses an unmanaged
+  CRD, and `helm upgrade --take-ownership` adopts it. **Operator action:** drop
+  `--set crds.adoptExisting=...`; keep `--take-ownership` for a one-time
+  adoption.
+
+### Helm renders that would not run now fail (#7298, #7299)
+
+These inputs used to render cleanly and then fail on the cluster. They now
+fail `helm template` / `helm upgrade` with the fix in the message.
+
+- `ferrum-mesh` with `ca.enabled=true`: the CA Deployment runs
+  `FERRUM_MODE=cp` from `ca.env`, which refuses a non-loopback plaintext CP
+  gRPC bind at startup (#7298). **Operator action:** set
+  `ca.env.FERRUM_CP_GRPC_TLS_CERT_PATH` and `ca.env.FERRUM_CP_GRPC_TLS_KEY_PATH`
+  (and mount them), bind a loopback `ca.env.FERRUM_CP_GRPC_LISTEN_ADDR`, or set
+  `ca.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` for development.
+- `ferrum-gateway` with a null `terminationGracePeriodSeconds`: that rendered an
+  empty field, leaving the pod on Kubernetes' 30s default (#7299). **Operator
+  action:** set an integer at least the minimum the error names.
+- `ferrum-gateway` with `admin.service.enabled=true` or
+  `metrics.serviceMonitor.enabled=true` and an `admin.bindAddress` that is
+  loopback in another spelling (for example `0:0:0:0:0:0:0:1`), or
+  `cp.service.enabled=true` with such a `cp.grpcBindAddress`: loopback is now
+  parsed, not prefix-matched, so the Service is refused as unreachable
+  (#7299). **Operator action:** bind a routable address such as `0.0.0.0` or
+  `::`.
+
+`ferrum-gateway` no longer fails the SleepAction check under `helm template`'s
+default Kubernetes version (1.20.0), which is not a real cluster; an explicit
+`--kube-version` below 1.29 still fails, as in `ferrum-mesh`.
+
+### `correlation_id` metadata is no longer a request-ID fallback (#7303)
+
+`ai_tool_governor` approval requests and `ws_frame_logging` disconnect records
+read the request ID from private canonical correlation state (the built-in
+`correlation_id` plugin), then from the `request_id` transaction metadata key.
+They no longer fall back to a `correlation_id` metadata key. **Operator
+action:** a custom plugin that publishes a request ID for these consumers must
+write it to `request_id` (`ferrum_edge::plugins::REQUEST_ID_METADATA_KEY`).
+
 ### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
@@ -3800,14 +3855,15 @@ not cascade-deleted. `crds.install=false` without
 `crds.skipInstallAcknowledged=true` fails render.
 
 A CRD that already exists from the former `crds/` directory is not in the Helm
-release. The first upgrade to this chart fails closed unless you adopt it.
+release. The first upgrade to this chart fails on Helm's ownership check unless
+Helm takes ownership of it.
 
 **Operator action:** before the first `helm upgrade` to this chart version on a
 cluster that already has `udpresponseamplificationpolicies.gateway.ferrum.io`:
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
-  --take-ownership --set crds.adoptExisting=true
+  --take-ownership
 ```
 
 `--take-ownership` was added in Helm 3.17.0, so this adoption step needs a
@@ -3818,8 +3874,10 @@ hand.
 Adoption keeps the CRD in the cluster and leaves its existing policy
 objects untouched. The chart renders the CRD with
 `helm.sh/resource-policy: keep`, so a later uninstall still does not delete
-it. After adoption, leave `crds.install=true` and drop `crds.adoptExisting`.
-Do not set `crds.install=false` to silence the error.
+it. After adoption, leave `crds.install=true`. Do not set `crds.install=false`
+to silence the error. (The chart's former `crds.adoptExisting` confirmation
+value was removed; see [#7299](#ferrum-mesh-chart-value-removals-7297-7299)
+below.)
 
 ### Enabled mesh injector requires a webhook CA trust source (issue [#4433](https://github.com/ferrum-edge/ferrum-edge/issues/4433))
 

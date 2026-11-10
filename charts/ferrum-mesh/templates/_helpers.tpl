@@ -1668,8 +1668,7 @@ failurePolicy to Ignore to make that configuration render.
 Ferrum-owned CRDs live in templates/ so helm upgrade applies schema changes.
 Helm's crds/ directory is install-once and would leave clusters on a stale
 UDPResponseAmplificationPolicy schema. Skipping install requires an explicit
-acknowledgement. An unmanaged CRD from the former crds/ directory must be
-adopted (crds.adoptExisting=true plus helm upgrade --take-ownership).
+acknowledgement.
 */}}
 {{- define "ferrum-mesh.validateCrds" -}}
 {{- $crds := .Values.crds | default dict -}}

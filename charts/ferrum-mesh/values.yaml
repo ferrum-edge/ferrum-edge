@@ -24,14 +24,9 @@ podDisruptionBudget:
 # (`helm.sh/resource-policy: keep`) so UDPResponseAmplificationPolicy objects
 # are not cascade-deleted. Compare the live annotation
 # gateway.ferrum.io/crd-schema-version to schemaVersion below.
-#
-# Existing clusters that installed the CRD from the former crds/ directory
-# must adopt it once: `helm upgrade --take-ownership --set crds.adoptExisting=true`.
-# See docs/upgrade_guide.md.
 crds:
   install: true
   skipInstallAcknowledged: false
-  adoptExisting: false
   udpResponseAmplificationPolicy:
     schemaVersion: v1alpha1-1
 
