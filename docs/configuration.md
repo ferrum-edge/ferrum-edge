@@ -353,19 +353,10 @@ remain distinct. Servers older than 8.0.17 reject the baseline schema DDL
 because the required collation is unavailable. The older `utf8mb4_bin` binary
 collation uses `PAD SPACE` semantics, while a UCA collation such as
 `utf8mb4_0900_as_cs` still folds canonically equivalent sequences; either
-would diverge from the runtime's byte-keyed identity indexes. Operators
-upgrading a populated deployment that still uses one of those collations (or
-an older case-insensitive default) must run the matching
-`ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`
-themselves; this is consistent with the build-out compatibility policy of
-folding schema changes into the V001 baseline rather than shipping
-incremental migrations. After core migrations run in `database`, `cp`, or
-`migrate` mode, Ferrum probes `information_schema.COLUMNS` for Ferrum
-identity-bearing columns and emits a single structured `warn!` naming every
-stale `table.column` (plus the exact `ALTER TABLE` remediation) when any
-collation is not `utf8mb4_0900_bin`. The probe is MySQL-only (no-op on
-PostgreSQL, SQLite, and MongoDB) and never refuses startup — matching the
-warn-and-continue posture used for other already-live schema issues.
+would diverge from the runtime's byte-keyed identity indexes. Under the
+build-out schema policy a database is created from the current V001 baseline,
+so every identity column carries the required collation; Ferrum ships no
+startup probe or repair for databases created with another collation.
 
 MySQL full runtime loads require `REPEATABLE READ` transaction isolation. If the
 server or session default is weaker, Ferrum rejects the candidate full load and
