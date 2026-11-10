@@ -936,6 +936,61 @@ const BOUNDARY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// and only while mesh content is actually being withheld.
 const REVISION_EVIDENCE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Ceiling for one scope's backed-off evidence-refresh spacing (issue #7259):
+/// the default `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` window, which every scope
+/// relists on anyway.
+const REVISION_EVIDENCE_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Spacing of ONE scope's demand-driven evidence refreshes (issue #7259).
+///
+/// A refresh only helps while relisting can produce the missing proof. When a
+/// scope can never gain evidence (an authorization refusal, a list that keeps
+/// failing), the watermark stays unavailable, every reconcile retains and asks
+/// again, and a fixed floor would relist every scope every
+/// [`REVISION_EVIDENCE_REFRESH_MIN_INTERVAL`] for as long as the fault lasts.
+/// So the spacing doubles each time a refresh fires without the published
+/// sequence having advanced since the previous one, up to
+/// [`REVISION_EVIDENCE_REFRESH_MAX_INTERVAL`], and drops back to the floor as
+/// soon as the sequence advances. Retention and the request itself are
+/// unchanged: this bounds the relist rate, it never relaxes the proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvidenceRefreshBackoff {
+    interval: Duration,
+    published_floor_at_last_refresh: Option<u64>,
+}
+
+impl Default for EvidenceRefreshBackoff {
+    fn default() -> Self {
+        Self {
+            interval: REVISION_EVIDENCE_REFRESH_MIN_INTERVAL,
+            published_floor_at_last_refresh: None,
+        }
+    }
+}
+
+impl EvidenceRefreshBackoff {
+    /// Spacing to apply before the next demand-driven refresh, measured from
+    /// the start of the current generation.
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Record that a demand-driven refresh fired while the tracker's published
+    /// sequence floor was `published_floor`.
+    fn record_refresh(&mut self, published_floor: u64) {
+        match self.published_floor_at_last_refresh {
+            Some(previous) if published_floor <= previous => {
+                self.interval = self
+                    .interval
+                    .saturating_mul(2)
+                    .min(REVISION_EVIDENCE_REFRESH_MAX_INTERVAL);
+            }
+            _ => self.interval = REVISION_EVIDENCE_REFRESH_MIN_INTERVAL,
+        }
+        self.published_floor_at_last_refresh = Some(published_floor);
+    }
+}
+
 /// Reads the authoritative `resourceVersion` boundary for one watch scope.
 ///
 /// Invoked once per watcher generation, immediately BEFORE the generation's own
@@ -1118,6 +1173,10 @@ pub(crate) async fn run_watcher_generations<S, F>(
     // initial list. A relist diff against a store that never listed would
     // report every object as "appeared without an event".
     let mut live_store_listed = false;
+    // Issue #7259: outlives a generation so a scope that keeps being asked
+    // for evidence it cannot produce backs off instead of relisting on the
+    // floor forever.
+    let mut refresh_backoff = EvidenceRefreshBackoff::default();
 
     loop {
         // `pending` is `Some` only for a replacement generation, i.e. exactly
@@ -1195,7 +1254,7 @@ pub(crate) async fn run_watcher_generations<S, F>(
             // replacement already listing needs no second trigger — it will
             // adopt a boundary read taken after the request was raised.
             let refresh_deadline = (refresh_requested && pending.is_none())
-                .then(|| generation_start + REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
+                .then(|| generation_start + refresh_backoff.interval());
             // Preserve the reason as well as the earliest deadline. An armed
             // refresh can coexist with an earlier idle deadline; classifying
             // that wake-up from `refresh_requested` alone would both mislabel
@@ -1237,10 +1296,12 @@ pub(crate) async fn run_watcher_generations<S, F>(
                             target.watcher_label
                         );
                     } else if relist_for_evidence_refresh {
+                        refresh_backoff.record_refresh(revision.published_floor());
                         debug!(
                             kind = %target.kind,
                             api_version = %target.api_version,
                             scope = %target.scope,
+                            next_refresh_spacing_secs = refresh_backoff.interval().as_secs(),
                             "{} rebuilding its reflector from an authoritative list because \
                              mesh config publication is withholding content under a revision \
                              this scope cannot advance",
@@ -1989,6 +2050,35 @@ pub(crate) fn spawn_crd_reprobe_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_refresh_backoff_doubles_while_the_sequence_cannot_advance() {
+        // Issue #7259: a scope that can never gain evidence keeps the
+        // watermark unavailable, so every reconcile asks again. Unproductive
+        // refreshes must space out instead of relisting on the floor forever.
+        let mut backoff = EvidenceRefreshBackoff::default();
+        assert_eq!(backoff.interval(), REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
+
+        backoff.record_refresh(100);
+        assert_eq!(
+            backoff.interval(),
+            REVISION_EVIDENCE_REFRESH_MIN_INTERVAL,
+            "the first refresh has nothing to compare against"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            backoff.record_refresh(100);
+            seen.push(backoff.interval().as_secs());
+        }
+        assert_eq!(seen, vec![10, 20, 40, 80, 160, 300, 300, 300, 300, 300]);
+
+        // The sequence advanced: refreshes are productive again, back to the
+        // floor so the quiet-scope case stays prompt.
+        backoff.record_refresh(101);
+        assert_eq!(backoff.interval(), REVISION_EVIDENCE_REFRESH_MIN_INTERVAL);
+        backoff.record_refresh(101);
+        assert_eq!(backoff.interval(), Duration::from_secs(10));
+    }
 
     #[test]
     fn watch_scopes_uses_all_namespaces_when_unset() {
