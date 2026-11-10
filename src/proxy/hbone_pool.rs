@@ -173,9 +173,14 @@ struct HboneConnectionLoadInner {
     /// CONNECT streams sent on this connection whose tunnel is still alive
     /// (including ones whose CONNECT response is still pending).
     active_streams: AtomicUsize,
-    /// Peer's `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT
-    /// response; `usize::MAX` until sampled or when the peer advertises none.
+    /// The connection's effective CONNECT stream cap: the peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT response,
+    /// bounded by `configured_max_streams`. Before the first sample it is
+    /// `configured_max_streams`.
     peer_max_streams: AtomicUsize,
+    /// The DestinationRule `maxConcurrentStreams` / global pool stream cap
+    /// this connection was dialed (and keyed) under; `usize::MAX` when none.
+    configured_max_streams: usize,
 }
 
 impl Default for HboneConnectionLoadInner {
@@ -183,11 +188,31 @@ impl Default for HboneConnectionLoadInner {
         Self {
             active_streams: AtomicUsize::new(0),
             peer_max_streams: AtomicUsize::new(usize::MAX),
+            configured_max_streams: usize::MAX,
         }
     }
 }
 
 impl HboneConnectionLoad {
+    /// A load bounded by the configured `maxConcurrentStreams` (issue #7181).
+    ///
+    /// The cap is part of the outer pool key, and `h2` cannot hold it on its
+    /// own: the dial seeds it as `initial_max_send_streams`, but the peer's
+    /// initial SETTINGS replace that (with "unlimited" when the peer
+    /// advertises nothing). The width decision therefore takes the smaller of
+    /// the peer's cap and this one, so a carrier at the operator's cap is
+    /// skipped and a sibling dialed while the key has room. `None` keeps the
+    /// peer's cap alone.
+    fn with_configured_stream_cap(cap: Option<u32>) -> Self {
+        let configured_max_streams =
+            cap.map_or(usize::MAX, |cap| usize::try_from(cap).unwrap_or(usize::MAX));
+        Self(Arc::new(HboneConnectionLoadInner {
+            active_streams: AtomicUsize::new(0),
+            peer_max_streams: AtomicUsize::new(configured_max_streams),
+            configured_max_streams,
+        }))
+    }
+
     #[inline]
     fn active_streams(&self) -> usize {
         self.0.active_streams.load(Ordering::Relaxed)
@@ -217,9 +242,10 @@ impl HboneConnectionLoad {
     /// lookup takes the connection's internal lock, which is why it runs here
     /// (outside every pool lock) rather than on the checkout scan.
     fn record_peer_max_streams(&self, sender: &SendRequest<Bytes>) {
-        self.0
-            .peer_max_streams
-            .store(sender.current_max_send_streams(), Ordering::Relaxed);
+        let effective = sender
+            .current_max_send_streams()
+            .min(self.0.configured_max_streams);
+        self.0.peer_max_streams.store(effective, Ordering::Relaxed);
     }
 }
 
@@ -2935,8 +2961,18 @@ pub(crate) async fn dial_h2_connect_sender(
                 .max_frame_size(pool_config.http2_max_frame_size)
                 .max_header_list_size(max_header_list_size)
                 .max_concurrent_reset_streams(4096);
+            // The DestinationRule `maxConcurrentStreams` / global stream cap,
+            // exactly as `pool::hyper_h2_client_builder` applies it (issue
+            // #7181): advertised to the peer as our own inbound cap, and our
+            // own outbound CONNECT bound until the peer's SETTINGS replace it.
+            // `max_concurrent_streams` alone caps only peer-initiated streams
+            // on a client, so the keyed cap bounded nothing. After SETTINGS
+            // the transport's `HboneConnectionLoad` keeps holding the cap
+            // for carrier selection.
             if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-                builder.max_concurrent_streams(max_streams);
+                builder
+                    .max_concurrent_streams(max_streams)
+                    .initial_max_send_streams(max_streams as usize);
             }
 
             let (sender, mut connection) =
@@ -3017,7 +3053,9 @@ pub(crate) async fn dial_h2_connect_sender(
             Ok(MeshH2Transport {
                 sender,
                 gate,
-                load: HboneConnectionLoad::default(),
+                load: HboneConnectionLoad::with_configured_stream_cap(
+                    pool_config.http2_max_concurrent_streams,
+                ),
             })
         }
     })
