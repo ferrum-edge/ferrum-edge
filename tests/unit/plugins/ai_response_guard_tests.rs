@@ -1337,6 +1337,134 @@ fn test_invalid_config_shapes_rejected() {
     }
 }
 
+// ─── ScanMode::All — structural scalars are outside detection too (#7129) ─
+
+/// A chat completion whose only `phone_us`-shaped token is the Unix-seconds
+/// `created` timestamp at the root.
+fn completion_with_created(content: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1731196800,
+        "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]
+    }))
+    .unwrap()
+}
+
+fn sse_with_created(content: &str) -> Vec<u8> {
+    format!(
+        "data: {{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1731196800,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{content:?}}}}}]}}\n\ndata: [DONE]\n\n"
+    )
+    .into_bytes()
+}
+
+/// Issue #7129: with `scan_fields: all`, `reject` / `warn` / `redact` agree on
+/// what counts. A root structural scalar that merely looks like PII (every
+/// OpenAI completion's `created` matches `phone_us`) is neither detected nor
+/// redacted, while the same pattern in content, or under a nested key of the
+/// same name, still is.
+#[tokio::test]
+async fn test_all_mode_detection_skips_root_structural_scalars() {
+    for (content_type, clean, dirty) in [
+        (
+            "application/json",
+            completion_with_created("Hello"),
+            completion_with_created("Call 212-555-0100"),
+        ),
+        (
+            "text/event-stream",
+            sse_with_created("Hello"),
+            sse_with_created("Call 212-555-0100"),
+        ),
+    ] {
+        let mut headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        for action in ["reject", "warn", "redact"] {
+            let plugin = make_plugin(json!({
+                "pii_patterns": ["phone_us"], "scan_fields": "all", "action": action
+            }));
+            let mut ctx = ctx_with_content_type("POST", content_type);
+            assert!(
+                matches!(
+                    plugin
+                        .on_response_body(&mut ctx, 200, &mut headers, &clean)
+                        .await,
+                    PluginResult::Continue
+                ),
+                "{content_type} {action}: a structural timestamp is not a finding"
+            );
+            assert!(
+                !ctx.metadata.contains_key("ai_response_guard_detected"),
+                "{content_type} {action}: {:?}",
+                ctx.metadata
+            );
+            // Nothing to redact: the exact bytes (and their validators) stay.
+            assert!(
+                plugin
+                    .transform_response_body_with_context(
+                        &mut ctx,
+                        &clean,
+                        Some(content_type),
+                        &headers
+                    )
+                    .await
+                    .is_none(),
+                "{content_type} {action}: a structural-only body must stay unchanged"
+            );
+
+            let mut ctx = ctx_with_content_type("POST", content_type);
+            let result = plugin
+                .on_response_body(&mut ctx, 200, &mut headers, &dirty)
+                .await;
+            match action {
+                "reject" => assert!(
+                    matches!(result, PluginResult::Reject { .. }),
+                    "{content_type}: content PII must still reject"
+                ),
+                _ => {
+                    assert!(matches!(result, PluginResult::Continue), "{content_type}");
+                    assert!(
+                        ctx.metadata.contains_key("ai_response_guard_detected"),
+                        "{content_type} {action}: content PII must still be detected"
+                    );
+                }
+            }
+            if action == "redact" {
+                let redacted = plugin
+                    .transform_response_body_with_context(
+                        &mut ctx,
+                        &dirty,
+                        Some(content_type),
+                        &headers,
+                    )
+                    .await
+                    .expect("content PII is redacted");
+                let text = String::from_utf8(redacted).unwrap();
+                assert!(text.contains("[REDACTED:pii:phone_us]"), "{text}");
+                assert!(text.contains("1731196800"), "{text}");
+            }
+        }
+    }
+
+    // The carve-out is root-scalar only: a nested `created` is still content.
+    let nested = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "ok"}}],
+        "metadata": {"created": 1731196800}
+    }))
+    .unwrap();
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["phone_us"], "scan_fields": "all", "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &nested)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
 // ─── ScanMode::All — structural keys are protected from redaction ─────
 
 fn ipv4_redact_plugin() -> AiResponseGuard {
