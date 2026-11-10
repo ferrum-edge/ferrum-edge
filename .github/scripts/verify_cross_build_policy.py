@@ -11547,6 +11547,70 @@ def brace_options(value: str) -> tuple[str, ...] | None:
     return None
 
 
+BRACE_GROUP = re.compile(r"\{([^{}\n]*)\}")
+CROSS_OR_CARGO_WORD = re.compile(r"(?<![A-Za-z0-9_])(?:cross|cargo)(?![A-Za-z0-9_])")
+
+
+def bounded_word_brace_expansions(word: str) -> tuple[str, ...] | None:
+    """Expand one shell word's brace groups, or `None` past 256 results."""
+
+    expansions = [word]
+    while True:
+        expanded: list[str] = []
+        changed = False
+        for candidate in expansions:
+            expandable = next(
+                (
+                    (match, options)
+                    for match in BRACE_GROUP.finditer(candidate)
+                    if (options := brace_options(match.group(1))) is not None
+                ),
+                None,
+            )
+            if expandable is None:
+                expanded.append(candidate)
+                continue
+            match, options = expandable
+            changed = True
+            for option in options:
+                expanded.append(
+                    candidate[: match.start()] + option + candidate[match.end() :]
+                )
+                if len(expanded) > 256:
+                    return None
+        expansions = list(dict.fromkeys(expanded))
+        if not changed:
+            return tuple(expansions)
+
+
+def brace_overflow_hides_cross(value: str) -> bool:
+    """Whether an over-bound brace expansion could assemble a Cross word.
+
+    Bash expands brace groups inside one word, so the product that overflows
+    the line-level bound comes from groups in DIFFERENT words, and no single
+    word's spelling depends on another word's choice. Each word is therefore
+    expanded on its own: if any expansion yields a `cross`/`cargo` word the
+    literal word did not already show, the overflow hid it
+    (GHSA-q636-fxjc-3r78: eight two-way groups ahead of `cr{o,x}ss build`).
+    A single word that overflows on its own cannot be checked and fails
+    closed. Overflowing lines whose groups spell no such word (awk bodies,
+    JSON) are not reported.
+    """
+
+    for match in re.finditer(r"\S+", value):
+        word = match.group()
+        if "{" not in word:
+            continue
+        expansions = bounded_word_brace_expansions(word)
+        if expansions is None:
+            return True
+        if CROSS_OR_CARGO_WORD.search(word):
+            continue
+        if any(CROSS_OR_CARGO_WORD.search(expansion) for expansion in expansions):
+            return True
+    return False
+
+
 def brace_expansion_variants(value: str) -> tuple[str, ...]:
     """Enumerate bounded Bash brace expansions and fail closed on explosion."""
 
@@ -11574,12 +11638,15 @@ def brace_expansion_variants(value: str) -> tuple[str, ...]:
                 )
                 if len(expanded) > 256:
                     # A deliberately explosive shell expansion is an unknown
-                    # executable surface and therefore fails closed. The bare
-                    # word `cross` is not a surface any consumer reports, so the
-                    # overflow must hand back a whole Cross command
-                    # (GHSA-q636-fxjc-3r78: eight two-way groups ahead of
-                    # `cr{o,x}ss build` hid the dispatch).
-                    return tuple([*dict.fromkeys(variants), WHOLE_CROSS_COMMAND])
+                    # executable surface when it can spell a Cross word, and
+                    # then fails closed with a whole Cross command: the bare
+                    # word `cross` the overflow used to return is not a surface
+                    # any consumer reports (GHSA-q636-fxjc-3r78).
+                    if brace_overflow_hides_cross(value):
+                        return tuple(
+                            [*dict.fromkeys(variants), WHOLE_CROSS_COMMAND]
+                        )
+                    return tuple(dict.fromkeys(variants))
         variants = list(dict.fromkeys(expanded))
         if not changed:
             return tuple(variants)
@@ -24193,8 +24260,16 @@ pre_build = []
         f"echo {q636_groups}; cr{{o,x}}ss build --target {TARGET}"
     ) != (True, True):
         failures.append("an eight-group brace overflow hid a Cross dispatch")
-    if q636_reported(f"echo {q636_groups}; echo x{{c,d}}") != (True, True):
-        failures.append("a nine-group brace overflow did not fail closed")
+    if q636_reported(f"echo {q636_groups}; echo x{{c,d}}") != (False, False):
+        failures.append(
+            "a nine-group brace overflow that spells no Cross word was reported"
+        )
+    if q636_reported(
+        f"echo {q636_groups}; ca{{r,x}}go build --target {TARGET}"
+    ) != (True, True):
+        failures.append("an eight-group brace overflow hid a Cargo word")
+    if not brace_overflow_hides_cross("x" + "{a,b}" * 9 + " build"):
+        failures.append("a single word that overflows on its own must fail closed")
     q636_seven = " ".join(["{a,b}"] * 7)
     if q636_reported(
         f"echo {q636_seven}; cr{{o,x}}ss build --target {TARGET}"
