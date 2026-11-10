@@ -8367,17 +8367,14 @@ fn l4_route_proxies(
     acc: &mut K8sAccumulator,
     scheme: BackendScheme,
 ) -> Result<Vec<crate::config::types::Proxy>, K8sTranslateError> {
-    // Cross-namespace TCPRoute/TLSRoute parentRefs use the same listener
-    // AllowedRoutes gates as HTTPRoute/GRPCRoute. ReferenceGrant authorizes
-    // backendRefs only, not parentRefs. UDPRoute keeps its stricter
-    // same-namespace parent contract.
+    // Cross-namespace TCPRoute/TLSRoute/UDPRoute parentRefs use the same
+    // listener AllowedRoutes gates as HTTPRoute/GRPCRoute. ReferenceGrant
+    // authorizes backendRefs only, not parentRefs. Every authorized parent
+    // materializes in its Gateway's namespace, which owns the listener.
     ensure_route_parent_refs_allowed(object, acc)?;
-    if scheme.is_udp() {
-        ensure_l4_parent_refs_are_same_namespace(object)?;
-    }
 
     let config_namespaces = if scheme.is_udp() {
-        vec![object.metadata.namespace.clone()]
+        udp_route_materialization_namespaces(object, acc)
     } else {
         route_materialization_namespaces(object, acc)
     };
@@ -8417,7 +8414,8 @@ fn l4_route_proxies_for_namespace(
     // `TCPRoute`/`TLSRoute` keep the shared binding resolver, which is where
     // TLS SNI is bounded by the listener hostname.
     let (materialized_listener_bindings, materialized_parent_refs) = if scheme.is_udp() {
-        let (ports, parent_refs) = udp_route_surviving_materialization(object, acc);
+        let (ports, parent_refs) =
+            udp_route_surviving_materialization(object, acc, config_namespace);
         (
             ports
                 .into_iter()
@@ -8520,16 +8518,29 @@ fn l4_route_proxies_for_namespace(
             };
             (backend.host, backend.port, None)
         } else {
-            let upstream_id = resource_id(
-                "gwapi-l4-upstream",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                &rule_suffix,
-            );
+            // The upstream lives beside the proxies that reference it: in the
+            // parent Gateway's namespace, under the same source-bound id rule
+            // as the proxy when that is not the route's own namespace.
+            let upstream_id = if config_namespace == object.metadata.namespace {
+                resource_id(
+                    "gwapi-l4-upstream",
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &rule_suffix,
+                )
+            } else {
+                gateway_api_source_bound_id(
+                    "gwapi-l4-upstream",
+                    &object.kind,
+                    &object.metadata.namespace,
+                    &object.metadata.name,
+                    &rule_suffix,
+                    0,
+                )
+            };
             // A second route object deriving this key must not replace the
             // owner's weighted backend set.
-            if let Some(key) =
-                namespaced_resource_key(&object.metadata.namespace, upstream_id.as_str())
+            if let Some(key) = namespaced_resource_key(config_namespace, upstream_id.as_str())
                 && !acc.claim_gateway_api_route_upstream(&key, object)
             {
                 acc.warnings.push(format!(
@@ -8539,7 +8550,7 @@ fn l4_route_proxies_for_namespace(
                     object.metadata.namespace,
                     object.metadata.name,
                     upstream_id,
-                    object.metadata.namespace
+                    config_namespace
                 ));
                 acc.record_gateway_api_refused_route_claims(
                     object,
@@ -8550,7 +8561,7 @@ fn l4_route_proxies_for_namespace(
             }
             acc.upsert_upstream(upstream_for_route(
                 upstream_id.clone(),
-                object.metadata.namespace.clone(),
+                config_namespace.to_string(),
                 resolved.backends,
             ));
             (String::new(), 0, Some(upstream_id))
@@ -8732,16 +8743,42 @@ pub(crate) fn udp_route_surviving_listener_claims(
         .collect()
 }
 
-/// UDP listener ports and parentRefs that survive same-listener conflict loss.
+/// Namespaces a UDPRoute materializes in: the namespace of every Gateway
+/// whose listener the route still owns after conflict arbitration (the
+/// Gateway's namespace owns the stream listener, as for TCPRoute/TLSRoute).
+///
+/// A route that owns no listener anywhere falls back to its own namespace so
+/// the rule backends are still validated and the fail-closed "no listener was
+/// opened" diagnostics are still emitted exactly once.
+fn udp_route_materialization_namespaces(object: &K8sObject, acc: &K8sAccumulator) -> Vec<String> {
+    let mut namespaces: Vec<String> = udp_route_surviving_listener_claims(object, acc)
+        .into_iter()
+        .map(|claim| claim.listener.namespace)
+        .collect();
+    namespaces.sort();
+    namespaces.dedup();
+    if namespaces.is_empty() {
+        namespaces.push(object.metadata.namespace.clone());
+    }
+    namespaces
+}
+
+/// UDP listener ports and parentRefs in `config_namespace` that survive
+/// same-listener conflict loss.
 ///
 /// ParentRefs that retain at least one surviving listener are recorded as
 /// materialized so status `Programmed` tracks live ownership. Distinct
-/// Gateways/listeners that share a numeric port collapse to one physical proxy.
+/// Gateways/listeners in one namespace that share a numeric port collapse to
+/// one physical proxy.
 fn udp_route_surviving_materialization(
     object: &K8sObject,
     acc: &K8sAccumulator,
+    config_namespace: &str,
 ) -> (Vec<u16>, Vec<String>) {
-    let claims = udp_route_surviving_listener_claims(object, acc);
+    let claims: Vec<UdpListenerClaim> = udp_route_surviving_listener_claims(object, acc)
+        .into_iter()
+        .filter(|claim| claim.listener.namespace == config_namespace)
+        .collect();
     let mut ports: Vec<u16> = claims.iter().map(|claim| claim.port).collect();
     let mut parent_refs: Vec<String> = claims.into_iter().map(|claim| claim.parent_ref).collect();
     ports.sort();
@@ -9173,30 +9210,6 @@ fn l4_route_hosts(
         ));
     }
     Ok(string_array(&object.spec, "hostnames"))
-}
-
-fn ensure_l4_parent_refs_are_same_namespace(object: &K8sObject) -> Result<(), K8sTranslateError> {
-    let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    for parent_ref in parent_refs {
-        let group = string_field(parent_ref, "group").unwrap_or("gateway.networking.k8s.io");
-        let kind = string_field(parent_ref, "kind").unwrap_or("Gateway");
-        if group == "gateway.networking.k8s.io" && matches!(kind, "Gateway" | "ListenerSet") {
-            let parent_namespace =
-                string_field(parent_ref, "namespace").unwrap_or(&object.metadata.namespace);
-            if parent_namespace != object.metadata.namespace {
-                return Err(invalid_resource(
-                    object,
-                    format!(
-                        "{} cross-namespace parentRefs are not supported by Ferrum yet",
-                        object.kind
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// [`super::backend_ref::checked_backend_namespace`] plus the structured
