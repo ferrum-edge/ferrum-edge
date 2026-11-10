@@ -15035,42 +15035,6 @@ async fn aggregate_admission_refuses_an_envelope_mixing_method_and_reply() {
     }
 }
 
-/// `jwks_auth`'s generic mechanism path cannot stage a provider realm, so it
-/// never yields an external identity that would commit under a realm shared
-/// by every provider.
-#[tokio::test]
-async fn jwks_mechanism_verify_path_never_yields_an_external_identity() {
-    use ferrum_edge::plugins::utils::auth_flow::{
-        AuthMechanism, ExtractedCredential, VerifyOutcome,
-    };
-    let auth = two_issuer_jwks_auth();
-    let claims = json!({ "iss": ISSUER_A, "sub": "alice" });
-    let token = super::jwks_auth_support::create_rs256_token_with_kid(
-        &claims,
-        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
-        "issuer-a",
-    );
-    let outcome = auth
-        .verify(
-            ExtractedCredential::BearerToken(token),
-            &ferrum_edge::ConsumerIndex::new(&[]),
-        )
-        .await;
-    match outcome {
-        VerifyOutcome::Success {
-            consumer,
-            external_identity,
-            external_identity_header,
-            ..
-        } => {
-            assert!(consumer.is_none());
-            assert!(external_identity.is_none());
-            assert!(external_identity_header.is_none());
-        }
-        other => panic!("a valid token still verifies: {other:?}"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-consumer tool grants (`allowed_groups` / `denied_groups`)
 // ---------------------------------------------------------------------------

@@ -16,9 +16,9 @@ use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::auth_flow::{
-    self, AuthMechanism, CredentialRejection, ExtractedCredential, VerifyOutcome,
-    commit_authentication_attempt, credential_deadline_from_claims,
-    external_identity_realm_authority, nonblank_identity, refine_external_identity_realm_authority,
+    self, CredentialRejection, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
+    credential_deadline_from_claims, external_identity_realm_authority, nonblank_identity,
+    refine_external_identity_realm_authority,
 };
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
@@ -1280,12 +1280,7 @@ impl JwksAuth {
             .collect()
     }
 
-    fn resolve_identity(
-        &self,
-        claims: &Value,
-        provider: &JwksProvider,
-        _consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
+    fn resolve_identity(&self, claims: &Value, provider: &JwksProvider) -> VerifyOutcome {
         let effective_identity_claim = provider
             .consumer_identity_claim
             .as_deref()
@@ -1431,13 +1426,6 @@ impl JwksAuth {
         self.sender_constrained_issuers
             .iter()
             .any(|constrained| constrained == issuer)
-    }
-
-    /// Try to validate a token against all configured providers.
-    async fn validate_token(&self, token: &str) -> Result<(Value, usize), (u16, &'static str)> {
-        let provider_indices: Vec<usize> = (0..self.providers.len()).collect();
-        self.validate_token_for_providers(token, &provider_indices)
-            .await
     }
 
     /// Check required_scopes and required_roles for a matched provider.
@@ -1696,11 +1684,7 @@ impl JwksAuth {
         );
     }
 
-    async fn authenticate_request(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
+    async fn authenticate_request(&self, ctx: &mut RequestContext) -> PluginResult {
         let credential = self.extract_jwks_credential(ctx);
 
         match credential {
@@ -1807,7 +1791,7 @@ impl JwksAuth {
                 match commit_authentication_attempt(
                     ctx,
                     attempt,
-                    self.resolve_identity(&claims, provider, consumer_index),
+                    self.resolve_identity(&claims, provider),
                     "jwks_auth",
                     true,
                 ) {
@@ -1963,90 +1947,13 @@ impl JwksAuth {
     }
 }
 
-#[async_trait]
-impl AuthMechanism for JwksAuth {
-    fn mechanism_name(&self) -> &'static str {
-        "jwks_auth"
-    }
-
-    fn authentication_challenge(&self) -> &'static str {
-        self.advertised_challenge
-    }
-
+impl JwksAuth {
+    /// `WWW-Authenticate` challenge for a rejected bearer credential, with the
+    /// RFC 6750 §3.1 `error` code.
     fn rejection_challenge(&self, rejection: CredentialRejection) -> &'static str {
         match rejection {
             CredentialRejection::InvalidFormat => auth_flow::BEARER_INVALID_REQUEST_CHALLENGE,
             CredentialRejection::InvalidCredential => auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
-        }
-    }
-
-    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        match self.extract_jwks_credential(ctx) {
-            JwksExtractedCredential::Missing => ExtractedCredential::Missing,
-            JwksExtractedCredential::InvalidFormat(body) => {
-                ExtractedCredential::InvalidFormat(body)
-            }
-            JwksExtractedCredential::BearerToken {
-                token,
-                dpop_scheme: false,
-                ..
-            } => ExtractedCredential::BearerToken(token),
-            // This mechanism path runs no sender-constraint check, so a
-            // `DPoP`-scheme presentation must not reach it as a plain bearer
-            // token. The plugin's own `authenticate` is the only entry point
-            // that validates and claims the proof.
-            JwksExtractedCredential::BearerToken {
-                dpop_scheme: true, ..
-            } => ExtractedCredential::Missing,
-        }
-    }
-
-    async fn verify(
-        &self,
-        credential: ExtractedCredential,
-        consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
-        let ExtractedCredential::BearerToken(token) = credential else {
-            return VerifyOutcome::NotApplicable;
-        };
-
-        let (claims, provider_idx) = match self.validate_token(&token).await {
-            Ok(result) => result,
-            Err((status, body)) => {
-                return if status == 403 {
-                    VerifyOutcome::Forbidden(body.to_string())
-                } else {
-                    VerifyOutcome::InvalidFormat(body.to_string())
-                };
-            }
-        };
-
-        let provider = &self.providers[provider_idx];
-        if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
-            return if status == 403 {
-                VerifyOutcome::Forbidden(body)
-            } else {
-                VerifyOutcome::Invalid(body)
-            };
-        }
-
-        // This generic mechanism path is not a production entry point — the
-        // plugin's own `authenticate` is — and it cannot stage the provider's
-        // identity-realm authority. It therefore never yields an external
-        // identity, which would otherwise commit under a mechanism-only realm
-        // shared by every provider: only a mapped Consumer survives here.
-        match self.resolve_identity(&claims, provider, consumer_index) {
-            VerifyOutcome::Success {
-                consumer,
-                credential_deadline,
-                ..
-            } => VerifyOutcome::Success {
-                consumer,
-                external_identity: None,
-                external_identity_header: None,
-                credential_deadline,
-            },
-            other => other,
         }
     }
 }
@@ -2221,9 +2128,11 @@ impl super::Plugin for JwksAuth {
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        self.authenticate_request(ctx, consumer_index).await
+        // External claims are scoped to the provider that verified them; a
+        // verified identity is never resolved to a gateway Consumer.
+        self.authenticate_request(ctx).await
     }
 
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
