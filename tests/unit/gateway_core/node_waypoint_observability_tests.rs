@@ -738,6 +738,52 @@ fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
     assert_eq!(status_count(503), Some(1));
 }
 
+/// Issue #7158: a relay-synthesis refusal is decided before any proxy matched,
+/// so its transaction line is attributed to the gateway's serving namespace
+/// (`FERRUM_NAMESPACE`), like a route miss, never the resource default.
+#[test]
+fn inbound_connect_relay_synthesis_refusal_logs_the_serving_namespace() {
+    let _guard = observability_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let (denied, peerless) = runtime.block_on(async {
+        let env_config = EnvConfig {
+            namespace: "tenant-a".to_string(),
+            ..EnvConfig::default()
+        };
+        let (state, _) = ProxyState::new(
+            GatewayConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            env_config,
+            None,
+            None,
+        )
+        .expect("proxy state");
+        let denied = refuse_at_synthesis(
+            &state,
+            Peer::Authenticated,
+            "address_not_terminated_here",
+            ("10.0.0.9", 8080),
+            false,
+        )
+        .await;
+        let peerless = refuse_at_synthesis(
+            &state,
+            Peer::Peerless,
+            "address_not_terminated_here",
+            ("10.0.0.9", 8080),
+            false,
+        )
+        .await;
+        (denied, peerless)
+    });
+    assert_eq!(denied.summary.proxy_id, None);
+    assert_eq!(denied.summary.namespace, "tenant-a");
+    assert_eq!(peerless.summary.namespace, "tenant-a");
+}
+
 /// A fence sweep re-judging a live tunnel whose per-pod scope is gone is not a
 /// request (issue #7146). The fail-closed `scope_missing` refusal still applies
 /// to it, but the destination-policy rejection counter describes REQUESTS and

@@ -3238,7 +3238,17 @@ pub(crate) async fn reject_inbound_connect_relay_synthesis_with_plugins(
     );
     let status = response.status().as_u16();
     let deny_policy = terminal.deny_policy;
-    log_pre_backend_rejected_request(plugins, ctx, status, start_time, deny_policy, 0).await;
+    // Decided before any proxy matched: attribute it to the serving namespace
+    // (issue #7158).
+    log_pre_route_rejected_request(
+        plugins,
+        ctx,
+        &state.env_config.namespace,
+        status,
+        start_time,
+        deny_policy,
+    )
+    .await;
     record_request(state, status);
     response
 }
@@ -25846,6 +25856,7 @@ pub async fn log_rejected_request(
         None,
         true,
         false,
+        None,
     )
     .await;
 }
@@ -25943,6 +25954,35 @@ pub async fn log_pre_backend_rejected_request(
         None,
         false,
         false,
+        None,
+    )
+    .await;
+}
+
+/// [`log_pre_backend_rejected_request`] for a rejection decided before any
+/// proxy matched (issue #7158). With no matched proxy the only namespace the
+/// request can be attributed to is the gateway's serving namespace
+/// (`FERRUM_NAMESPACE`), as [`log_unrouted_request`] does; never the
+/// resource-deserialization default.
+pub(crate) async fn log_pre_route_rejected_request(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    serving_namespace: &str,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+) {
+    log_rejected_request_with_path_and_backend_state(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        0,
+        None,
+        false,
+        false,
+        Some(serving_namespace),
     )
     .await;
 }
@@ -25973,6 +26013,7 @@ pub(crate) async fn log_rejected_request_with_path(
         request_path_override,
         true,
         false,
+        None,
     )
     .await;
 }
@@ -26001,6 +26042,7 @@ pub(crate) async fn log_client_disconnect_rejection_with_path(
         request_path_override,
         true,
         true,
+        None,
     )
     .await;
 }
@@ -26033,6 +26075,9 @@ async fn log_rejected_request_with_path_and_backend_state(
     request_path_override: Option<&str>,
     include_backend_target: bool,
     client_disconnect: bool,
+    // Namespace for a rejection decided before any proxy matched; `None`
+    // keeps the resource default for callers that always have a match.
+    unmatched_namespace: Option<&str>,
 ) {
     // Gateway diagnostic references (issue #5846): every plugin and gateway
     // rejection passes through here before its response head is written, so
@@ -26076,9 +26121,11 @@ async fn log_rejected_request_with_path_and_backend_state(
         .bytes_sent_observed
         .load(std::sync::atomic::Ordering::Acquire);
     let summary = TransactionSummary {
-        namespace: proxy
-            .map(|p| p.namespace.clone())
-            .unwrap_or_else(crate::config::types::default_namespace),
+        namespace: match (proxy, unmatched_namespace) {
+            (Some(p), _) => p.namespace.clone(),
+            (None, Some(namespace)) => namespace.to_owned(),
+            (None, None) => crate::config::types::default_namespace(),
+        },
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
