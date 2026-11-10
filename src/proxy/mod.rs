@@ -65558,12 +65558,13 @@ async fn proxy_to_backend_http2(
         )
     };
     let map_h2_err = {
-        let resolved_ip = resolved_ip.clone();
         // Borrowed, not cloned: the closure is consumed inside this function,
-        // so a per-request String allocation on the direct-H2 dispatch path
-        // would be pure hot-path waste.
+        // so a per-request String allocation (or `Arc` clone) on the direct-H2
+        // dispatch path would be pure hot-path waste. Only the error arms,
+        // which build an owned response, clone the resolved IP (issue #7166).
+        let resolved_ip = &resolved_ip;
         let proxy_id = proxy.id.as_str();
-        let body_size_exceeded = Arc::clone(&body_size_exceeded);
+        let body_size_exceeded = &body_size_exceeded;
         let passthrough_write_timeout = passthrough_write_timeout.as_ref();
         let write_timeout_ms = proxy.backend_write_timeout_ms;
         move |e: hyper::Error| {
@@ -65579,7 +65580,7 @@ async fn proxy_to_backend_http2(
                         ),
                         headers: HashMap::new(),
                         connection_error: false,
-                        backend_resolved_ip: resolved_ip,
+                        backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                         request_on_wire: true,
                         buffered_trailers: None,
@@ -65599,7 +65600,7 @@ async fn proxy_to_backend_http2(
                 return (
                     http_backend_dispatch_error_response(
                         retry::ErrorClass::ReadWriteTimeout,
-                        resolved_ip,
+                        resolved_ip.clone(),
                     ),
                     None,
                 );
@@ -65608,7 +65609,7 @@ async fn proxy_to_backend_http2(
             // connection_error tracks request_reached_wire instead of being
             // hardcoded true with a post-wire ProtocolError class.
             (
-                direct_h2_send_request_error_response(proxy_id, e, resolved_ip),
+                direct_h2_send_request_error_response(proxy_id, e, resolved_ip.clone()),
                 None,
             )
         }
