@@ -634,13 +634,12 @@ pub async fn run(
         });
         listener_handles.push(https_handle);
         startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
-    } else if env_config.proxy_https_port == 0 {
+    } else {
+        // `proxy_frontend_tls_slot` is `None` exactly when the HTTPS port is 0.
         info!(
             "{} — HTTPS proxy listener disabled",
             crate::secrets::report_env_assignment("FERRUM_PROXY_HTTPS_PORT", "0")
         );
-    } else {
-        info!("TLS not configured - HTTPS listener disabled");
     }
 
     // ── Gateway API listener ports ───────────────────────────────────────
@@ -708,14 +707,15 @@ pub async fn run(
     // HTTP/3 (QUIC) listener.
     let mut h3_listener_started = false;
     if env_config.enable_http3 {
-        if env_config.proxy_https_port == 0 {
+        // Like HTTPS, H3 needs only the dynamic TLS slot, which exists exactly
+        // when the HTTPS port is non-zero.
+        if proxy_frontend_tls_slot.is_none() {
             info!(
                 "{} — HTTP/3 proxy listener disabled",
                 crate::secrets::report_env_assignment("FERRUM_PROXY_HTTPS_PORT", "0")
             );
-        } else if let Some(tls_config) =
-            http3_startup_tls_config(tls_config.clone(), proxy_frontend_tls_slot.as_ref())?
-        {
+        } else {
+            let tls_config = http3_startup_tls_config(tls_config.clone())?;
             let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
             let h3_state = proxy_state.clone();
             let h3_shutdown = shutdown_tx.subscribe();
@@ -779,13 +779,11 @@ pub async fn run(
             listener_handles.push(h3_handle);
             startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
             h3_listener_started = true;
-        } else {
-            info!("TLS not configured - HTTP/3 proxy listener disabled");
         }
     }
     if env_config.proxy_http_port == 0 && proxy_frontend_tls_slot.is_none() {
         warn!(
-            "No HTTP or HTTPS proxy listeners are active — {} and HTTPS is disabled or TLS is not configured. Only stream proxies (TCP/UDP) will serve traffic.",
+            "No HTTP or HTTPS proxy listeners are active — {} and HTTPS is disabled. Only stream proxies (TCP/UDP) will serve traffic.",
             crate::secrets::report_env_assignment("FERRUM_PROXY_HTTP_PORT", "0")
         );
     }
@@ -1251,17 +1249,16 @@ fn proxy_frontend_tls_slot_from_operator(
     })
 }
 
+/// The server config the HTTP/3 listener binds with: the operator's frontend
+/// TLS when configured, otherwise a placeholder that refuses handshakes until
+/// CP-delivered material reaches the dynamic TLS slot.
 fn http3_startup_tls_config(
     operator_tls_config: Option<Arc<rustls::ServerConfig>>,
-    proxy_frontend_tls_slot: Option<&tls::SharedFrontendTls>,
-) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
-    if operator_tls_config.is_some() {
-        return Ok(operator_tls_config);
+) -> Result<Arc<rustls::ServerConfig>, anyhow::Error> {
+    match operator_tls_config {
+        Some(config) => Ok(config),
+        None => tls::temporary_disabled_listener_tls_config(),
     }
-    if proxy_frontend_tls_slot.is_some() {
-        return tls::temporary_disabled_listener_tls_config().map(Some);
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -1329,29 +1326,15 @@ mod tests {
             tls::temporary_disabled_listener_tls_config().expect("temporary test TLS config");
 
         let startup_tls =
-            http3_startup_tls_config(Some(operator_tls.clone()), None).expect("startup TLS config");
+            http3_startup_tls_config(Some(operator_tls.clone())).expect("startup TLS config");
 
-        assert!(startup_tls.is_some_and(|tls| Arc::ptr_eq(&tls, &operator_tls)));
+        assert!(Arc::ptr_eq(&startup_tls, &operator_tls));
     }
 
     #[test]
     fn http3_startup_tls_config_bootstraps_dynamic_tls_slot() {
-        let listener_slot = tls::empty_frontend_tls_slot();
-
-        let startup_tls =
-            http3_startup_tls_config(None, Some(&listener_slot)).expect("startup TLS config");
-
-        assert!(
-            startup_tls.is_some(),
-            "HTTP/3 should bind and wait for CP-delivered frontend TLS"
-        );
-    }
-
-    #[test]
-    fn http3_startup_tls_config_is_absent_without_any_tls_source() {
-        let startup_tls =
-            http3_startup_tls_config(None, None).expect("startup TLS config decision");
-
-        assert!(startup_tls.is_none());
+        // HTTP/3 binds with a placeholder and waits for CP-delivered frontend
+        // TLS in the dynamic slot.
+        http3_startup_tls_config(None).expect("startup TLS config");
     }
 }
