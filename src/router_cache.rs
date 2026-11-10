@@ -4236,12 +4236,8 @@ fn frequency_aware_evict<V>(
     removed
 }
 
-/// Build a cache key from host and path with exact-capacity pre-allocation.
-///
-/// Uses NUL separator which cannot appear in hostnames or URL paths.
-/// Uses `String::with_capacity` + `push_str` instead of `format!()` to
-/// avoid format-machinery overhead and produce an exact-size allocation.
-/// Write the cache key into an existing buffer (zero-allocation on cache hits).
+/// Write the cache key (`host\0path\0port-or-*\0t|p`) into an existing buffer
+/// (no allocation on cache hits). NUL cannot appear in hostnames or URL paths.
 /// Used by the thread-local fast path in `find_proxy()`.
 #[inline]
 fn write_cache_key(

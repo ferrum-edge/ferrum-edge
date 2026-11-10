@@ -5,9 +5,6 @@
 //! This wrapper defers timer creation until the inner future returns `Pending`,
 //! so fast-path operations (e.g., reading from a buffer that already has data)
 //! never allocate a timer.
-//!
-//! Other benchmarkes it delivered a 27x
-//! speedup over tokio timeouts by combining lazy init with timer coalescing.
 
 use pin_project_lite::pin_project;
 use std::future::Future;

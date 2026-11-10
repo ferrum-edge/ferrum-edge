@@ -102,7 +102,8 @@ fn emit_bootstrap_error(message: &str, fields: &[(&str, String)]) {
 /// 4. Initialize structured JSON logging
 /// 5. Parse environment configuration (`EnvConfig::from_env()`)
 /// 6. Build the multi-threaded tokio runtime with configured worker/blocking threads
-/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, mesh, injector, migrate)
+/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, mesh, injector,
+///    node_agent, migrate)
 ///    — each mode then loads TLS certs (frontend, admin, DTLS, gRPC) and validates
 ///    per-proxy backend TLS paths before starting listeners
 /// 8. Wait for SIGINT/SIGTERM for graceful shutdown
@@ -116,7 +117,7 @@ unsafe fn run_gateway_cli() {
     // ── CLI parsing ─────────────────────────────────────────────────────
     // Parse before anything else so `--settings`/`--spec`/`--mode` env var
     // overrides are in place before `CONF_FILE_CACHE` OnceLock is triggered
-    // by `resolve_ferrum_var()` during logging init (line ~95 below).
+    // by `resolve_ferrum_var()` during logging init (`init_logging()`).
     let cli = cli::Cli::parse();
 
     // Handle early-exit subcommands that don't need the startup pipeline.
@@ -353,7 +354,7 @@ fn init_logging() -> Result<LoggingGuards, String> {
         let fmt_layer = logging::filter_output_layer(
             tracing_subscriber::fmt::layer()
                 .json()
-                    .with_writer(SeverityWriter {
+                .with_writer(SeverityWriter {
                     stdout: stdout_writer.clone(),
                     stderr: stderr_writer.clone(),
                 }),
@@ -391,7 +392,7 @@ fn init_logging() -> Result<LoggingGuards, String> {
         let fmt_layer = logging::filter_output_layer(
             tracing_subscriber::fmt::layer()
                 .json()
-                    .with_writer(SeverityWriter {
+                .with_writer(SeverityWriter {
                     stdout: stdout_writer,
                     stderr: stderr_writer,
                 }),
@@ -689,7 +690,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
 
     // Same lowest-precedence mode selection as the `validate` branch above, and
     // for the same reasons. Scoped to `run` because that is the only serving
-    // entry point whose CLI overrides were applied in `main()`.
+    // entry point whose CLI overrides were applied in `run_gateway_cli()`.
     if matches!(&cli.command, Some(cli::Command::Run(_))) {
         cli::infer_file_mode();
     }
