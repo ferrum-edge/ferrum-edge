@@ -1498,6 +1498,53 @@ async fn streaming_half_open_admits_exactly_one_probe() {
     );
 }
 
+/// The streaming claim publishes the same circuit metadata as the buffered
+/// loop (issue #7125): a skipped open provider counts in
+/// `ai_federation_circuit_open_skips`, and the committed provider, not the
+/// skipped one, is the last circuit seen.
+#[tokio::test]
+async fn streaming_claim_records_skip_and_committed_circuit_metadata() {
+    let breaker = json!({"failure_threshold": 1, "cooldown_seconds": 30, "success_threshold": 1});
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "fallback_enabled": true,
+        "providers": [
+            openai_provider(json!({"name": "first", "circuit_breaker": breaker})),
+            openai_provider(json!({"name": "second", "circuit_breaker": breaker}))
+        ]
+    }));
+    assert!(test_helpers::open_circuit_for_test(&plugin, 0));
+
+    let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let meta = |key: &str| ctx.metadata.get(key).map(String::as_str);
+    assert_eq!(meta("ai_federation_circuit_open_skips"), Some("1"));
+    assert_eq!(meta("ai_federation_circuit_last_provider"), Some("second"));
+    assert_eq!(meta("ai_federation_circuit_last_state"), Some("closed"));
+    assert_eq!(meta("ai_federation_circuit_half_open_probes"), None);
+    drop(ctx);
+
+    // A committed half-open probe is visible too.
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "fallback_enabled": false,
+        "providers": [openai_provider(json!({"circuit_breaker": breaker}))]
+    }));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
+    let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let meta = |key: &str| ctx.metadata.get(key).map(String::as_str);
+    assert_eq!(meta("ai_federation_circuit_last_provider"), Some("openai"));
+    assert_eq!(
+        meta("ai_federation_circuit_last_state"),
+        Some("half_open_probe")
+    );
+    assert_eq!(meta("ai_federation_circuit_half_open_probes"), Some("1"));
+    assert_eq!(meta("ai_federation_circuit_open_skips"), None);
+}
+
 /// Cancelling a half-open probe frees the single slot without scoring it.
 #[tokio::test]
 async fn streaming_cancellation_frees_the_half_open_probe_slot() {

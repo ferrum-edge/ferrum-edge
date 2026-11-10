@@ -372,6 +372,91 @@ fn unknown_config_properties_are_rejected_with_qualified_paths() {
     }
 }
 
+/// Nested type errors name the full schema path, never the bare leaf key
+/// (issue #7132): `builtins.jailbreak.enabled` must not read as the root
+/// `enabled` switch, and list entries carry their index.
+#[test]
+fn nested_type_errors_name_the_qualified_schema_path() {
+    let endpoint = "http://127.0.0.1:9/v1/embeddings";
+    let cases = [
+        (
+            json!({
+                "provider": provider(endpoint),
+                "builtins": {"jailbreak": {"enabled": "yes"}}
+            }),
+            "`builtins.jailbreak.enabled` must be a boolean",
+        ),
+        (
+            json!({
+                "provider": provider(endpoint),
+                "builtins": {"jailbreak": {"examples_mode": 1}}
+            }),
+            "`builtins.jailbreak.examples_mode` must be a string",
+        ),
+        (
+            json!({
+                "provider": provider(endpoint),
+                "builtins": {"prompt_injection": true},
+                "inspect": {"request": "yes"}
+            }),
+            "`inspect.request` must be a boolean",
+        ),
+        (
+            json!({
+                "provider": provider(endpoint),
+                "builtins": disabled_builtins(),
+                "custom_rules": [{"id": "rule", "examples": ["blocked"], "action": 5}]
+            }),
+            "`custom_rules[0].action` must be a string",
+        ),
+        (
+            json!({
+                "provider": provider(endpoint),
+                "builtins": disabled_builtins(),
+                "deny_topics": [
+                    {"id": "first", "examples": ["first topic"]},
+                    {"id": "second", "examples": ["second topic"], "description": 7}
+                ]
+            }),
+            "`deny_topics[1].description` must be a string",
+        ),
+        (
+            json!({
+                "provider": provider(endpoint),
+                "builtins": {"prompt_injection": true},
+                "privacy": {"include_snippet_hash": "no"}
+            }),
+            "`privacy.include_snippet_hash` must be a boolean",
+        ),
+        (
+            json!({
+                "provider": provider(endpoint),
+                "builtins": {"prompt_injection": true},
+                "extraction": {"request_json_paths": "$.prompt"}
+            }),
+            "`extraction.request_json_paths` must be an array",
+        ),
+        (
+            json!({
+                "provider": {
+                    "type": "openai_compatible_embeddings",
+                    "endpoint": endpoint,
+                    "model": 3
+                },
+                "builtins": {"prompt_injection": true}
+            }),
+            "`provider.model` must be a string",
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = AiSemanticFirewall::new(&config, PluginHttpClient::default())
+            .err()
+            .expect("a wrong-typed nested field must reject configuration");
+        assert!(error.contains(expected), "expected {expected}: {error}");
+    }
+}
+
 #[test]
 fn active_directions_reject_empty_extraction_arrays() {
     for extraction in [

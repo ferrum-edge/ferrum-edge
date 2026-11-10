@@ -7175,6 +7175,18 @@ async fn forged_meta_anthropic_ctx(plugin: &AiStreamRouter) -> RequestContext {
     ctx
 }
 
+/// `ANTHROPIC_SSE` with a `message_start.message.model` that differs from the
+/// committed `claude-3-5-sonnet`, so a normalizer that adopted the provider's
+/// report would be visible.
+fn anthropic_sse_reporting_a_different_model() -> String {
+    let sse = ANTHROPIC_SSE.replace(
+        "\"model\":\"claude-3-5-sonnet\"",
+        "\"model\":\"provider-reported-model\"",
+    );
+    assert!(sse.contains("provider-reported-model"));
+    sse
+}
+
 #[tokio::test]
 async fn streaming_normalizer_identity_comes_from_the_private_claim() {
     let plugin = build(openai_and_anthropic_config());
@@ -7184,7 +7196,8 @@ async fn streaming_normalizer_identity_comes_from_the_private_claim() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("the owning instance must still install its normalizer");
     let mut collected = Vec::new();
-    let chunk = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    let sse = anthropic_sse_reporting_a_different_model();
+    let chunk = inspector.on_chunk(sse.as_bytes()).await;
     collected.extend_from_slice(&forwarded(chunk));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -7197,6 +7210,10 @@ async fn streaming_normalizer_identity_comes_from_the_private_claim() {
         !out.contains("forged-identity"),
         "a metadata rewrite must not change the generation identity: {out}"
     );
+    assert!(
+        !out.contains("provider-reported-model"),
+        "the provider's message_start model must not replace the committed model: {out}"
+    );
 }
 
 #[tokio::test]
@@ -7204,11 +7221,12 @@ async fn buffered_normalizer_identity_comes_from_the_private_claim() {
     let plugin = build(openai_and_anthropic_config());
     let mut ctx = forged_meta_anthropic_ctx(&plugin).await;
 
+    let sse = anthropic_sse_reporting_a_different_model();
     let buffered = plugin
         .normalize_response_body_with_context(
             &mut ctx,
             200,
-            ANTHROPIC_SSE.as_bytes(),
+            sse.as_bytes(),
             Some("text/event-stream"),
             &HashMap::new(),
         )
@@ -7218,6 +7236,7 @@ async fn buffered_normalizer_identity_comes_from_the_private_claim() {
 
     assert!(out.contains("\"model\":\"claude-3-5-sonnet\""), "{out}");
     assert!(!out.contains("forged-identity"), "{out}");
+    assert!(!out.contains("provider-reported-model"), "{out}");
 }
 
 #[tokio::test]
@@ -9478,6 +9497,61 @@ async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
     );
 }
 
+/// Anthropic routes validate `tools` whether or not `tool_choice` is present
+/// (issue #7126): the translator never drops a declaration, so a malformed
+/// list is refused at claim time with an OpenAI-shaped `400` naming `tools`,
+/// exactly as the Gemini route refuses it.
+#[tokio::test]
+async fn test_anthropic_claim_fail_closed_on_malformed_tools_without_tool_choice() {
+    let anthropic = build(openai_and_anthropic_config());
+    let gemini = build(gemini_config());
+    let malformed_tools = [
+        json!({"not": "an-array"}),
+        json!([{"type": "function", "function": {"description": "no name"}}]),
+        json!([{"type": "function", "function": {"name": "bad name!"}}]),
+        json!([{"type": "web_search", "function": {"name": "lookup"}}]),
+        json!([{"name": "lookup", "parameters": {"type": "object"}}]),
+        json!([
+            {"type": "function", "function": {"name": "lookup"}},
+            "not-an-object"
+        ]),
+    ];
+    for tools in malformed_tools {
+        for (plugin, model) in [
+            (&anthropic, "claude-3-5-sonnet"),
+            (&gemini, "gemini-1.5-flash"),
+        ] {
+            let body = json!({
+                "model": model,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+            });
+            let mut ctx = post_ctx(&body);
+            let mut headers = json_headers();
+            let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert_eq!(reject_status(&result), Some(400), "{model}: {tools}");
+            assert_eq!(
+                rejected_param(&result).as_deref(),
+                Some("tools"),
+                "{model}: the 400 must name `tools`, not `tool_choice`: {tools}"
+            );
+        }
+    }
+
+    // A well-formed list without `tool_choice` is still translated in full.
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": weather_tools(),
+    });
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("well-formed tools translate");
+    assert_eq!(parsed["tools"][0]["name"], json!("get_weather"));
+}
+
 #[tokio::test]
 async fn test_gemini_alt_sse_query_merge_variants() {
     // Client query is preserved and alt=sse is appended.
@@ -10106,6 +10180,56 @@ async fn test_explicit_anthropic_version_is_forwarded_unchanged() {
         headers.get("anthropic-version").map(String::as_str),
         Some("2026-01-01")
     );
+}
+
+/// `anthropic_version` is only sent to `anthropic` providers, so a value on any
+/// other provider type is refused like `default_max_tokens` (issue #7128);
+/// an explicit `null` still means omission.
+#[test]
+fn test_config_rejects_anthropic_version_on_other_provider_types() {
+    for (provider_type, endpoint, pattern) in [
+        (
+            "openai",
+            "https://api.openai.com/v1/chat/completions",
+            "gpt-*",
+        ),
+        (
+            "openai_compatible",
+            "https://llm.example.com/v1/chat/completions",
+            "llama-*",
+        ),
+        (
+            "azure_openai",
+            "https://example.openai.azure.com/openai/deployments/d/chat/completions",
+            "gpt-*",
+        ),
+        (
+            "google_gemini",
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
+            "gemini-*",
+        ),
+    ] {
+        let provider = |anthropic_version: Value| {
+            anthropic_provider(json!({
+                "provider_type": provider_type,
+                "endpoint": endpoint,
+                "model_patterns": [pattern],
+                "anthropic_version": anthropic_version,
+            }))
+        };
+        let err = AiStreamRouter::new(&provider(json!("2023-06-01")), http_client())
+            .err()
+            .expect("anthropic_version on a non-anthropic provider must fail admission");
+        assert!(err.contains("anthropic_version"), "{provider_type}: {err}");
+        assert!(
+            err.contains("only supported for `anthropic` providers"),
+            "{provider_type}: {err}"
+        );
+        assert!(
+            AiStreamRouter::new(&provider(Value::Null), http_client()).is_ok(),
+            "{provider_type}: an explicit null is omission"
+        );
+    }
 }
 
 #[test]

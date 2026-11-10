@@ -1019,8 +1019,16 @@ impl AiStreamRouter {
             validate_provider_header_value(&name, "api_key", &api_key)?;
             let auth = build_auth(provider_type, api_key);
 
-            let anthropic_version = optional_str(pv, "anthropic_version")?
-                .unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.to_string());
+            let anthropic_version = optional_str(pv, "anthropic_version")?;
+            // Only Anthropic sends the header, so on any other provider the
+            // field would be silently inert (same rule as `default_max_tokens`).
+            if anthropic_version.is_some() && provider_type != ProviderType::Anthropic {
+                return Err(format!(
+                    "ai_stream_router: provider {name:?} `anthropic_version` is only supported for `anthropic` providers (no other provider type sends an `anthropic-version` header)"
+                ));
+            }
+            let anthropic_version =
+                anthropic_version.unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.to_string());
             // An explicit empty string is not omission (`null` is): it would
             // send an empty `anthropic-version` header on every request.
             if anthropic_version.is_empty() {
@@ -2161,6 +2169,10 @@ fn validate_anthropic_translation(
             ));
         }
     }
+    // Closed tools validation runs whether or not `tool_choice` is present:
+    // `translate_tools` must never drop a declaration, so a malformed list is
+    // refused here (issue #7126), as on Gemini routes.
+    openai_declared_tool_names(openai_body)?;
     let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
     let tool_choice_kind = tool_choice.as_ref().map(|(kind, _)| *kind);
     let thinking = resolve_anthropic_thinking(openai_body, tool_choice_kind, default_max_tokens)?;
@@ -2209,32 +2221,6 @@ enum ToolChoiceKind {
     /// OpenAI `required` → Anthropic `{"type":"any"}`.
     ForcedAny,
     ForcedNamed,
-}
-
-fn openai_declared_tool_names(openai_body: &Value) -> Result<Option<Vec<&str>>, String> {
-    let Some(tools) = openai_body.get("tools") else {
-        return Ok(None);
-    };
-    if tools.is_null() {
-        return Ok(None);
-    }
-    let arr = tools
-        .as_array()
-        .ok_or_else(|| "unsupported or malformed tools".to_string())?;
-    if arr.is_empty() {
-        return Ok(None);
-    }
-    let mut names = Vec::with_capacity(arr.len());
-    for tool in arr {
-        let func = tool.get("function").unwrap_or(tool);
-        let name = func
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| valid_tool_name(value))
-            .ok_or_else(|| "unsupported or malformed tools".to_string())?;
-        names.push(name);
-    }
-    Ok(Some(names))
 }
 
 /// Effective Anthropic `max_tokens` this route forwards (OpenAI `max_tokens`,
@@ -2482,7 +2468,7 @@ fn validate_gemini_request_params(openai_body: &Value) -> Result<(), ParamReject
     // client that disabled parallel calls for callable tools cannot have that
     // contract honored.
     if present(openai_body, "parallel_tool_calls") == Some(&Value::Bool(false))
-        && gemini_declared_function_names(openai_body)
+        && openai_declared_tool_names(openai_body)
             .ok()
             .flatten()
             .is_some()
@@ -3055,15 +3041,17 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
     }
     // Closed tools + tool_choice validation: never silently drop unsupported
     // declarations or weaken non-`none` choices without a tools array.
-    let _ = gemini_declared_function_names(openai_body)?;
+    let _ = openai_declared_tool_names(openai_body)?;
     let _ = resolve_gemini_tool_choice(openai_body)?;
     Ok(())
 }
 
-/// Closed Gemini-representable OpenAI `tools` declarations. Every entry must be
-/// `{type:"function", function:{name:...}}` with a valid name; unsupported or
-/// unrepresentable entries fail closed rather than being skipped.
-fn gemini_declared_function_names(openai_body: &Value) -> Result<Option<Vec<&str>>, String> {
+/// Closed OpenAI `tools` declarations both translations can represent
+/// (Anthropic `tools`, Gemini `functionDeclarations`). Every entry must be
+/// `{type:"function", function:{name:...}}` with a valid name; a non-array
+/// `tools`, or an unsupported or unrepresentable entry, fails closed rather
+/// than being skipped. Absent, `null`, and `[]` declare no tools.
+fn openai_declared_tool_names(openai_body: &Value) -> Result<Option<Vec<&str>>, String> {
     let Some(tools) = openai_body.get("tools") else {
         return Ok(None);
     };
@@ -3138,7 +3126,7 @@ fn resolve_gemini_tool_choice(openai_body: &Value) -> Result<Option<Value>, Stri
         _ => return Err("unsupported or malformed tool_choice".to_string()),
     };
 
-    let tools = gemini_declared_function_names(openai_body)?;
+    let tools = openai_declared_tool_names(openai_body)?;
     if kind != ToolChoiceKind::None && tools.is_none() {
         return Err("tool_choice requires a non-empty tools array".to_string());
     }
@@ -3786,8 +3774,10 @@ impl Plugin for AiStreamRouter {
                 (Some("thinking"), Some("invalid_thinking"))
             } else if message.contains("reasoning_effort") {
                 (Some("reasoning_effort"), Some("invalid_reasoning_effort"))
-            } else if message.contains("tool_choice") || message.contains("tools") {
+            } else if message.contains("tool_choice") {
                 (Some("tool_choice"), Some("invalid_tool_choice"))
+            } else if message.contains("tools") {
+                (Some("tools"), Some("invalid_tools"))
             } else {
                 (Some("messages"), Some("invalid_messages"))
             };
@@ -3802,8 +3792,10 @@ impl Plugin for AiStreamRouter {
         if provider.provider_type == ProviderType::GoogleGemini
             && let Err(message) = validate_gemini_translation(&openai_body)
         {
-            let (param, code) = if message.contains("tool_choice") || message.contains("tools") {
+            let (param, code) = if message.contains("tool_choice") {
                 (Some("tool_choice"), Some("invalid_tool_choice"))
+            } else if message.contains("tools") {
+                (Some("tools"), Some("invalid_tools"))
             } else {
                 (Some("messages"), Some("invalid_messages"))
             };
@@ -5716,9 +5708,9 @@ impl AnthropicSseNormalizer {
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
                     self.stream_id = Some(id.to_string());
                 }
-                if let Some(m) = message.get("model").and_then(Value::as_str) {
-                    self.model = m.to_string();
-                }
+                // `message.model` is the provider's own report and is never
+                // stamped into normalized chunks: the client-visible identity is
+                // the claim-committed model, exactly as on Gemini routes.
                 // `output_tokens` here is a placeholder the terminal delta
                 // supersedes; only the input side is authoritative.
                 let start_usage =

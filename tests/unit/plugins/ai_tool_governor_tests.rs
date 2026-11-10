@@ -1950,6 +1950,75 @@ async fn streaming_allows_and_releases_held_frames() {
     assert_eq!(out, bytes);
 }
 
+/// The live SSE inspector reads every complete event of a chunk in place and
+/// drains the consumed prefix once per chunk (issue #7133). Many events per
+/// chunk, a partial trailing event, and every two-chunk split must still
+/// deliver an allowed stream byte for byte, in order.
+#[tokio::test]
+async fn streaming_many_events_per_chunk_are_delivered_in_order_at_every_split() {
+    let plugin = make(streaming_config(
+        json!({ "get_weather": { "action": "allow" } }),
+        "deny",
+    ));
+    let mut body =
+        String::from("data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n");
+    for i in 0..40 {
+        body.push_str(&format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"t{i} \"}}}}]}}\n\n"
+        ));
+        if i % 10 == 0 {
+            body.push_str(": keepalive\n\n");
+        }
+    }
+    body.push_str(concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"held behind the batch\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    ));
+    let bytes = body.as_bytes();
+    // Whole body in one chunk (split 0), then every two-chunk split.
+    for split in 0..bytes.len() {
+        let ctx = create_test_context();
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let chunks: Vec<&[u8]> = if split == 0 {
+            vec![bytes]
+        } else {
+            let (first, second) = bytes.split_at(split);
+            vec![first, second]
+        };
+        let (out, terminated) = drive_stream(&mut inspector, &chunks).await;
+        assert!(
+            !terminated,
+            "split {split}: an allowed stream must not be cut"
+        );
+        assert_eq!(out, bytes, "split {split}: output must equal the input");
+    }
+
+    // A denied call carried among many events in one chunk is still cut
+    // without releasing its held frames.
+    let denied = body.replace("get_weather", "drop_database");
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[denied.as_bytes()]).await;
+    assert!(terminated, "a denied tool call must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("t39 "),
+        "content before the call streams: {text}"
+    );
+    assert!(!text.contains("drop_database"), "held call leaked: {text}");
+    assert!(
+        !text.contains("held behind the batch"),
+        "held frame leaked: {text}"
+    );
+}
+
 #[tokio::test]
 async fn streaming_reconstructs_split_arguments_and_denies_without_leaking() {
     // A blocked pattern that only matches once the argument fragments are

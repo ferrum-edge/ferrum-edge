@@ -1177,8 +1177,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped as RFC 6347 §4.1.2.7 and RFC 9147 §4.5.2 require; authenticated
   fatal alerts and handshake certificate or security failures still end the
   session, and handshake deadlines still bound a stalled handshake.
+- **`ai_stream_router` Anthropic chunks carry the committed model**
+  (issue #7127). The Anthropic stream normalizer replaced the model it stamps
+  into every `chat.completion.chunk` with the provider's
+  `message_start.message.model`, so Anthropic routes echoed whatever the
+  endpoint reported while Gemini routes echoed the routed model. Both now
+  stamp the claim-committed model; the provider's report is ignored.
+- **`ai_semantic_cache` can hit behind a generating `correlation_id`**
+  (issue #7130). The cache's request-context partition bound the fresh UUID a
+  `correlation_id` instance mints when the client sends no request id, so
+  every request got its own key and the cache stored an entry per request
+  without ever serving one. It now omits that header under the private
+  provenance rule `response_caching` already uses (issue #3929); a
+  client-supplied id is still a key dimension. A gateway-injected
+  `traceparent` from `otel_tracing` is still bound.
+- **`ai_transcript_audit` reads MCP event-stream outcomes in every SSE
+  framing** (issue #7134). The MCP outcome parser split the response with
+  `str::lines` and matched a bare `data:` prefix, so a CR-terminated or
+  BOM-prefixed event stream yielded no JSON-RPC responses: a failed tool call
+  was not seen as failed, `always_capture_on_error` could drop it, and
+  `mcp.calls[].result` was absent. It now splits lines and strips BOMs like
+  the plugin's other SSE paths. The docs now state that `ai_transcript_audit`
+  and `ai_tool_governor` read `ai_token_metrics` output only under its
+  default `ai` metadata prefix.
+- **`ai_stream_router` refuses malformed `tools` on Anthropic routes**
+  (issue #7126). Tool declarations were validated only when `tool_choice`
+  (or extended thinking) was present; otherwise a non-array `tools` produced
+  no tools, entries without a string name were skipped, invalid names were
+  forwarded, and non-`function` entries were sent as functions, so the
+  request succeeded with tools missing. Anthropic routes now apply the same
+  closed `{type:"function", function:{name}}` check as Gemini routes and
+  `ai_federation`, on every request. The claim-time `400` for a malformed
+  `tools` list on Anthropic and Gemini routes now reports `param: "tools"`
+  (`code: "invalid_tools"`) instead of `tool_choice`.
+- **`ai_stream_router` refuses `anthropic_version` on non-Anthropic
+  providers** (issue #7128). The field was parsed and validated for every
+  provider type but only ever sent to `anthropic` providers, so a value on
+  any other provider was silently inert. A non-null value there now fails
+  admission (and the OpenAPI schema), like `default_max_tokens`. Remove it
+  from such providers before upgrading.
+- **`ai_semantic_cache` rebuild throttle and Redis envelope** (issue #7131).
+  The HNSW vector-index rebuild throttle measured its 30-second interval on
+  the wall clock, so after a backward clock step of N seconds no new entry
+  became semantically searchable for N + 30 seconds. It now uses the same
+  monotonic clock as the expired-entry cleanup throttle. The Redis envelope
+  drops its `semantic_scope_key` and `embedding` fields, which were never
+  written (Redis holds exact entries only) and were only fed back into the
+  MAC on read; the envelope version is now 5. Entries written by an earlier
+  build fail the version check and are quarantined like any other
+  cross-version envelope, so a Redis-backed cache starts cold after upgrade.
+- **`ai_semantic_firewall` type errors name the full field path**
+  (issue #7132). A wrong-typed nested field was reported by its leaf name
+  only: `builtins: {jailbreak: {enabled: "yes"}}` said `` `enabled` must be a
+  boolean`` (which reads as the root switch) and `custom_rules[i]` errors had
+  no index. They now name the qualified path, for example
+  `` `builtins.jailbreak.enabled` `` or `` `custom_rules[0].action` ``.
+- **`ai_federation` streaming claims publish complete circuit metadata**
+  (issue #7125). A claimed stream wrote only `ai_federation_circuit_last_provider`
+  / `_last_state = "open"` for a provider skipped on an open circuit and
+  nothing for the provider it committed, so after skipping A and committing B
+  the transaction log said "A / open" and a committed half-open probe was
+  invisible. The streaming claim now records the same keys as the buffered
+  loop: `ai_federation_circuit_open_skips` per skip, and the committed
+  provider's `_last_provider`, `_last_state` and
+  `ai_federation_circuit_half_open_probes`.
 
 ### Performance
+- **`ai_tool_governor` drains its live SSE buffer once per chunk**
+  (issue #7133). The streaming tool-call inspector removed each complete
+  event from the front of its carry buffer, moving the rest of the chunk
+  every time, so a chunk of N events of total size S cost O(N·S) byte moves.
+  Events are now read in place and the consumed prefix is drained once per
+  chunk (O(S)). Output and policy decisions are unchanged.
 - **Multi-namespace control planes load their namespaces concurrently.** With
   `FERRUM_CP_NAMESPACES` set to a list or `*`, each incremental poll, each
   set of pre-load change-sequence boundary reads and each full reload used to

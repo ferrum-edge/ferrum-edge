@@ -2417,6 +2417,73 @@ fn is_valid_model_identifier(model: &str) -> bool {
 /// Only these providers are vulnerable to URL injection via the `model`
 /// field — for OpenAI-compatible / Anthropic / Cohere providers the
 /// model goes into the request body, not the URL.
+/// Record a provider skipped because its circuit is open: bump
+/// `ai_federation_circuit_open_skips` and name it as the last circuit seen.
+/// Shared by the buffered loop and the streaming claim so both publish the
+/// same keys (issue #7125).
+fn record_circuit_open_skip(ctx: &mut RequestContext, provider_name: &str) {
+    let skips = ctx
+        .metadata
+        .get("ai_federation_circuit_open_skips")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    ctx.metadata.insert(
+        "ai_federation_circuit_open_skips".to_string(),
+        skips.to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_federation_circuit_last_provider".to_string(),
+        provider_name.to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_federation_circuit_last_state".to_string(),
+        "open".to_string(),
+    );
+}
+
+/// Record the circuit admission of a provider the request is sent to (the
+/// buffered loop's attempt, or the streaming claim's committed provider), and
+/// count a half-open probe. A provider without a circuit records nothing.
+fn record_circuit_admission(
+    ctx: &mut RequestContext,
+    provider: &ResolvedProvider,
+    admission: CircuitAdmission,
+) {
+    if provider.circuit.is_none() {
+        return;
+    }
+    ctx.metadata.insert(
+        "ai_federation_circuit_last_provider".to_string(),
+        provider.name.clone(),
+    );
+    ctx.metadata.insert(
+        "ai_federation_circuit_last_state".to_string(),
+        match admission {
+            CircuitAdmission::Closed => "closed",
+            CircuitAdmission::HalfOpenProbe => "half_open_probe",
+            CircuitAdmission::Open => "open",
+        }
+        .to_string(),
+    );
+    if admission == CircuitAdmission::HalfOpenProbe {
+        let probes = ctx
+            .metadata
+            .get("ai_federation_circuit_half_open_probes")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        ctx.metadata.insert(
+            "ai_federation_circuit_half_open_probes".to_string(),
+            probes.to_string(),
+        );
+        info!(
+            provider = %provider.name,
+            "ai_federation: provider circuit admitted a half-open probe"
+        );
+    }
+}
+
 fn provider_embeds_model_in_url(provider_type: ProviderType) -> bool {
     matches!(
         provider_type,
@@ -7786,14 +7853,7 @@ impl AiFederation {
             if admission == CircuitAdmission::Open {
                 skipped_open_circuit = true;
                 super::prometheus_metrics::global_registry().record_ai_federation_open_skip();
-                ctx.metadata.insert(
-                    "ai_federation_circuit_last_provider".to_string(),
-                    provider.name.clone(),
-                );
-                ctx.metadata.insert(
-                    "ai_federation_circuit_last_state".to_string(),
-                    "open".to_string(),
-                );
+                record_circuit_open_skip(ctx, &provider.name);
                 if !self.fallback_enabled {
                     return self.openai_error_response(
                         503,
@@ -7912,6 +7972,7 @@ impl AiFederation {
                 Some("provider_policy_violation"),
             );
         };
+        record_circuit_admission(ctx, provider, admission);
 
         {
             // --- COMMIT. Nothing below may fail over to another provider. ---
@@ -9105,24 +9166,7 @@ impl Plugin for AiFederation {
             if admission == CircuitAdmission::Open {
                 skipped_open_circuit = true;
                 super::prometheus_metrics::global_registry().record_ai_federation_open_skip();
-                let skips = ctx
-                    .metadata
-                    .get("ai_federation_circuit_open_skips")
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                ctx.metadata.insert(
-                    "ai_federation_circuit_open_skips".to_string(),
-                    skips.to_string(),
-                );
-                ctx.metadata.insert(
-                    "ai_federation_circuit_last_provider".to_string(),
-                    provider.name.clone(),
-                );
-                ctx.metadata.insert(
-                    "ai_federation_circuit_last_state".to_string(),
-                    "open".to_string(),
-                );
+                record_circuit_open_skip(ctx, &provider.name);
                 debug!(
                     provider = %provider.name,
                     "ai_federation: skipping provider with open circuit"
@@ -9150,37 +9194,7 @@ impl Plugin for AiFederation {
                 }
                 break;
             }
-            if provider.circuit.is_some() {
-                ctx.metadata.insert(
-                    "ai_federation_circuit_last_provider".to_string(),
-                    provider.name.clone(),
-                );
-                ctx.metadata.insert(
-                    "ai_federation_circuit_last_state".to_string(),
-                    match admission {
-                        CircuitAdmission::Closed => "closed",
-                        CircuitAdmission::HalfOpenProbe => "half_open_probe",
-                        CircuitAdmission::Open => "open",
-                    }
-                    .to_string(),
-                );
-                if admission == CircuitAdmission::HalfOpenProbe {
-                    let probes = ctx
-                        .metadata
-                        .get("ai_federation_circuit_half_open_probes")
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                    ctx.metadata.insert(
-                        "ai_federation_circuit_half_open_probes".to_string(),
-                        probes.to_string(),
-                    );
-                    info!(
-                        provider = %provider.name,
-                        "ai_federation: provider circuit admitted a half-open probe"
-                    );
-                }
-            }
+            record_circuit_admission(ctx, provider, admission);
             let resolved_model = Self::resolve_model(provider, &model);
 
             // Defense against URL injection via the user-controlled `model`
