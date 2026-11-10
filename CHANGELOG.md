@@ -59,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **CP `GET /admin/metrics` reports `database_polling`** (#7215). The
+  Control Plane has no proxy state, and the builder's no-proxy-state branch
+  dropped the delta-poll block, so CP operators never saw it although
+  `docs/admin_metrics.md` documents it for `cp`. It is now attached in both
+  `database` and `cp` modes.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

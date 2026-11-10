@@ -29,7 +29,8 @@ pub struct AdminMetrics {
     pub rate_limiting: AdminMetricsRateLimiting,
     pub adaptive_concurrency: AdminMetricsAdaptiveConcurrency,
     pub tcp_connection_throttle: AdminMetricsTcpConnectionThrottle,
-    /// Present only in database mode when the delta-poll registry is installed.
+    /// Present only in database and CP modes when the delta-poll registry is
+    /// installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_polling: Option<DatabaseDeltaPollMetricsSnapshot>,
 }
@@ -427,10 +428,18 @@ pub fn build_admin_metrics(
     database_polling: Option<DatabaseDeltaPollMetricsSnapshot>,
 ) -> AdminMetrics {
     let source_status = config_source_status(db_available).to_string();
+    // Only DB-backed config sources (database and CP) poll for deltas; CP has
+    // no proxy state, so this must be attached on both branches below.
+    let database_polling = if mode == "database" || mode == "cp" {
+        database_polling
+    } else {
+        None
+    };
 
     let Some(ps) = proxy_state else {
         let mut metrics = empty_proxy_metrics(mode);
         metrics.gateway.config_source_status = source_status;
+        metrics.database_polling = database_polling;
         return metrics;
     };
 
@@ -614,11 +623,7 @@ pub fn build_admin_metrics(
         tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(
             ps.plugin_cache.tcp_connection_throttle_active_connections(),
         ),
-        database_polling: if mode == "database" || mode == "cp" {
-            database_polling
-        } else {
-            None
-        },
+        database_polling,
     }
 }
 
