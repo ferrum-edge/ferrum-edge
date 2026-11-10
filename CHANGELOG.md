@@ -618,6 +618,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TCPRoute/TLSRoute proxy ids change (`gwapi-l4-<ns>-<name>-0` becomes
   `gwapi-l4-<ns>-<name>-tcproute-0` or `-tlsroute-0`); anything keyed on those
   ids (dashboards, plugin `proxy_id` references) needs the new spelling.
+- **A Sidecar `ingress[]` stream listener with a dedicated `bind` no longer
+  removes every mesh outbound HTTP route** (issue #7231). The mesh stream
+  proxy builders (dedicated-bind and inbound raw-TCP relay, east-west gateway
+  and service, stream EgressGateway, NodeWaypoint UDP/DTLS listener) left the
+  dispatch kind at its HTTP default until the final normalization, so the
+  outbound materializer read the host-less bind proxy as an HTTP catch-all and
+  skipped every `__mesh-outbound-*` route (logged at debug only), cutting all
+  HTTP-family mesh egress for that workload. They now set the dispatch kind
+  from their scheme, as the outbound raw-TCP relay already did; the
+  NodeWaypoint UDP listener port reservation and the non-Linux scoped-policy
+  UDP fail-closed strip now also see these proxies as stream proxies.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
