@@ -97,11 +97,6 @@ impl MeshBpfMetricsExporter {
         self.prefix.as_ref()
     }
 
-    /// Shared counter store read on each scrape.
-    pub fn metrics_state(&self) -> Arc<BpfMetricsState> {
-        self.state.clone()
-    }
-
     /// Render the BPF metrics in Prometheus text exposition format.
     ///
     /// Cold path — called once per authenticated `/metrics` scrape. Emits

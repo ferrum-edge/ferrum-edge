@@ -2135,8 +2135,6 @@ fn mesh_cert_expiry_series_is_stale(expires_at: u64, last_observed_at: u64, now:
     now >= stale_after
 }
 
-/// Build a `MeshRequestKey` from a transaction summary.
-///
 /// Hard cap on the number of distinct interned mesh-label values.
 ///
 /// The legitimate mesh label space (workload / namespace / principal / app /
@@ -3312,13 +3310,6 @@ fn write_optional_mesh_label(
     let _ = write!(labels, "{}=\"{}\"", name, escape_label_value(value));
 }
 
-/// Current value of the aggregate ADS stream rejection counter. Test-only
-/// accessor so the cap can be asserted without scraping the full metrics text.
-#[cfg(test)]
-pub fn xds_streams_rejected_count() -> u64 {
-    XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
-}
-
 /// Current value of the first-slice NACK counter for a `(namespace, type_url)`
 /// pair. Test-only accessor.
 #[cfg(test)]
@@ -3566,15 +3557,15 @@ mod tests {
         let namespace = format!("ns-{suffix}");
         let type_url = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 
-        let before = xds_streams_rejected_count();
+        let before = xds_streams_rejected_total();
         increment_xds_stream_rejected();
         increment_xds_stream_rejected();
         increment_xds_first_slice_nack(&namespace, type_url);
 
-        assert_eq!(xds_streams_rejected_count() - before, 2);
+        assert_eq!(xds_streams_rejected_total() - before, 2);
         assert_eq!(xds_first_slice_nack_count(&namespace, type_url), 1);
 
-        let total = xds_streams_rejected_count();
+        let total = xds_streams_rejected_total();
         let mut output = String::new();
         render_mesh_observability_metrics(&mut output);
 

@@ -74,7 +74,7 @@
 //!
 //! These env vars may themselves be resolved by the gateway's external secret
 //! resolution system (Vault, AWS Secrets Manager, etc.) via the `_VAULT`,
-//! `_AWS`, `_AZURE`, `_GCP`, `_FILE`, or `_ENV` suffixes.
+//! `_AWS`, `_AZURE`, `_GCP`, or `_FILE` suffixes.
 //!
 //! ## Configuration
 //!
@@ -506,12 +506,9 @@ enum AwsLambdaCredentials {
 
 /// AWS Lambda–specific configuration.
 #[derive(Clone)]
-#[allow(dead_code)]
 struct AwsLambdaConfig {
     region: String,
     credentials: AwsLambdaCredentials,
-    function_name: String,
-    qualifier: Option<String>,
     /// Set when a credential came from the process environment or the default
     /// chain and the operator did not opt out: the only endpoints those
     /// credentials may be signed for (issue #6111). Re-checked before every
@@ -1038,8 +1035,6 @@ impl ServerlessFunction {
                     let aws_cfg = AwsLambdaConfig {
                         region,
                         credentials: lambda_credentials,
-                        function_name,
-                        qualifier,
                         ambient_endpoint_scope,
                     };
 
