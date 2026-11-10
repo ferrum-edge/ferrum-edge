@@ -597,6 +597,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **HBONE admission-fence sweeps no longer count as scope-missing rejections**
+  (#7146). `ferrum_mesh_node_waypoint_destination_policy_rejections_total`
+  with `reason="scope_missing"` or `"destination_scope_missing"` counted once
+  per live tunnel per sweep when a tunnel's per-pod scope had gone, so a
+  routine policy apply looked like many denied requests. Like the other
+  reasons, these now count only real requests; the tunnel is still refused.
+- **Typed mesh diagnostics name every field** (#7146). A type error under
+  `MeshService.allow_path_parameters` or a policy rule `to[].headers` /
+  `to[].port_patterns` now names its schema path instead of a redacted key, and
+  an unknown `to` key lists those fields as expected.
+- **The `oidc_relying_party` logged-out page is served as HTML** (#7147). The
+  local logout response now carries `Content-Type: text/html; charset=utf-8`
+  instead of the default `application/json`, so browsers render the page.
+- **`response_caching` reads `Vary`, `ETag` and `Last-Modified`
+  case-insensitively** (#7148), like the other headers it consults. A
+  mixed-case `Vary: *` is no longer stored, mixed-case `Vary` dimensions are
+  keyed, the merged `vary` list replaces the original key instead of being
+  added beside it, and a mixed-case `ETag` or `Last-Modified` answers a
+  conditional request with `304`.
+- **`jwks_auth` admits only the published `sync_mode` and `dpop_replay_scope`
+  spellings** (#7151). Values such as `"REDIS"` or `" Shared "` were accepted by
+  file mode and database rows although the `JwksAuthConfig` schema rejects them;
+  they now fail admission, as in `hmac_auth`.
+- **Mesh freshness families are contiguous in `/metrics`** (#7145). The
+  federation and remote-discovery last-success and age gauges were written as
+  interleaved samples under two headers, which strict OpenMetrics parsers
+  reject. Each family is now emitted as one group.
+- **Batch log sinks no longer burst flushes after a slow flush** (#7150). After
+  a flush (with retries) that outlasted several `flush_interval_ms` periods,
+  the flush timer fired the missed ticks back to back and sent the recovering
+  collector a run of tiny batches. It now resumes one interval later.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
@@ -662,6 +693,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it cannot crowd out Gateway API status on the shared Kubernetes client.
   Each writer's own batch behaves as before, and clusters that watch only one
   of the two are unchanged.
+- **Less per-record and per-request work in plugin hot paths** (#7145, #7146,
+  #7150, #7152). Log serialization binary-searches the built-in safe metadata
+  name list instead of scanning all 414 names per key, and no longer allocates
+  a key per metadata entry when flattening without a prefix. The HBONE inner
+  pool and mesh TCP egress recorders increment an existing series under a
+  shared read lock. The mesh destination-workload label fallback is interned
+  instead of allocated per request, and `grpc_web` copies `Content-Type` only
+  for gRPC-Web requests.
 
 ## [0.9.20] - 2026-11-02
 
