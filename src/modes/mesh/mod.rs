@@ -681,7 +681,7 @@ impl MeshRuntimeConfig {
 
     pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let config_protocol = MeshConfigProtocol::parse(&env_config.mesh_config_protocol)?;
-        let cp_urls = env_config.resolved_dp_cp_grpc_urls();
+        let cp_urls = env_config.dp_cp_grpc_urls.clone();
         if config_protocol.requires_control_plane() && cp_urls.is_empty() {
             return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
         }

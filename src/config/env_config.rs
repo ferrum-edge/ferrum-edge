@@ -6791,11 +6791,6 @@ impl EnvConfig {
         ))
     }
 
-    /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
-    pub fn resolved_dp_cp_grpc_urls(&self) -> Vec<String> {
-        self.dp_cp_grpc_urls.clone()
-    }
-
     /// Seconds the shutdown signal handler holds the accept loops open after
     /// SIGTERM/SIGINT, after the process-wide draining verdict is published.
     ///

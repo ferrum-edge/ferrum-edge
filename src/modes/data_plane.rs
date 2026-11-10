@@ -195,7 +195,7 @@ pub async fn run(
         start_config_staleness_monitor(config_freshness.clone(), shutdown_tx.subscribe());
 
     // Spawn the DP gRPC client to connect to CP and receive config updates
-    let cp_urls = env_config.resolved_dp_cp_grpc_urls();
+    let cp_urls = env_config.dp_cp_grpc_urls.clone();
     if cp_urls.is_empty() {
         return Err(anyhow::anyhow!(
             "FERRUM_DP_CP_GRPC_URLS is required in dp mode"

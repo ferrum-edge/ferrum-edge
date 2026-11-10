@@ -918,10 +918,7 @@ fn test_env_config_mesh_mode_valid() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::Mesh);
-            assert_eq!(
-                config.resolved_dp_cp_grpc_urls(),
-                vec!["http://cp:50051".to_string()]
-            );
+            assert_eq!(config.dp_cp_grpc_urls, vec!["http://cp:50051".to_string()]);
         },
     );
 }
@@ -7107,7 +7104,7 @@ fn test_env_config_node_agent_rejects_hbone_port_equal_to_outbound_capture() {
 // --- DP CP failover URL tests ---
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_single_entry() {
+fn test_dp_cp_grpc_urls_single_entry() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -7125,14 +7122,14 @@ fn test_resolved_dp_cp_grpc_urls_single_entry() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            let urls = config.resolved_dp_cp_grpc_urls();
+            let urls = config.dp_cp_grpc_urls.clone();
             assert_eq!(urls, vec!["http://cp1:50051"]);
         },
     );
 }
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
+fn test_dp_cp_grpc_urls_multi_urls_only() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -7151,7 +7148,7 @@ fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            let urls = config.resolved_dp_cp_grpc_urls();
+            let urls = config.dp_cp_grpc_urls.clone();
             assert_eq!(
                 urls,
                 vec![
@@ -7165,7 +7162,7 @@ fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
 }
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_trims_whitespace() {
+fn test_dp_cp_grpc_urls_trims_whitespace() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -7193,7 +7190,7 @@ fn test_resolved_dp_cp_grpc_urls_trims_whitespace() {
 }
 
 #[test]
-fn test_resolved_dp_cp_grpc_urls_filters_empty() {
+fn test_dp_cp_grpc_urls_filters_empty() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
@@ -7237,7 +7234,7 @@ fn test_dp_mode_validation_accepts_urls() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.resolved_dp_cp_grpc_urls(), vec!["https://cp1:50051"]);
+            assert_eq!(config.dp_cp_grpc_urls, vec!["https://cp1:50051"]);
         },
     );
 }

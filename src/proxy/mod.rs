@@ -41821,14 +41821,12 @@ async fn handle_proxy_request_inner(
                 // HALF_OPEN probe slot, letting an unadmitted retry advance or
                 // close a breaker that should have rejected the attempt.
                 if let Some(cb_config) = &proxy.circuit_breaker {
-                    match state
-                        .circuit_breaker_cache
-                        .can_execute_with_admission_epoch(
-                            &proxy.namespace,
-                            &proxy.id,
-                            grpc_current_cb_key.as_deref(),
-                            cb_config,
-                        ) {
+                    match state.circuit_breaker_cache.can_execute(
+                        &proxy.namespace,
+                        &proxy.id,
+                        grpc_current_cb_key.as_deref(),
+                        cb_config,
+                    ) {
                         Ok((cb, probe_ticket, admission_open_epoch)) => {
                             // #1649 R6 finding 1: re-capture the admission epoch for
                             // the rotated target so the deferred body-completion
@@ -45232,14 +45230,12 @@ async fn handle_proxy_request_inner(
             // `record_backend_outcome` attributes against the target that
             // actually produced `result`, not the never-called new target.
             if let Some(cb_config) = &proxy.circuit_breaker {
-                match state
-                    .circuit_breaker_cache
-                    .can_execute_with_admission_epoch(
-                        &proxy.namespace,
-                        &proxy.id,
-                        current_cb_target_key.as_deref(),
-                        cb_config,
-                    ) {
+                match state.circuit_breaker_cache.can_execute(
+                    &proxy.namespace,
+                    &proxy.id,
+                    current_cb_target_key.as_deref(),
+                    cb_config,
+                ) {
                     Ok((cb, probe_ticket, admission_open_epoch)) => {
                         // Adopt the rotated target's probe slot (the prior
                         // target's was taken by the intermediate record above).

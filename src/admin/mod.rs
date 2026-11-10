@@ -6002,7 +6002,7 @@ async fn handle_mesh_config_drift_get(
             let proto = ps.env_config.mesh_config_protocol.as_str();
             let cp_url = ps
                 .env_config
-                .resolved_dp_cp_grpc_urls()
+                .dp_cp_grpc_urls
                 .first()
                 .cloned()
                 .unwrap_or_default();
