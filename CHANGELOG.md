@@ -652,6 +652,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boolean`` (which reads as the root switch) and `custom_rules[i]` errors had
   no index. They now name the qualified path, for example
   `` `builtins.jailbreak.enabled` `` or `` `custom_rules[0].action` ``.
+- **`ai_federation` streaming claims publish complete circuit metadata**
+  (issue #7125). A claimed stream wrote only `ai_federation_circuit_last_provider`
+  / `_last_state = "open"` for a provider skipped on an open circuit and
+  nothing for the provider it committed, so after skipping A and committing B
+  the transaction log said "A / open" and a committed half-open probe was
+  invisible. The streaming claim now records the same keys as the buffered
+  loop: `ai_federation_circuit_open_skips` per skip, and the committed
+  provider's `_last_provider`, `_last_state` and
+  `ai_federation_circuit_half_open_probes`.
 
 ### Performance
 - **`ai_tool_governor` drains its live SSE buffer once per chunk**
