@@ -4483,14 +4483,13 @@ impl AiTranscriptAudit {
         // `BTreeMap` keeps the retained set stable for a given input.
         //
         // Only the per-instance `ai_semantic_cache.<id>.*` entries are
-        // truncated. The fixed-name producer keys (legacy `ai_cache_*` and
-        // `request_deduplication.replayed`) are a closed set of four and are
-        // not a cardinality axis, but they sort around the namespaced block —
-        // `request_deduplication.replayed` sorts after all of it — so a plain
-        // sorted truncation would discard the documented replay marker first
-        // while keeping an eleventh cache instance's status. Retaining them
-        // first keeps the cap at 32 total entries and keeps the record's
-        // per-request signals present regardless of chain width.
+        // truncated. The one fixed-name producer key,
+        // `request_deduplication.replayed`, is not a cardinality axis, but it
+        // sorts after the whole namespaced block, so a plain sorted truncation
+        // would discard the documented replay marker first while keeping an
+        // eleventh cache instance's status. Retaining it first keeps the cap at
+        // 32 total entries and keeps the record's per-request signal present
+        // regardless of chain width.
         if harvest.cache.len() > MAX_CACHE_TELEMETRY_ENTRIES {
             let fixed_name_entries = harvest
                 .cache
@@ -6749,7 +6748,6 @@ pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
     metadata.remove(MD_SAMPLE_HIT);
     metadata.remove(MD_STREAM_REQUEST);
     metadata.remove(MD_FINAL_REQ_SEEN);
-    metadata.retain(|key, _| !key.starts_with("ai_transcript_audit.stream_marker"));
     if !candidate {
         metadata.remove(MD_RECORD_ID);
         metadata.remove(MD_SAMPLED);
@@ -8159,9 +8157,9 @@ fn fired_metadata_value(value: &str) -> bool {
 /// widening the record and the collector's key space without bound. Truncation
 /// runs after the scan against the sorted `BTreeMap`, so the surviving subset
 /// is stable rather than `HashMap`-iteration-order dependent, and it applies
-/// only to the per-instance axis: the four fixed-name producer keys are
-/// retained first so a wide cache chain cannot displace the record's
-/// `request_deduplication.replayed` marker.
+/// only to the per-instance axis: the fixed-name
+/// `request_deduplication.replayed` marker is retained first so a wide cache
+/// chain cannot displace it.
 const MAX_CACHE_TELEMETRY_ENTRIES: usize = 32;
 
 /// Longest cache-telemetry value retained. Every admitted value is already
@@ -8238,13 +8236,6 @@ fn is_namespaced_cache_telemetry_key(key: &str) -> bool {
 fn cache_telemetry_suffix(key: &str) -> Option<&'static str> {
     if key == DEDUP_REPLAYED_KEY {
         return Some("replayed");
-    }
-    // Legacy `ai_cache_status` is the namespaced `cache_status` field with an
-    // `ai_` prefix, so the two spellings share one value domain.
-    if let Some(legacy) = key.strip_prefix("ai_")
-        && let Some(suffix) = cache_telemetry_field(legacy)
-    {
-        return Some(suffix);
     }
     semantic_cache_telemetry_suffix(key)
 }
