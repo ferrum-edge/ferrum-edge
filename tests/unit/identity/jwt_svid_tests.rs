@@ -1828,7 +1828,7 @@ async fn configured_material_refuses_in_process_rotation() {
     // stable identity.
     let pem = signing_key_pem();
     let signer = authority_with_key(&pem);
-    assert!(!signer.allows_in_process_rotation());
+    assert!(!signer.uses_ephemeral_key());
     let before = signer.generation();
     let key_id_before = signer.active_key_id();
 
@@ -1976,7 +1976,7 @@ async fn an_ephemeral_authority_may_still_rotate_in_process() {
     // The negative control for the refusal above: the dev/test posture has no
     // continuity to lose, so it keeps its in-process rotation.
     let signer = authority();
-    assert!(signer.allows_in_process_rotation());
+    assert!(signer.uses_ephemeral_key());
     signer
         .rotate()
         .await

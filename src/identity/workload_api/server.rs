@@ -385,9 +385,8 @@ impl WorkloadApiService {
         SpiffeWorkloadApiServer::new(self)
     }
 
-    /// Extract `PeerInfo` from a tonic request: the bearer token from the
-    /// `authorization` metadata header (Bearer scheme) plus, on a Unix-socket
-    /// transport, the kernel-supplied `SO_PEERCRED` pid/uid/gid.
+    /// Extract `PeerInfo` from a tonic request: on a Unix-socket transport, the
+    /// kernel-supplied `SO_PEERCRED` pid/uid/gid.
     ///
     /// Peer credentials come from `UdsConnectInfo`, which tonic populates from
     /// the accepted socket itself — they are kernel-attested and cannot be
@@ -395,23 +394,21 @@ impl WorkloadApiService {
     /// not fatal here: it simply means no `SO_PEERCRED`-based attestor applies,
     /// and the attestor chain decides.
     fn peer_info_from_request<T>(req: &Request<T>) -> PeerInfo {
-        let mut info = PeerInfo::default();
-        if let Some(auth) = req.metadata().get("authorization")
-            && let Ok(s) = auth.to_str()
-        {
-            info.bearer_token = parse_authorization_header(s);
-        }
         #[cfg(unix)]
         if let Some(connect_info) = req
             .extensions()
             .get::<tonic::transport::server::UdsConnectInfo>()
             && let Some(cred) = connect_info.peer_cred
         {
-            info.pid = cred.pid();
-            info.uid = Some(cred.uid());
-            info.gid = Some(cred.gid());
+            return PeerInfo {
+                pid: cred.pid(),
+                uid: Some(cred.uid()),
+                gid: Some(cred.gid()),
+            };
         }
-        info
+        #[cfg(not(unix))]
+        let _ = req;
+        PeerInfo::default()
     }
 
     fn validate_workload_metadata<T>(req: &Request<T>) -> Result<(), Status> {
@@ -717,34 +714,6 @@ impl WorkloadApiService {
             bundles.insert(td.to_string(), bundle_concat);
         }
         Ok(bundles)
-    }
-}
-
-/// Parse an `authorization` header value into the bare bearer token.
-///
-/// RFC 6750 §2.1: the Bearer scheme name is case-insensitive. We accept
-/// `Bearer`, `bearer`, `BEARER`, etc. If the value carries no scheme word
-/// (no whitespace separator), the entire trimmed value is treated as the
-/// raw token — preserving the existing behaviour for callers that hand in
-/// a bare token string. If the scheme is present but not Bearer (e.g.
-/// `Basic xyz`), the entire value is also passed through as-is so the
-/// downstream attestor chain sees the original metadata; no attestor
-/// today recognises non-Bearer schemes, so they reject the resulting
-/// "token" with `NotApplicable` / `Failed`.
-fn parse_authorization_header(raw: &str) -> Option<String> {
-    // Strip leading whitespace only — preserve trailing whitespace so that
-    // an input like `"Bearer "` (scheme word with no token) splits on the
-    // delimiter and resolves to an empty token (returned as `None`)
-    // instead of being collapsed to the bare string `"Bearer"`.
-    let leading_trimmed = raw.trim_start();
-    let token = match leading_trimmed.split_once(|c: char| c.is_ascii_whitespace()) {
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => rest.trim(),
-        _ => leading_trimmed.trim_end(),
-    };
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
     }
 }
 
@@ -1098,94 +1067,5 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             spiffe_id: validated.spiffe_id.to_string(),
             claims: Some(validated.claims),
         }))
-    }
-}
-
-#[cfg(test)]
-mod authz_parse_tests {
-    use super::parse_authorization_header;
-
-    #[test]
-    fn strips_canonical_bearer_prefix() {
-        assert_eq!(
-            parse_authorization_header("Bearer eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_lowercase_bearer_prefix() {
-        // RFC 6750 §2.1: Bearer scheme is case-insensitive.
-        assert_eq!(
-            parse_authorization_header("bearer eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_uppercase_bearer_prefix() {
-        assert_eq!(
-            parse_authorization_header("BEARER eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_mixed_case_bearer_prefix() {
-        assert_eq!(
-            parse_authorization_header("BeArEr eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn handles_extra_whitespace_after_scheme() {
-        assert_eq!(
-            parse_authorization_header("bearer    eyJhbGciOiJI   "),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn handles_tab_separator() {
-        // Some clients use a tab between scheme and token. RFC 7230 allows
-        // any HTAB or SP between scheme and credentials.
-        assert_eq!(
-            parse_authorization_header("bearer\teyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn passes_through_raw_token_with_no_scheme() {
-        // Bare token (no whitespace) — keep as-is.
-        assert_eq!(
-            parse_authorization_header("eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn passes_through_non_bearer_scheme_unchanged() {
-        // Non-Bearer schemes (e.g. Basic) flow through unchanged so the
-        // downstream attestor chain rejects them with NotApplicable rather
-        // than the server stripping a scheme it does not recognise.
-        assert_eq!(
-            parse_authorization_header("Basic dXNlcjpwYXNz"),
-            Some("Basic dXNlcjpwYXNz".to_string())
-        );
-    }
-
-    #[test]
-    fn returns_none_for_empty_value() {
-        assert_eq!(parse_authorization_header(""), None);
-        assert_eq!(parse_authorization_header("   "), None);
-    }
-
-    #[test]
-    fn returns_none_for_bearer_with_no_token() {
-        // Just "Bearer" with no token after — strip leaves empty.
-        assert_eq!(parse_authorization_header("Bearer "), None);
-        assert_eq!(parse_authorization_header("bearer   "), None);
     }
 }
