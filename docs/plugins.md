@@ -7548,7 +7548,7 @@ Mesh mode auto-injects it as the reserved global `__mesh_authz` on every applica
 | `ambient_udp_source_scoping` | Boolean | `false` | **Injection-only.** Enables node-waypoint ambient UDP source-policy scoping. Same strict boolean admission as `per_pod_policy_scoping`. |
 | `cluster_domain` | String | `cluster.local` | **Injection-only.** Primary Kubernetes cluster domain, used for node-waypoint service-host matching. |
 | `cluster_domains` | Array of strings | `[]` | **Injection-only.** Deduplicated cluster-domain aliases for the same host matching. |
-| `node_waypoint_route_upstreams` | Array of objects | `[]` | **Injection-only.** Mesh-generated route upstream metadata used to precompute destination policy scopes for node-waypoint dispatch. |
+| `node_waypoint_route_upstreams` | Array of objects | `[]` | **Injection-only.** Mesh-generated route upstream metadata used to precompute destination policy scopes for node-waypoint dispatch. Always empty on a data plane fed by a mesh slice (native, xDS or file source): slices carry no VirtualService/HTTPRoute HTTP route upstreams today. |
 
 The five injection-only keys are populated by mesh mode and are documented here only so an operator reading a live `/plugins` response can identify them; do not hand-author them.
 

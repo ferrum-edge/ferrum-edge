@@ -13732,6 +13732,12 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
 /// destination index resolves (`node_waypoint_route_upstreams`), with each
 /// target's Service identity. Shared by `mesh_authz` and RequestAuthentication
 /// destination selection so both resolve a route to the same workloads.
+///
+/// Empty on every slice-built config: `gateway_config_from_mesh_slice_with_federation`
+/// materializes only `istio-vs-l4-upstream-*` upstreams, so no
+/// `istio-vs-upstream-` / `gwapi-route-upstream-` id reaches this filter in
+/// production. Only the whole-config `prepare_gateway_config_for_mesh` test
+/// entry point supplies such upstreams (issue #7233).
 fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json::Value> {
     config
         .upstreams
