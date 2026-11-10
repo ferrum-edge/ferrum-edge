@@ -186,12 +186,7 @@ pub fn source_poll_interval(
                 SourceScheme::File => file_default,
                 _ => provider_default,
             };
-            let Some(raw) = uri
-                .options
-                .get("poll")
-                .or_else(|| uri.options.get("poll_interval"))
-                .or_else(|| uri.options.get("poll_interval_seconds"))
-            else {
+            let Some(raw) = uri.options.get("poll") else {
                 return Some(default);
             };
             match parse_poll_interval(raw) {

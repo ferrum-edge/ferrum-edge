@@ -28,6 +28,14 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Undocumented TLS source option spellings are no longer read (#7218)
+
+A TLS material source URI sets its refresh cadence only with the documented
+`?poll=` option; the undocumented `poll_interval` and `poll_interval_seconds`
+spellings are now ignored, so such a source uses the default cadence. A
+`pkcs11://` key source selects its key type only with `key_type`; a `type`
+option is now ignored. Rename those options before upgrading.
+
 ### `FERRUM_TLS_CURVES` is no longer read (#7218)
 
 `FERRUM_TLS_CURVES` was a compatibility alias of
