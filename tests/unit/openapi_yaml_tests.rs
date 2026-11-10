@@ -11515,6 +11515,13 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
                     "last_failure_unix": null,
                     "last_outcome": "none"
                 },
+                "mesh_node_waypoint_dtls_reload": {
+                    "generation": 2,
+                    "last_swapped_listeners": 1,
+                    "last_success_unix": 1700000000,
+                    "last_failure_unix": 1700000100,
+                    "last_outcome": "rejected"
+                },
                 "bind_failures_total": 0,
                 "bind_failures": []
             }),
