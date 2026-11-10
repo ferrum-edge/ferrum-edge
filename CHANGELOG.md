@@ -95,6 +95,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`api_chargeback` validates its config before claiming the process-global
   registry** (#7109). A config with a bad currency, tunable, or pricing block
   no longer creates the `/charges` registry singleton.
+- **CP `GET /admin/metrics` reports `database_polling`** (#7215). The
+  Control Plane has no proxy state, and the builder's no-proxy-state branch
+  dropped the delta-poll block, so CP operators never saw it although
+  `docs/admin_metrics.md` documents it for `cp`. It is now attached in both
+  `database` and `cp` modes.
+- **MongoDB full loads run the SQL loader's warn-level validation** (#7211).
+  On MongoDB, `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` and the backend egress
+  policy had no effect at config load: no near-expiry or unreadable backend
+  certificate warnings, and no host, consumer-uniqueness, egress-policy or
+  plugin-config warnings. The MongoDB full load now runs the same warning
+  passes, in the same order, as the SQL full load. Nothing new is rejected.
+- **macOS FD count reports open descriptors** (#7212). The overload
+  monitor's macOS sampler divided the size hint from a NULL-buffer
+  `proc_pidinfo(PROC_PIDLISTFDS)` call (fd-table capacity plus slack) by the
+  entry size, so `fd_current` in `/overload` and the FD-pressure tier were
+  inflated and never shrank after a burst. It now counts the entries the call
+  writes, and a failed count fails closed (critical) as on Linux instead of
+  reporting `0`. Linux is unchanged.
+- **`POST /batch` refuses stream listeners that single writes refuse**
+  (#7214). A batch could persist a stream proxy on a reserved gateway port
+  (proxy, admin or gRPC listener), on a port another process already holds,
+  or an HTTP proxy on a process-global frontend it can never be served on;
+  the conflict then surfaced only at listener reconcile (fatal at startup in
+  database mode). The batch now runs the same reserved-port, process-global
+  frontend and OS bind-probe checks as `POST /proxies` (skipped on a CP, as
+  for single writes) and reports them as `400` batch validation errors.
+- **Admin API parity fixes** (#7216).
+  - `POST /admin/tls/rotate/proxy` is now `400`: `proxy` was an undocumented
+    alias missing from `openapi.yaml` and `docs/admin_api.md`. Use
+    `proxy_https` (or the documented `frontend` alias).
+  - `POST /admin/tls/rotate` and the other TLS mutations now write their
+    typed audit event in file, DP and mesh modes; the event was skipped
+    whenever there was no config database.
+  - `GET /config/export` answers `500` if the document cannot be serialized,
+    instead of `200` with `{}`, which read as an empty namespace.
+  - A batch or restore with an unknown plugin name reports it once instead of
+    twice.
+  - `/health` no longer builds the FIPS and listener-failure blocks for
+    callers that do not get the detailed tier.
+- **Config diagnostics quote stored identifiers** (#7217). Proxy/plugin
+  association load errors, the `expected_proxy_ids` precondition refusal
+  (`412`), the spec-owned upstream decode error and two orphan-cleanup INFO
+  logs now render namespaces and ids Debug-quoted (or sanitized), per the
+  validation-diagnostics rule. Plugin rejection messages use one spelling,
+  ``Plugin "<name>" (`id`="<id>")``, everywhere. A consumer credential
+  type that fails the path-safe name rule is reported once and no longer
+  also appears bare in per-entry `credentials.<type>[<n>]` errors. Update
+  any log matcher keyed on the old `(id=…)` or `proxy_id=<bare>` spellings.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

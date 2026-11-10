@@ -256,8 +256,10 @@ failure, so a resource that starts serving on a later reconcile clears its entry
 | Platform | FD Monitoring | FD Limit |
 |----------|--------------|----------|
 | Linux | Kernel open-FD aggregate from `stat(/proc/self/fd).st_size` (Linux 6.2+); directory walk of `/proc/self/fd` on older kernels | `getrlimit(RLIMIT_NOFILE)`, falling back to `/proc/sys/fs/nr_open` when the hard cap is unlimited |
-| macOS | `proc_pidinfo(PROC_PIDLISTFDS)` | `getrlimit(RLIMIT_NOFILE)`; an unlimited hard cap disables the FD tier |
+| macOS | `proc_pidinfo(PROC_PIDLISTFDS)`, counting the entries it writes (the size-only call returns table capacity, not the open count) | `getrlimit(RLIMIT_NOFILE)`; an unlimited hard cap disables the FD tier |
 | Windows | Not available (ratios are 0.0) | Not available |
+
+On Linux and macOS a failed FD count fails closed: the count is reported as the maximum value, which forces FD pressure to critical.
 
 Event loop latency and connection monitoring work on all platforms.
 

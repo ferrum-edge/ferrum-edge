@@ -218,14 +218,14 @@ pub(crate) fn validate_config_graph(
         }) {
             if plugin.scope != crate::config::types::PluginScope::Global {
                 errors.push(format!(
-                    "Plugin {:?} (id={:?}, namespace={:?}): transaction_log_schema must have scope `global`",
+                    "Plugin {:?} (`id`={:?}, `namespace`={:?}): transaction_log_schema must have scope `global`",
                     plugin.plugin_name, plugin.id, namespace
                 ));
                 continue;
             }
             if let Err(error) = TransactionLogSchema::new(&plugin.config) {
                 errors.push(format!(
-                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
+                    "Plugin {:?} (`id`={:?}, `namespace`={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 ));
             }
@@ -249,7 +249,7 @@ pub(crate) fn validate_config_graph(
                 SchemaCapabilities::BASE,
             ) {
                 errors.push(format!(
-                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
+                    "Plugin {:?} (`id`={:?}, `namespace`={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 ));
                 continue;
@@ -260,7 +260,7 @@ pub(crate) fn validate_config_graph(
                 http_client.clone(),
             ) {
                 let message = format!(
-                    "Plugin {:?} (id={:?}, namespace={:?}): {}",
+                    "Plugin {:?} (`id`={:?}, `namespace`={:?}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 );
                 if !optional_failures_are_errors

@@ -480,3 +480,34 @@ async fn mesh_config_revision_reset_requires_confirm_and_records_audit_on_succes
         "503 must carry the closed-set audit reason: {body}"
     );
 }
+
+/// Issue #7216: `POST /admin/tls/rotate` is served in file, DP and mesh modes,
+/// which have no config database. The TLS mutation audit must therefore not be
+/// gated on `state.db`; it goes through `record_operation_audit`, which
+/// finalizes the admitted intent through the spool when there is no database.
+#[test]
+fn tls_mutation_audit_does_not_require_a_database() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    let probe = "tls_mutation_audit_descriptor(&method, segments.as_slice(), None).is_some()";
+    let probe_at = source.find(probe).expect("TLS mutation audit gate");
+    let gate_start = source[..probe_at]
+        .rfind("if state.admin_audit_enabled")
+        .expect("audit-enabled gate");
+    let gate = &source[gate_start..probe_at];
+    assert!(
+        !gate.contains("state.db"),
+        "TLS mutation audit must not require a database: {gate}"
+    );
+    let block_end = source[probe_at..]
+        .find("\n    response\n}")
+        .expect("end of the audit block");
+    let block = &source[probe_at..probe_at + block_end];
+    assert!(
+        block.contains("record_operation_audit(&state, event).await"),
+        "TLS mutation audit must use record_operation_audit"
+    );
+    assert!(
+        !block.contains("audit::record("),
+        "TLS mutation audit must not call the DB-only recorder"
+    );
+}

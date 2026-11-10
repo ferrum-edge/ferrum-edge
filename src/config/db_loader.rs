@@ -2193,7 +2193,7 @@ impl DatabaseStore {
     ) -> anyhow::Error {
         let message = match namespace {
             Some(namespace) => format!(
-                "operation={} resource=proxy_plugins namespace={}: failed to query proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins namespace={:?}: failed to query proxy/plugin associations: {}",
                 operation, namespace, source
             ),
             None => format!(
@@ -2236,7 +2236,7 @@ impl DatabaseStore {
         row.try_get::<String, _>("plugin_config_id").map_err(|e| {
             anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
                 format!(
-                    "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
+                    "operation={} resource=proxy_plugins proxy_id={:?} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
                     operation, proxy_id, e
                 ),
                 e,
@@ -2255,7 +2255,7 @@ impl DatabaseStore {
             .unwrap_or_default();
         anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
             format!(
-                "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
+                "operation={} resource=proxy_plugins namespace={:?}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
                 operation, namespace, column_context, source
             ),
             source,
@@ -2284,7 +2284,7 @@ impl DatabaseStore {
         if let Some(proxy_id) = associations.keys().next() {
             return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
                 format!(
-                    "operation={} resource=proxy_plugins proxy_id={}: association row references a proxy that was not present in the loaded proxy candidate",
+                    "operation={} resource=proxy_plugins proxy_id={:?}: association row references a proxy that was not present in the loaded proxy candidate",
                     operation, proxy_id
                 ),
             )));
@@ -2403,7 +2403,7 @@ impl DatabaseStore {
 
         Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
             format!(
-                "operation={} resource=proxy_plugins proxy_id={} namespace={}: invalid proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins proxy_id={:?} namespace={:?}: invalid proxy/plugin associations: {}",
                 operation,
                 proxy.id,
                 proxy.namespace,
@@ -2437,7 +2437,7 @@ impl DatabaseStore {
 
         Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
             format!(
-                "operation={} resource=proxy_plugins namespace={}: invalid proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins namespace={:?}: invalid proxy/plugin associations: {}",
                 operation,
                 namespace,
                 errors.join("; ")
@@ -4344,7 +4344,10 @@ impl DatabaseStore {
         .collect::<Result<_, _>>()?;
 
         for (id, namespace) in &orphaned_configs {
-            info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
+            info!(
+                "Cascade-deleting orphaned proxy_group plugin config {}",
+                crate::startup::sanitize_startup_scalar(id)
+            );
             sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
@@ -4399,7 +4402,10 @@ impl DatabaseStore {
         };
 
         if ref_rows.is_empty() && dispatch_ref.is_none() {
-            info!("Cleaning up orphaned upstream {}", upstream_id);
+            info!(
+                "Cleaning up orphaned upstream {}",
+                crate::startup::sanitize_startup_scalar(upstream_id)
+            );
             sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(upstream_id)
                 .bind(namespace)
@@ -11460,7 +11466,7 @@ impl DatabaseStore {
             let id = row.try_get::<String, _>("id").map_err(|e| {
                 anyhow::Error::from(e).context(format!(
                     "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
-                     namespace={namespace} api_spec_id={spec_id} column=id: \
+                     namespace={namespace:?} api_spec_id={spec_id:?} column=id: \
                      failed to decode spec-owned upstream id required for external reference checks"
                 ))
             })?;

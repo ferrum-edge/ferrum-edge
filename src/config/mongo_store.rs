@@ -84,8 +84,8 @@ mod inner {
         Upstream,
     };
     use crate::config::validation_pipeline::{
-        ConfigValidationRejection, ValidationAction, collect_rejecting_runtime_config_errors,
-        validate_plugin_file_dependencies_off_thread,
+        ConfigValidationRejection, ValidationAction, ValidationPipeline,
+        collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
     };
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use anyhow::Context;
@@ -10576,10 +10576,9 @@ mod inner {
                 );
             }
 
-            // Fail-closed consumer identity collisions (issue #2121): Mongo
-            // `load_full_config` does not run the SQL-side
-            // `ValidationPipeline`, so quarantine colliding consumers here
-            // directly. First-loaded consumer wins; the
+            // Fail-closed consumer identity collisions (issue #2121), parity
+            // with the SQL loader: quarantine colliding consumers before any
+            // validation runs. First-loaded consumer wins; the
             // `consumer_identity_index` collection prevents NEW collisions
             // from being committed, this guard covers pre-existing rows.
             let identity_quarantined = config.quarantine_colliding_consumer_identities();
@@ -10605,6 +10604,19 @@ mod inner {
             let consumer_quarantine_active = !identity_quarantined.is_empty()
                 || !hmac_quarantined.is_empty()
                 || !jwt_quarantined.is_empty();
+
+            // Warn-level field and host validation, parity with the SQL loader
+            // (issue #7211): backend certificate expiry/readability against
+            // `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` and the backend egress
+            // policy. Warnings only; the rejecting contract runs below.
+            ValidationPipeline::new(&mut config)
+                .validate_all_fields_with_ip_policy(
+                    self.cert_expiry_warning_days,
+                    &self.backend_allow_ips,
+                    ValidationAction::Warn,
+                )
+                .validate_hosts(ValidationAction::Warn)
+                .run()?;
 
             // Serving-mode repairability (issue #4526), parity with the SQL
             // loader: quarantine stored plugin rows the shared construction
@@ -10633,8 +10645,7 @@ mod inner {
                 config.quarantined_plugin_configs = quarantined;
             }
 
-            // Mongo does not run the SQL-side `ValidationPipeline`, but full
-            // runtime loads must still fail closed on the same rejecting
+            // Full runtime loads must fail closed on the same rejecting
             // validation contract used by SQL loads and CP updates. This
             // catches malformed routes, stream proxy shapes, dangling upstream
             // references, and invalid plugin associations before startup or
@@ -10661,6 +10672,14 @@ mod inner {
                     .into_anyhow(),
                 );
             }
+
+            // Warn-level uniqueness and plugin-config validation on the
+            // accepted snapshot, parity with the SQL loader (issue #7211).
+            ValidationPipeline::new(&mut config)
+                .validate_unique_consumer_identities(ValidationAction::Warn)
+                .validate_unique_consumer_credentials(ValidationAction::Warn)
+                .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
+                .run()?;
 
             // Match relational database full-load semantics for node-local
             // plugin files. Warning-mode validation keeps an absent MMDB a

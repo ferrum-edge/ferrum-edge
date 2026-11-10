@@ -775,12 +775,21 @@ pub(crate) fn count_open_fds() -> u64 {
     count_open_fds_linux("/proc/self/fd")
 }
 
+/// Count open file descriptors with `proc_pidinfo(PROC_PIDLISTFDS)`.
+///
+/// A NULL-buffer call returns the size to allocate (fd-table capacity plus
+/// slack), not the open count, so it only sizes the buffer; the count comes
+/// from the bytes the second call actually writes. Descriptors opened between
+/// the two calls beyond the slack are missed, which is fine for a sample.
+///
+/// Fail closed like the Linux path: if either call fails, return `u64::MAX`
+/// so FD pressure is forced critical.
 #[cfg(target_os = "macos")]
 pub(crate) fn count_open_fds() -> u64 {
-    // On macOS, use proc_pidinfo via the libc FFI constants.
-    // PROC_PIDLISTFDS = 1, sizeof(proc_fdinfo) = 8
+    // <sys/proc_info.h>: PROC_PIDLISTFDS = 1; struct proc_fdinfo is
+    // { int32_t proc_fd; uint32_t proc_fdtype; } (8 bytes, 4-byte aligned).
     const PROC_PIDLISTFDS: i32 = 1;
-    const PROC_FDINFO_SIZE: u64 = 8; // sizeof(proc_fdinfo) = u32 + u32
+    const PROC_FDINFO_SIZE: usize = 8;
     let pid = std::process::id() as i32;
     unsafe extern "C" {
         fn proc_pidinfo(
@@ -791,11 +800,28 @@ pub(crate) fn count_open_fds() -> u64 {
             buffersize: i32,
         ) -> i32;
     }
-    let buffer_size = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    if buffer_size <= 0 {
-        return 0;
+    let size_hint = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if size_hint <= 0 {
+        return u64::MAX;
     }
-    (buffer_size as u64) / PROC_FDINFO_SIZE
+    let entries = (size_hint as usize).div_ceil(PROC_FDINFO_SIZE);
+    let Ok(buffer_bytes) = i32::try_from(entries * PROC_FDINFO_SIZE) else {
+        return u64::MAX;
+    };
+    let mut buffer = vec![[0u32; 2]; entries];
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDLISTFDS,
+            0,
+            buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+            buffer_bytes,
+        )
+    };
+    if written < 0 {
+        return u64::MAX;
+    }
+    (written as u64) / PROC_FDINFO_SIZE as u64
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2046,6 +2072,28 @@ mod tests {
     fn fd_count_is_nonzero() {
         let count = count_open_fds();
         assert!(count > 0, "Process should have at least some open FDs");
+    }
+
+    /// Issue #7212: the macOS count must be the open descriptors, not the
+    /// fd-table capacity plus slack that a NULL-buffer `proc_pidinfo` returns.
+    /// `/dev/fd` lists the open descriptors; take the closest of a few pairs
+    /// because other tests open and close descriptors concurrently.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fd_count_matches_open_descriptors_on_macos() {
+        let mut best = u64::MAX;
+        for _ in 0..8 {
+            let counted = count_open_fds();
+            assert_ne!(counted, u64::MAX, "proc_pidinfo must succeed for self");
+            let listed = std::fs::read_dir("/dev/fd")
+                .expect("/dev/fd is readable")
+                .count() as u64;
+            best = best.min(counted.abs_diff(listed));
+            if best <= 2 {
+                break;
+            }
+        }
+        assert!(best <= 2, "count_open_fds drifted {best} from /dev/fd");
     }
 
     #[cfg(target_os = "linux")]

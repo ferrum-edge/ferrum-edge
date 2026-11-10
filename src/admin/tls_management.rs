@@ -1598,7 +1598,7 @@ enum RotateTarget {
 fn requested_surfaces(surface: &str) -> Result<RotateTarget, String> {
     match surface {
         "all" => Ok(RotateTarget::All),
-        "frontend" | "proxy" | "proxy_https" => Ok(RotateTarget::Watcher("proxy_https")),
+        "frontend" | "proxy_https" => Ok(RotateTarget::Watcher("proxy_https")),
         "backend" | "backend_tls" => Ok(RotateTarget::Watcher("backend_tls")),
         "admin" | "admin_https" => Ok(RotateTarget::Watcher("admin_https")),
         "dtls" | "frontend_dtls" => Ok(RotateTarget::Watcher("dtls")),
@@ -2900,6 +2900,8 @@ mod tests {
         );
         assert_eq!(requested_surfaces("all").unwrap(), RotateTarget::All);
         assert!(requested_surfaces("bogus").is_err());
+        // Issue #7216: `proxy` was never in the OpenAPI enum or the docs.
+        assert!(requested_surfaces("proxy").is_err());
     }
 
     #[test]

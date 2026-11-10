@@ -8,8 +8,8 @@
 //! - `${name}` — replaced with the value of `name` from the supplied map.
 //! - `$$`     — literal `$`.
 //! - Unknown variables are left as `${name}` in the output (so operators can
-//!   spot typos in real payloads). [`validate_template`] reports them up front
-//!   at plugin construction time.
+//!   spot typos in real payloads). [`validate_template`] checks only that
+//!   braces are balanced; it does not report unknown variables.
 //!
 //! Errors:
 //! - Unbalanced `${` (no matching `}`) is a hard error from
@@ -259,9 +259,9 @@ pub fn unknown_variables(template: &str, known: &HashSet<&str>) -> Result<Vec<St
     Ok(unknown)
 }
 
-/// Dry-run `template` against `known` variable names: returns `Ok(())` when
-/// the template is well-formed (balanced braces). Unknown variables are NOT
-/// errors — collect them with [`unknown_variables`] and warn the operator.
+/// Dry-run `template`: returns `Ok(())` when it is well-formed (balanced
+/// braces). Unknown variables are NOT errors and are not reported;
+/// [`unknown_variables`] can list them, but no production caller uses it.
 pub fn validate_template(template: &str) -> Result<(), String> {
     let mut i = 0;
     while i < template.len() {
