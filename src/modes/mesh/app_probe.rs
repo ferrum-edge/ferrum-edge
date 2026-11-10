@@ -113,8 +113,8 @@ pub const DEFAULT_APP_PROBE_MAX_ACTIVE_PROBES: usize = 16;
 
 /// Body returned when the active-probe budget is exhausted. Fixed, tiny, and
 /// carries nothing request-derived. Named for the budget, not for process
-/// overload: this listener is deliberately not overload-gated (see
-/// [`AppProbeAdmission`]).
+/// overload: overload is shed earlier, in the accept loop
+/// ([`AppProbeAdmission::try_admit`]), and never reaches this response.
 const PROBE_BUDGET_EXHAUSTED_BODY: &str = "app probe budget exhausted\n";
 
 // ── Wire types (injector producer ⇄ sidecar consumer) ────────────────────

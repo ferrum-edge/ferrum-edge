@@ -231,8 +231,10 @@ impl NodeLocalEnrolledDestinationOwner<'_> {
 /// Lock-free, poller-published index of the pods enrolled on THIS node.
 ///
 /// Read once per authenticated inbound CONNECT (and per UDP CONNECT) through
-/// [`Self::terminates_for`]: one `ArcSwap::load()` plus at most one hash lookup
-/// per candidate address, no allocation and no filesystem access.
+/// `NodeLocalEnrolledDestinationsHandle::snapshot` and
+/// `NodeLocalEnrolledDestinationsSnapshot::owner_for`: one `ArcSwap::load()`
+/// plus at most one hash lookup per candidate address, no allocation and no
+/// filesystem access.
 #[derive(Debug)]
 pub struct NodeLocalEnrolledDestinations {
     current: ArcSwap<EnrolledGeneration>,
@@ -370,11 +372,6 @@ impl NodeLocalEnrolledDestinationsHandle {
     #[allow(dead_code)] // Serving runtimes install through the global slot; also an external test seam.
     pub fn new(index: Arc<NodeLocalEnrolledDestinations>) -> Self {
         Self(Some(index))
-    }
-
-    /// The index, when a node-local registry is authoritative for this proxy.
-    pub fn index(&self) -> Option<&NodeLocalEnrolledDestinations> {
-        self.0.as_deref()
     }
 
     /// Load the authoritative registry generation once for a complete guard

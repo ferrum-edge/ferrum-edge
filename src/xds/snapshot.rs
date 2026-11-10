@@ -171,15 +171,6 @@ impl XdsSnapshotCache {
         snapshot
     }
 
-    pub(crate) fn insert_with_fingerprint(
-        &self,
-        snapshot: XdsSnapshot,
-        fingerprint: XdsConfigFingerprint,
-    ) -> Arc<XdsSnapshot> {
-        let cache_key = snapshot.node_id.clone();
-        self.insert_with_fingerprint_for_key(cache_key, snapshot, fingerprint)
-    }
-
     pub(crate) fn insert_with_fingerprint_for_key(
         &self,
         cache_key: String,

@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-//! Pod enrollment and lifecycle management for the eBPF node agent.
+//! Pod enrollment criteria for the eBPF node agent.
 //!
-//! Watches local-node pods via kube-rs, enrolls/unenrolls them based on
-//! label/annotation criteria, and delegates BPF attachment to the
-//! `EbpfBackend` trait.
+//! Pure helpers (`evaluate_enrollment`, excluded-namespace handling) that
+//! decide from labels/annotations whether a local-node pod is enrolled. The
+//! kube-rs pod watcher and BPF attachment live in `crate::modes::node_agent`.
 
 use std::collections::HashSet;
 

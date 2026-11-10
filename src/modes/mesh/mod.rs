@@ -224,7 +224,7 @@ pub enum MeshListenerKind {
     /// UDP TPROXY capture listener (F3 §3.3 Stage 3). Plaintext; bound to the
     /// Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT`. Receives TPROXY-diverted UDP
     /// datagrams, recovers per-datagram orig-dst from the `IP_RECVORIGDSTADDR`
-    /// cmsg, and (Stage 3) drops them — the egress relay is Stage 4. Only
+    /// cmsg, and hands them to the datagram-over-mesh egress relay. Only
     /// emitted when `FERRUM_MESH_CAPTURE_UDP_ENABLED` is set (default-off).
     PlaintextUdpCapture,
     /// NodeWaypoint **transparent inbound capture** listener (issue #3287).
@@ -1114,7 +1114,8 @@ impl MeshRuntimeConfig {
                 ));
                 // Sidecar relays captured UDP over a mesh-mTLS datagram tunnel
                 // (#1808), so the helper emits the `PlaintextUdpCapture` listener
-                // here when the capture flag is set (gated to Ambient | Sidecar).
+                // here when the capture flag is set (Sidecar only; Ambient uses
+                // the per-pod-netns producer instead).
                 listeners.extend(self.udp_capture_listener());
                 listeners
             }
@@ -1407,13 +1408,14 @@ impl MeshRuntimeConfig {
         Ok(())
     }
 
-    /// The optional UDP TPROXY capture listener (F3 §3.3), emitted on the two
-    /// topologies that actually **relay** captured UDP — **Ambient** (datagram
-    /// over HBONE `:15008`) and **Sidecar** (datagram over mesh-mTLS `:15006`).
-    /// UDP egress materialization is dual-transport
+    /// The optional current-netns UDP TPROXY capture listener (F3 §3.3),
+    /// emitted for **Sidecar only** (datagram over mesh-mTLS `:15006`). UDP
+    /// egress materialization is dual-transport
     /// (`materialize_mesh_outbound_udp_upstreams` gates `Ambient => HBONE,
-    /// Sidecar => SidecarMtls, _ => return`), so this listener is gated to the
-    /// SAME two topologies. Emitting it for a topology with NO UDP relay
+    /// Sidecar => SidecarMtls, _ => return`), but **Ambient** relays captured
+    /// UDP from the per-pod-netns producer (`NetnsUdpCaptureManager`, #2013),
+    /// which binds its capture sockets inside each enrolled pod netns, so it
+    /// gets no listener here. Emitting it for a topology with NO UDP relay
     /// (EastWestGateway / EgressGateway / waypoints) would divert the pod's UDP
     /// into a listener with no relay and **black-hole every captured datagram**
     /// (codex r1 P2); leaving those un-captured (UDP passes through) is the
@@ -1421,16 +1423,10 @@ impl MeshRuntimeConfig {
     /// no outbound capture listener (and UDP stays mesh-wide-only there per the
     /// per-pod-scope notes).
     ///
-    /// **End-to-end status (tracked in #1808): the FIRST working end-to-end UDP
-    /// path is SIDECAR** — the injector's pod-netns TPROXY producer (re-enabled
-    /// via `injector::sidecar_udp_capture_supported()`) feeds this listener, the
+    /// On Sidecar (#1808) the injector's pod-netns TPROXY producer (enabled via
+    /// `injector::sidecar_udp_capture_supported()`) feeds this listener, the
     /// egress datapath relays the datagram over a mesh-mTLS CONNECT, and the
-    /// destination unframes it into a local `UdpSocket`. **Ambient still has NO
-    /// UDP capture *producer*** feeding this listener — the node-agent host-netns
-    /// path emits no UDP TPROXY rules (the same per-pod-scope blocker that defers
-    /// F4.3 / #1803) and eBPF capture is `connect()`-hooked / TCP-only — so
-    /// Ambient end-to-end UDP capture→relay is **not yet active in production**
-    /// (its relay/transport is implemented and unit-tested, awaiting a producer).
+    /// destination unframes it into a local `UdpSocket`.
     ///
     /// NOTE: the injector/init TPROXY-rule emission for a Sidecar pod is gated to
     /// MATCH this runtime listener gate: `injector::sidecar_udp_capture_supported()`
@@ -1578,10 +1574,12 @@ impl MeshRuntimeConfig {
 
 /// Prepare a gateway snapshot for mesh-mode serving.
 ///
-/// Mesh mode is the only caller. The mutation is cold-path: it runs before
-/// `ProxyState` builds router/plugin caches, so non-mesh modes and ordinary
-/// requests never pay for mesh plugin injection.
-#[allow(dead_code)] // Used by tests and future xDS bootstrap wiring.
+/// No serving path calls this: every mesh config source builds from a
+/// [`MeshSlice`] through `gateway_config_from_mesh_slice_with_federation`.
+/// This entry point takes a whole `GatewayConfig` and is used by tests and the
+/// `startup_rollback_test_seams` seam. The mutation is cold-path: it runs
+/// before `ProxyState` builds router/plugin caches.
+#[allow(dead_code)] // Used by tests and test seams.
 pub fn prepare_gateway_config_for_mesh(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -1607,9 +1605,10 @@ pub fn prepare_gateway_config_for_mesh(
 /// Prepare a gateway snapshot from an already-projected [`MeshSlice`].
 ///
 /// This is the CP-driven materialization path: the slice *is* the serving
-/// inventory. File-mode [`prepare_gateway_config_for_mesh`] additionally
-/// filters `MeshConfig` to `runtime.namespace` before this step, which is
-/// why a document that names Services in other namespaces never reaches the
+/// inventory. The whole-config [`prepare_gateway_config_for_mesh`] entry
+/// point (tests only) additionally projects `MeshConfig` through
+/// [`MeshSlice::from_gateway_config`] before this step, which is why a
+/// document that names Services in other namespaces never reaches the
 /// NodeWaypoint UDP materializer on that path.
 #[allow(dead_code)] // Used by tests.
 pub fn prepare_gateway_config_from_mesh_slice(
@@ -3075,7 +3074,7 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
 
     // Both UDP upstream families: the egress relay upstreams and — since issue
     // #3286 — the NodeWaypoint UDP/DTLS LISTENER upstreams. Their proxies are
-    // removed above, so leaving the upstreams behind would keep dead endpoint
+    // removed below, so leaving the upstreams behind would keep dead endpoint
     // state in the applied generation.
     let udp_upstreams: Vec<String> = config
         .upstreams
@@ -5136,7 +5135,7 @@ pub(crate) fn cross_cluster_service_sni(
 /// Matches workloads by SPIFFE ID against the service's `WorkloadRef` list. Each
 /// workload address + the resolved container port for `service_port` produces one
 /// `UpstreamTarget`. When a workload has no addresses, it is skipped (pod IP not
-/// yet assigned). One passthrough proxy is materialized per HTTP-family service
+/// yet assigned). One passthrough proxy is materialized per declared service
 /// port (multi-port east-west, issue #2010 phase 3), each keyed by the port's SNI
 /// alias ([`cross_cluster_service_sni`]).
 fn build_east_west_service_targets(
@@ -5374,9 +5373,9 @@ fn mesh_east_west_service_upstream_id(namespace: &str, name: &str, sni_label: &s
 
 /// True for application protocols routed through the HTTP-family proxy chain.
 /// Stream protocols (raw TCP/TLS and the DB protocols) need an L4 stream proxy;
-/// `Udp` is a distinct L4 transport whose capture/egress arrives in a later
-/// stage. Neither is HTTP-family — only `Udp` is also excluded from the
-/// raw-TCP stream lane (see [`service_udp_stream_ports`]).
+/// `Udp` is a distinct L4 transport with its own datagram capture/egress lane.
+/// Neither is HTTP-family — only `Udp` is also excluded from the raw-TCP
+/// stream lane (see [`service_udp_stream_ports`]).
 fn is_http_family_mesh_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
@@ -5608,9 +5607,9 @@ pub(crate) fn mesh_outbound_service_groups(
 
 /// True when a (override-resolved) protocol is the distinct UDP L4 transport.
 /// `Udp` is NEITHER HTTP-family NOR raw-TCP-stream — it forms the third leg of
-/// the port partition. Capture/egress for UDP arrives in a later F3 §3.3 stage;
-/// today this only keeps UDP ports out of the other two lanes (they were
-/// previously mis-classified as HTTP via `Unknown`).
+/// the port partition, which keeps UDP ports out of the other two lanes (they
+/// were previously mis-classified as HTTP via `Unknown`) and routes them to the
+/// datagram-over-mesh egress lane (F3 §3.3).
 fn is_udp_mesh_protocol(protocol: AppProtocol) -> bool {
     // `Dtls` is the SAME L4 transport as `Udp`; only the NodeWaypoint listener
     // materializer distinguishes them (it terminates frontend DTLS on a `Dtls`
@@ -5663,11 +5662,12 @@ pub(crate) fn service_tcp_stream_ports(
 
 /// UDP service ports of an in-mesh service, with `protocol_overrides` applied:
 /// the third leg of the HTTP-family / raw-TCP-stream / UDP port partition.
-/// Consumed by the Ambient UDP egress materializer
-/// (`materialize_mesh_outbound_udp_upstreams`, F3 §3.3 Stage 4) and the route
-/// table's `mesh_udp_egress` index — a captured UDP datagram whose orig-dst
-/// matches `(service VIP, UDP service port)` is tunnelled over a `udp`-marked
-/// HBONE CONNECT. Mirrors [`service_http_family_ports`] and
+/// Consumed by the UDP egress materializer
+/// (`materialize_mesh_outbound_udp_upstreams`, F3 §3.3 Stage 4; Ambient and
+/// Sidecar), the NodeWaypoint UDP listener materializer, and the route table's
+/// `mesh_udp_egress` index — a captured UDP datagram whose orig-dst matches
+/// `(service VIP, UDP service port)` is tunnelled over a `udp`-marked mesh
+/// CONNECT (HBONE on Ambient, mesh-mTLS on Sidecar). Mirrors [`service_http_family_ports`] and
 /// [`service_tcp_stream_ports`]; the SINGLE forward-derivation source the
 /// materializer, the route table, and the capability enrollment share.
 pub(crate) fn service_udp_stream_ports(
@@ -6149,31 +6149,6 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
     specs
 }
 
-/// Materialize inbound routes for the sidecar's **local** workload so that
-/// mTLS-terminated traffic on the inbound listener (`:15006`) reaches the
-/// co-located application on loopback. `docs/mesh.md` documents this ("the
-/// inbound listener … forwards plaintext to the local application"), but nothing
-/// implemented it: the slice's services/workloads were never turned into
-/// routable inbound proxies, so an inbound request found no proxy and returned
-/// 404. (The existing integration tests passed only because they hand-supplied a
-/// `Proxy`.) This closes that gap for the sidecar inbound direction.
-///
-/// Driven by the **local workload(s)** — this sidecar's own pods, matched by the
-/// SPIFFE identity in `runtime.workload_spiffe_id`. Each route is keyed by the
-/// workload's own service FQDN (`service_name`/`namespace`) — never another
-/// service that merely shares the SPIFFE id — and targets the workload's own
-/// listening port (the app/target port, which may differ from the K8s service
-/// port). One loopback proxy is emitted PER HTTP-family service port; the
-/// route table groups a multi-port service's siblings under one lowest-port
-/// representative and the request path swaps in the sibling matching the
-/// inbound connection's captured original destination (REDIRECT-captured
-/// plain inbound) or the pre-strip `Host`/`:authority` port (peer-sidecar
-/// dials), failing closed when a multi-port request carries neither signal —
-/// see `HostRouteTable::select_mesh_inbound_port_route`. Stream-family raw TCP
-/// inbound is prepared as a runtime-only port map consumed by the accept loop
-/// before Hyper parses the connection. The emitted HTTP proxies carry the
-/// [`MESH_INBOUND_PROXY_ID_PREFIX`] so the request path keeps them off the
-/// outbound listener.
 fn resolve_sidecar_inbound_backend_port(
     service_port: &crate::modes::mesh::config::ServicePort,
     workload: &crate::modes::mesh::config::Workload,
@@ -6204,6 +6179,31 @@ fn resolve_sidecar_inbound_backend_port(
     }
 }
 
+/// Materialize inbound routes for the sidecar's **local** workload so that
+/// mTLS-terminated traffic on the inbound listener (`:15006`) reaches the
+/// co-located application on loopback. `docs/mesh.md` documents this ("the
+/// inbound listener … forwards plaintext to the local application"), but nothing
+/// implemented it: the slice's services/workloads were never turned into
+/// routable inbound proxies, so an inbound request found no proxy and returned
+/// 404. (The existing integration tests passed only because they hand-supplied a
+/// `Proxy`.) This closes that gap for the sidecar inbound direction.
+///
+/// Driven by the **local workload(s)** — this sidecar's own pods, matched by the
+/// SPIFFE identity in `runtime.workload_spiffe_id`. Each route is keyed by the
+/// workload's own service FQDN (`service_name`/`namespace`) — never another
+/// service that merely shares the SPIFFE id — and targets the workload's own
+/// listening port (the app/target port, which may differ from the K8s service
+/// port). One loopback proxy is emitted PER HTTP-family service port; the
+/// route table groups a multi-port service's siblings under one lowest-port
+/// representative and the request path swaps in the sibling matching the
+/// inbound connection's captured original destination (REDIRECT-captured
+/// plain inbound) or the pre-strip `Host`/`:authority` port (peer-sidecar
+/// dials), failing closed when a multi-port request carries neither signal —
+/// see `HostRouteTable::select_mesh_inbound_port_route`. Stream-family raw TCP
+/// inbound is prepared as a runtime-only port map consumed by the accept loop
+/// before Hyper parses the connection. The emitted HTTP proxies carry the
+/// [`MESH_INBOUND_PROXY_ID_PREFIX`] so the request path keeps them off the
+/// outbound listener.
 fn materialize_sidecar_inbound_proxies(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -7761,9 +7761,13 @@ enum MeshEgressTransport {
 ///   destination's `:15008`): `mesh.hbone`-tagged targets light up
 ///   `current_dispatch_hbone` → `HboneConnectionPool`.
 /// - **NodeWaypoint** captured HTTP Service traffic materializes host-routed
-///   service routes with no mesh transport tag: the in-pod-netns listener has
-///   already attributed the source pod, `mesh_authz` runs on the normal plugin
-///   chain, and dispatch dials the selected backing pod app port directly.
+///   service routes: the in-pod-netns listener has already attributed the
+///   source pod and `mesh_authz` runs on the normal plugin chain. In an
+///   identity-backed posture each target is `mesh.hbone`-tagged for the
+///   destination NodeWaypoint (dial host and pinned NodeWaypoint SVID from
+///   `Workload.node_waypoint`), with the backing pod app endpoint as the
+///   CONNECT authority; only the explicit no-CA/dev posture keeps the untagged
+///   plaintext target (see `MeshEgressTransport`).
 ///   Direct Pod-IP/headless HTTP routes remain fail-closed because the current
 ///   eBPF path must not synthesize unreachable pod-IP HBONE targets.
 /// - **Sidecar** egress uses plain **SVID-mTLS HTTP/2** to the peer sidecar's
@@ -8266,7 +8270,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
 }
 
 /// Materialize per-port UDP egress upstreams for the UDP service ports of
-/// in-mesh services (F3 §3.3 Stage 4). **Ambient-only.**
+/// in-mesh services (F3 §3.3 Stage 4), on Ambient and Sidecar.
 ///
 /// Like raw-TCP egress, NO route proxy enters the config: a UDP datagram has no
 /// Host header to route by. Instead the captured datagram's original
@@ -9134,7 +9138,7 @@ fn build_outbound_mesh_targets(
 ///
 /// The service's remote workloads are first REACHABILITY-FILTERED (codex r2
 /// [R2-2]): a remote workload is kept only if it has ≥1 address AND its
-/// first-service-port target port resolves — MIRRORING
+/// target port for this `service_port` resolves — MIRRORING
 /// [`build_east_west_service_targets`]'s skip conditions on the GATEWAY side, so
 /// a workload the destination cluster's east-west materializer would itself drop
 /// (no pod IP / unresolved named targetPort) never produces a dead gateway path
@@ -9746,7 +9750,7 @@ fn cross_cluster_hbone_synthetic_host(
 /// DESTINATION-SIDE FORWARDING (why the dest east-west gateway forwards to the
 /// app port, not `:15008`): the remote cluster's east-west gateway is a SNI
 /// passthrough that forwards the opaque outer TLS to the destination workload's
-/// APP PORT (`build_east_west_service_targets` resolves the first service port's
+/// APP PORT (`build_east_west_service_targets` resolves each service port's
 /// `targetPort` / container port, NOT a mesh terminator port). The destination
 /// pod's INBOUND CAPTURE then redirects that app-port traffic to the mesh
 /// terminator — iptables REDIRECT app-port → `:15008` for Ambient (an HBONE
@@ -11540,8 +11544,8 @@ fn resolve_subset_traffic_policy(
 
 /// Project a `MeshTrafficPolicy` onto a per-port `UpstreamPortOverride` slot.
 ///
-/// Per-port `tls` is intentionally not applied here today because backend TLS
-/// posture is stored at upstream scope (`backend_tls_*`), not per-port.
+/// Per-port `tls` is not applied here: the `portLevelSettings` caller resolves
+/// it separately and stores it on the slot's `tls` field.
 fn apply_traffic_policy_to_port_override(
     slot: &mut UpstreamPortOverride,
     policy: &MeshTrafficPolicy,
@@ -11942,7 +11946,7 @@ fn apply_traffic_policy_tls_to_upstream(
 ///
 /// Shared overlay used by both the upstream-level apply
 /// ([`apply_traffic_policy_tls_to_upstream`]) and the per-subset apply
-/// ([`apply_subset_traffic_policy_tls`]), so subset TLS overrides cannot drift
+/// (`resolve_subset_traffic_policy`), so subset TLS overrides cannot drift
 /// from the upstream-level translation. `identity` is used only for log /
 /// error context (the upstream id, or `<upstream>/<subset>`).
 ///
@@ -13392,8 +13396,7 @@ fn egress_gateway_proxy(
 /// proxy. Unlike `egress_gateway_proxy` (HTTP-family, host-routed off the
 /// shared 15090 listener), the stream variant routes by `listen_port`, owns
 /// its own listener bound to the ServiceEntry's destination port, and has
-/// `hosts: []` / `listen_path: None` per the stream-family proxy contract
-/// (CLAUDE.md "Proxy hosts/listen_path/listen_port contract").
+/// `hosts: []` / `listen_path: None` per the stream-family proxy contract.
 ///
 /// The protocol tag is stamped onto `Proxy.name` for observability (transaction
 /// logs surface the proxy name); the wire-level dispatch is identical for all
@@ -14204,7 +14207,7 @@ fn merge_tracing_config(
 /// which JWTs are *valid*, not which are *required*. A request with no JWT
 /// passes through. An invalid JWT is rejected. Enforcement (requiring a
 /// JWT) comes from AuthorizationPolicy. So the plugin is configured with
-/// `anonymous_on_missing_token: true`.
+/// `allow_missing_token: true`.
 ///
 /// The global instance carries the resources that select THIS proxy's own
 /// identity. On a NodeWaypoint, routes that reach a modeled destination are
@@ -15284,7 +15287,6 @@ pub async fn run(
         .to_string();
     let runtime = MeshRuntimeConfig::from_env_config(&env_config)
         .map_err(|e| anyhow::anyhow!("invalid mesh runtime configuration: {e}"))?;
-    ensure_runtime_config_protocol_supported(&runtime)?;
 
     // Issue #4249: arm the authoritative node-local enrolled-pod registry
     // BEFORE the bootstrap config is built, so the very first applied
@@ -15677,17 +15679,6 @@ fn arm_inbound_relay_enrolled_destinations(
          enrolled-pod registry"
     );
     Some(enrolled_destinations::InstalledEnrolledDestinationsGuard::install(index))
-}
-
-fn ensure_runtime_config_protocol_supported(
-    runtime: &MeshRuntimeConfig,
-) -> Result<(), anyhow::Error> {
-    match runtime.config_protocol {
-        MeshConfigProtocol::Native
-        | MeshConfigProtocol::Xds
-        | MeshConfigProtocol::File
-        | MeshConfigProtocol::StockXds => Ok(()),
-    }
 }
 
 struct MeshRuntimeBackgroundOwnership {
@@ -16096,10 +16087,10 @@ async fn arm_mesh_runtime_startup(
         // the snapshot installed above seeds BOTH policy scopes AND a
         // workload_spiffe_hash → SPIFFE index, so `resolve_record` lazily
         // enrolls `pod_uid` → identity by hash-join against the eBPF-stamped
-        // records (no separate enrollment channel). The path is complete in
-        // code and CI-verified at the load/attach level (`ebpf-live`); it stays
-        // unexercised on a live multi-pod datapath, where a tuple/byte-order or
-        // enrollment miss fails closed (never misattributes).
+        // records (no separate enrollment channel). It is CI-verified at the
+        // load/attach level (`ebpf-live`) and on a live multi-pod datapath
+        // (`node-waypoint-ebpf-live`); a tuple/byte-order or enrollment miss
+        // fails closed (never misattributes).
         owner.push_mesh_background(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         // NodeWaypoint UDP/DTLS per-datagram source-workload attribution
         // (issue #3286). A UDP listener has one shared frontend socket and no
@@ -16205,15 +16196,16 @@ async fn arm_mesh_runtime_startup(
         proxy_state
     };
     owner.set_proxy_state(proxy_state.clone());
-    // Node-waypoint in-netns outbound capture listeners (opt-in). The default
-    // outbound listener binds in the HOST netns, which a pod's loopback-rewritten
-    // capture (`connect4` → 127.0.0.1:15001, `connect6` → [::1]:15001) can never
-    // reach; with this enabled the proxy additionally opens dual-family loopback
-    // listeners INSIDE each enrolled pod's network namespace, so captured
-    // connections are accepted there and the GAP-2M sock_ops same-netns cookie
-    // bridge resolves their source identity. Pods are discovered from the registry
-    // the node-agent publishes. Linux-only; the full pod-loopback datapath is
-    // verified only on a live multi-pod node (see `src/proxy/netns_capture.rs`).
+    // Node-waypoint in-netns outbound capture listeners (always on for
+    // NodeWaypoint). The default outbound listener binds in the HOST netns,
+    // which a pod's loopback-rewritten capture (`connect4` → 127.0.0.1:15001,
+    // `connect6` → [::1]:15001) can never reach; so the proxy additionally
+    // opens dual-family loopback listeners INSIDE each enrolled pod's network
+    // namespace, so captured connections are accepted there and the GAP-2M
+    // sock_ops same-netns cookie bridge resolves their source identity. Pods
+    // are discovered from the registry the node-agent publishes. Linux-only;
+    // the full pod-loopback datapath is verified only on a live multi-pod node
+    // (see `src/proxy/netns_capture.rs`).
     if runtime.topology == MeshTopology::NodeWaypoint {
         // The connect hooks rewrite captured pod egress to loopback inside the
         // POD netns, taking only the port from FERRUM_MESH_OUTBOUND_LISTEN_ADDR.
@@ -16226,8 +16218,8 @@ async fn arm_mesh_runtime_startup(
         let capture_port = runtime.outbound_listen_addr.port();
         if capture_port == 0 {
             info!(
-                "Node-waypoint in-netns capture listeners requested, but the outbound listen \
-                 port is 0 (disabled); not starting in-netns capture"
+                "Node-waypoint outbound listen port is 0 (disabled); not starting in-netns \
+                 capture listeners"
             );
         } else {
             let capture_addr = std::net::SocketAddr::new(
@@ -16897,7 +16889,8 @@ async fn arm_mesh_runtime_startup(
         Ok(None) => {}
         Err(error) => {
             return Err(error.context(
-                "failed to start the mesh application-probe rewrite server; kubelet probes                  rewritten by the injector would fail closed",
+                "failed to start the mesh application-probe rewrite server; kubelet probes \
+                 rewritten by the injector would fail closed",
             ));
         }
     }
@@ -17408,10 +17401,11 @@ async fn arm_mesh_runtime_startup(
                 )
                 .await
             } else if matches!(kind, MeshListenerKind::PlaintextUdpCapture) {
-                // UDP TPROXY capture listener (F3 §3.3 Stage 3) — plaintext,
-                // distinct from the TCP capture/HTTP path: it binds a transparent
-                // UDP socket, recovers per-datagram orig-dst from cmsg, and drops
-                // (egress is Stage 4). `tls_config` is always None here.
+                // UDP TPROXY capture listener (F3 §3.3) — plaintext, distinct
+                // from the TCP capture/HTTP path: it binds a transparent UDP
+                // socket, recovers per-datagram orig-dst from cmsg, and hands
+                // each datagram to the mesh UDP egress relay. `tls_config` is
+                // always None here.
                 proxy::start_mesh_udp_capture_listener_with_signal(
                     addr,
                     state,
@@ -17422,12 +17416,8 @@ async fn arm_mesh_runtime_startup(
                 )
                 .await
             } else {
-                // Outbound capture (plaintext) — non-mTLS mesh listener. Use the
-                // generic listener entry but stamp direction by routing through
-                // the mesh mTLS variant with `record_mesh_mtls_metric=false`.
-                // We accomplish that by constructing the underlying call
-                // directly so we can pass `mesh_direction` even though TLS
-                // termination is disabled.
+                // Outbound capture (plaintext): non-mTLS mesh listener that
+                // still stamps `mesh_direction`.
                 proxy::start_mesh_plaintext_listener_with_signal(
                     addr,
                     state,
@@ -18959,10 +18949,10 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
     //     for the identical condition. So a configured SVID that fails to load —
     //     including an expired/mid-rotation leaf — aborts startup; it does not
     //     silently degrade to chain-only.
-    //   - Live reload: `stage_mesh_inbound_spiffe_bundle` keeps the PREVIOUS trust
-    //     bundle (the running verifier is retained, not dropped to chain-only), so
-    //     a transient mid-rotation failure does not drop inbound trust-domain
-    //     enforcement.
+    //   - Live reload: `stage_mesh_inbound_spiffe_bundle_with_federation` keeps
+    //     the PREVIOUS trust bundle (the running verifier is retained, not
+    //     dropped to chain-only), so a transient mid-rotation failure does not
+    //     drop inbound trust-domain enforcement.
     // We intentionally do not load only the trust bundle here: the gateway leaf
     // must also be currently valid for the listener to present a usable server
     // identity, so an expired leaf is a real fault, not a reason to half-load.
@@ -19089,26 +19079,6 @@ fn merge_trust_overlay_into_svid_bundle(
 /// federated trust domains active for inbound handshakes. A rebuild failure
 /// returns `None` (logged) and the caller leaves the previous trust bundles in
 /// place — this never fails the slice.
-#[cfg(test)]
-#[allow(dead_code)]
-fn stage_mesh_inbound_spiffe_bundle(
-    proxy_state: &ProxyState,
-    slot: Option<&tls::SharedBundleSlot>,
-    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
-    env_config: &EnvConfig,
-    slice: &MeshSlice,
-) -> Option<StagedSpiffeBundle> {
-    stage_mesh_inbound_spiffe_bundle_with_federation(
-        proxy_state,
-        slot,
-        runtime_trust_overlay_slot,
-        env_config,
-        slice,
-        None,
-        FederationActivation::disabled(),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn stage_mesh_inbound_spiffe_bundle_with_federation(
     proxy_state: &ProxyState,
@@ -23563,7 +23533,6 @@ mod tests {
                 let xds_config = runtime.xds_client_config();
 
                 assert_eq!(runtime.config_protocol, MeshConfigProtocol::Xds);
-                assert!(ensure_runtime_config_protocol_supported(&runtime).is_ok());
                 assert_eq!(xds_config.cp_urls, vec!["http://cp:50051"]);
                 assert_eq!(xds_config.node_id, "node-x");
                 assert_eq!(xds_config.cluster, "cluster-a");
@@ -23597,7 +23566,6 @@ mod tests {
 
                 assert_eq!(runtime.config_protocol, MeshConfigProtocol::File);
                 assert!(!runtime.config_protocol.requires_control_plane());
-                assert!(ensure_runtime_config_protocol_supported(&runtime).is_ok());
                 assert_eq!(
                     runtime.file_config_path.as_deref(),
                     Some("/etc/ferrum/mesh.yaml")
@@ -25494,7 +25462,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_outbound_udp_upstreams_materialize_ambient_only() {
+    fn mesh_outbound_udp_upstreams_materialize_for_ambient() {
         // UDP egress (F3 §3.3 Stage 4): Ambient materializes one per-port UDP
         // upstream with `mesh.hbone`-tagged, identity-pinned targets dialing the
         // resolved targetPort; NO route proxy (datagrams carry no Host). Distinct
@@ -26634,8 +26602,8 @@ mod tests {
         // DestinationRule portLevelSettings authored on a UDP SERVICE port
         // (`port: 53, targetPort: 5353`) stay under the targets' owning service
         // policy port while the target still dials the resolved workload port.
-        // Ambient-only: the UDP egress materializer stamps HBONE and only runs
-        // under Ambient topology.
+        // Exercised on Ambient (HBONE); the Sidecar mesh-mTLS materialization
+        // is covered by `mesh_outbound_udp_materializes_sidecar_mtls_upstream`.
         let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
         let mut svc = http_mesh_service("dns", 53, spiffe);
         svc.ports[0].protocol = AppProtocol::Udp;
@@ -27060,7 +27028,6 @@ mod tests {
                 && !upstream.port_overrides.contains_key(&8081),
             "the entry must not fan out to heterogeneous dial ports"
         );
-        // SELECTION-TIME policy must also land at the UPSTREAM level: with
         // Selection-time policy must also land at the upstream level so the
         // owning service port's policy applies before any target is selected.
         assert_eq!(
@@ -37063,7 +37030,6 @@ mod tests {
         );
         assert!(refusal.enabled);
 
-        // With no inbound route the refusal stays on every route.
         let mut bare = GatewayConfig::default();
         force_ensure_global_plugin(
             &mut bare,
@@ -38980,7 +38946,7 @@ mod tests {
         let file_svid_env = EnvConfig {
             gateway_svid_cert_path: Some("tests/certs/server.crt".to_string()),
             gateway_svid_key_path: Some("tests/certs/server.key".to_string()),
-            gateway_svid_trust_bundle_path: Some("tests/certs/ca.crt".to_string()),
+            gateway_svid_trust_bundle_path: Some("tests/certs/server.crt".to_string()),
             ..EnvConfig::default()
         };
         validate_egress_gateway_mtls_config(&file_svid_runtime, &file_svid_env)
@@ -40305,51 +40271,6 @@ mod tests {
     }
 
     #[test]
-    fn mesh_inbound_tls_slot_swaps_atomically() {
-        ensure_crypto_provider();
-        let env = EnvConfig {
-            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
-            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
-            ..EnvConfig::default()
-        };
-        let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
-        let mesh_frontend_identity =
-            load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
-                .expect("mesh frontend identity");
-        let tls_config = load_mesh_frontend_tls(
-            &env,
-            &tls_policy,
-            &[],
-            &no_enforced_crls(),
-            config::MtlsMode::Permissive,
-            MeshTopology::Sidecar,
-            mesh_frontend_identity.as_deref(),
-            None,
-            None,
-        )
-        .expect("TLS config builds")
-        .expect("TLS config present");
-        let slot: crate::proxy::SharedMeshInboundTls =
-            Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
-
-        slot.store(Arc::new(Some(tls_config.clone())));
-        let loaded = slot.load_full();
-        assert!(
-            loaded
-                .as_ref()
-                .as_ref()
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &tls_config)),
-            "load_full should observe the swapped TLS config"
-        );
-
-        slot.store(Arc::new(None));
-        assert!(
-            slot.load_full().is_none(),
-            "load_full should observe the plaintext swap"
-        );
-    }
-
-    #[test]
     fn validate_inbound_mtls_mode_accepts_disable_on_east_west_gateway() {
         // East-west gateways do SNI passthrough — there is no TLS-terminating
         // listener to fail closed. The resolved mode is structurally unused.
@@ -40364,6 +40285,7 @@ mod tests {
             MeshTopology::Sidecar,
             MeshTopology::Ambient,
             MeshTopology::NodeWaypoint,
+            MeshTopology::ServiceWaypoint,
             MeshTopology::EastWestGateway,
             MeshTopology::EgressGateway,
         ] {
@@ -41162,9 +41084,11 @@ mod tests {
     /// A wildcard host IS materializable when the operator declared concrete
     /// endpoints (`resolution: STATIC`) — the dial targets are those endpoints
     /// and the wildcard is only the route selector. Pins the #1727 injective id
-    /// encoding for the wildcard host alongside the supported shape; the
-    /// unresolvable variant (`DNS`/`NONE`, no endpoints) is refused instead and
-    /// is covered in `tests/conformance/istio_service_entry_egress.rs`.
+    /// encoding for the wildcard host alongside the supported shape. The
+    /// `DNS`/`NONE` HTTP-family variant also materializes (next test); a
+    /// `STATIC` wildcard with no endpoints, and a stream-family wildcard without
+    /// `STATIC` endpoints, are refused and covered in
+    /// `tests/conformance/istio_service_entry_egress.rs`.
     #[test]
     fn egress_sanitizes_wildcard_host_ids_but_preserves_route_host() {
         let mut entry = test_external_service_entry(

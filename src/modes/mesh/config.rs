@@ -1349,18 +1349,6 @@ pub struct PrincipalMatch {
     pub trust_domain_pattern: Option<String>,
 }
 
-/// Conjunctive source-negative / IP-block matchers for one Istio
-/// AuthorizationPolicy `from[].source`.
-///
-/// Istio ANDs every field inside a single `source` together, and a request
-/// matches the rule's `from` when **any one** source matches. The positive
-/// identity matchers (`principals` / `namespaces`) translate into the ORed
-/// [`PrincipalMatch`] list on [`MeshRule::from`]; the negative and IP-block
-/// matchers live here on [`MeshRule`] because they must AND with — not OR
-/// against — the positive set. Placing them in the ORed `from` vec would let
-/// traffic through whenever a single negative-only entry "matched", which is
-/// the opposite of Istio's deny-listing intent (fail-open).
-///
 /// Pre-parsed CIDR block for allocation-free hot-path IP matching.
 ///
 /// Constructed from a CIDR string like `"10.0.0.0/8"` or a bare IP like
@@ -1489,6 +1477,18 @@ impl<'de> Deserialize<'de> for ParsedCidr {
     }
 }
 
+/// Conjunctive source-negative / IP-block matchers for one Istio
+/// AuthorizationPolicy `from[].source`.
+///
+/// Istio ANDs every field inside a single `source` together, and a request
+/// matches the rule's `from` when **any one** source matches. The positive
+/// identity matchers (`principals` / `namespaces`) translate into the ORed
+/// [`PrincipalMatch`] list on [`MeshRule::from`]; the negative and IP-block
+/// matchers live here on [`MeshRule`] because they must AND with — not OR
+/// against — the positive set. Placing them in the ORed `from` vec would let
+/// traffic through whenever a single negative-only entry "matched", which is
+/// the opposite of Istio's deny-listing intent (fail-open).
+///
 /// IP fields are **fail-closed** when the corresponding request attribute is
 /// absent: a non-empty list with no value to test fails the match rather than
 /// admitting traffic the operator meant to gate. Negative identity and
@@ -4254,7 +4254,7 @@ pub struct EastWestGateway {
 /// Each DestinationRule targets a service host and carries connection pool
 /// settings, outlier detection, load balancer config, and optional subsets.
 /// The mesh runtime applies these onto matching `Upstream` entries during
-/// `prepare_gateway_config_for_mesh()`.
+/// mesh config preparation (`apply_destination_rules`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshDestinationRule {
     pub name: String,
@@ -9189,21 +9189,6 @@ fn mesh_service_fqdn_like(host: &str) -> bool {
         && labels.next() == Some("svc")
         && labels.next().is_some_and(|label| !label.is_empty())
         && labels.all(|label| !label.is_empty())
-}
-
-/// Lower-case in-place hostname normalisation for mesh entries — matches
-/// the existing `normalize_fields()` pattern used elsewhere in
-/// [`crate::config::types`]. Idempotent.
-pub fn normalize_mesh_fields(service_entries: &mut [ServiceEntry], workloads: &mut [Workload]) {
-    normalize_mesh_fields_internal(
-        service_entries,
-        workloads,
-        &mut [],
-        &mut [],
-        &mut [],
-        &mut [],
-        None,
-    );
 }
 
 fn normalize_mesh_fields_internal(

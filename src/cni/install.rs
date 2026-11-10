@@ -25,9 +25,11 @@
 //!   the binary that was installed.
 //!
 //! Uninstall removes an artifact only when that evidence is present and
-//! matches; anything else is retained and reported. It never reads or
-//! rewrites a neighbouring CNI configuration, and it never removes the shared
-//! plugin binary while any CNI configuration on the node still references it.
+//! matches; anything else is retained and reported. It never rewrites a
+//! neighbouring CNI configuration (it only reads them, bounded and
+//! `O_NOFOLLOW`, to see whether one still names `ferrum-cni`), and it never
+//! removes the shared plugin binary while any CNI configuration on the node
+//! still references it.
 //!
 //! # What the manifest's `previousBinarySha256` does and does not prove
 //!

@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use tonic::transport::{Certificate, Identity};
 
 pub use crate::grpc::dp_client::wait_optional_tls_reload;
@@ -46,16 +44,6 @@ pub fn tonic_tls_config(tls: &DpGrpcTlsConfig) -> tonic::transport::ClientTlsCon
 /// delivers the first slice and stays healthy can still fail back to primary.
 pub fn should_race_primary_retry(is_fallback: bool, primary_retry_secs: u64) -> bool {
     is_fallback && primary_retry_secs > 0
-}
-
-pub async fn sleep_or_shutdown(
-    duration: Duration,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(duration) => false,
-        _ = wait_for_shutdown(&mut shutdown_rx) => true,
-    }
 }
 
 pub async fn wait_for_shutdown(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) {
@@ -152,6 +140,8 @@ pub(crate) mod diagnostic_test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]

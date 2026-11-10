@@ -78,14 +78,6 @@ impl CrdResourceStore {
     pub async fn wait_until_ready_owned(self: Arc<Self>) -> Result<(), String> {
         self.wait_until_ready().await
     }
-
-    pub fn len(&self) -> usize {
-        self.store.state().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 pub struct ResourceStoreSet {
@@ -298,10 +290,6 @@ impl ResourceStoreSet {
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.notifier.change_tx.subscribe()
-    }
-
-    pub fn total_resources(&self) -> usize {
-        self.stores.iter().map(|s| s.len()).sum()
     }
 }
 

@@ -21,7 +21,8 @@
 //!   (`HboneConnectionPool::get_ws_byte_tunnel`). A tunnel opened over an
 //!   already-established pooled H2 connection still counts, so this is
 //!   "secured dial attempts", not "TLS handshakes". Datagram tunnels are out of
-//!   scope: NodeWaypoint emits no UDP capture listener and never relays UDP.
+//!   scope: NodeWaypoint UDP/DTLS listeners relay to node-local backends and
+//!   never open an HBONE datagram tunnel.
 //!   Independent of the destination's inbound phases.
 //!
 //! Asserted-identity and destination-policy counters are mutually exclusive for

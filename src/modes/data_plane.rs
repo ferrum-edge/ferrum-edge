@@ -6,7 +6,8 @@
 //!
 //! The DP has no direct database access. Its admin API is always read-only.
 //! If the gRPC connection to the CP drops, the DP continues serving with
-//! cached config and reconnects with a 5-second backoff loop.
+//! cached config and reconnects with jittered exponential backoff (1s → 30s)
+//! across the configured CP URLs.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

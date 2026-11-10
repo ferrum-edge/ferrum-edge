@@ -125,32 +125,3 @@ fn upsert_by_namespace_and_id<T, FNs, FId>(
         }
     }
 }
-
-/// Upsert items into a vec by ID: replace existing entries, append new ones.
-///
-/// Prefer [`upsert_by_namespace_and_id`] for GatewayConfig resources whose IDs
-/// are only unique per namespace. This ID-only helper remains for generic
-/// callers (e.g. control-plane unit tests) that intentionally key by a single
-/// string.
-#[cfg(test)]
-pub(crate) fn upsert_by_id<T, F>(existing: &mut Vec<T>, updates: Vec<T>, get_id: F)
-where
-    F: Fn(&T) -> &str,
-{
-    let mut index: HashMap<String, usize> = existing
-        .iter()
-        .enumerate()
-        .map(|(i, item)| (get_id(item).to_string(), i))
-        .collect();
-
-    for item in updates {
-        let id = get_id(&item).to_string();
-        if let Some(&pos) = index.get(id.as_str()) {
-            existing[pos] = item;
-        } else {
-            let pos = existing.len();
-            existing.push(item);
-            index.insert(id, pos);
-        }
-    }
-}

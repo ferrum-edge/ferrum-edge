@@ -420,9 +420,9 @@ impl NodeAgentConfig {
 
         // In-netns capture is the default for NodeWaypoint: publish the per-pod
         // registry whenever the node-agent runs in NodeWaypoint proxy mode with
-        // outbound capture enabled. Other proxy modes have no in-netns listener
-        // consumer, so leave it `None` and skip all the filesystem work on the
-        // hot paths.
+        // outbound capture enabled. The registry is also published for every
+        // Ambient topology (see `should_publish_registry` below); otherwise it
+        // stays `None` and the filesystem work is skipped on the hot paths.
         let node_waypoint_in_netns = env_config.node_agent_proxy_mode
             == NodeAgentProxyMode::NodeWaypoint
             && capture_config.outbound_capture_enabled;
@@ -2341,7 +2341,7 @@ where
     }
 
     // Optional CNI plugin listener: when enabled, spawns a UDS server that
-    // funnels ADD/DEL/CHECK calls from the `ferrum-cni` binary into this
+    // funnels ADD/DEL/CHECK/STATUS/GC calls from the `ferrum-cni` binary into this
     // loop via the `cni_work_rx` channel. When disabled (the default), the
     // channel stays empty and the receiver in the select! arm parks
     // forever — the kube-rs watcher remains the sole enrollment driver.
@@ -3087,18 +3087,6 @@ fn watcher_init_stale_uids(
         .collect()
 }
 
-/// Remove transiently-failed pods (in `FAILED_POD_ENROLLMENT_ATTEMPTS`) that
-/// vanished across a watcher reconnect/relist. The InitDone stale sweep only
-/// reconciles enrolled pods (`watcher_init_stale_uids` walks `pod_states`), but a
-/// pod that failed enrollment before it was inserted into `pod_states` keeps an
-/// owned snapshot *outside* `pod_states`. If that pod is gone after the relist,
-/// nothing else clears the record, so the periodic retry loop would replay it
-/// forever — warning and bumping `attach_errors` every ~30s for a UID the API no
-/// longer reports. Routing it through `handle_pod_removed` consumes any partial
-/// BPF cleanup evidence before clearing the retry record.
-///
-/// Records are scoped by the `pod_states` key prefix so a sibling node-agent
-/// runtime (or, under `cargo test`, another test's pods) is never pruned.
 fn has_failed_pod_enrollments(pod_states: &DashMap<String, PodAttachmentState>) -> bool {
     if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
         return false;
@@ -3528,6 +3516,18 @@ fn clear_partial_capture_state_if_recovered(
     }
 }
 
+/// Remove transiently-failed pods (in `FAILED_POD_ENROLLMENT_ATTEMPTS`) that
+/// vanished across a watcher reconnect/relist. The InitDone stale sweep only
+/// reconciles enrolled pods (`watcher_init_stale_uids` walks `pod_states`), but a
+/// pod that failed enrollment before it was inserted into `pod_states` keeps an
+/// owned snapshot *outside* `pod_states`. If that pod is gone after the relist,
+/// nothing else clears the record, so the periodic retry loop would replay it
+/// forever — warning and bumping `attach_errors` every ~30s for a UID the API no
+/// longer reports. Routing it through `handle_pod_removed` consumes any partial
+/// BPF cleanup evidence before clearing the retry record.
+///
+/// Records are scoped by the `pod_states` key prefix so a sibling node-agent
+/// runtime (or, under `cargo test`, another test's pods) is never pruned.
 fn prune_failed_enrollments_from_relist(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -4732,7 +4732,7 @@ struct PodEnrollmentAttemptSignature {
 /// transient eBPF attach/map failure that lands *after* the cgroup and veth
 /// resolved would become an indefinite capture gap whenever no further pod
 /// event arrives for that pod. We keep this snapshot so the periodic retry loop
-/// in `run_with_backend` can rebuild the event and try again every ~30s until
+/// in `run_with_pod_stream` can rebuild the event and try again every ~30s until
 /// it succeeds (or the pod is removed / no longer matches enrollment).
 ///
 /// `veth_iface_override` is intentionally not captured: production always sets
@@ -5567,10 +5567,6 @@ fn forget_failed_pod_enrollment(state_key: &str) {
 
 fn has_failed_pod_enrollment_attempt(state_key: &str) -> bool {
     FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(state_key)
-}
-
-fn forget_pod_enrollment_attempt(state_key: &str) {
-    FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
 }
 
 /// Re-drive enrollment for every pod that failed transiently and whose backoff
@@ -7609,7 +7605,7 @@ fn handle_pod_added_inner(
     }
 
     // Owned event snapshot stored alongside the failed-enrollment record so the
-    // periodic retry loop in `run_with_backend` can re-drive this enrollment
+    // periodic retry loop in `run_with_pod_stream` can re-drive this enrollment
     // once the backoff window expires, even if no further pod/CNI event arrives
     // for this pod. Cheap to build but only needed on the cold failure paths
     // below, so each `remember_failed_pod_enrollment` call clones it.
@@ -9349,7 +9345,7 @@ pub fn handle_pod_removed(
                     backend, pod_states, metrics, &state_key, pod_uid, state,
                 )
             });
-            forget_pod_enrollment_attempt(&state_key);
+            forget_failed_pod_enrollment(&state_key);
             // Pod events, retry ticks, and responder ticks share this select!
             // task, so the responder cannot observe suppression lifted between
             // the pending-failure writes above and this completion attempt.
@@ -9365,7 +9361,7 @@ pub fn handle_pod_removed(
             // Process restart / missed DEL: durable ownership rehydrated without
             // live `pod_states`. Drive the same Ferrum-owned teardown using the
             // persisted cleanup snapshot before ownership may clear.
-            forget_pod_enrollment_attempt(&state_key);
+            forget_failed_pod_enrollment(&state_key);
             unenroll_pod_attachment_state(
                 backend,
                 pod_states,
@@ -9384,18 +9380,18 @@ pub fn handle_pod_removed(
                 "Retaining Ferrum CNI ownership because rehydrated attachment lacks a cleanup snapshot"
             );
             remember_capture_failure(&state_key, CaptureFailureOp::PodDetach);
-            forget_pod_enrollment_attempt(&state_key);
+            forget_failed_pod_enrollment(&state_key);
             clear_partial_capture_state_if_recovered(pod_states, metrics);
             return;
         } else {
-            forget_pod_enrollment_attempt(&state_key);
+            forget_failed_pod_enrollment(&state_key);
         }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         let _ = forget_cni_owned_attachments_if_removal_complete(pod_states, pod_uid);
         return;
     };
 
-    forget_pod_enrollment_attempt(&state_key);
+    forget_failed_pod_enrollment(&state_key);
     unenroll_pod_attachment_state(
         backend, pod_states, config, metrics, &state_key, pod_uid, &state,
     );
@@ -11308,7 +11304,9 @@ mod tests {
         // cannot run eBPF (would take the iptables `handle_fallback()` path) must
         // refuse startup: `handle_fallback()` never runs the pod watcher that
         // populates the registry, so producer startup or disabled stale-rule
-        // cleanup would poll an empty directory (#2013).
+        // cleanup would poll an empty directory (#2013). The predicate has no
+        // UDP-enabled input: disabled capture still runs the registry-dependent
+        // stale-rule cleanup, so fallback refuses in both cases.
         assert!(
             ambient_udp_registry_requires_ebpf(false, true, true),
             "no eBPF + configured Ambient lifecycle registry must fail closed"
@@ -11320,10 +11318,6 @@ mod tests {
             !ambient_udp_registry_requires_ebpf(true, true, true),
             "eBPF-capable node publishes the registry; must not refuse"
         );
-
-        // Disabled capture still runs the registry-dependent stale-rule cleanup,
-        // so fallback must refuse rather than strand retained guards forever.
-        assert!(ambient_udp_registry_requires_ebpf(false, true, true));
 
         // NodeWaypoint also has a registry-backed in-netns path, but its
         // established iptables fallback remains valid when Ambient lifecycle

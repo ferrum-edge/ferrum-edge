@@ -11,7 +11,6 @@
 
 pub mod admission;
 pub mod carrier;
-pub mod conformance;
 pub mod nonce;
 pub mod server;
 pub mod snapshot;
@@ -120,9 +119,8 @@ pub use server::XdsAdsServer;
 pub use snapshot::{XdsResource, XdsSnapshot, XdsSnapshotCache};
 #[allow(unused_imports)]
 pub use stock::{
-    STOCK_REQUIRED_TYPE_URLS, STOCK_XDS_TYPE_URLS, StockDiscovery, StockRefusal,
-    StockXdsAccumulator, StockXdsLimits, parse_istio_cluster_name, parse_kubernetes_service_host,
-    refuse_stock_secret,
+    STOCK_XDS_TYPE_URLS, StockDiscovery, StockRefusal, StockXdsAccumulator, StockXdsLimits,
+    parse_istio_cluster_name, parse_kubernetes_service_host, refuse_stock_secret,
 };
 #[allow(unused_imports)]
 pub use translator::{

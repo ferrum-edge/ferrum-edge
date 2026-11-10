@@ -174,11 +174,6 @@ impl MeshOutboundEnforcement {
     }
 
     #[allow(dead_code)] // Admin / debug surface; reserved for future introspection.
-    pub fn namespace(&self) -> &str {
-        &self.namespace
-    }
-
-    #[allow(dead_code)] // Admin / debug surface; reserved for future introspection.
     pub fn outbound_listen_ports(&self) -> &[u16] {
         &self.outbound_listen_ports
     }

@@ -79,16 +79,6 @@ use super::translator::{CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL};
 /// security policy.
 pub const STOCK_XDS_TYPE_URLS: [&str; 4] = [CDS_TYPE_URL, EDS_TYPE_URL, LDS_TYPE_URL, RDS_TYPE_URL];
 
-/// Types that gate the first mesh slice.
-///
-/// CDS is unconditional. EDS is *conditional* on CDS having produced at least
-/// one EDS-discovered cluster — a mesh whose clusters are all STATIC has
-/// nothing to wait for, and blocking on an EDS response that will never come
-/// would wedge startup. LDS/RDS only enrich the view (port protocol
-/// classification and service VIPs), so they never gate. See
-/// [`StockXdsAccumulator::ready`] for the live predicate.
-pub const STOCK_REQUIRED_TYPE_URLS: [&str; 2] = [CDS_TYPE_URL, EDS_TYPE_URL];
-
 const HCM_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
 const TCP_PROXY_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy";
@@ -165,7 +155,6 @@ pub mod refusal {
     pub const FILESYSTEM_DATA_SOURCE: &str = "filesystem_data_source";
     pub const UNSUPPORTED_PEER_IDENTITY_MATCHER: &str = "unsupported_peer_identity_matcher";
     pub const UNPARSABLE_CLUSTER_NAME: &str = "unparsable_cluster_name";
-    pub const RESERVED_ENVOY_CLUSTER: &str = "reserved_envoy_cluster";
     pub const INBOUND_CLUSTER_NOT_MAPPED: &str = "inbound_cluster_not_mapped";
     pub const SUBSET_CLUSTER_UNSUPPORTED: &str = "subset_cluster_unsupported";
     pub const NON_KUBERNETES_SERVICE_HOST: &str = "non_kubernetes_service_host";
@@ -366,16 +355,6 @@ pub struct StockListener {
     pub route_config_names: Vec<String>,
     /// Cluster names referenced by this listener's TcpProxy chains.
     pub tcp_clusters: Vec<String>,
-}
-
-impl StockListener {
-    /// Application protocol this listener's filter chains classify its port as.
-    /// `Unknown` covers both "no classifiable chain" and "two chains disagreed"
-    /// — in either case Ferrum refuses to guess a protocol for the port.
-    pub fn app_protocol(&self) -> AppProtocol {
-        self.class
-            .map_or(AppProtocol::Unknown, PortClass::app_protocol)
-    }
 }
 
 /// A virtual host Ferrum accepted, reduced to the two things it can act on.

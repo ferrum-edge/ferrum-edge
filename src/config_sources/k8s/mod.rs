@@ -149,8 +149,9 @@ pub struct K8sTranslationOptions {
     pub prefer_istio_on_overlap: bool,
     pub istio_root_namespace: String,
     pub cluster_domain: String,
-    /// Opt-in core Kubernetes Pod/Service/EndpointSlice discovery. Default
-    /// false for the first rollout so operators can enable it deliberately.
+    /// Core Kubernetes Pod/Service/EndpointSlice discovery. Defaults to false
+    /// on this options struct; the env-level default
+    /// (`FERRUM_K8S_POD_DISCOVERY_ENABLED`) is true inside a pod.
     pub pod_discovery_enabled: bool,
     /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. When true, a
     /// Gateway API backendRef to a selector-less Service in the route's own
@@ -1909,19 +1910,6 @@ pub fn gateway_api_route_conflicts(
     gateway_api::route_conflicts(objects, options, Some(&acc))
 }
 
-pub fn gateway_api_route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
-    gateway_api::route_conflict_keys(object)
-}
-
-pub fn gateway_api_route_conflict_keys_with_context(
-    objects: &[K8sObject],
-    options: &K8sTranslationOptions,
-    object: &K8sObject,
-) -> Vec<GatewayApiRouteConflictKey> {
-    let acc = gateway_api_status_conflict_context(objects, options.clone());
-    gateway_api::route_conflict_keys_for_acc(object, Some(&acc))
-}
-
 pub(crate) fn gateway_api_route_conflict_keys_with_acc(
     object: &K8sObject,
     acc: &K8sAccumulator,
@@ -3193,14 +3181,15 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
     pub redirect: Option<&'a Value>,
 }
 
-/// Translate a VirtualService `http[]` entry's `match[]` blocks into a
-/// `mesh_route_dispatch` plugin instance for the route's proxy.
+/// Translate a VirtualService `http[]` entry's `match[]` blocks into the
+/// `mesh_route_dispatch` rules for the route's proxy, returning the rules
+/// and whether any in-scope entry is URI-only.
 ///
 /// Each in-scope `match[]` entry becomes one rule. URI predicates are
 /// already captured at the proxy level via `listen_path`, so this helper
 /// extracts only the non-URI predicates (`method`, `headers`,
-/// `queryParams`). If no in-scope match entry has non-URI predicates,
-/// returns `None` — no plugin emitted.
+/// `queryParams`). If no in-scope match entry has non-URI predicates, no
+/// rule is returned for it.
 ///
 /// `listen_path` scopes the in-scope entries to this proxy: a `match[]`
 /// entry with a `uri` predicate only contributes to the proxy whose
@@ -3210,8 +3199,8 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
 /// headers:...}]` `match[]` would bleed the `/b` header rule into the
 /// `/a` proxy, and the second P1 below would also fire.
 ///
-/// `reject_unmatched` is forced to `false` when any in-scope entry is
-/// URI-only. Istio `match[]` entries are ORed: a URI-only entry is an
+/// The caller forces `reject_unmatched` to `false` when any in-scope entry
+/// is URI-only. Istio `match[]` entries are ORed: a URI-only entry is an
 /// unconditional catch-all for its listen_path, so requests that miss
 /// every other predicate must still be allowed to fall through to the
 /// proxy's default backend. With `reject_unmatched: true` and a URI-only
@@ -3239,52 +3228,6 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
 /// regex and the dispatch rule carries the flag so the plugin re-evaluates
 /// with ASCII case folding. Regex URI matches keep their operator-supplied
 /// regex semantics; Istio documents `ignoreUriCase` as exact/prefix-only.
-///
-/// The rule's destination overrides to the route's own destination
-/// (`backend_host`/`backend_port` or `upstream_id`). The destination is
-/// effectively the proxy's default backend, so the override is a no-op for
-/// the single-route case. The plugin is still emitted so:
-///   1. Predicate config is captured and visible via the admin API.
-///   2. Future enhancements (multi-destination canary routing collapsing
-///      multiple `http[]` entries into one proxy + multi-rule plugin) reuse
-///      the same plugin contract.
-#[allow(dead_code)]
-pub(crate) fn mesh_route_dispatch_plugin_for_proxy(
-    proxy_id: &str,
-    namespace: &str,
-    http: &Value,
-    listen_path: Option<&str>,
-    destination: MeshRouteDispatchDestination<'_>,
-    policy: MeshRouteDispatchPolicy<'_>,
-    prepend_rules: &[Value],
-) -> Option<PluginConfig> {
-    let (mut rules, has_uri_only_match) =
-        mesh_route_dispatch_rules_for_proxy(http, listen_path, destination, policy, false);
-    if !prepend_rules.is_empty() {
-        let mut combined = Vec::with_capacity(prepend_rules.len() + rules.len());
-        combined.extend(prepend_rules.iter().cloned());
-        combined.append(&mut rules);
-        rules = combined;
-    }
-    if rules.is_empty() {
-        return None;
-    }
-
-    let current_route_has_rules = rules.len() > prepend_rules.len();
-    let reject_unmatched = current_route_has_rules && !has_uri_only_match;
-
-    mesh_route_dispatch_plugin_from_rules(proxy_id, namespace, rules, reject_unmatched)
-}
-
-#[allow(dead_code)]
-pub(crate) fn mesh_route_dispatch_uri_less_rules(
-    http: &Value,
-    destination: MeshRouteDispatchDestination<'_>,
-    policy: MeshRouteDispatchPolicy<'_>,
-) -> Vec<Value> {
-    mesh_route_dispatch_rules_for_proxy(http, None, destination, policy, true).0
-}
-
 pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     http: &Value,
     listen_path: Option<&str>,

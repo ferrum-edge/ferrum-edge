@@ -16,13 +16,14 @@
 //! - The CNI binary needs the same `cni::spec` / `cni::rpc` /
 //!   `cni::client` modules as the node-agent server, so sharing the
 //!   library crate avoids code duplication.
-//! - Both binaries live in the same docker image. Helm's install
-//!   init-container copies `ferrum-cni` out of `/usr/local/bin/`
-//!   on the node-agent image into the host's `/opt/cni/bin/`.
+//! - Both binaries live in the same docker image: the node-agent image
+//!   ships it at `/app/ferrum-cni`, and the chart's init container runs
+//!   `/app/ferrum-cni install`, which publishes the binary into the host's
+//!   `/opt/cni/bin/`.
 //! - cargo's `[[bin]]` targets compile against the parent crate's
 //!   `lib.rs`, so this file is intentionally tiny.
 //!
-//! Stub on non-Linux: CNI is a Linux concept. macOS/Windows builds
+//! Stub on non-Unix: CNI is a Linux concept. Non-Unix (Windows) builds
 //! print an error and exit 1 so the binary target compiles in the CI
 //! matrix without requiring conditional compilation in `Cargo.toml`.
 

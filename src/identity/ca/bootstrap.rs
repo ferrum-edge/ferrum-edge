@@ -1,8 +1,8 @@
 //! First-run helper that mints a self-signed root for development setups.
 //!
-//! Production deployments MUST supply an existing root via
-//! `FERRUM_MESH_CA_CERT_PATH` / `FERRUM_MESH_CA_KEY_PATH`. This helper exists
-//! only to make local labs and integration tests self-contained.
+//! Production deployments MUST NOT use it: supply file-based SVID material
+//! (`FERRUM_GATEWAY_SVID_*`) or use `FERRUM_MESH_CA_BACKEND=spire`. This helper
+//! exists only to make local labs and integration tests self-contained.
 //!
 //! Two safety gates are enforced before generating anything:
 //!
@@ -83,7 +83,8 @@ pub fn bootstrap_dev_root(config: BootstrapConfig) -> Result<BootstrappedRoot, C
     if crate::identity::production_mode() {
         return Err(CaError::Config(
             "FERRUM_MESH_PRODUCTION_MODE=true — refusing to bootstrap a self-signed root. \
-             Provide an existing root via FERRUM_MESH_CA_CERT_PATH / FERRUM_MESH_CA_KEY_PATH."
+             Provide file-based SVID material (FERRUM_GATEWAY_SVID_*) or use \
+             FERRUM_MESH_CA_BACKEND=spire."
                 .to_string(),
         ));
     }

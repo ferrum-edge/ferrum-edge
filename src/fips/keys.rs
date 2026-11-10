@@ -57,19 +57,6 @@ pub const MIN_RSA_MODULUS_BITS: usize = 2048;
 /// approved profile needs one.
 pub const MAX_RSA_MODULUS_BITS: usize = 8192;
 
-/// Approved elliptic-curve field sizes, in bits: P-256, P-384, P-521.
-///
-/// These are the NIST prime curves of FIPS 186-5 / SP 800-186. Curve25519 and
-/// Curve448 are absent: they are not approved for the ECDSA/ECDH schemes in
-/// SP 800-56A, which is also why `fips::policy::FIPS_DEFAULT_KX_GROUPS` omits
-/// X25519.
-///
-/// P-521 is admitted for *certificates* even though `ES512` is refused for
-/// JWS. That is not an inconsistency: the JWS exclusion is about the
-/// `jsonwebtoken` backend's implementation contract, while a P-521 certificate
-/// is handled by the rustls provider, which classifies `secp521r1` itself.
-pub const APPROVED_EC_FIELD_BITS: &[usize] = &[256, 384, 521];
-
 /// Upper bound on how much of a surface label a diagnostic reproduces.
 pub const MAX_SURFACE_LABEL_CHARS: usize = 64;
 

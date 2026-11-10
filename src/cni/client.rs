@@ -84,10 +84,9 @@ pub fn send_rpc(
     decode_body::<CniRpcResponse>(&body).map_err(CniError::IpcFailed)
 }
 
-/// Non-Unix stub so the crate compiles on macOS/Windows for tests.
-/// The CNI binary is Linux-only by design (CNI is a Linux concept), but
-/// keeping this stub means contributors on a Mac can still run the
-/// library tests without conditional compilation rippling through the
+/// Non-Unix stub so the crate compiles on non-Unix (Windows) targets for
+/// tests. The CNI binary is Linux-only by design (CNI is a Linux concept),
+/// but keeping this stub avoids conditional compilation rippling through the
 /// rest of the codebase.
 #[cfg(not(unix))]
 pub fn send_rpc(

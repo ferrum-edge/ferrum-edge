@@ -4,7 +4,7 @@
 //!
 //! | Mode       | Proxy | Admin API   | Config Source                    |
 //! |------------|-------|-------------|----------------------------------|
-//! | `database` | Yes   | Read/Write  | PostgreSQL/MySQL/SQLite polling   |
+//! | `database` | Yes   | Read/Write  | PostgreSQL/MySQL/SQLite/MongoDB polling |
 //! | `file`     | Yes   | Read-only   | YAML/JSON file, SIGHUP reload    |
 //! | `cp`       | No    | Read/Write  | DB polling + gRPC broadcast to DPs |
 //! | `dp`       | Yes   | Read-only   | gRPC stream from CP              |
@@ -492,9 +492,8 @@ pub(crate) fn clear_config_rejected_after_accepted_full_reload(
 mod tests {
     //! Inline tests for `handle_startup_plugin_migrations_with_list`.
     //!
-    //! Per CLAUDE.md "Test Placement", tests for `pub(crate)` items live
-    //! inline in source — they cannot be reached from the external
-    //! `tests/` crate without changing visibility.
+    //! These live inline because they exercise a `pub(crate)` item the
+    //! external `tests/` crate cannot reach without changing visibility.
     use super::*;
     use crate::config::db_backend::DatabaseBackend;
     use crate::config::db_loader::{DatabaseStore, DbPoolConfig};

@@ -7,8 +7,9 @@
 //! full reload and broadcasts fresh snapshots to all subscribers.
 //!
 //! The admin API is read/write (same as database mode). The CP validates
-//! DP client JWT tokens using `FERRUM_CP_DP_GRPC_JWT_SECRET` and enforces
-//! `major.minor` version compatibility between CP and DP.
+//! DP client JWT tokens using `FERRUM_CP_DP_GRPC_JWT_SECRET` and requires
+//! ConfigSync DPs to run the same build (exact build identity); mesh data
+//! planes on MeshSubscribe are held to a `major.minor` version floor.
 
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
@@ -56,9 +57,6 @@ use crate::modes::startup_security;
 use crate::startup::{sanitize_startup_cause, sanitize_startup_scalar, wait_for_start_signals};
 use crate::util::conn_limit::{ConnLimiter, ConnPermit};
 use crate::xds::XdsAdsServer;
-
-#[cfg(test)]
-use crate::config::incremental_apply::upsert_by_id;
 
 /// Bounded grace period for the Kubernetes CRD controller's owned tasks
 /// (watchers, reconciler, CRD reprobe) to observe shutdown and return.
@@ -5067,6 +5065,12 @@ mod tests {
         // Issue #2802: a CP DNS reconnect or failover can land on a database
         // whose custom-plugin schema lags the process binary.
         let source = include_str!("control_plane.rs");
+        // Only production code: `include_str!` also embeds this test module,
+        // whose needle literals would otherwise always match.
+        let test_module = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("test module marker");
+        let source = &source[..test_module];
         assert!(
             source.contains("async fn reconcile_plugin_migrations_after_cp_reconnect(")
                 && source.contains("handle_recovery_plugin_migrations("),
@@ -5218,47 +5222,6 @@ mod tests {
                 .removed_consumer_ids,
             vec![NamespacedResourceId::new("staging", "c1")]
         );
-    }
-
-    // ── upsert_by_id ───────────────────────────────────────────────────
-
-    #[test]
-    fn upsert_replaces_existing_by_id() {
-        let mut items = vec![("a", 1), ("b", 2)];
-        upsert_by_id(&mut items, vec![("b", 99)], |item| item.0);
-        assert_eq!(items[1].1, 99);
-        assert_eq!(items.len(), 2);
-    }
-
-    #[test]
-    fn upsert_appends_new_items() {
-        let mut items = vec![("a", 1)];
-        upsert_by_id(&mut items, vec![("c", 3)], |item| item.0);
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[1], ("c", 3));
-    }
-
-    #[test]
-    fn upsert_mixed_replace_and_append() {
-        let mut items = vec![("a", 1), ("b", 2)];
-        upsert_by_id(&mut items, vec![("b", 20), ("c", 30)], |item| item.0);
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[1].1, 20); // b replaced
-        assert_eq!(items[2], ("c", 30)); // c appended
-    }
-
-    #[test]
-    fn upsert_empty_updates_is_noop() {
-        let mut items = vec![("a", 1)];
-        upsert_by_id(&mut items, vec![], |item| item.0);
-        assert_eq!(items.len(), 1);
-    }
-
-    #[test]
-    fn upsert_into_empty_list() {
-        let mut items: Vec<(&str, i32)> = vec![];
-        upsert_by_id(&mut items, vec![("a", 1)], |item| item.0);
-        assert_eq!(items.len(), 1);
     }
 
     // apply_incremental_to_config

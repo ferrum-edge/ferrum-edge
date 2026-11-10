@@ -571,9 +571,10 @@ fn has_dot_segment(path: &Path) -> bool {
 
 /// A running Workload API listener.
 ///
-/// Dropping the handle does **not** stop the server; call
-/// [`WorkloadApiListener::shutdown`] so the serve future completes and the
-/// socket artifact is cleaned up deterministically.
+/// Dropping the handle closes the shutdown channel, which stops the server
+/// through the same bounded drain as [`WorkloadApiListener::shutdown`]; call
+/// `shutdown` to wait for the serve future to complete and the socket
+/// artifact to be cleaned up deterministically.
 pub struct WorkloadApiListener {
     socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,

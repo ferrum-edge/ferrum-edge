@@ -55,8 +55,8 @@ pub fn test_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Apply every RTDS-driven runtime knob exposed on `overlay`. Called from
-/// `MeshRuntimeState::record_applied_slice` after the proxy runtime accepts a
-/// slice so consumers never observe values from rejected updates.
+/// `MeshRuntimeState::record_applied_slice_with_token` after the proxy runtime
+/// accepts a slice so consumers never observe values from rejected updates.
 ///
 /// The two transformer calls publish provenance state only — see the module
 /// docs. Because they run post-accept, a rejected slice leaves the previous

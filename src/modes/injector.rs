@@ -161,11 +161,12 @@ pub struct InjectorConfig {
     pub exclude_outbound_cidrs: Vec<String>,
     pub ip6tables_mode: Ip6TablesMode,
     /// Whether the injected init container emits UDP TPROXY capture rules
-    /// (F3 §3.3 Stage 2). Default `false`: the consuming UDP listener arrives in
-    /// Stage 3, so an upgraded injector must not redirect UDP into a void.
+    /// (F3 §3.3). Default `false`; when on (iptables capture mode only) the
+    /// Sidecar also binds the transparent UDP capture listener on
+    /// `udp_outbound_port`.
     pub udp_capture_enabled: bool,
-    /// UDP TPROXY listener port (Stage 3 consumer); distinct from the TCP
-    /// outbound REDIRECT port.
+    /// UDP TPROXY capture listener port; distinct from the TCP outbound
+    /// REDIRECT port.
     pub udp_outbound_port: u16,
     /// Firewall mark stamped on TPROXY'd UDP datagrams.
     pub tproxy_mark: u32,
@@ -1522,8 +1523,8 @@ fn workload_spiffe_id(config: &InjectorConfig, pod: &Value, namespace: &str) -> 
 /// **Enabled (#1808).** The Sidecar mesh-mTLS datagram relay
 /// (`MeshMtlsConnectionPool::open_datagram_tunnel`) makes Sidecar the FIRST
 /// topology with a working end-to-end UDP path: the mesh runtime binds the UDP
-/// capture listener for Sidecar (`MeshRuntime::udp_capture_listener` is gated to
-/// Ambient OR Sidecar), the egress datapath relays each captured datagram over a
+/// capture listener for Sidecar (`MeshRuntimeConfig::udp_capture_listener` is
+/// Sidecar-only), the egress datapath relays each captured datagram over a
 /// `udp`-marked mesh-mTLS CONNECT (`:15006`), and the destination unframes it
 /// into a local `UdpSocket`. The injector only ever produces **Sidecar** pods
 /// (`FERRUM_MESH_TOPOLOGY=sidecar`), so this central switch ENABLES the three
@@ -1535,8 +1536,8 @@ fn workload_spiffe_id(config: &InjectorConfig, pod: &Value, namespace: &str) -> 
 /// behind the operator's `udp_capture_enabled` flag (default-off). (The
 /// node-agent / ambient host-netns path installs no UDP TPROXY rules — see
 /// `capture::udp_tproxy_commands_for_family`'s `host_netns` short-circuit — and
-/// ambient's UDP producer is still deferred (F4.3 / #1803), so this gate does NOT
-/// touch that path.)
+/// Ambient uses the per-pod-netns producer (#2013), so this gate does NOT touch
+/// that path.)
 const fn sidecar_udp_capture_supported() -> bool {
     true
 }

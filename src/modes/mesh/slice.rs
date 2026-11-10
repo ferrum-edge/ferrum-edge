@@ -31,8 +31,8 @@ pub struct MeshSliceRequest {
     /// DP's `MeshTopology == ServiceWaypoint`; the slice builder narrows
     /// `services` / `service_entries` (and the workloads / mesh policies that
     /// hang off them) to entries bound to this waypoint via
-    /// `MeshConfig.waypoint_bindings`. `None` keeps the legacy behavior of
-    /// admitting every resource visible to the workload's namespace.
+    /// `MeshConfig.waypoint_bindings`. `None` admits every resource visible
+    /// to the workload's namespace.
     pub waypoint_name: Option<String>,
     pub labels: BTreeMap<String, String>,
     /// Kubernetes cluster DNS domain used when synthesizing MeshService FQDN
@@ -564,8 +564,10 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub multi_cluster: Option<MultiClusterConfig>,
-    /// Mesh-wide outbound traffic policy. `None` keeps the legacy
-    /// `AllowAny` behavior. When `Some(RegistryOnly)`, the slice-apply
+    /// Mesh-wide outbound traffic policy. `None` falls back to the runtime
+    /// default (`FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`, see
+    /// [`Self::effective_outbound_traffic_policy`]). When
+    /// `Some(RegistryOnly)`, the slice-apply
     /// path auto-injects the `mesh_outbound_registry` plugin with a
     /// registry built from `services` ∪ `service_entries` ∪
     /// `workloads.addresses`.
@@ -2282,21 +2284,6 @@ impl MeshSlice {
     }
 }
 
-/// Narrow slice resources to those bound to the named GAMMA Waypoint.
-///
-/// Returns the input vectors unchanged when no binding for `waypoint_name`
-/// exists (the slice falls back to whatever the workload-scope filter
-/// already produced — fail-open is intentional for the **routing** rollout
-/// window, so an operator who flips `FERRUM_MESH_TOPOLOGY=service_waypoint`
-/// before the matching `Gateway` resource lands does not see immediate
-/// service loss). When at least one binding matches, services and dependent
-/// resources are filtered to only those in the binding's `services` list.
-///
-/// This fail-open is NOT a binding and must never license the inbound HBONE
-/// relay. That inventory is derived from
-/// [`MeshSlice::service_waypoint_bound_services`], which stays empty unless
-/// this exact waypoint identity has a matching binding that claims service
-/// traffic (`waypoint_for=service` or `all`; issue #4251).
 struct ServiceWaypointNarrowingResources {
     services: Vec<MeshService>,
     service_entries: Vec<ServiceEntry>,
@@ -2475,6 +2462,21 @@ fn target_refs_attach_to_waypoint_services(
     })
 }
 
+/// Narrow slice resources to those bound to the named GAMMA Waypoint.
+///
+/// Returns the input vectors unchanged when no binding for `waypoint_name`
+/// exists (the slice falls back to whatever the workload-scope filter
+/// already produced — fail-open is intentional for the **routing** rollout
+/// window, so an operator who flips `FERRUM_MESH_TOPOLOGY=service_waypoint`
+/// before the matching `Gateway` resource lands does not see immediate
+/// service loss). When at least one binding matches, services and dependent
+/// resources are filtered to only those in the binding's `services` list.
+///
+/// This fail-open is NOT a binding and must never license the inbound HBONE
+/// relay. That inventory is derived from
+/// [`MeshSlice::service_waypoint_bound_services`], which stays empty unless
+/// this exact waypoint identity has a matching binding that claims service
+/// traffic (`waypoint_for=service` or `all`; issue #4251).
 fn narrow_for_service_waypoint(
     waypoint_name: &str,
     waypoint_namespace: &str,
@@ -7280,9 +7282,8 @@ mod tests {
     #[test]
     fn same_tier_peer_auth_equal_modes_resolve_deterministically() {
         // When two same-tier policies carry the SAME effective mode, the result
-        // is identical regardless of slice order; the value-neutral
-        // (namespace, name) tiebreak only selects a canonical winning policy,
-        // never the resolved mode.
+        // is identical regardless of slice order: only the mode is returned,
+        // so equal-mode ties need no further ordering.
         let a = pa_with_scope(
             "zz-policy",
             "aaa-root",

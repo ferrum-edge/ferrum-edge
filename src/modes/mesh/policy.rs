@@ -1,8 +1,8 @@
 //! Mesh authorization policy evaluation.
 //!
-//! This is the Layer 5 policy core used by the future `mesh_authz` plugin.
-//! It evaluates the Layer 2 `MeshPolicy` model without changing the plugin
-//! trait or proxy hot path.
+//! This is the Layer 5 policy core behind the `mesh_authz` plugin
+//! (`crate::plugins::mesh::authz`), evaluated on its per-request path.
+//! It evaluates the Layer 2 `MeshPolicy` model.
 //! Path matching is intentionally literal; callers must pass already-normalized
 //! request paths when they want dot-segment, slash, or percent-decoding policy.
 #![allow(dead_code)]
@@ -2396,8 +2396,8 @@ mod tests {
 
     #[test]
     fn first_deny_match_wins_second_deny_not_evaluated() {
-        // Two DENY policies with different names; the first match returns
-        // immediately with its policy name.
+        // Two DENY policies with different names; the first matching DENY is
+        // the one reported.
         let slice = MeshSlice {
             mesh_policies: vec![
                 policy("deny-first", PolicyAction::Deny, Vec::new()),
@@ -2918,7 +2918,8 @@ mod tests {
 
     #[test]
     fn header_name_lookup_is_case_insensitive() {
-        // Headers stored with mixed case should match rules written lowercase.
+        // A rule header name written in mixed case matches the lowercased
+        // request header map.
         let slice = MeshSlice {
             mesh_policies: vec![MeshPolicy {
                 name: "allow-tenant".to_string(),
@@ -2927,7 +2928,7 @@ mod tests {
                 rules: vec![MeshRule {
                     from: Vec::new(),
                     to: vec![RequestMatch {
-                        headers: BTreeMap::from([("x-tenant".to_string(), "prod".to_string())])
+                        headers: BTreeMap::from([("X-Tenant".to_string(), "prod".to_string())])
                             .into_iter()
                             .collect(),
                         ..RequestMatch::default()
@@ -3290,13 +3291,27 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        let mut attrs = BTreeMap::new();
-        attrs.insert("source.ip".to_string(), "10.2.3.4".into());
+        // `source.ip` is sourceable only with typed transport evidence, so the
+        // request carries `source_ip` as well as the attribute; without it the
+        // DENY would match through the unsourceable branch and never reach
+        // the CIDR comparison.
+        let request_from = |ip: &str| {
+            let mut attrs = BTreeMap::new();
+            attrs.insert("source.ip".to_string(), ip.into());
+            MeshAuthzRequest {
+                source_ip: Some(ip.parse().unwrap()),
+                ..http_request(attrs)
+            }
+        };
         assert_eq!(
-            evaluate_mesh_authorization(&slice, &http_request(attrs)),
+            evaluate_mesh_authorization(&slice, &request_from("10.2.3.4")),
             MeshAuthzDecision::Deny {
                 policy: "deny-private-source-ip".to_string()
             }
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request_from("192.168.1.1")),
+            MeshAuthzDecision::Allow
         );
     }
 

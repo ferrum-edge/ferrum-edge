@@ -879,14 +879,16 @@ pub(crate) struct DiscoveryTaskContext {
 ///
 /// The supervisor spawns its poller so an unexpected exit is observable as a
 /// `JoinError` instead of tearing down the supervisor with it (issue #3721).
-/// Clean cancel/shutdown ends supervision; an unexpected non-panic exit is
-/// restarted with bounded, jittered exponential backoff. Every restart is
-/// fenced on the generation: once the manager registers a replacement, the
-/// superseded supervisor exits instead of restarting or publishing.
+/// Clean cancel/shutdown ends supervision; the only unexpected exit is a
+/// poller panic, which is restarted with bounded, jittered exponential
+/// backoff. Every restart is fenced on the generation: once the manager
+/// registers a replacement, the superseded supervisor exits instead of
+/// restarting or publishing.
 ///
 /// Shipping profiles set `panic = "abort"` (issue #4166): a panicking poller
-/// terminates the process rather than producing a `JoinError`. The in-process
-/// panic-restart path is compiled only for `panic = "unwind"` (dev/test).
+/// terminates the process rather than producing a `JoinError`, so the
+/// panic-restart arm (always compiled) is reachable only under
+/// `panic = "unwind"` (dev/test).
 async fn supervise_discovery_task(
     ctx: Arc<DiscoveryTaskContext>,
     discoverer: Arc<dyn ServiceDiscoverer>,
@@ -1168,11 +1170,6 @@ impl StalenessExpiryProbeForTest {
     pub fn set_installed_discovered(&mut self, targets: Vec<UpstreamTarget>) {
         self.state.last_discovered = targets;
         self.state.snapshot_installed = true;
-    }
-
-    /// Discovered targets this probe still believes are installed.
-    pub fn installed_discovered(&self) -> &[UpstreamTarget] {
-        &self.state.last_discovered
     }
 
     /// Run the production expiry application once.

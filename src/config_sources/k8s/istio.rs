@@ -109,7 +109,7 @@ pub(super) fn translate(
             Ok(true)
         }
         "Sidecar" => {
-            let sidecar = sidecar(acc, object)?;
+            let sidecar = sidecar(object)?;
             acc.mesh.sidecars.push(sidecar);
             Ok(true)
         }
@@ -1178,10 +1178,7 @@ fn peer_authentication(
 ///     Classification is delegated to the shared, fail-closed
 ///     [`classify_sidecar_outbound_traffic_policy`] so the status writer's
 ///     `deferred_fields` report can never disagree with what is enforced.
-fn sidecar(
-    _acc: &mut K8sAccumulator,
-    object: &K8sObject,
-) -> Result<MeshSidecar, K8sTranslateError> {
+fn sidecar(object: &K8sObject) -> Result<MeshSidecar, K8sTranslateError> {
     let workload_selector = match object.spec.get("workloadSelector") {
         Some(selector_value) => {
             let labels = sidecar_selector_from_istio(Some(selector_value));
@@ -6324,16 +6321,6 @@ fn cors_string_arrays_plugin_valid(cors: &Value) -> bool {
         )
 }
 
-/// Build a proxy-scoped `cors` plugin for an Istio `VirtualService.http[].corsPolicy`.
-/// Returns `None` when there is no `corsPolicy`, or when the policy is not
-/// faithfully representable (a malformed/unknown origin matcher, an
-/// un-compilable `regex`, or an unparseable `maxAge`) — in that case it is left
-/// unprojected (warned, and reported as a deferred field by the status writer)
-/// rather than failing the whole VirtualService or silently approximating.
-/// `allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` and the legacy
-/// `allowOrigin` exact list are all projected. This reuses the existing `cors`
-/// plugin instead of duplicating preflight/header logic, mirroring the
-/// `request_mirror` approach for `http[].mirror`.
 /// Whether ONE `match[]` block applies to sidecars. Istio's
 /// `HTTPMatchRequest.gateways` OVERRIDES the top-level `spec.gateways` list:
 /// a match carrying `gateways` applies to sidecars iff it names the reserved
@@ -6485,6 +6472,16 @@ fn mesh_cors_policy_from_value(cors: &Value) -> Option<MeshCorsPolicy> {
     })
 }
 
+/// Build a proxy-scoped `cors` plugin for an Istio `VirtualService.http[].corsPolicy`.
+/// Returns `None` when there is no `corsPolicy`, or when the policy is not
+/// faithfully representable (a malformed/unknown origin matcher, an
+/// un-compilable `regex`, or an unparseable `maxAge`) — in that case it is left
+/// unprojected (warned, and reported as a deferred field by the status writer)
+/// rather than failing the whole VirtualService or silently approximating.
+/// `allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` and the legacy
+/// `allowOrigin` exact list are all projected. This reuses the existing `cors`
+/// plugin instead of duplicating preflight/header logic, mirroring the
+/// `request_mirror` approach for `http[].mirror`.
 fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option<PluginConfig> {
     let cors = http.get("corsPolicy")?;
     // `cors_policy_translatable` is the single shared gate; the actual origin
