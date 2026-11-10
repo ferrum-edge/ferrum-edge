@@ -141,6 +141,15 @@ INVALID_MODE_CONTRACT = (
 )
 # The functional coverage step must reach the instrumented gateway from every
 # binary-resolution path the suites use, and must not rebuild it per test.
+# The lib-unit shard's single llvm-cov invocation: the inline harness plus all
+# four unit targets, each on its own continuation line (issue #7282).
+COVERAGE_UNIT_TOKENS = (
+    "--lib",
+    "--test unit_tests",
+    "--test unit_plugins_a_tests",
+    "--test unit_plugins_b_tests",
+    "--test unit_gateway_core_tests",
+)
 FUNCTIONAL_STEP_TOKENS = (
     "if: matrix.kind == 'functional'",
     "nextest --test functional_tests",
@@ -325,8 +334,15 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         "Coverage Plan must self-test the coverage workflow verifier",
         failures,
     )
+    # The bare substring is also satisfied by the `--self-test` line, so the
+    # real contract invocation is matched as its own line (issue #7282).
     require(
-        "python3 .github/scripts/verify_coverage_workflow.py" in text,
+        re.search(
+            r"(?m)^\s*(?:- run:\s+)?python3 \.github/scripts/"
+            r"verify_coverage_workflow\.py\s*$",
+            text,
+        )
+        is not None,
         "Coverage Plan must enforce the coverage workflow contract",
         failures,
     )
@@ -346,8 +362,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "--github-output \"$GITHUB_OUTPUT\"" in text
-        or '--github-output "$GITHUB_OUTPUT"' in text,
+        '--github-output "$GITHUB_OUTPUT"' in text,
         "Coverage Plan must write planner outputs through --github-output",
         failures,
     )
@@ -416,11 +431,23 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         "coverage-shard must not restore the 75-minute deadline that canceled a progressing suite",
         failures,
     )
-    require(
-        "--lib" in shard_body and "--test unit_tests" in shard_body,
-        "coverage-shard must keep the combined lib + unit_tests coverage invocation",
-        failures,
+    active_shard_lines = "\n".join(
+        line.split(" #", 1)[0]
+        for line in shard_body.splitlines()
+        if not line.lstrip().startswith("#")
     )
+    for unit_token in COVERAGE_UNIT_TOKENS:
+        require(
+            re.search(
+                rf"(?m)^\s*(?:- run:\s+)?(?:cargo llvm-cov --no-report\s+)?"
+                rf"{re.escape(unit_token)}(?:\s+\\)?\s*$",
+                active_shard_lines,
+            )
+            is not None,
+            f"coverage-shard must keep `{unit_token}` in the combined lib + unit "
+            "coverage invocation",
+            failures,
+        )
     for token in FUNCTIONAL_STEP_TOKENS:
         require(
             token in shard_body,
@@ -518,7 +545,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        'name: coverage-report' in merge_body or "name: coverage-report" in merge_body,
+        "name: coverage-report" in merge_body,
         "Merge Coverage must keep publishing the coverage-report artifact",
         failures,
     )
@@ -850,7 +877,13 @@ jobs:
         include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
       - run: echo "${{ matrix.shard }}"
-      - run: cargo llvm-cov --no-report --lib --test unit_tests
+      - run: |
+          cargo llvm-cov --no-report \\
+            --lib \\
+            --test unit_tests \\
+            --test unit_plugins_a_tests \\
+            --test unit_plugins_b_tests \\
+            --test unit_gateway_core_tests
       - if: matrix.kind == 'integration'
         run: |
           nextest_args+=(-E "$INTEGRATION_FILTERSET")
@@ -965,9 +998,19 @@ jobs:
             "restored CARGO_BUILD_JOBS=3",
         ),
         (
-            "cargo llvm-cov --no-report --lib --test unit_tests",
-            "cargo llvm-cov --no-report --lib",
+            "            --test unit_tests \\\n",
+            "",
             "narrowed lib-unit coverage set",
+        ),
+        (
+            "            --test unit_plugins_b_tests \\\n",
+            "",
+            "dropped unit_plugins_b_tests coverage target",
+        ),
+        (
+            "      - run: python3 .github/scripts/verify_coverage_workflow.py\n",
+            "",
+            "dropped repository-contract verification (self-test only)",
         ),
         (
             "ln -f target/llvm-cov-target/debug/ferrum-edge target/debug/ferrum-edge",

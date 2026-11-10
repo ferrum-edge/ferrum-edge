@@ -610,9 +610,15 @@ def validate_performance_lane_contract(text: str, failures: list[str]) -> None:
         "performance-regression.yml must run the protocol-perf workflow verifier self-test",
         failures,
     )
+    # Both former operands were the bare path, which the `--self-test` line
+    # already satisfies; match the contract invocation as its own line.
     require(
-        "verify_protocol_perf_regression_workflow.py\n" in text
-        or "verify_protocol_perf_regression_workflow.py" in text,
+        re.search(
+            r"(?m)^\s*python3 \.github/scripts/"
+            r"verify_protocol_perf_regression_workflow\.py\s*$",
+            text,
+        )
+        is not None,
         "performance-regression.yml must run repository-contract verification for protocol-perf",
         failures,
     )
@@ -930,6 +936,21 @@ SIGHUP was not delivered
         failures.append(
             "self-test unexpectedly rejected a good performance-regression.yml "
             f"snippet: {pr_ci_failures}"
+        )
+
+    self_test_only_failures: list[str] = []
+    validate_performance_lane_contract(
+        pr_ci_good.replace(
+            "          python3 .github/scripts/verify_protocol_perf_regression_workflow.py\n",
+            "",
+            1,
+        ),
+        self_test_only_failures,
+    )
+    if not any("repository-contract" in item for item in self_test_only_failures):
+        failures.append(
+            "self-test expected a lane that only self-tests the protocol-perf "
+            "verifier to be rejected"
         )
 
     pr_ci_bad_failures: list[str] = []

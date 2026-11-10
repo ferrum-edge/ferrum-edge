@@ -111,8 +111,16 @@ _FIPS_HANDSHAKE_TESTS_COMMAND_RE = re.compile(
 )
 _PRODUCTION_SMOKE_NAME_RE = re.compile(r"(?m)^    name: Production Dockerfile eBPF image smoke$")
 _CACHE_ON_FAILURE_RE = re.compile(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$")
+# The lib-unit coverage shard compiles the inline harness and all four unit
+# targets in ONE llvm-cov invocation (issue #7282: matching only `--lib` and
+# `--test unit_tests` let three of the four targets drop out unnoticed).
 _COVERAGE_UNIT_TESTS_COMMAND_RE = re.compile(
-    r"cargo llvm-cov --no-report\s+\\\s*\n\s*--lib\s+\\\s*\n\s*--test unit_tests",
+    r"(?m)^\s*cargo llvm-cov --no-report\s+\\\n"
+    r"\s*--lib\s+\\\n"
+    r"\s*--test unit_tests\s+\\\n"
+    r"\s*--test unit_plugins_a_tests\s+\\\n"
+    r"\s*--test unit_plugins_b_tests\s+\\\n"
+    r"\s*--test unit_gateway_core_tests\s*$"
 )
 _ROOT_DESCRIPTION_BLOCK_RE = re.compile(r"(?m)^description:[^\n]*\n(?:(?:[ \t]+[^\n]*)?\n)*")
 
@@ -3431,8 +3439,15 @@ def check_rust_cache_fork_save_if(
             "restore only",
             failures,
         )
+        # Exactly one `cache-on-failure:` key whose value is `true`; "true"
+        # anywhere else in the block (a save-if expression) does not count
+        # (issue #7282).
         require(
-            "cache-on-failure:" in block and "true" in block,
+            [
+                value.split(" #", 1)[0].strip().strip("\"'")
+                for value in _CACHE_ON_FAILURE_RE.findall(block)
+            ]
+            == ["true"],
             f"{source} rust-cache site {index} must keep cache-on-failure true",
             failures,
         )
@@ -5356,7 +5371,8 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         _COVERAGE_UNIT_TESTS_COMMAND_RE.search(lib_unit)
         is not None,
-        "coverage lib-unit must compile lib and unit_tests in one llvm-cov invocation",
+        "coverage lib-unit must compile lib and all four unit targets in one "
+        "llvm-cov invocation",
         failures,
     )
 
@@ -5468,6 +5484,51 @@ def self_test() -> int:
         and "target" not in tracked_roots
         and ".git" not in tracked_roots,
         "self-test: the Dockerfile scan must enumerate tracked files only",
+        failures,
+    )
+    for label, cache_on_failure, expected_ok in (
+        ("literal true", "true", True),
+        ("quoted true", '"true"', True),
+        ("false beside a true save-if", "false", False),
+        ("missing key", None, False),
+    ):
+        fork_block = (
+            "      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000\n"
+            "        with:\n"
+            "          save-if: ${{ github.event.pull_request.head.repo.fork != true }}\n"
+            + (
+                f"          cache-on-failure: {cache_on_failure}\n"
+                if cache_on_failure is not None
+                else ""
+            )
+        )
+        fork_failures: list[str] = []
+        check_rust_cache_fork_save_if(
+            fork_block, "self-test", fork_failures, expected_count=1
+        )
+        cache_on_failure_flagged = any(
+            "cache-on-failure" in item for item in fork_failures
+        )
+        require(
+            cache_on_failure_flagged != expected_ok,
+            f"self-test: cache-on-failure check mis-judged the {label} fixture "
+            f"({fork_failures})",
+            failures,
+        )
+    coverage_workflow = read_pinned(COVERAGE_WORKFLOW)
+    require(
+        _COVERAGE_UNIT_TESTS_COMMAND_RE.search(coverage_workflow) is not None,
+        "self-test: the checked-in lib-unit coverage command must match",
+        failures,
+    )
+    require(
+        _COVERAGE_UNIT_TESTS_COMMAND_RE.search(
+            coverage_workflow.replace(
+                "            --test unit_plugins_b_tests \\\n", "", 1
+            )
+        )
+        is None,
+        "self-test: dropping unit_plugins_b_tests from lib-unit coverage must fail",
         failures,
     )
     source_digest = "a" * 64

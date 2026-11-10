@@ -880,8 +880,17 @@ def check_dns_tcp_stub_and_fail_closed(
     )
 
 
-def check_pr_ci_wiring(failures: list[str]) -> None:
-    ci = CI_YML.read_text(encoding="utf-8")
+# The bare script path also appears in the `--self-test` line, so the real
+# contract invocation is matched as its own line (issue #7282).
+_MESH_BASELINES_VERIFIER_RUN_RE = re.compile(
+    r"(?m)^\s*python3 \.github/scripts/"
+    r"verify_mesh_performance_baselines_workflow\.py\s*$"
+)
+
+
+def check_performance_lane_wiring(failures: list[str], ci: str | None = None) -> None:
+    if ci is None:
+        ci = CI_YML.read_text(encoding="utf-8")
     match = _PERFORMANCE_REGRESSION_JOB_RE.search(ci)
     body = match.group("body") if match else ""
     require(
@@ -895,7 +904,7 @@ def check_pr_ci_wiring(failures: list[str]) -> None:
         failures,
     )
     require(
-        "python3 .github/scripts/verify_mesh_performance_baselines_workflow.py" in body,
+        _MESH_BASELINES_VERIFIER_RUN_RE.search(body) is not None,
         "jobs.performance-regression must run the mesh baselines workflow verifier",
         failures,
     )
@@ -1481,6 +1490,18 @@ jobs:
     _self_test_hbone_trusted_fixture_contract(failures)
     _self_test_dns_tcp_stub_and_fail_closed(failures)
     _self_test_baseline_publication_state(failures)
+    lane = CI_YML.read_text(encoding="utf-8")
+    contract_only = "          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py\n"
+    if contract_only not in lane:
+        failures.append("self-test: performance-regression.yml no longer runs the verifier line")
+    else:
+        dropped: list[str] = []
+        check_performance_lane_wiring(dropped, lane.replace(contract_only, "", 1))
+        if not any("must run the mesh baselines workflow verifier" in item for item in dropped):
+            failures.append(
+                "self-test: dropping the real verifier run (keeping --self-test) "
+                "was not detected"
+            )
     # Intentionally skip repository docs checks in self-test; the publication
     # state machine above is exercised with isolated fixtures.
     if failures:
@@ -1500,7 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
     check_workflow(text, failures)
     check_scripts(failures)
     check_docs_and_baselines(failures)
-    check_pr_ci_wiring(failures)
+    check_performance_lane_wiring(failures)
     if failures:
         for failure in failures:
             print(f"::error::{failure}")

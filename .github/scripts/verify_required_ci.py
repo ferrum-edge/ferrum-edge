@@ -2069,9 +2069,10 @@ def main() -> int:
             "jobs.performance-regression must self-test the mesh baselines "
             "workflow verifier"
         )
-    if (
-        "python3 .github/scripts/verify_mesh_performance_baselines_workflow.py"
-        not in performance_regression_body
+    if not re.search(
+        r"(?m)^\s*python3 \.github/scripts/"
+        r"verify_mesh_performance_baselines_workflow\.py\s*$",
+        performance_regression_body,
     ):
         planner_errors.append(
             "jobs.performance-regression must run the mesh baselines workflow verifier"
