@@ -55,7 +55,6 @@ use crate::tls::source::MaterialKind;
 const STORE_FILE_NAME: &str = "acme-certificates.json";
 const ORDER_STORE_FILE_NAME: &str = "acme-orders.json";
 const ACCOUNT_STORE_FILE_NAME: &str = "acme-accounts.json";
-const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
 const HTTP01_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 /// Longest HTTP-01 token [`validate_http01_token`] accepts.
 const MAX_HTTP01_TOKEN_LEN: usize = 256;
@@ -2490,7 +2489,12 @@ impl AcmeResolverFallback {
 
 pub struct AcmeTlsAlpnResolver {
     fallback: AcmeResolverFallback,
-    cache: Mutex<BTreeMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    /// TLS-ALPN-01 validation certificates keyed by server name, each with
+    /// the key authorization it was built for. Holds at most one entry per
+    /// name: a new challenge replaces the previous key, and a name whose
+    /// challenge is no longer pending is evicted on its next `acme-tls/1`
+    /// handshake, so served validation keys do not accumulate.
+    cache: Mutex<BTreeMap<String, (String, Arc<rustls::sign::CertifiedKey>)>>,
 }
 
 impl std::fmt::Debug for AcmeTlsAlpnResolver {
@@ -2549,16 +2553,26 @@ impl AcmeTlsAlpnResolver {
     }
 
     fn tls_alpn_certified_key(&self, server_name: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let key_authorization = tls_alpn01_key_authorization_for_identifier(server_name)?;
-        let cache_key = format!("{server_name}\0{key_authorization}");
+        let Some(key_authorization) = tls_alpn01_key_authorization_for_identifier(server_name)
+        else {
+            // No pending challenge for this name any more: release its key.
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.remove(server_name);
+            }
+            return None;
+        };
         if let Ok(cache) = self.cache.lock()
-            && let Some(certified_key) = cache.get(&cache_key)
+            && let Some((cached_authorization, certified_key)) = cache.get(server_name)
+            && *cached_authorization == key_authorization
         {
             return Some(certified_key.clone());
         }
         let certified_key = build_tls_alpn01_certified_key(server_name, &key_authorization).ok()?;
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(cache_key, certified_key.clone());
+            cache.insert(
+                server_name.to_string(),
+                (key_authorization, certified_key.clone()),
+            );
         }
         Some(certified_key)
     }
@@ -2669,15 +2683,6 @@ pub fn http01_key_authorization_for_path(path: &str) -> Option<String> {
     global_order_store().ok()?.http01_key_authorization(&token)
 }
 
-fn acme_store_dir_from_env() -> PathBuf {
-    let path = crate::config::env_config::tls_managed_store_path_from_env();
-    if path.is_empty() {
-        PathBuf::from(DEFAULT_STORE_DIR)
-    } else {
-        PathBuf::from(path)
-    }
-}
-
 static GLOBAL_ACME_CERTIFICATE_STORE: OnceLock<Result<Arc<AcmeCertificateStore>, String>> =
     OnceLock::new();
 static GLOBAL_ACME_ORDER_STORE: OnceLock<Result<Arc<AcmeOrderStore>, String>> = OnceLock::new();
@@ -2686,7 +2691,7 @@ static GLOBAL_ACME_ACCOUNT_STORE: OnceLock<Result<Arc<AcmeAccountStore>, String>
 pub fn global_certificate_store() -> Result<Arc<AcmeCertificateStore>, String> {
     GLOBAL_ACME_CERTIFICATE_STORE
         .get_or_init(|| {
-            AcmeCertificateStore::open(acme_store_dir_from_env())
+            AcmeCertificateStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2696,7 +2701,7 @@ pub fn global_certificate_store() -> Result<Arc<AcmeCertificateStore>, String> {
 pub fn global_order_store() -> Result<Arc<AcmeOrderStore>, String> {
     GLOBAL_ACME_ORDER_STORE
         .get_or_init(|| {
-            AcmeOrderStore::open(acme_store_dir_from_env())
+            AcmeOrderStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2706,7 +2711,7 @@ pub fn global_order_store() -> Result<Arc<AcmeOrderStore>, String> {
 pub fn global_account_store() -> Result<Arc<AcmeAccountStore>, String> {
     GLOBAL_ACME_ACCOUNT_STORE
         .get_or_init(|| {
-            AcmeAccountStore::open(acme_store_dir_from_env())
+            AcmeAccountStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })

@@ -757,7 +757,7 @@ impl TlsPolicy {
         info!(
             "TLS policy: version_count={} (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`), \
              cipher_suite_count={} (`FERRUM_TLS_CIPHER_SUITES`), \
-             group_count={} (`FERRUM_TLS_CURVES`); \
+             group_count={} (`FERRUM_TLS_KEY_EXCHANGE_GROUPS`); \
              `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` value withheld",
             versions.len(),
             cipher_suites.len(),
@@ -986,14 +986,14 @@ fn parse_kx_groups(
             "secp384r1" | "p-384" | "p384" => rustls::NamedGroup::secp384r1,
             unknown => {
                 return Err(anyhow::anyhow!(
-                    "`FERRUM_TLS_CURVES`: Unknown curve/group {:?}. Supported: `X25519`, `secp256r1` (`P-256`), `secp384r1` (`P-384`)",
+                    "`FERRUM_TLS_KEY_EXCHANGE_GROUPS`: Unknown curve/group {:?}. Supported: `X25519`, `secp256r1` (`P-256`), `secp384r1` (`P-384`)",
                     unknown
                 ));
             }
         };
         let group = lookup_kx_group(provider, group_name).ok_or_else(|| {
             anyhow::anyhow!(
-                "`FERRUM_TLS_CURVES`: Curve/group {:?} is not implemented by the crypto provider in this build. See \
+                "`FERRUM_TLS_KEY_EXCHANGE_GROUPS`: Curve/group {:?} is not implemented by the crypto provider in this build. See \
                  `docs/fips.md` for the groups available in a FIPS build.",
                 name
             )
@@ -1002,7 +1002,7 @@ fn parse_kx_groups(
     }
     if groups.is_empty() {
         return Err(anyhow::anyhow!(
-            "`FERRUM_TLS_CURVES`: No curves/groups specified"
+            "`FERRUM_TLS_KEY_EXCHANGE_GROUPS`: No curves/groups specified"
         ));
     }
     Ok(groups)
@@ -1974,12 +1974,19 @@ pub fn load_mesh_server_identity(
     key_path: &str,
     cert_expiry_warning_days: u64,
 ) -> Result<Arc<MeshServerIdentity>, anyhow::Error> {
-    check_cert_expiry(cert_path, "mesh server TLS cert", cert_expiry_warning_days)?;
-
+    // Load the certificate once and check expiry on the bytes that will be
+    // served: a second read could fetch a provider source twice and check one
+    // rotation generation while storing another.
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
     let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)
         .map_err(|error| material_load_error("mesh server TLS cert", error))?;
+    check_cert_expiry_from_pem_bytes(
+        cert_material.bytes.expose_secret(),
+        "mesh server TLS cert",
+        &cert_material.display_source_id,
+        cert_expiry_warning_days,
+    )?;
     let key_material = load_material_blocking(&key_source, MaterialKind::Key)
         .map_err(|error| material_load_error("mesh server TLS private key", error))?;
 

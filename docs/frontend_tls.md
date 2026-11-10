@@ -1454,7 +1454,7 @@ For example, a policy selecting two versions, one cipher suite and one group
 emits:
 
 ```
-TLS policy: version_count=2 (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`), cipher_suite_count=1 (`FERRUM_TLS_CIPHER_SUITES`), group_count=1 (`FERRUM_TLS_CURVES`); `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` value withheld
+TLS policy: version_count=2 (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`), cipher_suite_count=1 (`FERRUM_TLS_CIPHER_SUITES`), group_count=1 (`FERRUM_TLS_KEY_EXCHANGE_GROUPS`); `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` value withheld
 ```
 
 You can also verify externally:

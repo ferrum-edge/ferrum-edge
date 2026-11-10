@@ -4929,3 +4929,36 @@ fn no_production_certificate_verifier_hard_codes_its_signature_schemes() {
     );
     assert!(cli.contains("crate::tls::NoVerifier"));
 }
+
+/// The final-request-body hook-context hand-back lives in one
+/// `RequestContext` method (issue #7223). No production path or test seam
+/// re-implements the swap field by field, so a field added to the hand-back
+/// cannot be forgotten on one dispatch path.
+#[test]
+fn final_request_body_hook_context_hand_back_has_one_implementation() {
+    let mut adopters = 0;
+    for (path, text) in production_sources() {
+        if path == "src/plugins/mod.rs" {
+            continue;
+        }
+        let production = without_cfg_test_items(&text);
+        for piecemeal in [
+            "adopt_final_request_body_hook_terminals(",
+            "adopt_final_request_body_hook_plugin_state(",
+            ".waf_metadata_initialized = ",
+        ] {
+            assert!(
+                !production.contains(piecemeal),
+                "{path}: hand a final-request-body hook context back through \
+                 `RequestContext::adopt_final_request_body_hook_context`, not `{piecemeal}`"
+            );
+        }
+        adopters += production
+            .matches("adopt_final_request_body_hook_context(")
+            .count();
+    }
+    assert!(
+        adopters >= 6,
+        "expected the five proxy dispatch sites and the `_test_support` seam, found {adopters}"
+    );
+}

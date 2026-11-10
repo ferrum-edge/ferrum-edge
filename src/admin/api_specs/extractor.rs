@@ -34,7 +34,7 @@ use url::Url;
 use super::external_refs::{
     EffectiveExternalRefPolicy, ExternalDocumentLoader, ExternalRefProcessPolicy,
     LoadedExternalDocument, MapExternalDocumentLoader, load_external_documents,
-    parse_external_ref_extension, redact_reference,
+    parse_external_ref_extension, redact_reference, resource_uri_key, split_ref,
 };
 
 /// HTTP method keys counted when computing `operation_count`.
@@ -4872,7 +4872,7 @@ impl LocalSchemaResolver {
         reference: &str,
         current_base: &Url,
     ) -> Result<ResolvedRef<'a>, ExtractError> {
-        let (uri_part, raw_fragment) = split_ref_uri_and_fragment(reference);
+        let (uri_part, raw_fragment) = split_ref(reference);
         let decoded_fragment = decode_uri_fragment(raw_fragment, reference)?;
 
         let target_resource = match uri_part {
@@ -5054,46 +5054,9 @@ fn unresolved_internal_ref_message(
     )
 }
 
-fn resource_uri_key(url: &Url) -> String {
-    let mut owned = url.clone();
-    owned.set_fragment(None);
-    normalize_percent_escape_case(owned.as_str())
-}
-
-fn normalize_percent_escape_case(value: &str) -> String {
-    let mut normalized = String::with_capacity(value.len());
-    let mut remaining = value;
-    while let Some(offset) = remaining.find('%') {
-        normalized.push_str(&remaining[..offset]);
-        let escape = &remaining[offset..];
-        if escape.len() >= 3
-            && escape.as_bytes()[1].is_ascii_hexdigit()
-            && escape.as_bytes()[2].is_ascii_hexdigit()
-        {
-            normalized.push('%');
-            normalized.push(char::from(escape.as_bytes()[1].to_ascii_uppercase()));
-            normalized.push(char::from(escape.as_bytes()[2].to_ascii_uppercase()));
-            remaining = &escape[3..];
-        } else {
-            normalized.push('%');
-            remaining = &escape[1..];
-        }
-    }
-    normalized.push_str(remaining);
-    normalized
-}
-
 fn append_json_pointer(base: &str, token: &str) -> String {
     let escaped = token.replace('~', "~0").replace('/', "~1");
     format!("{base}/{escaped}")
-}
-
-fn split_ref_uri_and_fragment(reference: &str) -> (Option<&str>, &str) {
-    match reference.split_once('#') {
-        None => (Some(reference), ""),
-        Some(("", fragment)) => (None, fragment),
-        Some((uri, fragment)) => (Some(uri), fragment),
-    }
 }
 
 fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractError> {
@@ -5572,7 +5535,7 @@ fn opaque_value_weight(value: &Value) -> (usize, usize) {
 /// actually be serialized. Counting decoded UTF-8 bytes alone underestimates
 /// attacker-controlled quotes, backslashes, and control characters by up to
 /// six bytes each.
-fn json_string_serialized_len(value: &str) -> usize {
+pub(super) fn json_string_serialized_len(value: &str) -> usize {
     value.chars().fold(2usize, |bytes, character| {
         let encoded = match character {
             '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,

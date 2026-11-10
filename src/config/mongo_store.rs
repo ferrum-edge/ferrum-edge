@@ -19531,36 +19531,6 @@ mod inner {
             assert_eq!(doc.get_str("id").unwrap(), "unique-id-123");
         }
 
-        #[test]
-        fn run_migrations_declares_proxy_plugin_cleanup_indexes() {
-            let source = include_str!("mongo_store.rs");
-            assert!(
-                source.contains(r#""plugins.plugin_config_id": 1"#),
-                "MongoDB must index proxy plugin associations for orphan cleanup"
-            );
-            assert!(
-                source.contains(r#""scope": 1, "_id": 1"#),
-                "MongoDB must have a scope-leading plugin_configs index for proxy_group cleanup"
-            );
-        }
-
-        #[test]
-        fn run_migrations_declares_unique_consumer_credential_indexes() {
-            let source = include_str!("mongo_store.rs");
-            assert!(
-                source.contains(r#""credentials.keyauth.key": 1"#)
-                    && source.contains(r#""credentials.mtls_auth.identity": 1"#)
-                    && source
-                        .contains(r#".keys(doc! { "namespace": 1, HMAC_SECRET_HASHES_FIELD: 1 })"#)
-                    && source.contains(".unique(true)"),
-                "MongoDB must enforce keyauth, mTLS, and HMAC credential uniqueness with indexes"
-            );
-            assert!(
-                !source.contains("drop_index(\"namespace_1_credentials.mtls_auth.identity_1\")"),
-                "mTLS index setup must never drop the exact-match uniqueness backstop"
-            );
-        }
-
         /// Regression guard for optional indexed proxy fields. MongoDB treats
         /// explicit `null` as an indexed value, so two HTTP proxies in the
         /// same namespace would collide on the unique name index when both
@@ -20598,18 +20568,28 @@ mod inner {
             );
         }
 
+        /// This file's production source, without this inline test module, so
+        /// a structural search cannot match the test's own search literals.
+        fn production_mongo_store_source() -> &'static str {
+            let source = include_str!("mongo_store.rs");
+            let tests_start = source
+                .find("    #[cfg(test)]\n    mod tests {")
+                .expect("inline test module");
+            &source[..tests_start]
+        }
+
         #[test]
         fn replace_api_spec_standalone_reinsert_implementation_inserts_plugins_before_proxy() {
-            let source = include_str!("mongo_store.rs");
+            let source = production_mongo_store_source();
             let reinsert_start = source
                 .find("// Re-insert new bundle with manual associations preserved.")
                 .expect("standalone replace_api_spec reinsert marker");
             let reinsert_path = &source[reinsert_start..];
             let plugin_insert = reinsert_path
-                .find("self.plugin_configs().insert_one(doc).await")
+                .find("self.plugin_configs().insert_one(")
                 .expect("standalone replace plugin insert");
             let proxy_insert = reinsert_path
-                .find("self.proxies().insert_one(doc).await")
+                .find("self.proxies().insert_one(")
                 .expect("standalone replace proxy insert");
             assert!(
                 plugin_insert < proxy_insert,
@@ -20634,17 +20614,27 @@ mod inner {
 
         #[test]
         fn compensate_bundle_insert_implementation_deletes_proxy_before_plugins() {
-            let source = include_str!("mongo_store.rs");
+            let source = production_mongo_store_source();
             let compensate_start = source
                 .find("async fn compensate_bundle_insert(")
                 .expect("compensate_bundle_insert function");
             let compensate_path = &source[compensate_start..];
+            // rustfmt splits these calls across lines (`self` / `.proxies()` /
+            // `.delete_one(...)`), so match the collection accessor.
             let proxy_delete = compensate_path
-                .find("self.proxies().delete_one")
+                .find(".proxies()")
                 .expect("compensating proxy delete");
             let plugin_delete = compensate_path
-                .find("self.plugin_configs().delete_one")
+                .find(".plugin_configs()")
                 .expect("compensating plugin delete");
+            for (at, what) in [(proxy_delete, "proxy"), (plugin_delete, "plugin_config")] {
+                assert!(
+                    compensate_path[at..]
+                        .split_once(')')
+                        .is_some_and(|(_, rest)| rest.trim_start().starts_with(".delete_one(")),
+                    "compensating {what} step must be a delete"
+                );
+            }
             assert!(
                 proxy_delete < plugin_delete,
                 "compensating rollback must delete the proxy before plugin_configs"

@@ -884,7 +884,7 @@ fn apply_scoped_dtls_socket_options(
 // ============================================================================
 
 /// The gateway TLS policy (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`,
-/// `FERRUM_TLS_CIPHER_SUITES`, `FERRUM_TLS_CURVES`) expressed in the DTLS
+/// `FERRUM_TLS_CIPHER_SUITES`, `FERRUM_TLS_KEY_EXCHANGE_GROUPS`) expressed in the DTLS
 /// stack's vocabulary.
 ///
 /// `docs/configuration.md` documents those variables as applying "inbound +
@@ -914,7 +914,7 @@ fn apply_scoped_dtls_socket_options(
 ///   observed. But a policy whose ENTIRE TLS 1.2 selection is `ECDHE-RSA-*`
 ///   while TLS 1.2 is enabled WOULD silently lose DTLS 1.2, so that is a
 ///   startup error naming the suites and the surface.
-/// * **Key-exchange groups.** `FERRUM_TLS_CURVES` parses to exactly X25519,
+/// * **Key-exchange groups.** `FERRUM_TLS_KEY_EXCHANGE_GROUPS` parses to exactly X25519,
 ///   secp256r1 and secp384r1, which are exactly the three groups dimpl
 ///   implements, so the mapping is faithful and is applied.
 ///
@@ -1042,7 +1042,7 @@ impl DtlsSuitePolicy {
                 }
                 other => {
                     return Err(anyhow::anyhow!(
-                        "Key-exchange group {:?} selected by FERRUM_TLS_CURVES has no DTLS \
+                        "Key-exchange group {:?} selected by FERRUM_TLS_KEY_EXCHANGE_GROUPS has no DTLS \
                          equivalent, so the {} cannot honour the configured TLS policy.",
                         other,
                         surface

@@ -2142,6 +2142,10 @@ pub struct EnvConfig {
     /// Namespace this gateway instance loads and manages. Resources from other
     /// namespaces are ignored. Default: "ferrum".
     pub namespace: String,
+    /// `FERRUM_LOG_LEVEL` as admitted by configuration parsing. Default:
+    /// "warn". Runtime tracing is initialised from the same variable before
+    /// `EnvConfig` is parsed (`gateway_entry.rs`), so this copy only records
+    /// the setting.
     pub log_level: String,
     /// Per-sink admitted record limit for process logging. Stdout/access logs
     /// share one sink and stderr owns another. Default: 4096.
@@ -4443,7 +4447,7 @@ impl Default for EnvConfig {
         Self {
             mode: OperatingMode::File,
             namespace: "ferrum".into(),
-            log_level: "error".into(),
+            log_level: "warn".into(),
             log_buffer_capacity: crate::logging::LOG_BUFFER_CAPACITY_DEFAULT,
             log_buffer_bytes: crate::logging::LOG_BUFFER_BYTES_DEFAULT,
             log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,

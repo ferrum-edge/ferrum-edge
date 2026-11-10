@@ -48,6 +48,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Compose `ferrum-mongodb` publishes host ports 8004/8447/9446** (#7296),
   so the `mongodb` and `cp-dp` profiles can run together. It previously
   reused 8002/8445 (ferrum-dp-1) and 9445 (ferrum-cp).
+- **Core cleanups** (issue #7227). `/metrics` now emits each
+  `ferrum_log_sink_*` family as one HELP/TYPE/sample group instead of all
+  headers first and the samples interleaved per sink; series names, labels and
+  values are unchanged. `EnvConfig::default().log_level` is now `warn`,
+  matching the parse default and the docs.
+- **Operator diagnostics name the right setting and keep their useful detail**
+  (issue #7229). `ferrum-edge health` now reports the numeric HTTP status
+  (`Unhealthy: HTTP status 503`) instead of a quoted status line the startup
+  renderer withheld. TLS and DTLS key-exchange group errors and the TLS policy
+  log line name `FERRUM_TLS_KEY_EXCHANGE_GROUPS` instead of the
+  `FERRUM_TLS_CURVES` alias. Unreadable Gateway multi-certificate material
+  reports the field label and failure class only, like the single-certificate
+  loader. A MeshSubscribe peer that omits its version is told CP and data
+  planes must run the same build.
+- **V001 baseline: namespace-scoped credential index and structured MySQL
+  duplicate-index check** (issue #7228). `idx_consumer_credential_index_consumer_id`
+  now covers `(namespace, consumer_id)`, matching its foreign key and the
+  namespace-scoped delete, so MySQL no longer creates a second implicit FK
+  index. On MySQL, V001 now tolerates only the structured server error 1061
+  when an index already exists; any other failure (even one whose text
+  contains "1061") fails the migration. The V001 checksum changes: recreate
+  development databases.
 - **Mesh HTTP/2 backend connections use the same builder settings as the
   direct-H2 and gRPC pools** (issue #7071).
   - Sidecar mesh-mTLS connections and the nested HTTP/2 connection a native

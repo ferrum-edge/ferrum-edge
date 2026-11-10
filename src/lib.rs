@@ -10885,13 +10885,7 @@ pub mod _test_support {
             &transformed,
         )
         .await;
-        ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
-        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
-        let request_body = ctx.metadata.remove("request_body");
-        ctx.metadata = hook_ctx.metadata;
-        if let Some(body) = request_body {
-            ctx.metadata.insert("request_body".to_string(), body);
-        }
+        ctx.adopt_final_request_body_hook_context(hook_ctx);
         (transformed, result)
     }
 

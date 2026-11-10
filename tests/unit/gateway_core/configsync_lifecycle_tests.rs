@@ -1084,6 +1084,15 @@ fn semver_version_negotiation_rejects_empty_malformed_and_incompatible() {
         check_peer_version_compatibility(FERRUM_VERSION, ""),
         Err(VersionCompatError::Missing)
     ));
+    // There is no version negotiation to upgrade to: CP and data planes must
+    // run the same build, so a missing version gets the same-build wording
+    // (issue #7229).
+    let missing = VersionCompatError::Missing.message("CP", "DP", FERRUM_VERSION);
+    assert!(
+        missing.contains("must run the same Ferrum Edge build"),
+        "{missing}"
+    );
+    assert!(!missing.contains("negotiation"), "{missing}");
     assert!(matches!(
         check_peer_version_compatibility(FERRUM_VERSION, "1"),
         Err(VersionCompatError::Malformed { .. })

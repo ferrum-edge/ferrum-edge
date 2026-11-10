@@ -318,14 +318,17 @@ pub(crate) fn load_gateway_multi_cert_tls_config_with_handshake_scope(
     let staple_source = match (ocsp_response_source, certificates.len()) {
         (Some(source), 1) => {
             let cert_source = CertSource::parse(source, MaterialKind::Ocsp);
-            let material = load_material_blocking(&cert_source, MaterialKind::Ocsp)?;
+            let material =
+                load_material_blocking(&cert_source, MaterialKind::Ocsp).map_err(|error| {
+                    crate::tls::material_load_error("server TLS OCSP response", error)
+                })?;
             let bytes = material.bytes.expose_secret().to_vec();
             // Bounded structural admission here; the certificate-bound half
             // runs in `load_certified_key` against the chain that will serve
             // the response (issue #4300).
             let structure = crate::tls::ocsp::validate_structure(&bytes).map_err(|error| {
                 anyhow::anyhow!(
-                    "OCSP response source '{}' was rejected: {error}",
+                    "OCSP response source {:?} was rejected: {error}",
                     material.display_source_id
                 )
             })?;
@@ -626,7 +629,8 @@ fn load_certified_key(
         );
     }
 
-    let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)?;
+    let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert)
+        .map_err(|error| crate::tls::material_load_error("Gateway server TLS cert", error))?;
     crate::tls::check_cert_expiry_from_pem_bytes(
         cert_material.bytes.expose_secret(),
         "Gateway server TLS cert",
@@ -642,7 +646,9 @@ fn load_certified_key(
         anyhow::anyhow!("Gateway certificate {} has an empty chain", input.identity)
     })?;
 
-    let key_material = load_material_blocking(&key_source, MaterialKind::Key)?;
+    let key_material = load_material_blocking(&key_source, MaterialKind::Key).map_err(|error| {
+        crate::tls::material_load_error("Gateway server TLS private key", error)
+    })?;
     let key = crate::tls::parse_pem_private_key(
         key_material.bytes.expose_secret(),
         "Gateway server TLS private key",

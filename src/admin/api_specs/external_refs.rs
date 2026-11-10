@@ -1774,7 +1774,10 @@ fn origin_key(uri: &Url) -> Result<String, ExtractError> {
         .map_err(|_| external_ref_error("external $ref URI origin is invalid"))
 }
 
-fn split_ref(reference: &str) -> (Option<&str>, &str) {
+/// Split a `$ref` into its URI part (`None` for a same-document reference)
+/// and its raw fragment. Shared with the extractor so resolver and loader
+/// agree on reference identity.
+pub(super) fn split_ref(reference: &str) -> (Option<&str>, &str) {
     match reference.split_once('#') {
         Some(("", fragment)) => (None, fragment),
         Some((uri, fragment)) => (Some(uri), fragment),
@@ -1782,6 +1785,9 @@ fn split_ref(reference: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Fragment-free resource key with percent-escape case normalized. The
+/// extractor's resolver uses this same function, so resolver keys and loader
+/// keys cannot drift apart.
 pub fn resource_uri_key(url: &Url) -> String {
     let mut owned = url.clone();
     owned.set_fragment(None);
