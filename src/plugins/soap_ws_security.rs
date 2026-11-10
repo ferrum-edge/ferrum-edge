@@ -368,8 +368,6 @@ use super::{Plugin, PluginResult, RequestContext};
 
 // ── Namespace URIs ──────────────────────────────────────────────────────────
 
-const PASSWORD_DIGEST_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest";
-const PASSWORD_TEXT_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText";
 const XMLDSIG_RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 const XMLDSIG_RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
 const XMLDSIG_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
@@ -2901,16 +2899,15 @@ impl SoapWsSecurity {
         // `Type="...#PasswordText"`. If a recognized `Type` attribute is present
         // it must agree with the configured policy; a mismatch is rejected.
         if let Some(type_attr) = password_element.unqualified_attribute("Type") {
-            let wire_type =
-                if type_attr.contains("PasswordDigest") || type_attr == PASSWORD_DIGEST_TYPE {
-                    Some(PasswordType::PasswordDigest)
-                } else if type_attr.contains("PasswordText") || type_attr == PASSWORD_TEXT_TYPE {
-                    Some(PasswordType::PasswordText)
-                } else {
-                    // Unrecognized Type value — fall through to the configured
-                    // policy rather than guessing a verification mode.
-                    None
-                };
+            let wire_type = if type_attr.contains("PasswordDigest") {
+                Some(PasswordType::PasswordDigest)
+            } else if type_attr.contains("PasswordText") {
+                Some(PasswordType::PasswordText)
+            } else {
+                // Unrecognized Type value — fall through to the configured
+                // policy rather than guessing a verification mode.
+                None
+            };
             if let Some(wire_type) = wire_type
                 && wire_type != self.password_type
             {
@@ -3799,7 +3796,6 @@ impl SoapWsSecurity {
         &self,
         structure: &SoapEnvelopeStructure<'a, 'i>,
         security: Node<'a, 'i>,
-        id_index: &DocumentIdIndex<'a, 'i>,
         envelope: &str,
         now: DateTime<Utc>,
         budget: &mut WorkBudget,
@@ -3900,13 +3896,18 @@ impl SoapWsSecurity {
             .map_err(|_| "WS-Security: signature verification failed".to_string())?;
 
         // ── Authenticated. Only now is Reference work performed ─────────
+        // The id index walks every element and hashes every id attribute, so
+        // it is built here, after trust is settled, and never for an untrusted
+        // or forged signature. It replaces one full-envelope rescan per
+        // Reference.
+        let id_index = DocumentIdIndex::build(security.document());
         let coverage = self.verify_reference_digests(
             signed_info_node,
             security,
             sig_node,
             &ReferenceDigestDocument {
                 structure,
-                id_index,
+                id_index: &id_index,
                 envelope,
             },
             budget,
@@ -5551,19 +5552,11 @@ impl SoapWsSecurity {
             }
         }
 
-        // Validate X.509 signature. The id index is built once here — after the
-        // structure is settled and before the first Reference is resolved —
-        // instead of rescanning the whole envelope per Reference.
+        // Validate X.509 signature. The id index used to resolve References is
+        // built inside, only once the signer is trusted and SignatureValue
+        // verifies.
         if run_x509 {
-            let id_index = DocumentIdIndex::build(&document);
-            match self.validate_x509_signature(
-                &structure,
-                security,
-                &id_index,
-                envelope,
-                now,
-                &mut budget,
-            ) {
+            match self.validate_x509_signature(&structure, security, envelope, now, &mut budget) {
                 Ok(cert_principal) => {
                     principal
                         .principal
