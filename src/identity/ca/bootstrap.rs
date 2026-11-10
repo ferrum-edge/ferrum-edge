@@ -57,14 +57,16 @@ pub struct BootstrappedRoot {
 /// Every reader of the opt-in ([`bootstrap_allowed`], [`bootstrap_dev_root`],
 /// and the `EnvConfig` validation gate that lets `validate` agree with
 /// startup) goes through this one function, so the accepted spelling cannot
-/// drift between them. Only `true` (ASCII case-insensitive, no surrounding
-/// whitespace) opts in; any other value, or an unset variable, leaves the
-/// bootstrap refused. This does **not** consult
+/// drift between them. It uses the identity guardrail truthy rule
+/// ([`crate::identity::parse_guardrail_flag`]): `true`/`1` opt in; an unset,
+/// blank, `false`/`0` or invalid value leaves the bootstrap refused (an invalid
+/// value also fails `EnvConfig` validation). This does **not** consult
 /// [`crate::identity::production_mode`]; callers check that guardrail first.
 pub fn dev_bootstrap_opted_in() -> bool {
-    env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    crate::identity::guardrail_opt_in(
+        "FERRUM_MESH_CA_BOOTSTRAP_DEV",
+        env::var("FERRUM_MESH_CA_BOOTSTRAP_DEV"),
+    )
 }
 
 /// Returns `true` iff both gates allow bootstrap to run.
@@ -90,7 +92,7 @@ pub fn bootstrap_dev_root(config: BootstrapConfig) -> Result<BootstrappedRoot, C
     }
     if !dev_bootstrap_opted_in() {
         return Err(CaError::Config(
-            "FERRUM_MESH_CA_BOOTSTRAP_DEV is not set to 'true' — bootstrap refused. \
+            "FERRUM_MESH_CA_BOOTSTRAP_DEV is not set to true or 1 — bootstrap refused. \
              Set the env var only in dev/test environments."
                 .to_string(),
         ));

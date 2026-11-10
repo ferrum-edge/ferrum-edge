@@ -7501,6 +7501,12 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        // The identity guardrail flags are read from the process environment
+        // only (never `EnvConfig`), but a typo must still fail loudly — e.g.
+        // `FERRUM_MESH_PRODUCTION_MODE=yes` must not fall through to the
+        // non-production posture and let a dev opt-out re-open a gate
+        // (issue #7237). One strict parser covers all five flags.
+        crate::identity::validate_guardrail_env()?;
         // Reserved: the offload runtime exists but is not wired at startup.
         // A nonzero value used to parse and then do nothing; fail closed so
         // operators cannot tune a knob that is silently ignored.
@@ -8007,19 +8013,6 @@ impl EnvConfig {
                              FERRUM_MESH_ALLOW_STATIC_ID=true enables the proof-free static fallback"
                                 .into(),
                         );
-                    }
-                }
-                // Validate the production-mode flag value loudly — like
-                // `EnvConfig`'s bool parser — so a typo (e.g. `tru` / `yes`)
-                // can't silently fall through to the non-production posture and
-                // let the dev opt-out re-open the no-identity gate.
-                if let Ok(raw) = std::env::var("FERRUM_MESH_PRODUCTION_MODE") {
-                    let v = raw.trim().to_ascii_lowercase();
-                    if !matches!(v.as_str(), "" | "true" | "false" | "1" | "0") {
-                        return Err(format!(
-                            "Invalid FERRUM_MESH_PRODUCTION_MODE value {raw:?}. \
-                             Expected true, false, 1, or 0"
-                        ));
                     }
                 }
                 if crate::identity::production_mode() {
