@@ -2287,7 +2287,6 @@ fn translate_connection_pool_http(
     };
 
     let overlay = MeshConnectionPoolHttp {
-        max_requests_per_connection: None,
         idle_timeout_ms,
         http2_max_requests,
         max_concurrent_streams,
@@ -20833,10 +20832,6 @@ extensionProviders:
         let dr = &mesh.destination_rules[0];
         let tp = dr.traffic_policy.as_ref().expect("traffic policy");
         let http = tp.connection_pool_http.as_ref().expect("http overlay");
-        assert!(
-            http.max_requests_per_connection.is_none(),
-            "maxRequestsPerConnection is validated but deferred, not projected"
-        );
         assert_eq!(http.idle_timeout_ms, Some(300_000));
         assert_eq!(http.http2_max_requests, Some(1000));
         assert!(
@@ -20878,7 +20873,6 @@ extensionProviders:
             .as_ref()
             .unwrap();
         assert_eq!(http.http2_max_requests, Some(500));
-        assert!(http.max_requests_per_connection.is_none());
         assert!(http.idle_timeout_ms.is_none());
     }
 
@@ -20915,10 +20909,6 @@ extensionProviders:
             .connection_pool_http
             .as_ref()
             .expect("port http overlay");
-        assert!(
-            http.max_requests_per_connection.is_none(),
-            "maxRequestsPerConnection is deferred at port level too"
-        );
         assert_eq!(http.idle_timeout_ms, Some(60_000));
         assert_eq!(http.http2_max_requests, Some(200));
         assert!(
@@ -21263,7 +21253,6 @@ extensionProviders:
         );
         assert_eq!(http.http1_max_pending_requests, Some(1024));
         // Unset fields stay None.
-        assert!(http.max_requests_per_connection.is_none());
         assert!(http.idle_timeout_ms.is_none());
     }
 

@@ -1034,7 +1034,6 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
                 host: "reviews.default.svc.cluster.local".to_string(),
                 traffic_policy: Some(MeshTrafficPolicy {
                     connection_pool_http: Some(MeshConnectionPoolHttp {
-                        max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
                         max_concurrent_streams: None,
@@ -1299,7 +1298,6 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
                 host: "reviews.default.svc.cluster.local".to_string(),
                 traffic_policy: Some(MeshTrafficPolicy {
                     connection_pool_http: Some(MeshConnectionPoolHttp {
-                        max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
                         max_concurrent_streams: None,
@@ -1356,7 +1354,6 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
         8080,
         MeshTrafficPolicy {
             connection_pool_http: Some(MeshConnectionPoolHttp {
-                max_requests_per_connection: Some(10),
                 idle_timeout_ms: Some(30_000),
                 http2_max_requests: Some(20),
                 max_concurrent_streams: None,

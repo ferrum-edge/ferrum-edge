@@ -1714,7 +1714,7 @@ impl MeshSlice {
         {
             (
                 mesh_service_identities(&mesh.services),
-                visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
+                visible_service_entry_hosts(mesh, effective_namespace),
             )
         } else {
             (BTreeSet::new(), BTreeMap::new())
@@ -1970,9 +1970,7 @@ impl MeshSlice {
         let service_entries: Vec<ServiceEntry> = mesh
             .service_entries
             .iter()
-            .filter(|entry| {
-                service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
-            })
+            .filter(|entry| service_entry_applies_to_workload(entry, effective_namespace))
             .flat_map(|entry| {
                 let Some(sidecar) = applicable_sidecar else {
                     return vec![entry.clone()];
@@ -2152,7 +2150,6 @@ impl MeshSlice {
                 mesh,
                 sidecar,
                 workload_namespace: effective_namespace,
-                workload_labels: &effective_labels,
                 cluster_domain: &cluster_domain,
                 mesh_service_identities: &mesh_service_identities,
                 service_entry_hosts: &service_entry_hosts,
@@ -2947,11 +2944,10 @@ fn insert_known_destination<'a>(
     }
 }
 
-struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
+struct EgressScopeBuildContext<'a> {
     mesh: &'a MeshConfig,
     sidecar: ResolvedSidecarEgress<'a>,
     workload_namespace: &'a str,
-    workload_labels: &'a L,
     cluster_domain: &'a str,
     mesh_service_identities: &'a BTreeSet<(String, String)>,
     service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
@@ -2959,14 +2955,13 @@ struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
     dry_run: bool,
 }
 
-fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
-    ctx: EgressScopeBuildContext<'_, L>,
+fn build_sidecar_egress_scope_snapshot(
+    ctx: EgressScopeBuildContext<'_>,
 ) -> MeshEgressScopeSnapshot {
     let EgressScopeBuildContext {
         mesh,
         sidecar,
         workload_namespace,
-        workload_labels,
         cluster_domain,
         mesh_service_identities,
         service_entry_hosts,
@@ -2981,9 +2976,7 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
     let scoped_service_entries: Vec<ServiceEntry> = mesh
         .service_entries
         .iter()
-        .filter(|entry| {
-            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
-        })
+        .filter(|entry| service_entry_applies_to_workload(entry, workload_namespace))
         .flat_map(|entry| narrow_service_entry_ports(entry, sidecar))
         .collect();
     let scoped_workloads: Vec<Workload> = mesh
@@ -3161,17 +3154,14 @@ pub(crate) enum ServiceEntryHostOwner {
 /// Index the hosts of every ServiceEntry visible to this workload by their
 /// owning (declaring) namespace. Narrowing only; the ownership rules live in
 /// [`index_service_entry_host_owners`].
-fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
+fn visible_service_entry_hosts(
     mesh: &MeshConfig,
     workload_namespace: &str,
-    workload_labels: &L,
 ) -> BTreeMap<String, ServiceEntryHostOwner> {
     let visible: Vec<&ServiceEntry> = mesh
         .service_entries
         .iter()
-        .filter(|entry| {
-            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
-        })
+        .filter(|entry| service_entry_applies_to_workload(entry, workload_namespace))
         .collect();
     index_service_entry_host_owners(visible)
 }

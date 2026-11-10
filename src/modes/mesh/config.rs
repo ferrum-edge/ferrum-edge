@@ -3146,11 +3146,11 @@ pub fn destination_rule_lookup_tier(
     }
 }
 
-pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
-    entry: &ServiceEntry,
-    workload_namespace: &str,
-    _workload_labels: &L,
-) -> bool {
+/// Whether `entry` applies to a workload in `workload_namespace`: export
+/// visibility only. `ServiceEntry.workload_selector` is carried but not
+/// consumed (no endpoint selection from selected workloads), and Kubernetes
+/// status reports it as a deferred field.
+pub fn service_entry_applies_to_workload(entry: &ServiceEntry, workload_namespace: &str) -> bool {
     service_entry_exported_to_namespace(entry, workload_namespace)
 }
 
@@ -4402,12 +4402,6 @@ pub struct MeshTrafficPolicy {
 /// resolved slots and dispatch wiring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshConnectionPoolHttp {
-    /// Deprecated carrier for `maxRequestsPerConnection`. New K8s translation
-    /// validates and warns on the field, reports it as deferred, and does not
-    /// populate this slot because Ferrum has no backend close-after-N-requests
-    /// behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_requests_per_connection: Option<u32>,
     /// Mapped from `idleTimeout` (parsed as an Istio duration, persisted
     /// as milliseconds). Translator rejects sub-second durations because
     /// the proxy-level `pool_idle_timeout_seconds` field is whole-second
