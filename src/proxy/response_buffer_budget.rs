@@ -638,12 +638,8 @@ fn request_decode_budget() -> &'static Budget {
 
 /// Publish the operator-configured request-decode bound. Called once during
 /// startup, before any listener accepts traffic, for the same reason and with
-/// the same restart-to-change semantics as [`init`].
-///
-/// `#[allow(dead_code)]`: the binary calls this from `main`, but the same
-/// module is separately compiled into the library crate where that binary-only
-/// call site is invisible.
-#[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
+/// the same restart-to-change semantics as [`init`]. Called from
+/// [`crate::startup::initialize_gateway_buffer_budgets`].
 pub(crate) fn init_request_decode(total_bytes: usize) {
     if REQUEST_DECODE_BUDGET
         .set(Budget::new(
@@ -672,12 +668,8 @@ fn request_buffer_budget() -> &'static Budget {
 
 /// Publish the operator-configured buffered-request bounds. Called once during
 /// startup, before any listener accepts traffic, with the same
-/// restart-to-change semantics as [`init`] and [`init_request_decode`].
-///
-/// `#[allow(dead_code)]`: the binary calls this from `main`, but the same
-/// module is separately compiled into the library crate where that binary-only
-/// call site is invisible.
-#[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
+/// restart-to-change semantics as [`init`] and [`init_request_decode`]. Called
+/// from [`crate::startup::initialize_gateway_buffer_budgets`].
 pub(crate) fn init_request_buffer(fallback_per_request_bytes: usize, total_bytes: usize) {
     if REQUEST_BUFFER_BUDGET
         .set(Budget::for_requests(
@@ -1203,11 +1195,7 @@ impl Budget {
 /// any listener accepts traffic. Later calls are ignored: the semaphore backs
 /// live reservations, so resizing it under them is not expressible — changing
 /// these values requires a restart, like the other process-global limits.
-///
-/// `#[allow(dead_code)]`: the binary calls this from `main`, but the same
-/// module is separately compiled into the library crate where that binary-only
-/// call site is invisible.
-#[allow(dead_code)] // binary startup caller; dead in the separately compiled library unit
+/// Called from [`crate::startup::initialize_gateway_buffer_budgets`].
 pub(crate) fn init(fallback_per_response_bytes: usize, total_bytes: usize) {
     if BUDGET
         .set(Budget::new(fallback_per_response_bytes, total_bytes))

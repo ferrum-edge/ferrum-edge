@@ -129,7 +129,6 @@ pub struct NodeWaypointUdpSourceBinding {
     /// index uses, so scope resolution needs no re-parse on the hot path.
     pub pod_uid: [u8; 16],
     /// Registry-published pod UID text, retained for diagnostics only.
-    #[allow(dead_code)] // Diagnostics + external test assertions; unread by the binary target.
     pub pod_uid_text: String,
     /// Attested workload SPIFFE identity for this pod.
     pub principal: SpiffeId,
@@ -140,7 +139,6 @@ pub struct NodeWaypointUdpSourceBinding {
     /// Index generation this binding was published in. Diagnostics only — never
     /// part of [`Self::attribution_eq`], because an unchanged republish must not
     /// invalidate live sessions.
-    #[allow(dead_code)] // Diagnostics + external test assertions; unread by the binary target.
     pub generation: u64,
 }
 

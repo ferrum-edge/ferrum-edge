@@ -103,7 +103,6 @@ impl TrustedProxies {
     }
 
     /// Returns an empty set (forwarded client metadata will be ignored).
-    #[allow(dead_code)] // Used by tests
     pub fn none() -> Self {
         Self {
             cidrs: CidrSet::default(),
@@ -111,7 +110,6 @@ impl TrustedProxies {
     }
 
     /// Returns the number of configured CIDR entries.
-    #[allow(dead_code)] // Used by tests
     pub fn len(&self) -> usize {
         self.cidrs.len()
     }
@@ -362,7 +360,7 @@ pub fn resolve_client_ip_field_lines<'a>(
 ///
 /// Production ingress uses [`resolve_client_ip_field_lines`] instead, because a
 /// `&str` cannot represent a field-line the client made unrepresentable.
-#[allow(dead_code)] // Used by external test crates via public API
+/// [`resolve_client_ip`] delegates here after parsing the socket address.
 pub fn resolve_client_ip_parsed(
     socket_ip: &str,
     socket_addr: &IpAddr,

@@ -8188,7 +8188,6 @@ pub struct ProxyState {
     /// for the consumer: [`ProxyState::advance_backend_security_generation`]
     /// sends here AND stores into `backend_svid_generation` itself, because the
     /// publication fence lifts before the consumer task can be scheduled.
-    #[allow(dead_code)]
     pub backend_svid_rotation_tx: tokio::sync::watch::Sender<u64>,
     /// Current backend client SVID generation shared by backend pools.
     ///
@@ -8196,7 +8195,6 @@ pub struct ProxyState {
     /// by [`ProxyState::advance_backend_security_generation`]. Both use
     /// `fetch_max`, so the generation is monotonic under any interleaving of
     /// the two writers.
-    #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
     pub backend_svid_generation: BackendSvidGeneration,
     /// Shared SOCK_OPS metrics state populated by the kernel ringbuf
     /// consumer. `Some(_)` only when the gateway runs the SOCK_OPS event
