@@ -627,6 +627,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process restarted. They now retry the candidate on every poll, as the
   frontend DTLS watcher already did. The TLS event and warning are still
   recorded once per distinct failing candidate.
+- **`FERRUM_OVERLOAD_LOOP_CRITICAL_US` is honoured by the event-loop probe**
+  (#7197). The probe waited a fixed 250 ms and reported a fixed 500 ms on
+  timeout, so a critical threshold above 500 ms never tripped, and with the
+  default a 250 ms stall was reported as 500 ms and rejected new connections.
+  The probe now waits up to the configured critical threshold, bounded by
+  `FERRUM_OVERLOAD_CHECK_INTERVAL_MS`, and reports at least that budget on
+  timeout. A critical threshold above the check interval still cannot be
+  reached; the docs now say so.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

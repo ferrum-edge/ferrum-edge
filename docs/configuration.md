@@ -1205,7 +1205,7 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD` | No | `0.85` | Request usage ratio above which keepalive is disabled |
 | `FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD` | No | `0.95` | Request usage ratio above which new requests receive 503 |
 | `FERRUM_OVERLOAD_LOOP_WARN_US` | No | `10000` | Event-loop latency warning threshold |
-| `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | No | `500000` | Event-loop latency threshold for rejecting new connections |
+| `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | No | `500000` | Event-loop latency threshold for rejecting new connections. The latency probe waits at most this long, bounded by `FERRUM_OVERLOAD_CHECK_INTERVAL_MS`, so a value above the check interval cannot be reached (see [overload_manager.md](overload_manager.md#configuration)) |
 
 ### Advanced Performance
 

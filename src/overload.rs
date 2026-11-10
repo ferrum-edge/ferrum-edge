@@ -1064,9 +1064,14 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
 /// On `current_thread` runtimes (or any runtime where `num_workers()` returns 0
 /// or 1, e.g. tokio's `LocalSet`-based tests), this falls back to the original
 /// single-task probe.
-async fn measure_event_loop_latency() -> Duration {
-    const EVENT_LOOP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-    const EVENT_LOOP_TIMEOUT_FAIL_CLOSED_LATENCY: Duration = Duration::from_micros(500_000);
+///
+/// `budget` bounds how long the probes are awaited (see
+/// [`event_loop_probe_budget`]). A probe still queued when it expires has
+/// waited at least `budget`, so the result is at least `budget`: with the
+/// budget equal to `loop_critical_us`, a stall that reaches the critical
+/// threshold reports at least the threshold and trips it (fail closed), and
+/// shorter stalls report their measured latency (issue #7197).
+async fn measure_event_loop_latency(budget: Duration) -> Duration {
     let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
 
     // Single-threaded fallback: just measure our own reschedule.
@@ -1086,7 +1091,7 @@ async fn measure_event_loop_latency() -> Duration {
     }
 
     let mut max_latency = Duration::ZERO;
-    let drain_result = tokio::time::timeout(EVENT_LOOP_PROBE_TIMEOUT, async {
+    let drain_result = tokio::time::timeout(budget, async {
         while let Some(result) = probes.join_next().await {
             // A probe task panicking is unexpected (yield_now never panics) but if
             // it ever happens, prefer continuing over aborting the monitor cycle.
@@ -1101,9 +1106,18 @@ async fn measure_event_loop_latency() -> Duration {
 
     if drain_result.is_err() {
         probes.abort_all();
-        return max_latency.max(EVENT_LOOP_TIMEOUT_FAIL_CLOSED_LATENCY);
+        return max_latency.max(budget);
     }
     max_latency
+}
+
+/// How long one monitor tick waits for the event-loop probes: the configured
+/// critical threshold, bounded by the check interval so one stalled worker
+/// cannot hold the monitor (and every other shedding flag) longer than one
+/// interval. A `loop_critical_us` above the check interval therefore cannot
+/// be reached; `docs/overload_manager.md` states this.
+fn event_loop_probe_budget(loop_critical_us: u64, check_interval: Duration) -> Duration {
+    Duration::from_micros(loop_critical_us).min(check_interval)
 }
 
 /// Monitor ticks between repeats of the FD-count timeout warning.
@@ -1338,7 +1352,11 @@ pub fn start_monitor(
             let req_ratio = pressure_ratio(req_used, max_requests as u64);
 
             // ── Event loop latency ──
-            let loop_latency = measure_event_loop_latency().await;
+            let loop_latency = measure_event_loop_latency(event_loop_probe_budget(
+                config.loop_critical_us,
+                interval,
+            ))
+            .await;
             let loop_us = loop_latency.as_micros() as u64;
             state.loop_latency_us.store(loop_us, Ordering::Relaxed);
 
@@ -2424,13 +2442,89 @@ mod tests {
         );
     }
 
+    /// The production budget at the default thresholds (500 ms critical, 1 s
+    /// check interval).
+    const DEFAULT_PROBE_BUDGET: Duration = Duration::from_millis(500);
+
+    /// Issue #7197: the probe budget, and with it the fail-closed value on a
+    /// timeout, follows `loop_critical_us` instead of fixed 250 ms / 500 ms
+    /// constants, so thresholds between 500 ms and the check interval are
+    /// reachable; it never exceeds one check interval.
+    #[test]
+    fn event_loop_probe_budget_follows_critical_threshold_bounded_by_interval() {
+        let interval = Duration::from_millis(1000);
+        assert_eq!(
+            event_loop_probe_budget(500_000, interval),
+            DEFAULT_PROBE_BUDGET
+        );
+        assert_eq!(
+            event_loop_probe_budget(300_000, interval),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            event_loop_probe_budget(750_000, interval),
+            Duration::from_millis(750)
+        );
+        assert_eq!(event_loop_probe_budget(5_000_000, interval), interval);
+        assert_eq!(
+            event_loop_probe_budget(2_000_000, Duration::from_millis(5000)),
+            Duration::from_secs(2)
+        );
+    }
+
+    /// A probe that cannot be scheduled within its budget reports at least
+    /// the budget, so the critical threshold it was sized from trips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measure_event_loop_latency_reports_at_least_the_budget_on_timeout() {
+        let handle = tokio::runtime::Handle::current();
+        let num_workers = handle.metrics().num_workers();
+        let budget = Duration::from_millis(40);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::with_capacity(num_workers);
+        let mut blockers = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started_tx = started_tx.clone();
+            blockers.push(tokio::spawn(async move {
+                started_tx.send(()).expect("probe observes worker entry");
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            }));
+        }
+        drop(started_tx);
+        let probe_thread = std::thread::spawn(move || {
+            for _ in 0..num_workers {
+                started_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("every runtime worker must be occupied");
+            }
+            let release_thread = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                for release in releases {
+                    let _ = release.send(());
+                }
+            });
+            let latency = handle.block_on(measure_event_loop_latency(budget));
+            release_thread.join().expect("release thread");
+            latency
+        });
+        for blocker in blockers {
+            blocker.await.expect("worker blocker should not panic");
+        }
+        let latency = probe_thread.join().expect("latency probe should not panic");
+        assert!(
+            latency >= budget,
+            "a probe starved past its budget must report at least the budget, got {latency:?}"
+        );
+    }
+
     /// Sanity check: under no load, the all-worker probe should still return a
     /// small latency, well under the 10 ms warn threshold. This guards against
     /// regressions where the probe accidentally serializes on something that
     /// would inflate idle-runtime readings.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn measure_event_loop_latency_idle_is_small() {
-        let latency = measure_event_loop_latency().await;
+        let latency = measure_event_loop_latency(DEFAULT_PROBE_BUDGET).await;
         assert!(
             latency < Duration::from_millis(10),
             "idle multi-worker probe should be <10ms, got {:?}",
@@ -2442,7 +2536,7 @@ mod tests {
     /// the original single-task probe and still returns quickly.
     #[tokio::test(flavor = "current_thread")]
     async fn measure_event_loop_latency_current_thread_fallback() {
-        let latency = measure_event_loop_latency().await;
+        let latency = measure_event_loop_latency(DEFAULT_PROBE_BUDGET).await;
         assert!(
             latency < Duration::from_millis(10),
             "current-thread probe should be <10ms, got {:?}",
@@ -2497,7 +2591,7 @@ mod tests {
                     .expect("every runtime worker must be occupied");
             }
             handle.block_on(async move {
-                let mut probe = std::pin::pin!(measure_event_loop_latency());
+                let mut probe = std::pin::pin!(measure_event_loop_latency(DEFAULT_PROBE_BUDGET));
                 let mut queued_tx = Some(queued_tx);
                 std::future::poll_fn(|cx| {
                     let result = std::future::Future::poll(probe.as_mut(), cx);
