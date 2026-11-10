@@ -1746,17 +1746,17 @@ touched proxy is republished by the next poll / control-plane broadcast. The
 single-resource routes also advance the touched proxy's `updated_at`; the
 `/batch` and `/restore` paths leave it unchanged. Those paths reject a `proxy_id`
 that does not exist in the namespace with `400` before anything is written. `GET /proxies/{id}` is therefore authoritative: a
+`201` from `POST /plugins/config` means *attached*, not merely created. A
+`proxy_id` that does not exist in the request's namespace is rejected with
+`400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
+is persisted, as before.
+
 Plugin and proxy writes validate their complete prospective plugin composition
 before persistence. Invalid CORS/mesh-dispatch ordering, exclusive-instance
 conflicts, metric-tag plan budgets and global registry ownership return `400`;
 the rejected plugin row and association are not committed. File/DB/CP admission
 and runtime cache publication use the same checks. See
 [Composition admission](plugins.md#composition-admission).
-
-`201` from `POST /plugins/config` means *attached*, not merely created. A
-`proxy_id` that does not exist in the request's namespace is rejected with
-`400 {"error":"proxy_id '<P>' does not exist in namespace '<ns>'"}` and nothing
-is persisted, as before.
 
 `scope: "proxy_group"` associations are unaffected — they are operator-managed
 through `PUT /proxies/{id}` and stay valid for any proxy in the namespace. File

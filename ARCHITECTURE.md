@@ -26,9 +26,10 @@ The directory trees below are representative excerpts; see the cited paths for t
 
 ```
 src/
-├── main.rs                    # Binary entry point
+├── main.rs                    # Binary entry point (jemalloc; includes gateway_entry.rs)
+├── gateway_entry.rs           # Startup pipeline and mode dispatch (`run_gateway_cli()`)
 ├── cli.rs                     # CLI subcommands and flag → env overrides
-├── startup.rs                 # Startup sequence and mode dispatch
+├── startup.rs                 # Startup helpers (diagnostic sanitizing, start signals, SIGHUP disposition)
 ├── lib.rs                     # Library root with public API exports
 ├── overload.rs                # Overload manager and load shedding
 ├── circuit_breaker.rs         # Three-state circuit breaker (Closed/Open/Half-Open)
@@ -167,8 +168,6 @@ tests/
 │
 ├── conformance_tests.rs                # Entry point: Istio/xDS/Gateway API conformance
 ├── conformance/
-│
-├── helpers/bin/                        # Standalone test server binaries
 │
 └── performance/                        # Performance/load testing (separate crate)
     └── multi_protocol/                 # Multi-protocol benchmark suite
@@ -401,7 +400,7 @@ All modes store the active configuration in an `ArcSwap<GatewayConfig>` — a lo
 | Mode | Data Source | On Source Failure |
 |------|------------|-------------------|
 | **File** | YAML/JSON file | Config loaded once at startup. File can be deleted/corrupted afterward with zero impact. SIGHUP reload gracefully falls back to previous config on parse errors. |
-| **Database** | SQL database | Polling loop logs a warning and continues with cached config. Gateway serves traffic indefinitely with stale config until DB recovers. If `FERRUM_DB_FAILOVER_URLS` is configured, failover URLs are tried in order before marking the DB as unavailable. If `FERRUM_DB_READ_REPLICA_URL` is configured, polling reads are offloaded to the replica (falls back to primary if replica is unreachable). |
+| **Database** | SQL database | Polling loop logs a warning and continues with cached config. Gateway serves traffic indefinitely with stale config until DB recovers. If `FERRUM_DB_FAILOVER_URLS` is configured, failover URLs are tried in order before marking the DB as unavailable. If `FERRUM_DB_READ_REPLICA_URL` is configured, eligible admin-only reads are offloaded to the replica (falling back to primary if the replica is unreachable); runtime config polling always uses the primary. |
 | **Control Plane** | SQL database | Polling loop logs a warning. Does not broadcast stale updates to Data Planes. DPs retain their last known config. Admin API reads fall back to the in-memory cached config. |
 | **Data Plane** | Control Plane (gRPC) | Priority-ordered multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`) with jittered exponential backoff (1s → 30s cap, ±25% jitter) between reconnect attempts. Serves the last **applied** snapshot while at least one CP remains authoritative or during intentional failover/reconnect handoffs. When **every** CP is lost and that snapshot reaches `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default 3600; `0` disables the bound as an explicit unsafe opt-in), readiness degrades (`/health` `ready: false`) and, under the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`, new HTTP/TCP/UDP/DTLS admissions are refused while in-flight work drains. `readiness_only` degrades readiness without blocking new traffic. Admin API reads served from cached config with `X-Data-Source: cached` header. See [docs/cp_dp_mode.md](docs/cp_dp_mode.md#bounded-last-known-good-configuration-age). |
 
@@ -619,7 +618,7 @@ cargo run -- run
 
 ### **2. Understanding the Codebase**
 
-1. **Start with `src/main.rs`** - Understand application startup
+1. **Start with `src/gateway_entry.rs`** (`run_gateway_cli()`, included by `src/main.rs`) - Understand application startup
 2. **Read `src/config/types.rs`** - Learn core data structures
 3. **Study `src/proxy/mod.rs`** - Understand proxy state management
 4. **Explore `src/plugins/mod.rs`** - Learn plugin system
@@ -632,7 +631,7 @@ cargo run -- run
 2. Implement `Plugin` trait
 3. Add a priority constant in the `priority` module of `src/plugins/mod.rs`
 4. Override `supported_protocols()` to declare protocol support
-5. Register the constructor in `create_plugin_with_http_client()` and add a `BUILTIN_PLUGIN_REGISTRATIONS` entry (which feeds `available_plugins()`)
+5. Register the constructor in `create_plugin_with_http_client_and_config_id()` and add a `BUILTIN_PLUGIN_REGISTRATIONS` entry (which feeds `available_plugins()`)
 6. Add unit tests in `tests/unit/plugins/`
 7. Update `FEATURES.md`, `README.md`, `docs/plugins.md`, `docs/plugin_execution_order.md`, `BUILTIN_PLUGIN_PARITY_META` in `src/plugins/builtin_parity.rs`, and `openapi.yaml` (CI checks registry/doc parity)
 
