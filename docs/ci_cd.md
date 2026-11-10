@@ -1000,9 +1000,11 @@ absolute/dot/dotdot/empty components, C0/DEL, backslash, backtick, or other
 unclassifiable punctuation. Malformed or hostile names select full mode, force
 every job gate on, and are omitted from the step summary rather than
 interpolated into Markdown. The same `--no-renames` fail-closed classification applies
-to `coverage.yml` coverage planning, `gateway-api-conformance.yml` relevance
-filtering, and the `performance-regression` path classifier on both
-`pull_request` and `merge_group` diffs. Coverage planning skips every
+to `coverage.yml` coverage planning and `gateway-api-conformance.yml` relevance
+filtering on both `pull_request` and `merge_group` diffs.
+(`performance-regression.yml` runs only on `schedule` and `workflow_dispatch`,
+so its retained path classifier never sees a pull-request or merge-group diff and
+schedules every benchmark.) Coverage planning skips every
 instrumented shard on classifiable pull-request and merge-group diffs (the
 `Merge Coverage` check reports success in under a minute); controller edits,
 empty or unavailable diffs, and malformed/hostile path transport fail closed to
