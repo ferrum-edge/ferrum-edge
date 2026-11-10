@@ -1197,3 +1197,46 @@ fn vendored_h2_exposes_the_reset_origin_hyper_patch_006_reads() {
         h2::server::SendResponse::<Bytes>::reset_is_local;
     let _ = accessor;
 }
+
+/// Issue #7156: the H1/H2 "Invalid backend path coordinates" 500s (three in
+/// `handle_proxy_request_inner`, one in the WebSocket upgrade handler) and the
+/// WebSocket missing-`OnUpgrade` 500 mark the terminal counted and record the
+/// request, like every sibling counting site (issue #6768). The H1/H2 body is
+/// the JSON its builder's default `content-type` declares.
+#[test]
+fn h1_h2_internal_error_exits_are_counted() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let squeezed: String = source.split_whitespace().collect();
+
+    let sites: Vec<&str> = squeezed
+        .split("\"Invalidbackendpathcoordinates\"}\"#,")
+        .collect();
+    assert_eq!(sites.len(), 5, "four H1/H2 invalid backend path exits");
+    assert!(
+        !squeezed.contains("b\"Invalidbackendpathcoordinates\""),
+        "the H1/H2 body must be JSON, not raw text"
+    );
+    for (index, site) in sites.iter().enumerate().take(4) {
+        // The counting statements sit just before (WebSocket) or just after
+        // (pre-plugin builder) the body literal.
+        let before = &site[site.len().saturating_sub(400)..];
+        let after = sites[index + 1];
+        let after = &after[..after.len().min(400)];
+        let window = format!("{before}{after}");
+        assert!(
+            window.contains("ctx.terminal_record.mark_counted();")
+                && window.contains("record_request(&state,"),
+            "invalid backend path exit {index} must be marked counted and recorded"
+        );
+    }
+
+    let on_upgrade = squeezed
+        .split("error!(\"FailedtoextractOnUpgradeextensionfromWebSocketrequest\");")
+        .nth(1)
+        .expect("missing OnUpgrade exit")
+        .split("returnOk(")
+        .next()
+        .expect("bounded missing OnUpgrade exit");
+    assert!(on_upgrade.contains("ctx.terminal_record.mark_counted();"));
+    assert!(on_upgrade.contains("record_request(&state,500);"));
+}

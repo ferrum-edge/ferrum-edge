@@ -16678,6 +16678,9 @@ async fn handle_websocket_request_authenticated(
     ) {
         Ok(url) => url,
         Err(_) => {
+            // Counted like every sibling reject of this handler (issue #7156).
+            ctx.terminal_record.mark_counted();
+            record_request(&state, 500);
             cb_probe.release_neutral();
             return Ok(build_websocket_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -16696,6 +16699,9 @@ async fn handle_websocket_request_authenticated(
         Some(on_upgrade) => on_upgrade,
         None => {
             error!("Failed to extract OnUpgrade extension from WebSocket request");
+            // Counted like every sibling reject of this handler (issue #7156).
+            ctx.terminal_record.mark_counted();
+            record_request(&state, 500);
             // The caller's CB check may have claimed a HALF_OPEN probe slot —
             // release it (gateway-side reject, not a backend outcome) so the
             // breaker can admit the next probe instead of wedging.
@@ -38877,13 +38883,17 @@ async fn handle_proxy_request_inner(
         ) {
             Ok(value) => value,
             Err(_) => {
-                return Ok(build_pre_plugin_reject_response(
+                // Counted like every other H1/H2 terminal (issue #7156).
+                let response = build_pre_plugin_reject_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Invalid backend path coordinates",
+                    br#"{"error":"Invalid backend path coordinates"}"#,
                     &HashMap::new(),
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
-                ));
+                );
+                ctx.terminal_record.mark_counted();
+                record_request(&state, response.status().as_u16());
+                return Ok(response);
             }
         };
         if let Some(response) = run_backend_path_plugins_or_build_reject(
@@ -40492,13 +40502,17 @@ async fn handle_proxy_request_inner(
         ) {
             Ok(value) => value,
             Err(_) => {
-                return Ok(build_pre_plugin_reject_response(
+                // Counted like every other H1/H2 terminal (issue #7156).
+                let response = build_pre_plugin_reject_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Invalid backend path coordinates",
+                    br#"{"error":"Invalid backend path coordinates"}"#,
                     &HashMap::new(),
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
-                ));
+                );
+                ctx.terminal_record.mark_counted();
+                record_request(&state, response.status().as_u16());
+                return Ok(response);
             }
         };
         let backend_start = Instant::now();
@@ -44320,13 +44334,17 @@ async fn handle_proxy_request_inner(
         Ok(value) => value,
         Err(_) => {
             cb_probe.release_neutral();
-            return Ok(build_pre_plugin_reject_response(
+            // Counted like every other H1/H2 terminal (issue #7156).
+            let response = build_pre_plugin_reject_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                b"Invalid backend path coordinates",
+                br#"{"error":"Invalid backend path coordinates"}"#,
                 &HashMap::new(),
                 request_uses_grpc_content_type,
                 grpc_web_response_content_type,
-            ));
+            );
+            ctx.terminal_record.mark_counted();
+            record_request(&state, response.status().as_u16());
+            return Ok(response);
         }
     };
     let backend_start = Instant::now();
