@@ -1381,9 +1381,6 @@ fn test_request_transformer_overlay_gate_parsing() {
     use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
     use ferrum_edge::plugins::request_transformer::runtime_overlay;
 
-    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
-    runtime_overlay::reset_for_test();
-
     let mut fields = HashMap::new();
     fields.insert(
         "ferrum.request_transformer.public.enabled".to_string(),
@@ -1401,24 +1398,26 @@ fn test_request_transformer_overlay_gate_parsing() {
         "ferrum.request_transformer..enabled".to_string(),
         RuntimeValue::Bool(true),
     );
+    fields.insert(
+        "ferrum.response_transformer.public.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
 
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
-    let snap = runtime_overlay::current_gates();
-    assert_eq!(snap.gate("public"), Some(false));
-    assert_eq!(snap.gate("internal"), Some(true));
-    assert_eq!(snap.gate("bad"), None);
-    assert_eq!(snap.gate(""), None);
-    assert_eq!(snap.gate("missing"), None);
+    let gates = runtime_overlay::scope_gates(&MeshRuntimeOverlay { fields });
+    assert_eq!(gates.get("public"), Some(&false));
+    assert_eq!(gates.get("internal"), Some(&true));
+    assert_eq!(gates.get("bad"), None);
+    assert_eq!(gates.get(""), None);
+    assert_eq!(gates.get("missing"), None);
+    assert_eq!(gates.len(), 2, "{gates:?}");
 
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay::default());
-    assert_eq!(runtime_overlay::current_gates().gate("public"), None);
+    assert!(runtime_overlay::scope_gates(&MeshRuntimeOverlay::default()).is_empty());
 }
 
 /// The gate is resolved from CONFIGURATION, not from live process-global state
 /// (GHSA-83rc-23c9-3g9x). Every case below therefore builds the instance from the
-/// effective config a mesh generation would have produced, and no case touches
-/// the process-global store — which is exactly the property being asserted: a
-/// store mutation cannot reach a constructed instance.
+/// effective config a mesh generation would have produced; there is no
+/// request-side process-global gate store for an instance to consult.
 ///
 /// Cross-generation and mid-request barriers live in
 /// `tests/integration/transformer_runtime_overlay_generation_tests.rs`.
@@ -1492,65 +1491,6 @@ async fn test_request_transformer_overlay_gate_resolves_from_effective_config() 
         !headers.contains_key("x-pess"),
         "default_enabled=false must suppress when the generation named no gate"
     );
-}
-
-/// A mutation of the process-global gate store must NOT change what an
-/// already-constructed instance does. This is the direct regression guard for the
-/// request-time lookup the advisory describes.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn test_request_transformer_ignores_live_process_global_gate_mutations() {
-    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
-    use ferrum_edge::plugins::request_transformer::runtime_overlay;
-    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
-    runtime_overlay::reset_for_test();
-
-    // Built from a generation that resolved the gate to TRUE.
-    let plugin = RequestTransformer::new(&json!({
-        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
-        "runtime_overlay_scope": "gated",
-        "runtime_overlay_resolved_enabled": true
-    }))
-    .unwrap();
-
-    // Publish a CONTRADICTING gate into the live store, as a later accepted
-    // slice would. The instance must not observe it.
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay {
-        fields: HashMap::from([(
-            "ferrum.request_transformer.gated.enabled".to_string(),
-            RuntimeValue::Bool(false),
-        )]),
-    });
-
-    let mut headers: HashMap<String, String> = HashMap::new();
-    plugin.before_proxy(&mut make_ctx(), &mut headers).await;
-    assert_eq!(
-        headers.get("x-gated").map(String::as_str),
-        Some("yes"),
-        "a live store mutation must not reach an already-published instance"
-    );
-
-    // And the same in the other direction.
-    let disabled = RequestTransformer::new(&json!({
-        "rules": [{"operation": "add", "target": "header", "key": "X-Gated", "value": "yes"}],
-        "runtime_overlay_scope": "gated",
-        "runtime_overlay_resolved_enabled": false
-    }))
-    .unwrap();
-    runtime_overlay::apply_overlay(&MeshRuntimeOverlay {
-        fields: HashMap::from([(
-            "ferrum.request_transformer.gated.enabled".to_string(),
-            RuntimeValue::Bool(true),
-        )]),
-    });
-    let mut headers: HashMap<String, String> = HashMap::new();
-    disabled.before_proxy(&mut make_ctx(), &mut headers).await;
-    assert!(
-        !headers.contains_key("x-gated"),
-        "a live store mutation must not enable an instance published as disabled"
-    );
-
-    runtime_overlay::reset_for_test();
 }
 
 #[test]
