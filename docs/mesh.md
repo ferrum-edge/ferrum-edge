@@ -2843,6 +2843,8 @@ In NodeWaypoint topology one HBONE listener serves many pods. The node-agent enr
 - Inode or fingerprint changed → pod restarted under the same UID; the identity-map entry is evicted so a fresh enrollment is required before traffic for the new instance is honoured. The fingerprint prevents missed restarts when the filesystem reuses the old inode number.
 - Path gone → pod removed; the identity-map entry is evicted. The per-pod policy scope is a separate slice-published map and remains until a later accepted slice replaces it.
 
+**Current status:** no production enrollment path supplies a cgroup path yet. Identities are enrolled lazily from the eBPF cookie record and bind no cgroup, so the cgroup sweep finds no candidates and pod restarts are not detected by this inode check; the idle identity GC below is what reclaims them (issue #7246).
+
 An independent idle identity GC task (`FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS`, default 30s) reclaims identities enrolled **without** a cgroup path. It evicts an identity only when its pod UID is no longer referenced by a live cookie record and its identity `Arc` has no other holder (`strong_count == 1`). This removes the identity-map entry; the per-pod policy scope is held in a separate slice-published map and changes only when a later accepted slice publishes a replacement. cgroup-bound identities are left to the cgroup-binding pass above.
 
 Set `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS=0` to disable only the cgroup-inode stat sweep. Set `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS=0` to disable lazy identity GC. Both tasks are best-effort GC, not security boundaries: the accept-path check on unknown socket cookies remains fail-closed regardless of sweep cadence.

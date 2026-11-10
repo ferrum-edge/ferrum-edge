@@ -43,8 +43,9 @@
 //! applies. There is no plaintext lane and no mesh-wide fallback while scoped
 //! enforcement applies.
 //!
-//! The scope comes from the SAME live-slice read that vouches the pod
-//! ([`crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver::policy_scope_for_pod`]),
+//! The scope comes from the SAME live-slice read that vouches the pod UID and
+//! principal
+//! ([`crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver::policy_scope_observation_for_pod_identity`]),
 //! so a workload that left the slice resolves to no scope and fails closed
 //! rather than borrowing a stale one.
 //!
