@@ -71,8 +71,9 @@ define_header_name_set! {
     ///   by the compression plugin to track the pre-compression encoding;
     ///   never forward to the backend.
     ///
-    /// - **`x-grpc-web-mode`:** internal grpc_web plugin marker used only between
-    ///   request header and body plugin phases; never forward to the backend.
+    /// - **`x-grpc-web-mode`:** reserved grpc_web name. The plugin keeps its
+    ///   mode in request metadata and never emits it; a client copy is never
+    ///   forwarded to the backend.
     ///
     /// - **`expect`:** the gateway has already satisfied the expectation. Hyper's
     ///   HTTP/1 *server* writes the interim `100 Continue` itself when the
