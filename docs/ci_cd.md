@@ -3080,7 +3080,10 @@ version = "<version>"
 
 **Release Process**:
 1. Record notable changes in `CHANGELOG.md` under `Unreleased`
-2. Update `Cargo.toml` version to the intended release version before tagging
+2. Update `Cargo.toml` version to the intended release version before tagging,
+   and set `openapi.yaml` `info.version` to the same value (the admin API is
+   versioned with the crate; the `openapi_info_version_matches_crate_version`
+   unit test fails when the two differ)
 3. Tag: `git tag v<version>` (matching the new version exactly)
 4. Release: GitHub Actions automatically builds and publishes
 
@@ -3121,7 +3124,7 @@ git tag v0.3.0
 
 ### Prerequisites
 
-- Modify `Cargo.toml` with new version
+- Modify `Cargo.toml` with new version, and `openapi.yaml` `info.version` to match
 - Move the relevant `CHANGELOG.md` entries from `Unreleased` to the new version heading
 - All nine publish-blocking required checks green for the exact `main` commit
   that will be tagged

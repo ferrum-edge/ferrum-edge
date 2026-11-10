@@ -192,7 +192,7 @@ info:
     unbounded header block per stream. A connection that neither delivers a new
     request nor holds one in flight for a whole
     `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` window is closed.
-  version: 0.2.0
+  version: 0.9.20
   license:
     name: PolyForm Noncommercial 1.0.0
     url: https://polyformproject.org/licenses/noncommercial/1.0.0
@@ -14423,7 +14423,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:ws_rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -14586,7 +14585,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:udp_rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -27441,67 +27439,7 @@ components:
                       minimum: 0
                       maximum: 65535
         trusted_hbone_assertors:
-          type: [array, "null"]
-          items:
-            oneOf:
-              - type: string
-                minLength: 1
-              - type: object
-                required: [assertor]
-                properties:
-                  assertor:
-                    type: string
-                    minLength: 1
-                    description: |
-                      Bare service-account name or full `spiffe://` SPIFFE ID
-                      identifying the peer this entry admits. Surrounding
-                      whitespace is trimmed before matching.
-                  asserts:
-                    type: [array, "null"]
-                    items:
-                      type: string
-                      minLength: 1
-                    description: |
-                      Exact SPIFFE IDs this assertor may assert and nothing
-                      else — the inventory of workloads it actually fronts. An
-                      empty array authorizes nothing. `null` is treated as
-                      absent. Mutually exclusive with `scope`.
-                  scope:
-                    type: [string, "null"]
-                    pattern: "^[ \t]*(same_namespace|mesh_wide)[ \t]*$"
-                    description: |
-                      Explicit grant contract. `same_namespace` (the default
-                      for every entry) permits only identities in the
-                      assertor's own Kubernetes namespace; `mesh_wide` requires
-                      `assertor` to be a full, exactly matched `spiffe://` ID,
-                      permits any identity that clears the trust-domain gate,
-                      and logs a warning at construction. Mutually exclusive
-                      with `asserts`. `null` is treated as absent. Surrounding
-                      spaces and tabs are trimmed before the value is compared,
-                      matching the `assertor` field's normalization; the
-                      pattern rather than an `enum` is what expresses that.
-                additionalProperties: false
-                allOf:
-                  # `asserts` and `scope` are mutually exclusive: the
-                  # constructor refuses an entry that sets both rather than
-                  # letting one silently win.
-                  - not:
-                      required: [asserts, scope]
-                  # `scope: mesh_wide` demands an exact `spiffe://` assertor.
-                  # A bare service-account matcher is namespace-blind, so
-                  # pairing it with a mesh-wide grant would admit any peer
-                  # whose SPIFFE path ends with that service-account name,
-                  # in any namespace, asserting any identity.
-                  - if:
-                      required: [scope]
-                      properties:
-                        scope:
-                          type: string
-                          pattern: "^[ \t]*mesh_wide[ \t]*$"
-                    then:
-                      properties:
-                        assertor:
-                          pattern: "^[ \t]*spiffe://"
+          $ref: '#/components/schemas/MeshTrustedHboneAssertors'
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -27519,6 +27457,94 @@ components:
             `ns/prod/sa/payments`. Baggage refused by the grant is dropped, the
             peer-cert identity is used instead, and the request is stamped
             `mesh_authz.ignored_baggage.assertion_out_of_scope=true`.
+    MeshTrustedHboneAssertors:
+      type: [array, "null"]
+      description: |
+        Trusted HBONE assertor allow-list shared by `mesh_authz`,
+        `workload_metrics`, and the injected
+        `_effective_mesh_authz_baggage_gates`. Both plugins admit it through one
+        parser, so this one schema is the contract for every copy. `null` (or
+        omission) selects the default `["ztunnel", "waypoint"]`; `[]` disables
+        baggage-derived identity entirely.
+
+        Whitespace is trimmed with Rust `str::trim` (Unicode `White_Space`)
+        before any comparison; the patterns spell that class out explicitly so
+        every JSON Schema regex dialect reads it the same way. A value that is
+        empty after trimming is refused.
+      items:
+        oneOf:
+          - $ref: '#/components/schemas/MeshTrustedHboneAssertors/$defs/assertor'
+          - type: object
+            required: [assertor]
+            additionalProperties: false
+            properties:
+              assertor:
+                $ref: '#/components/schemas/MeshTrustedHboneAssertors/$defs/assertor'
+              asserts:
+                type: [array, "null"]
+                items:
+                  type: string
+                  pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*spiffe://'
+                description: |
+                  Exact SPIFFE IDs this assertor may assert and nothing
+                  else — the inventory of workloads it actually fronts. An
+                  empty array authorizes nothing. `null` is treated as
+                  absent. Mutually exclusive with `scope`.
+              scope:
+                type: [string, "null"]
+                pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(same_namespace|mesh_wide)[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+                description: |
+                  Explicit grant contract. `same_namespace` (the default
+                  for every entry) permits only identities in the
+                  assertor's own Kubernetes namespace; `mesh_wide` requires
+                  `assertor` to be a full, exactly matched `spiffe://` ID,
+                  permits any identity that clears the trust-domain gate,
+                  and logs a warning at construction. Mutually exclusive
+                  with `asserts`. `null` is treated as absent. Surrounding
+                  whitespace is trimmed before the value is compared,
+                  matching the `assertor` field's normalization; the
+                  pattern rather than an `enum` is what expresses that.
+            allOf:
+              # `asserts` and `scope` are mutually exclusive: the constructor
+              # refuses an entry that sets both rather than letting one
+              # silently win. A `null` value counts as absent, so only two
+              # non-null values conflict.
+              - not:
+                  required: [asserts, scope]
+                  properties:
+                    asserts: {type: array}
+                    scope: {type: string}
+              # `scope: mesh_wide` demands an exact `spiffe://` assertor. A
+              # bare service-account matcher is namespace-blind, so pairing it
+              # with a mesh-wide grant would admit any peer whose SPIFFE path
+              # ends with that service-account name, in any namespace,
+              # asserting any identity.
+              - if:
+                  required: [scope]
+                  properties:
+                    scope:
+                      type: string
+                      pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*mesh_wide[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+                then:
+                  properties:
+                    assertor:
+                      pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*spiffe://'
+      $defs:
+        assertor:
+          type: string
+          # Non-blank after trimming, and either a `spiffe://` ID or a bare
+          # service-account name: anything else carrying `://` is a mistyped
+          # URI the constructor refuses rather than reading as a name.
+          pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+          anyOf:
+            - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*spiffe://'
+            - not:
+                pattern: '://'
+          description: |
+            Bare service-account name (matches any peer whose SPIFFE path ends
+            with `/sa/<name>`) or full `spiffe://` SPIFFE ID (matches exactly)
+            identifying the peer this entry admits. Surrounding whitespace is
+            trimmed before matching.
     MeshOutboundRegistryConfig:
       type: object
       description: |
@@ -28694,33 +28720,7 @@ components:
             type: string
           description: Additional SPIFFE trust domains accepted as equivalent to the workload's trust domain.
         trusted_hbone_assertors:
-          type: [array, "null"]
-          items:
-            oneOf:
-              - type: string
-              - type: object
-                required: [assertor]
-                properties:
-                  assertor:
-                    type: string
-                  asserts:
-                    type: [array, "null"]
-                    items:
-                      type: string
-                  scope:
-                    type: [string, "null"]
-                    pattern: '^\s*(same_namespace|mesh_wide)\s*$'
-                    description: |
-                      `mesh_wide` requires `assertor` to be a full, exactly
-                      matched `spiffe://` ID; bare service-account matchers are
-                      rejected.
-                additionalProperties: false
-                allOf:
-                  - not:
-                      required: [asserts, scope]
-                      properties:
-                        asserts: {type: array}
-                        scope: {type: string}
+          $ref: '#/components/schemas/MeshTrustedHboneAssertors'
           default: ["ztunnel", "waypoint"]
           description: |
             Allow-list of identity-asserting infrastructure components whose
@@ -28731,8 +28731,9 @@ components:
             empty array disables baggage-derived source attribution. Null
             selects the default, as does omission.
 
-            Identical schema and identical semantics to the `mesh_authz` field
-            of the same name — the two plugins share ONE relation, so telemetry
+            The same `MeshTrustedHboneAssertors` schema and the same semantics
+            as the `mesh_authz` field of the same name — the two plugins share
+            ONE parser and ONE relation, so telemetry
             attribution can never grant what authorization refused (issue
             #4274). Refused baggage is stamped
             `mesh.ignored_baggage=assertion_out_of_scope`.
@@ -29128,7 +29129,7 @@ components:
             additionalProperties: false
             properties:
               trusted_hbone_assertors:
-                $ref: '#/components/schemas/WorkloadMetricsConfig/properties/trusted_hbone_assertors'
+                $ref: '#/components/schemas/MeshTrustedHboneAssertors'
               trust_domain_aliases:
                 $ref: '#/components/schemas/WorkloadMetricsConfig/properties/trust_domain_aliases'
           description: |
@@ -32567,7 +32568,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -36614,7 +36614,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:graphql:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -36797,7 +36796,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
@@ -39103,7 +39101,6 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}"
           description: >-
             Key prefix for all Redis keys. Defaults to
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
