@@ -6038,7 +6038,15 @@ async fn post_login_redirects_require_a_trusted_origin() {
             "https://app.example.com:8443/admin",
             "https://app.example.com:8443/admin",
         ),
-        (OTHER_PORT, "https://app.example.com/admin", "/"),
+        // The `redirect_uri`'s own origin (`app.example.com:443`) is always
+        // trusted, whatever the explicit list names (issue #7147).
+        (
+            OTHER_PORT,
+            "https://app.example.com/admin",
+            "https://app.example.com/admin",
+        ),
+        (OTHER_PORT, "https://other.example.com/admin", "/"),
+        (HOST_ONLY, "https://other.example.com/admin", "/"),
     ] {
         let server = MockServer::start().await;
         let plugin = callback_plugin_with(&server, |config| {
@@ -6061,6 +6069,52 @@ async fn post_login_redirects_require_a_trusted_origin() {
             headers.get("location").map(String::as_str),
             Some(expected),
             "trusted={trusted:?} rd={target}"
+        );
+    }
+}
+
+/// Issue #7147: under the minimal config (no `trusted_redirect_hosts`, no
+/// redirect parameter) the deep link sealed at the challenge survives login,
+/// because the `redirect_uri`'s own origin is implicitly trusted. A sealed
+/// target on another port of the same host is a different origin and still
+/// lands on `post_login_default_path`.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn deep_links_on_the_callback_origin_survive_login_without_an_allowlist() {
+    for (host, expected) in [
+        ("app.example.com", "https://app.example.com/app/orders?id=7"),
+        ("app.example.com:8443", "/home"),
+    ] {
+        let server = MockServer::start().await;
+        let plugin = callback_plugin_with(&server, |config| {
+            let behavior = config["behavior"].as_object_mut().expect("behavior object");
+            behavior.remove("trusted_redirect_hosts");
+            behavior.remove("post_login_redirect_param");
+            behavior.insert("post_login_default_path".to_string(), json!("/home"));
+        })
+        .await;
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app/orders".into());
+        ctx.request_is_secure = true;
+        ctx.headers
+            .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers.insert("host".to_string(), host.to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        ctx.set_raw_query_string("id=7".to_string());
+        ctx.materialize_query_params();
+        let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+        let id_token = create_rs256_token(
+            &oidc_id_token_claims(&challenge),
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        );
+        mount_token_and_jwks(&server, &id_token).await;
+        let headers = assert_callback_redirect(
+            complete_callback(&plugin, &challenge, "authorization-code").await,
+        );
+        assert_eq!(
+            headers.get("location").map(String::as_str),
+            Some(expected),
+            "host={host}"
         );
     }
 }

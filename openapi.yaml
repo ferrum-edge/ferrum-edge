@@ -25929,7 +25929,7 @@ components:
               items:
                 type: string
                 minLength: 1
-              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo; anything else lands on post_login_default_path.
+              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo. The redirect_uri's own origin is always trusted; anything else lands on post_login_default_path.
             refresh_skew_secs:
               type: integer
               format: uint64

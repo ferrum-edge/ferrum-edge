@@ -1308,17 +1308,31 @@ impl OidcRelyingParty {
         // lowercase, a host-only entry binds the scheme's default port, and an
         // explicit `host:443` / `host:80` names that same default port
         // (PR6833-SOL-4). Anything that is not a bare authority is refused.
-        let callback_scheme = Url::parse(&redirect_uri)
-            .map_err(|e| format!("oidc_relying_party: `redirect_uri` is invalid: {e}"))?
-            .scheme()
-            .to_string();
-        let trusted_redirect_hosts =
+        let callback_url = Url::parse(&redirect_uri)
+            .map_err(|e| format!("oidc_relying_party: `redirect_uri` is invalid: {e}"))?;
+        let callback_scheme = callback_url.scheme().to_string();
+        let mut trusted_redirect_hosts =
             parse_behavior_string_array(behavior_obj, "trusted_redirect_hosts")?
                 .iter()
                 .map(|entry| normalize_trusted_redirect_origin(entry, &callback_scheme))
                 .collect::<Result<Vec<_>, _>>()?;
         if post_login_redirect_param.is_some() && trusted_redirect_hosts.is_empty() {
             return Err("oidc_relying_party: `behavior.trusted_redirect_hosts` is required when `post_login_redirect_param` is set".to_string());
+        }
+        // The callback's own origin is always a trusted post-login target
+        // (issue #7147): the browser is already on it, so returning there
+        // cannot widen the open-redirect surface, and without it a deep link
+        // sealed under the minimal config would always be discarded for
+        // `post_login_default_path`. Same `host:effective-port` form as the
+        // explicit entries.
+        if let (Some(host), Some(port)) = (
+            callback_url.host_str(),
+            callback_url.port_or_known_default(),
+        ) {
+            let callback_origin = format!("{host}:{port}");
+            if !trusted_redirect_hosts.contains(&callback_origin) {
+                trusted_redirect_hosts.push(callback_origin);
+            }
         }
         let refresh_skew_secs =
             optional_behavior_u64(behavior_obj, "refresh_skew_secs", DEFAULT_REFRESH_SKEW_SECS)?;
@@ -3196,7 +3210,8 @@ impl OidcRelyingParty {
     /// `behavior.trusted_redirect_hosts` entry by host *and* effective port —
     /// an entry without a port admits only the scheme's default port, and
     /// `host:port` admits exactly that port (`host:443` is the same origin as
-    /// `host` under `https`). Anything else lands on
+    /// `host` under `https`). The `redirect_uri`'s own origin is always in that
+    /// list (added at construction). Anything else lands on
     /// `behavior.post_login_default_path`.
     fn sanitize_redirect(&self, original: &str) -> String {
         let fallback = || self.behavior.post_login_default_path.clone();
