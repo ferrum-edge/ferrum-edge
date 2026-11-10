@@ -2267,7 +2267,8 @@ impl AiResponseGuard {
                 // address — cannot silently become "unchanged" and forward the
                 // original detected body (GHSA-pwcm-6rh8-f2gh). The instance
                 // discharges its own entry when it installs bytes;
-                // `on_final_response_body` rejects anything still outstanding.
+                // `finalize_client_visible_response_body` rejects anything
+                // still outstanding.
                 let replay = ctx.finalized_response_replay;
                 let state = ctx.plugin_state_mut();
                 state
@@ -4542,25 +4543,6 @@ impl Plugin for AiResponseGuard {
         self.discharge_pending_redaction(ctx, replacement)
     }
 
-    /// Context-free entry point. Without a request context there is no
-    /// route-effective ceiling, so it falls back to the process fail-closed
-    /// retained ceiling — still finite, just looser than the per-response one
-    /// production uses through the hook above.
-    async fn transform_response_body(
-        &self,
-        body: &[u8],
-        content_type: Option<&str>,
-        _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
-        self.redacted_response_body(
-            body,
-            content_type,
-            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
-            &mut Vec::new(),
-            &mut false,
-        )
-    }
-
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
         ctx.plugin_state().is_some_and(|state| {
             state
@@ -4706,20 +4688,6 @@ impl Plugin for AiResponseGuard {
             detected
         );
         self.undelivered_redaction_reject(ctx, detected)
-    }
-
-    /// Preserve the established final-body hook contract for direct callers.
-    /// The proxy skips this compatibility hook after it has invoked the
-    /// authoritative client-visible phase, so production performs one decision.
-    async fn on_final_response_body(
-        &self,
-        ctx: &mut RequestContext,
-        response_status: u16,
-        response_headers: &HashMap<String, String>,
-        body: &[u8],
-    ) -> PluginResult {
-        self.finalize_client_visible_response_body(ctx, response_status, response_headers, body)
-            .await
     }
 
     fn on_response_body_transformed(
@@ -5327,8 +5295,8 @@ impl AiResponseGuard {
     /// Clear this instance's promised-redaction marker when — and only when — a
     /// replacement was actually produced.
     ///
-    /// `None` leaves the marker outstanding, so `on_final_response_body` turns
-    /// it into a rejection instead of letting the original detected body be
+    /// `None` leaves the marker outstanding, so
+    /// `finalize_client_visible_response_body` turns it into a rejection instead of letting the original detected body be
     /// forwarded as "unchanged".
     fn discharge_pending_redaction(
         &self,
