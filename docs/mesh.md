@@ -2898,6 +2898,7 @@ Wildcard hosts (`*.example.com`) are supported via bucketed suffix matching. The
 
 - Supports A (IPv4) and AAAA (IPv6) queries.
 - EDNS(0) OPT pseudo-records are echoed when they fit.
+- Name lookup is ASCII case-insensitive, but a locally answered response copies the client's QNAME back byte-for-byte, so resolvers that randomise QNAME case (DNS 0x20, e.g. unbound `use-caps-for-id`) accept mesh answers. Cached responses are shared across case variants and re-stamped per query.
 - Locally synthesized UDP answers are clamped to the client's advertised payload size (or 512 bytes without EDNS). Matched upstream replies are forwarded whole after transaction-ID restoration; the local-answer clamp does not apply to them.
 - TCP fallback for large responses.
 - Concurrent query limiting via `FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES` (default 1024) using a semaphore.
