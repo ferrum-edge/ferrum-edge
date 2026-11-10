@@ -23454,10 +23454,7 @@ async fn run_bound_proxy_listener(
     run_accept_loop(
         listener,
         state,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Static { tls_config },
         conn_semaphore,
         shutdown,
         mesh_direction,
@@ -23813,10 +23810,7 @@ pub(crate) async fn start_proxy_listener_with_tls_and_accept_gate(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Static { tls_config },
         None,
         false,
         None,
@@ -23843,10 +23837,7 @@ pub async fn start_global_proxy_listener_with_tls_and_signal(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Static { tls_config },
         None,
         false,
         frontend_proxy_protocol,
@@ -23904,10 +23895,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_accept_gate(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Static { tls_config },
         mesh_direction,
         dual_stack,
         None,
@@ -24002,10 +23990,7 @@ pub(crate) async fn start_proxy_listener_with_dynamic_tls_and_accept_gate(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Dynamic {
-            slot: tls_slot,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Dynamic { slot: tls_slot },
         None,
         false,
         None,
@@ -24032,10 +24017,7 @@ pub async fn start_global_proxy_listener_with_dynamic_tls_and_signal(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Dynamic {
-            slot: tls_slot,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Dynamic { slot: tls_slot },
         None,
         false,
         frontend_proxy_protocol,
@@ -24086,7 +24068,6 @@ enum ListenerTlsSource {
     /// `Option<Arc<_>>` and performs no atomic read.
     Static {
         tls_config: Option<Arc<rustls::ServerConfig>>,
-        record_mesh_mtls_metric: bool,
     },
     /// Dynamic mesh inbound TLS loaded from the authoritative
     /// `ProxyState::mesh_inbound_tls_policy` on every accept so
@@ -24098,10 +24079,7 @@ enum ListenerTlsSource {
     /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) takes effect on the next
     /// handshake without restarting the listener. Existing in-flight TLS
     /// sessions keep their old `ServerConfig`.
-    Dynamic {
-        slot: crate::tls::SharedFrontendTls,
-        record_mesh_mtls_metric: bool,
-    },
+    Dynamic { slot: crate::tls::SharedFrontendTls },
 }
 
 impl ListenerTlsSource {
@@ -24132,18 +24110,10 @@ impl ListenerTlsSource {
         }
     }
 
+    /// Only mesh inbound listeners count mesh mTLS handshakes; the static
+    /// and dynamic HTTPS listeners never do.
     fn record_mesh_mtls_metric(&self) -> bool {
-        match self {
-            Self::Static {
-                record_mesh_mtls_metric,
-                ..
-            } => *record_mesh_mtls_metric,
-            Self::MeshInbound { .. } => true,
-            Self::Dynamic {
-                record_mesh_mtls_metric,
-                ..
-            } => *record_mesh_mtls_metric,
-        }
+        matches!(self, Self::MeshInbound { .. })
     }
 
     /// Whether this source REQUIRES a TLS config to serve a connection.
@@ -50297,31 +50267,28 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
         replay_headers.append(header_name, header_value);
     }
 
-    let (response, request_body_exceeded, streaming_h2_read_timeout_ms) =
-        boxed_proxy_to_backend_mesh_retry(
-            state,
-            proxy,
-            backend_url,
-            method,
-            headers,
-            Some(upstream_target),
-            Some(&body),
-            Some(&replay_headers),
-            dispatch_hbone,
-            plugins,
-            request_ctx,
-            false, // buffered response for the H3 plain writer
-            client_ip,
-            xff_append_ip,
-            request_is_secure,
-            &request_ctx.bytes_sent_observed,
-        )
-        .await;
-    h3_mesh_buffered_retry_response(
-        response,
-        request_body_exceeded,
-        streaming_h2_read_timeout_ms,
+    // The third element is the StreamingH2 relay read budget; a buffered H3
+    // response has no streaming follow-on to apply it to.
+    let (response, request_body_exceeded, _) = boxed_proxy_to_backend_mesh_retry(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        Some(upstream_target),
+        Some(&body),
+        Some(&replay_headers),
+        dispatch_hbone,
+        plugins,
+        request_ctx,
+        false, // buffered response for the H3 plain writer
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        &request_ctx.bytes_sent_observed,
     )
+    .await;
+    h3_mesh_buffered_retry_response(response, request_body_exceeded)
 }
 
 /// One H3 plain mesh helper future, heap-allocated so it is not a frame slot
@@ -50389,11 +50356,7 @@ pub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>(
 fn h3_mesh_buffered_retry_response(
     response: retry::BackendResponse,
     request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
-    streaming_h2_read_timeout_ms: u64,
 ) -> retry::BackendResponse {
-    // Copy so the target-effective deadline stays on this seam; buffered H3
-    // has no StreamingH2 follow-on that would consume it as a relay budget.
-    let _applied_read_timeout_ms = streaming_h2_read_timeout_ms;
     if !request_body_exceeded
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -81562,10 +81525,7 @@ mod tests {
     /// TLS, so the accept loop can correctly route to the plaintext handler.
     #[test]
     fn listener_tls_source_static_plaintext_does_not_require_tls() {
-        let source = ListenerTlsSource::Static {
-            tls_config: None,
-            record_mesh_mtls_metric: false,
-        };
+        let source = ListenerTlsSource::Static { tls_config: None };
         assert!(
             !source.requires_tls(),
             "Static listener with no TLS configured is the legitimate plaintext path"
@@ -81579,10 +81539,7 @@ mod tests {
     #[test]
     fn listener_tls_source_respects_mesh_plaintext_capability() {
         let slot = crate::tls::empty_frontend_tls_slot();
-        let dynamic = ListenerTlsSource::Dynamic {
-            slot,
-            record_mesh_mtls_metric: false,
-        };
+        let dynamic = ListenerTlsSource::Dynamic { slot };
         assert!(dynamic.requires_tls());
 
         let sidecar_dev = ListenerTlsSource::MeshInbound {
