@@ -2404,6 +2404,7 @@ The outer HBONE HTTP/2 transport is pooled (see [HBONE Outbound Pool](#hbone-out
 3. The published configuration no longer declares the route (deleted, re-bound, or recreated proxy, or keep-alive turned off).
 4. Credential expiry (the recorded deadline).
 5. Idle timeout — the effective `pool_idle_timeout_seconds`, floored at 15 s — or the checkout-time sweep.
+6. A native-gRPC dispatch on a nested HTTP/2 carrier failed before reaching the wire (a cancelled dispatch or an HTTP/2 protocol NACK): that carrier, and only that one, is evicted at the next checkout, so the retry opens or picks another instead of waiting for the dying connection to report closed.
 
 An HTTP/1.1 sender returns to the idle set **only** after a clean, fully consumed response (complete body, no error, no `Connection: close`, no cancel, no fired deadline); a streaming body carries its lease and drops it on any other terminal. An HTTP/2 sender whose connection ended (including after GOAWAY) is evicted.
 
