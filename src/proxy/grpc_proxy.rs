@@ -1743,7 +1743,23 @@ impl GrpcConnectionPool {
         });
         match acquired {
             Ok(sender) => Ok(sender),
-            Err(err) => {
+            // Only a `maxConnections` refusal (the creator's, or a coalesced
+            // waiter's rebuilt from `SharedPoolCreateKind::MaxConnections`)
+            // reuses an already-established shard, so a cap below the shard
+            // count converges on `cap` connections. Any other create failure
+            // (TLS, ALPN, refused connect, ...) surfaces, rather than being
+            // masked by a still-open sibling for as long as one lives — which
+            // would also answer a capability probe `Ok` for a target whose
+            // new connections fail (issue #7181).
+            Err(err)
+                if matches!(
+                    err,
+                    GrpcProxyError::BackendUnavailable {
+                        kind: GrpcBackendUnavailableKind::MaxConnections,
+                        ..
+                    }
+                ) =>
+            {
                 // Phase 2 (synchronous re-borrow): rebuild the pool key in
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
@@ -1769,6 +1785,7 @@ impl GrpcConnectionPool {
                     None => Err(err),
                 }
             }
+            Err(err) => Err(err),
         }
     }
 }
