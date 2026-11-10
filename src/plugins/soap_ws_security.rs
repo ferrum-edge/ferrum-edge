@@ -1018,7 +1018,8 @@ fn soap_string_array(
 
 /// Enum-valued array with an explicit default. Unknown members are rejected —
 /// dropping them used to be able to empty an allow-list or narrow it in ways
-/// the operator never asked for.
+/// the operator never asked for — and so is an empty array, so the result is
+/// never empty (every caller passes a non-empty default).
 fn soap_enum_array<T: Copy>(
     object: Option<&ConfigObject>,
     path: &str,
@@ -2114,14 +2115,6 @@ impl SoapWsSecurity {
             &[SignatureAlgorithm::RsaSha256],
         )?;
 
-        if x509_enabled && allowed_signature_algorithms.is_empty() {
-            return Err(
-                "soap_ws_security: x509_signature.allowed_algorithms must contain at least one of \
-                 `rsa-sha256` or `rsa-sha1` when x509_signature is enabled"
-                    .to_string(),
-            );
-        }
-
         let allowed_digest_algorithms: Vec<DigestAlgorithm> = soap_enum_array(
             x509_cfg,
             "config.x509_signature",
@@ -2129,14 +2122,6 @@ impl SoapWsSecurity {
             DIGEST_ALGORITHM_VARIANTS,
             &[DigestAlgorithm::Sha256],
         )?;
-
-        if x509_enabled && allowed_digest_algorithms.is_empty() {
-            return Err(
-                "soap_ws_security: x509_signature.allowed_digest_algorithms must contain at least \
-                 one of `sha256` or `sha1` when x509_signature is enabled"
-                    .to_string(),
-            );
-        }
 
         let require_signed_timestamp = soap_bool(
             x509_cfg,
@@ -2346,14 +2331,6 @@ impl SoapWsSecurity {
             &[SignatureAlgorithm::RsaSha256],
         )?;
 
-        if saml_enabled && saml_allowed_signature_algorithms.is_empty() {
-            return Err(
-                "soap_ws_security: saml.allowed_signature_algorithms must contain at least one of \
-                 `rsa-sha256` or `rsa-sha1` when SAML is enabled"
-                    .to_string(),
-            );
-        }
-
         let saml_allowed_digest_algorithms: Vec<DigestAlgorithm> = soap_enum_array(
             saml_cfg,
             "config.saml",
@@ -2361,14 +2338,6 @@ impl SoapWsSecurity {
             DIGEST_ALGORITHM_VARIANTS,
             &[DigestAlgorithm::Sha256],
         )?;
-
-        if saml_enabled && saml_allowed_digest_algorithms.is_empty() {
-            return Err(
-                "soap_ws_security: saml.allowed_digest_algorithms must contain at least one of \
-                 `sha256` or `sha1` when SAML is enabled"
-                    .to_string(),
-            );
-        }
 
         // ── Nonce / replay config ───────────────────────────────────────
         // Zero capacity used to be accepted and made replay detection inert
