@@ -18,8 +18,10 @@ Ferrum issue [#5714](https://github.com/ferrum-edge/ferrum-edge/issues/5714)
 
 ## The bug
 
-Ferrum sends every plain-`http` HTTP/1.1 backend request through reqwest, which
-uses hyper-util's legacy `Client`. For an HTTP/1 connection, the client hands
+Ferrum sends an HTTP/1.1 backend request through reqwest, which uses
+hyper-util's legacy `Client`, whenever the direct HTTP/1.1 pool does not take it
+(retry attempts, requests with pending body-plugin work, or
+`FERRUM_POOL_HTTP1_DIRECT=false`). For an HTTP/1 connection, the client hands
 the request to hyper's connection task over a tokio unbounded channel
 (`hyper::client::dispatch::Sender::try_send` → `UnboundedSender::send`). In
 tokio 1.52.3, `UnboundedSender::send` works in two steps:

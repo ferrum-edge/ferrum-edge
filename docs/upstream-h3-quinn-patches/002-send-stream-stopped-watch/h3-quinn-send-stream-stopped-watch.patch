@@ -2,7 +2,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 index 46df0115f..d43618457 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -331,6 +331,18 @@ where
+@@ -331,6 +331,19 @@ where
          self.send.send_id()
      }
  }
@@ -22,7 +22,7 @@ index 46df0115f..d43618457 100644
  impl<B> quic::SendStreamUnframed<B> for BidiStream<B>
  where
      B: Buf,
-@@ -518,6 +530,41 @@ where
+@@ -518,6 +531,41 @@ where
      }
  }
  
