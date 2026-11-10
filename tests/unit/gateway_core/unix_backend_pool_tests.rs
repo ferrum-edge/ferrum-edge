@@ -3697,3 +3697,74 @@ async fn a_lease_refused_by_the_handoff_gate_is_checked_back_in_untouched() {
     assert_eq!(stats.physical_connects, 1);
     assert_eq!(stats.hits, 1);
 }
+
+/// Issue #7182: the periodic idle sweep honours the per-proxy
+/// `pool_idle_timeout_seconds` the carrier was pooled under, exactly as
+/// checkout does. A proxy that disables idle expiry (`Some(0)`) keeps its
+/// carrier through a sweep that the global one-second timeout drives.
+#[tokio::test]
+async fn the_idle_sweep_honours_the_per_proxy_idle_timeout() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    // `idle_timeout_seconds: 1` gives the sweep its shortest interval.
+    let pool = pool(PoolConfig {
+        idle_timeout_seconds: 1,
+        ..PoolConfig::default()
+    });
+    let mut never_expires = test_proxy("unix-pool-idle-override");
+    never_expires.pool_idle_timeout_seconds = Some(0);
+    let other = test_proxy("unix-pool-idle-sweeper");
+
+    let lease = pool
+        .checkout_h1(
+            &never_expires,
+            socket.to_str().expect("utf-8"),
+            never_expires.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    pool.checkin_h1(lease);
+    assert_eq!(pool.stats().idle_h1_connections, 1);
+
+    // Past the sweep interval and past the GLOBAL timeout (idle age is whole
+    // Unix seconds and must be strictly greater than the timeout).
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+
+    // A checkout for a DIFFERENT identity runs the sweep without touching the
+    // pooled carrier's own slot.
+    let _sweeper = pool
+        .checkout_h1(
+            &other,
+            socket.to_str().expect("utf-8"),
+            other.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("sweeping checkout");
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        1,
+        "the sweep must not cut a per-proxy idle timeout to the global value"
+    );
+
+    let reused = pool
+        .checkout_h1(
+            &never_expires,
+            socket.to_str().expect("utf-8"),
+            never_expires.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert!(
+        reused.reused(),
+        "the carrier kept by the sweep is handed out"
+    );
+    expect_accepts(&peer, 2, "one dial per identity, no redial").await;
+}

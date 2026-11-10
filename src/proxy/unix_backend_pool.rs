@@ -568,6 +568,10 @@ mod imp {
         /// took this lease, captured at checkout so the check-in (which has no
         /// `Proxy`) applies the same decision the checkout did.
         keep_alive: bool,
+        /// The effective `pool_idle_timeout_seconds` for the dispatch that took
+        /// this lease, captured at checkout so the check-in (which has no
+        /// `Proxy`) can stamp it on the idle entry for the periodic sweep.
+        idle_timeout_seconds: u64,
         pub sender: UnixH1Sender,
     }
 
@@ -633,6 +637,12 @@ mod imp {
         sender: UnixH1Sender,
         admitted: AdmittedUnixSocket,
         last_used_at: AtomicU64,
+        /// The effective idle timeout (per-proxy override, else global) of the
+        /// dispatch that pooled this entry. The periodic sweep has no `Proxy`,
+        /// so it reads this instead of the global value; otherwise a longer
+        /// per-proxy timeout (or `0` = never) would be cut to the global one
+        /// (issue #7182).
+        idle_timeout_seconds: u64,
     }
 
     struct SharedH2c {
@@ -643,6 +653,8 @@ mod imp {
         sender: MeshMtlsSender,
         admitted: AdmittedUnixSocket,
         last_used_at: AtomicU64,
+        /// See [`IdleH1::idle_timeout_seconds`].
+        idle_timeout_seconds: u64,
     }
 
     /// The parts of a pooled entry the shared slot maintenance needs, so the
@@ -653,6 +665,7 @@ mod imp {
         fn generation(&self) -> &AtomicU64;
         fn admitted(&self) -> &AdmittedUnixSocket;
         fn last_used_at(&self) -> u64;
+        fn idle_timeout_seconds(&self) -> u64;
         fn is_closed(&self) -> bool;
     }
 
@@ -668,6 +681,9 @@ mod imp {
         }
         fn last_used_at(&self) -> u64 {
             self.last_used_at.load(Ordering::Relaxed)
+        }
+        fn idle_timeout_seconds(&self) -> u64 {
+            self.idle_timeout_seconds
         }
         fn is_closed(&self) -> bool {
             self.sender.is_closed()
@@ -686,6 +702,9 @@ mod imp {
         }
         fn last_used_at(&self) -> u64 {
             self.last_used_at.load(Ordering::Relaxed)
+        }
+        fn idle_timeout_seconds(&self) -> u64 {
+            self.idle_timeout_seconds
         }
         fn is_closed(&self) -> bool {
             self.sender.is_closed()
@@ -772,23 +791,20 @@ mod imp {
 
     /// Amortized sweep of one map: drop closed, expired, and
     /// identity-changed carriers, then reclaim slots that can no longer be
-    /// reached. Returns how many carriers were evicted.
+    /// reached. Returns how many carriers were evicted. Expiry uses each
+    /// entry's own effective idle timeout, as checkout does.
     ///
     /// Empty slots are always reclaimed. Config liveness is held once in the
     /// live-set snapshot, not repeated in an unbounded per-key tombstone map;
     /// generation fencing makes a late insertion safe even after its old slot
     /// has been reclaimed.
-    fn prune_slots<T: PooledEntry>(
-        map: &DashMap<UnixPoolKey, KeySlot<T>>,
-        idle_timeout: u64,
-        now: u64,
-    ) -> u64 {
+    fn prune_slots<T: PooledEntry>(map: &DashMap<UnixPoolKey, KeySlot<T>>, now: u64) -> u64 {
         let mut evicted = 0u64;
         map.retain(|_key, slot| {
             let before = slot.entries.len();
             slot.entries.retain(|entry| {
                 !entry.is_closed()
-                    && !entry_idle_expired(entry.last_used_at(), idle_timeout, now)
+                    && !entry_idle_expired(entry.last_used_at(), entry.idle_timeout_seconds(), now)
                     && entry
                         .admitted()
                         .still_names_checked_object()
@@ -2192,10 +2208,9 @@ mod imp {
                 return;
             }
 
-            let idle_timeout = self.pool_config.idle_timeout_seconds;
-            let evicted_h1 = prune_slots(&self.h1_idle, idle_timeout, now);
+            let evicted_h1 = prune_slots(&self.h1_idle, now);
             Self::note_pooled_removed(&self.idle_h1_gauge, evicted_h1);
-            let evicted_h2c = prune_slots(&self.h2c_carriers, idle_timeout, now);
+            let evicted_h2c = prune_slots(&self.h2c_carriers, now);
             Self::note_pooled_removed(&self.h2c_carrier_gauge, evicted_h2c);
             let evicted = evicted_h1.saturating_add(evicted_h2c);
             if evicted > 0 {
@@ -2326,6 +2341,7 @@ mod imp {
             // fences this lease out of the pool.
             let generation = self.publication_generation.load(Ordering::Acquire);
             let keep_alive = self.keep_alive_enabled(proxy);
+            let idle_timeout_seconds = self.idle_timeout_seconds(proxy);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
 
@@ -2346,6 +2362,7 @@ mod imp {
                 timeout_ms,
                 generation,
                 keep_alive,
+                idle_timeout_seconds,
                 before_register,
             )
             .await
@@ -2370,6 +2387,7 @@ mod imp {
             let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
             let generation = self.publication_generation.load(Ordering::Acquire);
             let keep_alive = self.keep_alive_enabled(proxy);
+            let idle_timeout_seconds = self.idle_timeout_seconds(proxy);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -2380,6 +2398,7 @@ mod imp {
                 timeout_ms,
                 generation,
                 keep_alive,
+                idle_timeout_seconds,
                 || std::future::ready(()),
             )
             .await
@@ -2394,6 +2413,7 @@ mod imp {
             timeout_ms: u64,
             generation: u64,
             keep_alive: bool,
+            idle_timeout_seconds: u64,
             before_register: F,
         ) -> Result<UnixH1Checkout, UnixBackendError>
         where
@@ -2459,6 +2479,7 @@ mod imp {
                 reused: false,
                 generation,
                 keep_alive,
+                idle_timeout_seconds,
                 sender,
             })
         }
@@ -2535,6 +2556,7 @@ mod imp {
                         reused: true,
                         generation,
                         keep_alive,
+                        idle_timeout_seconds: idle_timeout,
                         sender: entry.sender,
                     });
                     break;
@@ -2582,6 +2604,7 @@ mod imp {
                 reused: _,
                 generation,
                 keep_alive,
+                idle_timeout_seconds,
                 sender,
             } = checkout;
             // Keep-alive off: the carrier served its one exchange and is
@@ -2630,6 +2653,7 @@ mod imp {
                     sender,
                     admitted,
                     last_used_at: AtomicU64::new(unix_secs()),
+                    idle_timeout_seconds,
                 });
                 // The shard guard is released HERE, before the second fence
                 // read: the release/acquire pair on that shard is what orders a
@@ -2912,6 +2936,7 @@ mod imp {
                     sender: sender.clone(),
                     admitted,
                     last_used_at: AtomicU64::new(unix_secs()),
+                    idle_timeout_seconds: self.idle_timeout_seconds(proxy),
                 });
                 // Shard guard released before the second fence read, as in
                 // `checkin_h1_fenced`.

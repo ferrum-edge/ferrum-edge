@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **The Unix-socket backend pool's idle sweep honours per-proxy
+  `pool_idle_timeout_seconds`** (#7182). Checkout already applied the
+  per-proxy override, but the periodic sweep evicted every pooled HTTP/1.1
+  and h2c carrier with the global `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`, so a
+  longer per-proxy timeout (or `0`, never) was cut to the global value. Each
+  pooled carrier now records the effective timeout it was pooled under and
+  the sweep uses it.
 - **A pipelined conflicting-`Content-Length` request no longer fails the
   valid HTTP/1 requests queued ahead of it when the TCP read splits its head**
   (#7179). The frontend framing guard decided whether to stop observing
