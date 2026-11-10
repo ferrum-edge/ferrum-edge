@@ -73,6 +73,20 @@ pub const MAX_BATCH_WIRE_BYTES: usize = 16 * 1024;
 /// datagram is 2 wire bytes, so the byte bound alone would admit 8,192).
 pub const MAX_BATCH_DATAGRAMS: usize = 1024;
 
+/// Largest framed wire size one [`FrameBatch`] can reach, and therefore its
+/// up-front buffer reservation. A batch either holds following datagrams up to
+/// [`MAX_BATCH_WIRE_BYTES`], or one first datagram of up to
+/// [`MAX_FRAME_PAYLOAD`] bytes that already exceeds that bound (nothing joins
+/// it afterwards), so the larger of the two is the ceiling — never their sum.
+pub const MAX_BATCH_BUFFER_BYTES: usize = if MAX_BATCH_WIRE_BYTES > MAX_FRAME_WIRE_BYTES {
+    MAX_BATCH_WIRE_BYTES
+} else {
+    MAX_FRAME_WIRE_BYTES
+};
+
+/// Framed wire size of one maximal datagram.
+const MAX_FRAME_WIRE_BYTES: usize = LEN_PREFIX + MAX_FRAME_PAYLOAD;
+
 /// Bounded batch of framed datagrams destined for ONE tunnel write.
 ///
 /// Callers drain only already-ready datagrams into it (`try_recv` on a queue or
@@ -108,11 +122,11 @@ pub enum BatchWriteFailureKind {
 }
 
 impl FrameBatch {
-    /// A batch pre-sized for `MAX_BATCH_WIRE_BYTES` plus one maximal datagram,
-    /// so steady-state batching never reallocates.
+    /// A batch pre-sized for the largest wire size it can hold
+    /// ([`MAX_BATCH_BUFFER_BYTES`]), so steady-state batching never reallocates.
     pub fn new() -> Self {
         Self {
-            buf: BytesMut::with_capacity(MAX_BATCH_WIRE_BYTES + LEN_PREFIX + MAX_FRAME_PAYLOAD),
+            buf: BytesMut::with_capacity(MAX_BATCH_BUFFER_BYTES),
             ends: Vec::with_capacity(64),
             payload_bytes: 0,
         }
