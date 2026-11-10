@@ -1409,9 +1409,31 @@ fn test_execute_health_rejects_503_with_200_ok_body() {
     );
     let err = result.expect_err("503 with '200 OK' body must be unhealthy");
     assert!(
-        err.contains("503"),
-        "error should report the real status line, got: {err}"
+        err.contains("HTTP status 503"),
+        "error should report the real status code, got: {err}"
     );
+}
+
+/// The `health` command prints its error through the startup renderer, which
+/// withholds quoted spans. The numeric status must survive that rendering so
+/// an operator can tell 503 from 401/404/500 (issue #7229).
+#[test]
+fn test_execute_health_rendered_error_keeps_numeric_status() {
+    for (response, code) in [
+        (
+            &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"[..],
+            "503",
+        ),
+        (
+            &b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"[..],
+            "401",
+        ),
+    ] {
+        let (result, _) = run_health_against_response(false, response);
+        let err = result.expect_err("a non-200 status must be unhealthy");
+        let rendered = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(err), &[]);
+        assert_eq!(rendered, format!("Unhealthy: HTTP status {code}"));
+    }
 }
 
 #[test]
@@ -1473,7 +1495,7 @@ fn test_execute_health_uses_final_non200_after_informational_response() {
           HTTP/1.1 503 Service Unavailable\r\nContent-Length: 6\r\n\r\n200 OK",
     );
     let error = result.expect_err("the final 503 must be unhealthy");
-    assert!(error.contains("503 Service Unavailable"), "{error}");
+    assert!(error.contains("HTTP status 503"), "{error}");
 }
 
 #[test]
@@ -1484,7 +1506,7 @@ fn test_execute_health_treats_101_as_final_unhealthy_response() {
           HTTP/1.1 200 OK\r\n\r\n",
     );
     let error = result.expect_err("101 must not be skipped in search of a later 200");
-    assert!(error.contains("101 Switching Protocols"), "{error}");
+    assert!(error.contains("HTTP status 101"), "{error}");
 }
 
 #[test]
