@@ -9774,31 +9774,10 @@ where
             // Always try IPv6 cleanup: an earlier process/config may have
             // created ip6tables chains even when the current plan has none.
             let include_v6_cleanup = true;
-            let udp_capture_enabled = config.capture_config.udp_capture_enabled;
 
-            // The node-agent runs in the HOST netns, where the UDP TPROXY
-            // `addrtype --dst-type LOCAL` direction split is wrong (pod IPs are
-            // FORWARDED, not LOCAL), so `udp_tproxy_commands_for_family` emits NO
-            // UDP TPROXY rules for `host_netns`. Surface that explicitly so an
-            // operator who set FERRUM_MESH_CAPTURE_UDP_ENABLED=true on the
-            // node-agent is not silently left thinking UDP is captured: node-agent
-            // host-netns UDP capture is unsupported in this stage and eBPF does NOT
-            // cover UDP either (the connect()-cgroup hooks are TCP-only). UDP
-            // capture lives in the injector's pod-netns path; node-agent /
-            // node-waypoint UDP capture is a future stage.
-            if udp_capture_enabled && config.capture_config.host_netns {
-                warn!(
-                    "FERRUM_MESH_CAPTURE_UDP_ENABLED=true, but the node-agent installs no UDP \
-                     TPROXY rules: it has no UDP listener, and capture rules without a socket \
-                     are a black hole. This is expected — UDP capture is owned by the mesh \
-                     proxy. For Ambient, set FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
-                     on the ambient proxy to use the host-network capture path (per-pod \
-                     ingress-interface scoping), or leave it unset to use the per-pod-netns \
-                     producer; for Sidecar, the injector's init container installs the \
-                     pod-netns rules. eBPF capture does NOT cover UDP either (the \
-                     connect()-cgroup hooks are TCP-only). TCP capture is unaffected."
-                );
-            }
+            // The fallback never captures UDP: only the Ambient topology enables
+            // it, and `run` refuses this fallback for Ambient (#7254). Host-netns
+            // UDP TPROXY is unsupported anyway (pod IPs are FORWARDED, not LOCAL).
 
             // UNCONDITIONAL pre-setup teardown of the EXACT Ferrum-owned UDP TPROXY
             // state, regardless of the CURRENT `udp_capture_enabled` flag (codex
@@ -9829,7 +9808,7 @@ where
 
             let setup = setup_commands_for_plan(&plan);
             if let Err(setup_err) = execute(setup, "setup").await {
-                let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
+                let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
                 if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
                     warn!(
                         error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
@@ -9846,7 +9825,7 @@ where
             wait_for_shutdown(shutdown_tx).await;
 
             info!("Shutdown signal received, cleaning up iptables rules");
-            let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
+            let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
             if let Err(e) = execute(cleanup, "cleanup").await {
                 warn!(error = %crate::startup::sanitize_startup_scalar(&e), "Failed to clean up iptables fallback rules");
             }
@@ -9904,20 +9883,17 @@ fn setup_commands_for_plan(plan: &IptablesPlan) -> Vec<String> {
     commands
 }
 
-fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec<String> {
-    // `udp_capture_enabled` gates the UDP TPROXY teardown (mangle chains + the
-    // Ferrum-owned `ip rule`/`ip route`): when this node never installs UDP
-    // capture, cleanup must not touch routing state it never created (codex r1).
-    //
-    // The cleanup is split into the iptables-TABLE teardown and the RAW `ip`
-    // routing teardown. The IPv4 routing teardown is already emitted
-    // unconditionally (raw `ip`, no iptables dependency).
-    let v4 = IptablesPlan::cleanup_split(udp_capture_enabled);
+/// TCP-capture teardown for the iptables fallback. The fallback never installs
+/// UDP capture: `NodeAgentConfig::from_env_config` enables it only for the
+/// Ambient topology, and `run` refuses the fallback for Ambient (#7254). Stale
+/// UDP state from an earlier run is reaped by [`udp_pre_setup_teardown_commands`].
+fn cleanup_commands_for_plan(include_v6: bool) -> Vec<String> {
+    let v4 = IptablesPlan::cleanup_split();
     let mut commands = v4.iptables;
     commands.extend(v4.ip_routing);
     if include_v6 {
-        let v6 = IptablesPlan::cleanup_v6_split(udp_capture_enabled);
-        // Only the ip6tables-TABLE teardown is guarded behind an `ip6tables`
+        let v6 = IptablesPlan::cleanup_v6_split();
+        // The ip6tables-TABLE teardown is guarded behind an `ip6tables`
         // availability probe — stale v6 chains from an earlier config should not
         // make node-agent fallback cleanup fail when `ip6tables` is absent.
         commands.extend(
@@ -9925,11 +9901,6 @@ fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec
                 .iter()
                 .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
         );
-        // The RAW `ip -6` routing teardown (fwmark rule + local route) is emitted
-        // UNCONDITIONALLY — `ip -6` does not depend on `ip6tables`, so gating it on
-        // the probe would leak the rule/route and keep diverting marked UDP after
-        // shutdown when `ip6tables` is missing (codex r3). It carries its own
-        // best-effort `|| true`.
         commands.extend(v6.ip_routing);
     }
     commands
@@ -14420,7 +14391,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_try_ipv6_teardown_when_ip6tables_disabled() {
-        let commands = cleanup_commands_for_plan(true, false);
+        let commands = cleanup_commands_for_plan(true);
 
         assert!(
             commands.iter().any(|cmd| cmd.contains("ip6tables")),
@@ -14436,7 +14407,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_wrap_required_ipv6_teardown_best_effort() {
-        let commands = cleanup_commands_for_plan(true, false);
+        let commands = cleanup_commands_for_plan(true);
 
         assert!(
             commands
@@ -14453,13 +14424,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_emits_v6_ip_routing_unconditionally_not_ip6tables_gated() {
+    fn udp_teardown_emits_v6_ip_routing_unconditionally_not_ip6tables_gated() {
         // codex r3: the raw `ip -6 rule/route del` UDP routing teardown must be
         // emitted UNCONDITIONALLY (NOT wrapped in the `ip6tables` availability
         // probe) — `ip -6` can remove the fwmark rule + local route even when
         // `ip6tables` is missing, so gating it would leak routing state and keep
-        // marked UDP diverting after shutdown.
-        let commands = cleanup_commands_for_plan(true, true);
+        // marked UDP diverting after shutdown. The fallback's shutdown cleanup
+        // carries no UDP state (#7254); the pre-setup teardown owns it.
+        let commands = udp_pre_setup_teardown_commands(true);
 
         // The v6 `ip -6 rule del`/`ip -6 route del` must appear as standalone
         // commands, NOT embedded inside an `if command -v ip6tables` wrapper.
