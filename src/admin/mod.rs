@@ -3304,7 +3304,9 @@ async fn handle_admin_request_inner(
                     "status": "connected",
                     "type": db.db_type()
                 });
-                if let Some(stats) = db.pool_stats() {
+                // Pool stats are authenticated detail (issue #7216): built
+                // only for the detailed tier, never for an anonymous probe.
+                if detailed && let Some(stats) = db.pool_stats() {
                     db_info["pool"] = serde_json::to_value(&stats).unwrap_or_else(|_| json!(null));
                 }
                 health_status["database"] = db_info;
@@ -3326,7 +3328,10 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        if let Some(db) = &state.db {
+        // Failover topology and admission fences are authenticated detail and
+        // change neither `status` nor `ready`, so they are built only for the
+        // detailed tier (issue #7216).
+        if detailed && let Some(db) = &state.db {
             let topology = db.failover_topology_status();
             if !topology.primary_active {
                 let mut failover = json!({
@@ -3356,31 +3361,29 @@ async fn handle_admin_request_inner(
 
             // Process-local mTLS DNS admission fences (issue #7031). Present
             // only while at least one namespace is fenced; authenticated
-            // detail tier only, like `failover_topology`. Built only for the
-            // detailed tier: the snapshot walks the store's fence registry, so
-            // unauthenticated (minimal) and tenant probes must never pay for
-            // it. Does not change `status`/`ready`: reconnect/failover stay
-            // available and only the fenced namespaces' admissions fail closed.
-            if detailed {
-                let fence = db.mtls_dns_admission_fence_status();
-                if fence.fenced() {
-                    let mut fence_info = json!({
-                        "fenced": true,
-                        "retained_fences": fence.retained_fences,
-                        "namespaces": fence.namespaces,
-                    });
-                    if let Some(since) = fence.oldest_retained_since_unix_ms {
-                        fence_info["oldest_retained_since_unix_ms"] = json!(since);
+            // detail tier only, like `failover_topology`. The snapshot walks
+            // the store's fence registry, so unauthenticated (minimal) and
+            // tenant probes must never pay for it. Does not change
+            // `status`/`ready`: reconnect/failover stay available and only the
+            // fenced namespaces' admissions fail closed.
+            let fence = db.mtls_dns_admission_fence_status();
+            if fence.fenced() {
+                let mut fence_info = json!({
+                    "fenced": true,
+                    "retained_fences": fence.retained_fences,
+                    "namespaces": fence.namespaces,
+                });
+                if let Some(since) = fence.oldest_retained_since_unix_ms {
+                    fence_info["oldest_retained_since_unix_ms"] = json!(since);
+                }
+                match health_status.get_mut("database") {
+                    Some(serde_json::Value::Object(map)) => {
+                        map.insert("mtls_dns_admission_fence".to_string(), fence_info);
                     }
-                    match health_status.get_mut("database") {
-                        Some(serde_json::Value::Object(map)) => {
-                            map.insert("mtls_dns_admission_fence".to_string(), fence_info);
-                        }
-                        _ => {
-                            health_status["database"] = json!({
-                                "mtls_dns_admission_fence": fence_info
-                            });
-                        }
+                    _ => {
+                        health_status["database"] = json!({
+                            "mtls_dns_admission_fence": fence_info
+                        });
                     }
                 }
             }
@@ -3618,18 +3621,21 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        // Report cached config availability for resilience visibility
-        if let Some(config) = state.cached_gateway_config() {
-            health_status["cached_config"] = json!({
-                "available": true,
-                "loaded_at": config.loaded_at.to_rfc3339(),
-                "proxy_count": config.proxies.len(),
-                "consumer_count": config.consumers.len(),
-            });
-        } else {
-            health_status["cached_config"] = json!({
-                "available": false
-            });
+        // Report cached config availability for resilience visibility.
+        // Authenticated detail only (issue #7216): it never changes `status`.
+        if detailed {
+            if let Some(config) = state.cached_gateway_config() {
+                health_status["cached_config"] = json!({
+                    "available": true,
+                    "loaded_at": config.loaded_at.to_rfc3339(),
+                    "proxy_count": config.proxies.len(),
+                    "consumer_count": config.consumers.len(),
+                });
+            } else {
+                health_status["cached_config"] = json!({
+                    "available": false
+                });
+            }
         }
 
         if (state.mode == "database" || state.mode == "cp")
@@ -3640,40 +3646,48 @@ async fn handle_admin_request_inner(
             // reload-latency signal only: a disconnected or degraded watcher
             // never forces `status: degraded`, because periodic polling remains
             // authoritative and keeps applying committed changes.
-            let change_stream = snapshot.change_stream.clone();
-            if let Some(degraded) = snapshot.degraded {
+            //
+            // A degraded poll loop degrades the coarse `status` for every
+            // tier; the `database_polling` object itself is authenticated
+            // detail and is built only for the detailed tier (issue #7216).
+            if snapshot.degraded.is_some() {
                 health_status["status"] = json!("degraded");
-                let mut polling = json!({
-                    "status": "degraded",
-                    "reason": degraded.reason,
-                    "resource_category": degraded.resource_category,
-                    "validation_category": degraded.validation_category,
-                    "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
-                    "current_backoff_bucket": degraded.current_backoff_bucket,
-                    "current_backoff_seconds": degraded.current_backoff_seconds,
-                    "escalated": degraded.escalated,
-                });
-                if let Some(at) = snapshot.last_poll_completed_at {
-                    polling["last_poll_completed_at"] = json!(at);
-                }
-                health_status["database_polling"] = polling;
-            } else {
-                let mut polling = json!({
-                    "status": "ok",
-                    "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
-                    "current_backoff_bucket": snapshot.current_backoff_bucket,
-                    "current_backoff_seconds": snapshot.current_backoff_seconds,
-                });
-                if let Some(at) = snapshot.last_poll_completed_at {
-                    polling["last_poll_completed_at"] = json!(at);
-                }
-                health_status["database_polling"] = polling;
             }
-            if let Some(change_stream) = change_stream
-                && let Ok(value) = serde_json::to_value(&change_stream)
-                && let Some(polling) = health_status.get_mut("database_polling")
-            {
-                polling["change_stream"] = value;
+            if detailed {
+                let change_stream = snapshot.change_stream.clone();
+                if let Some(degraded) = snapshot.degraded {
+                    let mut polling = json!({
+                        "status": "degraded",
+                        "reason": degraded.reason,
+                        "resource_category": degraded.resource_category,
+                        "validation_category": degraded.validation_category,
+                        "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
+                        "current_backoff_bucket": degraded.current_backoff_bucket,
+                        "current_backoff_seconds": degraded.current_backoff_seconds,
+                        "escalated": degraded.escalated,
+                    });
+                    if let Some(at) = snapshot.last_poll_completed_at {
+                        polling["last_poll_completed_at"] = json!(at);
+                    }
+                    health_status["database_polling"] = polling;
+                } else {
+                    let mut polling = json!({
+                        "status": "ok",
+                        "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
+                        "current_backoff_bucket": snapshot.current_backoff_bucket,
+                        "current_backoff_seconds": snapshot.current_backoff_seconds,
+                    });
+                    if let Some(at) = snapshot.last_poll_completed_at {
+                        polling["last_poll_completed_at"] = json!(at);
+                    }
+                    health_status["database_polling"] = polling;
+                }
+                if let Some(change_stream) = change_stream
+                    && let Ok(value) = serde_json::to_value(&change_stream)
+                    && let Some(polling) = health_status.get_mut("database_polling")
+                {
+                    polling["change_stream"] = value;
+                }
             }
         }
 
@@ -3712,11 +3726,14 @@ async fn handle_admin_request_inner(
             health_status["config_rejected"] = json!(true);
         }
 
-        if state
-            .proxy_state
-            .as_ref()
-            .is_some_and(|ps| ps.config.load_full().mesh.is_some())
-            || state.mode == "mesh"
+        // Mesh egress-scope / config-stream detail never changes `status`, so
+        // it is built only for the detailed tier (issue #7216).
+        if detailed
+            && (state
+                .proxy_state
+                .as_ref()
+                .is_some_and(|ps| ps.config.load().mesh.is_some())
+                || state.mode == "mesh")
         {
             let egress_health = state
                 .mesh_runtime_state
@@ -5548,10 +5565,13 @@ async fn handle_admin_request_inner(
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
-        // Live-apply cursor status (issue #4139). Operator-gated like the
-        // other convergence/status surfaces: it discloses only change-log
-        // sequence numbers and topology epochs — no resource data — and is
-        // how a `?apply=async` bulk client proves its writes are live. Not
+        // Live-apply cursor status (issue #4139). Operator-gated, as the role
+        // table in `docs/admin_api.md` lists it, unlike the read-only viewer
+        // introspection routes (`/cluster`, `/mesh/config-drift`,
+        // `/mesh/slice-drift`, `/mesh/federation`; issue #7216). It discloses
+        // only change-log sequence numbers and topology epochs — no resource
+        // data — and is how a `?apply=async` bulk client proves its writes are
+        // live. Not
         // namespace-scoped: cursors are process-topology values, not
         // tenant-addressed resources (writes to non-served namespaces never
         // mint one).

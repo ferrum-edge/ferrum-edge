@@ -1643,9 +1643,15 @@ fn health_builds_admission_fence_snapshot_only_in_the_detailed_tier() {
         "exactly one admin call site may snapshot mTLS DNS admission fences"
     );
     let at = ADMIN_SOURCE.find(call).expect("fence snapshot call site");
+    // Issue #7216 moved the gate up to the whole failover/fence block.
+    let gate = "if detailed && let Some(db) = &state.db {";
+    let gate_at = ADMIN_SOURCE[..at]
+        .rfind(gate)
+        .expect("the fence snapshot must follow the `detailed` database-detail gate");
+    let gated = &ADMIN_SOURCE[gate_at + gate.len()..at];
     assert!(
-        ADMIN_SOURCE[..at].ends_with("if detailed {\n                let fence = "),
-        "the fence snapshot must be the first statement of an `if detailed` block"
+        gated.matches('{').count() >= gated.matches('}').count(),
+        "the fence snapshot must stay inside the `if detailed` block"
     );
     let health = ADMIN_SOURCE
         .find("if path == \"/health\" || path == \"/status\" {")
