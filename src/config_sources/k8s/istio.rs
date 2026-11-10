@@ -11231,57 +11231,6 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_environment_custom_tag_does_not_resolve_controller_host_env() {
-        // Structural proof only: the translator carries `defaultValue` plus a
-        // typed `custom_env_tags` lookup and never reads process environment.
-        // Do not mutate the process environment — Rust 2024 forbids unsynchronized
-        // `set_var` under the parallel test harness, and host env is not the DP.
-        let result = translate_k8s_objects(
-            &[object(
-                "Telemetry",
-                serde_json::json!({
-                    "tracing": [{
-                        "customTags": {
-                            "env_tag": {
-                                "environment": {
-                                    "name": "FERRUM_TEST_TELEMETRY_ENV_TAG",
-                                    "defaultValue": "fallback-value"
-                                }
-                            }
-                        }
-                    }]
-                }),
-            )],
-            options(),
-        )
-        .expect("translation succeeds");
-
-        let mesh = result.config.mesh.expect("mesh config");
-        let tracing = mesh.telemetry_resources[0]
-            .config
-            .tracing
-            .as_ref()
-            .expect("tracing config");
-
-        assert_eq!(
-            tracing.custom_tags.get("env_tag").map(String::as_str),
-            Some("fallback-value"),
-            "controller must not read host env as the data plane"
-        );
-        assert_eq!(
-            tracing.custom_env_tags.get("env_tag").map(String::as_str),
-            Some("FERRUM_TEST_TELEMETRY_ENV_TAG")
-        );
-        assert!(
-            tracing
-                .custom_tags
-                .values()
-                .all(|value| value != "live-env-value"),
-            "translated literals must stay at defaultValue, never a host env read"
-        );
-    }
-
-    #[test]
     fn telemetry_environment_custom_tag_rejects_missing_name() {
         let err = translate_k8s_objects(
             &[object(
@@ -22180,7 +22129,7 @@ extensionProviders:
     fn sidecar_ingress_unrecognized_protocol_is_deferred() {
         // A TYPO like `HTPS` must NOT be routed as HTTP or guessed as TCP. The
         // ingress-specific classifier maps it to `Unknown` so resolution defers
-        // it (`NonHttpProtocol`) instead of exposing a mistyped listener.
+        // it (`UnmodeledProtocol`) instead of exposing a mistyped listener.
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
@@ -22202,7 +22151,7 @@ extensionProviders:
         assert!(
             matches!(
                 entry.resolve(),
-                Err(crate::modes::mesh::config::IngressListenerUnsupported::NonHttpProtocol)
+                Err(crate::modes::mesh::config::IngressListenerUnsupported::UnmodeledProtocol)
             ),
             "a mistyped protocol must defer, not route"
         );

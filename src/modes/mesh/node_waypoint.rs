@@ -36,10 +36,12 @@
 //! Per-pod policy scope is part of the SAME slice generation as the identity
 //! gate: the accept path receives `(identity, scope)` from one `resolve_*`
 //! call (one slice load). The HTTP/HBONE request path re-derives scope per
-//! request via [`NodeWaypointIdentityResolver::policy_scope_for_pod`] — one
-//! `ArcSwap::load` then a `scopes_by_pod_uid` lookup — so a workload whose
-//! SPIFFE hash is unchanged but whose scope changed is served the scope from the
-//! very generation that re-vouched for it. Keying scope by pod UID (not SPIFFE)
+//! request via [`NodeWaypointIdentityResolver::current_policy_scope_for_identity`]
+//! — one `ArcSwap::load`, a re-check that the generation still vouches the
+//! identity (issue #6800), then a `scopes_by_pod_uid` lookup — so a workload
+//! whose SPIFFE hash is unchanged but whose scope changed is served the scope
+//! from the very generation that re-vouched for it, and a withdrawn workload
+//! stops being served. Keying scope by pod UID (not SPIFFE)
 //! means pods that share a service account but carry different labels are scoped
 //! independently.
 //! The slice is published as one atomic `ArcSwap` store on slice apply; nothing
@@ -1351,7 +1353,8 @@ impl NodeWaypointIdentityResolver {
     /// scope from the very generation that vouched for it, satisfying the "never
     /// partial" reload invariant. The scope is returned to the caller (the TCP
     /// accept path captures it once at accept; the HTTP path re-queries per
-    /// request via [`Self::policy_scope_for_pod`], itself a single slice load).
+    /// request via [`Self::current_policy_scope_for_identity`], itself a single
+    /// slice load).
     fn resolve_record(
         &self,
         cookie: u64,

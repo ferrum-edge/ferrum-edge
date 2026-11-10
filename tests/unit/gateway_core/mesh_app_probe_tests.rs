@@ -548,3 +548,96 @@ fn loopback_probe_verifier_advertises_the_client_providers_schemes() {
     );
     assert_eq!(advertised, vec![mapping[0].0]);
 }
+
+// ── httpGet `Host` override (issue #7242) ───────────────────────────────
+
+/// Accept one probe connection, read its request head, answer `200`, and
+/// return the head as sent on the wire.
+async fn serve_one_probe_request(listener: tokio::net::TcpListener) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut stream, _) = listener.accept().await.expect("accept probe");
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut buf).await.expect("read probe request");
+        assert!(read > 0, "probe closed before sending a full request head");
+        head.extend_from_slice(&buf[..read]);
+    }
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        .await
+        .expect("write probe response");
+    String::from_utf8(head).expect("request head is UTF-8")
+}
+
+/// A `Host` entry in `httpHeaders` replaces the default `Host` (from
+/// `httpGet.host` or `127.0.0.1`) instead of adding a second `Host` field,
+/// which an RFC 9112 server must reject with 400. As for kubelet, the first
+/// recorded `Host` entry wins; other headers are still sent.
+#[tokio::test]
+async fn an_http_headers_host_entry_replaces_the_default_host() {
+    use ferrum_edge::modes::mesh::app_probe::AppProbeHeader;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind app fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let app = tokio::spawn(serve_one_probe_request(listener));
+
+    let mut targets = std::collections::BTreeMap::new();
+    targets.insert(
+        app_probe_key("app", "readinessProbe"),
+        AppProbeSpec::from_http_get(
+            AppProbeHttpGet {
+                path: "/ready".to_string(),
+                port,
+                scheme: AppProbeScheme::Http,
+                host: Some("spec-host.example".to_string()),
+                http_headers: vec![
+                    AppProbeHeader {
+                        name: "Host".to_string(),
+                        value: "app.example".to_string(),
+                    },
+                    AppProbeHeader {
+                        name: "X-Probe".to_string(),
+                        value: "1".to_string(),
+                    },
+                    AppProbeHeader {
+                        name: "host".to_string(),
+                        value: "second.example".to_string(),
+                    },
+                ],
+            },
+            DEFAULT_PROBE_TIMEOUT_SECONDS,
+        ),
+    );
+    let server = AppProbeServer::new(targets);
+    assert_eq!(
+        server
+            .handle_request(&Method::GET, &app_probe_path("app", "readinessProbe"))
+            .await,
+        StatusCode::OK
+    );
+
+    let head = tokio::time::timeout(std::time::Duration::from_secs(5), app)
+        .await
+        .expect("app fixture saw the probe")
+        .expect("app fixture task");
+    let hosts: Vec<&str> = head
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("host") {
+                Some(value.trim())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(hosts, vec!["app.example"], "request head:\n{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("\r\nx-probe: 1\r\n"),
+        "other recorded headers are still sent:\n{head}"
+    );
+}

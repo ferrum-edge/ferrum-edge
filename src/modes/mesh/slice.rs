@@ -50,8 +50,7 @@ pub struct MeshSliceRequest {
     pub sidecar_egress_dry_run: bool,
     /// When `true`, and only when Sidecar egress narrowing is also enabled and
     /// applicable, the slice builder filters `workloads` to identities
-    /// referenced by admitted services. Defaults to `false` for a one-release
-    /// dry-run window.
+    /// referenced by admitted services. Defaults to `false`.
     pub enforce_sidecar_identity_narrowing: bool,
     /// Keep the namespace-visible AuthorizationPolicy candidate superset needed
     /// for destination-side Ambient UDP per-pod source scoping. The consumer
@@ -1563,17 +1562,32 @@ impl MeshSlice {
         // destination candidates come from the destination-visible workload
         // view and must remain present even when their pod UID was stripped at
         // the CP boundary or never existed (for example, WorkloadEntry).
+        //
+        // Only topologies that authorize traffic for OTHER workloads need this
+        // superset: Ambient / ServiceWaypoint (UDP source scoping) and
+        // NodeWaypoint (per-pod destination scoping). A Sidecar, gateway, or
+        // other single-workload slice keeps only the policies selecting its own
+        // workload (issue #7241): a neighbour's selector policy there is never
+        // enforced, can fail `mesh_authz` construction on a `labels_ambiguous`
+        // slice, and makes every subscriber's slice change when any
+        // namespace workload's policy does.
+        let carries_other_workload_policy_candidates =
+            request.ambient_udp_source_scoping || request.node_waypoint_capture_scoping;
         let ambient_udp_policy_candidates: Vec<(String, BTreeMap<String, String>)> =
-            ambient_udp_source_workloads
-                .iter()
-                .chain(workloads.iter())
-                .map(|workload| {
-                    (
-                        workload.namespace.clone(),
-                        labels_to_btree(&workload.selector.labels),
-                    )
-                })
-                .collect();
+            if carries_other_workload_policy_candidates {
+                ambient_udp_source_workloads
+                    .iter()
+                    .chain(workloads.iter())
+                    .map(|workload| {
+                        (
+                            workload.namespace.clone(),
+                            labels_to_btree(&workload.selector.labels),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
             if candidate_label_sets.is_empty() {
                 vec![&effective_labels]
@@ -2733,9 +2747,12 @@ fn narrow_workload_identities(
         );
     } else if admitted_services.is_empty() {
         debug!(
-            node_id = request.node_id.as_str(),
-            namespace = request.namespace.as_str(),
-            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
+            node_id = %sanitize_startup_cause(format!("{:?}", request.node_id.as_str()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", request.namespace.as_str()), &[]),
+            workload_spiffe_id = %sanitize_startup_cause(
+                format!("{:?}", request.workload_spiffe_id.as_deref().unwrap_or("")),
+                &[]
+            ),
             "Sidecar workload identity narrowing found no admitted services; slice workloads will be empty"
         );
     }
@@ -4113,8 +4130,11 @@ fn resolve_applicable_sidecar_outbound_policy(
             && let Some(policy) = selected_policy
         {
             debug!(
-                sidecar = %sidecar.name,
-                namespace = %sidecar.namespace,
+                sidecar = %sanitize_startup_cause(format!("{:?}", sidecar.name.as_str()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", sidecar.namespace.as_str()),
+                    &[]
+                ),
                 policy = ?policy,
                 "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
             );

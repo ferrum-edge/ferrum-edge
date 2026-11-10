@@ -1706,7 +1706,10 @@ fn destination_rule_subset_zero_pending_fails_while_zero_retries_is_valid() {
         .expect_err("invalid subset HTTP caps must reject the whole snapshot")
         .to_string();
     assert!(error.contains("subsets[0]"));
-    assert!(error.contains("http1MaxPendingRequests must be positive"));
+    assert!(
+        error.contains("subsets[0].traffic_policy.connection_pool_http.http1_max_pending_requests must be positive"),
+        "native diagnostics must name the native field path: {error}"
+    );
     assert!(
         !error.contains("maxRetries"),
         "maxRetries=0 is an explicit disabling cap, not a validation error: {error}"

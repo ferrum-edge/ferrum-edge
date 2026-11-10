@@ -976,6 +976,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live-reload watchers for its `acme://` sources and then never renewed, so
   the certificate expired without warning. DP mode now starts the scheduler
   and joins it at shutdown like the other serving modes.
+- **Mesh inbound fail-closed errors name the missing identity** (#7238). A mesh
+  inbound listener with no server identity under the default PERMISSIVE mode
+  was reported as "PERMISSIVE … would accept unauthenticated plaintext
+  alongside TLS", although no TLS was served. The warning and the
+  `FERRUM_MESH_PRODUCTION_MODE=true` startup refusal now say the listener has
+  no usable TLS server identity and list the remedies (gateway SVID files,
+  `FERRUM_MESH_CA_BACKEND`, or the frontend TLS cert and key). The STRICT
+  error lists the same three sources instead of only the frontend cert.
+- **Rewritten mesh `httpGet` probes send one `Host` header** (#7242). When a
+  pod's probe set `Host` in `httpHeaders`, the sidecar's app-probe server sent
+  both its default `Host` and the recorded one, a request RFC 9112 servers
+  reject with 400, so the readiness or liveness probe failed after injection.
+  The recorded `Host` now replaces the default (the first one wins, as for
+  kubelet).
+- **Sidecar mesh slices no longer carry neighbours' selector policies**
+  (#7241). Every slice had been carrying each same-namespace
+  AuthorizationPolicy that selected any visible workload, a superset only the
+  Ambient, ServiceWaypoint and NodeWaypoint topologies use. On a Sidecar or
+  gateway slice an unrelated neighbour's enforcing selector policy could fail
+  `mesh_authz` construction on a shared-SPIFFE (`labels_ambiguous`) slice,
+  label-less subscribers logged a warning per neighbour policy, and every
+  subscriber's slice changed whenever any workload's policy did. Those slices
+  now keep only the policies that apply to their own workload.
+- **Native mesh config: empty ServiceEntry namespace rejected, native field
+  paths in DestinationRule pool errors** (#7243). A `ServiceEntry` with an
+  empty `namespace` was accepted although no workload could see it; it is now
+  rejected like every other namespaced mesh resource. Native/file
+  DestinationRule connection-pool errors now name the native field
+  (`traffic_policy.connection_pool_http.http1_max_pending_requests`,
+  `max_connections`, `tcp_idle_timeout_seconds`, …) with the Istio name in
+  parentheses, instead of Istio paths that do not exist in the native schema.
+- **Quieter mesh DNS overload and headless-service logs** (#7245). The mesh
+  DNS proxy's per-query overload warnings (query and TCP session limits, full
+  forward queue, upstream forward limit and transaction-ID exhaustion,
+  upstream timeouts) are now sampled to one warning per site per 10 seconds
+  with a suppressed count, so log volume no longer grows with query rate under
+  saturation. A headless service with TCP-family ports no longer warns on
+  every slice apply that it "cannot be egress-routed": its direct pod-IP dials
+  are routed, so the message is now a debug event; the UDP equivalent stays a
+  warning but is sampled.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

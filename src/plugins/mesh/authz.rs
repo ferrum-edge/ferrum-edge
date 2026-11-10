@@ -3433,10 +3433,15 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     // A current Ferrum CP cannot reach this branch with an
                     // ENFORCING genuinely-ambiguous slice: it sets
                     // `labels_ambiguous` on divergent shared-SPIFFE candidates
-                    // (slice.rs), and the candidate-any projection only keeps a
-                    // selector policy that matches SOME candidate — a single
-                    // label-less candidate `{}` never matches a non-empty selector,
-                    // so the policy is dropped at slice build and never rides in.
+                    // (slice.rs), and on a Sidecar or gateway slice the
+                    // candidate-any projection only keeps a selector policy that
+                    // matches SOME candidate — a single label-less candidate `{}`
+                    // never matches a non-empty selector, so the policy is
+                    // dropped at slice build and never rides in. (Ambient,
+                    // ServiceWaypoint and NodeWaypoint slices also carry the
+                    // policies of other visible workloads for their UDP and
+                    // per-destination authorization; see
+                    // `MeshSlice::from_gateway_config`.)
                     // The only way an unmarked empty-label slice carries an
                     // unsatisfiable enforcing selector policy is a cross-version
                     // slice from a CP predating the marker (serde defaults

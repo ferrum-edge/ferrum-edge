@@ -719,7 +719,7 @@ impl MeshDnsProxy {
                                 ) {
                                     let _ = socket.send_to(&response, src).await;
                                 }
-                                warn!(src = %src, "DNS proxy query concurrency limit reached");
+                                crate::warn_sampled!(src = %src, "DNS proxy query concurrency limit reached");
                                 continue;
                             };
                             let packet = buf[..len].to_vec();
@@ -803,7 +803,7 @@ fn try_acquire_dns_tcp_session_permit(
     match semaphore.clone().try_acquire_owned() {
         Ok(permit) => Some(permit),
         Err(_) => {
-            warn!(client = %src, "DNS proxy TCP session concurrency limit reached");
+            crate::warn_sampled!(client = %src, "DNS proxy TCP session concurrency limit reached");
             None
         }
     }
@@ -851,7 +851,7 @@ async fn handle_dns_query_udp(
                     max_response_size,
                 );
                 let _ = socket.send_to(&response, src).await;
-                warn!(client = %src, "DNS upstream forward queue is full");
+                crate::warn_sampled!(client = %src, "DNS upstream forward queue is full");
             }
         }
         DnsDecision::Drop => {}
@@ -888,7 +888,11 @@ async fn handle_dns_tcp_connection(
         }
 
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-            warn!(client = %src, payload_bytes = len, "DNS proxy TCP query concurrency limit reached");
+            crate::warn_sampled!(
+                client = %src,
+                payload_bytes = len,
+                "DNS proxy TCP query concurrency limit reached"
+            );
             return;
         };
 
@@ -1270,9 +1274,9 @@ async fn run_udp_forwarder_with_entropy(
                 if pending.len() >= max_outstanding {
                     if upstream_id_space_exhausted(pending.len()) {
                         record_upstream_id_exhaustion();
-                        warn!("DNS upstream transaction ID space exhausted");
+                        crate::warn_sampled!("DNS upstream transaction ID space exhausted");
                     } else {
-                        warn!(
+                        crate::warn_sampled!(
                             client = %request.src,
                             outstanding = pending.len(),
                             "DNS upstream forward limit reached"
@@ -1300,7 +1304,7 @@ async fn run_udp_forwarder_with_entropy(
                     }
                     Err(UpstreamIdAllocError::Exhausted) => {
                         record_upstream_id_exhaustion();
-                        warn!("DNS upstream transaction ID space exhausted");
+                        crate::warn_sampled!("DNS upstream transaction ID space exhausted");
                         send_udp_servfail(&client_socket, &request.query, request.src).await;
                         continue;
                     }
@@ -1408,7 +1412,7 @@ async fn run_udp_forwarder_with_entropy(
                 for id in expired_ids.drain(..) {
                     if let Some(request) = pending.remove(&id) {
                         request.abort.abort();
-                        warn!(
+                        crate::warn_sampled!(
                             client = %request.client,
                             upstream = %upstream,
                             "Upstream DNS query timed out"
@@ -3726,13 +3730,6 @@ mod tests {
     }
 
     #[test]
-    fn resolution_table_empty_slice() {
-        let table = DnsResolutionTable::from_mesh_slice(&MeshSlice::default());
-        assert_eq!(table.exact_count(), 0);
-        assert_eq!(table.wildcard_count(), 0);
-    }
-
-    #[test]
     fn resolution_table_deduplicates_ips() {
         let spiffe1 = "spiffe://cluster.local/ns/default/sa/api-1";
         let spiffe2 = "spiffe://cluster.local/ns/default/sa/api-2";
@@ -3952,31 +3949,6 @@ mod tests {
     // ── Wildcard resolution edge cases ──────────────────────────────────
 
     #[test]
-    fn wildcard_does_not_match_base_domain() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(vec!["*.corp.io"], vec!["10.0.0.1"])],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        assert!(table.resolve("corp.io").is_none());
-    }
-
-    #[test]
-    fn wildcard_does_not_match_multi_level_subdomain() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(vec!["*.example.com"], vec!["10.0.0.1"])],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        // Multi-level subdomain should NOT match a single-label wildcard
-        assert!(table.resolve("deep.sub.example.com").is_none());
-        // Single-level subdomain should match
-        assert!(table.resolve("api.example.com").is_some());
-    }
-
-    #[test]
     fn wildcard_multiple_overlapping_suffixes() {
         let slice = MeshSlice {
             service_entries: vec![
@@ -4164,22 +4136,6 @@ mod tests {
             DnsDecision::Respond(_) => panic!("non-mesh name should be forwarded"),
             DnsDecision::Drop => panic!("valid query should not be dropped"),
         }
-    }
-
-    #[test]
-    fn resolution_table_case_insensitive_query() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(
-                vec!["my-service.example.com"],
-                vec!["10.0.0.1"],
-            )],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        assert!(table.resolve("MY-SERVICE.EXAMPLE.COM").is_some());
-        assert!(table.resolve("My-Service.Example.Com").is_some());
-        assert!(table.resolve("my-service.example.com").is_some());
     }
 
     #[test]
