@@ -1588,14 +1588,9 @@ impl ResponseCaching {
         config: &Value,
         pool_shard_amount: usize,
     ) -> Result<Self, String> {
+        // `from_json` refuses an empty `cacheable_methods` and defaults an
+        // omitted one to GET/HEAD, so the list is never empty here.
         let config = ResponseCachingConfig::from_json(config)?;
-
-        if config.cacheable_methods.is_empty() {
-            return Err(
-                "response_caching: no `cacheable_methods` configured — plugin will cache nothing"
-                    .to_string(),
-            );
-        }
 
         let shard_amount = crate::util::sharding::pool_shard_amount(pool_shard_amount);
         let instance_id = NEXT_RESPONSE_CACHING_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);

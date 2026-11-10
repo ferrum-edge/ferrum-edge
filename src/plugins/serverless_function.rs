@@ -539,6 +539,7 @@ pub struct ServerlessFunction {
     /// reason as [`Self::azure_function_key`].
     gcp_authorization_header: Option<HeaderValue>,
     payload_format: PayloadFormat,
+    /// Forward the request body; also whether the body must be buffered.
     forward_body: bool,
     /// Lowercased, de-duplicated (first occurrence kept) forwarded names.
     forward_headers: Vec<String>,
@@ -547,8 +548,6 @@ pub struct ServerlessFunction {
     max_response_body_bytes: usize,
     on_error: ErrorAction,
     error_status_code: u16,
-    /// Pre-computed: plugin needs request body buffered.
-    requires_body: bool,
 }
 
 impl ServerlessFunction {
@@ -1103,8 +1102,6 @@ impl ServerlessFunction {
             encode_metadata_segment(instance_id)
         );
 
-        let requires_body = forward_body;
-
         Ok(Some(Self {
             http_client,
             provider,
@@ -1125,7 +1122,6 @@ impl ServerlessFunction {
             max_response_body_bytes,
             on_error,
             error_status_code,
-            requires_body,
         }))
     }
 
@@ -4132,7 +4128,7 @@ impl Plugin for ServerlessFunction {
     /// the transform/final-hook phases. The bytes the function receives come
     /// from the finalized phase parameter, never from this early buffer.
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.requires_body
+        self.forward_body
     }
 
     /// The invocation payload is built from the canonical decoding of the
@@ -4143,11 +4139,11 @@ impl Plugin for ServerlessFunction {
     }
 
     fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
-        self.requires_body
+        self.forward_body
     }
 
     fn needs_request_body_bytes(&self) -> bool {
-        self.requires_body
+        self.forward_body
     }
 
     fn needs_request_body_text(&self) -> bool {

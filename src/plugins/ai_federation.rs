@@ -144,6 +144,10 @@ const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
 const MAX_CONCURRENT_REQUESTS: usize = 4096;
 const MAX_STOP_SEQUENCES: usize = 4;
+/// Anthropic `max_tokens` forwarded when the OpenAI request sets neither
+/// `max_tokens` nor `max_completion_tokens`. Anthropic requires an output bound;
+/// the other translated providers apply their own model default.
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 4096;
 const MAX_STOP_SEQUENCE_CHARS: usize = 1024;
 const MAX_MODEL_IDENTIFIER_BYTES: usize = 256;
 const MAX_PROVIDERS: usize = 128;
@@ -2697,6 +2701,10 @@ fn validate_openai_request(
     parse_openai_tools(openai_body)?;
     validate_openai_tool_choice(openai_body)?;
     normalized_stop_sequences(openai_body)?;
+    openai_max_output_tokens(openai_body)?;
+    for field in ["temperature", "top_p"] {
+        openai_sampling_number(openai_body, field)?;
+    }
     Ok(())
 }
 
@@ -3036,6 +3044,23 @@ fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
 
 fn tool_result_text(content: &Value) -> Result<String, String> {
     ai_translation::tool_result_text(content).map_err(|error| format!("ai_federation: {error}"))
+}
+
+/// The client's output bound (`max_tokens`, else `max_completion_tokens`;
+/// `null` is absent, any other non-positive-integer is rejected).
+fn openai_max_output_tokens(openai_body: &Value) -> Result<Option<u64>, String> {
+    ai_translation::openai_max_output_tokens(openai_body)
+        .map_err(|error| format!("ai_federation: {error}"))
+}
+
+/// A sampling number (`temperature`, `top_p`; `null` is absent, any other
+/// non-number is rejected).
+fn openai_sampling_number<'a>(
+    openai_body: &'a Value,
+    field: &str,
+) -> Result<Option<&'a Value>, String> {
+    ai_translation::openai_sampling_number(openai_body, field)
+        .map_err(|error| format!("ai_federation: {error}"))
 }
 
 fn normalized_stop_sequences(openai_body: &Value) -> Result<Option<Value>, String> {
@@ -4388,10 +4413,7 @@ fn translate_to_anthropic(
         message_index += 1;
     }
 
-    let max_tokens = openai_body["max_tokens"]
-        .as_u64()
-        .or_else(|| openai_body["max_completion_tokens"].as_u64())
-        .unwrap_or(4096);
+    let max_tokens = openai_max_output_tokens(openai_body)?.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
 
     let mut body = json!({
         "model": resolved_model,
@@ -4404,10 +4426,10 @@ fn translate_to_anthropic(
     }
 
     // Map optional fields
-    if let Some(temp) = openai_body.get("temperature") {
+    if let Some(temp) = openai_sampling_number(openai_body, "temperature")? {
         body["temperature"] = temp.clone();
     }
-    if let Some(top_p) = openai_body.get("top_p") {
+    if let Some(top_p) = openai_sampling_number(openai_body, "top_p")? {
         body["top_p"] = top_p.clone();
     }
     if let Some(stop) = normalized_stop_sequences(openai_body)? {
@@ -4600,16 +4622,13 @@ fn translate_to_gemini(
 
     // generationConfig
     let mut gen_config = serde_json::Map::new();
-    if let Some(max_tokens) = openai_body
-        .get("max_tokens")
-        .or_else(|| openai_body.get("max_completion_tokens"))
-    {
-        gen_config.insert("maxOutputTokens".to_string(), max_tokens.clone());
+    if let Some(max_tokens) = openai_max_output_tokens(openai_body)? {
+        gen_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
     }
-    if let Some(temp) = openai_body.get("temperature") {
+    if let Some(temp) = openai_sampling_number(openai_body, "temperature")? {
         gen_config.insert("temperature".to_string(), temp.clone());
     }
-    if let Some(top_p) = openai_body.get("top_p") {
+    if let Some(top_p) = openai_sampling_number(openai_body, "top_p")? {
         gen_config.insert("topP".to_string(), top_p.clone());
     }
     if let Some(stop) = normalized_stop_sequences(openai_body)? {
@@ -4796,16 +4815,13 @@ fn translate_to_bedrock(
 
     // inferenceConfig
     let mut inference_config = serde_json::Map::new();
-    if let Some(max_tokens) = openai_body
-        .get("max_tokens")
-        .or_else(|| openai_body.get("max_completion_tokens"))
-    {
-        inference_config.insert("maxTokens".to_string(), max_tokens.clone());
+    if let Some(max_tokens) = openai_max_output_tokens(openai_body)? {
+        inference_config.insert("maxTokens".to_string(), json!(max_tokens));
     }
-    if let Some(temp) = openai_body.get("temperature") {
+    if let Some(temp) = openai_sampling_number(openai_body, "temperature")? {
         inference_config.insert("temperature".to_string(), temp.clone());
     }
-    if let Some(top_p) = openai_body.get("top_p") {
+    if let Some(top_p) = openai_sampling_number(openai_body, "top_p")? {
         inference_config.insert("topP".to_string(), top_p.clone());
     }
     if let Some(stop) = normalized_stop_sequences(openai_body)? {
@@ -4930,10 +4946,14 @@ fn translate_to_cohere(
     body["model"] = Value::String(resolved_model.to_string());
 
     // Remove the OpenAI spellings of every field Cohere names differently or
-    // does not accept. Each one is re-added below under its native name; a
-    // removal with no re-add would silently discard the client's setting.
+    // does not accept, and the copied output bound and temperature so a JSON
+    // `null` is never forwarded. Each one is re-added below under its native
+    // name; a removal with no re-add would silently discard the client's
+    // setting.
     if let Some(obj) = body.as_object_mut() {
+        obj.remove("max_tokens");
         obj.remove("max_completion_tokens");
+        obj.remove("temperature");
         obj.remove("stop");
         obj.remove("top_p");
         obj.remove("tool_choice");
@@ -4943,18 +4963,19 @@ fn translate_to_cohere(
     // than dropped (issue #5256) — dropping it silently handed the request to
     // the provider's model-specific default generation length. When a client
     // supplies both, `max_tokens` wins, exactly as the Bedrock adapter
-    // resolves the same pair.
-    if let Some(limit) = openai_body
-        .get("max_tokens")
-        .or_else(|| openai_body.get("max_completion_tokens"))
-    {
-        body["max_tokens"] = limit.clone();
+    // resolves the same pair. A `null` field is absent, so
+    // `{"max_tokens": null, "max_completion_tokens": 256}` forwards 256.
+    if let Some(limit) = openai_max_output_tokens(openai_body)? {
+        body["max_tokens"] = json!(limit);
+    }
+    if let Some(temp) = openai_sampling_number(openai_body, "temperature")? {
+        body["temperature"] = temp.clone();
     }
     // Cohere spells nucleus sampling `p` (issue #5258). The value is forwarded
     // unchanged — clamping it into Cohere's accepted range would substitute a
     // setting the client never asked for, so an out-of-range value is the
     // provider's own validation error.
-    if let Some(top_p) = openai_body.get("top_p") {
+    if let Some(top_p) = openai_sampling_number(openai_body, "top_p")? {
         body["p"] = top_p.clone();
     }
     if let Some(choice) = cohere_tool_choice(openai_body)? {

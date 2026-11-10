@@ -884,8 +884,9 @@ on a native-gRPC request.
   `RedisLimiter::new_with_config_id` picks the constructor from
   `RateLimitAlgorithm::REQUIRES_SERVER_CLOCK` — a REQUIRED associated const, so
   a new algorithm must state its contract rather than inherit one. True for
-  `HttpRateLimitAlgorithm` / `DynamicHttpRateLimitAlgorithm` (`rate_limiting`,
-  `graphql`, `grpc_method_router`); false for the `ai_rate_limiter`,
+  `DynamicHttpRateLimitAlgorithm` (`rate_limiting`, `graphql`,
+  `grpc_method_router`; `HttpRateLimitAlgorithm` / `RequestUnit` are
+  `#[cfg(test)]` inline-test fixtures, not a production path); false for the `ai_rate_limiter`,
   `ws_rate_limiting` and `udp_rate_limiting` algorithms, for
   `request_deduplication`, `soap_ws_security`'s shared replay authority,
   `jwks_auth` / `hmac_auth` replay clients, and `ai_semantic_cache`. Those
@@ -953,9 +954,10 @@ on a native-gRPC request.
   "fail-closed relative to an exact trailing window" guarantee across local and
   Redis modes.
 - `weighted_window_count` in `src/plugins/utils/rate_limit.rs` is the ONLY place
-  the two-window weighted estimate is written down. `FixedWindow`, all three
-  `ai_rate_limiter` `INCRBY` arms, and the `ws_rate_limiting` frame budget route
-  through it; do not re-inline the formula, or a test on one path stops proving
+  the two-window weighted estimate is written down. All three
+  `ai_rate_limiter` `INCRBY` arms and the `ws_rate_limiting` frame budget route
+  through it (as does the test-only `FixedWindow` helper, which no plugin
+  constructs); do not re-inline the formula, or a test on one path stops proving
   anything about the others
   (`token_accounting_paths_share_the_one_weighted_formula`).
 - Request-quota key format is

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Removed
+- **Plugin readers for metadata and record shapes no built-in writes**
+  (#7115). `ai_transcript_audit` no longer exports the pre-namespace
+  `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity` keys in a
+  record's `cache` section (only `ai_semantic_cache.<id>.*` and
+  `request_deduplication.replayed`), and those keys are no longer on the
+  built-in safe log-metadata allowlist. `api_chargeback_sink` reads
+  `request_id` only from the canonical `request_id` metadata, not the
+  `x-request-id` / `correlation_id` spellings. `request_deduplication`
+  refuses a Redis replay record whose body is a JSON byte array instead of
+  the base64 string it writes, and `oidc_relying_party` no longer defaults a
+  session payload's `context_id` / `claims_expires_at_unix`.
 - **`ferrum_xds_warming_partial_applies_total` is no longer exported**
   (#7027). The xDS data plane only builds a mesh slice once every required
   type (CDS/EDS/LDS/RDS/ECDS) reports the same `version_info`, so a slice is
@@ -185,6 +196,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   classification, so a port that moved to the handoff budget could give up
   early and publish a spurious `BindFailed`. Each wait is now bounded by the
   budget the current classification selects, as documented.
+- **AI translators no longer forward `null` sampling values or drop the
+  client's output bound** (#7124). `ai_federation`'s Gemini, Bedrock, and
+  Cohere adapters read `max_tokens` with a plain field lookup, so
+  `{"max_tokens": null, "max_completion_tokens": 256}` forwarded a `null`
+  bound and lost the 256; the Anthropic adapter replaced a string, float,
+  zero, or negative bound with 4096. Both AI translation plugins now share one
+  rule: a `null` `max_tokens`, `max_completion_tokens`, `temperature`, or
+  `top_p` is absent, a present output bound must be a positive integer, and a
+  present `temperature` / `top_p` must be a number; anything else is an
+  OpenAI-shaped `400` on buffered and streaming routes alike. On
+  `ai_stream_router`, a `stop` that is not a string or an array of strings is
+  now a `400` instead of being forwarded as an empty list. Anthropic's 4096
+  default for an unbounded `ai_federation` request is now documented.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

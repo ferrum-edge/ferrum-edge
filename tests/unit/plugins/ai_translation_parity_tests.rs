@@ -294,3 +294,67 @@ async fn tool_call_rules_match_on_both_route_kinds() {
         assert_both("anthropic", label, body, admitted).await;
     }
 }
+
+fn sampling_request(model: &str, fields: Value) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    for (key, value) in fields.as_object().expect("fields are an object") {
+        body[key] = value.clone();
+    }
+    body
+}
+
+/// Issue #7124: a JSON `null` output bound or sampling number is absent, and
+/// any other mistyped value is a `400` on both route kinds rather than being
+/// forwarded, dropped, or replaced by a default.
+#[tokio::test]
+async fn output_bound_and_sampling_rules_match_on_both_route_kinds() {
+    let cases: [(&str, Value, bool); 14] = [
+        (
+            "null max_tokens beside max_completion_tokens",
+            json!({"max_tokens": null, "max_completion_tokens": 256}),
+            true,
+        ),
+        ("null temperature", json!({"temperature": null}), true),
+        ("null top_p", json!({"top_p": null}), true),
+        ("null stop", json!({"stop": null}), true),
+        (
+            "numeric sampling values",
+            json!({"temperature": 0.2, "top_p": 1}),
+            true,
+        ),
+        ("string max_tokens", json!({"max_tokens": "256"}), false),
+        ("zero max_tokens", json!({"max_tokens": 0}), false),
+        ("float max_tokens", json!({"max_tokens": 1.5}), false),
+        (
+            "negative max_completion_tokens",
+            json!({"max_completion_tokens": -1}),
+            false,
+        ),
+        ("string temperature", json!({"temperature": "hot"}), false),
+        ("boolean top_p", json!({"top_p": true}), false),
+        ("numeric stop", json!({"stop": 7}), false),
+        ("object stop", json!({"stop": {"a": "b"}}), false),
+        (
+            "stop array with a number",
+            json!({"stop": ["END", 7]}),
+            false,
+        ),
+    ];
+    for (provider_type, model) in [
+        ("anthropic", "claude-sonnet-4-20250514"),
+        ("google_gemini", "gemini-2.0-flash"),
+    ] {
+        for (label, fields, admitted) in &cases {
+            assert_both(
+                provider_type,
+                label,
+                sampling_request(model, fields.clone()),
+                *admitted,
+            )
+            .await;
+        }
+    }
+}

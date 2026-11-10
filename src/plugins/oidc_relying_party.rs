@@ -484,14 +484,12 @@ struct CreatedFlow {
 #[derive(Clone, Serialize, Deserialize)]
 struct SessionPayload {
     version: u8,
-    #[serde(default)]
     context_id: String,
     sub: String,
     id_token_b64: String,
     access_token_b64: String,
     refresh_token_b64: Option<String>,
     expires_at_unix: i64,
-    #[serde(default)]
     claims_expires_at_unix: i64,
     refresh_after_unix: i64,
     issued_at_unix: i64,

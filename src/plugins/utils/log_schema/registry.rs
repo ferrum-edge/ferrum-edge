@@ -432,8 +432,8 @@ fn lookup_entry(name: &str) -> Option<NamedSchema> {
     state.schemas.get(name).cloned()
 }
 
-/// Snapshot of the registered names (for diagnostics / admin endpoints).
-#[allow(dead_code)]
+/// Snapshot of the registered names, sorted. Only the inline tests read it.
+#[cfg(test)]
 pub fn registered_names() -> Vec<String> {
     let state = read_lock();
     let mut names: Vec<String> = state.schemas.keys().cloned().collect();
