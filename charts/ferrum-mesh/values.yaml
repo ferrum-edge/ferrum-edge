@@ -47,6 +47,9 @@ controlPlane:
   # to >= 2 for HA before enabling production control planes; the PDB renders
   # only when replicas >= 2.
   replicas: 1
+  # CP/DP gRPC port: the chart renders FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort>
+  # (unless controlPlane.env sets FERRUM_CP_GRPC_LISTEN_ADDR) and uses the same
+  # port for the container port and the control-plane Service.
   grpcPort: 50051
   rbac:
     create: true

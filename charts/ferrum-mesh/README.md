@@ -17,6 +17,12 @@ naming, labelling, secret, and validation conventions.
 
 Example value overlays live under [`examples/`](examples/).
 
+`controlPlane.grpcPort` (default `50051`) sets the control-plane container port,
+its Service port, and the listener itself: the chart renders
+`FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort>` unless `controlPlane.env` sets
+`FERRUM_CP_GRPC_LISTEN_ADDR`, in which case that value is used unchanged and must
+listen on the same port.
+
 ## Container image tag
 
 The current `appVersion` is **0.9.20**, the published v0.9.20 release. The
