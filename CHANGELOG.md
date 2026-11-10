@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **`hmac_auth`'s pre-buffered success path commits through the shared
+  authentication boundary** (#7139). A signed request whose body was buffered
+  before `authenticate` set `identified_consumer` / `auth_method` by hand
+  instead of calling `commit_authentication_attempt`, so it added an HMAC
+  Consumer beside an external identity an earlier mechanism had already
+  committed and skipped the shared identity/realm, credential-deadline,
+  principal-state and cleanup steps. Both paths now share one commit tail.
 - **`ai_rate_limiter` reserves every output cap `ai_request_guard`
   evaluates** (#7135). The limiter read caps only as JSON unsigned integers
   and only as `generationConfig.maxOutputTokens` /
