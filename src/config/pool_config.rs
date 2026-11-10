@@ -594,8 +594,8 @@ impl PoolConfig {
     /// a warning when the value is adjusted.
     ///
     /// Global env/`ferrum.conf` parsing ([`Self::from_env_with_conf`]) rejects
-    /// out-of-range values instead of clamping. This helper remains for
-    /// non-env call sites that still want a defensive clamp.
+    /// out-of-range values instead of clamping, and no production call site
+    /// uses this clamp today; only tests call it.
     pub fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
         if value < MIN_IDLE_PER_HOST {
             tracing::warn!(

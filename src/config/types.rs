@@ -10343,9 +10343,9 @@ impl Upstream {
     /// `port`. Per-port `port_overrides[port].connect_timeout_ms` wins over
     /// `proxy_default_ms` (the Proxy's own `backend_connect_timeout_ms`).
     ///
-    /// Used by the dispatch hot path so DestinationRule per-port settings
-    /// translated by the Istio config source actually take effect at request
-    /// time. `0` from either source means "disabled".
+    /// No dispatch path calls this today (only tests do); the mesh pools read
+    /// the per-port override themselves. `0` from either source means
+    /// "disabled".
     #[inline]
     pub fn effective_connect_timeout_ms(&self, port: u16, proxy_default_ms: u64) -> u64 {
         self.port_overrides
