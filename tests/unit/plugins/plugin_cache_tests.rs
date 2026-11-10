@@ -7466,7 +7466,7 @@ async fn rejected_staged_jwks_candidate_cannot_leave_stricter_policy_on_live_sto
 
     let server = wiremock::MockServer::start().await;
     let uri = format!("{}/staged-policy/jwks.json", server.uri());
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache_for_test();
 
     let published_max_stale = Duration::from_secs(7_200);

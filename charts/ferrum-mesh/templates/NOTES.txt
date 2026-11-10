@@ -20,8 +20,11 @@ To take ownership: helm upgrade --take-ownership --set crds.adoptExisting=true
 {{- if not .Values.crds.install }}
 
 WARNING: crds.install=false — helm upgrade will NOT update
-UDPResponseAmplificationPolicy. Apply templates/crds-udpresponseamplificationpolicy.yaml
-with kubectl apply --server-side if the live annotation is not v1alpha1-1.
+UDPResponseAmplificationPolicy. If the live annotation is not v1alpha1-1, render
+the CRD and apply it (the template file itself is not plain YAML):
+  helm template {{ .Release.Name }} <chart> -n {{ .Release.Namespace }} \
+    --show-only templates/crds-udpresponseamplificationpolicy.yaml \
+    --set crds.install=true | kubectl apply --server-side -f -
 {{- end }}
 
 {{- if .Values.injector.enabled }}

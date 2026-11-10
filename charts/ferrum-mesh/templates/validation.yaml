@@ -25,10 +25,10 @@
        literal and the allowlist are still parsed strictly: the runtime rejects a
        malformed FERRUM_ADMIN_ALLOWED_CIDRS entry in every mode. */ -}}
 {{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "ambient" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ambient" "env" (.Values.ambient.env | default dict) "admin" (.Values.ambient.admin | default dict)) | fromYaml) "hardFail" false "probes" .Values.ambient.probes) -}}
-{{- include "ferrum-mesh.failReservedEnv" (dict "label" "ambient.env" "env" .Values.ambient.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "ambient.env" "env" .Values.ambient.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS" "FERRUM_MESH_CAPTURE_MODE")) -}}
 {{- end -}}
 {{- if .Values.injector.enabled -}}
-{{- include "ferrum-mesh.failReservedEnv" (dict "label" "injector.env" "env" .Values.injector.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS")) -}}
+{{- include "ferrum-mesh.failReservedEnv" (dict "label" "injector.env" "env" .Values.injector.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_INJECTOR_LISTEN_ADDR" "FERRUM_INJECTOR_REQUIRE_ANNOTATION" "FERRUM_INJECTOR_TLS_CERT_PATH" "FERRUM_INJECTOR_TLS_KEY_PATH")) -}}
 {{- end -}}
 {{- if .Values.nodeAgent.enabled -}}
 {{- include "ferrum-mesh.validateAdminBind" (dict "component" "nodeAgent" "bind" (.Values.nodeAgent.admin.bindAddress | default "127.0.0.1")) -}}

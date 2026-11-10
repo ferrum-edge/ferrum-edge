@@ -17,6 +17,15 @@ naming, labelling, secret, and validation conventions.
 
 Example value overlays live under [`examples/`](examples/).
 
+Every namespaced object renders into the Helm release namespace; select it with
+`helm install --namespace <ns>` (the chart has no `namespace` value).
+
+`controlPlane.grpcPort` (default `50051`) sets the control-plane container port,
+its Service port, and the listener itself: the chart renders
+`FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort>` unless `controlPlane.env` sets
+`FERRUM_CP_GRPC_LISTEN_ADDR`, in which case that value is used unchanged and must
+listen on the same port.
+
 ## Container image tag
 
 The current `appVersion` is **0.9.20**, the published v0.9.20 release. The
@@ -78,8 +87,16 @@ kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
 ```
 
 A mismatch is an operator failure. Either leave `crds.install=true` so the
-next upgrade applies the template, or apply that YAML with
-`kubectl apply --server-side` and set `crds.skipInstallAcknowledged=true`.
+next upgrade applies the template, or set `crds.skipInstallAcknowledged=true`
+and apply the rendered CRD yourself (the template file is a Helm template, not
+plain YAML):
+
+```bash
+helm template <release> ./charts/ferrum-mesh -n <namespace> \
+  --show-only templates/crds-udpresponseamplificationpolicy.yaml \
+  --set crds.install=true | kubectl apply --server-side -f -
+```
+
 `crds.install=false` without that acknowledgement fails render.
 
 Existing clusters that installed this CRD from the former `crds/` directory

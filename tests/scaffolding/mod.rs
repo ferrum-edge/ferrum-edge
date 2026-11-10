@@ -100,20 +100,6 @@ pub fn file_mode_yaml_for_backend(port: u16) -> String {
     file_mode_yaml_for_backend_with(port, Value::Null)
 }
 
-/// Build file-mode YAML for an HTTPS backend on `127.0.0.1:<port>`.
-/// `backend_read_timeout_ms` defaults to 5000 — callers can override via
-/// [`file_mode_yaml_for_backend_with`].
-pub fn file_mode_yaml_for_https_backend(port: u16) -> String {
-    file_mode_yaml_for_backend_with(
-        port,
-        serde_json::json!({
-            "backend_scheme": "https",
-            "backend_host": "localhost",
-            "backend_tls_verify_server_cert": false,
-        }),
-    )
-}
-
 /// Build file-mode YAML with explicit overrides. `overrides` is merged
 /// into the default proxy body so tests can tweak a single field (e.g.,
 /// `backend_read_timeout_ms`) without rebuilding the whole config.

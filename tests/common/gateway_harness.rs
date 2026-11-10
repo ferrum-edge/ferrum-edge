@@ -283,16 +283,6 @@ impl TestGateway {
         }
     }
 
-    /// Poll `GET /proxies` until the configured JWT is accepted. Prefer
-    /// [`wait_for_owned_gateway_identity`] at spawn time so the JWT wait is
-    /// coupled to the same `Child` as readiness.
-    pub async fn wait_for_admin_auth(
-        &self,
-        timeout: Duration,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        wait_for_admin_auth_inner(self.admin_port, &self.auth_header(), timeout, None).await
-    }
-
     /// Poll the proxy port with a raw TCP connect until it accepts or the
     /// deadline expires. Tests that bypass `reqwest` (raw HTTP, hyper H2 prior
     /// knowledge, TCP/UDP listeners) should call this after `spawn` because the
@@ -324,13 +314,6 @@ impl TestGateway {
         if let Some(mut child) = self.child.take() {
             shutdown_gateway_child(&mut child);
         }
-    }
-
-    /// Return the `Child` handle without dropping it (e.g. to send a signal).
-    /// After this call, `Drop` will no longer clean up the process — the caller
-    /// is responsible for termination.
-    pub fn take_child(&mut self) -> Option<Child> {
-        self.child.take()
     }
 
     /// OS PID of the running gateway process, if any. Use for `kill -HUP <pid>`

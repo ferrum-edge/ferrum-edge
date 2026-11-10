@@ -1,5 +1,3 @@
-version: '3.9'
-
 # =============================================================================
 # Admin API exposure (read before publishing the admin port)
 # =============================================================================
@@ -178,10 +176,12 @@ services:
     depends_on:
       mongodb:
         condition: service_healthy
+    # Host ports differ from ferrum-dp-1 (8002/8445) and ferrum-cp (9445) so
+    # the mongodb and cp-dp profiles can run together.
     ports:
-      - "8002:8000"     # HTTP proxy
-      - "8445:8443"     # HTTPS proxy
-      - "9445:9443"     # Admin API HTTPS (set FERRUM_ADMIN_TLS_* to serve; admin is loopback-only by default)
+      - "8004:8000"     # HTTP proxy
+      - "8447:8443"     # HTTPS proxy
+      - "9446:9443"     # Admin API HTTPS (set FERRUM_ADMIN_TLS_* to serve; admin is loopback-only by default)
     environment:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: mongodb

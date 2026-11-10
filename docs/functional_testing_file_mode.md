@@ -94,27 +94,26 @@ identity.
 
 #### Test: `test_file_mode_config_reload_on_sighup`
 
-Exercises a configuration reload attempt using SIGHUP:
+Exercises a live configuration reload through SIGHUP:
 
-1. Creates a temporary config with one proxy
+1. Creates a temporary config with one proxy (`/api/v1`)
 2. Starts echo server and gateway
-3. Sends a request to the initial path and checks that an HTTP response is
-   received
-4. Updates the config file to add a second proxy
-5. Attempts to send SIGHUP to the gateway process (Unix only; the command
-   result is ignored)
-6. Sends a request to the added path and checks that an HTTP response is
-   received
+3. Requires `200` with the echo body for the stripped path on `/api/v1`, and
+   `404` on `/api/v2` (the route the reload will add)
+4. Rewrites the config file to add a second proxy (`/api/v2`)
+5. Sends SIGHUP with `kill -HUP` and requires a successful exit status (Unix
+   only; the functional suite runs on Linux)
+6. Polls `/api/v2` with a 15 s deadline until it returns `2xx`, then requires
+   the echo body for the stripped path
+7. Requires `/api/v1` to keep routing after the reload
 
 **What it tests:**
-- Attempting to signal the gateway with SIGHUP
-- An attempted live-configuration reload followed by an HTTP request
+- SIGHUP delivery to the file-mode gateway
+- The reload applying the rewritten file: a route that returned `404` before
+  the signal routes to the backend afterwards
+- Routes kept across the reload keep serving
 
-Both assertions use `reqwest::Client::send(...).is_ok()`, which checks only that
-the request completed and received an HTTP response, regardless of status. The
-test attempts a SIGHUP reload but does not establish that the signal was
-delivered, that reloading succeeded, or that the new route became active. It
-does not prove routing to a backend or inspect the response body.
+A reload that never applies fails at the deadline instead of passing.
 
 #### Test: `test_file_mode_empty_config`
 
@@ -134,19 +133,16 @@ Verifies graceful handling of empty configurations:
 Configures two backends and sends a request to each configured path:
 
 1. Creates a config with two proxies on different paths
-2. Starts two echo servers on different ports
+2. Starts two self-identifying backends (`backend-1`, `backend-2`) on
+   different ports
 3. Starts the gateway
-4. Sends requests to both backend paths
-5. Verifies both requests complete
+4. Sends a request to each proxy path
 
 **What it tests:**
-- Multiple proxy configurations
-- HTTP requests to both configured paths complete and receive a response
-
-As with the reload test, each assertion is `reqwest::Client::send(...).is_ok()`
-(any response, including a 404, satisfies it); the test does not assert exact
-status codes, routing to either backend, the stripped path as seen by each
-backend, which backend served a request, or path isolation between proxies.
+- Each request returns `200` from the backend its proxy names (the body's
+  `server` field), so the two routes are not crossed
+- The listen path is stripped (`/api/backendN/test` reaches the backend as
+  `/test`)
 
 #### Test: `test_file_mode_consumer_identity_headers_forwarded`
 

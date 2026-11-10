@@ -682,11 +682,16 @@ fn ambient_udp_lifecycle_selects_the_tools_capable_published_runtime() {
     );
 
     // The node-agent keeps the distroless variant: only the pod that shells out
-    // receives the larger attack surface.
+    // receives the larger attack surface. Its selector suffixes a plain tag with
+    // `-ebpf` and leaves an operator-chosen variant tag as given (issue #7299).
     let node_agent = read("charts/ferrum-mesh/templates/node-agent-daemonset.yaml");
     assert!(
-        node_agent.contains("printf \"%s-ebpf\" $nodeAgentImageTag"),
+        node_agent.contains("include \"ferrum-mesh.ebpfImageTag\" $nodeAgentImageTag"),
         "the node-agent must keep selecting the distroless `-ebpf` variant"
+    );
+    assert!(
+        helpers.contains("{{- printf \"%s-ebpf\" . -}}"),
+        "the shared eBPF tag selector must suffix a plain tag with `-ebpf`"
     );
     assert!(
         !node_agent.contains("-ebpf-tools"),

@@ -3,6 +3,7 @@
 //! tasks must serialize on `jwks_remote_global_cache` so a parallel reset
 //! cannot abort another test's background fetch.
 
+use super::jwks_auth_support::cache_test_lock;
 use ferrum_edge::_test_support::jwks_discovery_candidate_for_test;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_cache::{
@@ -17,7 +18,6 @@ use ferrum_edge::plugins::utils::jwks_store::{
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 use wiremock::matchers::method;
 use wiremock::{Mock, ResponseTemplate};
@@ -52,11 +52,6 @@ fn get_or_create_jwks_store(
         refresh_interval,
         Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
     )
-}
-
-pub(super) fn cache_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[serial_test::serial(jwks_remote_global_cache)]
