@@ -1148,6 +1148,9 @@ impl Plugin for OtelTracing {
             }
         };
 
+        // Both arms above built this value with a fresh gateway span id, so
+        // it is gateway-minted per-request state (issue #7130).
+        ctx.stage_gateway_minted_traceparent(traceparent.clone());
         ctx.metadata
             .insert(TRACEPARENT_HEADER.to_string(), traceparent);
         ctx.claim_gateway_trace_owner(GatewayTraceOwner::OtelTracing);
@@ -3829,10 +3832,13 @@ pub(crate) fn build_traceparent(
     traceparent
 }
 
+/// Returns whether this call minted the `traceparent` it left in `metadata`
+/// (a fresh root, or the header's trace id under a fresh span id); false when
+/// existing trace metadata was kept as is.
 pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
     metadata: &mut HashMap<String, String, MS>,
     headers: &HashMap<String, String>,
-) {
+) -> bool {
     if metadata.contains_key("trace_id") && metadata.contains_key("span_id") {
         if !metadata.contains_key("trace_sampled") {
             let sampled = metadata
@@ -3845,7 +3851,7 @@ pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
                 if sampled { "true" } else { "false" }.to_string(),
             );
         }
-        return;
+        return false;
     }
 
     if let Some(existing) = header_value_case_insensitive(headers, TRACEPARENT_HEADER)
@@ -3872,7 +3878,7 @@ pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
                 if sampled { "01" } else { "00" },
             ),
         );
-        return;
+        return true;
     }
 
     let generated = OtelTracing::generate_trace_context(true);
@@ -3880,6 +3886,7 @@ pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
     metadata.insert("span_id".to_string(), generated.span_id);
     metadata.insert("trace_sampled".to_string(), "true".to_string());
     metadata.insert(TRACEPARENT_HEADER.to_string(), generated.traceparent);
+    true
 }
 
 /// Return true only when metadata carries an affirmative sampling decision.

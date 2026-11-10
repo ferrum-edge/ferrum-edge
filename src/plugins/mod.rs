@@ -3950,6 +3950,17 @@ pub(crate) struct PluginRequestState {
     /// omitting it loses no backend-visible distinction. Typed and outside
     /// `metadata` so plugin-writable state cannot move the comparison target.
     pub(crate) published_rate_limit_headers: Vec<(&'static str, String)>,
+    /// The exact W3C `traceparent` the gateway trace owner (`otel_tracing`, or
+    /// a trace-enabled `workload_metrics`) minted for this request: a fresh
+    /// root, or the trusted caller's trace id under a fresh gateway span id.
+    /// Either way its span id is new on every request, so a retained-result
+    /// partition (`response_caching`, `ai_semantic_cache`) that bound it would
+    /// never hit (issue #7130). Same private-provenance rule as
+    /// `published_rate_limit_headers`: the forwarded field is omitted only
+    /// while its live value equals this, and a caller's `traceparent`
+    /// forwarded unchanged stays bound. Typed and outside `metadata` so a
+    /// plugin-writable `traceparent` metadata value cannot move the target.
+    pub(crate) gateway_minted_traceparent: Option<String>,
     /// Per-`ai_semantic_cache`-instance embedding vectors staged between
     /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
     /// high-dimensional vectors cannot enter transaction logs. The outer key is
@@ -5005,9 +5016,49 @@ impl RequestContext {
         lines == 1
     }
 
+    /// Record the exact `traceparent` the gateway trace owner minted for this
+    /// request (see `PluginRequestState::gateway_minted_traceparent`). A later
+    /// mint (a sibling re-deriving the span) replaces it.
+    pub(crate) fn stage_gateway_minted_traceparent(&mut self, traceparent: String) {
+        self.plugin_state_mut().gateway_minted_traceparent = Some(traceparent);
+    }
+
+    /// Whether `name` is the request's single `traceparent` field and its
+    /// live value is exactly the one the gateway trace owner minted.
+    ///
+    /// Same shape as [`Self::is_gateway_published_rate_limit_header`]: the
+    /// name must be the exact lowercase key, and a case-variant duplicate
+    /// (which folds into one combined field on egress) keeps every line
+    /// bound. A caller's own `traceparent` forwarded unchanged never matches,
+    /// because the gateway always mints a fresh span id.
+    pub(crate) fn is_gateway_minted_traceparent_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        const TRACEPARENT: &str = "traceparent";
+        if name != TRACEPARENT {
+            return false;
+        }
+        let Some(staged) = self
+            .plugin_state()
+            .and_then(|state| state.gateway_minted_traceparent.as_deref())
+        else {
+            return false;
+        };
+        staged == value
+            && headers
+                .keys()
+                .filter(|key| key.eq_ignore_ascii_case(TRACEPARENT))
+                .count()
+                == 1
+    }
+
     /// Whether `name`/`value` in `headers` is gateway-minted per-request state
     /// that a retained-result partition must not bind: a generated correlation
-    /// id or published rate-limit telemetry, each proven by private provenance.
+    /// id, published rate-limit telemetry, or the gateway trace owner's minted
+    /// `traceparent`, each proven by private provenance.
     pub(crate) fn is_gateway_minted_request_header(
         &self,
         headers: &HashMap<String, String>,
@@ -5016,6 +5067,7 @@ impl RequestContext {
     ) -> bool {
         self.is_gateway_generated_correlation_header(name, value)
             || self.is_gateway_published_rate_limit_header(headers, name, value)
+            || self.is_gateway_minted_traceparent_header(headers, name, value)
     }
 
     pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {

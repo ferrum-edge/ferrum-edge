@@ -954,9 +954,10 @@ pub fn append_request_context_partition(
 /// state is omitted under the same private-provenance rule
 /// `response_caching` uses (`RequestContext::is_gateway_minted_request_header`):
 /// a `correlation_id` value this request's instance generated because the
-/// client sent none (issue #7130), and the `x-ratelimit-*` counters a
+/// client sent none (issue #7130), the `traceparent` the gateway trace owner
+/// minted with a fresh span id, and the `x-ratelimit-*` counters a
 /// `rate_limiting` instance with `expose_headers` forwards while their live
-/// value still matches that limiter's staging. Both change on every request,
+/// value still matches that limiter's staging. All change on every request,
 /// so binding them makes every entry unreachable. Client-supplied or rewritten
 /// values stay bound. Keep every other origin input and the independent
 /// caller/destination partitions intact.
