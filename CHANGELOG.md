@@ -85,6 +85,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database mode). The batch now runs the same reserved-port, process-global
   frontend and OS bind-probe checks as `POST /proxies` (skipped on a CP, as
   for single writes) and reports them as `400` batch validation errors.
+- **Admin API parity fixes** (#7216).
+  - `POST /admin/tls/rotate/proxy` is now `400`: `proxy` was an undocumented
+    alias missing from `openapi.yaml` and `docs/admin_api.md`. Use
+    `proxy_https` (or the documented `frontend` alias).
+  - `POST /admin/tls/rotate` and the other TLS mutations now write their
+    typed audit event in file, DP and mesh modes; the event was skipped
+    whenever there was no config database.
+  - `GET /config/export` answers `500` if the document cannot be serialized,
+    instead of `200` with `{}`, which read as an empty namespace.
+  - A batch or restore with an unknown plugin name reports it once instead of
+    twice.
+  - `/health` no longer builds the FIPS and listener-failure blocks for
+    callers that do not get the detailed tier.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

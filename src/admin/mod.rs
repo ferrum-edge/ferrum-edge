@@ -3563,7 +3563,7 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        if let Some(failures) = state.serving_listener_failures.as_ref() {
+        if detailed && let Some(failures) = state.serving_listener_failures.as_ref() {
             let snapshot = failures.snapshot();
             if snapshot.failures_total > 0 {
                 health_status["listener_failures"] =
@@ -3582,7 +3582,9 @@ async fn handle_admin_request_inner(
         // explicit `certified: false`: Ferrum is not itself a validated
         // cryptographic module, and a status scraper must not be able to read
         // "enforcing" as "certified". See docs/fips.md.
-        health_status["fips"] = crate::fips::status_metadata();
+        if detailed {
+            health_status["fips"] = crate::fips::status_metadata();
+        }
 
         // Data-plane namespace scope (issue #5447). The Admin API is
         // deliberately multi-namespace, but a proxy data plane serves exactly
@@ -5605,8 +5607,11 @@ async fn handle_admin_request_inner(
             &json!({"error": "Not Found"}),
         )),
     };
+    // No `state.db` requirement: `POST /admin/tls/rotate` is served in file,
+    // DP and mesh modes too, and `record_operation_audit` finalizes the
+    // admitted intent through the spool when there is no database (#7216).
     if state.admin_audit_enabled
-        && let (Ok(http_response), Some(db)) = (response.as_ref(), state.db.as_ref())
+        && let Ok(http_response) = response.as_ref()
         && http_response.status().is_success()
         && tls_mutation_audit_descriptor(&method, segments.as_slice(), None).is_some()
     {
@@ -5636,9 +5641,7 @@ async fn handle_admin_request_inner(
                 audit_namespace_for_request(segments.as_slice(), &namespace),
                 json!({"path": path}),
             );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event).await {
-                log_audit_enqueue_failure(&error);
-            }
+            record_operation_audit(&state, event).await;
         }
     }
     response
@@ -5666,7 +5669,6 @@ fn tls_mutation_audit_descriptor(
     };
     let resource_type = match segments.get(2).copied() {
         Some("certificates") => "tls_certificate",
-        Some("private-keys") => "tls_private_key",
         Some("ca-bundles") => "tls_ca_bundle",
         Some("crls") => "tls_crl",
         Some("ocsp-responses") => "tls_ocsp_response",
@@ -9043,6 +9045,9 @@ pub(crate) fn collect_plugin_config_admission_errors(
                 "PluginConfig '{}': unknown plugin name '{}'",
                 plugin_config.id, plugin_config.plugin_name
             ));
+            // The definition check below would report the same unknown name
+            // a second time (issue #7216).
+            continue;
         }
         if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
             if let Err(err) = crate::plugins::validate_plugin_config_policy_only(

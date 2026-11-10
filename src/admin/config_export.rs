@@ -444,10 +444,12 @@ pub(crate) async fn handle_config_export(
             }
         };
         let export = build_config_export(config, source, &owned_namespace, &key);
-        serde_json::to_vec(&export).unwrap_or_else(|_| b"{}".to_vec())
+        serde_json::to_vec(&export)
     })
     .await;
-    let Ok(body) = built else {
+    // A join failure or a serialization failure is a 500, never a `200` with
+    // an empty document that would read as an empty namespace (issue #7216).
+    let Ok(Ok(body)) = built else {
         return super::json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": "Configuration export failed"}),

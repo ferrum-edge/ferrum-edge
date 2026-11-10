@@ -4374,6 +4374,17 @@ async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete(
         status, 400,
         "batch must refuse the unknown disabled plugin: {body:?}"
     );
+    // Issue #7216: the unknown name is reported once, not a second time by
+    // the definition check as an "invalid config".
+    let errors = body["validation_errors"].to_string();
+    assert!(
+        errors.contains("unknown plugin name 'does_not_exist'"),
+        "{body:?}"
+    );
+    assert!(
+        !errors.contains("invalid config: Unknown plugin name"),
+        "unknown plugin name reported twice: {body:?}"
+    );
 
     // A disabled config-graph participant keeps its policy screening on both
     // paths: the definition is admitted or refused identically.
