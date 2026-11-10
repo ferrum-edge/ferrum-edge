@@ -196,3 +196,64 @@ fn ambient_container_ports_follow_the_listen_addresses() {
         "an ambient.env address must win over the default, and port 0 must omit the port"
     );
 }
+
+/// The CA Deployment runs `FERRUM_MODE=cp` from `ca.env`, which
+/// `EnvConfig::validate_cp_dp_grpc_transport_security` refuses at boot on a
+/// non-loopback plaintext CP gRPC bind (issue #7298). The chart must fail the
+/// render instead, accepting the same three escapes the runtime accepts.
+#[test]
+fn ca_plaintext_cp_grpc_bind_fails_the_render() {
+    let validation = read_chart("templates/validation.yaml");
+    let ca_block = &validation[validation
+        .find("{{- if .Values.ca.enabled -}}")
+        .expect("validation.yaml must validate the CA component")..];
+    let ca_block = &ca_block[..ca_block.find("{{- end -}}").expect("closed CA block")];
+    assert!(
+        ca_block.contains(
+            "{{- include \"ferrum-mesh.validateCpGrpcTransport\" (dict \"label\" \"ca.env\" \"env\" .Values.ca.env) -}}"
+        ),
+        "the CA component must run the CP gRPC transport guard over ca.env"
+    );
+
+    let helpers = read_chart("templates/_helpers.tpl");
+    let start = helpers
+        .find("{{- define \"ferrum-mesh.validateCpGrpcTransport\" -}}")
+        .expect("ferrum-mesh.validateCpGrpcTransport helper must exist");
+    let helper = &helpers[start..];
+    let helper = &helper[..helper
+        .find("{{- end -}}\n{{- end -}}")
+        .expect("closed helper")];
+    for needle in [
+        "\"FERRUM_CP_GRPC_LISTEN_ADDR\" | default \"0.0.0.0:50051\"",
+        "\"FERRUM_CP_GRPC_TLS_CERT_PATH\"",
+        "\"FERRUM_CP_GRPC_TLS_KEY_PATH\"",
+        "\"FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT\"",
+        "(list \"true\" \"1\" \"yes\")",
+        "include \"ferrum-mesh.isLoopbackBind\" $host",
+        "(ne ($port | int) 0)",
+    ] {
+        assert!(
+            helper.contains(needle),
+            "validateCpGrpcTransport must mirror the runtime check: missing {needle}"
+        );
+    }
+
+    let runtime = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/config/env_config.rs"),
+    )
+    .expect("read src/config/env_config.rs");
+    assert!(
+        runtime.contains("fn validate_cp_dp_grpc_transport_security"),
+        "the chart guard mirrors EnvConfig::validate_cp_dp_grpc_transport_security"
+    );
+
+    let dev = read_chart("examples/development-values.yaml");
+    let ca = &dev[dev
+        .find("\nca:\n")
+        .expect("development example has a ca block")..];
+    assert!(
+        ca.contains("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: \"true\""),
+        "the development example must opt the CA into plaintext CP gRPC so \
+         `-f development-values.yaml --set ca.enabled=true` still renders"
+    );
+}

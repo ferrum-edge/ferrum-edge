@@ -186,6 +186,27 @@ Context: root.
 {{- end -}}
 {{- end -}}
 
+{{/*
+Mirror EnvConfig::validate_cp_dp_grpc_transport_security (src/config/env_config.rs)
+for a pod that runs FERRUM_MODE=cp from `.env`: a non-loopback, non-zero
+FERRUM_CP_GRPC_LISTEN_ADDR (default 0.0.0.0:50051) with no
+FERRUM_CP_GRPC_TLS_CERT_PATH + FERRUM_CP_GRPC_TLS_KEY_PATH pair and no
+FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true exits at boot, so fail the render
+instead of shipping a crash-looping pod (issue #7298).
+Input: dict "label" <values path of the env map> "env" <env map>.
+*/}}
+{{- define "ferrum-mesh.validateCpGrpcTransport" -}}
+{{- $env := .env | default dict -}}
+{{- $addr := trim (toString (index $env "FERRUM_CP_GRPC_LISTEN_ADDR" | default "0.0.0.0:50051")) -}}
+{{- $port := regexFind "[0-9]+$" $addr -}}
+{{- $host := trimSuffix (printf ":%s" $port) $addr -}}
+{{- $tls := and (trim (toString (index $env "FERRUM_CP_GRPC_TLS_CERT_PATH" | default ""))) (trim (toString (index $env "FERRUM_CP_GRPC_TLS_KEY_PATH" | default ""))) -}}
+{{- $allowPlaintext := has (lower (trim (toString (index $env "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" | default "")))) (list "true" "1" "yes") -}}
+{{- if and (ne ($port | int) 0) (not $tls) (not $allowPlaintext) (not (include "ferrum-mesh.isLoopbackBind" $host)) -}}
+{{- fail (printf "%s: FERRUM_MODE=cp refuses at startup to bind PLAINTEXT CP gRPC on non-loopback %s. Set %s.FERRUM_CP_GRPC_TLS_CERT_PATH and %s.FERRUM_CP_GRPC_TLS_KEY_PATH (and mount them), bind a loopback FERRUM_CP_GRPC_LISTEN_ADDR (127.0.0.1:50051), or set %s.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=\"true\" to permit plaintext config sync (development only)." .label $addr .label .label .label) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ferrum-mesh.renderSecretEnv" -}}
 {{- $source := .source | default dict -}}
 {{- $existing := $source.existingSecret | default dict -}}

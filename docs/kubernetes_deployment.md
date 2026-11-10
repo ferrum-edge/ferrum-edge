@@ -341,6 +341,14 @@ independent `ferrum-mesh` release in the same cluster must set a unique
 intentional, and a later release must not force-import or skip-create to share
 another release's class.
 
+The mesh CA Deployment (`ca.enabled=true`) runs `FERRUM_MODE=cp` from `ca.env`,
+so it is held to the CP gRPC transport check at render time: a non-loopback,
+non-zero `FERRUM_CP_GRPC_LISTEN_ADDR` (default `0.0.0.0:50051`) fails `helm
+template` unless `ca.env` sets both `FERRUM_CP_GRPC_TLS_CERT_PATH` and
+`FERRUM_CP_GRPC_TLS_KEY_PATH` or `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"`
+(the development example sets the opt-in). The binary refuses the same
+configuration at startup.
+
 ### Gateway API CRDs (required)
 
 Ferrum does **not** ship upstream Gateway API CRDs in the Helm chart. Upstream
