@@ -848,7 +848,8 @@ pub async fn start_stock_xds_client_with_shutdown(
             tls_reload.as_ref(),
             &xds_urls,
             &mut last_tls_revision,
-        );
+        )
+        .await;
 
         // ── issue #3852: fail-closed credential gate ──
         // An invalid source must PREVENT reconnection, not merely fail the next

@@ -734,7 +734,8 @@ pub async fn start_xds_client_with_shutdown(
             tls_reload.as_ref(),
             &cp_urls,
             &mut last_tls_revision,
-        );
+        )
+        .await;
 
         let cp_url = &cp_urls[current_cp_index];
         if last_cp_url.as_deref() != Some(cp_url.as_str()) {

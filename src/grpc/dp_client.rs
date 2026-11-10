@@ -825,6 +825,26 @@ pub fn build_dp_grpc_tls_config(
     }))
 }
 
+/// Rebuild the DP/mesh gRPC TLS client config for a reload revision on the
+/// blocking pool.
+///
+/// [`build_dp_grpc_tls_config`] reads files or blocks on the TLS source
+/// runtime for provider-backed schemes, so a running client loop must not
+/// call it on a Tokio worker (issue #7205). The rebuild always runs to
+/// completion: if the awaiting loop is dropped (shutdown), the blocking task
+/// finishes and its result is discarded.
+pub async fn rebuild_dp_grpc_tls_config(
+    reload: &DpGrpcTlsReload,
+    cp_urls: &[String],
+) -> Result<Option<DpGrpcTlsConfig>, anyhow::Error> {
+    let env_config = reload.env_config.clone();
+    let cp_urls = cp_urls.to_vec();
+    let label = reload.label;
+    tokio::task::spawn_blocking(move || build_dp_grpc_tls_config(&env_config, &cp_urls, label))
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} gRPC TLS material rebuild task did not complete"))?
+}
+
 fn load_grpc_material(
     raw: &str,
     kind: MaterialKind,
@@ -1080,7 +1100,7 @@ pub async fn start_dp_client_with_stream_timings(
             let revision = *reload.revision_rx.borrow();
             if revision != last_tls_revision {
                 last_tls_revision = revision;
-                match build_dp_grpc_tls_config(&reload.env_config, &cp_urls, reload.label) {
+                match rebuild_dp_grpc_tls_config(reload, &cp_urls).await {
                     Ok(next_config) => {
                         tls_config = next_config;
                         info!(
@@ -1853,7 +1873,7 @@ enum FrontendTlsSnapshotUpdate {
     },
 }
 
-fn stage_frontend_tls_snapshot(
+async fn stage_frontend_tls_snapshot(
     config: &GatewayConfig,
     proxy_state: &ProxyState,
     frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
@@ -1891,7 +1911,7 @@ fn stage_frontend_tls_snapshot(
             {
                 frontend_tls_restore_slot.store(slot.load_full());
             }
-            let Some(tls_policy) = proxy_state.tls_policy.as_deref() else {
+            let Some(tls_policy) = proxy_state.tls_policy.clone() else {
                 anyhow::bail!(
                     "frontend TLS material was provided by CP but this DP has no TLS policy"
                 );
@@ -1923,73 +1943,110 @@ fn stage_frontend_tls_snapshot(
                 .env_config
                 .frontend_tls_live_reload_enabled
                 .then_some(crate::tls::ClientTrustScope::ProxyFrontend);
-            let mut tls_config = if !certificates.is_empty() {
-                load_gateway_multi_cert_tls_config_with_handshake_scope(
-                    &certificates,
-                    proxy_state
-                        .env_config
-                        .frontend_tls_client_ca_bundle_path
-                        .as_deref(),
-                    proxy_state
-                        .env_config
-                        .frontend_tls_ocsp_response_source
-                        .as_deref(),
-                    tls_policy,
-                    proxy_state.env_config.tls_cert_expiry_warning_days,
-                    proxy_state.env_config.tls_crl_expiry_warning_days,
-                    proxy_state.crls.as_ref().as_slice(),
-                    handshake_scope,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to materialize {} Gateway frontend TLS certificate sources: {}",
-                        certificates.len(),
-                        error
-                    )
-                })?
-            } else {
-                crate::tls::load_frontend_tls_candidate_from_paths(
-                    cert_path,
-                    key_path,
-                    proxy_state
-                        .env_config
-                        .frontend_tls_client_ca_bundle_path
-                        .as_deref(),
-                    proxy_state
-                        .env_config
-                        .frontend_tls_ocsp_response_source
-                        .as_deref(),
-                    false,
-                    tls_policy,
-                    proxy_state.env_config.tls_cert_expiry_warning_days,
-                    proxy_state.env_config.tls_crl_expiry_warning_days,
-                    proxy_state.crls.as_ref().as_slice(),
-                    handshake_scope,
-                )
-                .map(|candidate| candidate.config)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to materialize frontend TLS certificate source {}: {}",
-                        cert_path,
-                        error
-                    )
-                })?
+            // Certificate, key, CA and OCSP sources are files or provider URIs
+            // that block on the TLS source runtime, and one snapshot can carry
+            // up to 256 of them. Materialize on the blocking pool so a
+            // FULL_SNAPSHOT never stalls a serving Tokio worker (issue #7205).
+            // The stream handler awaits this before applying, so apply
+            // ordering is unchanged; if the handler is dropped, the build
+            // finishes and its result is discarded.
+            let inputs = FrontendTlsMaterialInputs {
+                certificates,
+                cert_path: cert_path.to_string(),
+                key_path: key_path.to_string(),
+                env_config: proxy_state.env_config.clone(),
+                tls_policy,
+                crls: proxy_state.crls.clone(),
+                handshake_scope,
             };
-            crate::tls::enable_early_data(&mut tls_config, tls_policy);
-            if proxy_state.env_config.ktls_enabled.could_be_enabled() {
-                crate::tls::enable_secret_extraction_for_ktls(&mut tls_config);
-            }
-
-            Ok(FrontendTlsSnapshotUpdate::Replace {
-                tls_config,
-                cert_source: if !certificates.is_empty() {
-                    format!("{} Gateway certificate(s)", certificates.len())
-                } else {
-                    cert_path.to_string()
-                },
-            })
+            tokio::task::spawn_blocking(move || materialize_frontend_tls_snapshot(inputs))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("frontend TLS materialization task did not complete")
+                })?
         }
     }
+}
+
+/// Owned inputs for [`materialize_frontend_tls_snapshot`], so the blocking
+/// build can run on the blocking pool.
+struct FrontendTlsMaterialInputs {
+    certificates: Vec<GatewayCertificateInput>,
+    cert_path: String,
+    key_path: String,
+    env_config: Arc<EnvConfig>,
+    tls_policy: Arc<crate::tls::TlsPolicy>,
+    crls: crate::tls::CrlList,
+    handshake_scope: Option<crate::tls::ClientTrustScope>,
+}
+
+/// Build the frontend TLS server config a CP snapshot asks for. Blocking:
+/// reads files and provider-backed sources.
+fn materialize_frontend_tls_snapshot(
+    inputs: FrontendTlsMaterialInputs,
+) -> Result<FrontendTlsSnapshotUpdate, anyhow::Error> {
+    let FrontendTlsMaterialInputs {
+        certificates,
+        cert_path,
+        key_path,
+        env_config,
+        tls_policy,
+        crls,
+        handshake_scope,
+    } = inputs;
+    let mut tls_config = if !certificates.is_empty() {
+        load_gateway_multi_cert_tls_config_with_handshake_scope(
+            &certificates,
+            env_config.frontend_tls_client_ca_bundle_path.as_deref(),
+            env_config.frontend_tls_ocsp_response_source.as_deref(),
+            &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            env_config.tls_crl_expiry_warning_days,
+            crls.as_slice(),
+            handshake_scope,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to materialize {} Gateway frontend TLS certificate sources: {}",
+                certificates.len(),
+                error
+            )
+        })?
+    } else {
+        crate::tls::load_frontend_tls_candidate_from_paths(
+            &cert_path,
+            &key_path,
+            env_config.frontend_tls_client_ca_bundle_path.as_deref(),
+            env_config.frontend_tls_ocsp_response_source.as_deref(),
+            false,
+            &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            env_config.tls_crl_expiry_warning_days,
+            crls.as_slice(),
+            handshake_scope,
+        )
+        .map(|candidate| candidate.config)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to materialize frontend TLS certificate source {}: {}",
+                cert_path,
+                error
+            )
+        })?
+    };
+    crate::tls::enable_early_data(&mut tls_config, &tls_policy);
+    if env_config.ktls_enabled.could_be_enabled() {
+        crate::tls::enable_secret_extraction_for_ktls(&mut tls_config);
+    }
+
+    Ok(FrontendTlsSnapshotUpdate::Replace {
+        tls_config,
+        cert_source: if !certificates.is_empty() {
+            format!("{} Gateway certificate(s)", certificates.len())
+        } else {
+            cert_path
+        },
+    })
 }
 
 /// The Gateway certificate set this data plane must serve, in the control
@@ -2716,7 +2773,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     frontend_tls_runtime,
                     cp_frontend_tls_materialized.as_ref(),
                     frontend_tls_restore_slot.as_ref(),
-                ) {
+                )
+                .await
+                {
                     Ok(update) => update,
                     Err(error) => {
                         error!(
@@ -3870,6 +3929,7 @@ mod tests {
             &cp_materialized,
             &restore_slot,
         )
+        .await
         .expect("disabled HTTPS listener should not reject the whole snapshot");
 
         assert!(matches!(update, FrontendTlsSnapshotUpdate::Unchanged));
