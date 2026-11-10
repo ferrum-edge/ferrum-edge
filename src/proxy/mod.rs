@@ -17276,7 +17276,7 @@ async fn handle_websocket_request_authenticated(
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 https_to_plaintext::maybe_warn_https_to_plaintext_backend(
                     &proxy,
-                    &current_backend_url,
+                    strip_query_params(&current_backend_url),
                     e.as_ref(),
                 );
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
@@ -17536,7 +17536,7 @@ async fn handle_websocket_request_authenticated(
                 // than the misleading hardcoded `connect_failure`.
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %current_backend_url,
+                    backend_url = %strip_query_params(&current_backend_url),
                     error_kind = retry::error_class_log_kind(ws_error_class),
                     error_class = %ws_error_class,
                     error = %e,
@@ -18280,7 +18280,8 @@ async fn handle_websocket_request_authenticated(
 
     info!(
         "WebSocket upgrade response sent for authenticated connection: {} -> {}",
-        proxy.id, current_backend_url
+        proxy.id,
+        strip_query_params(&current_backend_url)
     );
 
     Ok(upgrade_response)
@@ -19668,7 +19669,10 @@ pub(crate) async fn connect_websocket_backend(
         }
     };
 
-    debug!("Connected to backend WebSocket server: {}", backend_url);
+    debug!(
+        "Connected to backend WebSocket server: {}",
+        strip_query_params(backend_url)
+    );
     debug!("Backend response status: {}", backend_response.status());
 
     let negotiated_subprotocol = backend_response

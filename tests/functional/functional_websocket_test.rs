@@ -3539,6 +3539,90 @@ async fn test_h3_websocket_failed_backend_upgrade_returns_502() {
     let _keep_dead_port = dead_port_reservation;
 }
 
+/// A failed WebSocket backend dial is logged at ERROR with the backend URL,
+/// but never with the client's query string: browsers cannot set headers on a
+/// WebSocket handshake, so the query routinely carries `?access_token=`
+/// credentials (GHSA-pwwg-8543-q37r). Covers the H1 and H3 failure records.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_backend_failure_log_omits_query_credentials() {
+    const SECRET: &str = "ws-query-secret-7c1f0e";
+    let dead_port_reservation = reserve_refused_tcp_port().expect("reserve refused dead port");
+    let dead_port = dead_port_reservation.port;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, dead_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+    // ERROR/WARN records land in this file (see `start_gateway_with_extra_env`).
+    let stderr_path = config_path.with_extension(format!("gateway-{gateway_http_port}.stderr.log"));
+
+    let h1_url = format!(
+        "ws://127.0.0.1:{}/ws-echo?access_token={}",
+        gateway_http_port, SECRET
+    );
+    assert!(
+        tokio_tungstenite::connect_async(&h1_url).await.is_err(),
+        "H1 upgrade to a refused backend must fail"
+    );
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let h3_url = format!(
+        "https://localhost:{}/ws-echo?access_token={}",
+        gateway_https_port, SECRET
+    );
+    let ws = client
+        .websocket(&h3_url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket failed-upgrade response");
+    assert_eq!(ws.status, StatusCode::BAD_GATEWAY);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (h1_lines, h3_lines) = loop {
+        let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let h1_lines: Vec<String> = log
+            .lines()
+            .filter(|line| {
+                line.contains("WebSocket backend connection failed") && !line.contains("H3 ")
+            })
+            .map(str::to_owned)
+            .collect();
+        let h3_lines: Vec<String> = log
+            .lines()
+            .filter(|line| line.contains("H3 WebSocket backend connection failed"))
+            .map(str::to_owned)
+            .collect();
+        if (!h1_lines.is_empty() && !h3_lines.is_empty()) || tokio::time::Instant::now() >= deadline
+        {
+            break (h1_lines, h3_lines);
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        !h1_lines.is_empty(),
+        "expected the H1 WebSocket backend failure record"
+    );
+    assert!(
+        !h3_lines.is_empty(),
+        "expected the H3 WebSocket backend failure record"
+    );
+    for line in h1_lines.iter().chain(h3_lines.iter()) {
+        assert!(
+            !line.contains(SECRET),
+            "WebSocket backend failure log leaked the query credential: {line}"
+        );
+    }
+
+    gateway.shutdown();
+    let _keep_dead_port = dead_port_reservation;
+}
+
 /// The H3 bridge releases the per-IP request guard after the 200 upgrade
 /// response. Keeping it for the full WebSocket session would make one
 /// long-lived socket block ordinary requests from the same client IP.
