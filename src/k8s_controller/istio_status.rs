@@ -648,6 +648,32 @@ fn ferrum_detail_matches(status: &Value, desired: &Option<Value>) -> bool {
         .is_none_or(|detail| status.get("ferrum") == Some(detail))
 }
 
+/// JSON Merge Patch (RFC 7396) that turns `live` into exactly `desired`.
+///
+/// For objects on both sides this recurses key by key and adds an explicit
+/// `null` for every live key `desired` lacks; anything else (scalars, arrays,
+/// or a type change) replaces the live value wholesale, as merge patch does.
+/// Recursion follows `desired`, which Ferrum builds, so its depth is bounded
+/// by Ferrum's own detail shape rather than by the live object.
+fn merge_patch_replacing(live: Option<&Value>, desired: &Value) -> Value {
+    let (Some(Value::Object(live)), Value::Object(desired)) = (live, desired) else {
+        return desired.clone();
+    };
+    let mut patch = serde_json::Map::with_capacity(desired.len());
+    for (key, desired_value) in desired {
+        patch.insert(
+            key.clone(),
+            merge_patch_replacing(live.get(key), desired_value),
+        );
+    }
+    for key in live.keys() {
+        if !desired.contains_key(key) {
+            patch.insert(key.clone(), Value::Null);
+        }
+    }
+    Value::Object(patch)
+}
+
 fn is_supported_istio_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -714,8 +740,18 @@ fn istio_status_patch(
         // Pin the Ferrum-specific block under `status.ferrum` so the
         // existing `status` fields Istio writes stay untouched. This is
         // a JSON Merge Patch so `null` would delete; only insert when
-        // Some.
-        status_patch.insert("ferrum".to_string(), detail.clone());
+        // Some. The detail's key set differs per outcome (a rejection
+        // carries `translation.error`, an acceptance does not), and RFC 7396
+        // leaves keys absent from the patch untouched, so every key the live
+        // block has but the desired one lacks is deleted explicitly. Without
+        // that a fixed resource would keep its stale `error` beside
+        // `FerrumAccepted=True`, and `ferrum_detail_matches` would never
+        // match again, re-patching the object on every reconcile.
+        let live_detail = live_status.and_then(|status| status.get("ferrum"));
+        status_patch.insert(
+            "ferrum".to_string(),
+            merge_patch_replacing(live_detail, detail),
+        );
     }
 
     let mut patch = serde_json::Map::new();
@@ -3302,6 +3338,64 @@ mod tests {
         assert_eq!(
             patch["status"]["ferrum"]["translation"]["scope"].as_str(),
             Some("Namespace")
+        );
+    }
+
+    /// RFC 7396 `MergePatch(target, patch)`.
+    fn apply_merge_patch(target: &mut Value, patch: &Value) {
+        let Value::Object(patch) = patch else {
+            *target = patch.clone();
+            return;
+        };
+        if !target.is_object() {
+            *target = json!({});
+        }
+        let target = target.as_object_mut().unwrap();
+        for (key, value) in patch {
+            if value.is_null() {
+                target.remove(key);
+            } else {
+                apply_merge_patch(target.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+    }
+
+    #[test]
+    fn patch_status_removes_stale_ferrum_detail_keys_after_a_fix() {
+        // The object was rejected last reconcile; it is accepted now. The
+        // stale `translation.error` (and any other key the new detail lacks)
+        // must be deleted, or the live block never matches the desired one
+        // and the object is re-patched forever (issue #7261).
+        let live_status = json!({
+            "conditions": [],
+            "validationMessages": [{"type": "istio"}],
+            "ferrum": {
+                "translation": {"action": "rejected", "error": "spec.foo is invalid"},
+                "legacy": {"note": "old"}
+            }
+        });
+        let desired_detail = json!({
+            "translation": {"action": "accepted", "rules_translated": 2, "target_refs": []}
+        });
+        let update = IstioStatusUpdate {
+            api_version: "security.istio.io/v1".to_string(),
+            kind: "AuthorizationPolicy".to_string(),
+            namespace: "default".to_string(),
+            name: "test".to_string(),
+            uid: String::new(),
+            status: json!({ "conditions": [] }),
+            ferrum_detail: Some(desired_detail.clone()),
+        };
+        let patch = istio_status_patch(&update, Some(&live_status), "42", "uid-test");
+
+        let mut patched = live_status.clone();
+        apply_merge_patch(&mut patched, &patch["status"]);
+        assert_eq!(patched["ferrum"], desired_detail);
+        assert!(ferrum_detail_matches(&patched, &Some(desired_detail)));
+        // Istio's own fields are untouched.
+        assert_eq!(
+            patched["validationMessages"],
+            live_status["validationMessages"]
         );
     }
 
