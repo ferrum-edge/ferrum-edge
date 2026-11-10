@@ -45,8 +45,6 @@
 //! `__mesh_bpf_metrics` plugin still emits a stable Prometheus surface so
 //! dashboards do not break.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use ferrum_ebpf_common::{

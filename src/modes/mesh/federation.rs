@@ -56,7 +56,6 @@ use crate::util::backoff::{
 pub(crate) const FEDERATION_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
 #[cfg(test)]
 const FEDERATION_BACKOFF_MAX_SECS: u64 = BACKOFF_MAX_SECS;
-#[allow(dead_code)]
 pub(crate) const DEFAULT_FEDERATION_MAX_STALE_SECONDS: u64 = 3600;
 
 /// Hard cap on federation response body size. A real SPIFFE bundle is
@@ -621,7 +620,6 @@ pub struct FederationPollerConfig {
 impl FederationPollerConfig {
     /// Returns `None` when the poller should be disabled (interval 0 or no
     /// federated remote clusters configured).
-    #[allow(dead_code)]
     pub fn from_env(interval_seconds: u64, timeout_seconds: u64, fail_open: bool) -> Option<Self> {
         Self::from_env_with_max_stale(
             interval_seconds,
@@ -650,7 +648,6 @@ impl FederationPollerConfig {
 }
 
 /// Holds the spawned tasks so callers can join during graceful shutdown.
-#[allow(dead_code)] // Integration tests call this through the lib crate; the bin target does not.
 pub struct FederationPollerHandles {
     pub tasks: Vec<JoinHandle<()>>,
 }
@@ -712,7 +709,6 @@ fn poll_targets_for_multi_cluster(
 /// there are no configured federation endpoints; otherwise returns the spawned
 /// task handles. The caller-supplied `store` is shared with the mesh runtime
 /// so successful polls are observable by the slice-apply path immediately.
-#[allow(dead_code)] // Integration tests call this through the lib crate; the bin target does not.
 pub fn spawn_federation_poller(
     multi_cluster: Option<&MultiClusterConfig>,
     config: Option<FederationPollerConfig>,

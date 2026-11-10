@@ -152,7 +152,6 @@ pub struct RemoteClusterEntry {
 
 impl RemoteClusterEntry {
     /// Construct an entry, wrapping the poll timestamp in a fresh shared atomic.
-    #[allow(dead_code)]
     pub fn new(
         cluster_name: String,
         trust_domain: TrustDomain,

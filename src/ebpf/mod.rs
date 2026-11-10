@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Userspace eBPF manager for the node-agent capture mode.
 //!
 //! This module owns the trait surface, shared types, and mock backend for

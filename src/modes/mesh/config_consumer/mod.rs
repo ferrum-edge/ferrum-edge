@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Mesh configuration consumers.
 
 pub mod common;

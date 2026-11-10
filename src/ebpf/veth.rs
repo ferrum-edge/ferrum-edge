@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Host-side veth interface discovery for enrolled pods.
 //!
 //! When a pod is enrolled for eBPF capture, the node agent attaches a tc

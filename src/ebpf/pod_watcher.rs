@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Pod enrollment criteria for the eBPF node agent.
 //!
 //! Pure helpers (`evaluate_enrollment`, excluded-namespace handling) that

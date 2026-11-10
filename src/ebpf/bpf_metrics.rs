@@ -47,8 +47,6 @@
 //! pattern (warn enter, info recover, no per-event spam). This is the
 //! "silent drops would be a regression" guard from the GAP-SC3 plan.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! cgroup v2 path resolution for Kubernetes pods.
 //!
 //! Kubernetes uses two cgroup drivers — `systemd` and `cgroupfs` — each
@@ -612,11 +611,13 @@ pub fn collect_cgroup_tree(_pod_cgroup_path: &Path) -> CgroupTreeWalk {
 /// Pure bookkeeping (no aya types), kept outside the Linux-only loader so its
 /// transitions are unit-tested on every host; only the live loader
 /// (`AyaEbpfBackend::detach_pod`) uses it outside tests.
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct UnconfirmedCgroupDetaches {
     paths: Vec<String>,
 }
 
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
 impl UnconfirmedCgroupDetaches {
     /// Record a cgroup whose program detach failed. Idempotent per path.
     pub(crate) fn record(&mut self, cgroup_path: String) {
@@ -651,6 +652,7 @@ impl UnconfirmedCgroupDetaches {
 /// Whether a cgroup path still exists. Anything other than a definite
 /// `NotFound` (for example a permission error) is treated as present, so an
 /// unconfirmed detach is never reported as complete on doubt.
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
 pub(crate) fn cgroup_path_may_exist(cgroup_path: &str) -> bool {
     !matches!(
         std::fs::symlink_metadata(cgroup_path),

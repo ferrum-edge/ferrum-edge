@@ -1326,11 +1326,7 @@ async fn load_full_config_multi_with_sequence(
 
 /// External-test view of CP full-load sequencing without exposing the
 /// credential-bearing internal outcome type.
-///
-/// `#[allow(dead_code)]` because integration tests exercise this seam; the
-/// binary target does not construct it, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub struct CpFullLoadSequenceOutcomeForTest {
     pub config: GatewayConfig,
     pub sequences: HashMap<String, u64>,
@@ -1341,11 +1337,7 @@ pub struct CpFullLoadSequenceOutcomeForTest {
 /// Exercise the production full-load boundary orchestration from external
 /// integration tests with a scripted [`CpFullLoadSource`]. Runs at the
 /// maximum per-phase budget (the default SQL pool's and MongoDB's).
-///
-/// `#[allow(dead_code)]` because only external integration tests call this;
-/// the binary target does not, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn load_full_config_multi_with_sequence_for_test(
     db: &(impl CpFullLoadSource + ?Sized),
     namespaces: &[String],
@@ -1375,10 +1367,7 @@ pub async fn load_full_config_multi_with_sequence_for_test(
 /// External-test view of the CP multi-namespace incremental poll.
 ///
 /// Not `Debug`: `IncrementalResult` carries consumer credentials.
-/// `#[allow(dead_code)]` because only external integration tests construct
-/// it; the binary target does not, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub struct CpIncrementalMultiLoadOutcomeForTest {
     pub result: IncrementalResult,
     pub next_sequences: HashMap<String, u64>,
@@ -1387,11 +1376,7 @@ pub struct CpIncrementalMultiLoadOutcomeForTest {
 
 /// Exercise the production multi-namespace incremental poll from external
 /// integration tests with a scripted [`CpIncrementalLoadSource`].
-///
-/// `#[allow(dead_code)]` because only external integration tests call this;
-/// the binary target does not, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn load_incremental_config_multi_for_test(
     db: &(impl CpIncrementalLoadSource + ?Sized),
     namespaces: &[String],

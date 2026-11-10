@@ -4,9 +4,10 @@
 //! between Rust types and the `#[repr(C)]` shared types from
 //! `ferrum-ebpf-common`. Only available on Linux with `--features ebpf`.
 
-#![allow(dead_code)]
+use std::net::{IpAddr, Ipv6Addr};
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+use std::net::Ipv4Addr;
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::Ebpf;
@@ -611,6 +612,7 @@ pub fn parse_cidr_to_lpm_key_data(cidr: &str) -> Result<ParsedCidrKey, String> {
     }
 }
 
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
 fn ipv4_to_nbo_key(addr: Ipv4Addr) -> u32 {
     u32::from(addr).to_be()
 }

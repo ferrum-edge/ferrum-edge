@@ -494,9 +494,7 @@ const MINIMAL_WITHHELD_LOG_RECORD: &str = "{}";
 // already holds the `&RedactionPlan` snapshot it is acting on and reaches
 // `plan.withheld_record` through `withheld_record(plan, ..)`, so calling this
 // there would add a second global-plan lookup and let the emitted line come
-// from a different snapshot than the record being withheld. The binary target
-// therefore compiles it unused; scoped to this accessor only.
-#[allow(dead_code)]
+// from a different snapshot than the record being withheld. Tests read it.
 pub fn withheld_log_record() -> &'static str {
     match redaction_plan() {
         Some(plan) => plan.withheld_record.as_str(),

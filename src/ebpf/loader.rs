@@ -4,8 +4,6 @@
 //! BPF ELF bytes, attach programs to pod cgroups and veth interfaces, and
 //! manage BPF map contents. Available only on Linux with `--features ebpf`.
 
-#![allow(dead_code)]
-
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::collections::HashMap;
 use std::ffi::CString;

@@ -5,10 +5,6 @@
 //! the canonical Layer 2 mesh model instead of reading any config source
 //! directly.
 
-// Phase B exposes xDS pieces before every runtime path consumes them. Keep the
-// allowance scoped to dead code only; unused imports should still be caught.
-#![allow(dead_code)]
-
 pub mod admission;
 pub mod carrier;
 pub mod nonce;

@@ -548,9 +548,7 @@ impl StockXdsCredentialSource {
     }
 
     // Constructed by the external mesh stock-xDS test suites, which drive the
-    // production client with no bearer configured. The binary target has no
-    // downstream consumer, so the accessor is dead there by construction.
-    #[allow(dead_code)]
+    // production client with no bearer configured.
     pub fn unauthenticated() -> Self {
         Self {
             path: None,
@@ -722,8 +720,7 @@ impl StockBearerCredential {
 
     /// The in-process content identity. Read by the external credential tests
     /// to prove a rotation is observed as a CONTENT change (production compares
-    /// through `observed_state`), so it is dead in the binary target.
-    #[allow(dead_code)]
+    /// through `observed_state`).
     pub fn fingerprint(&self) -> StockCredentialFingerprint {
         self.fingerprint
     }

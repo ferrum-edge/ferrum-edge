@@ -1618,7 +1618,6 @@ async fn start_node_agent_admin_listeners(
 
 /// Test-only seam for issue #3704 external coverage of the production
 /// node-agent admin HTTP/HTTPS planner and startup path.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub async fn start_node_agent_admin_listeners_for_test(
     env_config: &EnvConfig,
@@ -2049,7 +2048,6 @@ impl NodeAgentReadiness {
     }
 }
 
-#[allow(dead_code)] // External unit tests cover the combined readiness boundary.
 pub(crate) fn set_node_agent_startup_readiness_for_test(
     initial_pod_sync_complete: bool,
     topology_ready: bool,
@@ -2167,7 +2165,6 @@ fn apply_ingress_topology_outcome(
 /// It exposes only the topology bit and the readiness derived from it (with no
 /// UDP migration generation); BPF-map and metrics effects remain observable
 /// through the existing mock backend and metrics snapshots.
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) fn apply_ingress_topology_outcome_for_test(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
@@ -2194,7 +2191,6 @@ pub(crate) fn apply_ingress_topology_outcome_for_test(
 /// drive the node-agent watcher loop against an injected finite (or pending)
 /// pod-event stream without a live Kubernetes API. CNI is disabled; callers
 /// may seed already-attached pods to assert BPF detach/cleanup side effects.
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) async fn run_with_pod_stream_for_test<S, I>(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
@@ -2243,7 +2239,6 @@ where
 /// tests can exercise the real outcome arm and readiness/quarantine wiring.
 /// `startup_ready` is the loop's published `/health` bit, and a
 /// `udp_migration_generation` requires `config.node_waypoint_pod_registry_dir`.
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_topology_outcome_stream_for_test<S, T>(
     backend: &mut crate::ebpf::MockEbpfBackend,
@@ -3078,7 +3073,6 @@ fn cni_capture_readiness_rejection(
     }
 }
 
-#[allow(dead_code)] // External unit tests cover the combined proof gate.
 pub(crate) fn cni_capture_readiness_rejection_for_test(
     verb: RpcVerb,
     initial_sync_complete: bool,
@@ -3752,7 +3746,6 @@ async fn probe_kube_add_dependency_ready(
 }
 
 /// Test seam for CNI STATUS live Kubernetes ADD-dependency readiness (#3225).
-#[allow(dead_code)] // External integration tests exercise this through `_test_support`.
 pub(crate) async fn apply_cni_request_with_kube_metadata_for_test(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -3766,7 +3759,6 @@ pub(crate) async fn apply_cni_request_with_kube_metadata_for_test(
 }
 
 /// External tests advance paused Tokio time against this exact STATUS probe budget.
-#[allow(dead_code)] // Re-exported through `_test_support` for integration coverage.
 pub(crate) const CNI_STATUS_KUBE_PROBE_TIMEOUT_FOR_TEST: Duration = CNI_STATUS_KUBE_PROBE_TIMEOUT;
 
 fn apply_cni_add_from_pod(
@@ -10596,18 +10588,11 @@ fn shutdown_backend_state(
 /// Test-only seams for the issue #2371 startup-rollback contract.
 ///
 /// Every item here exists solely so external unit tests (`tests/unit/`) can
-/// drive the *production* rollback paths through `crate::_test_support`. The
-/// library target reaches them through that bridge; `src/main.rs` re-declares
-/// every module **without** it, so in the binary target nothing in this module
-/// has a caller. That is the entire justification for the module-scoped
-/// `allow(dead_code)`: it covers only test-only items — no production item is
-/// suppressed, and `-D dead_code` still applies to the rest of the file. Same
-/// convention as the `_for_test` seams in `src/load_balancer.rs`.
+/// drive the *production* rollback paths through `crate::_test_support`.
 ///
 /// These probes call the production entry points (`initialize_backend`,
 /// `InitializedBackendOwner::{shutdown_pods, fail_with}`) directly — there is no
 /// test-only twin of the cleanup logic to drift from.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub mod startup_cleanup_test_seams {
     use super::*;

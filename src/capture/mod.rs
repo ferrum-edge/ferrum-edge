@@ -1714,47 +1714,6 @@ impl CleanupCommands {
     }
 }
 
-// EbpfPlan and helpers are consumed by the node-agent eBPF capture path
-// (ambient DaemonSet integration). The sidecar injector deliberately does NOT
-// inject an init container for eBPF mode — privileged capabilities would cause
-// Pod Security Baseline/Restricted admission rejection on every pod, even when
-// the script does nothing on 5.7+ kernels.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EbpfPlan {
-    pub enabled: bool,
-    pub fallback: IptablesPlan,
-    pub required_kernel: &'static str,
-}
-
-#[allow(dead_code)]
-impl EbpfPlan {
-    pub fn for_config(config: &CaptureConfig) -> Result<Self, String> {
-        Ok(Self {
-            enabled: config.mode == CaptureMode::Ebpf,
-            fallback: IptablesPlan::for_config(config)?,
-            required_kernel: "5.7",
-        })
-    }
-
-    pub fn fallback_script(&self) -> String {
-        let fallback_cmds = self.fallback.script();
-        let (major, minor) = parse_kernel_requirement(self.required_kernel);
-        format!(
-            "MAJOR=$(uname -r | cut -d. -f1)\n\
-             MINOR=$(uname -r | cut -d. -f2)\n\
-             if [ \"$MAJOR\" -lt {major} ] || \
-             {{ [ \"$MAJOR\" -eq {major} ] && [ \"$MINOR\" -lt {minor} ]; }}; then\n\
-             echo \"Kernel $(uname -r) < {req}, falling back to iptables\"\n\
-             {fallback_cmds}\n\
-             else\n\
-             echo \"Kernel $(uname -r) supports eBPF capture, skipping iptables\"\n\
-             fi",
-            req = self.required_kernel,
-        )
-    }
-}
-
 impl IptablesPlan {
     pub fn script(&self) -> String {
         // `set -e` makes the injected init container fail **closed**: if any
@@ -2109,14 +2068,6 @@ impl IptablesPlan {
         };
         iptables_script(&v4_commands, &v6_commands, ip6tables_mode, false)
     }
-}
-
-#[allow(dead_code)]
-fn parse_kernel_requirement(version: &str) -> (u32, u32) {
-    let mut parts = version.split('.');
-    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(5);
-    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(7);
-    (major, minor)
 }
 
 pub fn should_fallback_to_iptables(kernel_release: &str) -> bool {
@@ -4093,62 +4044,6 @@ iptables() {{
         assert!(should_fallback_to_iptables("5.4.0"));
         assert!(!should_fallback_to_iptables("5.7.0"));
         assert!(!should_fallback_to_iptables("6.6.12"));
-    }
-
-    #[test]
-    fn ebpf_plan_carries_iptables_fallback() {
-        let mut config = CaptureConfig::explicit(15006, 15001);
-        config.mode = CaptureMode::Ebpf;
-
-        let plan = EbpfPlan::for_config(&config).unwrap();
-
-        assert!(plan.enabled);
-        assert_eq!(plan.required_kernel, "5.7");
-        assert_eq!(plan.fallback.ip6tables_mode, Ip6TablesMode::Auto);
-        assert!(
-            plan.fallback
-                .v4_commands
-                .iter()
-                .any(|cmd| cmd.contains("--uid-owner 1337"))
-        );
-        assert!(
-            plan.fallback
-                .v4_commands
-                .iter()
-                .any(|cmd| cmd.contains("--to-ports 15001"))
-        );
-    }
-
-    #[test]
-    fn ebpf_fallback_script_contains_kernel_check_and_iptables() {
-        let mut config = CaptureConfig::explicit(15006, 15001);
-        config.mode = CaptureMode::Ebpf;
-
-        let plan = EbpfPlan::for_config(&config).unwrap();
-        let script = plan.fallback_script();
-
-        assert!(script.contains("uname -r"));
-        assert!(script.contains("-lt 5"));
-        assert!(script.contains("-lt 7"));
-        assert!(script.contains("falling back to iptables"));
-        assert!(script.contains("supports eBPF"));
-        assert!(script.contains("--to-ports 15001"));
-        assert!(script.contains("--to-ports 15006"));
-    }
-
-    #[test]
-    fn ebpf_fallback_script_preserves_required_ip6tables_mode() {
-        let mut config = CaptureConfig::explicit(15006, 15001);
-        config.mode = CaptureMode::Ebpf;
-        config.ip6tables_mode = Ip6TablesMode::Required;
-        config.include_cidrs = vec!["fd00::/8".to_string()];
-
-        let plan = EbpfPlan::for_config(&config).unwrap();
-        let script = plan.fallback_script();
-
-        assert_eq!(plan.fallback.ip6tables_mode, Ip6TablesMode::Required);
-        assert!(script.contains("ip6tables is required for IPv6 mesh capture"));
-        assert!(script.contains("ip6tables nat table is required for IPv6 mesh capture"));
     }
 
     #[test]
