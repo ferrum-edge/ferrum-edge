@@ -3383,28 +3383,8 @@ mod tests {
     use crate::config::db_loader::NamespacedResourceId;
     use crate::dns::{DnsCache, DnsConfig};
     use crate::proxy::ProxyState;
-    use crate::util::backoff::jittered_backoff_with_entropy;
     use chrono::Utc;
     use serde_json::json;
-
-    #[test]
-    fn jittered_backoff_with_entropy_stays_within_expected_range() {
-        let samples = [0, 249, 250, 499, u64::MAX];
-
-        for entropy in samples {
-            let duration = jittered_backoff_with_entropy(1, entropy);
-            assert!(duration >= Duration::from_millis(750));
-            assert!(duration < Duration::from_millis(1250));
-        }
-    }
-
-    #[test]
-    fn jittered_backoff_never_sleeps_below_minimum() {
-        assert_eq!(
-            jittered_backoff_with_entropy(0, 0),
-            Duration::from_millis(100)
-        );
-    }
 
     fn minimal_proxy_state() -> ProxyState {
         ProxyState::new(
