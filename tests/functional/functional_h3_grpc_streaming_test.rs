@@ -54,6 +54,22 @@ fn file_mode_yaml_with_response_buffering(
     remove_buffered_trailer_fields: bool,
     override_existing_security_headers: bool,
 ) -> String {
+    file_mode_yaml_with_options(
+        backend_port,
+        buffer_response,
+        remove_buffered_trailer_fields,
+        override_existing_security_headers,
+        None,
+    )
+}
+
+fn file_mode_yaml_with_options(
+    backend_port: u16,
+    buffer_response: bool,
+    remove_buffered_trailer_fields: bool,
+    override_existing_security_headers: bool,
+    circuit_breaker: Option<serde_json::Value>,
+) -> String {
     let mut proxy = json!({
         "id": "h3-grpc-stream",
         "listen_path": "/api",
@@ -68,6 +84,9 @@ fn file_mode_yaml_with_response_buffering(
     });
     if buffer_response {
         proxy["response_body_mode"] = json!("buffer");
+    }
+    if let Some(circuit_breaker) = circuit_breaker {
+        proxy["circuit_breaker"] = circuit_breaker;
     }
     let mut security_config = json!({
         "override_existing": override_existing_security_headers,
@@ -153,6 +172,22 @@ async fn spawn_h3_grpc_gateway_with_response_buffering(
     remove_buffered_trailer_fields: bool,
     override_existing_security_headers: bool,
 ) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_yaml(
+        file_mode_yaml_with_response_buffering(
+            backend_port,
+            buffer_response,
+            remove_buffered_trailer_fields,
+            override_existing_security_headers,
+        ),
+        extra_env,
+    )
+    .await
+}
+
+async fn spawn_h3_grpc_gateway_with_yaml(
+    yaml: String,
+    extra_env: &[(&str, String)],
+) -> (GatewayHarness, u16) {
     // Outer retry (codex P3): `FERRUM_PROXY_HTTPS_PORT` is a fixed port we
     // reserve-then-drop before the subprocess binds it, so a parallel test can
     // steal it in the bind-drop-rebind window. Re-reserve a FRESH port (and fresh
@@ -167,12 +202,7 @@ async fn spawn_h3_grpc_gateway_with_response_buffering(
         let (cert_path, key_path) = write_frontend_certs(scratch.path());
 
         let mut builder = GatewayHarness::builder()
-            .file_config(file_mode_yaml_with_response_buffering(
-                backend_port,
-                buffer_response,
-                remove_buffered_trailer_fields,
-                override_existing_security_headers,
-            ))
+            .file_config(yaml.clone())
             .log_level("info")
             .capture_output()
             .env("FERRUM_ENABLE_HTTP3", "true")
@@ -737,6 +767,110 @@ async fn h3_buffered_grpc_trailers_only_resists_hostile_terminal_set() {
 #[ignore]
 async fn h3_buffered_grpc_trailers_only_resists_terminal_removal() {
     assert_h3_buffered_grpc_trailers_only_preserves_initial_terminal_status(true).await;
+}
+
+// Issue #7189: the buffered H3 → gRPC bridge must record backend health
+// (circuit breaker / passive health / least-latency) from the backend's gRPC
+// terminal status, not from the HTTP 200 status line. A completed response
+// carrying `grpc-status: 14` (UNAVAILABLE → 503) must count as a breaker
+// failure, so with `failure_threshold: 1` the next RPC is short-circuited and
+// never reaches the backend — the same outcome an H1/H2 client gets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_unavailable_trailer_trips_circuit_breaker() {
+    let backend_listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-buffered-cb-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    // Two scripted RPCs on the pooled connection: the second is consumed (and
+    // counted) only if the breaker failed to open after the first.
+    let unavailable_rpc = [
+        GrpcStep::AcceptRpc(MatchRpc::any()),
+        GrpcStep::SendInitialHeaders,
+        GrpcStep::RespondMessage(Bytes::from_static(b"partial")),
+        GrpcStep::RespondStatus {
+            code: 14,
+            message: "backend unavailable",
+        },
+    ];
+    let backend = ScriptedGrpcBackend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .steps(unavailable_rpc.clone())
+        .steps(unavailable_rpc)
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = file_mode_yaml_with_options(
+        backend_port,
+        true,
+        false,
+        false,
+        Some(json!({
+            "failure_threshold": 1,
+            "success_threshold": 1,
+            "timeout_seconds": 30,
+            "failure_status_codes": [500, 502, 503, 504],
+            "half_open_max_requests": 1,
+            "trip_on_connection_errors": true,
+        })),
+    );
+    let (_harness, https_port) = spawn_h3_grpc_gateway_with_yaml(yaml, &[]).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+
+    // RPC 1: relayed in full (buffered), HTTP 200 with grpc-status 14.
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"ping").await.expect("send message");
+    stream.finish().await.expect("finish");
+    let (status, _headers) = stream.recv_response().await.expect("recv response");
+    let (_body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("recv body+trailers");
+    assert_eq!(status.as_u16(), 200, "gRPC failures ride on HTTP 200");
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("14")
+    );
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "the first RPC must reach the backend"
+    );
+    // The gateway records the outcome right after the response FIN; give that
+    // bookkeeping a moment before the follow-up RPC.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // RPC 2: the breaker is OPEN, so the gateway answers it locally.
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    let _ = stream.send_message(b"ping").await;
+    let _ = stream.finish().await;
+    let (status, headers) = stream
+        .recv_response()
+        .await
+        .expect("circuit-open reject surfaces");
+    assert_eq!(
+        backend.received_stream_count(),
+        1,
+        "a completed buffered H3 gRPC response with grpc-status 14 must trip the \
+         breaker; a second backend stream means health was recorded from HTTP 200"
+    );
+    assert_eq!(
+        status.as_u16(),
+        200,
+        "gRPC reject is Trailers-Only HTTP 200"
+    );
+    assert_eq!(
+        headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("14"),
+        "circuit-open gRPC reject must be UNAVAILABLE"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────

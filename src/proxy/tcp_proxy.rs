@@ -5047,10 +5047,11 @@ async fn handle_tcp_connection_inner(
                 peer_chain_der.as_deref(),
             )
         {
-            return Err(anyhow::anyhow!(
-                "{}",
-                crate::tls::client_trust::TRUST_WITHDRAWN_REASON
-            ));
+            // The typed client-side `ClientTrustWithdrawn` refusal every later
+            // withdrawal fence returns, so disconnect metrics and logs never
+            // read it as a TLS error. No session is registered yet, so there
+            // is no fence counter to settle.
+            return Err(settle_stream_trust_withdrawal(None, &client_trust_settled));
         }
         let peer_cert_der = peer_chain_der
             .as_ref()
@@ -5820,6 +5821,13 @@ async fn handle_tcp_connection_inner(
                     ));
                 }
                 Err(PrefixForwardReject::Io(error)) => {
+                    // Genuine backend evidence (the fence did not fire): the
+                    // dial succeeded and the backend then failed the first
+                    // write, exactly like a failed outbound PROXY header write
+                    // or a relay `BackendFailure`. Settle the admitted breaker
+                    // ticket as a failure instead of letting the probe guard
+                    // release it neutrally on drop.
+                    record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                     return Err(anyhow::anyhow!(
                         "failed forwarding inspected first bytes to backend: {error}"
                     ));

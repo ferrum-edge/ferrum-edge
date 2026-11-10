@@ -25459,7 +25459,7 @@ async fn handle_tls_connection(
         tls_connection_metadata.record_mesh_mtls_metric,
     )
     .await?;
-    info!("TLS connection established from {}", remote_addr.ip());
+    debug!("TLS connection established from {}", remote_addr.ip());
 
     // Extract peer certificate and chain before wrapping the stream.
     // This is the only point where the ServerConnection is accessible — once
@@ -53890,11 +53890,11 @@ async fn proxy_to_backend(
                 // No size limit — stream directly. Buffer small bodies eagerly
                 // when Content-Length is known and below the cutoff (cheaper than
                 // async coalescing). Skip buffering for SSE (unbounded streams).
-                let content_length = response
-                    .headers()
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<usize>().ok());
+                // Same canonical parse as the sibling arms: a standards-valid
+                // repeated identical declaration is a known length, an ambiguous
+                // one is not (`GHSA-xrfj-852f-645j`).
+                let content_length = canonical_header_content_length(response.headers())
+                    .and_then(|len| usize::try_from(len).ok());
                 let cutoff = state.response_buffer_cutoff_bytes;
                 if cutoff > 0
                     && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)

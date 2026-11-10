@@ -841,6 +841,128 @@ fn test_extract_sni_dtls_rejects_malformed_sni_extension_lengths() {
     );
 }
 
+/// A single-fragment DTLS ClientHello record from explicit parts, so a test can
+/// shape the cipher-suite, compression and extension vectors directly.
+fn build_dtls_client_hello_from_parts(
+    cipher_suites: &[u8],
+    compression_methods: &[u8],
+    extensions: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0xfe, 0xfd]);
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(0); // session_id length
+    body.push(0); // cookie length (DTLS-specific)
+    body.extend_from_slice(&(cipher_suites.len() as u16).to_be_bytes());
+    body.extend_from_slice(cipher_suites);
+    body.push(compression_methods.len() as u8);
+    body.extend_from_slice(compression_methods);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(extensions);
+
+    let body_len = body.len();
+    let mut handshake = vec![0x01];
+    handshake.extend_from_slice(&(body_len as u32).to_be_bytes()[1..]);
+    handshake.extend_from_slice(&[0x00, 0x00]); // message_seq
+    handshake.extend_from_slice(&[0x00, 0x00, 0x00]); // fragment_offset
+    handshake.extend_from_slice(&(body_len as u32).to_be_bytes()[1..]);
+    handshake.extend_from_slice(&body);
+
+    let mut record = vec![0x16, 0xfe, 0xfd, 0x00, 0x00];
+    record.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
+/// One extension: type (2) + length (2) + data.
+fn dtls_extension(ext_type: u16, data: &[u8]) -> Vec<u8> {
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&ext_type.to_be_bytes());
+    ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    ext.extend_from_slice(data);
+    ext
+}
+
+/// A `server_name` extension carrying the given `(name_type, name)` entries.
+fn dtls_server_name_extension(names: &[(u8, &[u8])]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for (name_type, name) in names {
+        list.push(*name_type);
+        list.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        list.extend_from_slice(name);
+    }
+    let mut data = (list.len() as u16).to_be_bytes().to_vec();
+    data.extend_from_slice(&list);
+    dtls_extension(0x0000, &data)
+}
+
+// Issue #7191: the DTLS passthrough parser applies the same ClientHello shape
+// rules as the TLS classifier before it routes on a hostname.
+#[test]
+fn test_extract_sni_dtls_parts_builder_routes_a_well_formed_hello() {
+    let sni = dtls_server_name_extension(&[(0x00, b"parts.example.com")]);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&build_dtls_client_hello_from_parts(
+            &[0x00, 0x2f],
+            &[0x00],
+            &sni,
+        )),
+        DtlsSniResult::Hostname("parts.example.com".to_string())
+    );
+}
+
+#[test]
+fn test_extract_sni_dtls_rejects_duplicate_extension_of_any_type() {
+    let mut extensions = dtls_server_name_extension(&[(0x00, b"tenant.example.com")]);
+    // supported_groups (0x000a) twice: not `server_name`, still forbidden.
+    let groups = dtls_extension(0x000a, &[0x00, 0x02, 0x00, 0x1d]);
+    extensions.extend_from_slice(&groups);
+    extensions.extend_from_slice(&groups);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&build_dtls_client_hello_from_parts(
+            &[0x00, 0x2f],
+            &[0x00],
+            &extensions,
+        )),
+        DtlsSniResult::Malformed
+    );
+}
+
+#[test]
+fn test_extract_sni_dtls_rejects_repeated_server_name_type_of_any_kind() {
+    let extensions =
+        dtls_server_name_extension(&[(0x00, b"tenant.example.com"), (0x07, b"a"), (0x07, b"b")]);
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&build_dtls_client_hello_from_parts(
+            &[0x00, 0x2f],
+            &[0x00],
+            &extensions,
+        )),
+        DtlsSniResult::Malformed
+    );
+}
+
+#[test]
+fn test_extract_sni_dtls_rejects_empty_or_odd_cipher_suites_and_empty_compression() {
+    let sni = dtls_server_name_extension(&[(0x00, b"tenant.example.com")]);
+    for (label, cipher_suites, compression) in [
+        ("empty cipher suites", &[][..], &[0x00][..]),
+        ("odd cipher suites", &[0x00, 0x2f, 0x00][..], &[0x00][..]),
+        ("empty compression", &[0x00, 0x2f][..], &[][..]),
+    ] {
+        assert_eq!(
+            extract_sni_from_dtls_client_hello(&build_dtls_client_hello_from_parts(
+                cipher_suites,
+                compression,
+                &sni,
+            )),
+            DtlsSniResult::Malformed,
+            "{label} must not route"
+        );
+    }
+}
+
 #[test]
 fn test_extract_sni_dtls_wrong_handshake_type() {
     // Other handshake messages are not eligible to create a catch-all session.
