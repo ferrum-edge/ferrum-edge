@@ -1,4 +1,5 @@
-//! Database mode — single-instance gateway backed by PostgreSQL, MySQL, or SQLite.
+//! Database mode — single-instance gateway backed by PostgreSQL, MySQL, SQLite,
+//! or MongoDB.
 //!
 //! Lifecycle:
 //! 1. Connect to the primary DB (with failover URL retry)
@@ -1703,7 +1704,7 @@ pub async fn run(
     ) {
         Ok(Some(candidate)) => {
             let mut config = candidate.config;
-            info!("Loading TLS configuration with client certificate verification...");
+            info!("Loading TLS configuration...");
             // Enable 0-RTT on the proxy frontend only (not admin).
             tls::enable_early_data(&mut config, &tls_policy);
             // Enable kTLS session-secret extraction on the proxy frontend
@@ -3926,6 +3927,12 @@ pub(super) mod tests {
     #[test]
     fn normal_startup_seeds_poll_cursor_from_initial_full_load() {
         let source = include_str!("database.rs");
+        // Only production code: `include_str!` also embeds this test module,
+        // whose needle literals would otherwise always match.
+        let test_module = source
+            .find("\n#[cfg(test)]\npub(super) mod tests")
+            .expect("test module marker");
+        let source = &source[..test_module];
         assert!(
             source.contains("let (config, initial_change_cursor) ="),
             "database startup must retain the initial topology-bound full-load cursor"
@@ -3944,10 +3951,19 @@ pub(super) mod tests {
         // migrations, the poll-loop availability helper must invoke the same
         // warn/auto-apply policy once deferred core migrations succeed.
         let source = include_str!("database.rs");
+        // Only production code: `include_str!` also embeds this test module,
+        // whose needle literals would otherwise always match.
+        let test_module = source
+            .find("\n#[cfg(test)]\npub(super) mod tests")
+            .expect("test module marker");
+        let source = &source[..test_module];
         let helper_start = source
             .find("async fn mark_db_available_after_successful_poll_load(")
             .expect("availability helper must exist");
-        let helper = &source[helper_start..];
+        let helper_end = source[helper_start..]
+            .find("\n/// A validation-rejected full snapshot")
+            .map_or(source.len(), |offset| helper_start + offset);
+        let helper = &source[helper_start..helper_end];
         assert!(
             helper.contains("handle_recovery_plugin_migrations"),
             "recovery path must reconcile custom-plugin migrations"
@@ -4456,6 +4472,12 @@ pub(super) mod tests {
     #[test]
     fn startup_backup_seeds_config_rejection_before_first_poll() {
         let source = include_str!("database.rs");
+        // Only production code: `include_str!` also embeds this test module,
+        // whose needle literals would otherwise always match.
+        let test_module = source
+            .find("\n#[cfg(test)]\npub(super) mod tests")
+            .expect("test module marker");
+        let source = &source[..test_module];
         assert!(
             source
                 .contains("crate::config::validation_pipeline::is_config_validation_rejection(&e)"),
