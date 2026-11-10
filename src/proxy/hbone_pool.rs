@@ -1007,8 +1007,10 @@ impl HboneConnectionPool {
         shard_amount: usize,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
+        let entries = Arc::new(DashMap::with_shard_amount(shard_amount));
+        spawn_idle_entry_sweeper(&entries, &pool_config);
         Self {
-            entries: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            entries,
             creation_locks: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
             gateway_svid,
@@ -2471,11 +2473,7 @@ impl HboneConnectionPool {
 
     fn maybe_prune_idle_entries(&self) {
         let now = unix_secs();
-        let interval = if self.pool_config.idle_timeout_seconds == 0 {
-            60
-        } else {
-            self.pool_config.idle_timeout_seconds.clamp(1, 60)
-        };
+        let interval = idle_prune_interval_secs(&self.pool_config);
         let last = self.last_idle_prune_unix_secs.load(Ordering::Relaxed);
         if now.saturating_sub(last) < interval {
             return;
@@ -3767,6 +3765,50 @@ fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
 fn record_hbone_evictions(count: usize) {
     crate::runtime_metrics::global_ref()
         .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
+}
+
+/// Seconds between idle sweeps: the global idle timeout clamped to `1..=60`,
+/// or 60 when idle expiry is off globally (a per-proxy timeout may still
+/// apply to individual entries).
+fn idle_prune_interval_secs(pool_config: &PoolConfig) -> u64 {
+    if pool_config.idle_timeout_seconds == 0 {
+        60
+    } else {
+        pool_config.idle_timeout_seconds.clamp(1, 60)
+    }
+}
+
+/// Periodic idle sweep for the HBONE / mesh CONNECT pool (issue #7182).
+///
+/// The rate-limited prune also runs on the cold create path, but a
+/// destination that stops receiving lookups never reaches it, so without this
+/// task its connections — sockets, DestinationRule `maxConnections` slots,
+/// trust-registry registrations — would outlive `idleTimeout` indefinitely.
+/// Holds only a `Weak` reference to the entry map, so the task ends with the
+/// pool, exactly like the direct pools' sweepers. Spawned only inside a Tokio
+/// runtime.
+fn spawn_idle_entry_sweeper(
+    entries: &Arc<DashMap<String, Vec<HbonePoolEntry>>>,
+    pool_config: &PoolConfig,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(entries);
+    let interval = Duration::from_secs(idle_prune_interval_secs(pool_config));
+    handle.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(entries) = weak.upgrade() else { break };
+            entries.retain(|_, entries| {
+                record_hbone_evictions(prune_pool_entries(entries));
+                !entries.is_empty()
+            });
+        }
+    });
 }
 
 /// Remove the pool entry whose gate is `gate`. Identity match (not key-only)
