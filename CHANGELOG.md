@@ -618,6 +618,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ferrum-edge validate`, log one warning, and leave the scheduler off, so
   certificates silently stopped renewing. Startup and `ferrum-edge validate`
   now reject it. The value is still ignored while auto-renewal is disabled.
+- **TLS live-reload watchers retry a failed rebuild** (#7196). The frontend
+  proxy HTTPS/H2/H3, admin HTTPS and CP/DP gRPC TLS watchers, and the backend
+  TLS watcher for ordinary source rotations, recorded a failed rebuild as the
+  accepted source state, so a transient failure (a source deadline, a provider
+  blip, or a rotated-in certificate whose `notBefore` was still ahead) left the
+  listener on the old certificate until the source bytes changed again or the
+  process restarted. They now retry the candidate on every poll, as the
+  frontend DTLS watcher already did. The TLS event and warning are still
+  recorded once per distinct failing candidate.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

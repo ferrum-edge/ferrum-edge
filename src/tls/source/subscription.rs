@@ -851,6 +851,10 @@ async fn run_material_set_reload_loop(
             None
         }
     };
+    // A failed rebuild leaves `last_fingerprint` on the accepted generation so
+    // the next poll retries the same candidate (issue #7196). This remembers
+    // the failing candidate so its event and warning are recorded once.
+    let mut last_rebuild_failure: Option<MaterialSetFingerprint> = None;
 
     // `tokio::time::interval` completes its first tick immediately. The startup
     // fingerprint above already is that pass, so consume the immediate tick
@@ -947,6 +951,7 @@ async fn run_material_set_reload_loop(
                 let event_entries = next_fingerprint.entries.clone();
                 record_refresh_for_entries(surface, &next_fingerprint.entries, "rotated");
                 last_fingerprint = Some(next_fingerprint);
+                last_rebuild_failure = None;
                 revision_tx.send_modify(|r| *r = r.saturating_add(1));
                 let revision = *revision_tx.borrow();
                 crate::tls::events::record_rotation_success(surface, &event_entries, revision);
@@ -957,18 +962,24 @@ async fn run_material_set_reload_loop(
                 );
             }
             Err(error) => {
+                // Keep `last_fingerprint` on the accepted generation: a
+                // transient failure (source deadline, provider blip, a
+                // certificate whose notBefore is still ahead) is retried at
+                // the watcher cadence instead of being treated as applied.
                 record_refresh_for_entries(surface, &next_fingerprint.entries, "rebuild_error");
-                crate::tls::events::record_rebuild_error(
-                    surface,
-                    &next_fingerprint.entries,
-                    &error,
-                );
-                last_fingerprint = Some(next_fingerprint);
-                warn!(
-                    surface,
-                    error = %error,
-                    "TLS material sources changed but rebuild failed; keeping previous material"
-                );
+                if last_rebuild_failure.as_ref() != Some(&next_fingerprint) {
+                    crate::tls::events::record_rebuild_error(
+                        surface,
+                        &next_fingerprint.entries,
+                        &error,
+                    );
+                    warn!(
+                        surface,
+                        error = %error,
+                        "TLS material sources changed but rebuild failed; keeping previous material and retrying at the bounded watcher cadence"
+                    );
+                    last_rebuild_failure = Some(next_fingerprint);
+                }
             }
         }
     }
@@ -1263,10 +1274,12 @@ async fn run_dynamic_material_set_reload_loop(
     let rebuild: SharedMaterialSetRebuildFn = Arc::from(rebuild);
 
     let mut last_fingerprint: Option<DynamicMaterialFingerprint> = None;
-    // A tenant refusal (or recovery) transition whose rebuild failed has not
-    // invalidated cached configs yet. Retry it on every poll, even when the
-    // fingerprint is unchanged, until a rebuild succeeds.
-    let mut refusal_rebuild_pending = false;
+    // A candidate whose rebuild failed has not been applied: neither a rotated
+    // source nor a tenant refusal (or recovery) transition has invalidated
+    // cached configs yet. Retry it on every poll, even when the fingerprint is
+    // unchanged, until a rebuild succeeds. Issue #7196 widened this from
+    // refusal transitions to every failed rebuild.
+    let mut rebuild_retry_pending = false;
     let mut load_failures = LoadFailureTransitionTracker::default();
     let mut last_source_signature: Option<Vec<(MaterialKind, String)>> = None;
     let mut k8s_targets = Vec::new();
@@ -1396,7 +1409,7 @@ async fn run_dynamic_material_set_reload_loop(
         }
 
         let unchanged = last_fingerprint.as_ref() == Some(&next_fingerprint);
-        if unchanged && !refusal_rebuild_pending {
+        if unchanged && !rebuild_retry_pending {
             record_refresh_for_entries(surface, &next_fingerprint.material.entries, "unchanged");
             if !wait_material_set_reload_tick(interval, &mut shutdown_rx, &mut force_rx).await {
                 finish_dynamic_reload(surface, &mut k8s_handles, isolate_tenant_files);
@@ -1405,12 +1418,9 @@ async fn run_dynamic_material_set_reload_loop(
             continue;
         }
 
-        let refusal_changed = last_fingerprint
-            .as_ref()
-            .is_none_or(|last| last.refused != next_fingerprint.refused);
         match run_material_set_rebuild(&rebuild).await {
             Ok(()) => {
-                refusal_rebuild_pending = false;
+                rebuild_retry_pending = false;
                 let event_entries = next_fingerprint.material.entries.clone();
                 record_refresh_for_entries(surface, &next_fingerprint.material.entries, "rotated");
                 last_fingerprint = Some(next_fingerprint);
@@ -1429,7 +1439,7 @@ async fn run_dynamic_material_set_reload_loop(
                     &next_fingerprint.material.entries,
                     "rebuild_error",
                 );
-                refusal_rebuild_pending |= refusal_changed;
+                rebuild_retry_pending = true;
                 // A retry of an unchanged candidate is already reported.
                 if !unchanged {
                     crate::tls::events::record_rebuild_error(
@@ -1751,12 +1761,14 @@ mod tests {
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failing_clone = failing.clone();
         let rebuild: MaterialSetRebuildFn = Box::new(move || {
-            let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
-            if attempt == 0 {
-                Ok(())
-            } else {
+            attempts_clone.fetch_add(1, Ordering::SeqCst);
+            if failing_clone.load(Ordering::SeqCst) {
                 Err(anyhow::anyhow!("simulated rebuild failure"))
+            } else {
+                Ok(())
             }
         });
 
@@ -1800,15 +1812,40 @@ mod tests {
             "same bytes must not bump revision"
         );
 
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Issue #7196: a failed rebuild is not treated as applied. The same
+        // candidate is retried at the watcher cadence without another change.
+        failing.store(true, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&path, b"different failing bytes").expect("rewrite changed bytes");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while attempts.load(Ordering::SeqCst) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a failed rebuild must be retried on later polls"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             *revision_rx.borrow(),
             1,
             "failed rebuild must not bump revision"
         );
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        // Once the transient failure clears, the unchanged candidate applies.
+        failing.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), revision_rx.changed())
+            .await
+            .expect("the retried candidate should apply once rebuild succeeds")
+            .expect("watcher should still be alive");
+        assert_eq!(*revision_rx.borrow(), 2);
+
+        // Applied: unchanged bytes stop rebuilding again.
+        let applied_attempts = attempts.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), applied_attempts);
+        assert_eq!(*revision_rx.borrow(), 2);
 
         shutdown_tx.send_replace(true);
         task.await.expect("watcher exits cleanly");
