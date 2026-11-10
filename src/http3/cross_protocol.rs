@@ -10315,6 +10315,18 @@ where
                     body_completed = false;
                 }
             }
+            // A completed buffered gRPC response carries its backend outcome in the
+            // grpc-status trailer (HTTP 200), captured pre-hook as
+            // `grpc_backend_dispatch_status`, so an UNAVAILABLE/INTERNAL backend must
+            // count as a failure, not look healthy, for the breaker, passive health,
+            // least-latency AND the admission limiter — exactly as the streaming
+            // arm and the H1/H2 gRPC path record it (issue #7189). An incomplete
+            // stream stays a client disconnect, matching H1/H2.
+            let backend_outcome_status = if body_completed {
+                grpc_backend_dispatch_status
+            } else {
+                response_status
+            };
             if authorization_terminated {
                 cb_probe.release_neutral();
                 drop(backend_admission_permits.take());
@@ -10326,7 +10338,7 @@ where
                     upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    response_status,
+                    backend_outcome_status,
                     false,
                     None,
                     cb_probe.settle(),
@@ -10334,19 +10346,9 @@ where
                     backend_start.elapsed(),
                 );
             }
-            // A completed buffered gRPC response carries its backend outcome in the
-            // grpc-status trailer (HTTP 200), captured pre-hook as
-            // `grpc_backend_dispatch_status`, so an UNAVAILABLE/INTERNAL backend must
-            // shrink, not look healthy. An incomplete stream stays a client
-            // disconnect (ignored), matching H1/H2.
-            let admission_status = if body_completed {
-                grpc_backend_dispatch_status
-            } else {
-                response_status
-            };
             record_cross_protocol_backend_admission_outcome(
                 &mut backend_admission_permits,
-                admission_status,
+                backend_outcome_status,
                 false,
                 if body_completed {
                     None
