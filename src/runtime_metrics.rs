@@ -389,6 +389,12 @@ impl RuntimeMetrics {
 
     pub fn record_log(&self, level: LogLevel, category: &'static str) {
         self.log_counts[level.index()].fetch_add(1, Ordering::Relaxed);
+        // Existing keys take the shard read lock only; `entry` would take the
+        // write lock on every counted event (issue #7207).
+        if let Some(counter) = self.log_counts_by_category.get(&(level, category)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.log_counts_by_category
             .entry((level, category))
             .or_insert_with(|| CachePadded::new(AtomicU64::new(0)))

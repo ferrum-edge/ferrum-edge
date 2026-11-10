@@ -4311,51 +4311,54 @@ fn make_cache_key(
 /// in the SAME coordinate system the router used to compute the offset, so the
 /// slice can never land mid-codepoint or desync routing from forwarding.
 pub(crate) fn normalize_encoded_slashes(path: &str) -> Cow<'_, str> {
-    if !path.as_bytes().contains(&b'%') {
-        return Cow::Borrowed(path);
-    }
-
     let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut modified = false;
+    // Find the first foldable escape before allocating, so a path that only
+    // carries other percent-escapes stays zero-allocation (issue #7207).
+    // Every byte before it is copied verbatim by the fold loop, so starting
+    // the loop there keeps the output byte-identical.
+    let Some(first) = (0..bytes.len()).find(|&i| encoded_slash_len(bytes, i).is_some()) else {
+        return Cow::Borrowed(path);
+    };
 
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..first]);
+    let mut i = first;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            // Double-encoded slash: %252F / %252f (5 bytes)
-            if i + 4 < bytes.len()
-                && bytes[i + 1] == b'2'
-                && bytes[i + 2] == b'5'
-                && bytes[i + 3] == b'2'
-                && matches!(bytes[i + 4], b'F' | b'f')
-            {
-                out.push(b'/');
-                i += 5;
-                modified = true;
-                continue;
-            }
-            // Single-encoded slash: %2F / %2f (3 bytes)
-            if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
-                out.push(b'/');
-                i += 3;
-                modified = true;
-                continue;
-            }
+        if let Some(len) = encoded_slash_len(bytes, i) {
+            out.push(b'/');
+            i += len;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
     }
 
-    if modified {
-        // Input was valid UTF-8 and we only replaced ASCII percent-sequences
-        // with ASCII '/'; the result is guaranteed valid UTF-8.
-        match String::from_utf8(out) {
-            Ok(s) => Cow::Owned(s),
-            Err(_) => Cow::Borrowed(path),
-        }
-    } else {
-        Cow::Borrowed(path)
+    // Input was valid UTF-8 and we only replaced ASCII percent-sequences
+    // with ASCII '/'; the result is guaranteed valid UTF-8.
+    match String::from_utf8(out) {
+        Ok(s) => Cow::Owned(s),
+        Err(_) => Cow::Borrowed(path),
     }
+}
+
+/// Length of the encoded slash starting at `bytes[i]`: 5 for a double-encoded
+/// `%252F` / `%252f`, 3 for `%2F` / `%2f`, `None` otherwise.
+fn encoded_slash_len(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'%') {
+        return None;
+    }
+    if i + 4 < bytes.len()
+        && bytes[i + 1] == b'2'
+        && bytes[i + 2] == b'5'
+        && bytes[i + 3] == b'2'
+        && matches!(bytes[i + 4], b'F' | b'f')
+    {
+        return Some(5);
+    }
+    if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
+        return Some(3);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -6273,7 +6276,18 @@ mod tests {
     #[test]
     fn encoded_slash_other_percent_unchanged() {
         let result = normalize_encoded_slashes("/api%20name");
+        // Issue #7207: a path with only non-slash escapes is not copied.
+        assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(result, "/api%20name");
+    }
+
+    #[test]
+    fn encoded_slash_after_other_escapes_keeps_prefix_bytes() {
+        assert_eq!(
+            normalize_encoded_slashes("/x%20y%25%2Fz%252"),
+            "/x%20y%25/z%252"
+        );
+        assert_eq!(normalize_encoded_slashes("/%2%2f"), "/%2/");
     }
 
     #[test]
