@@ -4313,7 +4313,10 @@ A datagram matching no declared mesh UDP destination is dropped.
   host-netns producer an interface-scoped `mangle PREROUTING` guard (it installs no
   OUTPUT chain) — and pod UDP stays blocked by the node-agent's BPF gate until the producer publishes
   `.udp-ready/<pod_uid>`; a pod leaving capture keeps its DROP posture until the
-  node-agent acknowledges the closed gate.
+  node-agent acknowledges the closed gate. On the host-netns producer that wait holds
+  closed only the departing pod's interface (and any pod not yet captured): pods whose
+  capture is already live and unchanged keep their UDP egress, on a capture listener
+  restarted with their evidence alone.
 - Startup fails closed on an invalid capture config, a runtime image missing
   `sh`/`ip`/`iptables`, or a required IPv6 `ip6tables` failure. Routing is installed
   before the `PREROUTING` jumps, so a routing failure never leaves live chains with no
