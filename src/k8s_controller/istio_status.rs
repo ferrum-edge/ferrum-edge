@@ -1556,16 +1556,14 @@ fn virtual_service_clamped_fields(spec: &Value) -> Vec<&'static str> {
 /// counts so operators can confirm Ferrum's view of an external service.
 ///
 /// A `protocol: UDP` port is ACCEPTED (it translates to `AppProtocol::Udp`) but
-/// its EgressGateway egress lane is INERT: the EgressGateway materializer skips
-/// UDP ports because ServiceEntry/egress-external UDP is out of scope (east-west
-/// UDP capture/egress shipped in F3 §3.3, but external-UDP egress did not), so
-/// the resource would
-/// otherwise show as fully accepted in `kubectl describe` while no
-/// proxy/listener/upstream is produced. Surface that gap as a `deferred_fields`
-/// entry (keeping `FerrumAccepted=True` — it IS accepted/translated, just
-/// inert), detected via the SHARED `service_entry_port_protocol_is_udp` predicate
-/// so the status report can never diverge from the translator's classification or
-/// the materializer's skip.
+/// its external egress is CONDITIONAL (issue #3263): the EgressGateway admits
+/// it into a datagram allowlist only with `FERRUM_MESH_EGRESS_STREAM_ENABLED`,
+/// and Sidecar/Ambient sources capture it only for a `MESH_EXTERNAL`,
+/// `resolution: STATIC` entry with IP-literal endpoints. No listener is ever
+/// bound for it. Surface those conditions as a `deferred_fields` entry
+/// (keeping `FerrumAccepted=True`), detected via the SHARED
+/// `service_entry_port_protocol_is_udp` predicate so the status report can never
+/// diverge from the translator's classification.
 ///
 /// A wildcard `spec.hosts[]` element on a stream-family port is reported the
 /// same way (issue #4535): the stream materialization branch refuses a wildcard
@@ -1612,15 +1610,10 @@ fn service_entry_status(
         .unwrap_or(0);
 
     // A `protocol: UDP` ServiceEntry is accepted (it translates to
-    // `AppProtocol::Udp`) but the EgressGateway materializer skips UDP ports as
-    // inert (ServiceEntry/egress-external UDP is out of scope; east-west UDP
-    // capture/egress shipped in F3 §3.3 — see `build_egress_proxies_and_upstreams`
-    // in `src/modes/mesh/mod.rs`, which keys its one-time deferral warning off
-    // `AppProtocol::Udp`). Surface that gap as a deferred field so the resource
-    // does not appear fully accepted while no proxy/listener/upstream is produced.
-    // Detect UDP ports on the raw spec via the SHARED predicate the translator's
-    // classifier feeds, so this report stays in lock-step with the materializer's
-    // skip.
+    // `AppProtocol::Udp`), but external UDP egress needs conditions the
+    // resource alone does not establish (see the doc comment above). Detect UDP
+    // ports on the raw spec via the SHARED predicate the translator's
+    // classifier feeds, so this report stays in lock-step with it.
     let has_udp_port = object
         .spec
         .get("ports")
@@ -1633,9 +1626,11 @@ fn service_entry_status(
     let mut deferred: Vec<&'static str> = Vec::new();
     if has_udp_port {
         deferred.push(
-            "spec.ports[].protocol: UDP — egress materialization deferred \
-             (ServiceEntry/egress-external UDP is out of scope; east-west UDP \
-             capture/egress shipped in F3 §3.3)",
+            "spec.ports[].protocol: UDP — external UDP egress is conditional (the \
+             EgressGateway admits it only with FERRUM_MESH_EGRESS_STREAM_ENABLED; \
+             Sidecar/Ambient sources capture it only for a MESH_EXTERNAL, \
+             resolution: STATIC entry with IP-literal endpoints; no UDP listener is \
+             bound)",
         );
     }
 
@@ -4176,8 +4171,8 @@ mod tests {
         assert!(
             deferred
                 .iter()
-                .any(|f| f.contains("UDP") && f.contains("egress materialization deferred")),
-            "deferred_fields should mention the deferred UDP egress lane, got {deferred:?}"
+                .any(|f| f.contains("UDP") && f.contains("external UDP egress is conditional")),
+            "deferred_fields should state the UDP egress conditions, got {deferred:?}"
         );
     }
 

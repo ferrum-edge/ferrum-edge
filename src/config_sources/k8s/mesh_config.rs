@@ -68,31 +68,6 @@ impl MeshConfigProviderRegistry {
     pub(crate) fn is_unsupported_ext_authz_provider(&self, name: &str) -> bool {
         self.unsupported_ext_authz_provider_names.contains(name)
     }
-
-    fn merge_from(&mut self, parsed: ParsedMeshConfig, warnings: &mut Vec<String>) {
-        for (name, provider) in parsed.registry.tracing_providers {
-            self.non_tracing_provider_names.remove(&name);
-            self.tracing_providers.insert(name, provider);
-        }
-        for name in parsed.registry.non_tracing_provider_names {
-            if !self.tracing_providers.contains_key(&name) {
-                self.non_tracing_provider_names.insert(name);
-            }
-        }
-        for (name, provider) in parsed.registry.ext_authz_providers {
-            self.unsupported_ext_authz_provider_names.remove(&name);
-            self.ext_authz_providers.insert(name, provider);
-        }
-        for name in parsed.registry.unsupported_ext_authz_provider_names {
-            if !self.ext_authz_providers.contains_key(&name) {
-                self.unsupported_ext_authz_provider_names.insert(name);
-            }
-        }
-        if !parsed.registry.default_tracing_provider_names.is_empty() {
-            self.default_tracing_provider_names = parsed.registry.default_tracing_provider_names;
-        }
-        warnings.extend(parsed.warnings);
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,8 +106,12 @@ pub(crate) fn collect(
     }
     let parsed =
         parse_mesh_config(raw_mesh_config).map_err(|message| invalid_resource(object, message))?;
-    acc.mesh_config_registry
-        .merge_from(parsed, &mut acc.warnings);
+    // Only the root-namespace `istio` ConfigMap reaches here and Kubernetes
+    // names are unique, so this is the whole registry: take it as parsed
+    // (bounds such as `MAX_MESH_EXT_AUTHZ_PROVIDERS` were enforced by the
+    // parser) rather than merging into an always-empty default.
+    acc.mesh_config_registry = parsed.registry;
+    acc.warnings.extend(parsed.warnings);
     Ok(())
 }
 
@@ -998,8 +977,8 @@ extensionProviders:
     #[test]
     fn duplicate_tracing_provider_in_same_config_map_warns_once() {
         // Two entries with the same name in one ConfigMap. Only the
-        // pre-merge dup detector should fire; the cross-ConfigMap merge_from
-        // path must not emit a second identical warning.
+        // parser's duplicate detector fires; collection must not emit a
+        // second identical warning.
         let parsed = parse(
             r#"
 extensionProviders:

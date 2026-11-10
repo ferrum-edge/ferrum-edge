@@ -3713,10 +3713,6 @@ fn validate_vs_header_name(
         })
 }
 
-fn route_has_uncollapsible_local_policy(route_plugins: &[PluginConfig]) -> bool {
-    !route_plugins.is_empty()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn materialize_route_candidate(
     proxies: &mut Vec<Proxy>,
@@ -4026,10 +4022,6 @@ fn parse_l4_cidr_list(
         out.push(raw.to_string());
     }
     Ok(out)
-}
-
-fn attach_l4_stream_match(proxy: &mut Proxy, arm: crate::proxy::stream_match::StreamMatchArm) {
-    proxy.stream_match = Some(crate::proxy::stream_match::StreamMatchCriteria { arms: vec![arm] });
 }
 
 /// Resolve L4 (`tcp[]`/`tls[]`) route destinations into Ferrum backends.
@@ -4715,10 +4707,12 @@ pub const MAX_L4_CANDIDATE_PROXIES: usize = 64;
 /// remaining independently tunable from [`MAX_L4_CANDIDATE_PROXIES`].
 pub const MAX_PROJECTED_L4_PROXIES: usize = 1024;
 
+/// Project each L4 candidate (a stream proxy and the one match arm it was
+/// built from) into every namespace the VirtualService is visible to.
 fn project_l4_proxy_visibility(
     object: &K8sObject,
     acc: &K8sAccumulator,
-    proxies: Vec<Proxy>,
+    proxies: Vec<(Proxy, crate::proxy::stream_match::StreamMatchArm)>,
     upstream_templates: Vec<crate::config::types::Upstream>,
 ) -> Result<(Vec<Proxy>, Vec<crate::config::types::Upstream>), K8sTranslateError> {
     let (mut export_namespaces, public) = l4_export_namespaces(object, acc)?;
@@ -4729,9 +4723,7 @@ fn project_l4_proxy_visibility(
         // `known_namespaces` yet.
         for gateway in proxies
             .iter()
-            .filter_map(|proxy| proxy.stream_match.as_ref())
-            .flat_map(|criteria| criteria.arms.iter())
-            .flat_map(|arm| arm.gateways.iter())
+            .flat_map(|(_, arm)| arm.gateways.iter())
             .filter(|gateway| gateway.as_str() != crate::proxy::stream_match::MESH_GATEWAY_TOKEN)
         {
             if let Some((namespace, _)) = gateway.split_once('/') {
@@ -4771,12 +4763,11 @@ fn project_l4_proxy_visibility(
     let mut projected = Vec::with_capacity(projected_proxy_count);
     let mut projected_upstreams = Vec::new();
     let mut emitted_upstream_keys = HashSet::new();
-    for proxy in proxies {
-        let Some(criteria) = proxy.stream_match.as_ref() else {
-            continue;
-        };
+    for (proxy, arm) in proxies {
         for namespace in &export_namespaces {
-            let mut criteria = criteria.clone();
+            let mut criteria = crate::proxy::stream_match::StreamMatchCriteria {
+                arms: vec![arm.clone()],
+            };
             let mut projected_arms = Vec::with_capacity(criteria.arms.len().saturating_mul(2));
             for arm in criteria.arms.drain(..) {
                 if arm
@@ -4933,8 +4924,7 @@ fn virtual_service_l4_proxies(
                     backend_read_timeout_ms: None,
                 });
                 proxy.passthrough = true;
-                attach_l4_stream_match(&mut proxy, stream_arm);
-                proxies.push(proxy);
+                proxies.push((proxy, stream_arm));
             }
         }
     }
@@ -4985,8 +4975,7 @@ fn virtual_service_l4_proxies(
                     "tcp",
                     &vs_gateways,
                 )?;
-                attach_l4_stream_match(&mut proxy, arm);
-                proxies.push(proxy);
+                proxies.push((proxy, arm));
             } else {
                 for (mi, m) in match_entries.into_iter().enumerate() {
                     let stream_arm = parse_l4_match_arm(object, m, "tcp", &vs_gateways)?;
@@ -5022,8 +5011,7 @@ fn virtual_service_l4_proxies(
                         retry: None,
                         backend_read_timeout_ms: None,
                     });
-                    attach_l4_stream_match(&mut proxy, stream_arm);
-                    proxies.push(proxy);
+                    proxies.push((proxy, stream_arm));
                 }
             }
         }
@@ -5238,7 +5226,7 @@ fn virtual_service_routes(
             // Istio `http[].mirror`: attach a proxy-scoped `request_mirror`
             // plugin. Mirror is a per-route action; making it a route-local
             // plugin means a route that must be collapsed with siblings fails
-            // closed (via `route_has_uncollapsible_local_policy`) rather than
+            // closed (a non-empty `route_plugins` blocks collapse) rather than
             // silently mirroring the siblings' traffic too. This reuses the
             // battle-tested `request_mirror` plugin instead of duplicating its
             // fire-and-forget task plumbing on the dispatch hot path.
@@ -5253,8 +5241,8 @@ fn virtual_service_routes(
             // A matcher outside those bounds is left unprojected (warned +
             // reported as a deferred field) rather than silently approximated
             // or widened. Like mirror this is a route-local plugin, so a route
-            // that must collapse with siblings fails closed via
-            // `route_has_uncollapsible_local_policy` — route-local CORS never
+            // that must collapse with siblings fails closed (a non-empty
+            // `route_plugins` blocks collapse) — route-local CORS never
             // leaks onto a sibling route.
             if let Some(cors_plugin) = route_cors_plugin(object, http, &proxy_id) {
                 route_plugins.push(cors_plugin);
@@ -5264,9 +5252,9 @@ fn virtual_service_routes(
             // emitted dispatch rule rather than spinning up a separate
             // proxy-scoped `fault_injection` plugin. The per-rule
             // representation collapses cleanly with sibling routes — the
-            // historical fail-closed escape hatch
-            // (`route_has_uncollapsible_local_policy` returning true on a
-            // fault-carrying merged route) is no longer needed for fault.
+            // historical fail-closed escape hatch (a route-local plugin
+            // blocking collapse of a fault-carrying merged route) is no
+            // longer needed for fault.
             if let Some(delay) = http
                 .get("fault")
                 .and_then(route_local_fault_delay_for_rule)
@@ -5388,7 +5376,9 @@ fn virtual_service_routes(
                 || consumes_pending_scoped
                 || (is_uri_less_catch_all
                     && (has_later_any_path || pending_uri_less_route.is_some()));
-            if route_has_uncollapsible_local_policy(&route_plugins)
+            // Any route-local plugin (mirror, CORS) is policy that cannot be
+            // collapsed with sibling routes without leaking onto them.
+            if !route_plugins.is_empty()
                 && (consumes_pending_uri_less
                     || overlaps_pending_scoped
                     || (guarded_route && collapse_required))
@@ -6635,18 +6625,16 @@ fn mesh_cors_policy_from_value(cors: &Value) -> Option<MeshCorsPolicy> {
     let mut allowed_origins = Vec::new();
     for origin in cors_allowed_origins(cors)? {
         let matcher = match &origin {
-            // Kept for the native allow-all string form; the translator itself
-            // now emits every exact as a `{"exact": ...}` matcher object.
-            Value::String(exact) => MeshCorsOriginMatch::Exact(exact.clone()),
             Value::Object(map) => {
                 if let Some(exact) = map.get("exact").and_then(Value::as_str) {
                     MeshCorsOriginMatch::Exact(exact.to_string())
                 } else if let Some(prefix) = map.get("prefix").and_then(Value::as_str) {
                     MeshCorsOriginMatch::Prefix(prefix.to_string())
                 } else {
-                    // `cors_allowed_origins` only emits the supported shapes;
-                    // anything else is a translatability bug upstream — stay
-                    // fail-closed rather than approximate.
+                    // `cors_allowed_origins` only emits these matcher objects
+                    // (every exact as `{"exact": ...}`); anything else is a
+                    // translatability bug upstream — stay fail-closed rather
+                    // than approximate.
                     let regex = map.get("regex").and_then(Value::as_str)?;
                     MeshCorsOriginMatch::Regex(regex.to_string())
                 }
@@ -7102,10 +7090,10 @@ fn workload_ports(object: &K8sObject) -> Result<Vec<WorkloadPort>, K8sTranslateE
 /// port), so `protocol: UDP` mirrors the K8s Service L4 mapping
 /// (`core::workload_port_protocol`) to `AppProtocol::Udp` rather than the
 /// `Unknown` (HTTP-family) catch-all — otherwise a UDP ServiceEntry would still
-/// be classified HTTP-family and routed into HTTP/stream materialization. UDP is
-/// inert in this F3 §3.3 stage (no UDP capture/egress yet); the classification
-/// just keeps it partitioned out of the other lanes. Unrecognized tokens (e.g.
-/// `sctp`) stay `Unknown`.
+/// be classified HTTP-family and routed into HTTP/stream materialization. UDP
+/// takes the datagram lanes (in-mesh UDP capture/egress and the external-UDP
+/// egress allowlist, issue #3263). Unrecognized tokens (e.g. `sctp`) stay
+/// `Unknown`.
 fn app_protocol(value: Option<&str>) -> AppProtocol {
     match value.unwrap_or_default().to_ascii_lowercase().as_str() {
         "http" => AppProtocol::Http,
@@ -7132,11 +7120,11 @@ fn app_protocol(value: Option<&str>) -> AppProtocol {
 ///
 /// Routes the raw token through the SAME [`app_protocol`] classifier the
 /// ServiceEntry translator uses to populate `ServicePort.protocol`, then checks
-/// for [`AppProtocol::Udp`] — so the Istio status writer's UDP-deferral
-/// detection can never diverge from what the translator classifies (and thus
-/// from what the EgressGateway materializer skips as inert in F3 §3.3 stage 1,
-/// which keys off `AppProtocol::Udp`). Used by `istio_status::service_entry_status`
-/// to surface the deferred UDP egress lane in `deferred_fields`. Shared (like
+/// for [`AppProtocol::Udp`] — so the Istio status writer's UDP egress note
+/// can never diverge from what the translator classifies (and thus from the
+/// external-UDP egress materializers, which key off `AppProtocol::Udp`). Used
+/// by `istio_status::service_entry_status` to surface the conditions external
+/// UDP egress needs in `deferred_fields`. Shared (like
 /// [`cors_policy_translatable`] / [`sidecar_ingress_protocol_is_http_family`]) so
 /// the predicate lives in one place and translation/materialization and the
 /// status report stay in lock-step.
