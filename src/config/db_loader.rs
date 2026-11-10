@@ -13879,7 +13879,8 @@ fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, any
         id: row.try_get("id")?,
         namespace: row_namespace_or_default(row),
         username: row.try_get("username")?,
-        custom_id: row.try_get("custom_id").ok(),
+        // An identity column: a decode failure must not silently drop it.
+        custom_id: optional_utf8_text_column(row, "custom_id")?,
         credentials,
         acl_groups,
         created_at: parse_datetime_column(row, "created_at"),
@@ -13971,19 +13972,16 @@ fn row_to_plugin_config_inner(
             .map_err(|reason| anyhow::anyhow!("PluginConfig {:?}: {}", id_preview, reason))?,
         proxy_id: optional_utf8_text_column(row, "proxy_id")?,
         enabled: row.try_get::<i32, _>("enabled")? != 0,
+        // A decode failure must not silently drop the override and change
+        // plugin execution order (issue #7192).
         priority_override: row
-            .try_get::<Option<i32>, _>("priority_override")
-            .ok()
-            .flatten()
+            .try_get::<Option<i32>, _>("priority_override")?
             .map(|v| v.clamp(0, 10_000) as u16),
         trigger,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.
-        api_spec_id: row
-            .try_get::<Option<String>, _>("api_spec_id")
-            .ok()
-            .flatten(),
+        api_spec_id: optional_utf8_text_column(row, "api_spec_id")?,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
