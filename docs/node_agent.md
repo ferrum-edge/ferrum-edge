@@ -59,7 +59,7 @@ Ordering on the normal shutdown path is per-pod first, then node-global: enrolle
 
 The node-agent watches pods on the local node via kube-rs (`spec.nodeName={node_name}` field selector) and reacts to three Kubernetes event flavors. `Event::Apply` from the watcher conflates "added" and "modified", so the same code path handles initial enrollment and mid-life updates.
 
-Watcher-loop exit is classified deliberately: an operator-requested shutdown still runs BPF/CNI cleanup and returns success (process exit 0). If the Kubernetes pod-watcher stream ends unexpectedly, the same cleanup path runs, then the mode returns an error so `main` exits nonzero and supervisors that restart only failed processes relaunch the agent. Transient watcher *errors* are logged and retried by kube-rs; they do not exit the loop. The tie-break is deterministic rather than whichever branch the runtime happens to poll first: an operator shutdown observed at any point up to and including the poll that reports end-of-stream classifies as shutdown (exit 0), so a SIGTERM racing a closing watcher never produces a spurious failure exit. Both exits drop `/health` readiness, signal the shutdown watch (so the CNI listener task cannot outlive the loop), detach BPF state exactly once, then join the listener.
+Watcher-loop exit is classified deliberately: an operator-requested shutdown still runs BPF/CNI cleanup and returns success (process exit 0). If the Kubernetes pod-watcher stream ends unexpectedly, the same cleanup path runs, then the mode returns an error so `main` exits nonzero and supervisors that restart only failed processes relaunch the agent. Transient watcher *errors* are logged and retried by kube-rs; they do not exit the loop. The tie-break is deterministic rather than whichever branch the runtime happens to poll first: an operator shutdown observed at any point up to and including the poll that reports end-of-stream classifies as shutdown (exit 0), so a SIGTERM racing a closing watcher never produces a spurious failure exit. Both exits drop `/health` readiness, signal the shutdown watch (so the CNI listener task cannot outlive the loop), detach BPF state exactly once, then join the listener. A CNI listener that stops serving outside shutdown (a socket parent, lock, stale-socket, bind, chmod or publication failure) is fatal the same way: with the chained conflist installed every pod creation on the node fails while no listener serves the socket, so the agent runs the same cleanup and exits nonzero for a restart instead of staying up and Ready. The one exception to the cleanup is a published socket that another generation replaced: that owner is live, so the agent exits without detaching capture state or retracting the UDP registry proof. The iptables fallback treats its passthrough listener the same way.
 
 | Event | Source trigger | Node-agent action |
 |---|---|---|
@@ -2164,10 +2164,11 @@ Symptom: pods on a node stick in `ContainerCreating` with a CNI error mentioning
 3. Fix the node-agent (check its logs, `ferrum_node_agent_capture_state`, and `ferrum_node_agent_cni_socket_lifecycle_total`), then recreate the node-agent pod to reinstall the chain.
 
 The listener holds a sibling `<socket>.lock` advisory lock for its complete
-lifetime. A second live node-agent generation refuses to replace the active
-owner and continues with watcher reconciliation; after a crash, the kernel
-releases the lock and the next generation removes the stale socket before
-publishing. Publication retains the socket's device/inode identity, and
+lifetime. A second live node-agent generation (a rolling-restart overlap)
+refuses to replace the active owner, which keeps serving CNI calls, and retries
+the lock every second; once the owner exits, it takes the socket over. After a
+crash, the kernel releases the lock and the next generation removes the stale
+socket before publishing. Publication retains the socket's device/inode identity, and
 shutdown unlinks the well-known path only when it still names that identity,
 so a draining old generation cannot remove an explicitly coordinated
 replacement.
@@ -2175,7 +2176,7 @@ replacement.
 ### Fallback semantics
 
 - **Default disabled.** `nodeAgent.cni.enabled=false` (chart) / `FERRUM_NODE_AGENT_CNI_ENABLED=false` (env) keeps the kube-rs watcher as the sole enrollment path. Existing operators upgrade with zero behavior change.
-- **Enabled but UDS unreachable.** If the listener fails to bind (permission error on the parent dir or another live generation holds the ownership lock), the node-agent logs `error!` and continues running with the watcher path active. Stale socket files from crashed owners are recovered only after the new process acquires that lock. The CNI binary on the host then fails **every** kubelet ADD on that node with `IpcFailed`, so new pods stick in `ContainerCreating` — the watcher path still reconciles pods that already have a sandbox, but it cannot create one. kubelet DEL still completes (empty success) so terminating pods are not stranded; stale Ferrum state is reclaimed by GC and node-agent sweeps once the daemon returns. If this happens during initial pod startup the rollback watcher removes the chain once its readiness budget expires; if it happens after the node-agent was once ready, recovery is manual ("Recovering a node").
+- **Enabled but UDS unreachable.** If the listener cannot establish or keep its socket (for example a permission error on the parent dir, or a bind or publication failure), the node-agent logs `error!`, runs its normal shutdown cleanup, and exits nonzero so the DaemonSet restarts it; it does not keep running and reporting Ready without a listener. Another live generation holding the ownership lock is not a failure: the new process waits for that owner to exit and then takes the socket over. Stale socket files from crashed owners are recovered only after the new process acquires that lock. While no listener serves the socket, the CNI binary on the host fails **every** kubelet ADD on that node with `IpcFailed`, so new pods stick in `ContainerCreating` — the watcher path still reconciles pods that already have a sandbox, but it cannot create one. kubelet DEL still completes (empty success) so terminating pods are not stranded; stale Ferrum state is reclaimed by GC and node-agent sweeps once the daemon returns. If this happens during initial pod startup the rollback watcher removes the chain once its readiness budget expires; if it happens after the node-agent was once ready, recovery is manual ("Recovering a node").
 - **CNI plugin installed but node-agent not running.** Same effect as above, and the watcher path is irrelevant because the node-agent process is absent. If the pod never became ready in the first place, the rollback watcher unchains the node automatically.
 - **CNI plugin enabled, node-agent running, watcher disabled.** Not a supported configuration. The watcher is the source of truth for enrollment; the CNI hook only acknowledges sandbox-setup events to close the race window.
 
@@ -2216,8 +2217,8 @@ Socket lifecycle failures use
 `ownership_conflict`, `ownership_io_error`, `stale_socket_cleanup_error`,
 `handoff_identity_error`, `handoff_publication_error`, and
 `shutdown_cleanup_error`. The corresponding structured log carries the same
-`reason`; an ownership conflict is an explicit startup refusal, not stale-file
-recovery.
+`reason`; an ownership conflict is an explicit refusal to replace a live owner,
+not stale-file recovery. It is counted once per wait, not once per lock retry.
 
 ### Lifecycle coverage and remaining gaps
 

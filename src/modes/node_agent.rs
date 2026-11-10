@@ -65,7 +65,7 @@ use crate::ebpf::{
     NodeAgentProxyMode, PodAttachmentState, PodInfo, TcAttachDirection,
 };
 use crate::modes::node_agent_cni_server::{
-    self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
+    self, CniListenerExit, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
 };
 use crate::proxy::node_waypoint_udp_reply_source::ReplySourceGeneration;
 
@@ -1755,11 +1755,14 @@ fn create_backend(
 /// Explicit shutdown remains a clean `Ok` exit. Unexpected end-of-stream from
 /// the Kubernetes watcher still runs the same BPF/CNI cleanup, then returns
 /// `Err` so supervisors that restart only on nonzero exit will relaunch the
-/// agent (#2369).
+/// agent (#2369). A CNI listener that stops serving outside shutdown is fatal
+/// the same way (#7253): with the chained conflist installed every pod
+/// creation on the node fails until a listener serves the socket again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PodWatcherLoopExit {
     ShutdownRequested,
     WatcherExhausted,
+    CniListenerStopped(CniListenerExit),
 }
 
 /// Timer for the pod/CNI select loop's maintenance arms. `Delay` keeps a loop
@@ -2371,7 +2374,7 @@ where
     // channel stays empty and the receiver in the select! arm parks
     // forever — the kube-rs watcher remains the sole enrollment driver.
     let (cni_work_tx, mut cni_work_rx): (_, CniWorkReceiver) = cni_work_channel();
-    let cni_listener_handle = if cni_config.enabled {
+    let mut cni_listener_handle = if cni_config.enabled {
         // Durable ownership rides beside the configured CNI socket. Rehydrate
         // before the listener accepts GC so crash recovery can identify
         // Ferrum-owned attachments. Rejected durable state fails closed for GC
@@ -2719,18 +2722,40 @@ where
                     }
                     None => {
                         // Channel closed — listener task exited. Disable this
-                        // select arm so the watcher keeps running instead of
-                        // spinning on an immediately-ready closed receiver.
+                        // select arm so the loop never spins on an
+                        // immediately-ready closed receiver.
                         cni_work_open = false;
                         if *shutdown_rx.borrow() {
                             debug!("CNI work queue closed during shutdown");
-                        } else {
-                            // With the chained conflist installed, ADD fails
-                            // closed while no listener serves the socket, so
-                            // this is a node-wide pod-creation outage (#7253).
-                            error!(
-                                "Node-agent CNI listener is not serving; CNI ADD on this node fails closed until the node-agent is restarted"
-                            );
+                            continue;
+                        }
+                        // Every sender is gone, so the listener task has
+                        // returned (or is returning) its exit reason.
+                        let listener_exit = match cni_listener_handle.take() {
+                            Some(handle) => handle.await.unwrap_or(CniListenerExit::Failed),
+                            None => CniListenerExit::Failed,
+                        };
+                        match listener_exit {
+                            CniListenerExit::Unsupported => {
+                                warn!(
+                                    "Node-agent CNI listener is unavailable on this target; the kube-rs watcher is the sole enrollment path"
+                                );
+                            }
+                            CniListenerExit::Shutdown => {
+                                break PodWatcherLoopExit::ShutdownRequested;
+                            }
+                            CniListenerExit::Failed | CniListenerExit::ReplacedByAnotherOwner => {
+                                // With the chained conflist installed, ADD
+                                // fails closed while no listener serves the
+                                // socket: a node-wide pod-creation outage.
+                                // Exit nonzero so the supervisor restarts the
+                                // agent and with it the listener (#7253).
+                                error!(
+                                    listener_exit = ?listener_exit,
+                                    "Node-agent CNI listener stopped serving; exiting so a restart restores CNI ADD on this node"
+                                );
+                                break PodWatcherLoopExit::CniListenerStopped(listener_exit);
+                            }
                         }
                     }
                 }
@@ -3007,22 +3032,35 @@ where
         attached_pods = pod_states.len(),
         "Node agent shutting down, detaching BPF programs"
     );
-    let registry_proof_retracted = match retract_udp_migration_registry_sync_for_mutation(
-        udp_migration_generation.is_some(),
-        config,
-        &mut readiness,
-        UdpRegistryMutationLane::Shutdown,
-    ) {
-        Ok(_) => true,
-        Err(error) => {
-            warn!(
-                error = %crate::startup::sanitize_startup_scalar(&error),
-                "Ambient UDP registry proof could not be retracted during shutdown; preserving registry entries and refusing ordered pod detach mutation"
-            );
-            false
+    // Another live generation published over this agent's CNI socket: its
+    // capture state and registry proof may be what that owner serves, so this
+    // agent leaves both untouched (the same latch as a failed retraction).
+    let another_owner_is_live = matches!(
+        exit_reason,
+        PodWatcherLoopExit::CniListenerStopped(CniListenerExit::ReplacedByAnotherOwner)
+    );
+    let registry_proof_retracted = if another_owner_is_live {
+        false
+    } else {
+        match retract_udp_migration_registry_sync_for_mutation(
+            udp_migration_generation.is_some(),
+            config,
+            &mut readiness,
+            UdpRegistryMutationLane::Shutdown,
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Ambient UDP registry proof could not be retracted during shutdown; preserving registry entries and refusing ordered pod detach mutation"
+                );
+                false
+            }
         }
     };
-    if registry_proof_retracted {
+    if another_owner_is_live {
+        owner.preserve_fail_closed_state("CNI socket replaced by another live node-agent");
+    } else if registry_proof_retracted {
         owner.shutdown_pods(&pod_states, config);
     } else {
         // The marker is still a live proof consumed by the mesh cleanup
@@ -3052,6 +3090,9 @@ where
         PodWatcherLoopExit::WatcherExhausted => {
             Err(anyhow::anyhow!("Pod watcher ended unexpectedly"))
         }
+        PodWatcherLoopExit::CniListenerStopped(_) => Err(anyhow::anyhow!(
+            "Node-agent CNI listener stopped serving the CNI socket"
+        )),
     }
 }
 
@@ -9497,27 +9538,59 @@ async fn handle_fallback(
         None
     };
 
-    let result = handle_fallback_with(
+    let fallback = handle_fallback_with(
         config,
         probe,
         metrics.as_ref(),
         shutdown_tx,
         |cmds, phase| async move { execute_iptables_commands(&cmds, phase).await },
         startup_ready,
-    )
-    .await;
+    );
 
-    if let Some((listener, worker)) = cni_handles {
-        shutdown_tx.shutdown();
-        if let Err(err) = listener.await {
-            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough listener task panicked");
+    let Some((mut listener, worker)) = cni_handles else {
+        return fallback.await;
+    };
+    // A passthrough listener that stops serving outside shutdown is the same
+    // node-wide pod-creation outage as on the eBPF path (#7253): shut the
+    // fallback down through its normal cleanup and exit nonzero.
+    tokio::pin!(fallback);
+    let mut listener_failure = None;
+    let mut listener_joined = false;
+    let result = tokio::select! {
+        result = &mut fallback => result,
+        exit = &mut listener => {
+            listener_joined = true;
+            let exit = exit.unwrap_or(CniListenerExit::Failed);
+            if matches!(
+                exit,
+                CniListenerExit::Failed | CniListenerExit::ReplacedByAnotherOwner
+            ) && !*shutdown_tx.borrow()
+            {
+                error!(
+                    listener_exit = ?exit,
+                    "Node-agent CNI passthrough listener stopped serving; exiting so a restart restores CNI ADD on this node"
+                );
+                listener_failure = Some(exit);
+                shutdown_tx.shutdown();
+            }
+            fallback.await
         }
-        if let Err(err) = worker.await {
-            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough worker task panicked");
-        }
+    };
+
+    shutdown_tx.shutdown();
+    if !listener_joined && let Err(err) = listener.await {
+        warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough listener task panicked");
+    }
+    if let Err(err) = worker.await {
+        warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough worker task panicked");
     }
 
-    result
+    match (result, listener_failure) {
+        (Ok(()), Some(_)) => Err(anyhow::anyhow!(
+            "Node-agent CNI passthrough listener stopped serving the CNI socket"
+        )),
+        (result, _) => result,
+    }
 }
 
 fn spawn_cni_passthrough_listener(
@@ -9526,7 +9599,10 @@ fn spawn_cni_passthrough_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     startup_ready: Arc<AtomicBool>,
     ownership_store_path: Option<std::path::PathBuf>,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+) -> (
+    tokio::task::JoinHandle<CniListenerExit>,
+    tokio::task::JoinHandle<()>,
+) {
     let (cni_work_tx, mut cni_work_rx) = cni_work_channel();
     let listener = spawn_cni_listener(socket_path, cni_work_tx.clone(), metrics, shutdown);
     drop(cni_work_tx);
