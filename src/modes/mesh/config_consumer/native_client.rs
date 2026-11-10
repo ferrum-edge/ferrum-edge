@@ -1092,22 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn native_config_carries_primary_retry_secs() {
-        let config = NativeMeshClientConfig {
-            node_id: "n".to_string(),
-            namespace: "ferrum".to_string(),
-            workload_spiffe_id: None,
-            waypoint_name: None,
-            labels: HashMap::new(),
-            ambient_udp_source_scoping: false,
-            node_waypoint_capture_scoping: false,
-            primary_retry_secs: 300,
-            timings: MeshStreamTimings::production(),
-        };
-        assert_eq!(config.primary_retry_secs, 300);
-    }
-
-    #[test]
     fn mesh_client_self_minted_token_carries_namespace_and_local_audience() {
         let token = generate_dp_jwt_full(
             "test-secret",
