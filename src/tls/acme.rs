@@ -2489,7 +2489,12 @@ impl AcmeResolverFallback {
 
 pub struct AcmeTlsAlpnResolver {
     fallback: AcmeResolverFallback,
-    cache: Mutex<BTreeMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    /// TLS-ALPN-01 validation certificates keyed by server name, each with
+    /// the key authorization it was built for. Holds at most one entry per
+    /// name: a new challenge replaces the previous key, and a name whose
+    /// challenge is no longer pending is evicted on its next `acme-tls/1`
+    /// handshake, so served validation keys do not accumulate.
+    cache: Mutex<BTreeMap<String, (String, Arc<rustls::sign::CertifiedKey>)>>,
 }
 
 impl std::fmt::Debug for AcmeTlsAlpnResolver {
@@ -2548,16 +2553,26 @@ impl AcmeTlsAlpnResolver {
     }
 
     fn tls_alpn_certified_key(&self, server_name: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let key_authorization = tls_alpn01_key_authorization_for_identifier(server_name)?;
-        let cache_key = format!("{server_name}\0{key_authorization}");
+        let Some(key_authorization) = tls_alpn01_key_authorization_for_identifier(server_name)
+        else {
+            // No pending challenge for this name any more: release its key.
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.remove(server_name);
+            }
+            return None;
+        };
         if let Ok(cache) = self.cache.lock()
-            && let Some(certified_key) = cache.get(&cache_key)
+            && let Some((cached_authorization, certified_key)) = cache.get(server_name)
+            && *cached_authorization == key_authorization
         {
             return Some(certified_key.clone());
         }
         let certified_key = build_tls_alpn01_certified_key(server_name, &key_authorization).ok()?;
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(cache_key, certified_key.clone());
+            cache.insert(
+                server_name.to_string(),
+                (key_authorization, certified_key.clone()),
+            );
         }
         Some(certified_key)
     }
