@@ -501,8 +501,11 @@ mod tests {
     use crate::config::migrations::CustomPluginMigration;
 
     // The shared capture (`tests/common/diagnostic_logs.rs`, mounted once at
-    // the crate root, which also registers its capture regression test).
+    // the crate root). CI's unit workflow runs this module's capture
+    // regression test by name, so it stays registered here too.
     pub(super) use crate::diagnostic_test_logs::capture_logs;
+
+    crate::diagnostic_test_interest::capture_regression!(capture_logs, tracing::Level::TRACE);
 
     #[test]
     fn config_rejection_logs_withhold_values_on_first_and_repeated_failures() {
