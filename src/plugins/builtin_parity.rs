@@ -6,6 +6,9 @@
 //! [`crate::plugins::BUILTIN_PLUGIN_REGISTRATIONS`]: classification,
 //! documented active phases, protocol-matrix capability surface, and rationale.
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 use super::{
     ALL_PROTOCOLS, GRPC_ONLY_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
     HTTP_ONLY_PROTOCOLS, ProxyProtocol, ResponseBodyProduction, TCP_ONLY_PROTOCOLS,
@@ -67,17 +70,27 @@ pub const BUILTIN_WEBSOCKET_FRAMING_PLUGINS: &[&str] = &[
 /// letting an undeclared producer allocate a replacement without a bound. A
 /// custom plugin cannot take a built-in's name: `create_plugin_with_http_client`
 /// resolves built-in names before it ever reaches the custom registry.
+///
+/// The answer for every built-in name is precomputed once, so the buffered
+/// response phases that consult it per plugin do one hash lookup instead of
+/// scanning the parity table.
 pub fn declared_response_body_production(name: &str) -> ResponseBodyProduction {
-    if BUILTIN_RESPONSE_BODY_PRODUCERS.contains(&name) {
-        ResponseBodyProduction::BoundedByRetainedCeiling
-    } else if BUILTIN_PLUGIN_PARITY_META
-        .iter()
-        .any(|meta| meta.name == name)
-    {
-        ResponseBodyProduction::Never
-    } else {
-        ResponseBodyProduction::Undeclared
-    }
+    static DECLARED: LazyLock<HashMap<&'static str, ResponseBodyProduction>> =
+        LazyLock::new(|| {
+            BUILTIN_PLUGIN_PARITY_META
+                .iter()
+                .map(|meta| (meta.name, ResponseBodyProduction::Never))
+                .chain(
+                    BUILTIN_RESPONSE_BODY_PRODUCERS
+                        .iter()
+                        .map(|name| (*name, ResponseBodyProduction::BoundedByRetainedCeiling)),
+                )
+                .collect()
+        });
+    DECLARED
+        .get(name)
+        .copied()
+        .unwrap_or(ResponseBodyProduction::Undeclared)
 }
 
 /// How a built-in plugin appears in public inventories.

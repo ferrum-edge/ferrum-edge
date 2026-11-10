@@ -7461,6 +7461,10 @@ impl Plugin for PrometheusMetrics {
         "prometheus_metrics"
     }
 
+    fn uses_mesh_request_key(&self) -> bool {
+        true
+    }
+
     fn priority(&self) -> u16 {
         super::priority::PROMETHEUS_METRICS
     }

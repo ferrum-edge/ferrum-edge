@@ -182,6 +182,18 @@ async fn test_prometheus_plugin_creation() {
     assert!(plugin.requires_ws_disconnect_hooks());
 }
 
+/// Issue #7117: terminal delivery builds the mesh RED key only for plugins that
+/// declare they read it, not by matching plugin names.
+#[test]
+fn only_mesh_observability_sinks_use_the_mesh_request_key() {
+    let prometheus = PrometheusMetrics::new(&json!({}), "ferrum").unwrap();
+    assert!(prometheus.uses_mesh_request_key());
+    let workload = WorkloadMetrics::new(&json!({})).expect("workload_metrics config");
+    assert!(workload.uses_mesh_request_key());
+    let token_metrics = AiTokenMetrics::new(&json!({})).expect("ai_token_metrics config");
+    assert!(!token_metrics.uses_mesh_request_key());
+}
+
 #[tokio::test]
 async fn test_prometheus_plugin_rejects_invalid_config_shapes() {
     let cases = [

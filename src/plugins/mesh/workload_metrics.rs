@@ -1418,6 +1418,10 @@ impl Plugin for WorkloadMetrics {
         true
     }
 
+    fn uses_mesh_request_key(&self) -> bool {
+        true
+    }
+
     fn workload_custom_trace_attributes(&self) -> Option<&str> {
         self.custom_trace_attributes_marker.as_deref()
     }

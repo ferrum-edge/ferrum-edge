@@ -9267,16 +9267,19 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
 
 impl ChainedResponseStreamInspector {
     async fn chunk_through(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        let mut buf = bytes::Bytes::copy_from_slice(chunk);
+        // The first inspector reads the caller's chunk in place; each later one
+        // reads what the previous inspector released. Nothing is copied here.
+        let mut released: Option<bytes::Bytes> = None;
         for index in 0..self.inspectors.len() {
-            if buf.is_empty() {
+            let input: &[u8] = released.as_deref().unwrap_or(chunk);
+            if input.is_empty() {
                 // An upstream inspector is holding this window; nothing yet for
                 // the rest of the chain to see.
                 return ResponseStreamAction::Forward(bytes::Bytes::new());
             }
             self.prime(index);
-            match self.inspectors[index].on_chunk(&buf).await {
-                ResponseStreamAction::Forward(out) => buf = out,
+            match self.inspectors[index].on_chunk(input).await {
+                ResponseStreamAction::Forward(out) => released = Some(out),
                 ResponseStreamAction::Terminate(final_bytes)
                     if self.inspectors[index].stage()
                         == ResponseStreamInspectorStage::Normalize =>
@@ -9294,12 +9297,16 @@ impl ChainedResponseStreamInspector {
             }
             if self.inspectors[index].has_deferred_cut() {
                 self.notify_prior_downstream_terminated(index);
+                let carry = released.take().unwrap_or_default();
                 return self
-                    .flush_from(index + 1, buf, ChainFlushEnd::Cut(index))
+                    .flush_from(index + 1, carry, ChainFlushEnd::Cut(index))
                     .await;
             }
         }
-        ResponseStreamAction::Forward(buf)
+        // A chain always holds at least one inspector, so `released` is set.
+        ResponseStreamAction::Forward(
+            released.unwrap_or_else(|| bytes::Bytes::copy_from_slice(chunk)),
+        )
     }
 
     /// Flush inspectors `from..` as the end of the stream: each receives
@@ -10357,9 +10364,7 @@ async fn log_with_mirror_inner(
     {
         crate::diagnostic_ref::record_request_detail(slot, summary, ctx);
     }
-    let precompute_mesh_key = plugins
-        .iter()
-        .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+    let precompute_mesh_key = plugins.iter().any(|plugin| plugin.uses_mesh_request_key());
     // Built from the request's typed mesh label projection when it is
     // authoritative for this summary (issue #6793); parsed from the metadata
     // strings otherwise.
@@ -10481,9 +10486,7 @@ impl Drop for TerminalDeliveryGuard<'_> {
         let summary = self.summary.clone();
         let ctx = self.ctx.clone();
         let _ = crate::observability_delivery::spawn_terminal(async move {
-            let precompute_mesh_key = plugins
-                .iter()
-                .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+            let precompute_mesh_key = plugins.iter().any(|plugin| plugin.uses_mesh_request_key());
             let mesh_key = if precompute_mesh_key {
                 crate::plugins::mesh::prometheus_helpers::mesh_request_key_for_request(
                     &summary, &ctx,
@@ -11681,6 +11684,14 @@ pub trait Plugin: Any + Send + Sync {
     /// Whether this transaction contributes to the shared mesh service graph.
     /// Wrappers must honor the same memoized decision as terminal logging.
     fn records_mesh_service_graph(&self, _summary: &TransactionSummary) -> bool {
+        false
+    }
+
+    /// Whether this plugin's terminal logging reads the precomputed mesh RED
+    /// key that [`Self::log_with_mesh_key`] receives. Terminal delivery builds
+    /// the key once per transaction only when a plugin in the chain says so,
+    /// instead of discovering consumers by name. Wrappers must forward it.
+    fn uses_mesh_request_key(&self) -> bool {
         false
     }
 
