@@ -22,6 +22,29 @@ agent_bin_is_conductor_owned() {
   esac
 }
 
+# Prints the absolute physical path of an executable candidate. A
+# relative result (a relative PATH entry) is resolved against the
+# CURRENT directory, because dispatchers save the result and then `cd`
+# to the worker worktree: an unresolved relative name would launch
+# whatever same-named file the worktree contains instead (#394). A bare
+# name with no slash (alias, builtin, or function) is not a file path
+# and fails.
+agent_bin_absolute() {
+  local candidate=$1 dir
+  case "$candidate" in
+    /*) printf '%s\n' "$candidate" ;;
+    */*)
+      # Physical traversal (`-P`) so `link/../bin` resolves through the
+      # symlink the way the original PATH lookup did, and no inherited
+      # CDPATH: it both redirects relative lookups and echoes the result
+      # into the captured stdout.
+      dir=$(CDPATH='' cd -P -- "$(dirname -- "$candidate")" 2>/dev/null && pwd -P) || return 1
+      printf '%s/%s\n' "$dir" "$(basename -- "$candidate")"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # resolve_agent_bin <command-name> <env-var-name> [candidate-abs-path...]
 # Prints the resolved absolute path on stdout; diagnostics go to stderr.
 resolve_agent_bin() {
@@ -47,7 +70,7 @@ resolve_agent_bin() {
 
   local candidate
   for candidate in "$@"; do
-    if [[ -x "$candidate" ]] && ! agent_bin_is_conductor_owned "$candidate"; then
+    if [[ "$candidate" == /* && -x "$candidate" ]] && ! agent_bin_is_conductor_owned "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -55,6 +78,11 @@ resolve_agent_bin() {
 
   if command -v "$cmd" >/dev/null 2>&1; then
     candidate=$(command -v "$cmd")
+    if ! candidate=$(agent_bin_absolute "$candidate") || [[ ! -x "$candidate" ]]; then
+      printf '%s on PATH does not resolve to an executable absolute path.\n' "$cmd" >&2
+      printf 'Install %s standalone or set %s to your own install.\n' "$cmd" "$env_var" >&2
+      return 127
+    fi
     if agent_bin_is_conductor_owned "$candidate"; then
       printf '%s on PATH resolves to a Conductor-bundled binary: %s\n' \
         "$cmd" "$candidate" >&2
