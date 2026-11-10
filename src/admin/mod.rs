@@ -6547,58 +6547,49 @@ async fn ensure_credential_unique(
     }
 }
 
+/// Run the requested consumer credential uniqueness checks against one
+/// candidate snapshot and answer the first failing kind (mTLS, then HMAC,
+/// then JWT) with `409`, or `503` when the snapshot cannot be loaded.
+async fn ensure_consumer_credential_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+    checks: crud::ConsumerCredentialChecks,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::consumer_credential_candidate_errors(db, namespace, consumer, checks).await {
+        Ok(found) => {
+            for errors in [found.mtls, found.hmac, found.jwt] {
+                if !errors.is_empty() {
+                    return Err(Box::new(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": errors.join("; ")}),
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn ensure_mtls_consumer_candidate(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
 ) -> Result<(), Box<Response<Full<Bytes>>>> {
-    match crud::mtls_consumer_candidate_errors(db, namespace, consumer).await {
-        Ok(errors) if errors.is_empty() => Ok(()),
-        Ok(errors) => Err(Box::new(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": errors.join("; ")}),
-        ))),
-        Err(error) => Err(Box::new(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &db_error_response(&error),
-        ))),
-    }
-}
-
-async fn ensure_hmac_consumer_candidate(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> Result<(), Box<Response<Full<Bytes>>>> {
-    match crud::hmac_consumer_candidate_errors(db, namespace, consumer).await {
-        Ok(errors) if errors.is_empty() => Ok(()),
-        Ok(errors) => Err(Box::new(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": errors.join("; ")}),
-        ))),
-        Err(error) => Err(Box::new(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &db_error_response(&error),
-        ))),
-    }
-}
-
-async fn ensure_jwt_consumer_candidate(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> Result<(), Box<Response<Full<Bytes>>>> {
-    match crud::jwt_consumer_candidate_errors(db, namespace, consumer).await {
-        Ok(errors) if errors.is_empty() => Ok(()),
-        Ok(errors) => Err(Box::new(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": errors.join("; ")}),
-        ))),
-        Err(error) => Err(Box::new(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &db_error_response(&error),
-        ))),
-    }
+    ensure_consumer_credential_candidate(
+        db,
+        namespace,
+        consumer,
+        crud::ConsumerCredentialChecks {
+            mtls: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn persist_consumer_update(
@@ -6614,17 +6605,21 @@ async fn persist_consumer_update(
     // its credential index entries. Revalidate retained HMAC credentials even
     // when the requested mutation targets another credential type, so stale or
     // out-of-band duplicates fail before the datastore uniqueness backstop.
-    if !consumer.credential_entries("hmac_auth").is_empty()
-        && let Err(response) =
-            ensure_hmac_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
-    {
-        return *response;
-    }
     // Same for retained `jwt` secrets: a secret shared with another Consumer
-    // in the namespace lets either sign as the other.
-    if !consumer.credential_entries("jwt").is_empty()
-        && let Err(response) =
-            ensure_jwt_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
+    // in the namespace lets either sign as the other. Both checks share one
+    // candidate snapshot.
+    let retained_checks = crud::ConsumerCredentialChecks {
+        mtls: false,
+        hmac: !consumer.credential_entries("hmac_auth").is_empty(),
+        jwt: !consumer.credential_entries("jwt").is_empty(),
+    };
+    if let Err(response) = ensure_consumer_credential_candidate(
+        db.as_ref(),
+        &consumer.namespace,
+        &consumer,
+        retained_checks,
+    )
+    .await
     {
         return *response;
     }

@@ -2590,54 +2590,68 @@ async fn consumer_candidate_config(
     Ok(config)
 }
 
-pub(crate) async fn mtls_consumer_candidate_errors(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> DbResult<Vec<String>> {
-    Ok(consumer_candidate_config(db, namespace, consumer)
-        .await?
-        .validate_unique_mtls_credentials()
-        .err()
-        .unwrap_or_default())
+/// Which consumer credential uniqueness checks one candidate snapshot runs.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConsumerCredentialChecks {
+    pub(crate) mtls: bool,
+    pub(crate) hmac: bool,
+    pub(crate) jwt: bool,
 }
 
-/// Reject an admin Consumer/credential write whose hmac_auth secret is
-/// already claimed by another consumer in the namespace. Snapshot-based like
-/// the mTLS candidate check (rather than a credential-index probe) so
-/// pre-existing rows written before hmac secrets were policed are still
-/// authoritative. `lock_namespace_config_admission` serializes same-process
-/// prechecks; namespace-scoped SQL/Mongo uniqueness constraints are the
-/// cross-process persistence backstop.
-pub(crate) async fn hmac_consumer_candidate_errors(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> DbResult<Vec<String>> {
-    Ok(consumer_candidate_config(db, namespace, consumer)
-        .await?
-        .validate_unique_hmac_credentials()
-        .err()
-        .unwrap_or_default())
+/// Per-kind uniqueness errors from one candidate snapshot.
+#[derive(Default)]
+pub(crate) struct ConsumerCredentialErrors {
+    pub(crate) mtls: Vec<String>,
+    pub(crate) hmac: Vec<String>,
+    pub(crate) jwt: Vec<String>,
 }
 
-/// Reject an admin Consumer/credential write whose `jwt` secret is already
-/// configured on another consumer in the namespace. `jwt_auth` picks the
-/// verifying Consumer from the signer-chosen identity claim, so a shared JWT
-/// secret lets each holder sign as the other. Snapshot-based like the HMAC
-/// check; only collisions involving this consumer are reported, so a
-/// pre-existing duplicate between two other Consumers (quarantined on load)
-/// does not block an unrelated write.
-pub(crate) async fn jwt_consumer_candidate_errors(
+/// Run the requested consumer credential uniqueness checks against ONE
+/// namespace snapshot with `consumer` applied (issue #7209: each check used to
+/// load its own snapshot). Nothing is loaded when no check is requested.
+///
+/// - mTLS: the candidate's certificate identities must be unique.
+/// - HMAC: an hmac_auth secret already claimed by another consumer is
+///   refused. Snapshot-based (rather than a credential-index probe) so
+///   pre-existing rows written before hmac secrets were policed are still
+///   authoritative. `lock_namespace_config_admission` serializes
+///   same-process prechecks; namespace-scoped SQL/Mongo uniqueness
+///   constraints are the cross-process persistence backstop.
+/// - JWT: `jwt_auth` picks the verifying Consumer from the signer-chosen
+///   identity claim, so a shared JWT secret lets each holder sign as the
+///   other. Only collisions involving this consumer are reported, so a
+///   pre-existing duplicate between two other Consumers (quarantined on
+///   load) does not block an unrelated write.
+pub(crate) async fn consumer_credential_candidate_errors(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
-) -> DbResult<Vec<String>> {
-    Ok(consumer_candidate_config(db, namespace, consumer)
-        .await?
-        .validate_unique_jwt_credentials_for_consumers(&[consumer.id.as_str()])
-        .err()
-        .unwrap_or_default())
+    checks: ConsumerCredentialChecks,
+) -> DbResult<ConsumerCredentialErrors> {
+    let mut errors = ConsumerCredentialErrors::default();
+    if !(checks.mtls || checks.hmac || checks.jwt) {
+        return Ok(errors);
+    }
+    let config = consumer_candidate_config(db, namespace, consumer).await?;
+    if checks.mtls {
+        errors.mtls = config
+            .validate_unique_mtls_credentials()
+            .err()
+            .unwrap_or_default();
+    }
+    if checks.hmac {
+        errors.hmac = config
+            .validate_unique_hmac_credentials()
+            .err()
+            .unwrap_or_default();
+    }
+    if checks.jwt {
+        errors.jwt = config
+            .validate_unique_jwt_credentials_for_consumers(&[consumer.id.as_str()])
+            .err()
+            .unwrap_or_default();
+    }
+    Ok(errors)
 }
 
 impl ValidationError {
@@ -6135,28 +6149,17 @@ impl AdminResource for Consumer {
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        let mut errors = Vec::new();
-        if resource.has_credential("mtls_auth") {
-            errors.extend(
-                mtls_consumer_candidate_errors(db, namespace, resource)
-                    .await
-                    .map_err(AfterValidateError::Db)?,
-            );
-        }
-        if resource.has_credential("hmac_auth") {
-            errors.extend(
-                hmac_consumer_candidate_errors(db, namespace, resource)
-                    .await
-                    .map_err(AfterValidateError::Db)?,
-            );
-        }
-        if resource.has_credential("jwt") {
-            errors.extend(
-                jwt_consumer_candidate_errors(db, namespace, resource)
-                    .await
-                    .map_err(AfterValidateError::Db)?,
-            );
-        }
+        let checks = ConsumerCredentialChecks {
+            mtls: resource.has_credential("mtls_auth"),
+            hmac: resource.has_credential("hmac_auth"),
+            jwt: resource.has_credential("jwt"),
+        };
+        let found = consumer_credential_candidate_errors(db, namespace, resource, checks)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let mut errors = found.mtls;
+        errors.extend(found.hmac);
+        errors.extend(found.jwt);
         if errors.is_empty() {
             Ok(())
         } else {
