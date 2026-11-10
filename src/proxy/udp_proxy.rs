@@ -3336,7 +3336,7 @@ pub struct UdpListenerConfig {
     pub backend_tls_reload_epoch: Arc<AtomicU64>,
     /// Gateway TLS hardening policy (`FERRUM_TLS_MIN_VERSION` /
     /// `FERRUM_TLS_MAX_VERSION` / `FERRUM_TLS_CIPHER_SUITES` /
-    /// `FERRUM_TLS_CURVES`) applied to backend DTLS configs built by this
+    /// `FERRUM_TLS_KEY_EXCHANGE_GROUPS`) applied to backend DTLS configs built by this
     /// listener (issue #4507). `None` keeps the DTLS stack's own defaults;
     /// every serving mode supplies `Some`.
     pub tls_policy: Option<Arc<crate::tls::TlsPolicy>>,

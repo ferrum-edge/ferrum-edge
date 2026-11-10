@@ -8822,3 +8822,32 @@ fn test_unconfigured_tls_managed_store_path_is_private_to_the_process() {
         assert_eq!(tls_managed_store_path_from_env(), EXPLICIT);
     });
 }
+
+/// Issue #7218: `FERRUM_TLS_CURVES` was a compatibility alias of
+/// `FERRUM_TLS_KEY_EXCHANGE_GROUPS`; build-out policy keeps no aliases, so only
+/// the canonical name selects the key-exchange groups.
+#[test]
+fn tls_key_exchange_groups_read_only_the_canonical_env_name() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_TLS_CURVES", "secp384r1"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tls_curves, None);
+        },
+    );
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_TLS_KEY_EXCHANGE_GROUPS", "X25519,secp384r1"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tls_curves.as_deref(), Some("X25519,secp384r1"));
+        },
+    );
+}

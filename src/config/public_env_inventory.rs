@@ -12,11 +12,8 @@
 //!   [`TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV`], and the dynamic plugin-config
 //!   secret namespace [`PLUGIN_SECRET_EXAMPLE_ENV`])
 //!
-//! [`PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS`] is a small allowlist for accepted
-//! compatibility aliases that intentionally share the canonical setting's
-//! docs/template row. [`is_public_ferrum_env_coverage_exempt`] is the membership
-//! check used by the external parity tests. Build-out policy does not add new
-//! legacy shims; only existing permitted aliases belong here.
+//! Every inventory member owns its own docs table row and template
+//! assignment; build-out policy keeps no compatibility aliases.
 //!
 //! External unit tests under `tests/unit/config/env_docs_parity_tests.rs`
 //! fail closed when a public inventory setting lacks a
@@ -608,7 +605,6 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS",
     "FERRUM_TLS_CRL_FILE_PATH",
     "FERRUM_TLS_CRL_SOURCE",
-    "FERRUM_TLS_CURVES",
     "FERRUM_TLS_EARLY_DATA_METHODS",
     "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS",
     "FERRUM_TLS_KEY_EXCHANGE_GROUPS",
@@ -663,26 +659,6 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_XDS_MAX_TOTAL_STREAMS",
     "FERRUM_XDS_STREAM_CHANNEL_CAPACITY",
 ];
-
-/// Accepted settings that intentionally do not own a separate docs table row
-/// and/or `ferrum.conf` assignment. Canonical replacements remain covered.
-///
-/// Keep this list sorted and minimal. Prefer documenting the canonical name
-/// only; do not grow this allowlist for new aliases under build-out policy.
-pub const PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS: &[&str] = &[
-    // Compatibility alias of `FERRUM_TLS_KEY_EXCHANGE_GROUPS` (canonical).
-    "FERRUM_TLS_CURVES",
-];
-
-/// True when `key` is an explicit DOC-03 docs/`ferrum.conf` coverage exemption.
-///
-/// Exemptions remain inventory members; they only skip owning a separate docs
-/// table row and/or template assignment because a canonical twin is covered.
-pub fn is_public_ferrum_env_coverage_exempt(key: &str) -> bool {
-    PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS
-        .binary_search(&key)
-        .is_ok()
-}
 
 /// Recognized settings-file keys. This does not restrict arbitrary process
 /// environment variables or extend secret-suffix resolution to ferrum.conf.

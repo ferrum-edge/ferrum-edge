@@ -28,6 +28,15 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `FERRUM_TLS_CURVES` is no longer read (#7218)
+
+`FERRUM_TLS_CURVES` was a compatibility alias of
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS`. The alias is removed under the build-out
+policy, so a value set only through `FERRUM_TLS_CURVES` (including its
+`_FILE` / secret-manager suffixes) is now ignored and the default groups
+(`X25519,secp256r1`) apply. Rename the variable to
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS` before upgrading.
+
 ### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
