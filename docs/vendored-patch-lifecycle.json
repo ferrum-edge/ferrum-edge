@@ -170,7 +170,8 @@
       },
       "regression_tests": [
         "tests/integration/connection_pool_tests.rs::test_connect_timeout_does_not_fragment_pool",
-        "tests/integration/connection_pool_tests.rs::test_pooled_client_exposes_per_request_connect_timeout"
+        "tests/integration/connection_pool_tests.rs::test_pooled_client_exposes_per_request_connect_timeout",
+        "tests/integration/connection_pool_tests.rs::test_per_request_connect_timeout_bounds_each_resolved_address"
       ]
     },
     {

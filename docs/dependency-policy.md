@@ -471,7 +471,8 @@ of the vendor copy and must keep passing after retirement:
 - Per-request connect timeout across shared pool keys —
   `tests/integration/connection_pool_tests.rs`
   (`test_connect_timeout_does_not_fragment_pool`,
-  `test_pooled_client_exposes_per_request_connect_timeout`).
+  `test_pooled_client_exposes_per_request_connect_timeout`,
+  `test_per_request_connect_timeout_bounds_each_resolved_address`).
 - HTTP/3 graceful close with a buffered response is not a false 502 —
   `tests/integration/http3_integration_tests.rs`
   (`h3_buffered_response_survives_graceful_close_race`,

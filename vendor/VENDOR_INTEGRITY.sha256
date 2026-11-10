@@ -409,7 +409,7 @@ cd1b1a5af01a93f08ca440b84732da59d64c53bf7d94b4c03d8d19760cc059b7  vendor/reqwest
 0ef0d5bfed59109238316f0f6dddf44dcfe68843f4491c59d24fab166cd766f4  vendor/reqwest-0.13.4-ferrum-patched/src/blocking/response.rs
 295a7be8cb959c1c414b832f58f9268c14aae2a170d4f8a09a133521a8387dfa  vendor/reqwest-0.13.4-ferrum-patched/src/blocking/wait.rs
 8918ce12dcebc785b86989e0c4b5044bb1a66f10a0d39a728261fdab41bfb8a9  vendor/reqwest-0.13.4-ferrum-patched/src/config.rs
-6042d8f5a5d00476219b196deff52e5f92f7884b72183b7e2f390d93ec0b30ec  vendor/reqwest-0.13.4-ferrum-patched/src/connect.rs
+34b1279b9b4ef0e7c401478a0c87ae55598c451360c42c86dd536b436d8f8e95  vendor/reqwest-0.13.4-ferrum-patched/src/connect.rs
 1925b79a225bc9c0398c59e2fac11379df5db2d27493a1902ae79388ba1817d5  vendor/reqwest-0.13.4-ferrum-patched/src/cookie.rs
 d078d9982d7e5e9e977e90ded62080fc3ac0b124753de508147f15ff8818aff8  vendor/reqwest-0.13.4-ferrum-patched/src/dns/gai.rs
 b48f5d12585b16bfff64c302fa46b6e4acac6b6ecf4e06b252ded5e1b97daf86  vendor/reqwest-0.13.4-ferrum-patched/src/dns/hickory.rs

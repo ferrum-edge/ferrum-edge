@@ -842,6 +842,74 @@ async fn test_per_request_connect_timeout_fires_at_runtime() {
     );
 }
 
+/// Resolves every name to a non-routable address first and a loopback
+/// address second; the dialed port always comes from the URL.
+struct BlackholeThenLoopbackResolver;
+
+impl reqwest::dns::Resolve for BlackholeThenLoopbackResolver {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async {
+            let addresses: Vec<std::net::SocketAddr> = vec![
+                std::net::SocketAddr::from(([192, 0, 2, 1], 0)), // TEST-NET-1, RFC 5737
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            ];
+            let addrs: reqwest::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// The per-request connect timeout also reaches the TCP connector, which
+/// spreads it across the resolved addresses (reqwest PR #3017's
+/// `set_connect_timeout` plumbing, restored in issue #7308). A name whose
+/// first address black-holes therefore still connects through its second
+/// address inside the budget. Without the connector timeout the first attempt
+/// would consume the whole budget and the outer connect deadline would fail
+/// the request. Where TEST-NET-1 is refused at once instead of black-holed
+/// the second address is reached immediately, so the test cannot fail falsely.
+#[tokio::test]
+async fn test_per_request_connect_timeout_bounds_each_resolved_address() {
+    use crate::scaffolding::port_registry::TestSocket;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind loopback backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let backend = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).await.expect("read request");
+            if read == 0 {
+                return;
+            }
+            head.extend_from_slice(&buf[..read]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+            .await
+            .expect("write response");
+    });
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(BlackholeThenLoopbackResolver))
+        .build()
+        .expect("client");
+
+    let response = client
+        .get(format!("http://multi-address.test:{port}/"))
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .expect("the second resolved address must be reached inside the connect budget");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), "ok");
+    backend.await.expect("backend task");
+}
+
 /// Runtime regression test: pool-sharing siblings honor per-request connect timeouts.
 ///
 /// Two proxies that resolve to the same `reqwest::Client` (per pool-key
