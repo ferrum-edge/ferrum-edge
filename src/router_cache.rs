@@ -7527,11 +7527,15 @@ mod tests {
         let cached_before = cache.cache_len();
         assert!(cached_before >= 1);
 
-        // Flip refusal without clearing so the next lookup must reject a
-        // still-resident positive cache entry on the hit path.
-        cache.publish_listener_admission_without_clearing_for_tests(
-            GatewayListenerAdmission::decided(BTreeSet::from([80])),
-        );
+        // Flip to a pending admission without clearing, so the next lookup
+        // must reject a still-resident positive cache entry on the hit path.
+        // `pending()` refuses port-scoped routes but not the frontend port, so
+        // the early `explicitly_refuses` return does not fire and only the
+        // cache-hit `allows(port)` check stands between the lookup and the
+        // stale entry.
+        let admission = GatewayListenerAdmission::pending();
+        assert!(!admission.explicitly_refuses(80));
+        cache.publish_listener_admission_without_clearing_for_tests(admission);
         assert_eq!(
             cache.cache_len(),
             cached_before,

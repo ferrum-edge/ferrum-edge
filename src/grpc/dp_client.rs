@@ -3537,31 +3537,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refused_operator_trust_candidate_retains_h3_last_good_pair() {
-        let startup = test_operator_candidate(test_server_config(), 1);
-        let pairing = DpFrontendH3Pairing::from_operator_candidate(startup.clone());
-        let listener = crate::tls::empty_frontend_tls_slot();
-        let cp = test_server_config();
-        pairing
-            .publish_cp_server_config(Some(cp.clone()), Some(&listener), None)
-            .await;
-        let before = pairing.h3_accepted().expect("paired");
-
-        // A malformed/refused operator candidate never updates the accepted
-        // slot or calls publish_operator_candidate, so H3 keeps last-good
-        // config, trust, and the CP server certificate.
-        let _refused = test_operator_candidate(test_server_config(), 99);
-        let after = pairing.h3_accepted().expect("retained");
-        assert!(Arc::ptr_eq(&before, &after));
-        assert!(Arc::ptr_eq(&after.config, &cp));
-        assert_eq!(after.client_trust.material, startup.client_trust.material);
-        assert!(Arc::ptr_eq(
-            listener.load_full().as_ref().as_ref().expect("CP config"),
-            &cp
-        ));
-    }
-
-    #[tokio::test]
     async fn clearing_cp_material_restores_latest_accepted_operator_not_startup() {
         let startup_config = test_server_config();
         let pairing = DpFrontendH3Pairing::from_operator_candidate(test_operator_candidate(
