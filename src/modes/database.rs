@@ -2524,7 +2524,7 @@ pub async fn run(
                     let mut last_db_ips: Option<Vec<IpAddr>> = None;
                     let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
                         Arc::new(tokio::sync::Mutex::new(None));
-                    let mut force_full_reload = false;
+                    let mut force_full_reload: Option<crate::modes::FullReloadReason> = None;
                     // Active rejected-delta retry deadline. A change-stream
                     // wake-up must never run before it, or a stream of
                     // committed-but-invalid changes could defeat the backoff.
@@ -2600,7 +2600,8 @@ pub async fn run(
                                         plugin_migration_reconcile_state_poll
                                             .store(PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release);
                                         last_db_ips = Some(ips);
-                                        force_full_reload = true;
+                                        force_full_reload =
+                                            Some(crate::modes::FullReloadReason::DnsReconnect);
                                     }
                                     Err(error) => {
                                         log_database_dns_reconnect_failure(hostname, &error);
@@ -2626,7 +2627,7 @@ pub async fn run(
                         // projected single-document read per tick, and it runs
                         // before the reload decision so the repair happens in
                         // this tick rather than the next.
-                        if !force_full_reload {
+                        if force_full_reload.is_none() {
                             let running_config = proxy_state_poll.current_config();
                             let drifted = detect_gateway_trust_drift(
                                 db_poll.as_ref(),
@@ -2635,11 +2636,12 @@ pub async fn run(
                             )
                             .await;
                             if !drifted.is_empty() {
-                                force_full_reload = true;
+                                force_full_reload =
+                                    Some(crate::modes::FullReloadReason::GatewayTrustDrift);
                             }
                         }
 
-                        if force_full_reload {
+                        if let Some(full_reload_reason) = force_full_reload {
                             match load_full_config_with_sequence(&db_poll, &poll_namespace).await {
                                 Ok((new_config, cursor)) => {
                                     match try_publish_full_reload_after_gate(
@@ -2648,8 +2650,8 @@ pub async fn run(
                                         &db_available_poll,
                                         &proxy_state_poll,
                                         new_config,
-                                        "full reload after DB DNS reconnect",
-                                        "after DB DNS reconnect",
+                                        full_reload_reason.reload_context(),
+                                        full_reload_reason.trigger(),
                                         auto_apply_plugin_migrations_poll,
                                         &plugin_migration_reconcile_state_poll,
                                         &mut last_change_cursor,
@@ -2665,9 +2667,12 @@ pub async fn run(
                                             continue;
                                         }
                                         Some(true) => {
-                                            force_full_reload = false;
+                                            force_full_reload = None;
                                             rejected_delta_tracker.record_accepted();
-                                            debug!("Full config reload complete after DB DNS reconnect");
+                                            debug!(
+                                                reason = full_reload_reason.as_label(),
+                                                "Full config reload complete"
+                                            );
                                         }
                                         Some(false) => {}
                                     }
@@ -2681,14 +2686,15 @@ pub async fn run(
                                             auto_apply_plugin_migrations_poll,
                                             &plugin_migration_reconcile_state_poll,
                                             &e,
-                                            "full reload after DB DNS reconnect",
+                                            full_reload_reason.reload_context(),
                                         )
                                         .await;
                                         database_delta_poll_metrics_for_poll
                                             .record_poll_failure(DatabasePollFailureReason::ValidationRejected);
                                     } else {
                                         error!(
-                                            "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying"
+                                            reason = full_reload_reason.as_label(),
+                                            "Authoritative primary full config reload failed; keeping existing config and retrying"
                                         );
                                         database_delta_poll_metrics_for_poll
                                             .record_config_source_unavailable(
