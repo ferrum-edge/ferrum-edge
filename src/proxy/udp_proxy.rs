@@ -1101,7 +1101,50 @@ impl BackendDtlsConfigCacheState {
     }
 }
 
-type PendingSessionMap = Arc<DashMap<UdpSessionKey, PendingDatagramQueue, ahash::RandomState>>;
+/// Pending-session gates plus an exact gate count.
+///
+/// The pending-gate cap is checked once per datagram from a source with no
+/// session, which is exactly the spoofed-flood case the cap exists for, and
+/// `DashMap::len()` read-locks every shard. The count therefore lives beside the
+/// map (issue #7167). Membership changes only through [`Self::remove`],
+/// [`try_insert_pending_session_gate`] and [`take_pending_datagrams`], which
+/// adjust `len` while holding the entry's shard lock (increment before the
+/// insert becomes visible, decrement after the removal), so the count never
+/// under-reports a live gate.
+struct PendingSessionTable {
+    map: DashMap<UdpSessionKey, PendingDatagramQueue, ahash::RandomState>,
+    len: AtomicUsize,
+}
+
+impl PendingSessionTable {
+    fn with_shard_amount(shard_amount: usize) -> Self {
+        Self {
+            map: DashMap::with_hasher_and_shard_amount(ahash::RandomState::default(), shard_amount),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    fn get_mut(
+        &self,
+        key: &UdpSessionKey,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, UdpSessionKey, PendingDatagramQueue>> {
+        self.map.get_mut(key)
+    }
+
+    fn remove(&self, key: &UdpSessionKey) -> Option<(UdpSessionKey, PendingDatagramQueue)> {
+        let removed = self.map.remove(key);
+        if removed.is_some() {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
+    }
+}
+
+type PendingSessionMap = Arc<PendingSessionTable>;
 
 /// Maximum number of follow-up datagrams queued per pending (setup-in-progress)
 /// session. Sized for real opening flights — a QUIC Initial + 0-RTT coalesced
@@ -2014,7 +2057,7 @@ fn try_insert_pending_session_gate(
             max_sessions
         ));
     }
-    match pending_sessions.entry(session_key.clone()) {
+    match pending_sessions.map.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
             #[cfg(feature = "bench-udp-profile")]
             crate::udp_profile::lookup_outcome(
@@ -2029,6 +2072,9 @@ fn try_insert_pending_session_gate(
                 crate::udp_profile::Operation::PendingRaceGate,
                 false,
             );
+            // Counted while the vacant entry still holds the shard lock, so a
+            // concurrent removal can never decrement before this increment.
+            pending_sessions.len.fetch_add(1, Ordering::Relaxed);
             vacant.insert(PendingDatagramQueue {
                 forwarded_client,
                 ..Default::default()
@@ -2088,11 +2134,12 @@ fn take_pending_datagrams(
     pending_sessions: &PendingSessionMap,
     session_key: &UdpSessionKey,
 ) -> Option<Vec<PendingDatagram>> {
-    match pending_sessions.entry(session_key.clone()) {
+    match pending_sessions.map.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
             if occupied.get().datagrams.is_empty() {
                 udp_count!(PendingEmptyRemove, 1);
                 occupied.remove();
+                pending_sessions.len.fetch_sub(1, Ordering::Relaxed);
                 None
             } else {
                 let queue = occupied.get_mut();
@@ -2233,22 +2280,25 @@ fn udp_session_shard_amount(override_value: usize) -> usize {
     crate::util::sharding::pool_shard_amount(override_value)
 }
 
-struct UdpSessionEpochView {
-    proxy: Proxy,
+/// Per-session view of the pinned epoch. `proxy` borrows from that epoch
+/// (which the setup task holds for the whole setup) instead of cloning the
+/// whole `Proxy` per new session (issue #7167).
+struct UdpSessionEpochView<'e> {
+    proxy: &'e Proxy,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     consumer_index: Arc<ConsumerIndex>,
     sni_hostname: Option<String>,
 }
 
-fn resolve_udp_session_epoch_view(
+fn resolve_udp_session_epoch_view<'e>(
     listener_proxy_id: &str,
     listener_proxy_namespace: &str,
-    epoch: &RequestEpoch,
+    epoch: &'e RequestEpoch,
     initial_data: &[u8],
     sni_proxy_ids: Option<&[NamespacedResourceId]>,
     listen_port: u16,
-) -> Result<UdpSessionEpochView, anyhow::Error> {
+) -> Result<UdpSessionEpochView<'e>, anyhow::Error> {
     let base_proxy = epoch
         .proxy_by_namespaced_id(listener_proxy_namespace, listener_proxy_id)
         .ok_or_else(|| {
@@ -2299,8 +2349,9 @@ fn resolve_udp_session_epoch_view(
 
     let proxy = epoch
         .proxy_by_namespaced_id(resolved_namespace, resolved_proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found"))?
-        .clone();
+        .ok_or_else(|| {
+            anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found")
+        })?;
     let plugins =
         epoch
             .plugin_cache
@@ -3970,10 +4021,8 @@ pub async fn start_udp_listener_holding_port(
         ahash::RandomState::default(),
         session_shard_amount,
     ));
-    let pending_sessions: PendingSessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
-        ahash::RandomState::default(),
-        session_shard_amount,
-    ));
+    let pending_sessions: PendingSessionMap =
+        Arc::new(PendingSessionTable::with_shard_amount(session_shard_amount));
 
     // Spawn session cleanup task
     spawn_session_cleanup(
@@ -7768,11 +7817,11 @@ async fn handle_dtls_client_inner(
     if client_trust.is_retired() {
         return Err(client_trust.settle_withdrawal());
     }
-    // Look up proxy config
+    // Look up proxy config. Borrowed from the pinned epoch, which outlives this
+    // handler, rather than cloned per DTLS session (issue #7167).
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?
-        .clone();
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?;
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
     if crate::udp_amplification::factor_is_unlimited(proxy.udp_max_response_amplification_factor) {
         crate::udp_amplification::record_policy_unlimited();
@@ -7806,7 +7855,7 @@ async fn handle_dtls_client_inner(
     // balancer's socket address.
     let lb_hash_key = udp_lb_hash_key_for_client_ip(identity.resolved().ip());
     let (backend_host, backend_port) = resolve_backend_target(
-        &proxy,
+        proxy,
         &epoch.load_balancer,
         health_checker,
         &lb_hash_key,
@@ -7974,7 +8023,7 @@ async fn handle_dtls_client_inner(
         .then(|| {
             cached_backend_dtls_config(
                 backend_dtls_config_cache,
-                &proxy,
+                proxy,
                 &backend_host,
                 tls_no_verify,
                 crls,
@@ -8606,7 +8655,7 @@ async fn handle_dtls_client_inner(
 /// re-authorization.
 async fn admit_plain_udp_stream(
     epoch: &RequestEpoch,
-    view: &UdpSessionEpochView,
+    view: &UdpSessionEpochView<'_>,
     identity: DatagramClientIdentity,
     listen_port: u16,
     node_waypoint_udp_source: Option<
@@ -8741,7 +8790,7 @@ async fn admit_plain_udp_stream(
 async fn create_session(
     request_epoch: &Arc<RequestEpochStore>,
     epoch: &RequestEpoch,
-    view: UdpSessionEpochView,
+    view: UdpSessionEpochView<'_>,
     dns_cache: &DnsCache,
     frontend_socket: &Arc<FrontendUdpSocket>,
     identity: DatagramClientIdentity,
@@ -8802,7 +8851,7 @@ async fn create_session(
     let lb_hash_key = udp_session_lb_hash_key(identity.resolved().ip(), session_key.destination);
     let (backend_host, backend_port) = resolve_or_reuse_backend_target(
         preselected_backend_target,
-        &proxy,
+        proxy,
         &epoch.load_balancer,
         health_checker,
         &lb_hash_key,
@@ -8965,7 +9014,7 @@ async fn create_session(
         .then(|| {
             cached_backend_dtls_config(
                 backend_dtls_config_cache,
-                &proxy,
+                proxy,
                 &backend_host,
                 tls_no_verify,
                 crls,
@@ -12004,7 +12053,16 @@ backend_tls_verify_server_cert: false
     }
 
     fn test_pending_map() -> super::PendingSessionMap {
-        Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default()))
+        Arc::new(super::PendingSessionTable::with_shard_amount(4))
+    }
+
+    /// Open a pending gate through the production insert path.
+    fn open_test_gate(pending: &super::PendingSessionMap, key: &super::UdpSessionKey) {
+        assert!(
+            super::try_insert_pending_session_gate(pending, key, usize::MAX, None)
+                .expect("gate below cap"),
+            "gate must be newly inserted"
+        );
     }
 
     fn test_client_addr() -> std::net::SocketAddr {
@@ -12359,9 +12417,9 @@ backend_tls_verify_server_cert: false
 
         // Absent entry: nothing to drain, nothing inserted.
         assert!(super::take_pending_datagrams(&pending, &addr).is_none());
-        assert!(!pending.contains_key(&addr));
+        assert!(!pending.map.contains_key(&addr));
 
-        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
+        open_test_gate(&pending, &addr);
         {
             let mut entry = pending.get_mut(&addr).expect("gate present");
             assert!(entry.push_bounded(&[1], Some(7)));
@@ -12385,7 +12443,7 @@ backend_tls_verify_server_cert: false
             ]
         );
         assert!(
-            pending.contains_key(&addr),
+            pending.map.contains_key(&addr),
             "gate must survive a non-empty take"
         );
 
@@ -12408,7 +12466,7 @@ backend_tls_verify_server_cert: false
         // Empty queue: the gate is removed atomically and the drain ends.
         assert!(super::take_pending_datagrams(&pending, &addr).is_none());
         assert!(
-            !pending.contains_key(&addr),
+            !pending.map.contains_key(&addr),
             "empty take must remove the pending gate"
         );
     }
@@ -12419,7 +12477,7 @@ backend_tls_verify_server_cert: false
         let addr = test_session_key();
 
         // Armed gate (setup failure path): entry and queued datagrams removed.
-        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
+        open_test_gate(&pending, &addr);
         {
             let _gate = super::PendingSessionGate {
                 pending_sessions: Arc::clone(&pending),
@@ -12428,12 +12486,12 @@ backend_tls_verify_server_cert: false
             };
         }
         assert!(
-            !pending.contains_key(&addr),
+            !pending.map.contains_key(&addr),
             "armed gate must remove the pending entry on drop"
         );
 
         // Disarmed gate (successful handoff): entry left alone.
-        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
+        open_test_gate(&pending, &addr);
         {
             let mut gate = super::PendingSessionGate {
                 pending_sessions: Arc::clone(&pending),
@@ -12443,9 +12501,104 @@ backend_tls_verify_server_cert: false
             gate.disarm();
         }
         assert!(
-            pending.contains_key(&addr),
+            pending.map.contains_key(&addr),
             "disarmed gate must not touch the map"
         );
+    }
+
+    #[test]
+    fn pending_gate_count_tracks_every_insert_and_removal_path() {
+        let pending = test_pending_map();
+        let max = 8;
+        let keys: Vec<super::UdpSessionKey> = (0..32u16)
+            .map(|i| {
+                super::UdpSessionKey::undestined(SocketAddr::from(([127, 0, 0, 1], 41_000 + i)), 1)
+            })
+            .collect();
+
+        // Flood: only `max` distinct sources get a gate, the rest hit the cap.
+        let mut admitted = Vec::new();
+        for key in &keys {
+            match super::try_insert_pending_session_gate(&pending, key, max, None) {
+                Ok(true) => admitted.push(key.clone()),
+                Ok(false) => panic!("a fresh source must not be reported as an existing gate"),
+                Err(err) => assert!(
+                    err.to_string()
+                        .contains("UDP pending session limit reached"),
+                    "unexpected error: {err}"
+                ),
+            }
+        }
+        assert_eq!(admitted.len(), max);
+        assert_eq!(pending.len(), max);
+        assert_eq!(pending.len(), pending.map.len());
+
+        // A datagram for an existing gate does not count it twice.
+        assert!(
+            !super::try_insert_pending_session_gate(&pending, &admitted[0], usize::MAX, None)
+                .expect("existing gate below cap")
+        );
+        assert_eq!(pending.len(), max);
+
+        // Drain through both production removal paths.
+        let (by_take, by_abort) = admitted.split_at(max / 2);
+        for key in by_take {
+            assert!(super::take_pending_datagrams(&pending, key).is_none());
+        }
+        for key in by_abort {
+            drop(super::PendingSessionGate {
+                pending_sessions: Arc::clone(&pending),
+                session_key: key.clone(),
+                armed: true,
+            });
+        }
+        assert_eq!(
+            pending.len(),
+            0,
+            "every removal path must release its count"
+        );
+        assert_eq!(pending.map.len(), 0);
+
+        // Removing an absent gate must not underflow the count.
+        assert!(pending.remove(&keys[0]).is_none());
+        assert!(super::take_pending_datagrams(&pending, &keys[0]).is_none());
+        assert_eq!(pending.len(), 0);
+
+        // Capacity is available again once the flood drained.
+        assert!(
+            super::try_insert_pending_session_gate(&pending, &keys[max], max, None)
+                .expect("cap released")
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_gate_count_stays_exact_under_concurrent_churn() {
+        let pending = test_pending_map();
+        std::thread::scope(|scope| {
+            // Workers share one key space, so inserts and removals of the
+            // same gate race across threads.
+            for worker in 0..4u16 {
+                let pending = &pending;
+                scope.spawn(move || {
+                    for round in 0..200u16 {
+                        let key = super::UdpSessionKey::undestined(
+                            SocketAddr::from(([127, 0, 0, 1], 20_000 + (round + worker) % 50)),
+                            1,
+                        );
+                        let _ =
+                            super::try_insert_pending_session_gate(pending, &key, usize::MAX, None);
+                        if round % 2 == 0 {
+                            let _ = super::take_pending_datagrams(pending, &key);
+                        } else {
+                            let _ = pending.remove(&key);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(pending.len(), pending.map.len());
+        assert_eq!(pending.len(), 0);
     }
 
     #[test]
