@@ -9339,9 +9339,7 @@ async fn create_session(
                         let error_message = e.to_string();
                         disconnect_error = Some((
                             error_message.clone(),
-                            crate::retry::classify_boxed_error(
-                                anyhow::anyhow!(error_message).as_ref(),
-                            ),
+                            crate::retry::classify_boxed_error(e.as_ref()),
                             crate::plugins::DisconnectCause::BackendError,
                             crate::plugins::Direction::BackendToClient,
                         ));
@@ -9388,9 +9386,7 @@ async fn create_session(
                         let error_message = e.to_string();
                         disconnect_error = Some((
                             error_message.clone(),
-                            crate::retry::classify_boxed_error(
-                                anyhow::anyhow!(error_message).as_ref(),
-                            ),
+                            crate::retry::classify_boxed_error(&e),
                             crate::plugins::DisconnectCause::BackendError,
                             crate::plugins::Direction::BackendToClient,
                         ));
@@ -9647,9 +9643,7 @@ async fn create_session(
                         // attribute the session teardown to the client recv path.
                         disconnect_error = Some((
                             error_message.clone(),
-                            crate::retry::classify_boxed_error(
-                                anyhow::anyhow!(error_message).as_ref(),
-                            ),
+                            crate::retry::classify_boxed_error(&e),
                             crate::plugins::DisconnectCause::RecvError,
                             crate::plugins::Direction::BackendToClient,
                         ));
@@ -9921,9 +9915,7 @@ async fn create_session(
                                                     disconnected_wall_at: chrono::Utc::now(),
                                                     connection_error: Some(error_message.clone()),
                                                     error_class: Some(
-                                                        crate::retry::classify_boxed_error(
-                                                            anyhow::anyhow!(error_message).as_ref(),
-                                                        ),
+                                                        crate::retry::classify_boxed_error(&e),
                                                     ),
                                                     disconnect_direction: Some(
                                                         crate::plugins::Direction::BackendToClient,
@@ -10043,9 +10035,7 @@ async fn create_session(
                                 // (client), not the backend — client-side.
                                 disconnect_error = Some((
                                     error_message.clone(),
-                                    crate::retry::classify_boxed_error(
-                                        anyhow::anyhow!(error_message).as_ref(),
-                                    ),
+                                    crate::retry::classify_boxed_error(&e),
                                     crate::plugins::DisconnectCause::RecvError,
                                     crate::plugins::Direction::BackendToClient,
                                 ));

@@ -109,7 +109,10 @@ async fn test_tcp_fault_admission_preserves_half_close_and_queued_bytes() {
 fn test_classify_stream_error_preserves_tls_failures() {
     let error =
         anyhow::anyhow!("Backend TLS handshake failed to 127.0.0.1:443: invalid peer certificate");
-    assert_eq!(classify_stream_error(&error), ErrorClass::TlsError);
+    assert_eq!(classify_stream_setup_error(&error), ErrorClass::TlsError);
+    // Issue #7213: untyped TLS wording surfaced from the copy loop is not
+    // phase evidence, so it keeps the post-wire twin of a rustls error.
+    assert_eq!(classify_stream_error(&error), ErrorClass::ConnectionReset);
 }
 
 #[test]
