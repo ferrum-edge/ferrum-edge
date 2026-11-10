@@ -113,7 +113,7 @@ The test follows a specific ordering to satisfy database foreign key constraints
 
 | # | Test | Request | Expected |
 |---|------|---------|----------|
-| 17 | Valid signature | HMAC-SHA256 over the `ferrum-hmac-v1` signing string | 200 OK |
+| 17 | Valid signature | HMAC-SHA256 over the `ferrum-hmac-v2` signing string | 200 OK |
 | 18 | Wrong secret | Signature computed with wrong key | 401 |
 | 19 | Missing Date header | No Date header (freshness check) | 401 |
 | 20 | Unknown consumer | `username="nonexistent"` | 401 |
@@ -219,13 +219,13 @@ Plugins execute by priority (lower = first):
 
 ### HMAC Signing String
 
-The `/hmacauth` proxy uses `signing_profile: ferrum-hmac-v1` (with `allow_unsafe_replayable_v1: true`). The signature is computed over:
+The `/hmacauth` proxy uses the default `ferrum-hmac-v2` profile with `replay_scope: process`. The signature is computed over:
 
 ```text
-ferrum-hmac-v1\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
+ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}\n{NONCE}
 ```
 
-`ferrum-hmac-v2` appends a trailing `{NONCE}` field. The test helpers are in `tests/common/hmac_helpers.rs`; see [`hmac_auth`](plugins.md#hmac_auth) for the field definitions.
+Every request carries a fresh `nonce` (`hmac_v2_authorization`), because each signed request is single-use. The test helpers are in `tests/common/hmac_helpers.rs`; see [`hmac_auth`](plugins.md#hmac_auth) for the field definitions.
 
 ### JWT Token Notes
 

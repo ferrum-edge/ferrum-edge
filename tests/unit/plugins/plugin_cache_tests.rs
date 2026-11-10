@@ -3524,7 +3524,7 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
             json!({
                 "ttl_seconds": 60,
                 "vary_by_headers": ["x-tenant"],
-                "cache_key_include_consumer": true
+                "anonymous_caller_scope": "shared"
             }),
             PluginScope::Proxy,
             Some("p1"),
@@ -3543,7 +3543,7 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
             json!({
                 "ttl_seconds": 60,
                 "vary_by_header": ["x-tenant"],
-                "cache_key_include_consumr": true
+                "anonymous_caller_scop": "shared"
             }),
             PluginScope::Proxy,
             Some("p1"),
@@ -3561,8 +3561,8 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
         "reload error must path-qualify Vary typo: {error}"
     );
     assert!(
-        error.contains("\"config.cache_key_include_consumr\""),
-        "reload error must path-qualify consumer typo: {error}"
+        error.contains("\"config.anonymous_caller_scop\""),
+        "reload error must path-qualify the caller-scope typo: {error}"
     );
 
     let after = cache.get_plugins("ferrum", "p1");

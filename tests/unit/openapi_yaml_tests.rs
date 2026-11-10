@@ -794,6 +794,22 @@ fn circuit_breaker_config_documents_cooldown_seconds_input_alias() {
     );
 }
 
+/// Issue #7114: `error_truncate_chars` only ever narrows the compiled-in
+/// diagnostic ceiling, so its documented default is that ceiling rather than a
+/// larger value the runtime would silently clamp.
+#[test]
+fn openapi_validator_error_truncate_default_is_the_diagnostic_ceiling() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let field = &spec["components"]["schemas"]["OpenapiValidatorConfig"]["properties"]["error_truncate_chars"];
+    assert_eq!(
+        field["default"],
+        json!(ferrum_edge::plugins::utils::validation_diagnostics::MAX_DIAGNOSTIC_CHARS)
+    );
+    let docs = include_str!("../../docs/openapi_validator.md");
+    assert!(docs.contains("| `error_truncate_chars` | `256` |"));
+}
+
 #[test]
 fn mtls_auth_schemas_match_runtime_contract() {
     let spec: serde_json::Value =
@@ -5928,8 +5944,7 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
 /// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
 /// no conditional constraints at all, so schema-based tooling approved
 /// deployments the gateway refuses to start with — an empty configuration,
-/// unsafe v1 without its acknowledgement, v2 without a replay scope, and every
-/// impossible Redis/scope pairing. This is the real schema-vs-runtime
+/// a profile without a replay scope, and every impossible Redis/scope pairing. This is the real schema-vs-runtime
 /// acceptance matrix.
 #[test]
 fn hmac_auth_schema_acceptance_matches_runtime_admission() {
@@ -5954,12 +5969,6 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": "process", "sync_mode": "local"}),
         json!({"signing_profile": "ferrum-hmac-v2", "replay_scope": "process"}),
         json!({
-            "signing_profile": "ferrum-hmac-v2",
-            "replay_scope": "process",
-            "allow_unsafe_replayable_v1": false
-        }),
-        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": true}),
-        json!({
             "replay_scope": "shared",
             "sync_mode": "redis",
             "redis_url": redis_url
@@ -5970,11 +5979,6 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": "process", "signed_headers": ["x-tenant-id", "content-type"]}),
         json!({"replay_scope": "process", "signed_headers": []}),
         json!({"replay_scope": "process", "max_body_bytes": 268_435_456}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "signed_headers": ["idempotency-key"]
-        }),
         json!({"signing_profile": "rfc9421", "replay_scope": "process"}),
         json!({
             "signing_profile": "rfc9421",
@@ -5995,26 +5999,22 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
     }
 
     let rejected = [
-        // Profile / acknowledgement / scope admission (the #5001 matrix).
+        // Profile / scope admission (the #5001 matrix). The replayable
+        // `ferrum-hmac-v1` profile and its acknowledgement are gone (#7114).
         json!({}),
         json!({"clock_skew_seconds": 60}),
         json!({"signing_profile": "ferrum-hmac-v1"}),
-        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": false}),
+        json!({"signing_profile": "ferrum-hmac-v1", "replay_scope": "process"}),
         json!({
             "signing_profile": "ferrum-hmac-v1",
             "allow_unsafe_replayable_v1": true,
             "replay_scope": "process"
         }),
         json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": false}),
         json!({"replay_scope": "shared"}),
         json!({"replay_scope": "shared", "sync_mode": "redis"}),
         json!({"replay_scope": "process", "sync_mode": "redis", "redis_url": redis_url}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "sync_mode": "redis",
-            "redis_url": redis_url
-        }),
         // Scalar spellings: the enums are exact on both surfaces.
         json!({"replay_scope": " PROCESS "}),
         json!({"replay_scope": "Process"}),
@@ -6032,13 +6032,8 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": true}),
         json!({"replay_scope": "process", "replay_scop": "shared"}),
         json!({"replay_scope": "process", "require_digest": true}),
-        // Replay capacity is bounded and meaningless without replay state.
+        // Replay capacity is bounded.
         json!({"replay_scope": "process", "replay_max_entries": 10_000_001}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "replay_max_entries": 1000
-        }),
         // Signed headers, body ceiling, and RFC 9421 policy bounds.
         json!({"replay_scope": "process", "signed_headers": ["X-Tenant-Id"]}),
         json!({"replay_scope": "process", "signed_headers": ["authorization"]}),
@@ -10447,7 +10442,6 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
     }
     assert!(compression_docs.contains("Strict config validation"));
     assert!(compression_docs.contains("KeepLastKnownGood"));
-    assert!(compression_docs.contains("disable_on_etag"));
     assert!(
         compression_docs.contains("**Multiple instances:**"),
         "compression docs must describe multi-instance first-wins ownership"
@@ -17160,8 +17154,6 @@ fn response_caching_schema_matches_strict_runtime_contract() {
             "respect_cache_control": true,
             "respect_no_cache": false,
             "vary_by_headers": ["x-tenant"],
-            "cache_key_include_query": true,
-            "cache_key_include_consumer": true,
             "add_cache_status_header": true,
             "invalidate_on_unsafe_methods": false
         }),
@@ -17176,8 +17168,8 @@ fn response_caching_schema_matches_strict_runtime_contract() {
 
     for invalid in [
         json!({"vary_by_header": ["x-tenant"]}),
-        json!({"cache_key_include_consumr": true}),
-        json!({"cache_key_include_quer": false}),
+        json!({"cache_key_include_consumer": true}),
+        json!({"cache_key_include_query": false}),
         json!({"respect_cache_contro": true}),
         json!({"respect_no_cach": true}),
         json!({"cacheable_status_code": [200]}),
@@ -17278,8 +17270,6 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         "max_total_size_bytes",
         "respect_cache_control",
         "respect_no_cache",
-        "cache_key_include_query",
-        "cache_key_include_consumer",
         "add_cache_status_header",
         "invalidate_on_unsafe_methods",
     ] {

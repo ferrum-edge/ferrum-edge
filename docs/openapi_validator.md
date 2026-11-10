@@ -211,7 +211,7 @@ The generated plugin config has this shape:
 | `error_response.response_status_code` | `502` | Status for blocked response validation errors. |
 | `error_response.unsupported_media_type_status_code` | `415` | Status for a nonempty request body that no media entry declared for the matched operation covers, including a body sent with no `Content-Type`. Separate from `request_status_code` so remapping schema failures does not also remap media-type refusals. |
 | `error_response.content_type` | `application/problem+json` | Content type for generated error bodies. |
-| `error_truncate_chars` | `1024` | Size bound for diagnostics; the effective cap is `min(error_truncate_chars, 256)`. See [Diagnostic confidentiality](#diagnostic-confidentiality). |
+| `error_truncate_chars` | `256` | Size bound for diagnostics; the effective cap is `min(error_truncate_chars, 256)`. See [Diagnostic confidentiality](#diagnostic-confidentiality). |
 
 ### Strict config admission
 

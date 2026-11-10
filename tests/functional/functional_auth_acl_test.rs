@@ -13,8 +13,8 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use crate::common::{
-    TestGateway, content_digest_sha256_header, empty_digest_header, generate_hmac_signature,
-    generate_hmac_signature_with_digest, hmac_authority_from_url,
+    TestGateway, content_digest_sha256_header, empty_digest_header, hmac_authority_from_url,
+    hmac_v2_authorization,
 };
 
 use base64::Engine;
@@ -214,7 +214,7 @@ fn hmac_authorization_for_digest(
     authority: &str,
     digest: &str,
 ) -> String {
-    let signature = generate_hmac_signature_with_digest(
+    hmac_v2_authorization(
         method,
         path,
         date,
@@ -222,8 +222,7 @@ fn hmac_authorization_for_digest(
         authority,
         "alice-hmac-shared-secret-at-least-32-bytes",
         digest,
-    );
-    format!(r#"hmac username="alice", algorithm="hmac-sha256", signature="{signature}""#)
+    )
 }
 
 async fn send_raw_h1_hmac_request(
@@ -278,16 +277,15 @@ async fn send_declared_oversized_invalid_h1_hmac_request(
 
     let authority = format!("127.0.0.1:{proxy_port}");
     let digest = empty_digest_header();
-    let signature = generate_hmac_signature(
+    let authorization = hmac_v2_authorization(
         "POST",
         "/hmacauth",
         date,
         username,
         &authority,
         signing_secret,
+        &digest,
     );
-    let authorization =
-        format!(r#"hmac username="{username}", algorithm="hmac-sha256", signature="{signature}""#);
     let request = format!(
         "POST /hmacauth HTTP/1.1\r\nHost: {authority}\r\nAuthorization: {authorization}\r\nDate: {date}\r\nDigest: {digest}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         10 * 1024 * 1024 + 1
@@ -1151,8 +1149,7 @@ async fn test_auth_acl_comprehensive() {
             "enabled": true,
             "config": {
                 "clock_skew_seconds": 300,
-                "signing_profile": "ferrum-hmac-v1",
-                "allow_unsafe_replayable_v1": true
+                "replay_scope": "process"
             }
         }),
         json!({
@@ -1645,17 +1642,14 @@ async fn test_auth_acl_comprehensive() {
     // Test 17: HMAC Auth — valid signature
     println!("\n--- Test 17: HMAC Auth — Valid Signature ---");
     let date = Utc::now().to_rfc2822();
-    let signature = generate_hmac_signature(
+    let hmac_header = hmac_v2_authorization(
         "GET",
         "/hmacauth",
         &date,
         "alice",
         &hmac_authority,
         "alice-hmac-shared-secret-at-least-32-bytes",
-    );
-    let hmac_header = format!(
-        "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-        signature
+        &empty_digest_header(),
     );
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
@@ -1681,17 +1675,14 @@ async fn test_auth_acl_comprehensive() {
     // Test 18: HMAC Auth — wrong secret (bad signature)
     println!("\n--- Test 18: HMAC Auth — Wrong Secret ---");
     let date = Utc::now().to_rfc2822();
-    let bad_sig = generate_hmac_signature(
+    let hmac_header = hmac_v2_authorization(
         "GET",
         "/hmacauth",
         &date,
         "alice",
         &hmac_authority,
         "wrong-secret",
-    );
-    let hmac_header = format!(
-        "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-        bad_sig
+        &empty_digest_header(),
     );
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
@@ -1710,17 +1701,14 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 19: HMAC Auth — missing Date header (replay protection)
     println!("\n--- Test 19: HMAC Auth — Missing Date Header ---");
-    let sig_no_date = generate_hmac_signature(
+    let hmac_header = hmac_v2_authorization(
         "GET",
         "/hmacauth",
         "",
         "alice",
         &hmac_authority,
         "alice-hmac-shared-secret-at-least-32-bytes",
-    );
-    let hmac_header = format!(
-        "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-        sig_no_date
+        &empty_digest_header(),
     );
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
@@ -1739,17 +1727,14 @@ async fn test_auth_acl_comprehensive() {
     // Test 20: HMAC Auth — unknown consumer
     println!("\n--- Test 20: HMAC Auth — Unknown Consumer ---");
     let date = Utc::now().to_rfc2822();
-    let sig = generate_hmac_signature(
+    let hmac_header = hmac_v2_authorization(
         "GET",
         "/hmacauth",
         &date,
         "nonexistent",
         &hmac_authority,
         "some-secret",
-    );
-    let hmac_header = format!(
-        "hmac username=\"nonexistent\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-        sig
+        &empty_digest_header(),
     );
     let resp = client
         .get(format!("{}/hmacauth", proxy_url))
@@ -2764,8 +2749,7 @@ async fn test_hmac_auth_plus_acl() {
                 "enabled": true,
                 "config": {
                     "clock_skew_seconds": 300,
-                    "signing_profile": "ferrum-hmac-v1",
-                    "allow_unsafe_replayable_v1": true
+                    "replay_scope": "process"
                 }
             }),
             acl_plugin_id: "plugin-hmac-allow-acl",
@@ -2791,8 +2775,7 @@ async fn test_hmac_auth_plus_acl() {
                 "enabled": true,
                 "config": {
                     "clock_skew_seconds": 300,
-                    "signing_profile": "ferrum-hmac-v1",
-                    "allow_unsafe_replayable_v1": true
+                    "replay_scope": "process"
                 }
             }),
             acl_plugin_id: "plugin-hmac-deny-acl",
@@ -2810,10 +2793,14 @@ async fn test_hmac_auth_plus_acl() {
         secret: &str,
     ) -> (String, String) {
         let date = Utc::now().to_rfc2822();
-        let signature = generate_hmac_signature("GET", path, &date, username, authority, secret);
-        let header = format!(
-            "hmac username=\"{}\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-            username, signature
+        let header = hmac_v2_authorization(
+            "GET",
+            path,
+            &date,
+            username,
+            authority,
+            secret,
+            &empty_digest_header(),
         );
         (header, date)
     }

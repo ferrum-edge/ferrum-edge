@@ -400,9 +400,6 @@ impl RateLimiting {
                 config = config.to_string()
             )
         })?;
-        // Legacy root window fields get their own actionable diagnostic before
-        // the closed-key sweep would report them as merely "unknown".
-        reject_legacy_window_fields(object)?;
         // Keeps the documented key groups aligned with the closed root
         // allowlist used for admission and OpenAPI parity.
         debug_assert_rate_limit_redis_keys();
@@ -1960,27 +1957,6 @@ fn parse_limit_scope(
             "{label}: `scope` must be `default` or `consumers`, got: {other:?}"
         )),
     }
-}
-
-fn reject_legacy_window_fields(object: &serde_json::Map<String, Value>) -> Result<(), String> {
-    static LEGACY_FIELDS: &[&str] = &[
-        "requests_per_second",
-        "requests_per_minute",
-        "requests_per_hour",
-        "window_seconds",
-        "max_requests",
-        "consumer_limits",
-    ];
-
-    for field in LEGACY_FIELDS {
-        if object.contains_key(*field) {
-            return Err(format!(
-                "rate_limiting: `{field}` must be configured inside `limits` rules"
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 fn validate_limit_rule_fields(

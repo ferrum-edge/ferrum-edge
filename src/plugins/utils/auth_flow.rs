@@ -99,12 +99,11 @@ pub struct HmacAuthCredential {
     /// `true` when the selected field was RFC 9530 `Content-Digest`.
     /// `false` means RFC 3230 `Digest`. The two spellings are not interchangeable.
     pub digest_is_rfc9530: bool,
-    /// `ferrum-hmac-v2` client nonce from the `Authorization` parameters,
-    /// already validated for wire form. Bound into the v2 signing base and, once
-    /// the signature and body digest verify, claimed exactly once against the
-    /// shared replay authority. `None` under the legacy `ferrum-hmac-v1`
-    /// profile, which accepts no nonce and provides no single-use guarantee.
-    pub nonce: Option<String>,
+    /// Client nonce (`ferrum-hmac-v2` `Authorization` parameter or `rfc9421`
+    /// signature parameter), already validated for wire form. Bound into the
+    /// signature and, once the signature and body digest verify, claimed
+    /// exactly once against the shared replay authority.
+    pub nonce: String,
     /// Canonical values of the policy's `signed_headers`, in configuration
     /// order, appended to the Ferrum signing base. Empty when the policy
     /// requires no extra headers, and always empty under `rfc9421`, whose
@@ -144,7 +143,7 @@ impl fmt::Debug for HmacAuthCredential {
             .field("query", &"[REDACTED]")
             .field("digest_header", &"[REDACTED]")
             .field("digest_is_rfc9530", &self.digest_is_rfc9530)
-            .field("nonce", &self.nonce.as_ref().map(|_| "[REDACTED]"))
+            .field("nonce", &"[REDACTED]")
             // Header values and the RFC 9421 base can carry application data
             // and the raw query; only their shape is observable.
             .field("signed_header_values", &self.signed_header_values.len())

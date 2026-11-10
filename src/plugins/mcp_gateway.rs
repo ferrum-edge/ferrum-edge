@@ -315,7 +315,6 @@ impl McpGatewayMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitializeStrategy {
     Lazy,
-    Startup,
     Passthrough,
 }
 
@@ -323,10 +322,9 @@ impl InitializeStrategy {
     fn parse(value: &str, field: &str) -> Result<Self, String> {
         match value {
             "lazy" => Ok(Self::Lazy),
-            "startup" => Ok(Self::Startup),
             "passthrough" => Ok(Self::Passthrough),
             other => Err(format!(
-                "mcp_gateway: `{field}` must be `lazy`, `startup`, or `passthrough`, got {other:?}"
+                "mcp_gateway: `{field}` must be `lazy` or `passthrough`, got {other:?}"
             )),
         }
     }
@@ -378,7 +376,7 @@ enum DiscoveryBehavior {
 impl DiscoveryBehavior {
     fn parse(value: &str, field: &str) -> Result<Self, String> {
         match value {
-            "allow" | "allow_immediately" | "expose" => Ok(Self::Allow),
+            "allow" => Ok(Self::Allow),
             "hide_until_configured" => Ok(Self::HideUntilConfigured),
             other => Err(format!(
                 "mcp_gateway: `{field}` must be `allow` or `hide_until_configured`, got {other:?}"
@@ -1792,15 +1790,6 @@ impl McpGateway {
             &discovery.namespace_separator,
             validation.validate_tool_results,
         );
-        if sessions.initialize_upstreams == InitializeStrategy::Startup
-            || servers
-                .values()
-                .any(|server| server.initialize_strategy == InitializeStrategy::Startup)
-        {
-            warn!(
-                "mcp_gateway startup upstream initialization is treated as lazy in V1 because MCP initialize requires a downstream session"
-            );
-        }
         let mut enabled_server_ids: Vec<String> = servers
             .values()
             .filter(|server| server.enabled)

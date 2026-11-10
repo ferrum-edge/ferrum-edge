@@ -968,6 +968,41 @@ fn render_mcp_config_diagnostic(config: &Value) -> String {
     ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[])
 }
 
+/// Issue #7114: the alias spellings `allow_immediately` / `expose` (for
+/// `allow`) and `startup` (a lazy alias that only logged a warning) are
+/// refused; only the canonical values are accepted.
+#[test]
+fn alias_spellings_are_rejected() {
+    for overrides in [
+        json!({"discovery": {"on_new_tool": "allow_immediately"}}),
+        json!({"discovery": {"on_new_tool": "expose"}}),
+        json!({"discovery": {"on_schema_change": "allow_immediately"}}),
+        json!({"discovery": {"on_schema_change": "expose"}}),
+        json!({"sessions": {"initialize_upstreams": "startup"}}),
+        json!({"servers": {"demo": {
+            "upstream_url": "http://127.0.0.1:9/mcp",
+            "namespace": "demo",
+            "initialize_strategy": "startup"
+        }}}),
+    ] {
+        let config = schema_fixture(overrides.clone());
+        assert!(
+            create_plugin("mcp_gateway", &config).is_err(),
+            "alias must be rejected: {overrides}"
+        );
+    }
+    for overrides in [
+        json!({"discovery": {"on_new_tool": "allow", "on_schema_change": "allow"}}),
+        json!({"sessions": {"initialize_upstreams": "lazy"}}),
+    ] {
+        let config = schema_fixture(overrides.clone());
+        assert!(
+            create_plugin("mcp_gateway", &config).is_ok(),
+            "canonical value must be accepted: {overrides}"
+        );
+    }
+}
+
 #[test]
 fn configuration_diagnostics_preserve_schema_and_withhold_supplied_data() {
     let hostile = "'MCP_UNREGISTERED_SECRET\"\\\n`field`";
@@ -976,7 +1011,7 @@ fn configuration_diagnostics_preserve_schema_and_withhold_supplied_data() {
         (
             json!({"sessions": {"initialize_upstreams": hostile}}),
             "`sessions.initialize_upstreams`",
-            "`lazy`, `startup`, or `passthrough`",
+            "`lazy` or `passthrough`",
         ),
         (
             json!({"sessions": {"downstream_session_header": hostile}}),

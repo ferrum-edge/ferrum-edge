@@ -15072,6 +15072,14 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // explicitly inside an open reload bracket.
         return transaction_log_schema::TransactionLogSchema::validate_config(config);
     }
+    if name == "api_chargeback" {
+        // Shape-only: construction resolves the process-global `/charges`
+        // registry, and the validation client's auto shard count must never
+        // be the one that sizes it. Every config check still runs here; an
+        // accepted generation constructs with the node's configured shard
+        // count (issue #7109).
+        return api_chargeback::ApiChargeback::validate_config(config);
+    }
     if name == "serverless_function" {
         // Shape-only: CP/admin admission must not require the AWS / Azure / GCP
         // credentials that intentionally resolve only from a data plane's

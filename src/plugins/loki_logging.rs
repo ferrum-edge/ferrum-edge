@@ -340,12 +340,6 @@ impl LokiLogging {
             return Err("loki_logging: config must be an object".to_string());
         };
 
-        if config_object.contains_key("include_listen_path_label") {
-            return Err(
-                "loki_logging: `include_listen_path_label` was removed; use `include_proxy_id_label`"
-                    .to_string(),
-            );
-        }
         validate_known_config_fields(config_object)?;
 
         let (endpoint_url, endpoint_hostname) =
@@ -1619,19 +1613,6 @@ mod tests {
         let labels = plugin.build_http_labels(&summary);
         assert!(!labels.contains_key("proxy_id"));
         assert!(!labels.contains_key("status_class"));
-    }
-
-    #[test]
-    fn removed_listen_path_key_is_rejected() {
-        let result = LokiLogging::new(
-            &json!({
-                "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
-                "include_listen_path_label": false,
-            }),
-            client(),
-        );
-        let err = result.err().expect("removed key should be rejected");
-        assert!(err.contains("include_listen_path_label"), "got: {err}");
     }
 
     #[tokio::test]

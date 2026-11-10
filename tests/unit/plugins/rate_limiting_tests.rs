@@ -2453,6 +2453,34 @@ async fn composed_admitted_policy_id_ties_choose_the_smaller_id_in_either_order(
     );
 }
 
+/// Window fields belong inside `limits` rules. At the root they are ordinary
+/// unknown keys of the closed config (no dedicated removed-key diagnostic,
+/// issue #7113).
+#[test]
+fn root_window_fields_are_unknown_keys() {
+    for field in [
+        "requests_per_second",
+        "requests_per_minute",
+        "requests_per_hour",
+        "window_seconds",
+        "max_requests",
+        "consumer_limits",
+    ] {
+        let mut config = json!({
+            "limit_by": "ip",
+            "limits": [{"scope": "default", "requests_per_minute": 10}]
+        });
+        config[field] = json!(10);
+        let error = RateLimiting::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("root `{field}` must be rejected"));
+        assert!(
+            error.contains("unknown configuration key"),
+            "root `{field}`: {error}"
+        );
+    }
+}
+
 #[test]
 fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";

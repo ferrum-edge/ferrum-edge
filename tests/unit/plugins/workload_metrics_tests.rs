@@ -79,10 +79,32 @@ fn explicit_default_contracts_remain_accepted() {
         json!({"trusted_hbone_assertors": null, "trust_domain_aliases": null}),
         json!({"node_id": "", "workload_spiffe_id": " ", "labels": {}}),
         json!({"span_reporting_disabled": true}),
-        json!({"disable_span_reporting": true}),
-        json!({"disableSpanReporting": true}),
     ] {
         assert!(WorkloadMetrics::new(&config).is_ok(), "{config}");
+    }
+}
+
+/// Issue #7114: the plugin config takes only `span_reporting_disabled` and the
+/// Lightstep `access_token_env`; the alternate spellings are unknown keys
+/// (mesh injection writes only the snake_case names).
+#[test]
+fn alternate_spellings_are_rejected() {
+    for config in [
+        json!({"disable_span_reporting": true}),
+        json!({"disableSpanReporting": true}),
+        json!({
+            "tracing_provider": {"kind": "lightstep", "config": {
+                "collector_url": "https://example.com/v1/traces",
+                "accessTokenEnv": "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN"
+            }},
+            "span_reporting_disabled": true
+        }),
+    ] {
+        assert!(WorkloadMetrics::new(&config).is_err(), "{config}");
+        assert!(
+            validate_plugin_config("workload_metrics", &config).is_err(),
+            "{config}"
+        );
     }
 }
 
@@ -587,14 +609,14 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
             false,
         ));
         cases.push((json!({field: maximum + 1}), true));
-        for alias in [
-            "span_reporting_disabled",
-            "disable_span_reporting",
-            "disableSpanReporting",
-        ] {
+        cases.push((
+            json!({"tracing_provider": provider, "span_reporting_disabled": true, field: maximum + 1}),
+            true,
+        ));
+        for alias in ["disable_span_reporting", "disableSpanReporting"] {
             cases.push((
                 json!({"tracing_provider": provider, alias: true, field: maximum + 1}),
-                true,
+                false,
             ));
         }
     }
@@ -605,7 +627,7 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
         }}),
         json!({"kind": "lightstep", "config": {
             "collector_url": "https://example.com/v1/traces",
-            "accessTokenEnv": "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN"
+            "access_token_env": "FERRUM_PLUGIN_SECRET_LIGHTSTEP_TOKEN"
         }}),
     ] {
         cases.push((

@@ -2270,8 +2270,7 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
         "hmac_auth",
         "grpc-hmac",
         serde_json::json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true
+            "replay_scope": "process"
         }),
     );
     let state = create_test_proxy_state_with_plugins_upstreams_and_consumers(
@@ -2289,7 +2288,7 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
         "sha-256={}",
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(grpc_message))
     );
-    let signature = crate::common::generate_hmac_signature_with_digest(
+    let authorization = crate::common::hmac_v2_authorization(
         "POST",
         path,
         &date,
@@ -2297,9 +2296,6 @@ async fn hmac_auth_reuses_prebuffered_native_grpc_body_for_primary_dispatch() {
         &gateway_addr.to_string(),
         secret,
         &digest,
-    );
-    let authorization = format!(
-        "hmac username=\"grpc-hmac-user\", algorithm=\"hmac-sha256\", signature=\"{signature}\""
     );
 
     let (status, headers, body) = send_grpc_request(
@@ -2346,8 +2342,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
         "hmac_auth",
         "grpc-hmac-cd",
         serde_json::json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true
+            "replay_scope": "process"
         }),
     );
     let state = create_test_proxy_state_with_plugins_upstreams_and_consumers(
@@ -2362,7 +2357,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     let grpc_message = b"\x00\x00\x00\x00\x0bsigned body";
     let date = Utc::now().to_rfc2822();
     let digest = crate::common::content_digest_sha256_header(grpc_message);
-    let signature = crate::common::generate_hmac_signature_with_digest(
+    let authorization = crate::common::hmac_v2_authorization(
         "POST",
         path,
         &date,
@@ -2370,9 +2365,6 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
         &gateway_addr.to_string(),
         secret,
         &digest,
-    );
-    let authorization = format!(
-        "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{signature}\""
     );
 
     let (status, headers, body) = send_grpc_request(
@@ -2395,7 +2387,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
     let empty_body: &[u8] = b"";
     let empty_date = Utc::now().to_rfc2822();
     let empty_digest = crate::common::content_digest_sha256_header(empty_body);
-    let empty_signature = crate::common::generate_hmac_signature_with_digest(
+    let empty_authorization = crate::common::hmac_v2_authorization(
         "POST",
         path,
         &empty_date,
@@ -2403,9 +2395,6 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
         &gateway_addr.to_string(),
         secret,
         &empty_digest,
-    );
-    let empty_authorization = format!(
-        "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{empty_signature}\""
     );
     let (empty_status, empty_headers, empty_response) = send_grpc_request(
         gateway_addr,
@@ -2428,7 +2417,7 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
 
     let legacy = crate::common::empty_digest_header();
     let ambiguous_date = Utc::now().to_rfc2822();
-    let ambiguous_signature = crate::common::generate_hmac_signature_with_digest(
+    let ambiguous_authorization = crate::common::hmac_v2_authorization(
         "POST",
         path,
         &ambiguous_date,
@@ -2436,9 +2425,6 @@ async fn hmac_auth_rfc9530_content_digest_preserves_grpc_body_and_rejects_ambigu
         &gateway_addr.to_string(),
         secret,
         digest.as_str(),
-    );
-    let ambiguous_authorization = format!(
-        "hmac username=\"grpc-hmac-cd-user\", algorithm=\"hmac-sha256\", signature=\"{ambiguous_signature}\""
     );
     let (ambiguous_status, ambiguous_headers, _) = send_grpc_request(
         gateway_addr,

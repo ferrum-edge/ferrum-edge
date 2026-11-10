@@ -82,40 +82,6 @@ async fn multi_audience_rejects_unconfigured_audience() {
 }
 
 #[tokio::test]
-async fn legacy_audience_alias_still_validates() {
-    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let plugin = JwksAuth::new(
-        &json!({
-            "providers": [{
-                "issuer": "https://issuer.example.com",
-                "jwks": inline_jwks(),
-                "audience": "legacy-api"
-            }]
-        }),
-        default_client(),
-    )
-    .unwrap();
-
-    let token = create_rs256_token(
-        &json!({
-            "iss": "https://issuer.example.com",
-            "sub": "legacy-user",
-            "aud": "legacy-api"
-        }),
-        private_key_pem,
-    );
-    let mut ctx = make_ctx();
-    ctx.headers
-        .insert("authorization".to_string(), format!("Bearer {token}"));
-
-    let result = plugin
-        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
-        .await;
-    assert_continue(result);
-    assert_eq!(ctx.authenticated_identity.as_deref(), Some("legacy-user"));
-}
-
-#[tokio::test]
 async fn configured_audiences_reject_token_missing_aud() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let plugin = JwksAuth::new(

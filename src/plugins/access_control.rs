@@ -133,7 +133,6 @@ impl AccessControl {
             )
         })?;
 
-        reject_removed_ip_keys(object)?;
         reject_unknown_keys(object)?;
         reject_explicitly_empty_allow_lists(object)?;
 
@@ -402,22 +401,9 @@ impl AccessControl {
     }
 }
 
-fn reject_removed_ip_keys(object: &serde_json::Map<String, Value>) -> Result<(), String> {
-    for key in ["allowed_ips", "blocked_ips"] {
-        if object.contains_key(key) {
-            return Err(format!(
-                "access_control: `{key}` was removed; use the ip_restriction plugin for IP rules"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Reject any unrecognized config key so a misspelled allow/deny key fails
 /// config validation instead of being silently dropped (which would leave a
-/// weaker-than-intended policy). Mirrors serde `deny_unknown_fields`. The
-/// removed legacy IP keys are handled separately by `reject_removed_ip_keys`
-/// with their own migration message.
+/// weaker-than-intended policy). Mirrors serde `deny_unknown_fields`.
 fn reject_unknown_keys(object: &serde_json::Map<String, Value>) -> Result<(), String> {
     const KNOWN_KEYS: [&str; 7] = [
         "allowed_consumers",

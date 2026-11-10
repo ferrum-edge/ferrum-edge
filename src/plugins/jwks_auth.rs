@@ -382,7 +382,6 @@ const PROVIDER_FIELDS: &[&str] = &[
     "discovery_url",
     "jwks",
     "issuer",
-    "audience",
     "audiences",
     "from_headers",
     "from_params",
@@ -404,25 +403,6 @@ const PROVIDER_FIELDS: &[&str] = &[
     "dpop_replay_max_entries",
     "jwks_max_stale_seconds",
     "clock_skew_seconds",
-];
-
-/// Provider fields removed by the shared replay-authority migration, with the
-/// replacement named explicitly. Rejected rather than ignored: a config that
-/// still carries `dpop_jti_ttl_secs` was written believing it controls how long
-/// a proof stays single-use, and silently dropping it would leave that operator
-/// with an unexamined retention contract.
-const REMOVED_PROVIDER_FIELDS: &[(&str, &str)] = &[
-    (
-        "dpop_jti_ttl_secs",
-        "replay retention is no longer configurable — every marker is retained for a fixed \
-         horizon that dominates the widest admissible clock skew, so no reload can shorten the \
-         protection of an already-admitted proof",
-    ),
-    (
-        "dpop_jti_cache_max_entries",
-        "renamed to `dpop_replay_max_entries`; it now bounds a process replay lane that never \
-         evicts an unexpired marker (at capacity the request is refused instead)",
-    ),
 ];
 
 impl Drop for JwksAuth {
@@ -669,7 +649,6 @@ impl JwksAuth {
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
-            reject_removed_provider_fields(prov_obj, idx)?;
             reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
 
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
@@ -2637,19 +2616,6 @@ fn default_dpop_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> Str
     prefix
 }
 
-/// Reject provider fields the shared replay authority removed, naming the
-/// replacement. See [`REMOVED_PROVIDER_FIELDS`].
-fn reject_removed_provider_fields(config: &Map<String, Value>, idx: usize) -> Result<(), String> {
-    for (removed, guidance) in REMOVED_PROVIDER_FIELDS {
-        if config.contains_key(*removed) {
-            return Err(format!(
-                "jwks_auth: `provider[{idx}].{removed}` was removed — {guidance}"
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn reject_unknown_fields(
     config: &Map<String, Value>,
     allowed: &[&str],
@@ -3060,16 +3026,7 @@ fn parse_audiences(
     config: &Map<String, Value>,
     provider_idx: usize,
 ) -> Result<Vec<String>, String> {
-    let legacy_audience = optional_non_empty_string(config, "audience", provider_idx)?;
-    let mut audiences = parse_string_array(config, "audiences", provider_idx)?;
-
-    if let Some(audience) = legacy_audience
-        && !audiences.iter().any(|known| known == &audience)
-    {
-        audiences.push(audience);
-    }
-
-    Ok(audiences)
+    parse_string_array(config, "audiences", provider_idx)
 }
 
 fn parse_string_array(

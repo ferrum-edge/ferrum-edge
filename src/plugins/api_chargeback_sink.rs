@@ -31,6 +31,7 @@ use http::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -2695,6 +2696,10 @@ struct SinkMetrics {
     snapshot_overflow_spooled_total: SinkCounter,
     snapshot_overflow_pending_total: SinkCounter,
     snapshot_cardinality_rejections_total: SinkCounter,
+    /// Snapshot charges whose record hook ran after this generation closed
+    /// snapshot admission (reload retirement or shutdown), so they were never
+    /// accumulated or spooled (issue #7112).
+    snapshot_late_charges_dropped_total: SinkCounter,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
@@ -2733,6 +2738,7 @@ impl Default for SinkMetrics {
             snapshot_overflow_spooled_total: SinkCounter::default(),
             snapshot_overflow_pending_total: SinkCounter::default(),
             snapshot_cardinality_rejections_total: SinkCounter::default(),
+            snapshot_late_charges_dropped_total: SinkCounter::default(),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
@@ -2796,6 +2802,8 @@ impl SinkMetrics {
             Some(&process.snapshot_overflow_pending_total);
         metrics.snapshot_cardinality_rejections_total.process =
             Some(&process.snapshot_cardinality_rejections_total);
+        metrics.snapshot_late_charges_dropped_total.process =
+            Some(&process.snapshot_late_charges_dropped_total);
         metrics.failure_reasons.network.process = Some(&process.failure_reasons.network);
         metrics.failure_reasons.http_4xx.process = Some(&process.failure_reasons.http_4xx);
         metrics.failure_reasons.http_5xx.process = Some(&process.failure_reasons.http_5xx);
@@ -3104,16 +3112,12 @@ impl ApiChargebackSink {
         let redacted_insert_url = redacted_endpoint_url(&parsed_url);
         let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
         let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
-        // Build the spool-replay client before staging so a TLS/file failure
-        // cannot orphan an already-staged BatchingLogger or replayer task.
-        let replay_http = if self.config.spool.enabled {
-            Some(build_clickhouse_http_client(
-                &self.config.clickhouse,
-                &self.http_client,
-            )?)
-        } else {
-            None
-        };
+        // Spool replay shares the live delivery client and its connection pool,
+        // exactly as the default (shared plugin client) arm always has. A clone
+        // of the dedicated custom-TLS client shares its pool and CRL rotation,
+        // so the TLS files are read and their warnings logged once per
+        // activation (issue #7112).
+        let replay_http = self.config.spool.enabled.then(|| http.clone());
         let metrics = Arc::new(SinkMetrics::with_process_totals());
         let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let spool = if self.config.spool.enabled {
@@ -3813,9 +3817,11 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
                 match lifecycle
                     .accumulator
                     .record_http(summary, consumer, outcome, charge)
@@ -3865,9 +3871,11 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
                 match lifecycle
                     .accumulator
                     .record_stream(summary, consumer, charge)
@@ -3916,9 +3924,11 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(lifecycle) = self.snapshot_lifecycle.get()
-                && let Some(_admission) = lifecycle.admit()
-            {
+            if let Some(lifecycle) = self.snapshot_lifecycle.get() {
+                let Some(_admission) = lifecycle.admit() else {
+                    record_late_snapshot_charge(lifecycle);
+                    return;
+                };
                 match lifecycle
                     .accumulator
                     .record_websocket(summary, consumer, charge)
@@ -4331,6 +4341,9 @@ fn render_prometheus_for_sinks(
     let snapshot_cardinality_rejections = process
         .snapshot_cardinality_rejections_total
         .load(Ordering::Relaxed);
+    let snapshot_late_charges_dropped = process
+        .snapshot_late_charges_dropped_total
+        .load(Ordering::Relaxed);
     let mut any_snapshot = false;
 
     for runtime in sinks.values() {
@@ -4495,6 +4508,7 @@ fn render_prometheus_for_sinks(
         || snapshot_overflow_spooled > 0
         || snapshot_overflow_pending > 0
         || snapshot_cardinality_rejections > 0
+        || snapshot_late_charges_dropped > 0
     {
         output.push_str("# HELP chargeback_sink_snapshot_entries Snapshot accumulator identities retained in memory.\n");
         output.push_str("# TYPE chargeback_sink_snapshot_entries gauge\n");
@@ -4525,6 +4539,12 @@ fn render_prometheus_for_sinks(
         output.push_str(&format!(
             "chargeback_sink_snapshot_cardinality_rejections_total {}\n",
             snapshot_cardinality_rejections
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_late_charges_dropped_total Snapshot charges dropped because their record hook ran after the generation closed snapshot admission (reload retirement or shutdown).\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_late_charges_dropped_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_late_charges_dropped_total {}\n",
+            snapshot_late_charges_dropped
         ));
     }
     output.push_str(
@@ -4815,8 +4835,12 @@ const CHARGE_ROW_JSON_OVERHEAD_BYTES: usize = 1_024;
 /// Conservative upper bound on the JSONEachRow request body for `batch`.
 ///
 /// Charge-event strings are raw, so JSON escaping can expand each byte six-fold.
-fn charge_body_byte_bound(
-    batch: &[ChargeEvent],
+///
+/// Generic over owned and borrowed events so the live INSERT body (built from
+/// `&ChargeEvent` borrows of queued records) and the durable spool artifact
+/// (owned events) share one bound, one validator, and one writer.
+fn charge_body_byte_bound<E: Borrow<ChargeEvent>>(
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Option<usize> {
     // A projection can only ADD bytes per row (renamed keys, injected static /
@@ -4827,7 +4851,8 @@ fn charge_body_byte_bound(
     for event in batch {
         total = total
             .checked_add(
-                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
+                charge_event_retained_bytes(event.borrow())
+                    .checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
             )?
             .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
             .checked_add(projection_row_bytes)?;
@@ -4841,17 +4866,18 @@ fn charge_body_byte_bound(
 /// second attacker-shaped copy: it is reserved against the retained-byte ceiling
 /// before serialization and stays charged until the request (and every retry
 /// handle taken from it) is gone.
-fn materialize_charge_body(
+fn materialize_charge_body<E: Borrow<ChargeEvent>>(
     cfg: &ClickHouseFlushConfig,
-    batch: &[ChargeEvent],
+    batch: &[E],
 ) -> Result<ReservedPayload, String> {
     materialize_json_each_row(cfg.ceiling, batch, cfg.projection.as_deref())
 }
 
 /// Reject a batch whose charges cannot be represented in JSON before any
 /// attacker-shaped representation of it is allocated.
-fn validate_charge_batch(batch: &[ChargeEvent]) -> Result<(), String> {
+fn validate_charge_batch<E: Borrow<ChargeEvent>>(batch: &[E]) -> Result<(), String> {
     for event in batch {
+        let event: &ChargeEvent = event.borrow();
         for (field, value) in [
             ("charge_call", event.charge_call),
             ("charge_bytes_sent", event.charge_bytes_sent),
@@ -4878,12 +4904,13 @@ fn validate_charge_batch(batch: &[ChargeEvent]) -> Result<(), String> {
 /// a file written before a schema change replays under the schema in force when
 /// it was written. Internal identities (`SnapshotEntry` keys, spool ownership,
 /// accumulator keys) never pass through here and are untouched by projection.
-fn write_json_each_row<W: Write>(
+fn write_json_each_row<W: Write, E: Borrow<ChargeEvent>>(
     writer: &mut W,
-    batch: &[ChargeEvent],
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Result<(), String> {
     for (index, event) in batch.iter().enumerate() {
+        let event: &ChargeEvent = event.borrow();
         if index > 0 {
             writer
                 .write_all(b"\n")
@@ -4911,9 +4938,9 @@ fn write_json_each_row<W: Write>(
 /// Every producer of an attacker-shaped JSONEachRow representation — the HTTP
 /// delivery body and the durable spool artifact alike — goes through here, so
 /// no caller can serialize first and measure afterwards.
-fn materialize_json_each_row(
+fn materialize_json_each_row<E: Borrow<ChargeEvent>>(
     ceiling: &'static RetainedByteCeiling,
-    batch: &[ChargeEvent],
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Result<ReservedPayload, String> {
     validate_charge_batch(batch)?;
@@ -4929,93 +4956,13 @@ fn materialize_json_each_row(
     .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
 }
 
-fn charge_body_byte_bound_refs(
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Option<usize> {
-    let projection_row_bytes = projection.map_or(0, |p| p.row_overhead_bytes);
-    let mut total = CHARGE_ROW_JSON_OVERHEAD_BYTES;
-    for event in batch {
-        total = total
-            .checked_add(
-                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
-            )?
-            .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
-            .checked_add(projection_row_bytes)?;
-    }
-    Some(total)
-}
-
-fn validate_charge_batch_refs(batch: &[&ChargeEvent]) -> Result<(), String> {
-    for event in batch {
-        for (field, value) in [
-            ("charge_call", event.charge_call),
-            ("charge_bytes_sent", event.charge_bytes_sent),
-            ("charge_bytes_received", event.charge_bytes_received),
-            ("charge_total", event.charge_total),
-        ] {
-            require_finite_charge(value, field).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: event '{}' cannot be serialized: {error}",
-                    event.event_id
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn write_json_each_row_refs<W: Write>(
-    writer: &mut W,
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Result<(), String> {
-    for (index, event) in batch.iter().enumerate() {
-        if index > 0 {
-            writer
-                .write_all(b"\n")
-                .map_err(|error| format!("failed to write row separator: {error}"))?;
-        }
-        let result = match projection {
-            None => serde_json::to_writer(&mut *writer, event),
-            Some(projection) => serde_json::to_writer(
-                &mut *writer,
-                &SchemaView {
-                    summary: *event,
-                    schema: &projection.schema,
-                },
-            ),
-        };
-        result.map_err(|error| format!("failed to serialize charge event: {error}"))?;
-    }
-    Ok(())
-}
-
-fn materialize_json_each_row_refs(
-    ceiling: &'static RetainedByteCeiling,
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Result<ReservedPayload, String> {
-    validate_charge_batch_refs(batch)?;
-    let bound = charge_body_byte_bound_refs(batch, projection).ok_or_else(|| {
-        format!(
-            "{PLUGIN_NAME}: {}",
-            PayloadMaterializationError::BoundOverflowed.reason()
-        )
-    })?;
-    materialize_reserved_payload(ceiling, bound, |writer| {
-        write_json_each_row_refs(writer, batch, projection)
-    })
-    .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
-}
-
 async fn send_batch(
     cfg: &ClickHouseFlushConfig,
     batch: &[QueuedChargeEvent],
 ) -> Result<(), String> {
     let event_count = batch.len();
     let events: Vec<&ChargeEvent> = batch.iter().map(|queued| &queued.event).collect();
-    let body = materialize_charge_body_refs(cfg, &events).inspect_err(|error| {
+    let body = materialize_charge_body(cfg, &events).inspect_err(|error| {
         cfg.metrics
             .record_failure(FailureReason::Serialize, error.clone());
     })?;
@@ -5034,13 +4981,6 @@ async fn send_batch(
         }
         other => Err(other.safe_message().to_string()),
     }
-}
-
-fn materialize_charge_body_refs(
-    cfg: &ClickHouseFlushConfig,
-    batch: &[&ChargeEvent],
-) -> Result<ReservedPayload, String> {
-    materialize_json_each_row_refs(cfg.ceiling, batch, cfg.projection.as_deref())
 }
 
 async fn post_json_each_row(
@@ -9618,11 +9558,11 @@ fn spool_temp_is_stale(path: &Path, now: SystemTime, age_secs: u64) -> Result<bo
     Ok(elapsed >= Duration::from_secs(age_secs))
 }
 
-/// Parsed generation-owned atomic-write temp marker.
+/// Parsed generation-owned atomic-write temp marker. The generation segment
+/// must parse as a `u64` for the name to be recognized, but ownership is
+/// decided by the process tag alone, so the value is not retained.
 struct SpoolWriteTemp<'a> {
     process_tag: &'a str,
-    #[allow(dead_code)] // retained for diagnostics and future lease policy
-    generation: u64,
 }
 
 /// `<data-name>.write-<process_tag>-<generation>.tmp`
@@ -9641,20 +9581,16 @@ fn parse_spool_write_temp(name: &str) -> Option<SpoolWriteTemp<'_>> {
     let marker = name.strip_suffix(SPOOL_TMP_SUFFIX)?;
     let (_, attribution) = marker.rsplit_once(SPOOL_WRITE_MARKER)?;
     let (process_tag, generation) = attribution.rsplit_once('-')?;
-    if process_tag.is_empty() {
+    if process_tag.is_empty() || generation.parse::<u64>().is_err() {
         return None;
     }
-    Some(SpoolWriteTemp {
-        process_tag,
-        generation: generation.parse().ok()?,
-    })
+    Some(SpoolWriteTemp { process_tag })
 }
 
-/// Parsed in-flight replay claim marker.
+/// Parsed in-flight replay claim marker. The generation segment must parse as
+/// a `u64` for the name to be recognized; it is not retained.
 struct SpoolClaim<'a> {
     process_tag: &'a str,
-    #[allow(dead_code)] // retained for diagnostics and future lease policy
-    generation: u64,
     lease_deadline_unix: i64,
 }
 
@@ -9679,14 +9615,15 @@ fn parse_spool_claim(name: &str) -> Option<SpoolClaim<'_>> {
     let (_, attribution) = marker.rsplit_once(SPOOL_CLAIM_MARKER)?;
     let mut parts = attribution.split('-');
     let process_tag = parts.next()?;
-    let generation = parts.next()?.parse().ok()?;
+    if parts.next()?.parse::<u64>().is_err() {
+        return None;
+    }
     let lease_deadline_unix = parts.next()?.parse().ok()?;
     if process_tag.is_empty() || parts.next().is_some() {
         return None;
     }
     Some(SpoolClaim {
         process_tag,
-        generation,
         lease_deadline_unix,
     })
 }
@@ -12243,113 +12180,6 @@ fn open_spool_file_no_follow(path: &Path) -> Result<File, String> {
     })
 }
 
-/// One decoded spool artifact retained by the decode-only external test helper.
-///
-/// Production replay uses [`StreamingSpoolReader`] and never materializes this
-/// artifact-wide representation.
-struct ReservedSpoolArtifact {
-    text: String,
-    /// Charge on the decoded buffer. Reserved before the file is read, shrunk
-    /// to the buffer's real allocation, released on drop.
-    _text_reservation: ProcessByteReservation,
-}
-
-impl ReservedSpoolArtifact {
-    #[allow(dead_code)] // used by the external decode test helper
-    fn into_text(self) -> String {
-        self.text
-    }
-}
-
-/// Decode one spool artifact into a representation that is charged to `ceiling`
-/// for its whole life.
-///
-/// The decoded upper bound is reserved *before* the file is read, so a process
-/// already at its retained-byte ceiling refuses the artifact instead of
-/// materializing an unbounded owned copy of it.
-fn decode_spool_artifact(
-    path: &Path,
-    ceiling: &'static RetainedByteCeiling,
-) -> Result<ReservedSpoolArtifact, SpoolDecodeError> {
-    let file = File::open(path).map_err(|error| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: failed to open spool file '{}': {error}",
-            path.display()
-        ))
-    })?;
-    let encoded_len = file
-        .metadata()
-        .map_err(|error| {
-            SpoolDecodeError::Unreadable(format!(
-                "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
-                path.display()
-            ))
-        })?
-        .len();
-    if encoded_len > SPOOL_MAX_ARTIFACT_BYTES {
-        return Err(SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' exceeds the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
-            path.display()
-        )));
-    }
-    let compressed = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains(".ndjson.zst"));
-    // An uncompressed artifact decodes to exactly its on-disk size. Treat a
-    // zstd frame's declared content size only as a tighter bound: the header is
-    // unauthenticated, so it must never bypass the decompression-ratio limit.
-    let mut file = file;
-    let decoded_bound = if compressed {
-        let ratio_limit = spool_decompression_limit(encoded_len);
-        match read_zstd_frame_content_size(&mut file, path)? {
-            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared.min(ratio_limit),
-            Some(declared) => {
-                return Err(SpoolDecodeError::Unreadable(format!(
-                    "{PLUGIN_NAME}: spool file '{}' declares a {declared}-byte decoded size above the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
-                    path.display()
-                )));
-            }
-            None => ratio_limit,
-        }
-    } else {
-        encoded_len
-    };
-    let decoded_bound = usize::try_from(decoded_bound).map_err(|_| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' decoded bound exceeds this platform's addressable size",
-            path.display()
-        ))
-    })?;
-    let text_reservation = ceiling.try_acquire(decoded_bound).ok_or_else(|| {
-        SpoolDecodeError::CeilingExhausted(format!(
-            "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
-            path.display(),
-            PayloadMaterializationError::CeilingExhausted.reason()
-        ))
-    })?;
-
-    let decoded = if compressed {
-        decode_zstd_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
-    } else {
-        read_spool_bytes_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
-    };
-    let text = String::from_utf8(decoded).map_err(|error| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' is not valid UTF-8 JSONEachRow: {error}",
-            path.display()
-        ))
-    })?;
-    // Charge only what the buffer really holds; `from_utf8` reuses the `Vec`
-    // allocation, so `capacity` is the true retained size.
-    text_reservation.shrink_to(text.capacity());
-
-    Ok(ReservedSpoolArtifact {
-        text,
-        _text_reservation: text_reservation,
-    })
-}
-
 /// Bytes of a zstd frame prefix that always contain the complete frame header.
 ///
 /// A zstd frame header is at most 18 bytes (4-byte magic + 14-byte header).
@@ -12536,29 +12366,30 @@ fn read_spool_bytes_bounded(
     Ok(decoded)
 }
 
-fn decode_zstd_bounded(reader: impl Read, limit: usize, path: &Path) -> Result<Vec<u8>, String> {
-    let decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
-            path.display()
-        )
-    })?;
-    read_spool_bytes_bounded(decoder, limit, path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: spool file '{}' exceeded its decompression bound: {error}",
-            path.display()
-        )
-    })
-}
-
-/// Decode-only helper for external unit tests. The returned `String` outlives
-/// its ceiling reservation, which is exactly why production never uses this
-/// shape: [`decode_spool_artifact`] keeps the charge for the buffer's life.
+/// Decode-only helper for external unit tests.
+///
+/// Reads the artifact through the same bounded [`StreamingSpoolReader`] replay
+/// uses — identical size, ratio, row, UTF-8, and JSON-object checks — and
+/// returns the validated rows joined by `\n`. The returned `String` outlives
+/// every ceiling reservation, which is why production never uses this shape.
 #[allow(dead_code)]
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
-    decode_spool_artifact(path, process_ceiling())
-        .map(ReservedSpoolArtifact::into_text)
-        .map_err(SpoolDecodeError::into_message)
+    let mut reader = StreamingSpoolReader::open(path, process_ceiling())
+        .map_err(SpoolDecodeError::into_message)?;
+    let mut text = String::new();
+    while let Some(batch) = reader
+        .next_batch()
+        .map_err(SpoolDecodeError::into_message)?
+    {
+        let body = batch.body_range(0, batch.row_count())?;
+        let rows = std::str::from_utf8(&body)
+            .map_err(|_| format!("{PLUGIN_NAME}: decoded spool rows are not UTF-8"))?;
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(rows);
+    }
+    Ok(text)
 }
 
 #[doc(hidden)]
@@ -13399,7 +13230,32 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
     batch_size: usize,
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<(), String> {
-    let flush_config = ClickHouseFlushConfig {
+    let flush_config = replay_flush_config_for_tests(spool, insert_url, ceiling);
+    replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+}
+
+/// Replay one tick exactly as the production replayer schedules it: on the
+/// blocking pool, cancellable by dropping the returned future.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn replay_spool_tick_off_worker_for_tests(
+    spool: Arc<SpoolManager>,
+    insert_url: &str,
+) -> Result<(), String> {
+    let flush_config = Arc::new(replay_flush_config_for_tests(
+        &spool,
+        insert_url,
+        process_ceiling(),
+    ));
+    replay_spool_tick_off_worker(spool, flush_config, default_batch_size()).await
+}
+
+fn replay_flush_config_for_tests(
+    spool: &SpoolManager,
+    insert_url: &str,
+    ceiling: &'static RetainedByteCeiling,
+) -> ClickHouseFlushConfig {
+    ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(DedicatedPluginClient::fixed(reqwest::Client::new())),
         insert_url: insert_url.to_string(),
         redacted_insert_url: redacted_endpoint_url_str(insert_url),
@@ -13409,8 +13265,7 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
         metrics: Arc::clone(&spool.metrics),
         ceiling,
         projection: spool.projection.clone(),
-    };
-    replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+    }
 }
 
 /// Deterministic body-materialization probe for external unit tests.
@@ -13448,9 +13303,11 @@ pub fn probe_charge_body_materialization_with_projection_for_tests(
         ceiling,
         projection: projection.clone(),
     };
-    let bound = charge_body_byte_bound(batch, projection.as_deref())
+    // The same borrowed-event instantiation `send_batch` delivers through.
+    let events: Vec<&ChargeEvent> = batch.iter().collect();
+    let bound = charge_body_byte_bound(&events, projection.as_deref())
         .ok_or_else(|| format!("{PLUGIN_NAME}: bound overflowed"))?;
-    let body = materialize_charge_body(&cfg, batch)?;
+    let body = materialize_charge_body(&cfg, &events)?;
     let held = ceiling.used();
     drop(body);
     Ok((bound, held, ceiling.used()))
@@ -13860,11 +13717,16 @@ fn start_spool_replayer(
     commit_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let batch_size = batch_size.max(1);
+    let flush_config = Arc::new(flush_config);
     tokio::spawn(async move {
         if !wait_until_committed(commit_rx).await {
             return;
         }
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
+        // A tick that overran its interval (a large spool during a ClickHouse
+        // outage) waits a full interval before the next one instead of being
+        // followed by a burst of catch-up ticks.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             timer.tick().await;
             // Prepare and refresh owned-usage gauges off the Tokio worker so a
@@ -13895,10 +13757,60 @@ fn start_spool_replayer(
                     continue;
                 }
             }
-            if let Err(error) = replay_spool_once(&spool, &flush_config, batch_size).await {
+            if let Err(error) = replay_spool_tick_off_worker(
+                Arc::clone(&spool),
+                Arc::clone(&flush_config),
+                batch_size,
+            )
+            .await
+            {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
             }
         }
+    })
+}
+
+/// Run one [`replay_spool_once`] tick on Tokio's blocking pool.
+///
+/// A tick walks the spool tree, takes the cross-process namespace lock (before
+/// every delivery attempt, for claim renewal), decodes and validates whole
+/// artifacts before the first request, and fsyncs and renames dead-letter
+/// evidence — all synchronous file work that must not pin a runtime worker
+/// while unrelated tasks wait behind it (issue #7111). The tick is therefore
+/// driven by `Handle::block_on` on a blocking-pool thread; its ClickHouse POSTs
+/// stay asynchronous on the runtime's I/O and timer drivers.
+///
+/// Cancellation keeps its previous meaning. Dropping this future (a retiring
+/// generation aborts its replay task; runtime shutdown drops it) drops the
+/// cancellation sender, and the tick stops at its next await — the delivery
+/// POST — where dropping the replay future runs [`ReplayCancellationRelease`]
+/// and returns the in-flight claim to its durable replayable name.
+async fn replay_spool_tick_off_worker(
+    spool: Arc<SpoolManager>,
+    flush_config: Arc<ClickHouseFlushConfig>,
+    batch_size: usize,
+) -> Result<(), String> {
+    let handle = tokio::runtime::Handle::current();
+    let (cancel_tx, mut cancel_rx) = watch::channel(());
+    let tick = tokio::task::spawn_blocking(move || {
+        handle.block_on(async move {
+            tokio::select! {
+                biased;
+                // No value is ever sent: `changed` resolves only when the
+                // sender is dropped, i.e. when this tick was cancelled.
+                _ = cancel_rx.changed() => Err(format!(
+                    "{PLUGIN_NAME}: spool replay tick cancelled"
+                )),
+                result = replay_spool_once(&spool, &flush_config, batch_size) => result,
+            }
+        })
+    });
+    let outcome = tick.await;
+    drop(cancel_tx);
+    outcome.unwrap_or_else(|error| {
+        Err(format!(
+            "{PLUGIN_NAME}: spool replay worker did not complete: {error}"
+        ))
     })
 }
 
@@ -14782,7 +14694,11 @@ fn finalize_replayed_spool_file(
 /// The complete value is the typed accumulator key and is also copied into
 /// emitted `ChargeEvent`s. It must not be treated as first-writer-wins
 /// decoration on a coarser or delimiter-encoded identity.
-#[derive(Clone, Eq, Hash, PartialEq)]
+///
+/// `Hash` and map equality go through [`SnapshotKeyRef`], so the accumulator
+/// can look an identity up with a key borrowed from the request summary and
+/// build this owned key only when the identity is new (issue #7112).
+#[derive(Clone, Eq, PartialEq)]
 struct SnapshotMetadata {
     namespace: String,
     consumer_id: String,
@@ -14794,6 +14710,96 @@ struct SnapshotMetadata {
     http_status_code: Option<u16>,
     grpc_status: Option<u32>,
     protocol: String,
+}
+
+/// Borrowed form of a [`SnapshotMetadata`] identity: the same fields in the
+/// same order, borrowed from the request summary (already bounded).
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct SnapshotKeyRef<'a> {
+    namespace: &'a str,
+    consumer_id: &'a str,
+    consumer_name: Option<&'a str>,
+    proxy_id: &'a str,
+    proxy_name: &'a str,
+    route_id: Option<&'a str>,
+    status_code: u16,
+    http_status_code: Option<u16>,
+    grpc_status: Option<u32>,
+    protocol: &'a str,
+}
+
+impl SnapshotKeyRef<'_> {
+    fn to_metadata(self) -> SnapshotMetadata {
+        SnapshotMetadata {
+            namespace: self.namespace.to_owned(),
+            consumer_id: self.consumer_id.to_owned(),
+            consumer_name: self.consumer_name.map(str::to_owned),
+            proxy_id: self.proxy_id.to_owned(),
+            proxy_name: self.proxy_name.to_owned(),
+            route_id: self.route_id.map(str::to_owned),
+            status_code: self.status_code,
+            http_status_code: self.http_status_code,
+            grpc_status: self.grpc_status,
+            protocol: self.protocol.to_owned(),
+        }
+    }
+}
+
+/// The lookup view shared by owned and borrowed snapshot identities. The
+/// accumulator maps borrow their `SnapshotMetadata` keys as this trait object,
+/// and both forms hash and compare through [`SnapshotKeyView::key_ref`], so a
+/// borrowed probe finds exactly the entry the owned key was stored under.
+trait SnapshotKeyView {
+    fn key_ref(&self) -> SnapshotKeyRef<'_>;
+}
+
+impl SnapshotKeyView for SnapshotMetadata {
+    fn key_ref(&self) -> SnapshotKeyRef<'_> {
+        SnapshotKeyRef {
+            namespace: &self.namespace,
+            consumer_id: &self.consumer_id,
+            consumer_name: self.consumer_name.as_deref(),
+            proxy_id: &self.proxy_id,
+            proxy_name: &self.proxy_name,
+            route_id: self.route_id.as_deref(),
+            status_code: self.status_code,
+            http_status_code: self.http_status_code,
+            grpc_status: self.grpc_status,
+            protocol: &self.protocol,
+        }
+    }
+}
+
+impl SnapshotKeyView for SnapshotKeyRef<'_> {
+    fn key_ref(&self) -> SnapshotKeyRef<'_> {
+        *self
+    }
+}
+
+impl std::hash::Hash for SnapshotMetadata {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_ref().hash(state);
+    }
+}
+
+impl std::hash::Hash for dyn SnapshotKeyView + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_ref().hash(state);
+    }
+}
+
+impl PartialEq for dyn SnapshotKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_ref() == other.key_ref()
+    }
+}
+
+impl Eq for dyn SnapshotKeyView + '_ {}
+
+impl<'a> Borrow<dyn SnapshotKeyView + 'a> for SnapshotMetadata {
+    fn borrow(&self) -> &(dyn SnapshotKeyView + 'a) {
+        self
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
@@ -15182,21 +15188,34 @@ impl SnapshotAccumulator {
         outcome: HttpBillingOutcome,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
-        let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(proxy_name, MAX_FIELD_LEN),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: outcome.status_code,
-            http_status_code: Some(outcome.http_status_code),
-            grpc_status: snapshot_http_outcome(outcome).grpc_status,
-            protocol: infer_http_protocol(summary),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(
+            summary.proxy_id.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        let protocol = infer_http_protocol_cow(summary);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: &consumer_id,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: outcome.status_code,
+                http_status_code: Some(outcome.http_status_code),
+                grpc_status: snapshot_http_outcome(outcome).grpc_status,
+                protocol: &protocol,
+            },
+            charge,
+        )
     }
 
     fn record_stream(
@@ -15205,22 +15224,31 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(
-                summary.proxy_name.as_deref().unwrap_or("unknown"),
-                MAX_FIELD_LEN,
-            ),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: STREAM_STATUS_SENTINEL,
-            http_status_code: None,
-            grpc_status: None,
-            protocol: bound_key_field(&summary.protocol, MAX_FIELD_LEN),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(&summary.proxy_id, MAX_FIELD_LEN);
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        let protocol = bounded_key_field(&summary.protocol, MAX_FIELD_LEN);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: &consumer_id,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: STREAM_STATUS_SENTINEL,
+                http_status_code: None,
+                grpc_status: None,
+                protocol: &protocol,
+            },
+            charge,
+        )
     }
 
     fn record_websocket(
@@ -15229,38 +15257,47 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(
-                summary.proxy_name.as_deref().unwrap_or("unknown"),
-                MAX_FIELD_LEN,
-            ),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: STREAM_STATUS_SENTINEL,
-            http_status_code: None,
-            grpc_status: None,
-            protocol: "ws".to_string(),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(&summary.proxy_id, MAX_FIELD_LEN);
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: &consumer_id,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: STREAM_STATUS_SENTINEL,
+                http_status_code: None,
+                grpc_status: None,
+                protocol: "ws",
+            },
+            charge,
+        )
     }
 
-    fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) -> SnapshotRecordOutcome {
-        self.record_at(meta, charge, unix_timestamp_seconds())
+    fn record(&self, key: SnapshotKeyRef<'_>, charge: ChargeComputation) -> SnapshotRecordOutcome {
+        self.record_at(key, charge, unix_timestamp_seconds())
     }
 
     fn record_at(
         &self,
-        meta: SnapshotMetadata,
+        key: SnapshotKeyRef<'_>,
         charge: ChargeComputation,
         now: i64,
     ) -> SnapshotRecordOutcome {
         // Fast path: refresh an already-published identity in place with a
-        // borrowed lookup. No new admission is charged and no key copy is made
-        // for a same-key refresh; the owned key is cloned only on a miss.
-        if let Some(entry) = self.entries.get(&meta) {
+        // lookup borrowed from the request summary. No new admission is charged
+        // and no owned key is built for a same-key refresh; the owned
+        // `SnapshotMetadata` is materialized only on a miss.
+        if let Some(entry) = self.entries.get(&key as &dyn SnapshotKeyView) {
             entry.last_seen_at.store(now, Ordering::Relaxed);
             entry.revision.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = entry.totals.try_add(charge) {
@@ -15270,6 +15307,7 @@ impl SnapshotAccumulator {
             return SnapshotRecordOutcome::Accumulated;
         }
 
+        let meta = key.to_metadata();
         let entry_bytes = snapshot_metadata_retained_bytes(&meta);
         // Reserve the identity slot and its retained bytes against the hard
         // ceilings *before* publishing the key. Because the reservation is
@@ -15647,17 +15685,17 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) {
         let _ = self.record_at(
-            SnapshotMetadata {
-                namespace: namespace.to_string(),
-                consumer_id: consumer.to_string(),
+            SnapshotKeyRef {
+                namespace,
+                consumer_id: consumer,
                 consumer_name: None,
-                proxy_id: proxy_id.to_string(),
-                proxy_name: proxy_name.to_string(),
+                proxy_id,
+                proxy_name,
                 route_id: None,
                 status_code,
                 http_status_code: (protocol == "http").then_some(status_code),
                 grpc_status: None,
-                protocol: protocol.to_string(),
+                protocol,
             },
             charge,
             unix_timestamp_seconds(),
@@ -15681,17 +15719,17 @@ impl SnapshotAccumulator {
     ) -> bool {
         matches!(
             self.record_at(
-                SnapshotMetadata {
-                    namespace: namespace.to_string(),
-                    consumer_id: consumer.to_string(),
+                SnapshotKeyRef {
+                    namespace,
+                    consumer_id: consumer,
                     consumer_name: None,
-                    proxy_id: proxy_id.to_string(),
-                    proxy_name: proxy_name.to_string(),
+                    proxy_id,
+                    proxy_name,
                     route_id: None,
                     status_code,
                     http_status_code: (protocol == "http").then_some(status_code),
                     grpc_status: None,
-                    protocol: protocol.to_string(),
+                    protocol,
                 },
                 charge,
                 unix_timestamp_seconds(),
@@ -16346,26 +16384,37 @@ fn event_from_snapshot(
 }
 
 fn infer_http_protocol(summary: &TransactionSummary) -> String {
+    infer_http_protocol_cow(summary).into_owned()
+}
+
+fn infer_http_protocol_cow(summary: &TransactionSummary) -> std::borrow::Cow<'_, str> {
     if is_websocket_handshake(summary) {
-        return "ws".to_string();
+        return std::borrow::Cow::Borrowed("ws");
     }
     if let Some(protocol) = summary
         .metadata
         .get("request_protocol")
         .or_else(|| summary.metadata.get("mesh.request_protocol"))
     {
-        return bound_key_field(protocol, MAX_FIELD_LEN);
+        return bounded_key_field(protocol, MAX_FIELD_LEN);
     }
-    "http".to_string()
+    std::borrow::Cow::Borrowed("http")
 }
 
 fn metadata_value<MS: std::hash::BuildHasher>(
     metadata: &HashMap<String, String, MS>,
     keys: &[&str],
 ) -> Option<String> {
+    metadata_value_cow(metadata, keys).map(std::borrow::Cow::into_owned)
+}
+
+fn metadata_value_cow<'a, MS: std::hash::BuildHasher>(
+    metadata: &'a HashMap<String, String, MS>,
+    keys: &[&str],
+) -> Option<std::borrow::Cow<'a, str>> {
     keys.iter()
         .find_map(|key| metadata.get(*key))
-        .map(|value| bound_key_field(value, MAX_METADATA_FIELD_LEN))
+        .map(|value| bounded_key_field(value, MAX_METADATA_FIELD_LEN))
         .filter(|value| !value.is_empty())
 }
 
@@ -16379,6 +16428,18 @@ fn metadata_value<MS: std::hash::BuildHasher>(
 /// exhausted, the exact event is staged in the accumulator's bounded overflow
 /// instead; only when durable handoff *and* bounded staging both fail is a
 /// genuine cardinality loss recorded.
+/// Count a snapshot charge whose record hook ran after its generation closed
+/// snapshot admission. The generation's terminal delta has already been (or is
+/// being) finalized, so the charge is neither accumulated nor spooled; this
+/// fixed-cardinality counter is the only trace of it (issue #7112).
+fn record_late_snapshot_charge(lifecycle: &SnapshotLifecycle) {
+    lifecycle
+        .runtime
+        .metrics
+        .snapshot_late_charges_dropped_total
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEvent) {
     let runtime = &lifecycle.runtime;
     let metrics = &runtime.metrics;
@@ -16817,7 +16878,12 @@ fn bound_string(value: &str, max_len: usize) -> String {
 /// in practice this path is reached only by long operator-configured Consumer
 /// usernames, display names, or route identifiers.
 fn bound_key_field(value: &str, max_len: usize) -> String {
-    crate::plugins::chargeback::bounded_billing_identity(value, max_len).into_owned()
+    bounded_key_field(value, max_len).into_owned()
+}
+
+/// [`bound_key_field`] without the copy when the value is already in bounds.
+fn bounded_key_field(value: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
+    crate::plugins::chargeback::bounded_billing_identity(value, max_len)
 }
 
 /// Snapshot-mode view of an HTTP billing outcome: a non-standard gRPC status

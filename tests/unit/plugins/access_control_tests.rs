@@ -66,18 +66,20 @@ async fn test_access_control_plugin_creation() {
     assert!(!plugin.applies_after_proxy_on_reject());
 }
 
+/// IP rules belong to `ip_restriction`; `allowed_ips` / `blocked_ips` are
+/// ordinary unknown keys here (no dedicated removed-key diagnostic, issue
+/// #7113).
 #[tokio::test]
-async fn test_access_control_rejects_removed_ip_keys() {
-    let config = json!({
-        "allowed_ips": ["10.0.0.0/8"],
-        "blocked_ips": ["192.168.1.100"],
-        "allowed_consumers": ["testuser"]
-    });
-    let err = match AccessControl::new(&config) {
-        Ok(_) => panic!("removed IP keys should be rejected"),
-        Err(err) => err,
-    };
-    assert!(err.contains("ip_restriction"), "got: {err}");
+async fn test_access_control_rejects_ip_keys_as_unknown() {
+    for key in ["allowed_ips", "blocked_ips"] {
+        let mut config = json!({ "allowed_consumers": ["testuser"] });
+        config[key] = json!(["10.0.0.0/8"]);
+        let err = match AccessControl::new(&config) {
+            Ok(_) => panic!("{key} must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unknown config key"), "got: {err}");
+    }
 }
 
 #[tokio::test]

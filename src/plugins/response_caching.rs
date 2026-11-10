@@ -123,8 +123,6 @@ const BODYLESS_CACHEABLE_METHODS: [&str; 2] = ["GET", "HEAD"];
 pub const RESPONSE_CACHING_CONFIG_KEYS: &[&str] = &[
     "add_cache_status_header",
     "anonymous_caller_scope",
-    "cache_key_include_consumer",
-    "cache_key_include_query",
     "cacheable_methods",
     "cacheable_status_codes",
     "ignore_request_headers",
@@ -1010,8 +1008,6 @@ struct ResponseCachingConfig {
     /// either. Lowercased, sorted, and de-duplicated; see
     /// [`parse_ignored_request_headers`].
     ignore_request_headers: Vec<String>,
-    cache_key_include_query: bool,
-    cache_key_include_consumer: bool,
     add_cache_status_header: bool,
     invalidate_on_unsafe_methods: bool,
     anonymous_caller_scope: AnonymousCallerScope,
@@ -1049,10 +1045,6 @@ impl ResponseCachingConfig {
             respect_no_cache: optional_bool(config, "respect_no_cache")?.unwrap_or(true),
             vary_by_headers,
             ignore_request_headers,
-            cache_key_include_query: optional_bool(config, "cache_key_include_query")?
-                .unwrap_or(true),
-            cache_key_include_consumer: optional_bool(config, "cache_key_include_consumer")?
-                .unwrap_or(false),
             add_cache_status_header: optional_bool(config, "add_cache_status_header")?
                 .unwrap_or(true),
             invalidate_on_unsafe_methods: optional_bool(config, "invalidate_on_unsafe_methods")?
@@ -2208,16 +2200,8 @@ impl ResponseCaching {
         replay_partition::append_destination_partition(&mut hasher, ctx);
         append_request_construction_partition(&mut hasher, ctx);
 
-        // This legacy option no longer permits an origin-visible query to be
-        // omitted from a replay key. Keep the setting in the digest so changing
-        // it still rotates the keyspace, then bind the effective request target
-        // unconditionally below.
-        hasher.bool_value("include_query", self.config.cache_key_include_query);
-        // `cache_key_include_consumer` no longer decides whether callers are
-        // isolated — the caller partition below is unconditional. It is kept in
-        // the digest so flipping it still produces a disjoint keyspace rather
-        // than silently reusing entries minted under the other setting.
-        hasher.bool_value("include_consumer", self.config.cache_key_include_consumer);
+        // The effective request target and the caller partition below are
+        // bound unconditionally; no option omits either from the key.
         replay_partition::append_response_cache_request_partition(
             &mut hasher,
             ctx,
@@ -4106,9 +4090,8 @@ impl Plugin for ResponseCaching {
         // Unconditionally merge every credential/session header name
         // (`authorization`, `proxy-authorization`, `cookie`) into the keyed
         // Vary list. Presence remains a keyed bit, and present values remain
-        // hashed. Operators don't need to remember to set
-        // `cache_key_include_consumer: true` or list these in
-        // `vary_by_headers` — the safe default is to never share a cached
+        // hashed. Operators don't need to list these in `vary_by_headers` —
+        // the safe default is to never share a cached
         // response across distinct credentials or sessions. Keeping the names
         // on anonymous responses is also load-bearing: downstream shared caches
         // cannot observe Ferrum's private caller partition and must receive the
@@ -4583,7 +4566,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_principal_keyed_into_base_key_without_consumer_flag() {
-        // Default config (`cache_key_include_consumer: false`). An identity
+        // Default config. An identity
         // authenticated by a non-`Authorization` scheme must still be bound
         // into the cache key (SHA-256-hashed), so a `public` per-user response
         // is never shared across principals. (finding #1)
@@ -4616,7 +4599,7 @@ mod tests {
         );
 
         // A different principal on the same target must MISS: the caller
-        // partition is bound unconditionally, without `cache_key_include_consumer`.
+        // partition is bound unconditionally.
         let mut bob = make_ctx("GET", "/api/profile");
         bob.authenticated_identity = Some("bob@example.com".to_string());
         let mut bob_headers = bob.headers.clone();

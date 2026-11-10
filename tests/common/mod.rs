@@ -140,9 +140,8 @@ pub use gateway_harness::{
     wait_for_owned_gateway_identity,
 };
 pub use hmac_helpers::{
-    HmacV2Request, content_digest_sha256_header, empty_digest_header, generate_hmac_signature,
-    generate_hmac_signature_with_digest, generate_hmac_signature_with_query,
-    hmac_authority_from_url, hmac_v2_authorization_header, hmac_v2_nonce,
+    HmacV2Request, content_digest_sha256_header, empty_digest_header, hmac_authority_from_url,
+    hmac_v2_authorization, hmac_v2_authorization_header, hmac_v2_nonce,
 };
 pub use isolated_audit_fallback::isolated_audit_fallback_dir;
 pub use scheduled_scaling::{
