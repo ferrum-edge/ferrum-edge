@@ -597,6 +597,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **Kubernetes translator and status writers refuse or report what they used
+  to drop silently** (issues #7256, #7257, #7258, #7260, #7261).
+  - An HTTPRoute `RequestRedirect` whose `scheme` is not `http`/`https` or
+    whose `hostname` is not a precise hostname is now refused
+    (`Accepted=False`/`Invalid`). It used to reach `mesh_route_dispatch`,
+    whose constructor rejected it and failed the whole plugin-cache build
+    instead of this one route.
+  - An Istio DestinationRule `connectionPool.tcp.connectTimeout` that does
+    not parse, is `0s`, or exceeds 24 h, and a VirtualService `http[].timeout`
+    that does not parse, now refuse the resource (`FerrumAccepted=False`).
+    The connect timeout used to fall back to the default, and the route
+    timeout used to become disabled, while the resource reported Accepted.
+  - The controller no longer deletes operator plugin configs whose id starts
+    with `istio-vs-fi-` in managed namespaces; no translator emits that
+    prefix since fault injection moved onto `mesh_route_dispatch`.
+  - CRD reprobe passes no longer repeat the "CRD group not installed" warning
+    (and "CRD group detected" info) every 5 minutes; the startup warning now
+    says the group is re-probed and no restart is needed.
+  - After a rejected Istio resource is fixed, `status.ferrum.translation` no
+    longer keeps the stale `error` beside `FerrumAccepted=True` (and the
+    object is no longer re-patched on every reconcile). A policy's Ferrum
+    `status.ancestors` are never written partially when third-party entries
+    fill the 16-entry list. Listener `ResolvedRefs`/`Programmed` on a Gateway
+    that failed translation report `TranslationFailed` instead of
+    `UnsupportedProtocol`.
+- **CNI rejections use a plugin-specific error code** (issue #7263). A
+  node-agent rejection returned CNI error code `12`, inside the `0`–`99`
+  range the CNI spec reserves for its own well-known errors; it now returns
+  `100`.
+- **NodeWaypoint orig-dst bridge no longer spins on a dropped shutdown
+  sender** (issue #7264), and a failing SOCK_OPS dropped-events counter read
+  warns once instead of on every ringbuf wakeup.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
