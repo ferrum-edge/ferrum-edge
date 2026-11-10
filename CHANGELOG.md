@@ -606,6 +606,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its ref dropped with a misleading trust-domain warning, and a service whose
   refs were all of that kind was dropped from cross-cluster failover. Refs now
   match on the attached Service namespace, as service discovery does.
+- **Gateway API `sessionPersistence.absoluteTimeout` accepts compound
+  durations** (#7255). A Permanent-cookie session policy whose
+  `absoluteTimeout` used more than one GEP-2257 component (for example
+  `1h30m`), which the CRD admits, was rejected as "not a valid Gateway API
+  duration" and failed the whole HTTPRoute rule, `BackendLBPolicy` or
+  `XBackendTrafficPolicy`. It is now parsed with the same multi-component
+  parser as `timeouts` and `retry.backoff` (`1h30m` → `Max-Age=5400`).
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
