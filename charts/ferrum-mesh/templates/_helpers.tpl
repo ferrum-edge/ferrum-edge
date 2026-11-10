@@ -32,6 +32,27 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- end -}}
 {{- end -}}
 
+{{/*
+Container port of one ambient mesh listener, derived from the address the
+proxy actually binds: the ambient.env entry when set, else the binary default
+(src/modes/mesh/mod.rs DEFAULT_*_LISTEN_ADDR). Renders nothing for port 0 (the
+listener is disabled). The listen address is configured only through
+ambient.env, so the declared port can never disagree with the listener, and
+NodeWaypoint discovery (which reads FERRUM_MESH_HBONE_LISTEN_ADDR first, then
+the named `hbone` port) sees one value.
+Input: dict "env" <ambient.env> "name" <env var> "default" <default address>.
+*/}}
+{{- define "ferrum-mesh.ambientListenPort" -}}
+{{- $addr := trim (toString (index .env .name | default .default)) -}}
+{{- $port := regexFind "[0-9]+$" $addr -}}
+{{- if or (not (contains ":" $addr)) (eq $port "") (gt ($port | int) 65535) -}}
+{{- fail (printf "ambient.env.%s=%q must be a host:port socket address" .name $addr) -}}
+{{- end -}}
+{{- if ne ($port | int) 0 -}}
+{{- $port | int -}}
+{{- end -}}
+{{- end -}}
+
 {{/* The injector's capture mode comes from its own env, not Ambient's mode. */}}
 {{- define "ferrum-mesh.injectorSidecarImage" -}}
 {{- $env := .Values.injector.env | default dict -}}

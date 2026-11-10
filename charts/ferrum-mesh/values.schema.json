@@ -487,21 +487,6 @@
         "enabled": {
           "type": "boolean"
         },
-        "inboundPort": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-        },
-        "outboundPort": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-        },
-        "hbonePort": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-        },
         "captureMode": {
           "type": "string"
         },

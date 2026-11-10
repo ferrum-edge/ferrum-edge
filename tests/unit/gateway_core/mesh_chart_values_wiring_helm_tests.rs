@@ -126,3 +126,73 @@ fn chart_has_no_unused_namespace_value() {
         "values.schema.json must not admit a top-level namespace value"
     );
 }
+
+/// The ambient container ports must follow the listen addresses the proxy
+/// binds (issue #7297). The listeners are configured only through
+/// `ambient.env`, so separate port values would be decorative and could
+/// disagree with the real listeners (NodeWaypoint discovery reads
+/// `FERRUM_MESH_HBONE_LISTEN_ADDR`, then the named `hbone` port).
+#[test]
+fn ambient_container_ports_follow_the_listen_addresses() {
+    let values = read_chart("values.yaml");
+    let schema = read_chart("values.schema.json");
+    for key in ["inboundPort", "outboundPort", "hbonePort"] {
+        assert!(
+            !values.contains(&format!("  {key}:")),
+            "values.yaml must not declare ambient.{key}; the port comes from ambient.env"
+        );
+        assert!(
+            !schema.contains(&format!("\"{key}\"")),
+            "values.schema.json must not admit ambient.{key}"
+        );
+    }
+
+    let template = read_chart("templates/ambient-daemonset.yaml");
+    assert!(
+        !template.contains(".Values.ambient.outboundPort")
+            && !template.contains(".Values.ambient.inboundPort")
+            && !template.contains(".Values.ambient.hbonePort"),
+        "the ambient DaemonSet must not read the removed port values"
+    );
+    // Defaults must match the binary's DEFAULT_*_LISTEN_ADDR constants.
+    for listener in [
+        "(list \"outbound\" \"FERRUM_MESH_OUTBOUND_LISTEN_ADDR\" \"127.0.0.1:15001\")",
+        "(list \"inbound\" \"FERRUM_MESH_INBOUND_LISTEN_ADDR\" \"0.0.0.0:15006\")",
+        "(list \"hbone\" \"FERRUM_MESH_HBONE_LISTEN_ADDR\" \"0.0.0.0:15008\")",
+    ] {
+        assert!(
+            template.contains(listener),
+            "the ambient DaemonSet must derive a container port from {listener}"
+        );
+    }
+    assert!(
+        template.contains("include \"ferrum-mesh.ambientListenPort\""),
+        "container ports must come from the shared ambientListenPort helper"
+    );
+
+    let mesh_mode = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/modes/mesh/mod.rs"),
+    )
+    .expect("read src/modes/mesh/mod.rs");
+    for constant in [
+        "const DEFAULT_INBOUND_LISTEN_ADDR: &str = \"0.0.0.0:15006\";",
+        "const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = \"127.0.0.1:15001\";",
+        "const DEFAULT_HBONE_LISTEN_ADDR: &str = \"0.0.0.0:15008\";",
+    ] {
+        assert!(
+            mesh_mode.contains(constant),
+            "chart ambient listener defaults drifted from the binary: {constant}"
+        );
+    }
+
+    let helpers = read_chart("templates/_helpers.tpl");
+    let start = helpers
+        .find("{{- define \"ferrum-mesh.ambientListenPort\" -}}")
+        .expect("ferrum-mesh.ambientListenPort helper must exist");
+    let helper = &helpers[start..];
+    assert!(
+        helper.contains("index .env .name | default .default")
+            && helper.contains("{{- if ne ($port | int) 0 -}}"),
+        "an ambient.env address must win over the default, and port 0 must omit the port"
+    );
+}

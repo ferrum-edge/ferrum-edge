@@ -369,9 +369,12 @@ ambient:
   # joined node adopt the already-established placement instead of refusing it
   # forever. It is never rendered by the release that changes the placement.
   enabled: false
-  inboundPort: 15006
-  outboundPort: 15001
-  hbonePort: 15008
+  # The outbound/inbound/HBONE listen addresses are set only through
+  # ambient.env (FERRUM_MESH_OUTBOUND_LISTEN_ADDR, default 127.0.0.1:15001;
+  # FERRUM_MESH_INBOUND_LISTEN_ADDR, default 0.0.0.0:15006;
+  # FERRUM_MESH_HBONE_LISTEN_ADDR, default 0.0.0.0:15008). The container ports
+  # `outbound`, `inbound` and `hbone` are derived from those addresses (a port
+  # of 0 disables the listener and omits its container port).
   captureMode: iptables
   # Privileged one-shot preflight for the SETTLED host-netns UDP placement
   # (issue #3809). The installed placement ConfigMap is release desired state
