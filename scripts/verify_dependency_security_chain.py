@@ -24,7 +24,15 @@ SECURITY_FLOORS = {
     "aws-smithy-json": (0, 62, 7),
     "xxhash-rust": (0, 8, 16),
 }
-PATH_PATCHED = ("hyper", "reqwest", "h2", "hyper-util")
+PATH_PATCHED = ("hyper", "reqwest", "h2", "hyper-util", "sqlx-core", "h3", "h3-quinn")
+# Vendored crates deliberately left out of PATH_PATCHED because a second,
+# registry copy is expected and does not reach the patched code paths:
+# - tungstenite / tokio-tungstenite: kube-client's `ws` feature resolves the
+#   0.30 line from the registry; Ferrum's own WebSocket code depends on the
+#   vendored 0.29 copy directly.
+# - dimpl: the `strict_dimpl` dev-dependency alias pins registry `=0.8.0` as an
+#   independent DTLS test peer (issue #7000); the gateway uses the vendored 0.6
+#   copy.
 # The direct `aws-smithy-json` requirement in Cargo.toml exists only to hold the
 # AWS SDK on the fixed parser. If the SDK resolves a second copy on another 0.x
 # line, that requirement no longer constrains the SDK.

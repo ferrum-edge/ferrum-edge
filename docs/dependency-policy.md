@@ -64,11 +64,17 @@ every committed `Cargo.lock` against these floors with
 
 The same script also checks every committed lockfile that builds `ferrum-edge`
 (today the root, `fuzz/`, and `tests/performance/mesh/` lockfiles). Each must
-resolve `hyper`, `reqwest`, `h2`, and `hyper-util` to exactly one copy: the
-`[patch.crates-io]` path crate under `vendor/`, at the version its directory
-names, with no `source` or `checksum`. A second, registry copy would ship that
-crate without Ferrum's patches. The expected versions come from the `vendor/`
-directories, so moving a vendored crate needs no change to the checker.
+resolve `hyper`, `reqwest`, `h2`, `hyper-util`, `sqlx-core`, `h3`, and
+`h3-quinn` to exactly one copy: the `[patch.crates-io]` path crate under
+`vendor/`, at the version its directory names, with no `source` or `checksum`.
+A second, registry copy would ship that crate without Ferrum's patches. The
+expected versions come from the `vendor/` directories, so moving a vendored
+crate needs no change to the checker. Three vendored crates are deliberately
+not single-copy: `tungstenite` / `tokio-tungstenite` (kube-client's `ws`
+feature resolves the 0.30 line from the registry, while Ferrum's own WebSocket
+code depends on the vendored 0.29 copy) and `dimpl` (the `strict_dimpl`
+dev-dependency alias pins registry `=0.8.0` as an independent DTLS test peer,
+issue #7000).
 
 Every committed lockfile must also resolve `aws-smithy-json` to a single copy.
 The direct `aws-smithy-json` requirement only constrains the AWS SDK while it
