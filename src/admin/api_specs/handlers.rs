@@ -1256,12 +1256,16 @@ fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
 /// After ID assignment, re-links: `proxy.upstream_id = upstream.id` (if
 /// present); `plugin.proxy_id = proxy.id`; rebuilds `proxy.plugins`
 /// association list to reference the final plugin IDs.
-async fn assign_ids_for_put(
+///
+/// `existing_proxy` and `existing_spec_plugins` are the stored proxy row and
+/// spec-owned plugins the PUT handler already loaded for the replacement
+/// bundle; they are passed in so one PUT reads each only once (issue #7209).
+fn assign_ids_for_put(
     bundle: &mut ExtractedBundle,
-    db: &Arc<dyn DatabaseBackend>,
-    namespace: &str,
     existing_spec: &ApiSpec,
     existing_spec_upstream: Option<&Upstream>,
+    existing_proxy: Option<&crate::config::types::Proxy>,
+    existing_spec_plugins: &[crate::config::types::PluginConfig],
     spec_version: &str,
 ) -> Result<(), ApiSpecError> {
     // If proxy.id is empty (operator did not supply one), fill it in from
@@ -1271,16 +1275,6 @@ async fn assign_ids_for_put(
     if bundle.proxy.id.is_empty() {
         bundle.proxy.id = existing_spec.proxy_id.clone();
     }
-
-    // Load the existing proxy to get upstream_id and created_at.
-    let existing_proxy = match db
-        .get_proxy_for_write(namespace, &existing_spec.proxy_id)
-        .await
-    {
-        Ok(Some(p)) => Some(p),
-        Ok(None) => None,
-        Err(e) => return Err(classify_db_error(e)),
-    };
 
     // Upstream ID: reuse the existing spec-owned upstream if empty. Do not use
     // the current proxy.upstream_id here; direct admin CRUD can drift that
@@ -1295,15 +1289,10 @@ async fn assign_ids_for_put(
         u.id = reuse_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     }
 
-    // Load existing spec-owned plugins for canonical-tuple matching (Fix 5).
-    let mut existing_plugins = match db
-        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return Err(classify_db_error(e)),
-    };
-    if let Some(existing_proxy) = existing_proxy.as_ref() {
+    // Existing spec-owned plugins for canonical-tuple matching (Fix 5).
+    let mut existing_plugins: Vec<&crate::config::types::PluginConfig> =
+        existing_spec_plugins.iter().collect();
+    if let Some(existing_proxy) = existing_proxy {
         let assoc_order: std::collections::HashMap<String, usize> = existing_proxy
             .plugins
             .iter()
@@ -1327,7 +1316,7 @@ async fn assign_ids_for_put(
         (String, String, Option<u16>),
         std::collections::VecDeque<&crate::config::types::PluginConfig>,
     > = std::collections::HashMap::new();
-    for ep in &existing_plugins {
+    for ep in existing_plugins.iter().copied() {
         let key = plugin_canonical_key(ep)?;
         canonical_to_existing.entry(key).or_default().push_back(ep);
     }
@@ -1422,7 +1411,7 @@ async fn assign_ids_for_put(
 
     // Proxy: preserve stored created_at, refresh updated_at.
     bundle.proxy.updated_at = now;
-    bundle.proxy.created_at = existing_proxy.as_ref().map(|p| p.created_at).unwrap_or(now);
+    bundle.proxy.created_at = existing_proxy.map(|p| p.created_at).unwrap_or(now);
 
     // Upstream: preserve existing created_at if the same ID is being reused.
     if let Some(ref mut u) = bundle.upstream {
@@ -1441,7 +1430,7 @@ async fn assign_ids_for_put(
     let existing_plugin_map: std::collections::HashMap<&str, &crate::config::types::PluginConfig> =
         existing_plugins
             .iter()
-            .map(|ep| (ep.id.as_str(), ep))
+            .map(|ep| (ep.id.as_str(), *ep))
             .collect();
     for pc in &mut bundle.plugins {
         pc.updated_at = now;
@@ -3054,19 +3043,33 @@ pub async fn handle_put_api_spec(
         Err(error) => return Ok(error_response(classify_db_error(error))),
     };
 
+    // Fetch the existing proxy row once so we can:
+    //   1. Reuse stored IDs/created_at in `assign_ids_for_put`.
+    //   2. Exclude the spec's own upstream from the name-uniqueness check
+    //      (PUT with unchanged name must not self-collide).
+    //   3. Detect listen_port / transport changes for the port-probe
+    //      skip-on-unchanged logic (Fix 2).
+    // Use the *stored* upstream_id — NOT the bundle's post-assignment
+    // upstream.id, which can be operator-changed.
+    let existing_proxy_row: Option<crate::config::types::Proxy> = match db
+        .get_proxy_for_write(namespace, &existing_spec.proxy_id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Ok(error_response(classify_db_error(e))),
+    };
+
     // Assign IDs for PUT: reuse existing stored IDs for empty-id resources so
     // re-submitting the same ID-less spec is idempotent (Fix 1). This must
     // happen BEFORE the proxy-id immutability check and hash comparison.
     if let Err(e) = assign_ids_for_put(
         &mut bundle,
-        db,
-        namespace,
         &existing_spec,
         existing_spec_upstream.as_ref(),
+        existing_proxy_row.as_ref(),
+        &existing_spec_plugins,
         &metadata.version,
-    )
-    .await
-    {
+    ) {
         return Ok(error_response(e));
     }
 
@@ -3086,20 +3089,6 @@ pub async fn handle_put_api_spec(
         }));
     }
 
-    // Fetch the existing proxy row once so we can:
-    //   1. Exclude the spec's own upstream from the name-uniqueness check
-    //      (PUT with unchanged name must not self-collide).
-    //   2. Detect listen_port / transport changes for the port-probe
-    //      skip-on-unchanged logic (Fix 2).
-    // Use the *stored* upstream_id — NOT the bundle's post-assignment
-    // upstream.id, which can be operator-changed.
-    let existing_proxy_row: Option<crate::config::types::Proxy> = match db
-        .get_proxy_for_write(namespace, &existing_spec.proxy_id)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => return Ok(error_response(classify_db_error(e))),
-    };
     let previous_bundle = match existing_proxy_row.as_ref() {
         Some(proxy) => ExtractedBundle {
             proxy: proxy.clone(),
