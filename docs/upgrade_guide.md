@@ -28,6 +28,38 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Plugin config: deprecated options and alias spellings removed (#7114)
+
+Each of these was a compatibility shape with no producer that needs it. Each
+is now an unknown key or value and fails config load like any other; edit the
+config before upgrading:
+
+- **`hmac_auth` `signing_profile: ferrum-hmac-v1`** and
+  **`allow_unsafe_replayable_v1`** are gone. Every client must sign
+  `ferrum-hmac-v2` (with a fresh `nonce` per request) or `rfc9421`, and every
+  `hmac_auth` config needs `replay_scope` (`process`, or `shared` with
+  `sync_mode: redis`). `/metrics/runtime` no longer reports
+  `replay_authority.legacy_unsafe_profile_accepted`.
+- **`workload_metrics`**: use `span_reporting_disabled` (not
+  `disable_span_reporting` / `disableSpanReporting`) and, for a Lightstep
+  provider, `access_token_env` (not `accessTokenEnv`). Istio `Telemetry` and
+  `meshConfig` translation is unchanged.
+- **`jwks_auth`**: a provider's singular `audience` is gone; list the value in
+  `audiences`.
+- **`mcp_gateway`**: `discovery.on_new_tool` / `on_schema_change` accept only
+  `allow` or `hide_until_configured` (not `allow_immediately` / `expose`), and
+  `sessions.initialize_upstreams` / `servers.<id>.initialize_strategy` accept
+  only `lazy` or `passthrough` (not `startup`, which behaved as `lazy`).
+- **`ai_semantic_firewall`**: remove `privacy.log_raw_text`.
+- **`response_caching`**: remove `cache_key_include_query` and
+  `cache_key_include_consumer`. The query and the caller partition are always
+  part of the key, as before; the in-memory keyspace is rebuilt on the reload.
+- **`soap_ws_security`**: a SAML assertion is identified by its SAML 2.0 `ID`
+  attribute only; an assertion carrying only the SAML 1.x `AssertionID` is
+  refused.
+- **`openapi_validator`**: `error_truncate_chars` now defaults to `256`, the
+  value that was always enforced; no action is needed.
+
 ### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
