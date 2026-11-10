@@ -124,7 +124,6 @@ Contributing to Ferrum Edge itself.
 | [functional_testing_database.md](functional_testing_database.md) | Database-mode functional tests |
 | [functional_testing_file_mode.md](functional_testing_file_mode.md) | File-mode functional tests |
 | [functional_testing_load_stress.md](functional_testing_load_stress.md) | Load and stress testing |
-| [functional_testing_port_handoffs.md](functional_testing_port_handoffs.md) | Test port-handoff audit (issue #5579) |
 | [protocol_perf_regression.md](protocol_perf_regression.md) | Protocol performance regression gate |
 | [scaling_reload_diagnostics.md](scaling_reload_diagnostics.md) | 30,000-proxy scale harness publication and slow-query diagnostics |
 | [route_status_profile.md](route_status_profile.md) | Isolated route-status measurements in the Resources Scale Benchmark workflow |
@@ -135,7 +134,6 @@ Contributing to Ferrum Edge itself.
 | [mesh_runtime_benchmark.md](mesh_runtime_benchmark.md) | Mesh data-plane head-to-head benchmark methodology |
 | [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md) | Rust CodeQL extraction diagnostic |
 | [unit_compile_diagnostics.md](unit_compile_diagnostics.md) | Retained CI unit-test compilation diagnostics |
-| [ghcr_cache_migration.md](ghcr_cache_migration.md) | Moving the BuildKit cache to GHCR |
 | [native_cache_envelope.md](native_cache_envelope.md) | Native compiler-cache container-envelope proof |
 | [native_compiler_store_transfer.md](native_compiler_store_transfer.md) | Native compiler-store transfer proof |
 | [release_profile_study.md](release_profile_study.md) | Release build profile (LTO / codegen units) study |
@@ -177,7 +175,7 @@ Immutable publication and recovery records for individual releases.
 | [releases/v0.9.16-arm64-recovery.md](releases/v0.9.16-arm64-recovery.md) | ARM64 recovery after the v0.9.16 production failure |
 | [releases/v0.9.18-candidate.md](releases/v0.9.18-candidate.md) | v0.9.18 candidate provenance |
 | [releases/v0.9.18-arm64-recovery.md](releases/v0.9.18-arm64-recovery.md) | ARM64 OOM recovery after the unpublished v0.9.18 tag |
-| [releases/v0.9.19-candidate.md](releases/v0.9.19-candidate.md) | v0.9.19 publication record |
+| [releases/v0.9.19-publication.md](releases/v0.9.19-publication.md) | v0.9.19 publication record |
 | [releases/v0.9.20-publication.md](releases/v0.9.20-publication.md) | v0.9.20 publication record |
 
 ## Reference data

@@ -432,8 +432,6 @@ Keep `reserve_refused_tcp_port` bound for unavailable-backend fixtures. A future
 subprocess listener that must refuse connections before it starts instead uses
 `reserve_future_tcp_port`, which retains that behavior outside the source range.
 For native fixture backends, pass `into_listener` / `into_socket` directly.
-The [issue #5579 call-site audit](functional_testing_port_handoffs.md) records
-which handoffs need a rebind and which can retain their socket.
 
 `tests/common/gateway_harness.rs` uses these leases for gateway handoffs and
 keeps its bounded startup retries for unrelated OS users that do not participate

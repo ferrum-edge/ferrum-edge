@@ -22,7 +22,7 @@ keeps the default single-namespace behavior.
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_CP_NAMESPACES` | unset | Scope. Empty/unset = back-compat single namespace (`FERRUM_NAMESPACE`). `*` = cluster-wide CP (discovers namespaces dynamically). CSV (`prod,staging`) = explicit set. |
+| `FERRUM_CP_NAMESPACES` | unset | Scope. Empty/unset = default single namespace (`FERRUM_NAMESPACE`). `*` = cluster-wide CP (discovers namespaces dynamically). CSV (`prod,staging`) = explicit set. |
 | `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every CP/DP configuration JWT must carry an `ns` claim. This remains optional only for `Single` scope; `Set` and `All` scopes require `ns` claims automatically even when this flag is `false`. |
 | `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` | unset | **CP side.** Path to the namespace-bound verification credentials described in [Trust binding](#trust-binding-ghsa-3f2j-wwqw-grmg). **Required for `Set` and `All` scopes** — a multi-namespace CP refuses to start with only `FERRUM_CP_DP_GRPC_JWT_SECRET`. |
 | `FERRUM_CP_DP_GRPC_JWT_KEY_ID` | unset | **DP / mesh / xDS client side.** JWS `kid` stamped on self-minted tokens, selecting which trust-bundle credential verifies them. |
@@ -63,7 +63,7 @@ is printed in the CP startup log (`CP mode: serving single namespace ...`,
 
 `FERRUM_CP_NAMESPACES` parses to one of three internal shapes:
 
-- **`Single(ns)`** — back-compat default. CP loads `FERRUM_NAMESPACE` from
+- **`Single(ns)`** — the default. CP loads `FERRUM_NAMESPACE` from
   the database and serves only that namespace. DPs in other namespaces are
   rejected at subscribe time with `FAILED_PRECONDITION` and an error
   message naming both namespaces.
@@ -584,12 +584,12 @@ polled. `FERRUM_CP_DP_GRPC_JWT_KEY_ID` rides on every per-remote credential, so
 a peer control plane running a trust bundle can select the credential it bound
 to this cluster.
 
-### Rotate after upgrading
+### Rotate the shared secret
 
-Every data plane deployed before this change possesses fleet-wide signing
-authority. Rotate `FERRUM_CP_DP_GRPC_JWT_SECRET` (or retire it) as part of the
-rollout; upgrading the control plane alone does not revoke keys already
-distributed.
+Every data plane that holds the fleet-wide `FERRUM_CP_DP_GRPC_JWT_SECRET`
+possesses signing authority for every namespace. Rotate (or retire) that secret
+as part of moving to a trust bundle; changing control-plane scope alone does
+not revoke keys already distributed.
 
 ## Migration steps
 
@@ -597,8 +597,8 @@ distributed.
    `kubectl get ns -l ferrum-tenant=true -o name | sed 's|namespace/||'`
    is a typical pattern.
 
-2. **Roll CPs first**: deploy the new binary with the existing
-   `FERRUM_NAMESPACE` and `FERRUM_CP_NAMESPACES` unset. The CP still serves
+2. **Start single-namespace**: run the CPs with the existing
+   `FERRUM_NAMESPACE` and `FERRUM_CP_NAMESPACES` unset. Each CP serves
    a single namespace; verify with your existing single-namespace smoke tests.
 
 3. **Build the trust bundle**: create one verification credential per tenant
@@ -621,7 +621,7 @@ distributed.
    matching namespace can now subscribe; unbound credentials, missing `kid`s,
    and wrong claims fail before snapshot serialisation.
 
-6. **Rotate the old secret**: every DP deployed before this change holds
+6. **Rotate the old secret**: every DP that held the shared secret has
    fleet-wide signing authority. Rotate or retire
    `FERRUM_CP_DP_GRPC_JWT_SECRET` once the trust bundle is serving.
 
@@ -657,18 +657,7 @@ before any tenant B configuration, mesh slice, trust material, or xDS resource
 is serialized. A shared-CA client certificate does not change this: it is
 authentication, not namespace authorization.
 
-Pre-fix validation was run at commit
-`1252246777bdaa8fcbe6b401ffdc9020d7f71e11`. A temporary SQLite CP database
-was seeded with tenant-tagged proxies, consumers, and plugin markers for
-`tenant-a` and `tenant-b`; CP startup was exercised with
-`FERRUM_CP_NAMESPACES=tenant-a,tenant-b` and `FERRUM_CP_NAMESPACES=*` while
-`FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` was unset. Existing integration tests
-confirmed that `Set` and `All` scopes accepted a shared no-claim JWT and
-returned whichever namespace was requested. Source review also found that
-native `MeshConfigSync`, xDS ADS, K8s controller broadcasts, and gateway
-trust bundles were not consistently namespace-authorised.
-
-Post-fix CI gates this with `tests/integration/cp_multi_namespace_tests.rs`:
+CI gates this with `tests/integration/cp_multi_namespace_tests.rs`:
 missing, malformed, wrong, and ambiguous claims fail before the first
 snapshot; tenant A mesh wire JSON contains only tenant A services; and
 multi-tenant *unpartitioned* trust bundle side channels serialise as `null`.

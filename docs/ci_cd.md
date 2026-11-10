@@ -378,9 +378,9 @@ includes registry transfer; BuildKit logs establish actual layer reuse.
 Telemetry reports unknown registry hit/bytes, without inventing an Actions
 restore hit or measured size. Existing default-image Actions archives expire
 under LRU, with no further writes from this workflow. No cache limit, package
-visibility or spending setting is changed. The namespace is already public;
-activation still requires a successful trusted-main export followed by an
-anonymous reader with observed BuildKit reuse.
+visibility or spending setting is changed. The cache package is public, and
+both the `default-v1-linux-amd64-runtime` and
+`ambient-v1-linux-amd64-runtime-ebpf` manifests are fetchable anonymously.
 
 The Dockerfile declares `ARG FEATURES` after the shared apt and manifest layers
 so those two feature sets reuse toolchain work. A trusted-base copy of
@@ -4201,12 +4201,11 @@ Each of the three targets has its own `ambient-v1-linux-amd64-` cache tag so a
 later target does not overwrite another target's cache graph. GHCR container
 storage and bandwidth are currently free under GitHub's published policy.
 
-The dedicated cache package must be public for anonymous fork imports. Verify
-actual anonymous import after the first trusted-main export; new packages do
-not become public merely because their source repository is public. A missing
-cache still builds cold, while a failed registry export fails the writer. See
-[the migration runbook](ghcr_cache_migration.md) for activation, measurement,
-retention and the separate NodeWaypoint/manual-benchmark follow-ups.
+The dedicated cache package is public, which anonymous fork imports require; a
+new package does not become public merely because its source repository is
+public, so keep its visibility unchanged. A missing cache still builds cold,
+while a failed registry export fails the writer. Do not change shipping package
+visibility, and do not delete shipping packages when retiring cache references.
 
 ### NodeWaypoint eBPF registry cache reuse
 
