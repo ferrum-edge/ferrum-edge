@@ -643,6 +643,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and an unknown value fails the row like any other decode error, keeping the
   last good config. A `proxy_id` or `enabled` value that cannot be decoded
   also fails the row instead of detaching or enabling the plugin.
+- **A refused plugin-cache reload no longer promotes its named log schemas**
+  (#7198). Full and incremental plugin-cache builds promoted the
+  process-global `transaction_log_schema` registry before their last fallible
+  steps (proxy lifecycle generations, the mesh BPF metrics exporter on full
+  builds, and the `api_chargeback` overflow reservations). A reload refused at
+  one of those steps, for example by the chargeback `max_retained_bytes`
+  budget, left the registry on the rejected definitions while the published
+  cache stayed on the old ones, so later incremental builds constructed
+  loggers against schemas that were never accepted. The registry is now
+  promoted only after every step succeeds.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
