@@ -12,7 +12,8 @@ use ferrum_edge::capture::CaptureMode;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::modes::mesh::config::{MeshConfig, OutboundTrafficPolicy};
 use ferrum_edge::modes::mesh::{
-    MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
+    MeshConfigProtocol, MeshListenerKind, MeshRuntimeConfig, MeshTopology,
+    prepare_gateway_config_for_mesh,
 };
 
 use crate::conformance::registry::{Maturity, Status};
@@ -168,23 +169,38 @@ fn topology_egress_gateway() {
     assert_topology_apply_succeeds(MeshTopology::EgressGateway);
 }
 
-/// `MeshTopology::terminates_hbone` invariant: HBONE-terminating topologies
-/// (Ambient, NodeWaypoint, ServiceWaypoint) share the waypoint listener.
+/// HBONE termination invariant, read from the runtime listener plan that
+/// listener spawning actually uses: Ambient, NodeWaypoint and ServiceWaypoint
+/// bind an HBONE termination listener; Sidecar, EastWestGateway and
+/// EgressGateway never do.
 #[test]
-fn topology_terminates_hbone_invariant() {
+fn topology_hbone_termination_listener_invariant() {
     register_feature!(
         category = CATEGORY,
-        feature = "terminates_hbone classification",
+        feature = "HBONE termination listener",
         status = Status::Supported,
-        notes =
-            "Ambient/NodeWaypoint/ServiceWaypoint terminate HBONE; Sidecar/EastWest/Egress do not.",
+        notes = "Ambient/NodeWaypoint/ServiceWaypoint listener plans bind an HBONE termination \
+                 listener; Sidecar/EastWest/Egress plans do not.",
     );
-    assert!(MeshTopology::Ambient.terminates_hbone());
-    assert!(MeshTopology::NodeWaypoint.terminates_hbone());
-    assert!(MeshTopology::ServiceWaypoint.terminates_hbone());
-    assert!(!MeshTopology::Sidecar.terminates_hbone());
-    assert!(!MeshTopology::EastWestGateway.terminates_hbone());
-    assert!(!MeshTopology::EgressGateway.terminates_hbone());
+    for (topology, terminates_hbone) in [
+        (MeshTopology::Ambient, true),
+        (MeshTopology::NodeWaypoint, true),
+        (MeshTopology::ServiceWaypoint, true),
+        (MeshTopology::Sidecar, false),
+        (MeshTopology::EastWestGateway, false),
+        (MeshTopology::EgressGateway, false),
+    ] {
+        let hbone_listeners = runtime_for(topology)
+            .listener_plan()
+            .into_iter()
+            .filter(|listener| listener.kind == MeshListenerKind::HboneTermination)
+            .count();
+        assert_eq!(
+            hbone_listeners,
+            usize::from(terminates_hbone),
+            "{topology:?} HBONE termination listeners"
+        );
+    }
 }
 
 /// Out-of-scope conformance entry: Wasm and EnvoyFilter are NOT going to be
