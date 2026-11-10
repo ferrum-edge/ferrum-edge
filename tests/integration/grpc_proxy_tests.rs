@@ -4790,7 +4790,7 @@ async fn grpc_retry_does_not_dial_path_changing_target() {
 /// the first frame arrives after the backend sends its first chunk.
 ///
 /// The observed frame *count* is deliberately not asserted: the response
-/// rides `coalescing_h2_body`, so frame boundaries are producer-timing
+/// rides `coalescing_h2_body_strip_hop_by_hop_trailers`, so frame boundaries are producer-timing
 /// dependent. Byte totals, the trailer, and arrival timing are the
 /// invariants (issue #4489).
 #[tokio::test(flavor = "multi_thread")]
@@ -4887,7 +4887,7 @@ async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
     assert!(saw_trailer, "client did not observe a trailers frame");
 
     // Do NOT assert on the number of DATA frames observed: the gRPC
-    // response path deliberately runs through `coalescing_h2_body`
+    // response path deliberately runs through `coalescing_h2_body_strip_hop_by_hop_trailers`
     // (128 KiB target), so how many frames reach the client is a function
     // of producer timing and buffer occupancy, not a gateway contract.
     // Coalescing is byte-preserving, so assert on total body length

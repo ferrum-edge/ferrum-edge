@@ -1302,7 +1302,7 @@ async fn body_dropped_before_polling_fires_client_disconnect() {
 /// ever polling it — hyper sees from the response metadata that there's
 /// nothing to stream. Before the fix, the `Drop` safety net checked
 /// `is_end_stream()` on the inner body, which for streaming wrappers
-/// (`DirectH3Body`, partially-polled `CoalescingH3Body`) returns `false`
+/// (`DirectH3Body`, partially-polled H3 `Coalescing<S>`) returns `false`
 /// even for successful zero-length streams. That misclassified every
 /// HEAD / 204 streaming response as `client_disconnected=true`.
 ///
@@ -1324,7 +1324,7 @@ async fn unpolled_empty_streaming_body_is_not_client_disconnect() {
     // exercises is the STRUCTURAL path — when `kind` is `Stream` and the
     // body is dropped unpolled, the Drop impl MUST treat it as success
     // regardless of `is_end_stream()`, because streaming wrappers like
-    // `DirectH3Body` and partially-polled `CoalescingH3Body` return
+    // `DirectH3Body` and partially-polled H3 `Coalescing<S>` return
     // `false` from `is_end_stream()` even for successful zero-length
     // streams. The pre-fix Drop consulted `is_end_stream()` on the inner
     // body and flipped H3 wrappers into `client_disconnect`. The post-fix
