@@ -17,6 +17,7 @@ use crate::modes::mesh::config::{
     PrincipalMatch, RequestMatch, SourceNegationMatch, canonical_mesh_condition_sni_value,
     classify_mesh_condition_key, normalize_mesh_policy_header_map,
 };
+#[cfg(test)]
 use crate::modes::mesh::slice::MeshSlice;
 
 /// Protocol family of the evaluation context.
@@ -172,7 +173,10 @@ pub struct MeshAuthzEvaluation {
 /// this reaches deny metadata, which is attacker-triggerable.
 pub const MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT: &str = "custom:provider-conflict";
 
-pub fn evaluate_mesh_authorization(
+/// Test convenience: evaluate a whole slice's policies. Production always
+/// goes through [`evaluate_mesh_authorization_policies`] with a scoped list.
+#[cfg(test)]
+pub(crate) fn evaluate_mesh_authorization(
     slice: &MeshSlice,
     request: &MeshAuthzRequest,
 ) -> MeshAuthzDecision {
@@ -181,9 +185,9 @@ pub fn evaluate_mesh_authorization(
 
 /// Evaluate Layer 5 mesh authorization against an arbitrary policy iterator.
 ///
-/// Mirrors [`evaluate_mesh_authorization`] but accepts any borrowing iterator
-/// of `&MeshPolicy`. Lets node-waypoint topology apply a per-request scope
-/// filter without cloning the full [`MeshSlice`] — the slice carries dozens
+/// Accepts any borrowing iterator of `&MeshPolicy`, not a whole mesh slice.
+/// Lets node-waypoint topology apply a per-request scope filter without
+/// cloning the full [`crate::modes::mesh::slice::MeshSlice`] — the slice carries dozens
 /// of unrelated Vec fields (workloads, services, destination_rules, etc.)
 /// that the authz engine never reads, so cloning the slice just to swap
 /// `mesh_policies` would be a major regression on the request hot path.

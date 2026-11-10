@@ -52,7 +52,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -294,7 +294,6 @@ impl RemoteInstallOutcome {
 #[derive(Clone)]
 pub struct RemoteEndpointStore {
     inner: Arc<ArcSwap<RemoteEndpointSnapshot>>,
-    first_ready: Arc<AtomicBool>,
     /// Bumped on every successful install/remove so the slice-apply task
     /// re-runs even when the local CP config is unchanged (a remote cluster
     /// scaling up/down must re-materialize the aggregated upstream targets).
@@ -329,7 +328,6 @@ impl Default for RemoteEndpointStore {
         let (revision_tx, _) = watch::channel(0u64);
         Self {
             inner: Arc::new(ArcSwap::new(Arc::new(RemoteEndpointSnapshot::default()))),
-            first_ready: Arc::new(AtomicBool::new(false)),
             revision_tx: Arc::new(revision_tx),
             generation: Arc::new(AtomicU64::new(0)),
             cluster_generation: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
@@ -346,12 +344,6 @@ impl RemoteEndpointStore {
     /// Lock-free read.
     pub fn snapshot(&self) -> Arc<RemoteEndpointSnapshot> {
         self.inner.load_full()
-    }
-
-    /// `true` after at least one remote cluster has been successfully polled.
-    #[cfg(test)]
-    pub fn has_first_success(&self) -> bool {
-        self.first_ready.load(Ordering::Acquire)
     }
 
     /// Subscribe to install events. Mirrors `MeshRuntimeState::subscribe()`.
@@ -405,7 +397,7 @@ impl RemoteEndpointStore {
     /// remote cluster does not look stale to operator alerting. The refresh is a
     /// single relaxed store into the entry's **shared** `fetched_at` atomic — it
     /// does NOT clone the snapshot or the (potentially huge) endpoint payload,
-    /// and it does NOT touch `revision_tx`/`first_ready`, preserving the
+    /// and it does NOT touch `revision_tx`, preserving the
     /// "no reconcile on unchanged endpoints" optimization without the
     /// steady-state per-poll deep-clone the previous in-`rcu` refresh incurred.
     ///
@@ -500,7 +492,6 @@ impl RemoteEndpointStore {
             Arc::new(next)
         });
         if outcome.installed() {
-            self.first_ready.store(true, Ordering::Release);
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
         outcome
@@ -3570,7 +3561,6 @@ mod tests {
     #[test]
     fn store_install_and_snapshot_round_trip() {
         let store = RemoteEndpointStore::new();
-        assert!(!store.has_first_success());
         assert!(store.snapshot().is_empty());
 
         store.install_for_test(RemoteClusterEntry {
@@ -3590,7 +3580,6 @@ mod tests {
             },
             fetched_at: Arc::new(AtomicU64::new(1)),
         });
-        assert!(store.has_first_success());
         let snapshot = store.snapshot();
         let entry = snapshot.clusters.get("west").expect("installed entry");
         assert_eq!(entry.trust_domain.as_str(), "remote.local");
@@ -4439,14 +4428,16 @@ mod tests {
             fetched_at: Arc::new(AtomicU64::new(1)),
         };
         // The install must be silently dropped — the generation slot is gone.
+        let revision_before = *store.subscribe().borrow();
         store.install(entry, stale_gen);
         assert!(
             store.snapshot().is_empty(),
             "install with retired generation must not reinstate removed cluster"
         );
-        assert!(
-            !store.has_first_success(),
-            "first_ready must not be set by a generation-blocked install"
+        assert_eq!(
+            *store.subscribe().borrow(),
+            revision_before,
+            "a generation-blocked install must not wake the slice-apply task"
         );
     }
 
