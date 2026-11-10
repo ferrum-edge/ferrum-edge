@@ -55,7 +55,6 @@ use crate::tls::source::MaterialKind;
 const STORE_FILE_NAME: &str = "acme-certificates.json";
 const ORDER_STORE_FILE_NAME: &str = "acme-orders.json";
 const ACCOUNT_STORE_FILE_NAME: &str = "acme-accounts.json";
-const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
 const HTTP01_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 /// Longest HTTP-01 token [`validate_http01_token`] accepts.
 const MAX_HTTP01_TOKEN_LEN: usize = 256;
@@ -2669,15 +2668,6 @@ pub fn http01_key_authorization_for_path(path: &str) -> Option<String> {
     global_order_store().ok()?.http01_key_authorization(&token)
 }
 
-fn acme_store_dir_from_env() -> PathBuf {
-    let path = crate::config::env_config::tls_managed_store_path_from_env();
-    if path.is_empty() {
-        PathBuf::from(DEFAULT_STORE_DIR)
-    } else {
-        PathBuf::from(path)
-    }
-}
-
 static GLOBAL_ACME_CERTIFICATE_STORE: OnceLock<Result<Arc<AcmeCertificateStore>, String>> =
     OnceLock::new();
 static GLOBAL_ACME_ORDER_STORE: OnceLock<Result<Arc<AcmeOrderStore>, String>> = OnceLock::new();
@@ -2686,7 +2676,7 @@ static GLOBAL_ACME_ACCOUNT_STORE: OnceLock<Result<Arc<AcmeAccountStore>, String>
 pub fn global_certificate_store() -> Result<Arc<AcmeCertificateStore>, String> {
     GLOBAL_ACME_CERTIFICATE_STORE
         .get_or_init(|| {
-            AcmeCertificateStore::open(acme_store_dir_from_env())
+            AcmeCertificateStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2696,7 +2686,7 @@ pub fn global_certificate_store() -> Result<Arc<AcmeCertificateStore>, String> {
 pub fn global_order_store() -> Result<Arc<AcmeOrderStore>, String> {
     GLOBAL_ACME_ORDER_STORE
         .get_or_init(|| {
-            AcmeOrderStore::open(acme_store_dir_from_env())
+            AcmeOrderStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2706,7 +2696,7 @@ pub fn global_order_store() -> Result<Arc<AcmeOrderStore>, String> {
 pub fn global_account_store() -> Result<Arc<AcmeAccountStore>, String> {
     GLOBAL_ACME_ACCOUNT_STORE
         .get_or_init(|| {
-            AcmeAccountStore::open(acme_store_dir_from_env())
+            AcmeAccountStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })

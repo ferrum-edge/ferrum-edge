@@ -6,7 +6,18 @@
 //! warning-only. Operators must secure the existing ancestor chain: callers
 //! retain paths, not directory capabilities, for subsequent store operations.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The managed-TLS store directory shared by the managed-TLS, ACME, lease
+/// and TLS event stores.
+///
+/// One resolver keeps the four stores, and the lease table that coordinates
+/// them, in the same directory. `tls_managed_store_path_from_env` never
+/// returns an empty path: an unconfigured binary gets the documented
+/// `./ferrum-managed-tls` and every other process a private temp directory.
+pub(crate) fn managed_store_dir() -> PathBuf {
+    PathBuf::from(crate::config::env_config::tls_managed_store_path_from_env())
+}
 
 /// Create `path` and missing parents privately on Unix.
 ///
