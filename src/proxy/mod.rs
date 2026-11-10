@@ -42750,16 +42750,13 @@ async fn handle_proxy_request_inner(
                     );
 
                 let grpc_resolved_ip = if !plugins.is_empty() {
-                    state
-                        .dns_cache
-                        .resolve(
-                            &proxy.backend_host,
-                            proxy.dns_override.as_deref(),
-                            proxy.dns_cache_ttl_seconds,
-                        )
-                        .await
-                        .ok()
-                        .map(|ip| ip.to_string())
+                    boxed_resolve_summary_backend_ip(
+                        &state,
+                        &proxy,
+                        grpc_final_upstream_target.as_deref(),
+                        ctx.grpc_deadline_at(),
+                    )
+                    .await
                 } else {
                     None
                 };
@@ -43973,16 +43970,13 @@ async fn handle_proxy_request_inner(
                 let grpc_resolved_ip = if plugins.is_empty() {
                     None
                 } else {
-                    let resolve = state.dns_cache.resolve(
-                        &proxy.backend_host,
-                        proxy.dns_override.as_deref(),
-                        proxy.dns_cache_ttl_seconds,
-                    );
-                    match crate::plugins::await_grpc_deadline(ctx.grpc_deadline_at(), resolve).await
-                    {
-                        Ok(result) => result.ok().map(|ip| ip.to_string()),
-                        Err(()) => None,
-                    }
+                    boxed_resolve_summary_backend_ip(
+                        &state,
+                        &proxy,
+                        grpc_final_upstream_target.as_deref(),
+                        ctx.grpc_deadline_at(),
+                    )
+                    .await
                 };
 
                 // ── Pre-commitment authorization gate (#3815) ──────────────────
@@ -44216,9 +44210,14 @@ async fn handle_proxy_request_inner(
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                // Name the target that failed, not the route template (#7159).
+                let (warn_host, warn_port) = grpc_final_upstream_target.as_deref().map_or(
+                    (proxy.backend_host.as_str(), proxy.backend_port),
+                    |target| (target.host.as_str(), target.port),
+                );
                 https_to_plaintext::maybe_warn_https_to_plaintext_backend(
                     &proxy,
-                    &format!("{}:{}", proxy.backend_host, proxy.backend_port),
+                    &format!("{warn_host}:{warn_port}"),
                     &e,
                 );
                 let grpc_backend_connection_error = matches!(
@@ -44819,6 +44818,10 @@ async fn handle_proxy_request_inner(
     // `mut`: the pre-commitment authorization terminal below neutralizes the
     // health inputs of a dispatch the gateway itself cancelled (#3815).
     let mut final_backend_url: Option<String> = None;
+    // The mesh transport of the last attempt actually dispatched, set where
+    // `final_backend_url` is set after a retry dispatch; `None` while the
+    // initial attempt's transport stands (issue #7159).
+    let mut final_dispatch_transport: Option<Option<&'static str>> = None;
     let (mut backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
@@ -45680,6 +45683,13 @@ async fn handle_proxy_request_inner(
             }
             final_upstream_target = current_target.clone();
             final_backend_url = Some(current_url.clone());
+            final_dispatch_transport = Some(if retry_dispatch_hbone {
+                Some("hbone")
+            } else if retry_dispatch_mesh_mtls {
+                Some("mtls")
+            } else {
+                None
+            });
         }
         (result, current_cb_target_key, final_upstream_target)
     } else {
@@ -45944,16 +45954,18 @@ async fn handle_proxy_request_inner(
     stamp_original_response_metadata(&mut ctx, response_status, &response_headers);
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
+    // Attribute the target and transport of the attempt that answered, not
+    // the first attempt's, after a retry rotation (issue #7159).
     annotate_gateway_mesh_metadata(
         &mut ctx,
-        upstream_target.as_deref(),
-        if current_dispatch_hbone {
+        final_upstream_target.as_deref(),
+        final_dispatch_transport.unwrap_or(if current_dispatch_hbone {
             Some("hbone")
         } else if current_dispatch_mesh_mtls {
             Some("mtls")
         } else {
             None
-        },
+        }),
         backend_error_class,
     );
 
@@ -48410,6 +48422,41 @@ pub fn build_backend_url_with_target(
             url
         },
     )
+}
+
+/// The `backend_resolved_ip` a transaction summary logs for the LB-selected
+/// target that served the request (the native-gRPC branch, and the H3
+/// buffered loop after a retry rotated targets), never the route's template
+/// `backend_host` (a placeholder when `upstream_id` is set), bounded by the
+/// client's RPC deadline like every other awaited summary input (issue #7159).
+/// A cross-cluster HBONE target's synthetic host is not resolvable and is
+/// skipped, as on the mesh retry path. Constructed out of line and boxed so
+/// the lookup is not a frame slot in the generic request future.
+#[inline(never)]
+pub(crate) fn boxed_resolve_summary_backend_ip<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    target: Option<&'a UpstreamTarget>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+    Box::pin(async move {
+        if target.is_some_and(is_synthetic_cross_cluster_hbone_dispatch_target) {
+            return None;
+        }
+        let effective = resolve_effective_proxy_for_target(proxy, target);
+        let host = target.map_or(effective.backend_host.as_str(), |target| {
+            target.host.as_str()
+        });
+        let resolve = state.dns_cache.resolve(
+            host,
+            effective.dns_override.as_deref(),
+            effective.dns_cache_ttl_seconds,
+        );
+        match crate::plugins::await_grpc_deadline(grpc_deadline_at, resolve).await {
+            Ok(result) => result.ok().map(|ip| ip.to_string()),
+            Err(()) => None,
+        }
+    })
 }
 
 /// Resolve the effective `Proxy` for one backend dispatch, honoring an

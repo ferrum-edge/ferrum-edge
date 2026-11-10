@@ -3066,6 +3066,17 @@ pub mod _test_support {
         .await
     }
 
+    /// The `backend_resolved_ip` a transaction summary logs for the target
+    /// that served the request (`boxed_resolve_summary_backend_ip`, issue
+    /// #7159), with no RPC deadline.
+    pub async fn resolve_summary_backend_ip_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        target: Option<&crate::config::types::UpstreamTarget>,
+    ) -> Option<String> {
+        crate::proxy::boxed_resolve_summary_backend_ip(state, proxy, target, None).await
+    }
+
     pub fn request_method_is_allowed_for_test(allowed: &[String], method: &str) -> bool {
         crate::proxy::request_method_is_allowed(allowed, method)
     }

@@ -3392,3 +3392,125 @@ fn open_breaker_rejection_phase_has_one_spelling() {
     );
     assert_eq!(token_for_rejection_phase("circuit_breaker"), None);
 }
+
+/// Issue #7159: a transaction summary logs the address of the LB-selected
+/// target that served the request, never the route's template `backend_host`
+/// (a placeholder when `upstream_id` is set). A cross-cluster HBONE target's
+/// synthetic host is not resolvable and is skipped.
+#[tokio::test]
+async fn summary_backend_ip_resolves_the_target_that_served_the_request() {
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::config::types::{GatewayConfig, Proxy, UpstreamTarget};
+    use ferrum_edge::proxy::ProxyState;
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "summary-ip",
+        "listen_path": "/summary",
+        "backend_scheme": "http",
+        "backend_host": "203.0.113.7",
+        "backend_port": 8080,
+    }))
+    .expect("proxy fixture");
+    let target = |host: &str| -> UpstreamTarget {
+        serde_json::from_value(serde_json::json!({"host": host, "port": 9090}))
+            .expect("target fixture")
+    };
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (state, _) = ProxyState::new(
+        GatewayConfig::default(),
+        dns_cache,
+        EnvConfig::default(),
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+
+    let selected = target("198.51.100.4");
+    assert_eq!(
+        ferrum_edge::_test_support::resolve_summary_backend_ip_for_test(
+            &state,
+            &proxy,
+            Some(&selected),
+        )
+        .await
+        .as_deref(),
+        Some("198.51.100.4"),
+        "the selected target's address, not the template host"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::resolve_summary_backend_ip_for_test(&state, &proxy, None)
+            .await
+            .as_deref(),
+        Some("203.0.113.7"),
+        "a route without an upstream logs its own backend host"
+    );
+    let synthetic = target(&format!(
+        "{}east|reviews",
+        ferrum_edge::proxy::hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX
+    ));
+    assert_eq!(
+        ferrum_edge::_test_support::resolve_summary_backend_ip_for_test(
+            &state,
+            &proxy,
+            Some(&synthetic),
+        )
+        .await,
+        None
+    );
+}
+
+/// Issue #7159: after a retry rotates targets, every attribution the summary
+/// carries follows the attempt that answered. H1/H2 stamps mesh metadata from
+/// the final target and the final attempt's transport; the H3 buffered loop
+/// carries its final URL out (restored with the target when an open breaker
+/// refuses the rotation) and logs it, with the final target's address.
+#[test]
+fn retry_rotation_attributes_mesh_metadata_and_h3_summary_to_the_final_attempt() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let squeeze = |text: &str| -> String { text.split_whitespace().collect() };
+    let proxy_squeezed = squeeze(proxy);
+    assert!(
+        proxy_squeezed.contains(
+            "annotate_gateway_mesh_metadata(&mutctx,final_upstream_target.as_deref(),final_dispatch_transport.unwrap_or("
+        ),
+        "mesh metadata must name the final target and transport"
+    );
+    let loop_start = proxy
+        .find("while retry::should_retry(retry_config, &method, &result, attempt)")
+        .expect("HTTP retry loop");
+    let loop_tail = &proxy[loop_start..];
+    let loop_body = &loop_tail[..loop_tail
+        .find("(result, current_cb_target_key, final_upstream_target)")
+        .expect("HTTP retry loop end")];
+    assert_eq!(
+        loop_body
+            .matches("final_dispatch_transport = Some(")
+            .count(),
+        1,
+        "only an attempt that was dispatched updates the final transport"
+    );
+    let dispatched = loop_body
+        .rfind("final_backend_url = Some(current_url.clone());")
+        .expect("dispatched attempt attribution");
+    let transport = loop_body
+        .find("final_dispatch_transport = Some(")
+        .expect("final transport update");
+    assert!(dispatched < transport);
+
+    let server = include_str!("../../../src/http3/server.rs");
+    let server_squeezed = squeeze(server);
+    assert!(
+        server_squeezed
+            .contains("pre_rotation_url=Some(std::mem::replace(&mutcurrent_url,next_url));")
+    );
+    assert!(server_squeezed.contains(
+        "current_target=pre_rotation_target;current_cb_target_key=pre_rotation_cb_target_key;ifletSome(url)=pre_rotation_url{current_url=url;}break;"
+    ));
+    assert!(server_squeezed.contains("current_cb_target_key,current_target,Some(current_url),)"));
+    assert!(server_squeezed.contains("letfinal_backend_url=final_url.unwrap_or(backend_url);"));
+    assert!(
+        server_squeezed
+            .contains("backend_target:Some(strip_query_params(&final_backend_url).to_string()),")
+    );
+    assert!(server_squeezed.contains("crate::proxy::boxed_resolve_summary_backend_ip("));
+}
