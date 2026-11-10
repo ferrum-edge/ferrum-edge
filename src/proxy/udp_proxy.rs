@@ -4103,7 +4103,7 @@ pub async fn start_udp_listener_holding_port(
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
-                                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                                    debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                                 }
                                                 offset = end;
                                             }
@@ -4152,7 +4152,7 @@ pub async fn start_udp_listener_holding_port(
                                     )
                                     .await;
                                     if let Err(e) = result {
-                                        debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                        debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                     }
                                 }
                                 total_drained += n;
@@ -4286,11 +4286,10 @@ pub async fn start_udp_listener_holding_port(
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, addr2) = recv_batch.datagram(i);
-                                    let local2 = if pktinfo_active {
-                                        recv_batch.local_addr(i)
-                                    } else {
-                                        None
-                                    };
+                                    // This arm runs only while PKTINFO is not the
+                                    // primary receive path (`!pktinfo_primary`),
+                                    // so no per-datagram local address exists.
+                                    let local2: Option<crate::socket_opts::PktinfoLocal> = None;
 
                                     // Reject datagrams from new clients under
                                     // critical overload, or while the DP's
@@ -4363,7 +4362,7 @@ pub async fn start_udp_listener_holding_port(
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
-                                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                                    debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                                 }
                                                 offset = end;
                                             }
@@ -4412,7 +4411,7 @@ pub async fn start_udp_listener_holding_port(
                                     )
                                     .await;
                                     if let Err(e) = result {
-                                        debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                        debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                     }
                                 }
                                 total_drained += n;
@@ -4489,7 +4488,7 @@ pub async fn start_udp_listener_holding_port(
                                 )
                                 .await;
                                 if let Err(e) = result {
-                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                    debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                 }
                             }
                             Err(_) => break, // WouldBlock — socket drained
@@ -9165,7 +9164,7 @@ async fn create_session(
     let reply_metrics = metrics.clone();
     let reply_sessions = sessions.clone();
     let reply_dtls = dtls_conn;
-    let reply_plugins = plugins.to_vec();
+    let reply_plugins = Arc::clone(&plugins);
     let reply_proxy_name = proxy_name.clone();
     let reply_proxy_namespace = proxy_namespace.clone();
     let reply_backend_scheme = backend_scheme;
