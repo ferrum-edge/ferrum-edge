@@ -5327,45 +5327,34 @@ fn east_west_service_proxy(
     }
 }
 
-/// Sanitize one namespace/name component of an internal east-west id. These ids
-/// are purely internal registry keys (a `Proxy.id`/`Upstream.id`, never emitted
-/// to Kubernetes, DNS, SNI/TLS, or any wire protocol — the SNI is built
-/// independently by [`cross_cluster_service_sni`]), so the only requirement is
-/// intra-component uniqueness. `/` and `.` are folded to `-` so a hostile or
-/// malformed component cannot smuggle the reserved `.` port-marker separator
-/// (see [`mesh_east_west_service_proxy_id`]) into the middle of an id. A
-/// well-formed Kubernetes namespace/service name (DNS-1035/1123 label) contains
-/// neither character, so this is a no-op for real inputs.
-fn sanitize_mesh_id_component(component: &str) -> String {
-    component.replace(['/', '.'], "-")
-}
-
 /// East-west per-service proxy id. `sni_label` is the port's alias label from
 /// [`cross_cluster_service_sni_label`] (`p<port>`, or `p<port>-udp` for a UDP
 /// port), matching the SNI scheme where every port takes an explicit
 /// `<label>.<fqdn>` alias.
 ///
-/// The port marker is joined with `.` — a character DNS-1035/1123 labels forbid,
-/// so it CANNOT appear in a Kubernetes namespace or service name (codex #2040
-/// Finding B). This makes the per-port id `__mesh-ew-svc-<ns>-<name>.p<port>`
-/// unambiguous: a distinct service literally named `<name>-p<port>` yields
-/// `__mesh-ew-svc-<ns>-<name>-p<port>` (no dot) and a service named `<name>.p<port>`
-/// is not a valid k8s name (impossible), so neither can collide in the
-/// materializer's id-keyed upsert map. The ns/name components are individually
-/// sanitized (`/`,`.` → `-`) BEFORE the `.p<port>` marker is appended so a
-/// malformed component can never forge the structural separator, while the
-/// intentional marker dot is preserved (never collapsed).
+/// These ids are purely internal registry keys (a `Proxy.id`/`Upstream.id`,
+/// never emitted to Kubernetes, DNS, SNI/TLS, or any wire protocol — the SNI is
+/// built independently by [`cross_cluster_service_sni`]) and are forward-derived,
+/// never parsed. Every materialized proxy/upstream is stamped with the GATEWAY's
+/// namespace, so services from different namespaces share one id space: the
+/// namespace and name are each encoded with the injective
+/// [`sanitize_egress_host_id_part`], whose output contains neither `-` nor `.`.
+/// The `-` between them is therefore an unambiguous separator (`a`/`b-c` and
+/// `a-b`/`c` stay distinct, issue #7235), and the `.` before the port marker
+/// cannot be forged by a component: a service literally named `<name>-p<port>`
+/// yields `__mesh-ew-svc-<ns>-<name>_dash_p<port>.p<port>` (codex #2040 Finding
+/// B).
 fn mesh_east_west_service_proxy_id(namespace: &str, name: &str, sni_label: &str) -> String {
-    let namespace = sanitize_mesh_id_component(namespace);
-    let name = sanitize_mesh_id_component(name);
+    let namespace = sanitize_egress_host_id_part(namespace);
+    let name = sanitize_egress_host_id_part(name);
     format!("__mesh-ew-svc-{namespace}-{name}.{sni_label}")
 }
 
-/// East-west per-service upstream id; `sni_label` semantics and the
+/// East-west per-service upstream id; component encoding and the
 /// collision-free `.p<port>` marker mirror [`mesh_east_west_service_proxy_id`].
 fn mesh_east_west_service_upstream_id(namespace: &str, name: &str, sni_label: &str) -> String {
-    let namespace = sanitize_mesh_id_component(namespace);
-    let name = sanitize_mesh_id_component(name);
+    let namespace = sanitize_egress_host_id_part(namespace);
+    let name = sanitize_egress_host_id_part(name);
     format!("__mesh-ew-upstream-{namespace}-{name}.{sni_label}")
 }
 
@@ -5450,20 +5439,23 @@ pub(crate) fn is_mesh_ingress_bind_route_id(id: &str) -> bool {
     id.starts_with(MESH_INGRESS_BIND_PROXY_ID_PREFIX)
 }
 
-/// LATENT-COLLISION HAZARD (shared by this whole `mesh_*_id` family —
-/// `mesh_ingress_proxy_id`, `mesh_outbound_proxy_id`,
-/// `mesh_outbound_upstream_id`, `mesh_outbound_tcp_upstream_id`,
-/// `mesh_east_west_*_id`, etc.): the `{namespace}-{name}-{port}` join uses `-`
-/// as the field separator, but `replace(['/', '.'], "-")` ALSO emits `-`, so
-/// `(ns="a-b", name="c")` and `(ns="a", name="b-c")` would map to the same id.
-/// SAFE TODAY because every in-scope materializer consumes a SINGLE-namespace
-/// service set (the slice is scoped to one namespace), so the `namespace`
-/// segment is constant and only `name`+`port` vary — and a `name` cannot
-/// borrow a `-` from a fixed `namespace`. Dedicated Sidecar ingress bind ids
-/// (`mesh_ingress_bind_proxy_id`) are the exception: they already use the
-/// reversible `sanitize_egress_host_id_part` scheme so the id space stays
-/// injective across namespaces. Before any MULTI-namespace caller is added to
-/// the rest of this family, switch those constructors the same way. See #1727.
+/// LOSSY JOIN (shared by the `mesh_inbound_proxy_id`, `mesh_ingress_proxy_id`,
+/// `mesh_outbound_proxy_id`, `mesh_outbound_upstream_id`,
+/// `mesh_outbound_tcp_upstream_id` family): the `{namespace}-{name}-{port}` join
+/// uses `-` as the field separator, but `replace(['/', '.'], "-")` ALSO emits
+/// `-`, so `(ns="a-b", name="c")` and `(ns="a", name="b-c")` map to the same
+/// id string. The service sets are NOT single-namespace (an enforced `Sidecar`
+/// or a ServiceWaypoint carries services from every namespace); these ids stay
+/// distinct only because each materialized resource is stamped with its OWNING
+/// service's namespace and every consumer keys on `(namespace, id)`, so two
+/// services can share an id string only inside one namespace, where their names
+/// differ. Never parse these ids back into namespace/name (see
+/// `mesh_outbound_service_groups`), and never stamp them with a namespace other
+/// than the owning service's. Families that ARE stamped with a shared namespace
+/// encode each component with the injective `sanitize_egress_host_id_part`
+/// instead: dedicated Sidecar ingress bind ids (`mesh_ingress_bind_proxy_id`)
+/// and the east-west per-service ids (`mesh_east_west_service_proxy_id`, stamped
+/// with the gateway's namespace). See #1727 and #7235.
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }

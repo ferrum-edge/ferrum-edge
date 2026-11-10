@@ -649,6 +649,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resource id limit and the whole slice was rejected (last-good retained, or
   no start). That host/port is now skipped with a warning, without claiming
   its stream listen port, and the other entries still materialize.
+- **East-west gateway service routes no longer collide across namespaces**
+  (issue #7235). Every per-service east-west proxy/upstream is stamped with
+  the gateway's namespace, but its id joined the service namespace and name
+  with `-`, so services `a/b-c` and `a-b/c` on one port derived the same id
+  and one lost its SNI passthrough route on a slice spanning namespaces. The
+  namespace and name are now encoded injectively (as the Sidecar ingress bind
+  ids already were): ids change only for names containing `-` or `.`, for
+  example `__mesh-ew-svc-<ns>-foo-bar.p8080` becomes
+  `__mesh-ew-svc-<ns>-foo_dash_bar.p8080`.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
