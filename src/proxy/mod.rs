@@ -45386,7 +45386,7 @@ async fn handle_proxy_request_inner(
                             &method,
                             &retry_attempt_header_map,
                             current_target.as_deref(),
-                            retained_body.as_deref(),
+                            retained_body.as_ref(),
                             should_stream,
                             &plugins,
                             &ctx,
@@ -45411,7 +45411,7 @@ async fn handle_proxy_request_inner(
                             &method,
                             retry_attempt_headers,
                             current_target.as_deref(),
-                            retained_body.as_deref(),
+                            retained_body.as_ref(),
                             should_stream,
                             &plugins,
                             &ctx,
@@ -48829,7 +48829,7 @@ pub(crate) async fn proxy_to_backend_retry(
     method: &str,
     headers: RequestHeaders<'_>,
     upstream_target: Option<&UpstreamTarget>,
-    request_body: Option<&[u8]>,
+    request_body: Option<&Bytes>,
     stream_response: bool,
     plugins: &[Arc<dyn Plugin>],
     request_ctx: &RequestContext,
@@ -49198,7 +49198,10 @@ pub(crate) async fn proxy_to_backend_retry(
     if let Some(body) = request_body
         && !body.is_empty()
     {
-        let body_bytes = Bytes::copy_from_slice(body);
+        // The caller's retained body is a charged `Bytes` owner
+        // (`response_buffer_budget`, issue #4231): replay shares it rather
+        // than copying it into an uncharged buffer (issue #7160).
+        let body_bytes = body.clone();
         let (upload_body, pump) = install_buffered_upload_write_watermark(
             body_bytes.clone(),
             proxy.backend_write_timeout_ms,
@@ -67723,14 +67726,14 @@ fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::Backe
 /// `Request<Incoming>` body (already consumed) can be replayed. Mirrors the
 /// pattern used by `proxy_to_backend_retry` for HTTP/1.1.
 #[allow(clippy::too_many_arguments)]
-async fn proxy_to_backend_http3_retry(
+pub(crate) async fn proxy_to_backend_http3_retry(
     state: &ProxyState,
     proxy: &Proxy,
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
     upstream_target: Option<&UpstreamTarget>,
-    request_body: Option<&[u8]>,
+    request_body: Option<&Bytes>,
     stream_response: bool,
     plugins: &[Arc<dyn Plugin>],
     request_ctx: &RequestContext,
@@ -67770,11 +67773,17 @@ async fn proxy_to_backend_http3_retry(
     // Re-screen the (possibly LB-rotated) retry target: the native H3 pool
     // self-resolves via the shared DNS cache (canonical `IpAddr` fast
     // path; non-canonical → real DNS + resolved-address screen), so use the
-    // canonical screen, mirroring the first-attempt H3 screen — the
-    // URL-canonicalizing one would wrongly reject a legitimate all-numeric
-    // hostname reached via rotation.
-    if denied_literal_backend_ip_canonical(effective_host, &state.env_config.backend_allow_ips)
-        .is_some()
+    // canonical screen — the URL-canonicalizing one would wrongly reject a
+    // legitimate all-numeric hostname reached via rotation. Like the
+    // first-attempt H3 screen, it also covers the effective `dns_override`,
+    // so a denied override is refused here, before any pool call, rather than
+    // by the DNS layer's later error string (issue #7160).
+    if denied_literal_backend_or_dns_override_canonical(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    )
+    .is_some()
     {
         return backend_egress_denied_response(effective_host);
     }
@@ -67790,6 +67799,11 @@ async fn proxy_to_backend_http3_retry(
         .ok()
         .map(|ip| ip.to_string());
 
+    // The replay body is the caller's retained, charged `Bytes`: share it
+    // rather than copying it into an uncharged buffer, and declare its length
+    // exactly as the first attempt declares the buffered length (issue #7160).
+    let body_bytes = request_body.cloned().unwrap_or_default();
+    let request_content_length = (!body_bytes.is_empty()).then(|| body_bytes.len().to_string());
     let http3_headers = build_http3_backend_headers(
         state,
         proxy,
@@ -67801,11 +67815,9 @@ async fn proxy_to_backend_http3_retry(
             effective_port,
             request_is_secure,
             inbound_version,
-            content_length: None,
+            content_length: request_content_length.as_deref(),
         },
     );
-
-    let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
     let may_release_after_headers =
         !stream_response && plugins_may_release_response_body_under_retries(plugins, request_ctx);
     let retry_ctx = may_release_after_headers.then(|| retry_response_decision_context(request_ctx));

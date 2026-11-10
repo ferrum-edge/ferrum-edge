@@ -11185,7 +11185,7 @@ async fn handle_h3_request(
                             attempt_headers,
                         ),
                         current_target.as_deref(),
-                        Some(&body_data[..]),
+                        Some(&body_data),
                         false,
                         &plugins,
                         &ctx,

@@ -3035,6 +3035,37 @@ pub mod _test_support {
         .await
     }
 
+    /// One native-H3 retry attempt (`proxy_to_backend_http3_retry`) for a
+    /// plain `GET` with no body, upstream target, or plugins.
+    pub async fn proxy_to_backend_http3_retry_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        backend_url: &str,
+    ) -> crate::retry::BackendResponse {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        crate::proxy::proxy_to_backend_http3_retry(
+            state,
+            proxy,
+            backend_url,
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            false,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            true,
+            hyper::Version::HTTP_3,
+        )
+        .await
+    }
+
     pub fn request_method_is_allowed_for_test(allowed: &[String], method: &str) -> bool {
         crate::proxy::request_method_is_allowed(allowed, method)
     }
