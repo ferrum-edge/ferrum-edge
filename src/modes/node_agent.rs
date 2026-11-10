@@ -2428,6 +2428,15 @@ where
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = maintenance_interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
+    // The Node GET behind node-identity revalidation is bounded only by
+    // NODE_UID_LOOKUP_TIMEOUT (10 s), longer than the CNI server gives this
+    // loop to answer an RPC. It runs as a background task started on the
+    // retry cadence; this loop applies its result when it lands, so pod
+    // events, CNI calls and the other timers never wait on the API (#7254).
+    let mut node_uid_lookup: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
+    // The last applied refresh left identity fenced; the capture retry pass
+    // stays deferred while its registry-proof retraction is outstanding.
+    let mut node_identity_fenced = false;
     let mut topology_monitor_open = topology_monitor.is_some();
     let mut last_topology_outcome = topology_monitor
         .as_ref()
@@ -2787,73 +2796,111 @@ where
                     );
                 }
             }
-            _ = retry_interval.tick() => {
-                // Revalidate / retry this node's Kubernetes UID on the existing
-                // enrollment-retry cadence (issue #3809). A transient API, RBAC,
-                // or publication failure must not leave identity unresolved
-                // forever, and a same-name Node recreation must not keep using
-                // the predecessor UID. Registry-sync is retracted before any
-                // identity lookup/change; capture mutations stay fenced while
-                // that retraction is outstanding.
-                if let (Some(registry_dir), Some(client)) = (
-                    config.node_waypoint_pod_registry_dir.as_deref(),
-                    kube_client.as_ref(),
-                ) {
-                    let refresh = refresh_node_identity_binding(
-                        udp_node_uid.as_deref(),
-                        &mut shutdown_rx,
-                        || resolve_this_node_uid(client, config.node_name.as_str()),
-                        || {
-                            match crate::proxy::udp_placement_migration::clear_registry_sync_marker(
-                                registry_dir,
-                            ) {
-                                Ok(()) => {
-                                    readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
-                                    Ok(())
-                                }
-                                Err(error) => {
-                                    readiness.record_udp_proof(
-                                        UdpRegistryProofEvent::RetractionFailed,
-                                    );
-                                    Err(error)
-                                }
+            node_uid = async {
+                match node_uid_lookup.as_mut() {
+                    Some(lookup) => lookup.await,
+                    None => std::future::pending().await,
+                }
+            }, if node_uid_lookup.is_some() => {
+                node_uid_lookup = None;
+                let node_uid = node_uid.unwrap_or_else(|_| {
+                    Err("the node UID lookup task did not complete".to_string())
+                });
+                // Background lookups are started only when both are present.
+                let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
+                    continue;
+                };
+                // Revalidate / retry this node's Kubernetes UID (issue #3809).
+                // A transient API, RBAC, or publication failure must not leave
+                // identity unresolved forever, and a same-name Node recreation
+                // must not keep using the predecessor UID. Registry-sync is
+                // retracted before any identity change is applied; capture
+                // mutations stay fenced while that retraction is outstanding.
+                // The lookup already ran in the background, so this applies its
+                // result without awaiting the API.
+                let refresh = refresh_node_identity_binding(
+                    udp_node_uid.as_deref(),
+                    &mut shutdown_rx,
+                    || std::future::ready(node_uid),
+                    || {
+                        match crate::proxy::udp_placement_migration::clear_registry_sync_marker(
+                            registry_dir,
+                        ) {
+                            Ok(()) => {
+                                readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
+                                Ok(())
                             }
-                        },
-                        || {
-                            crate::proxy::udp_placement_migration::retract_node_identity(
-                                registry_dir,
-                            )
-                        },
-                        |uid| {
-                            crate::proxy::udp_placement_migration::publish_node_identity(
-                                registry_dir,
-                                uid,
-                            )
-                        },
-                    )
-                    .await;
-                    match refresh {
-                        NodeIdentityRefresh::Interrupted { uid } => {
-                            udp_node_uid = uid;
-                            if *shutdown_rx.borrow() {
-                                break PodWatcherLoopExit::ShutdownRequested;
+                            Err(error) => {
+                                readiness.record_udp_proof(
+                                    UdpRegistryProofEvent::RetractionFailed,
+                                );
+                                Err(error)
                             }
                         }
-                        refresh => {
-                            // A retraction during the refresh already moved
-                            // the proof (and therefore readiness) through
-                            // the closure above.
-                            udp_node_uid = refresh.uid().map(str::to_string);
-                            if matches!(refresh, NodeIdentityRefresh::Fenced { .. })
-                                && readiness.udp_proof.retraction_pending()
-                            {
-                                warn!(
-                                    "Deferring capture retry tick until node identity and Ambient UDP registry proof retraction recover"
-                                );
-                                continue;
-                            }
+                    },
+                    || {
+                        crate::proxy::udp_placement_migration::retract_node_identity(
+                            registry_dir,
+                        )
+                    },
+                    |uid| {
+                        crate::proxy::udp_placement_migration::publish_node_identity(
+                            registry_dir,
+                            uid,
+                        )
+                    },
+                )
+                .await;
+                match refresh {
+                    NodeIdentityRefresh::Interrupted { uid } => {
+                        udp_node_uid = uid;
+                        if *shutdown_rx.borrow() {
+                            break PodWatcherLoopExit::ShutdownRequested;
                         }
                     }
+                    refresh => {
+                        // A retraction during the refresh already moved the
+                        // proof (and therefore readiness) through the closure
+                        // above.
+                        udp_node_uid = refresh.uid().map(str::to_string);
+                        node_identity_fenced =
+                            matches!(refresh, NodeIdentityRefresh::Fenced { .. });
+                    }
+                }
+                // Republish a registry-sync marker bound to the refreshed
+                // identity now rather than on the next retry tick.
+                if !node_identity_fenced
+                    && readiness.pod_sync.is_synced()
+                    && readiness.udp_proof != UdpRegistryProof::Published
+                    && let Some(generation) = udp_migration_generation.as_deref()
+                {
+                    publish_udp_migration_registry_sync_with_recovery(
+                        generation,
+                        &pod_states,
+                        config,
+                        udp_node_uid.as_deref(),
+                        &mut readiness,
+                    );
+                }
+            }
+            _ = retry_interval.tick() => {
+                // Start the next node-identity revalidation in the background
+                // (see `node_uid_lookup`); at most one is in flight.
+                if node_uid_lookup.is_none()
+                    && config.node_waypoint_pod_registry_dir.is_some()
+                    && let Some(client) = kube_client.as_ref()
+                {
+                    let client = client.clone();
+                    let node_name = config.node_name.clone();
+                    node_uid_lookup = Some(tokio::spawn(async move {
+                        resolve_this_node_uid(&client, &node_name).await
+                    }));
+                }
+                if node_identity_fenced && readiness.udp_proof.retraction_pending() {
+                    warn!(
+                        "Deferring capture retry tick until node identity and Ambient UDP registry proof retraction recover"
+                    );
+                    continue;
                 }
                 // Re-drive any pod whose transient enrollment failure has aged
                 // past the backoff window, and retry stale detach/map cleanup
@@ -3014,6 +3061,10 @@ where
             }
         }
     };
+    // A revalidation still in flight has nothing left to apply it to.
+    if let Some(lookup) = node_uid_lookup.take() {
+        lookup.abort();
+    }
 
     // Same finally-style path for both exit reasons: stop background CNI work,
     // detach BPF / maps, then await the listener. Watcher exhaustion must not
