@@ -7676,6 +7676,79 @@ async fn exact_key_binds_client_supplied_correlation_id() {
     );
 }
 
+/// A `correlation_id` value the gateway minted because the client sent none is
+/// unique per request, so binding it would store one entry per request and never
+/// serve one (issue #7130). It is omitted under the same private-provenance rule
+/// `response_caching` uses (issue #3929); a client-supplied value stays bound.
+#[tokio::test]
+async fn exact_key_omits_a_gateway_generated_correlation_id() {
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+    let correlation = CorrelationId::new(&json!({})).unwrap();
+    async fn correlated(correlation: &CorrelationId, client_id: Option<&str>) -> RequestContext {
+        let extra: Vec<(&str, &str)> = client_id
+            .map(|id| vec![("x-request-id", id)])
+            .unwrap_or_default();
+        let mut ctx = partition_ctx(
+            Some(proxy_in_namespace("tenant-a")),
+            "127.0.0.1",
+            None,
+            &extra,
+        );
+        assert!(matches!(
+            correlation.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            correlation.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        ctx.headers = headers;
+        ctx
+    }
+
+    let mut first = correlated(&correlation, None).await;
+    let first_id = first
+        .headers
+        .get("x-request-id")
+        .cloned()
+        .expect("the gateway forwards a generated id");
+    partition_store(&plugin, &mut first).await;
+
+    let mut second = correlated(&correlation, None).await;
+    let second_id = second
+        .headers
+        .get("x-request-id")
+        .cloned()
+        .expect("the gateway forwards a generated id");
+    assert_ne!(first_id, second_id, "each request mints a unique id");
+    assert!(
+        partition_is_hit(&plugin, &mut second).await,
+        "only the gateway-minted correlation id differs, so the completion must replay"
+    );
+
+    // A client-supplied id is a real backend-visible dimension even when the
+    // correlation plugin is configured.
+    let mut client_a = correlated(&correlation, Some("client-chosen-a")).await;
+    assert_eq!(
+        client_a.headers.get("x-request-id").map(String::as_str),
+        Some("client-chosen-a")
+    );
+    partition_store(&plugin, &mut client_a).await;
+    let mut client_b = correlated(&correlation, Some("client-chosen-b")).await;
+    assert!(
+        !partition_is_hit(&plugin, &mut client_b).await,
+        "a client-supplied correlation ID is backend-visible and must partition"
+    );
+    let mut client_a_again = correlated(&correlation, Some("client-chosen-a")).await;
+    assert!(
+        partition_is_hit(&plugin, &mut client_a_again).await,
+        "the same client-supplied correlation ID must still hit"
+    );
+}
+
 /// `rate_limiting` with `expose_headers: true` forwards the caller's current
 /// budget to the backend. `x-ratelimit-remaining` changes on every admitted
 /// request, so binding the limiter's own value made every completion

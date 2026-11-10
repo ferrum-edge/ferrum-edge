@@ -603,6 +603,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `message_start.message.model`, so Anthropic routes echoed whatever the
   endpoint reported while Gemini routes echoed the routed model. Both now
   stamp the claim-committed model; the provider's report is ignored.
+- **`ai_semantic_cache` can hit behind a generating `correlation_id`**
+  (issue #7130). The cache's request-context partition bound the fresh UUID a
+  `correlation_id` instance mints when the client sends no request id, so
+  every request got its own key and the cache stored an entry per request
+  without ever serving one. It now omits that header under the private
+  provenance rule `response_caching` already uses (issue #3929); a
+  client-supplied id is still a key dimension. A gateway-injected
+  `traceparent` from `otel_tracing` is still bound.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

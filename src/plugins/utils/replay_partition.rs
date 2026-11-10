@@ -47,7 +47,8 @@
 //!   `respect_no_cache` is enabled, and single-field zero-length
 //!   `Content-Length`) and, separately, a gateway-minted correlation header
 //!   whose current value still matches private request provenance (issue
-//!   #3929), and the `x-ratelimit-*` telemetry `rate_limiting` forwards under
+//!   #3929; also omitted by the `ai_semantic_cache` request context, issue
+//!   #7130), and the `x-ratelimit-*` telemetry `rate_limiting` forwards under
 //!   `expose_headers` while each value still equals the owning limiter's
 //!   private staging (also omitted by `request_deduplication` fingerprints and
 //!   the `ai_semantic_cache` request context). Client-supplied correlation
@@ -949,12 +950,16 @@ pub fn append_request_context_partition(
 
 /// Append the finalized JSON request context used by `ai_semantic_cache`.
 /// Body framing and coding do not select a semantic neighborhood: the cache
-/// separately binds the parsed, normalized body. The per-request
-/// `x-ratelimit-*` counters a `rate_limiting` instance with `expose_headers`
-/// forwards are omitted while their live value still matches that limiter's
-/// private provenance — they change on every admitted request, so binding them
-/// makes every entry unreachable. Keep every other origin input and the
-/// independent caller/destination partitions intact.
+/// separately binds the parsed, normalized body. Gateway-minted per-request
+/// state is omitted under the same private-provenance rule
+/// `response_caching` uses (`RequestContext::is_gateway_minted_request_header`):
+/// a `correlation_id` value this request's instance generated because the
+/// client sent none (issue #7130), and the `x-ratelimit-*` counters a
+/// `rate_limiting` instance with `expose_headers` forwards while their live
+/// value still matches that limiter's staging. Both change on every request,
+/// so binding them makes every entry unreachable. Client-supplied or rewritten
+/// values stay bound. Keep every other origin input and the independent
+/// caller/destination partitions intact.
 pub fn append_semantic_request_context_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
@@ -963,7 +968,7 @@ pub fn append_semantic_request_context_partition(
     append_filtered_request_context_partition(hasher, ctx, request_headers, |name, value| {
         name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("content-encoding")
-            || ctx.is_gateway_published_rate_limit_header(request_headers, name, value)
+            || ctx.is_gateway_minted_request_header(request_headers, name, value)
     });
 }
 
