@@ -303,7 +303,7 @@ async fn cap_exhaustion_refuses_the_second_physical_dial() {
     );
     drop(outcomes);
     drop(client);
-    pool.clear();
+    pool.force_drain_all();
     // Dropping the client drops its pooled connection, which drops the token.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

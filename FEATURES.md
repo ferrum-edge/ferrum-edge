@@ -243,9 +243,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
   - `TCP_FASTOPEN` on server sockets — saves 1 RTT for repeat clients with cached TFO cookies, configurable queue length (`FERRUM_TCP_FASTOPEN_ENABLED`, `FERRUM_TCP_FASTOPEN_QUEUE_LEN`)
   - `IP_BIND_ADDRESS_NO_PORT` on all outbound sockets (HTTP/2 pool, gRPC pool, TCP stream proxy, HTTP/3 QUIC) — defers ephemeral port allocation to `connect()` for 4-tuple co-selection, preventing port exhaustion under high outbound connection rates
   - **Port exhaustion detection** — EADDRNOTAVAIL errors are classified as `PortExhaustion` across all connection paths, logged at `error` level with remediation guidance, and tracked via a monotonic counter on `GET /overload`
-- **Thread-local Date header caching** — caches the formatted HTTP `Date` value (IMF-fixdate) per-thread with second-granularity refresh, avoiding `SystemTime::now()` + formatting (~100ns) on every response
 - **Lazy timeout initialization** — defers tokio timer wheel allocation until the inner future returns `Pending`, so fast-path operations (e.g., buffered I/O reads that complete immediately) never allocate a timer
-- **TCP_INFO kernel diagnostics** (Linux) — `getsockopt(TCP_INFO)` access for kernel-level RTT, retransmit, and congestion window metrics on stream proxy connections
 
 ## Intelligent Cache & Load Management
 

@@ -32,7 +32,6 @@ pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 pub mod custom_plugins;
 pub mod data_path_metrics;
-pub mod date_cache;
 pub mod diagnostic_ref;
 #[cfg(test)]
 #[path = "../tests/support/diagnostic_interest.rs"]
@@ -87,16 +86,11 @@ pub mod util;
 pub mod xds;
 
 pub use admin::api_specs::ExtractedBundle;
-pub use admin::spec_codec::{compress_gzip, decompress_gzip_capped, sha256_hex};
-pub use config::types::{
-    ApiSpec, AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
-    Proxy, SpecFormat,
-};
+pub use config::types::{BackendScheme, GatewayConfig, HttpFlavor, Proxy};
 pub use consumer_index::ConsumerIndex;
 pub use load_balancer::LoadBalancerCache;
 pub use plugin_cache::{PluginCache, PluginCapabilities};
-pub use proxy::{build_backend_url, build_backend_url_with_target};
-pub use router_cache::{RouteMatch, RouterCache};
+pub use router_cache::RouterCache;
 
 /// Test-only re-exports of crate-private items.
 ///
@@ -1466,15 +1460,6 @@ pub mod _test_support {
         owned_proxy_headers: &mut Option<std::collections::HashMap<String, String>>,
     ) {
         crate::proxy::refresh_initial_backend_gateway_assertion_headers(ctx, owned_proxy_headers);
-    }
-
-    /// Install the route's precomputed credential-header registry so external
-    /// replay-partition tests can exercise stripped custom auth locations.
-    pub fn set_replay_credential_headers_for_test(
-        ctx: &mut crate::plugins::RequestContext,
-        headers: Vec<String>,
-    ) {
-        ctx.set_request_headers_to_redact(Arc::new(headers));
     }
 
     /// Model proxy core's typed backend-dispatch provenance for direct plugin
@@ -5505,41 +5490,25 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::find_listener_proxy(config, proxy_namespace, proxy_id).cloned()
     }
 
-    /// Mirror the TCP accept-loop disconnect summary contract: `duration_ms`
-    /// from process-monotonic `Instant`, RFC3339 connect/disconnect stamps
-    /// from civil/UTC wall clocks only. Used by parity regression tests for
-    /// issue #2624 (WebSocket/UDP/DTLS must match this split).
-    pub fn tcp_stream_summary_from_clocks_for_test(
+    /// The TCP accept loop's disconnect-summary clock fields
+    /// (`tcp_proxy::stream_disconnect_clocks`) as `(duration_ms,
+    /// timestamp_connected, timestamp_disconnected)`. Used by the issue #2624
+    /// parity regression tests (WebSocket/UDP/DTLS must match this split).
+    pub fn tcp_stream_disconnect_clocks_for_test(
         connected_mono: std::time::Instant,
         connected_wall_at: chrono::DateTime<chrono::Utc>,
         disconnected_wall_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::plugins::StreamTransactionSummary {
-        crate::plugins::StreamTransactionSummary {
-            plugin_trigger_decisions: Default::default(),
-            namespace: "ferrum".to_string(),
-            proxy_id: "tcp-proxy".to_string(),
-            proxy_lifecycle_generation: None,
-            proxy_name: Some("TCP Proxy".to_string()),
-            client_ip: "10.0.0.1".to_string(),
-            consumer_username: None,
-            auth_method: None,
-            backend_target: "10.0.0.2:9000".to_string(),
-            backend_resolved_ip: Some("10.0.0.2".to_string()),
-            protocol: "tcp".to_string(),
-            listen_port: 9000,
-            // Production: `connected_at.elapsed().as_millis() as f64`
-            duration_ms: connected_mono.elapsed().as_millis() as f64,
-            bytes_sent: 0,
-            bytes_received: 0,
-            connection_error: None,
-            error_class: None,
-            disconnect_direction: None,
-            disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
-            timestamp_connected: connected_wall_at.to_rfc3339(),
-            timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
-            sni_hostname: None,
-            metadata: Default::default(),
-        }
+    ) -> (f64, String, String) {
+        let clocks = crate::proxy::tcp_proxy::stream_disconnect_clocks(
+            connected_mono,
+            connected_wall_at,
+            disconnected_wall_at,
+        );
+        (
+            clocks.duration_ms,
+            clocks.timestamp_connected,
+            clocks.timestamp_disconnected,
+        )
     }
 
     /// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap a
@@ -6801,18 +6770,16 @@ pub mod _test_support {
         plugin.cache_keys_for_tests()
     }
 
-    /// Apply `response_caching`'s underflow-safe cache-size subtraction to a
-    /// standalone counter so tests can prove a drift larger than the current
-    /// total saturates at `0` instead of wrapping to `usize::MAX`.
-    pub fn response_caching_sub_total_size(total: &std::sync::atomic::AtomicUsize, n: usize) {
-        use std::sync::atomic::Ordering;
-
-        if n == 0 {
-            return;
-        }
-        let _ = total.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(n))
-        });
+    /// Add `add` to, then subtract `sub` from, `response_caching`'s running
+    /// cache-size accountant through its production helpers, so tests can prove
+    /// a drift larger than the current total saturates at `0` instead of
+    /// wrapping to `usize::MAX`.
+    pub fn response_caching_adjust_total_size_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+        add: usize,
+        sub: usize,
+    ) {
+        plugin.adjust_total_size_for_tests(add, sub);
     }
 
     // ── plugins/rate-limit cleanup wrappers (#2316) ──────────────────────────
@@ -7606,7 +7573,7 @@ pub mod _test_support {
     pub use crate::plugins::utils::redis_rate_limiter::{
         MemoryPolicyScreen, ReplaySetNxReplyError, classify_memory_info,
         classify_replay_set_nx_reply, is_cluster_topology_code, is_cluster_topology_error,
-        parse_cluster_enabled, parse_memory_policy_fields,
+        parse_cluster_enabled,
     };
 
     // ── plugins/utils/rate_limit (stable local-state lifecycle, issue #4268) ──
@@ -7916,11 +7883,7 @@ pub mod _test_support {
     }
 
     // ── plugins/utils/rate_limit (Redis failure policy) ──────────────────────
-    pub use crate::plugins::utils::rate_limit::{
-        ENFORCEMENT_UNAVAILABLE_BODY, ENFORCEMENT_UNAVAILABLE_MESSAGE,
-        ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RedisFailurePolicy,
-        parse_redis_failure_policy,
-    };
+    pub use crate::plugins::utils::rate_limit::{RedisFailurePolicy, parse_redis_failure_policy};
 
     /// Redis key a rate-limit window bucket would use, for hash-tag coverage.
     pub fn redis_slot_key(config: RedisConfig, rate_key: &str, suffix: &[&str]) -> String {
@@ -8022,8 +7985,7 @@ pub mod _test_support {
 
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::{
-        DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,
-        SqlReconnectTransitionTestHooks,
+        DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionTestHooks,
     };
     pub use crate::config::db_tls_snapshot::SqlTlsSnapshot;
 
@@ -8080,7 +8042,7 @@ pub mod _test_support {
     pub use crate::config::mongo_store::{
         AdmissionFence as MongoAdmissionFence, AdmissionFenceProbe as MongoAdmissionFenceProbe,
         AdmissionFenceReason as MongoAdmissionFenceReason, MongoReconnectTopology,
-        MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+        MongoReconnectTransitionTestHooks,
     };
 
     // External test crates only: mirror production `config_changes` shapes without
@@ -9832,19 +9794,6 @@ pub mod _test_support {
         .await
     }
 
-    /// Build the log metadata a transaction summary is rendered from, exactly as
-    /// every logger sink does.
-    ///
-    /// This is the production projection (`clone_log_metadata`), not a
-    /// re-implementation, so a test asserting that an internal lifecycle marker
-    /// is absent is asserting on the same redaction pass the operator's
-    /// transaction logs go through.
-    pub fn clone_log_metadata_for_test(
-        ctx: &crate::plugins::RequestContext,
-    ) -> HashMap<String, String> {
-        crate::proxy::clone_log_metadata(ctx).into_iter().collect()
-    }
-
     /// The stamped `Content-Length` a LATER buffered body transform will read
     /// for this response.
     ///
@@ -9852,7 +9801,7 @@ pub mod _test_support {
     /// (`get(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY).and_then(parse)`), so
     /// a test asserting on it is asserting on what the MCP reverse-mapping
     /// transform actually sees. The key is deliberately stripped from transaction
-    /// metadata, so `clone_log_metadata_for_test` cannot answer this.
+    /// metadata, so `clone_log_metadata` cannot answer this.
     pub fn stamped_response_content_length_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<usize> {
@@ -16025,71 +15974,6 @@ pub mod _test_support {
         crate::proxy::body::inspected_streaming_body(rx)
     }
 
-    /// H1/reqwest-style inspection seam: feed decoded body byte chunks through
-    /// a [`ResponseStreamInspector`] into the shared [`inspected_streaming_body`]
-    /// channel that production `run_response_inspection` uses.
-    ///
-    /// Pair with [`inspected_proxy_body_for_test`] (direct-H2 / native-H3
-    /// `run_proxy_body_response_inspection`) so external tests can prove an
-    /// attached inspector is driven on every HTTP body variant without standing
-    /// up a separate server framework.
-    pub fn inspected_byte_chunks_body_for_test(
-        chunks: Vec<bytes::Bytes>,
-        mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
-    ) -> crate::proxy::ProxyBody {
-        use crate::plugins::ResponseStreamAction;
-        use http_body::Frame;
-
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
-            for chunk in chunks {
-                if tx.is_closed() {
-                    return;
-                }
-                let action = tokio::select! {
-                    biased;
-                    _ = tx.closed() => return,
-                    action = inspector.on_chunk(&chunk) => action,
-                };
-                match action {
-                    ResponseStreamAction::Forward(out) => {
-                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                            return;
-                        }
-                    }
-                    ResponseStreamAction::Terminate(final_bytes) => {
-                        if let Some(fb) = final_bytes
-                            && !fb.is_empty()
-                        {
-                            let _ = tx.send(Ok(Frame::data(fb))).await;
-                        }
-                        return;
-                    }
-                }
-            }
-            let action = tokio::select! {
-                biased;
-                _ = tx.closed() => return,
-                action = inspector.on_end() => action,
-            };
-            match action {
-                ResponseStreamAction::Forward(out) => {
-                    if !out.is_empty() {
-                        let _ = tx.send(Ok(Frame::data(out))).await;
-                    }
-                }
-                ResponseStreamAction::Terminate(final_bytes) => {
-                    if let Some(fb) = final_bytes
-                        && !fb.is_empty()
-                    {
-                        let _ = tx.send(Ok(Frame::data(fb))).await;
-                    }
-                }
-            }
-        });
-        crate::proxy::body::inspected_streaming_body(rx)
-    }
-
     /// Build one standards-correct AWS event-stream message for external
     /// gateway tests without exposing a production message-construction API.
     ///
@@ -18946,8 +18830,8 @@ pub mod _test_support {
     // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────
 
     pub use crate::k8s_controller::reconciler::{
-        AcceptedK8sOverlay, merge_k8s_translation, publish_k8s_reconcile,
-        store_accepted_k8s_overlay, swap_merged_k8s_translation,
+        merge_k8s_translation, publish_k8s_reconcile, store_accepted_k8s_overlay,
+        swap_merged_k8s_translation,
     };
     pub use crate::k8s_controller::{
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
@@ -19006,9 +18890,7 @@ pub mod _test_support {
 
     // ── K8s controller shutdown supervision (#3220) ─────────────────────────
 
-    pub use crate::k8s_controller::{
-        K8sControllerHandle, K8sControllerShutdownOutcome, K8sControllerTaskFailure,
-    };
+    pub use crate::k8s_controller::K8sControllerHandle;
 
     /// Test-only view of the crate-private controller task registry.
     ///

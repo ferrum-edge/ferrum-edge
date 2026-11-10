@@ -18003,7 +18003,7 @@ async fn configured_server_headers_authenticate_every_upstream_request_and_clien
     );
 
     let (mut ctx, mut headers) = mcp_ctx(create_pr_tools_call(991));
-    ferrum_edge::_test_support::set_replay_credential_headers_for_test(
+    ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
         &mut ctx,
         vec!["x-api-key".to_string()],
     );
@@ -18661,7 +18661,7 @@ async fn final_backend_header_policy_reasserts_the_selected_servers_credential_b
     let _ = aggregate_tool_names(&plugin, &session_id, 1060).await;
 
     let (mut ctx, mut headers) = mcp_ctx(create_pr_tools_call(1061));
-    ferrum_edge::_test_support::set_replay_credential_headers_for_test(
+    ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
         &mut ctx,
         vec!["x-api-key".to_string()],
     );

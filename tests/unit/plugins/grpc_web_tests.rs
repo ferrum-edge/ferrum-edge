@@ -4841,7 +4841,7 @@ async fn staged_request_trailers_are_omitted_from_transaction_summaries() {
         "native trailer delivery must be unaffected"
     );
 
-    let log_metadata = ferrum_edge::_test_support::clone_log_metadata_for_test(&ctx);
+    let log_metadata = ferrum_edge::_test_support::clone_log_metadata(&ctx);
     assert!(
         !log_metadata.contains_key("grpc_web.request_trailers"),
         "the staging container must not reach a transaction summary"

@@ -721,12 +721,24 @@ fn algorithm_port_override_without_hash_on_clears_upstream_hash_strategy() {
         HashOnStrategy::Cookie("srv".to_string())
     );
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "ferrum", "u1", 8080),
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            Some(8080),
+            None,
+        ),
         HashOnStrategy::Ip,
         "switching a port to a non-hash algorithm should clear upstream sticky hash state"
     );
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "ferrum", "u1", 9090),
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            Some(9090),
+            None,
+        ),
         HashOnStrategy::Cookie("srv".to_string()),
         "ports without an override should keep the upstream strategy"
     );
@@ -756,7 +768,13 @@ fn non_algorithm_port_override_inherits_upstream_algorithm_and_hash_strategy() {
     let snapshot = cache.load();
 
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "ferrum", "u1", 8080),
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            Some(8080),
+            None,
+        ),
         HashOnStrategy::Header("x-user-id".to_string()),
         "non-LB port overrides should inherit upstream sticky hash state"
     );
@@ -808,7 +826,13 @@ fn consistent_hash_port_override_without_hash_on_preserves_upstream_hash_strateg
     let snapshot = cache.load();
 
     assert_eq!(
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(&snapshot, "ferrum", "u1", 8080),
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            Some(8080),
+            None,
+        ),
         HashOnStrategy::Cookie("srv".to_string()),
         "a consistent-hash port override should inherit the upstream hash key when none is set"
     );
@@ -1130,23 +1154,23 @@ fn port_passive_override_without_max_ejection_does_not_inherit_upstream_cap() {
     let snapshot = cache.load();
 
     assert_eq!(
-        LoadBalancerCache::max_ejection_percent_for_port_from(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
             &snapshot,
             "ferrum",
             "u1",
             &config.proxies[0],
-            8080,
+            Some(8080),
         ),
         None,
         "a port-level passive-health override owns the port cap even when it omits max_ejection_percent"
     );
     assert_eq!(
-        LoadBalancerCache::max_ejection_percent_for_port_from(
+        LoadBalancerCache::max_ejection_percent_resolved_from(
             &snapshot,
             "ferrum",
             "u1",
             &config.proxies[0],
-            9090,
+            Some(9090),
         ),
         Some(25),
         "ports without a passive override should still inherit the upstream cap"
@@ -2240,7 +2264,7 @@ fn per_port_consistent_hash_overrides_upstream_round_robin() {
         UpstreamPortOverride {
             algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
             // No per-port hash_on: inherits the upstream's `hash_on` key
-            // (cookie:srv) via `get_hash_on_strategy_for_port_from` semantics.
+            // (cookie:srv) via `get_hash_on_strategy_for_selection_from` semantics.
             ..Default::default()
         },
     );

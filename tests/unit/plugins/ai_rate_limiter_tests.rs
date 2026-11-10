@@ -8062,10 +8062,10 @@ async fn malformed_and_truncated_stream_frames_apply_the_policy_exactly_once() {
 //
 // Production attaches the limiter inspector through the shared factory, then
 // drives it via protocol-specific body seams:
-//   * H1/reqwest → byte chunks into `inspected_streaming_body`
+//   * H1/reqwest → `run_response_inspection` into `inspected_streaming_body`
 //   * direct H2 / native H3 → `run_proxy_body_response_inspection`
-// These tests reuse those harnesses (`inspected_byte_chunks_body_for_test` /
-// `inspected_proxy_body_for_test`) rather than standing up a server, and prove
+// These tests reuse those harnesses (`reqwest_inspected_response_body_for_test`
+// / `inspected_proxy_body_for_test`) rather than standing up a server, and prove
 // the attached `ai_rate_limiter` inspector is actually driven and terminally
 // reconciled — not merely that source wiring mentions the inspector.
 
@@ -8130,7 +8130,14 @@ async fn drive_gateway_stream_variant(
     let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
     let inspected = match variant {
         GatewayStreamBodyVariant::H1 => {
-            ferrum_edge::_test_support::inspected_byte_chunks_body_for_test(chunks, inspector)
+            // The production reqwest inspection task reads `'static` chunks.
+            let chunks: Vec<&'static [u8]> = chunks
+                .into_iter()
+                .map(|chunk| &*Box::leak(chunk.to_vec().into_boxed_slice()))
+                .collect();
+            ferrum_edge::_test_support::reqwest_inspected_response_body_for_test(
+                &chunks, inspector, 0,
+            )
         }
         GatewayStreamBodyVariant::H2 => {
             let frames = chunks

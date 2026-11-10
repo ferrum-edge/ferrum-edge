@@ -15,8 +15,8 @@ use ferrum_edge::_test_support::{
     response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     retry_response_decision_context_for_test, run_after_proxy_hooks_for_test,
-    run_after_proxy_hooks_reject_for_test, set_replay_credential_headers_for_test,
-    set_replay_request_body_empty_proven_for_test, set_request_wire_protocol_for_test,
+    run_after_proxy_hooks_reject_for_test, set_replay_request_body_empty_proven_for_test,
+    set_request_headers_to_redact_for_test, set_request_wire_protocol_for_test,
     set_response_presentation_policy_digest_for_test, stamp_original_response_metadata_for_test,
 };
 use ferrum_edge::config::types::{Consumer, HttpWireTransport};
@@ -4219,27 +4219,30 @@ fn test_parse_http_date_accepts_all_rfc9110_formats() {
 /// saturating subtraction floors at 0 instead.
 #[test]
 fn test_sub_total_size_saturates_instead_of_wrapping() {
-    use ferrum_edge::_test_support::response_caching_sub_total_size as sub;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use ferrum_edge::_test_support::{
+        response_caching_adjust_total_size_for_test as adjust,
+        response_caching_current_total_size_for_test as total,
+    };
 
-    let total = AtomicUsize::new(100);
+    let plugin = default_plugin();
+    adjust(&plugin, 100, 0);
+    assert_eq!(total(&plugin), 100);
 
     // Subtracting more than the current total must floor at 0, not wrap.
-    sub(&total, 250);
+    adjust(&plugin, 0, 250);
     assert_eq!(
-        total.load(Ordering::Relaxed),
+        total(&plugin),
         0,
         "underflow must saturate at 0, not wrap to usize::MAX"
     );
 
     // Subtracting from 0 stays at 0.
-    sub(&total, 10);
-    assert_eq!(total.load(Ordering::Relaxed), 0);
+    adjust(&plugin, 0, 10);
+    assert_eq!(total(&plugin), 0);
 
     // Normal subtraction still works.
-    total.store(100, Ordering::Relaxed);
-    sub(&total, 40);
-    assert_eq!(total.load(Ordering::Relaxed), 60);
+    adjust(&plugin, 100, 40);
+    assert_eq!(total(&plugin), 60);
 }
 
 /// Finding #62: under many concurrent stores plus interleaved invalidations
@@ -6704,7 +6707,7 @@ fn ctx_with_stripped_custom_credential(token: &str) -> RequestContext {
     );
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     ctx.authenticated_identity = Some("alice@example.com".to_string());
-    set_replay_credential_headers_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
+    set_request_headers_to_redact_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
     let mut raw = http::HeaderMap::new();
     raw.insert(
         "x-tenant-jwt",

@@ -946,6 +946,42 @@ fn mid_stream_unusable_snapshot_and_delta_rejection_force_resync() {
     assert_eq!(state.backoff_secs, BACKOFF_INITIAL_SECS);
 }
 
+/// The decision seams above only constrain the client if it acts on them: the
+/// DP client must end the stream through the returned disposition (an
+/// exhaustive `match`), never discard it and hard-code the outcome.
+#[test]
+fn dp_client_acts_on_the_stream_disposition_decisions() {
+    for discarded in [
+        "let _ = delta_rejection_stream_disposition(",
+        "let _ = snapshot_failure_stream_disposition(",
+    ] {
+        assert!(
+            !DP_CLIENT_SOURCE.contains(discarded),
+            "the DP client must not discard a stream disposition: {discarded}"
+        );
+    }
+    assert!(DP_CLIENT_SOURCE.contains("match delta_rejection_stream_disposition(kind) {"));
+    assert!(
+        DP_CLIENT_SOURCE
+            .contains("match snapshot_failure_stream_disposition(subscription_base_applied) {")
+    );
+    let compact: String = DP_CLIENT_SOURCE
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for kind in [
+        "DeltaRejectionKind::ParseFailure",
+        "DeltaRejectionKind::InvalidTrustSideChannel",
+        "DeltaRejectionKind::NonEmptyApplyRejected",
+    ] {
+        let site = format!("react_to_rejected_delta({kind})");
+        assert!(
+            compact.contains(&site),
+            "every delta rejection kind must end the stream through its disposition: {site}"
+        );
+    }
+}
+
 #[test]
 fn rejected_resync_payload_marks_cp_authority_lost() {
     // Issue #3726: a CP that repeatedly sends unusable payloads after an

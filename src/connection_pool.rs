@@ -749,12 +749,6 @@ impl ConnectionPool {
         Box::pin(async move { self.get_tls_config_for_backend(&proxy).await })
     }
 
-    /// Clear all pooled connections.
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        self.pool.clear();
-    }
-
     pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {
         let manager = self.pool.manager();
         manager
@@ -792,18 +786,4 @@ pub struct PoolStats {
     pub entries_per_host: HashMap<String, usize>,
     pub max_idle_per_host: usize,
     pub idle_timeout_seconds: u64,
-}
-
-impl std::fmt::Display for PoolStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Connection Pool Statistics:")?;
-        writeln!(f, "  Total pooled connections: {}", self.total_pools)?;
-        writeln!(f, "  Max idle per host: {}", self.max_idle_per_host)?;
-        writeln!(f, "  Idle timeout: {}s", self.idle_timeout_seconds)?;
-        writeln!(f, "  Connections per host:")?;
-        for (host, count) in &self.entries_per_host {
-            writeln!(f, "    {}: {}", host, count)?;
-        }
-        Ok(())
-    }
 }

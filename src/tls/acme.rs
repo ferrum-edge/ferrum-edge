@@ -229,12 +229,17 @@ pub struct AcmeOrderFinalization {
     csr_der_base64: String,
 }
 
-/// Fixed, redacted diagnostic for unusable finalization material.
+/// Unusable finalization material: the one content-free failure every
+/// [`AcmeOrderFinalization`] check returns.
 ///
-/// Deliberately content-free: the caller knows which order it was driving, and
-/// anything derived from the key or the CSR would be a disclosure.
-const UNUSABLE_FINALIZATION_MATERIAL: &str =
-    "ACME order finalization material is missing or unusable";
+/// Deliberately carries nothing: the caller knows which order it was driving,
+/// and anything derived from the key or the CSR would be a disclosure. Store
+/// and Admin callers that know the order surface it as
+/// [`AcmeError::UnusableFinalizationMaterial`], the single store-level variant
+/// for this failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("ACME order finalization material is missing or unusable")]
+pub struct UnusableFinalization;
 
 impl AcmeOrderFinalization {
     /// Generate a fresh key and a CSR covering exactly `domains`.
@@ -242,15 +247,14 @@ impl AcmeOrderFinalization {
     /// Mirrors what `instant_acme::Order::finalize()` would have generated
     /// internally (SANs from the order identifiers, empty distinguished name),
     /// except that it happens early enough to be persisted first.
-    pub fn generate(domains: &[String]) -> Result<Self, AcmeError> {
-        let mut params = rcgen::CertificateParams::new(domains.to_vec())
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+    pub fn generate(domains: &[String]) -> Result<Self, UnusableFinalization> {
+        let mut params =
+            rcgen::CertificateParams::new(domains.to_vec()).map_err(|_| UnusableFinalization)?;
         params.distinguished_name = rcgen::DistinguishedName::new();
-        let key_pair = rcgen::KeyPair::generate()
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+        let key_pair = rcgen::KeyPair::generate().map_err(|_| UnusableFinalization)?;
         let csr = params
             .serialize_request(&key_pair)
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+            .map_err(|_| UnusableFinalization)?;
         Self::from_parts(key_pair.serialize_pem(), csr.der().as_ref(), domains)
     }
 
@@ -260,7 +264,7 @@ impl AcmeOrderFinalization {
         key_pem: String,
         csr_der: &[u8],
         domains: &[String],
-    ) -> Result<Self, AcmeError> {
+    ) -> Result<Self, UnusableFinalization> {
         let material = Self {
             key_pem,
             csr_der_base64: BASE64_STANDARD.encode(csr_der),
@@ -278,14 +282,14 @@ impl AcmeOrderFinalization {
     ///
     /// Fails closed on corrupt material or a CSR that does not exactly match
     /// `domains`. Never regenerates anything.
-    pub fn csr_der(&self, domains: &[String]) -> Result<Vec<u8>, AcmeError> {
+    pub fn csr_der(&self, domains: &[String]) -> Result<Vec<u8>, UnusableFinalization> {
         validate_persisted_finalization_package(&self.key_pem, &self.csr_der_base64, domains)
     }
 
     /// Reject material that cannot later be used, at the store boundary and
     /// every network entrypoint, so a corrupt package cannot be written or
     /// drive a directory request.
-    pub fn validate(&self, domains: &[String]) -> Result<(), AcmeError> {
+    pub fn validate(&self, domains: &[String]) -> Result<(), UnusableFinalization> {
         self.csr_der(domains).map(|_| ())
     }
 }
@@ -299,13 +303,13 @@ impl AcmeOrderFinalization {
 /// domains (wildcards included). Multiple keys, malformed trailing PEM input,
 /// non-DNS SANs, duplicate DNS SANs, duplicate SAN extensions, and domain
 /// ambiguity fail closed. Errors never carry key, CSR, derived bytes, domains,
-/// or parse detail — only [`UNUSABLE_FINALIZATION_MATERIAL`].
+/// or parse detail — only [`UnusableFinalization`].
 fn validate_persisted_finalization_package(
     key_pem: &str,
     csr_der_base64: &str,
     domains: &[String],
-) -> Result<Vec<u8>, AcmeError> {
-    let unusable = || AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string());
+) -> Result<Vec<u8>, UnusableFinalization> {
+    let unusable = || UnusableFinalization;
     if key_pem.trim().is_empty() || csr_der_base64.trim().is_empty() {
         return Err(unusable());
     }
@@ -468,7 +472,7 @@ pub struct AcmeIssuedCertificateInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct AcmeHttp01OrderInput {
+pub struct AcmeOrderInput {
     pub id: String,
     pub certificate_id: Option<String>,
     pub domains: Vec<String>,
@@ -1035,7 +1039,9 @@ impl AcmeOrderStore {
         validate_tls_alpn01_challenges(&record.tls_alpn01_challenges)?;
         validate_dns01_challenges(&record.dns01_challenges)?;
         if let Some(finalization) = record.finalization.as_ref() {
-            finalization.validate(&record.domains)?;
+            finalization
+                .validate(&record.domains)
+                .map_err(|_| AcmeError::UnusableFinalizationMaterial(record.id.clone()))?;
         }
         let terminal_history = self.terminal_history;
         let outcome = self.file.mutate(move |document| {
@@ -1432,7 +1438,7 @@ impl AcmeCertificateRecord {
 }
 
 impl AcmeOrderRecord {
-    pub fn new_http01(input: AcmeHttp01OrderInput) -> Result<Self, AcmeError> {
+    pub fn new(input: AcmeOrderInput) -> Result<Self, AcmeError> {
         validate_acme_domains(&input.domains)?;
         if let Some(certificate_id) = input.certificate_id.as_deref() {
             validate_acme_id(certificate_id)?;
@@ -1441,7 +1447,9 @@ impl AcmeOrderRecord {
         validate_tls_alpn01_challenges(&input.tls_alpn01_challenges)?;
         validate_dns01_challenges(&input.dns01_challenges)?;
         if let Some(finalization) = input.finalization.as_ref() {
-            finalization.validate(&input.domains)?;
+            finalization
+                .validate(&input.domains)
+                .map_err(|_| AcmeError::UnusableFinalizationMaterial(input.id.clone()))?;
         }
         let now = Utc::now();
         Ok(Self {
@@ -3933,7 +3941,7 @@ async fn prepare_renewal_order(
         }
     }
 
-    AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    AcmeOrderRecord::new(AcmeOrderInput {
         id: format!("renew-{}", Uuid::new_v4().simple()),
         certificate_id: Some(certificate.id.clone()),
         domains: prepared.domains,
@@ -3974,8 +3982,8 @@ pub(crate) async fn resolve_renewal_completion_result(
     order_store: &Arc<AcmeOrderStore>,
     keeper: &crate::tls::lease::RenewalLeaseKeeper,
     order: &AcmeOrderRecord,
-    result: Result<client::CompletedAcmeHttp01Order, RenewalCompletionError>,
-) -> Result<Option<client::CompletedAcmeHttp01Order>, AcmeError> {
+    result: Result<client::CompletedAcmeOrder, RenewalCompletionError>,
+) -> Result<Option<client::CompletedAcmeOrder>, AcmeError> {
     let error = match result {
         Ok(completed) => return Ok(Some(completed)),
         Err(RenewalCompletionError::Preparation(error)) => return Err(error),
@@ -4005,7 +4013,7 @@ async fn complete_prepared_renewal_order(
     order: &AcmeOrderRecord,
     challenge_type: AcmeRenewalChallengeType,
     config: &AcmeRenewalSchedulerConfig,
-) -> Result<client::CompletedAcmeHttp01Order, RenewalCompletionError> {
+) -> Result<client::CompletedAcmeOrder, RenewalCompletionError> {
     let account_credentials_json = order
         .account_credentials_json
         .clone()
@@ -4025,7 +4033,7 @@ async fn complete_prepared_renewal_order(
     finalization
         .validate(&order.domains)
         .map_err(|_| AcmeError::UnusableFinalizationMaterial(order.id.clone()))?;
-    let complete_config = client::CompleteAcmeHttp01OrderConfig {
+    let complete_config = client::CompleteAcmeOrderConfig {
         directory_url: order.directory_url.clone(),
         account_credentials_json: crate::tls::source::SecretString::new(account_credentials_json),
         order_url,
@@ -4220,26 +4228,26 @@ pub mod client {
     }
 
     #[derive(Debug, Clone, Serialize)]
-    pub struct AcmeHttp01Challenge {
+    pub struct AcmeChallenge {
         pub identifier: String,
         pub token: String,
         pub key_authorization: String,
     }
 
     #[derive(Debug, Clone)]
-    pub struct PreparedAcmeHttp01Order {
+    pub struct PreparedAcmeOrder {
         pub domains: Vec<String>,
         pub order_url: String,
         pub account_id: String,
         pub account_credentials_json: SecretString,
-        pub challenges: Vec<AcmeHttp01Challenge>,
+        pub challenges: Vec<AcmeChallenge>,
         /// Generated before the order was created with the CA, so persisting the
         /// prepared order also persists everything finalization will need.
         pub finalization: super::AcmeOrderFinalization,
     }
 
     #[derive(Clone)]
-    pub struct CompleteAcmeHttp01OrderConfig {
+    pub struct CompleteAcmeOrderConfig {
         pub directory_url: String,
         pub account_credentials_json: SecretString,
         pub order_url: String,
@@ -4255,19 +4263,10 @@ pub mod client {
     }
 
     #[derive(Debug, Clone)]
-    pub struct CompletedAcmeHttp01Order {
+    pub struct CompletedAcmeOrder {
         pub cert_pem: String,
         pub key_pem: String,
     }
-
-    pub type AcmeTlsAlpn01Challenge = AcmeHttp01Challenge;
-    pub type PreparedAcmeTlsAlpn01Order = PreparedAcmeHttp01Order;
-    pub type CompleteAcmeTlsAlpn01OrderConfig = CompleteAcmeHttp01OrderConfig;
-    pub type CompletedAcmeTlsAlpn01Order = CompletedAcmeHttp01Order;
-    pub type AcmeDns01Challenge = AcmeHttp01Challenge;
-    pub type PreparedAcmeDns01Order = PreparedAcmeHttp01Order;
-    pub type CompleteAcmeDns01OrderConfig = CompleteAcmeHttp01OrderConfig;
-    pub type CompletedAcmeDns01Order = CompletedAcmeHttp01Order;
 
     #[derive(Debug, Error)]
     pub enum AcmeClientError {
@@ -4730,19 +4729,19 @@ pub mod client {
 
     pub async fn prepare_http01_order(
         config: AcmeOrderConfig,
-    ) -> Result<PreparedAcmeHttp01Order, AcmeClientError> {
+    ) -> Result<PreparedAcmeOrder, AcmeClientError> {
         prepare_order(config, ChallengeType::Http01, "http-01").await
     }
 
     pub async fn prepare_tls_alpn01_order(
         config: AcmeOrderConfig,
-    ) -> Result<PreparedAcmeTlsAlpn01Order, AcmeClientError> {
+    ) -> Result<PreparedAcmeOrder, AcmeClientError> {
         prepare_order(config, ChallengeType::TlsAlpn01, "tls-alpn-01").await
     }
 
     pub async fn prepare_dns01_order(
         config: AcmeOrderConfig,
-    ) -> Result<PreparedAcmeDns01Order, AcmeClientError> {
+    ) -> Result<PreparedAcmeOrder, AcmeClientError> {
         prepare_order(config, ChallengeType::Dns01, "dns-01").await
     }
 
@@ -4750,7 +4749,7 @@ pub mod client {
         config: AcmeOrderConfig,
         challenge_type: ChallengeType,
         challenge_name: &'static str,
-    ) -> Result<PreparedAcmeHttp01Order, AcmeClientError> {
+    ) -> Result<PreparedAcmeOrder, AcmeClientError> {
         let endpoint_policy = super::AcmeEndpointPolicy::new(&config.account.directory_url)
             .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let domains = normalize_order_domains(config.domains)?;
@@ -4793,14 +4792,14 @@ pub mod client {
                 .validate_endpoint(&challenge.url, "challenge URL")
                 .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
             let key_authorization = challenge.key_authorization();
-            challenges.push(AcmeHttp01Challenge {
+            challenges.push(AcmeChallenge {
                 identifier: challenge.identifier().to_string(),
                 token: challenge.token.clone(),
                 key_authorization: key_authorization.as_str().to_string(),
             });
         }
 
-        Ok(PreparedAcmeHttp01Order {
+        Ok(PreparedAcmeOrder {
             domains,
             order_url,
             account_id: account.account.id().to_string(),
@@ -4811,20 +4810,20 @@ pub mod client {
     }
 
     pub async fn complete_http01_order(
-        config: CompleteAcmeHttp01OrderConfig,
-    ) -> Result<CompletedAcmeHttp01Order, AcmeClientError> {
+        config: CompleteAcmeOrderConfig,
+    ) -> Result<CompletedAcmeOrder, AcmeClientError> {
         complete_order(config, ChallengeType::Http01, "http-01").await
     }
 
     pub async fn complete_tls_alpn01_order(
-        config: CompleteAcmeTlsAlpn01OrderConfig,
-    ) -> Result<CompletedAcmeTlsAlpn01Order, AcmeClientError> {
+        config: CompleteAcmeOrderConfig,
+    ) -> Result<CompletedAcmeOrder, AcmeClientError> {
         complete_order(config, ChallengeType::TlsAlpn01, "tls-alpn-01").await
     }
 
     pub async fn complete_dns01_order(
-        config: CompleteAcmeDns01OrderConfig,
-    ) -> Result<CompletedAcmeDns01Order, AcmeClientError> {
+        config: CompleteAcmeOrderConfig,
+    ) -> Result<CompletedAcmeOrder, AcmeClientError> {
         complete_order(config, ChallengeType::Dns01, "dns-01").await
     }
 
@@ -4958,10 +4957,10 @@ pub mod client {
     /// read from the material preparation already persisted, so every path
     /// returns the one key the certificate is actually issued against.
     async fn complete_order(
-        config: CompleteAcmeHttp01OrderConfig,
+        config: CompleteAcmeOrderConfig,
         challenge_type: ChallengeType,
         challenge_name: &'static str,
-    ) -> Result<CompletedAcmeHttp01Order, AcmeClientError> {
+    ) -> Result<CompletedAcmeOrder, AcmeClientError> {
         let endpoint_policy = super::AcmeEndpointPolicy::new(&config.directory_url)
             .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let order_url = config.order_url.trim();
@@ -5081,7 +5080,7 @@ pub mod client {
             AcmeClientError::Client("ACME completion produced no certificate".to_string())
         })?;
 
-        Ok(CompletedAcmeHttp01Order { cert_pem, key_pem })
+        Ok(CompletedAcmeOrder { cert_pem, key_pem })
     }
 
     struct ResolvedAccount {
@@ -5660,7 +5659,7 @@ pub mod client {
 
         #[tokio::test]
         async fn renewal_completion_uses_credential_and_persisted_order_boundary() {
-            let config = CompleteAcmeHttp01OrderConfig {
+            let config = CompleteAcmeOrderConfig {
                 directory_url: "https://acme.example/directory".to_string(),
                 account_credentials_json: SecretString::new(
                     serde_json::json!({
@@ -5695,7 +5694,7 @@ pub mod client {
         /// instead means the check ran first.
         #[tokio::test]
         async fn unusable_finalization_material_fails_before_any_network_call() {
-            let config = CompleteAcmeHttp01OrderConfig {
+            let config = CompleteAcmeOrderConfig {
                 directory_url: "https://acme.example/directory".to_string(),
                 account_credentials_json: SecretString::new(
                     serde_json::json!({
@@ -6151,7 +6150,7 @@ mod tests {
     fn order_store_serves_pending_http01_challenge() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = AcmeOrderStore::open(dir.path()).expect("open order store");
-        let record = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let record = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],
@@ -6192,7 +6191,7 @@ mod tests {
 
     #[test]
     fn order_store_rejects_malformed_http01_token() {
-        let error = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let error = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: None,
             domains: vec!["example.com".to_string()],
@@ -6220,7 +6219,7 @@ mod tests {
     fn order_store_serves_pending_tls_alpn01_challenge() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = AcmeOrderStore::open(dir.path()).expect("open order store");
-        let record = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let record = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],
@@ -6260,7 +6259,7 @@ mod tests {
 
     #[test]
     fn order_summary_exposes_dns01_txt_record() {
-        let record = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let record = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["*.example.com".to_string()],
@@ -6309,7 +6308,7 @@ mod tests {
     fn latest_order_for_certificate_selects_newest_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = AcmeOrderStore::open(dir.path()).expect("open order store");
-        let older = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let older = AcmeOrderRecord::new(AcmeOrderInput {
             id: "older-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],
@@ -6327,7 +6326,7 @@ mod tests {
         .expect("older order");
         store.upsert_order(older, false).expect("upsert older");
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let newer = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let newer = AcmeOrderRecord::new(AcmeOrderInput {
             id: "newer-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],
@@ -6373,7 +6372,7 @@ mod tests {
         certificate_store
             .upsert_certificate(certificate, false)
             .expect("upsert certificate");
-        let order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let order = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: vec!["example.com".to_string()],

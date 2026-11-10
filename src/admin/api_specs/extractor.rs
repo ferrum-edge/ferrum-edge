@@ -5071,12 +5071,12 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
                         "malformed percent-encoding in $ref '{reference}'"
                     )));
                 }
-                let hi = hex_nibble(bytes[index + 1]).ok_or_else(|| {
+                let hi = crate::util::hex_nibble(bytes[index + 1]).ok_or_else(|| {
                     schema_reference_error(format!(
                         "malformed percent-encoding in $ref '{reference}'"
                     ))
                 })?;
-                let lo = hex_nibble(bytes[index + 2]).ok_or_else(|| {
+                let lo = crate::util::hex_nibble(bytes[index + 2]).ok_or_else(|| {
                     schema_reference_error(format!(
                         "malformed percent-encoding in $ref '{reference}'"
                     ))
@@ -5093,15 +5093,6 @@ fn decode_uri_fragment(raw: &str, reference: &str) -> Result<String, ExtractErro
     String::from_utf8(out).map_err(|_| {
         schema_reference_error(format!("malformed percent-encoding in $ref '{reference}'"))
     })
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn is_json_pointer_fragment(decoded: &str) -> bool {

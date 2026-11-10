@@ -369,25 +369,11 @@ impl InventoryEntryBuilder {
 /// "no recorded failure" means the last validated owner accepted it. A recorded
 /// watcher/rebuild failure for the same configured source identity downgrades
 /// the entry without re-reading a single byte.
+/// State for a source this scope does not load (private keys and JWKS under
+/// [`InventoryScope::PublicMetadata`]): the last recorded source failure, if
+/// any. OCSP is always loaded, so a runtime-dropped staple is reported by
+/// `apply_dropped_staple_state` on the loaded path instead.
 fn populate_entry_from_reload_state(entry: &mut TlsInventoryEntry) {
-    // A staple retired at runtime is a serving-state fact, not a source-read
-    // fact, so the metrics scope — which never materializes OCSP bytes — must
-    // report it here too (issue #4505). There is no loaded `nextUpdate` to
-    // compare against on this path, so any recorded drop for this configured
-    // source applies until a later accepted load clears it.
-    if entry.material_kind == "ocsp"
-        && crate::tls::ocsp_recheck::dropped_staple_next_update(&entry.source.identifier).is_some()
-    {
-        entry.state = TlsInventoryState::Invalid;
-        entry.error = Some(
-            "stapled OCSP response was dropped at runtime after expiry or tracking-capacity \
-             retirement; refresh or reload the source to attach a tracked staple"
-                .to_string(),
-        );
-        entry.next_update = None;
-        entry.days_until_next_update = None;
-        return;
-    }
     let Some(failure) = crate::tls::events::latest_source_failure(&entry.source.identifier) else {
         return;
     };

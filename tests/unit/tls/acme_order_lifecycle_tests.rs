@@ -13,8 +13,8 @@
 
 use ferrum_edge::tls::acme::{
     AcmeAccountStore, AcmeCertificateRecord, AcmeCertificateStore, AcmeError,
-    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeIssuedCertificateInput,
-    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore, completed_finalize,
+    AcmeHttp01ChallengeRecord, AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderInput,
+    AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore, completed_finalize,
     order_produced_certificate, order_replacement_refusal, renewal_account_credentials,
 };
 
@@ -38,7 +38,7 @@ fn domains() -> Vec<String> {
 /// An order carrying real key/CSR material, the shape every finalizable order
 /// has.
 fn order(id: &str, certificate_id: Option<&str>, status: AcmeOrderStatus) -> AcmeOrderRecord {
-    AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    AcmeOrderRecord::new(AcmeOrderInput {
         id: id.to_string(),
         certificate_id: certificate_id.map(str::to_string),
         domains: domains(),

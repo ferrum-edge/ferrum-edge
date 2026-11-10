@@ -2438,9 +2438,16 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        crate::fips::base_crypto_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        // rustls asks on every ClientHello. The base provider is fixed at
+        // compile time, so resolve its schemes once instead of building a
+        // provider (and its suite and group `Vec`s) per handshake.
+        static SCHEMES: std::sync::LazyLock<Vec<rustls::SignatureScheme>> =
+            std::sync::LazyLock::new(|| {
+                crate::fips::base_crypto_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            });
+        SCHEMES.clone()
     }
 }
 
@@ -2757,15 +2764,6 @@ mod tests {
         assert!(identity.is_svid_rotating());
     }
 
-    fn new_test_client_config() -> rustls::ClientConfig {
-        let provider = Arc::new(crate::fips::base_crypto_provider());
-        rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("default protocol versions")
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth()
-    }
-
     fn new_test_server_config() -> rustls::ServerConfig {
         let key_pair =
             rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
@@ -2787,25 +2785,6 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(certs, private_key)
             .expect("server cert")
-    }
-
-    #[test]
-    fn apply_client_session_resumption_compiles_and_runs() {
-        let mut config = new_test_client_config();
-        apply_client_session_resumption(&mut config, None, &[]);
-    }
-
-    #[test]
-    fn apply_client_session_resumption_with_policy() {
-        let policy = TlsPolicy {
-            protocol_versions: vec![&rustls::version::TLS13],
-            crypto_provider: Arc::new(crate::fips::base_crypto_provider()),
-            prefer_server_cipher_order: false,
-            session_cache_size: 123,
-            early_data_max_size: 0,
-        };
-        let mut config = new_test_client_config();
-        apply_client_session_resumption(&mut config, Some(&policy), &[]);
     }
 
     #[tokio::test]

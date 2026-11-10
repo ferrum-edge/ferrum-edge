@@ -42,13 +42,13 @@ use super::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_TCP_KEEPALIVE_SECS,
     ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics, ConfigSyncStreamTimings,
-    DeltaRejectionKind, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
-    MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
-    advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
-    check_config_sync_build_identity, check_peer_version_compatibility, config_sync_build_identity,
-    connection_error_outcome, delta_rejection_stream_disposition,
-    evaluate_delta_against_subscription_base, evaluate_delta_authority,
-    evaluate_snapshot_clock_skew, full_snapshot_stream_disposition,
+    DeltaRejectionKind, DeltaRejectionStreamDisposition, FullSnapshotStreamDisposition,
+    GatewayTrustEquivalenceState, MultiCpBackoffState, SnapshotFailureStreamDisposition,
+    SubscriptionApplyState, advance_authority_from_committed, advance_multi_cp_backoff,
+    authoritative_snapshot_payload_matches, check_config_sync_build_identity,
+    check_peer_version_compatibility, config_sync_build_identity, connection_error_outcome,
+    delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
+    evaluate_delta_authority, evaluate_snapshot_clock_skew, full_snapshot_stream_disposition,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
     reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
@@ -2882,15 +2882,14 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         "Terminating ConfigSync stream after invalid gateway trust \
                                          side-channel so later resource deltas cannot apply"
                                     );
-                                    let _ = delta_rejection_stream_disposition(
-                                        DeltaRejectionKind::InvalidTrustSideChannel,
-                                    );
                                     crate::dp_config_freshness::record_snapshot_rejected();
                                     update_state_config_diverged(
                                         connection_state,
                                         divergence_metrics,
                                     );
-                                    return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
+                                    return Ok(react_to_rejected_delta(
+                                        DeltaRejectionKind::InvalidTrustSideChannel,
+                                    ));
                                 }
                             };
                         // Defense in depth: filter cross-namespace
@@ -3124,9 +3123,6 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     // Non-empty rejection: stop consuming this stream
                                     // so a later partial delta cannot apply against
                                     // the wrong base (issue #2394).
-                                    let _ = delta_rejection_stream_disposition(
-                                        DeltaRejectionKind::NonEmptyApplyRejected,
-                                    );
                                     error!(
                                         cp_version = %sanitize_startup_cause(
                                             format!("{cp_version:?}"),
@@ -3156,7 +3152,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         connection_state,
                                         divergence_metrics,
                                     );
-                                    return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
+                                    return Ok(react_to_rejected_delta(
+                                        DeltaRejectionKind::NonEmptyApplyRejected,
+                                    ));
                                 }
                             }
                         }
@@ -3167,11 +3165,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             "Failed to parse delta update: {}",
                             sanitize_startup_cause(e, &[])
                         );
-                        let _ =
-                            delta_rejection_stream_disposition(DeltaRejectionKind::ParseFailure);
                         crate::dp_config_freshness::record_snapshot_rejected();
                         update_state_config_diverged(connection_state, divergence_metrics);
-                        return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
+                        return Ok(react_to_rejected_delta(DeltaRejectionKind::ParseFailure));
                     }
                 }
             }
@@ -3205,12 +3201,32 @@ fn refuse_unusable_snapshot(subscription_base_applied: bool) -> DpStreamEnd {
 /// deltas cannot apply against a base that missed the authoritative reload.
 /// When a prior base was already accepted, reconnect for a fresh snapshot
 /// while keeping last-known-good config; otherwise fail over as an invalid base.
+///
+/// The decision comes from [`snapshot_failure_stream_disposition`], matched
+/// exhaustively so a new disposition cannot be added without the client
+/// handling it.
 fn react_to_unusable_snapshot(subscription_base_applied: bool) -> DpStreamEnd {
-    let _ = snapshot_failure_stream_disposition(subscription_base_applied);
-    if subscription_base_applied {
-        DpStreamEnd::ResyncAfterAcceptedConfig
-    } else {
-        DpStreamEnd::InvalidSubscriptionBase
+    match snapshot_failure_stream_disposition(subscription_base_applied) {
+        SnapshotFailureStreamDisposition::TerminateAndReconnect => {
+            if subscription_base_applied {
+                DpStreamEnd::ResyncAfterAcceptedConfig
+            } else {
+                DpStreamEnd::InvalidSubscriptionBase
+            }
+        }
+    }
+}
+
+/// End the stream for a rejected non-empty DELTA, as decided by
+/// [`delta_rejection_stream_disposition`] (matched exhaustively, like
+/// [`react_to_unusable_snapshot`]). Terminating forces an authoritative
+/// FULL_SNAPSHOT resync, so a later partial delta cannot apply against the
+/// wrong base (issue #2394); last-known-good config keeps serving.
+fn react_to_rejected_delta(kind: DeltaRejectionKind) -> DpStreamEnd {
+    match delta_rejection_stream_disposition(kind) {
+        DeltaRejectionStreamDisposition::TerminateAndResync => {
+            DpStreamEnd::ResyncAfterAcceptedConfig
+        }
     }
 }
 
@@ -3534,31 +3550,6 @@ mod tests {
         let h3 = pairing.h3_accepted().expect("paired H3 candidate");
         assert!(Arc::ptr_eq(&h3.config, &cp));
         assert!(!Arc::ptr_eq(&h3.config, &rotated_operator.config));
-    }
-
-    #[tokio::test]
-    async fn refused_operator_trust_candidate_retains_h3_last_good_pair() {
-        let startup = test_operator_candidate(test_server_config(), 1);
-        let pairing = DpFrontendH3Pairing::from_operator_candidate(startup.clone());
-        let listener = crate::tls::empty_frontend_tls_slot();
-        let cp = test_server_config();
-        pairing
-            .publish_cp_server_config(Some(cp.clone()), Some(&listener), None)
-            .await;
-        let before = pairing.h3_accepted().expect("paired");
-
-        // A malformed/refused operator candidate never updates the accepted
-        // slot or calls publish_operator_candidate, so H3 keeps last-good
-        // config, trust, and the CP server certificate.
-        let _refused = test_operator_candidate(test_server_config(), 99);
-        let after = pairing.h3_accepted().expect("retained");
-        assert!(Arc::ptr_eq(&before, &after));
-        assert!(Arc::ptr_eq(&after.config, &cp));
-        assert_eq!(after.client_trust.material, startup.client_trust.material);
-        assert!(Arc::ptr_eq(
-            listener.load_full().as_ref().as_ref().expect("CP config"),
-            &cp
-        ));
     }
 
     #[tokio::test]

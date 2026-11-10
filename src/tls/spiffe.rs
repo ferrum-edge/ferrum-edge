@@ -712,6 +712,14 @@ struct SpiffePeerVerifierCache {
     /// already does through `source`.
     crl_generation: u64,
     verifiers: PeerVerifierMap,
+    /// The latest candidate `(source, CRL generation)` that failed to build
+    /// while these verifiers stayed in force. A handshake that presents the
+    /// same candidate again reuses this set without rebuilding the trust
+    /// stores or re-warning, so a broken rotation warns once per candidate
+    /// (the `SvidServerCertResolver` contract in
+    /// `.claude/rules/tls-security.md`). Any new source snapshot or CRL
+    /// generation misses this memo and is built immediately.
+    rejected_candidate: Option<(Arc<Option<SvidBundle>>, u64)>,
 }
 
 type PeerChainVerifier = Arc<dyn rustls::server::danger::ClientCertVerifier>;
@@ -801,33 +809,53 @@ fn peer_verifier_cache(
         // revocation list the listener started with.
         return Ok(cached);
     }
+    if let Some(cache) = cached.as_ref()
+        && cache.rejected_candidate.as_ref().is_some_and(
+            |(rejected_source, rejected_generation)| {
+                Arc::ptr_eq(rejected_source, &source) && *rejected_generation == crls.generation()
+            },
+        )
+    {
+        // This exact candidate already failed to build and warned; building
+        // is deterministic for one (source, CRL generation) pair.
+        return Ok(cached);
+    }
 
+    let candidate_source = source.clone();
     match SpiffePeerVerifierCache::build(source, crls) {
         Ok(next) => {
             let next = Arc::new(Some(next));
             cache_slot.store(next.clone());
             Ok(next)
         }
-        Err(error) if cached.is_some() => {
+        Err(error) => {
+            let Some(cache) = cached.as_ref() else {
+                return Err(error);
+            };
             warn!(
                 error = %error,
                 "SPIFFE verifier cache: candidate trust update rejected; keeping last-known-good set"
             );
-            // The retained set is returned UNCHANGED, including its
-            // `crl_generation` (issue #5574). Recording the attempted
-            // generation on the last-known-good verifiers would be fail-open:
-            // a build can fail because the candidate SVID SOURCE is unusable
-            // while the enforced CRL generation moved with perfectly good
-            // records, and a cache stamped with that generation would keep
-            // serving handshakes under the OLD revocation list — matching on
-            // both halves — until the source itself changed. Retrying the
-            // build on every handshake while a candidate stays rejected is the
-            // same cost a rejected trust source already carried before CRLs
-            // were live, and it is what makes the next good publication take
-            // effect immediately.
-            Ok(cached)
+            // The retained verifiers keep their source and `crl_generation`
+            // UNCHANGED (issue #5574); only the rejected candidate is
+            // remembered beside them. Stamping the attempted generation on
+            // the last-known-good verifiers would be fail-open: a build can
+            // fail because the candidate SVID SOURCE is unusable while the
+            // enforced CRL generation moved with perfectly good records, and
+            // a cache stamped with that generation would keep serving
+            // handshakes under the OLD revocation list — matching on both
+            // halves — until the source itself changed. The memo matches only
+            // the exact rejected pair, so the next good publication (a new
+            // source or CRL generation) still takes effect immediately.
+            let retained = Arc::new(Some(SpiffePeerVerifierCache {
+                source: cache.source.clone(),
+                crl_generation: cache.crl_generation,
+                verifiers: cache.verifiers.clone(),
+                rejected_candidate: Some((candidate_source, crls.generation())),
+            }));
+            cache_slot.store(retained.clone());
+            Ok(retained)
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -849,6 +877,7 @@ impl SpiffePeerVerifierCache {
             source,
             crl_generation: crls.generation(),
             verifiers,
+            rejected_candidate: None,
         })
     }
 }
@@ -1210,9 +1239,10 @@ fn verify_peer_chain_result(
 /// Validate `end_entity + intermediates` against `bundle.trust_bundles`,
 /// extract the SPIFFE ID, and (optionally) match it against `expected_peer`.
 ///
-/// This uncached helper is retained for direct validation tests. Runtime
-/// verifiers use [`verify_peer_against_cached_snapshot`] so live handshakes
-/// rebuild chain verifiers only when the bundle slot rotates.
+/// Test-only: this uncached helper backs the direct validation tests below.
+/// Runtime verifiers use [`verify_peer_against_cached_snapshot`] so live
+/// handshakes rebuild chain verifiers only when the bundle slot rotates.
+#[cfg(test)]
 fn verify_peer_against_bundle(
     trust_bundles: &TrustBundleSet,
     end_entity: &CertificateDer<'_>,
@@ -1454,6 +1484,26 @@ mod tests {
         );
     }
 
+    /// Whether two cache entries serve the same verifier set: same source
+    /// snapshot, CRL generation and per-domain verifiers. A retained
+    /// last-known-good entry may differ only in its rejected-candidate memo.
+    fn same_verifier_set(
+        a: &Arc<Option<SpiffePeerVerifierCache>>,
+        b: &Arc<Option<SpiffePeerVerifierCache>>,
+    ) -> bool {
+        let (Some(a), Some(b)) = (a.as_ref(), b.as_ref()) else {
+            return false;
+        };
+        Arc::ptr_eq(&a.source, &b.source)
+            && a.crl_generation == b.crl_generation
+            && a.verifiers.len() == b.verifiers.len()
+            && a.verifiers.iter().all(|(domain, verifier)| {
+                b.verifiers
+                    .get(domain)
+                    .is_some_and(|other| Arc::ptr_eq(verifier, other))
+            })
+    }
+
     #[test]
     fn peer_verifier_cache_rejects_partial_trust_update_and_keeps_last_good() {
         let local_td = TrustDomain::new("cache.local").unwrap();
@@ -1490,15 +1540,33 @@ mod tests {
             .trust_bundles;
         let error = validate_trust_bundle_set(rejected_bundles)
             .expect_err("one unusable federated root must reject the complete update");
-        let retained = peer_verifier_cache(&cache, rejected_source, &no_crls())
+        let retained = peer_verifier_cache(&cache, rejected_source.clone(), &no_crls())
             .expect("a failed reload with an existing cache must retain last-known-good");
 
         assert!(error.contains("certificate record #1"), "got: {error}");
-        assert!(Arc::ptr_eq(&retained, &last_good));
         assert!(
-            Arc::ptr_eq(&cache.load_full(), &last_good),
-            "failed candidate must not replace the last-good verifier cache"
+            same_verifier_set(&retained, &last_good),
+            "failed candidate must not replace the last-good verifier set"
         );
+        assert!(Arc::ptr_eq(&cache.load_full(), &retained));
+
+        // The same rejected candidate is not rebuilt (and not re-warned) on
+        // the next handshake: a rebuild would store a fresh cache entry.
+        let again = peer_verifier_cache(&cache, rejected_source, &no_crls())
+            .expect("a repeated rejected candidate keeps last-known-good");
+        assert!(Arc::ptr_eq(&again, &retained));
+        assert!(
+            Arc::ptr_eq(&cache.load_full(), &retained),
+            "a recorded rejection must not rebuild for the same candidate"
+        );
+
+        // A new good publication is still adopted at once.
+        let adopted = peer_verifier_cache(&cache, valid_source.clone(), &no_crls())
+            .expect("the original good source still builds");
+        assert!(Arc::ptr_eq(
+            &adopted.as_ref().as_ref().expect("cache").source,
+            &valid_source
+        ));
     }
 
     #[test]
@@ -1561,7 +1629,7 @@ mod tests {
         )));
         let retained_after_drop = peer_verifier_cache(&cache, rejected_drop.clone(), &no_crls())
             .expect("rejected candidate must keep last-known-good");
-        assert!(Arc::ptr_eq(&retained_after_drop, &last_good));
+        assert!(same_verifier_set(&retained_after_drop, &last_good));
 
         // Domain present only in LKG (removed by rejected candidate) must still
         // pass membership + chain verification against the retained snapshot.
@@ -1576,7 +1644,7 @@ mod tests {
         )
         .expect("LKG-federated peer must remain trusted after rejected drop");
         assert_eq!(still_trusted.as_str(), federated_peer.as_str());
-        assert!(Arc::ptr_eq(&cache.load_full(), &last_good));
+        assert!(same_verifier_set(&cache.load_full(), &last_good));
 
         // Candidate declares an extra domain that LKG never admitted, but the
         // extra domain's authority is unusable so the whole candidate fails.
@@ -1597,7 +1665,7 @@ mod tests {
         )));
         let retained_after_add = peer_verifier_cache(&cache, rejected_add.clone(), &no_crls())
             .expect("rejected candidate must keep last-known-good");
-        assert!(Arc::ptr_eq(&retained_after_add, &last_good));
+        assert!(same_verifier_set(&retained_after_add, &last_good));
 
         // Membership must deny against the retained snapshot with the unknown-
         // domain diagnostic — not pass candidate membership then fail with
@@ -1623,7 +1691,7 @@ mod tests {
             !err.contains("no usable roots"),
             "candidate-only domain must not surface the unusable-roots path: {err}"
         );
-        assert!(Arc::ptr_eq(&cache.load_full(), &last_good));
+        assert!(same_verifier_set(&cache.load_full(), &last_good));
     }
 
     /// Issue a leaf SVID under `root` with a known serial so a CRL can revoke

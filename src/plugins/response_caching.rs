@@ -2043,6 +2043,16 @@ impl ResponseCaching {
         self.total_size.load(Ordering::Relaxed)
     }
 
+    /// Run the production accountant adjustments (add `add`, then subtract
+    /// `sub`) under the accounting guard, so tests can drive a drift larger
+    /// than the running total through the real saturating subtraction.
+    #[allow(dead_code)]
+    pub(crate) fn adjust_total_size_for_tests(&self, add: usize, sub: usize) {
+        let _guard = self.accounting_guard();
+        self.add_total_size_locked(add);
+        self.sub_total_size_locked(sub);
+    }
+
     #[allow(dead_code)]
     pub(crate) fn size_accounting_snapshot_for_tests(&self) -> (usize, usize) {
         let _guard = self.accounting_guard();

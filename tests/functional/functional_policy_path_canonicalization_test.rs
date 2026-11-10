@@ -17,8 +17,7 @@ use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
 use bytes::Bytes;
 use ferrum_edge::tls::acme::{
-    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeOrderRecord, AcmeOrderStatus,
-    AcmeOrderStore,
+    AcmeHttp01ChallengeRecord, AcmeOrderInput, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
 };
 use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -1454,7 +1453,7 @@ const ACME_KEY_AUTHORIZATION: &str = "tok_ABC-123.policy-path-thumbprint";
 /// creation uses.
 fn seed_pending_http01_order(store_dir: &std::path::Path) {
     let store = AcmeOrderStore::open(store_dir).expect("open ACME order store");
-    let order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    let order = AcmeOrderRecord::new(AcmeOrderInput {
         id: "policy-path-http01-order".to_string(),
         certificate_id: None,
         domains: vec!["policy-path.example.com".to_string()],

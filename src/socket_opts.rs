@@ -1,8 +1,8 @@
 //! Platform-specific socket optimizations inspired by Cloudflare Pingora.
 //!
 //! Provides `IP_BIND_ADDRESS_NO_PORT` (defers ephemeral port allocation to connect()),
-//! `TCP_FASTOPEN` (saves 1 RTT on repeat connections), `TCP_INFO` access for
-//! kernel-level BDP-optimal buffer sizing, `SO_BUSY_POLL` for low-latency UDP,
+//! `TCP_FASTOPEN` (saves 1 RTT on repeat connections), `SO_BUSY_POLL` for
+//! low-latency UDP,
 //! `UDP_GRO`/`UDP_SEGMENT` for kernel-level
 //! datagram batching, and `kTLS` for enabling splice(2) on TLS paths.
 //! Linux-only options are no-ops on other platforms, or fail closed where a
@@ -626,73 +626,6 @@ fn apply_pooled_tcp_keepalive_cfg(
     {
         let _ = (pool, stream, cfg);
     }
-}
-
-// ── TCP_INFO (BDP-optimal buffer sizing) ───────────────────────────────
-
-/// Kernel-level TCP connection metrics from `getsockopt(TCP_INFO)`.
-///
-/// Used to compute Bandwidth-Delay Product (BDP) for optimal buffer sizing
-/// on long-lived TCP stream connections. BDP = (rtt_us / 1_000_000) × cwnd × mss.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub struct TcpConnectionInfo {
-    /// Smoothed round-trip time in microseconds (SRTT).
-    pub rtt_us: u32,
-    /// Congestion window in segments.
-    pub snd_cwnd: u32,
-    /// Maximum segment size in bytes.
-    pub snd_mss: u32,
-}
-
-#[allow(dead_code)]
-impl TcpConnectionInfo {
-    /// Compute the Bandwidth-Delay Product in bytes.
-    ///
-    /// BDP represents the optimal amount of data in-flight between sender and
-    /// receiver. Socket buffers sized to BDP maximize throughput without waste.
-    pub fn bdp_bytes(&self) -> usize {
-        if self.rtt_us == 0 || self.snd_cwnd == 0 || self.snd_mss == 0 {
-            return 0;
-        }
-        // cwnd × mss gives the current congestion window in bytes.
-        // This already reflects the BDP as the kernel adjusts cwnd based on RTT.
-        (self.snd_cwnd as usize).saturating_mul(self.snd_mss as usize)
-    }
-}
-
-/// Retrieve TCP connection info from the kernel via `getsockopt(TCP_INFO)`.
-///
-/// Returns RTT, congestion window, and MSS for BDP-optimal buffer sizing.
-/// Linux 2.6+ only. No-op on non-Linux (returns `None`).
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-pub fn get_tcp_info(fd: std::os::unix::io::RawFd) -> Option<TcpConnectionInfo> {
-    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_INFO,
-            &mut info as *mut libc::tcp_info as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if ret != 0 {
-        return None;
-    }
-    Some(TcpConnectionInfo {
-        rtt_us: info.tcpi_rtt,
-        snd_cwnd: info.tcpi_snd_cwnd,
-        snd_mss: info.tcpi_snd_mss,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn get_tcp_info(_fd: i32) -> Option<TcpConnectionInfo> {
-    None
 }
 
 // ── Send-queue depth (SIOCOUTQ / SO_NWRITE) ────────────────────────────
@@ -3259,6 +3192,78 @@ pub mod io_uring_splice {
     pub const BACKEND_READ_TIMEOUT_MSG: &str = "backend read inactivity timeout";
     pub const BACKEND_WRITE_TIMEOUT_MSG: &str = "backend write inactivity timeout";
 
+    /// Upper bound for one readiness wait in [`io_uring_splice_loop`].
+    ///
+    /// Every deadline the loop enforces bounds the wait on its own, and the
+    /// parent's `shutdown(SHUT_RDWR)` wakes it at once, so this cap only bounds
+    /// how long an untimed relay sleeps between deadline rechecks.
+    const MAX_READINESS_WAIT_MS: u64 = 1_000;
+
+    /// Block until `fd` reports one of `events` (or an error / hangup, which
+    /// `poll(2)` always reports) or `timeout_ms` elapses.
+    ///
+    /// Returns `true` when the descriptor reported readiness (or `poll` itself
+    /// failed, so the caller's next syscall surfaces the real error) and
+    /// `false` on timeout. Runs on the relay's blocking thread.
+    pub fn wait_fd_ready(fd: i32, events: libc::c_short, timeout_ms: u64) -> bool {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let timeout = libc::c_int::try_from(timeout_ms).unwrap_or(libc::c_int::MAX);
+        loop {
+            // SAFETY: one initialized `pollfd` that outlives the call.
+            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+            if ready > 0 {
+                return true;
+            }
+            if ready == 0 {
+                return false;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return true;
+            }
+        }
+    }
+
+    /// Milliseconds until the nearest deadline the splice loop enforces, capped
+    /// at [`MAX_READINESS_WAIT_MS`] and at least 1. A disarmed write watermark
+    /// (`u64::MAX`) and inactive watermarks impose no deadline.
+    fn readiness_wait_ms(
+        now: u64,
+        shared_last_activity_ms: &std::sync::atomic::AtomicU64,
+        timeout_ms: u64,
+        read_watermark: Option<&std::sync::atomic::AtomicU64>,
+        read_timeout_ms: u64,
+        write_watermark: Option<&std::sync::atomic::AtomicU64>,
+        write_timeout_ms: u64,
+    ) -> u64 {
+        let remaining = |last: u64, limit: u64| limit.saturating_sub(now.saturating_sub(last));
+        let mut wait = MAX_READINESS_WAIT_MS;
+        if timeout_ms > 0 {
+            let last = shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+            wait = wait.min(remaining(last, timeout_ms));
+        }
+        if read_timeout_ms > 0
+            && let Some(wm) = read_watermark
+        {
+            wait = wait.min(remaining(
+                wm.load(std::sync::atomic::Ordering::Relaxed),
+                read_timeout_ms,
+            ));
+        }
+        if write_timeout_ms > 0
+            && let Some(wm) = write_watermark
+        {
+            let last = wm.load(std::sync::atomic::Ordering::Relaxed);
+            if last != u64::MAX {
+                wait = wait.min(remaining(last, write_timeout_ms));
+            }
+        }
+        wait.max(1)
+    }
+
     /// Splice data in one direction using io_uring: src_fd → pipe → dst_fd.
     ///
     /// Runs on a blocking thread (called via `tokio::task::spawn_blocking`).
@@ -3287,6 +3292,15 @@ pub mod io_uring_splice {
     /// bytes and refreshed on every successful write. Both watermarks emit a
     /// distinct message body (see `BACKEND_*_TIMEOUT_MSG`) so the caller can
     /// attribute the timeout to the correct `(Direction, StreamIoSide)`.
+    ///
+    /// Every splice is submitted with `SPLICE_F_NONBLOCK`. On `EAGAIN` the
+    /// worker waits in `poll(2)` for the descriptor that blocked (source
+    /// readable in phase 1, destination writable in phase 2) until the nearest
+    /// timeout deadline, so an idle relay sleeps instead of resubmitting every
+    /// millisecond, and the first byte after a quiet period is spliced as soon
+    /// as it arrives (issue #7226). If `poll` reports readiness but the next
+    /// splice still blocks, the worker sleeps 1 ms before waiting again, so a
+    /// descriptor that stays "ready" cannot spin the thread.
     #[allow(clippy::too_many_arguments)]
     pub fn io_uring_splice_loop(
         src_fd: i32,
@@ -3320,6 +3334,20 @@ pub mod io_uring_splice {
         let chunk_size: u32 = 128 * 1024;
         let read_wm_active = read_watermark.is_some() && read_timeout_ms > 0;
         let write_wm_active = write_watermark.is_some() && write_timeout_ms > 0;
+        // Set when the last readiness wait reported the descriptor ready; a
+        // further `EAGAIN` right after it backs off before waiting again.
+        let mut woke_ready = false;
+        let wait_ms = || {
+            readiness_wait_ms(
+                super::monotonic_now_ms(),
+                shared_last_activity_ms,
+                timeout_ms,
+                read_watermark,
+                read_timeout_ms,
+                write_watermark,
+                write_timeout_ms,
+            )
+        };
 
         loop {
             // Inline idle timeout check using the shared cross-direction timestamp.
@@ -3398,7 +3426,7 @@ pub mod io_uring_splice {
             if n < 0 {
                 let err = std::io::Error::from_raw_os_error(-n);
                 if err.kind() == std::io::ErrorKind::WouldBlock {
-                    // Recheck idle timeout inline before sleeping, even though the
+                    // Recheck idle timeout inline before waiting, even though the
                     // outer loop also checks it. Keeping the check here makes the
                     // two WouldBlock branches (Phase 1 here, Phase 2 below) behave
                     // uniformly and avoids relying on reviewers to trace control flow.
@@ -3440,12 +3468,17 @@ pub mod io_uring_splice {
                             ));
                         }
                     }
-                    // Back off to avoid tight spin — sleep 1ms then retry.
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // Wait for the source to become readable (or for the
+                    // nearest deadline) instead of resubmitting on a timer.
+                    if woke_ready {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    woke_ready = wait_fd_ready(src_fd, libc::POLLIN, wait_ms());
                     continue;
                 }
                 return Err(SpliceError::read(total, err));
             }
+            woke_ready = false;
 
             // Successful src→pipe: refresh the read watermark and prime the
             // write watermark (we now have queued bytes ready for dst).
@@ -3490,11 +3523,11 @@ pub mod io_uring_splice {
                     let err = std::io::Error::from_raw_os_error(-w);
                     if err.kind() == std::io::ErrorKind::WouldBlock {
                         // CRITICAL: This inner-loop WouldBlock branch must recheck
-                        // the idle timeout before sleeping. The `while remaining > 0`
+                        // the idle timeout before waiting. The `while remaining > 0`
                         // loop has no timeout check, so if the destination socket
                         // stops reading while data is buffered in the pipe, this
-                        // branch would spin at 1000 iters/sec forever without
-                        // releasing the blocking thread to the tokio pool.
+                        // branch would wait forever without releasing the
+                        // blocking thread to the tokio pool.
                         if timeout_ms > 0 {
                             let now = super::monotonic_now_ms();
                             let last =
@@ -3537,11 +3570,17 @@ pub mod io_uring_splice {
                                 ));
                             }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        // Wait for the destination to drain (or for the
+                        // nearest deadline) instead of resubmitting on a timer.
+                        if woke_ready {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        woke_ready = wait_fd_ready(dst_fd, libc::POLLOUT, wait_ms());
                         continue;
                     }
                     return Err(SpliceError::write(total, err));
                 }
+                woke_ready = false;
                 remaining -= w as u32;
                 total = total.saturating_add(w as u64);
                 // Refresh shared idle timeout — activity in either direction

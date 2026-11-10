@@ -43,6 +43,47 @@ fn level_reflects_action_flags() {
 
 // ── ConnectionGuard ───────────────────────────────────────────────────
 
+/// The HTTP/1.1 `Connection: close` decision ORs drain, the binary
+/// pressure-mode flag and RED shedding, and the binary flag must close on its
+/// own even while the RED probability is still 0 (the exact pressure threshold,
+/// or the window before the monitor stores the new probability).
+#[test]
+fn keepalive_close_honors_each_signal_independently() {
+    let state = OverloadState::new();
+    assert!(
+        !state.should_close_keepalive(),
+        "no drain, no pressure and RED probability 0 keep the connection"
+    );
+
+    state.disable_keepalive.store(true, Ordering::Relaxed);
+    state.red_drop_probability.store(0, Ordering::Relaxed);
+    assert!(
+        !state.should_disable_keepalive_red(),
+        "the RED sampler alone is quiet at probability 0"
+    );
+    assert!(
+        state.should_close_keepalive(),
+        "the binary pressure-mode flag must close even at RED probability 0"
+    );
+    state.disable_keepalive.store(false, Ordering::Relaxed);
+
+    state
+        .red_drop_probability
+        .store(RED_PROBABILITY_SCALE, Ordering::Relaxed);
+    assert!(
+        state.should_close_keepalive(),
+        "a saturated RED probability closes without the binary flag"
+    );
+    state.red_drop_probability.store(0, Ordering::Relaxed);
+    assert!(!state.should_close_keepalive());
+
+    state.draining.store(true, Ordering::Release);
+    assert!(
+        state.should_close_keepalive(),
+        "graceful drain closes without any pressure signal"
+    );
+}
+
 #[test]
 fn connection_guard_tracks_concurrent_connections() {
     let state = Arc::new(OverloadState::new());

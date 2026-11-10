@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use ferrum_edge::tls::acme::{
-    AcmeHttp01OrderInput, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
-    AcmeTlsAlpn01ChallengeRecord,
+    AcmeOrderInput, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore, AcmeTlsAlpn01ChallengeRecord,
 };
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
@@ -227,7 +226,7 @@ async fn try_start_injector(
 fn seed_pending_tls_alpn_order(store_dir: &std::path::Path) -> Result<(), String> {
     let store =
         AcmeOrderStore::open(store_dir).map_err(|e| format!("open ACME order store: {e}"))?;
-    let order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    let order = AcmeOrderRecord::new(AcmeOrderInput {
         id: "injector-tls-alpn-order".to_string(),
         certificate_id: Some("injector-certificate".to_string()),
         domains: vec![ACME_IDENTIFIER.to_string()],

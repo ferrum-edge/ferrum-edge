@@ -11275,7 +11275,7 @@ async fn canonical_and_route_credential_headers_never_reach_the_provider() {
     let plugin = build(openai_and_anthropic_config());
     let body = streaming_request("claude-3-5-sonnet");
     let mut ctx = post_ctx(&body);
-    ferrum_edge::_test_support::set_replay_credential_headers_for_test(
+    ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
         &mut ctx,
         vec!["x-tenant-credential".to_string()],
     );
