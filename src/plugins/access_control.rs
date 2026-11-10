@@ -133,7 +133,12 @@ impl AccessControl {
             )
         })?;
 
-        reject_unknown_keys(object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            ACCESS_CONTROL_CONFIG_KEYS,
+            "access_control: `config`: ",
+        )?;
         reject_explicitly_empty_allow_lists(object)?;
 
         let allowed = parse_string_set(
@@ -404,23 +409,15 @@ impl AccessControl {
 /// Reject any unrecognized config key so a misspelled allow/deny key fails
 /// config validation instead of being silently dropped (which would leave a
 /// weaker-than-intended policy). Mirrors serde `deny_unknown_fields`.
-fn reject_unknown_keys(object: &serde_json::Map<String, Value>) -> Result<(), String> {
-    const KNOWN_KEYS: [&str; 7] = [
-        "allowed_consumers",
-        "disallowed_consumers",
-        "allowed_groups",
-        "disallowed_groups",
-        "allowed_external_identities",
-        "disallowed_external_identities",
-        "allow_authenticated_identity",
-    ];
-    for key in object.keys() {
-        if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("access_control: unknown config key {key:?}"));
-        }
-    }
-    Ok(())
-}
+const ACCESS_CONTROL_CONFIG_KEYS: &[&str] = &[
+    "allowed_consumers",
+    "disallowed_consumers",
+    "allowed_groups",
+    "disallowed_groups",
+    "allowed_external_identities",
+    "disallowed_external_identities",
+    "allow_authenticated_identity",
+];
 
 /// Refuse an allow-list that is present but empty.
 ///

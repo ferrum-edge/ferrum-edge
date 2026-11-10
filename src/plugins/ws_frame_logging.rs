@@ -325,7 +325,12 @@ impl WsFrameLogging {
         let Some(object) = config.as_object() else {
             return Err("ws_frame_logging: config must be a JSON object".to_string());
         };
-        reject_unknown_keys(object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            WS_FRAME_LOGGING_CONFIG_KEYS,
+            "ws_frame_logging: `config`: ",
+        )?;
 
         let plugin_id: Box<str> = match plugin_config_id {
             None => UNATTRIBUTED_PLUGIN_ID.into(),
@@ -761,22 +766,6 @@ fn splitmix64(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
-}
-
-fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .filter(|key| !WS_FRAME_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "ws_frame_logging: `config`: unknown configuration key(s): {unknown:?}; allowed keys: `{}`",
-        WS_FRAME_LOGGING_CONFIG_KEYS.join("`, `")
-    ))
 }
 
 /// Render a keyed, non-reversible payload fingerprint string.

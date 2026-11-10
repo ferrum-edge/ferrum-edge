@@ -100,18 +100,12 @@ impl CorrelationId {
         let object = config
             .as_object()
             .ok_or_else(|| "correlation_id: config must be a JSON object".to_string())?;
-        let mut unknown_keys: Vec<&str> = object
-            .keys()
-            .map(String::as_str)
-            .filter(|key| !matches!(*key, "header_name" | "echo_downstream" | "inbound_policy"))
-            .collect();
-        if !unknown_keys.is_empty() {
-            unknown_keys.sort_unstable();
-            return Err(format!(
-                "correlation_id: unknown config field(s): {:?}",
-                unknown_keys.join(", ")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            &["header_name", "echo_downstream", "inbound_policy"],
+            "correlation_id: `config`: ",
+        )?;
 
         // Reject explicit non-string values for `header_name` so a misconfiguration
         // (e.g., setting an integer) does not silently fall back to the default.

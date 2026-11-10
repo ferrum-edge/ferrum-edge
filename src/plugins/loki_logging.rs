@@ -131,7 +131,7 @@ struct LokiFlushConfig {
     ceiling: &'static RetainedByteCeiling,
 }
 
-type LokiProvisionalAdmission = (Arc<str>, BTreeMap<String, String>, Arc<LokiByteLease>);
+type LokiProvisionalAdmission = (Arc<str>, Arc<BTreeMap<String, String>>, Arc<LokiByteLease>);
 
 struct LokiByteLease {
     used_bytes: Arc<AtomicUsize>,
@@ -281,29 +281,140 @@ struct LabelConfig {
     include_status_class: bool,
 }
 
+/// Which summary family a label set was built for. The two families set
+/// different per-entry labels over the same static map, so a set is only ever
+/// reused for its own family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LabelSetKind {
+    Http,
+    Stream,
+}
+
+/// The per-entry labels of one summary, as their FINAL value in the merged map:
+/// `Some` sets the label, `None` leaves it absent. The merged map is the static
+/// labels with exactly these two keys set or removed, so the kind plus these
+/// values determine the whole label set.
+type DynamicLabels<'a> = [(&'static str, Option<&'a str>); 2];
+
 impl LabelConfig {
-    fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
+    fn http_dynamic_labels<'a>(&'a self, summary: &'a TransactionSummary) -> DynamicLabels<'a> {
+        let proxy_id = match (self.include_proxy_id, summary.proxy_id.as_deref()) {
+            (true, Some(proxy_id)) => Some(proxy_id),
+            _ => self.static_label("proxy_id"),
+        };
+        let status_class = if self.include_status_class {
+            Some(status_class(summary.response_status_code))
+        } else {
+            self.static_label("status_class")
+        };
+        [("proxy_id", proxy_id), ("status_class", status_class)]
+    }
+
+    fn stream_dynamic_labels<'a>(
+        &'a self,
+        summary: &'a StreamTransactionSummary,
+    ) -> DynamicLabels<'a> {
+        let proxy_id = if self.include_proxy_id {
+            Some(summary.proxy_id.as_str())
+        } else {
+            self.static_label("proxy_id")
+        };
+        [
+            ("proxy_id", proxy_id),
+            ("protocol", Some(summary.protocol.as_str())),
+        ]
+    }
+
+    fn static_label(&self, name: &str) -> Option<&str> {
+        self.static_labels.get(name).map(String::as_str)
+    }
+
+    /// The merged label map: the static labels with `dynamic` applied.
+    fn build_labels(&self, dynamic: &DynamicLabels<'_>) -> BTreeMap<String, String> {
         let mut labels = self.static_labels.clone();
-        if self.include_proxy_id
-            && let Some(ref proxy_id) = summary.proxy_id
-        {
-            labels.insert("proxy_id".to_string(), proxy_id.clone());
-        }
-        if self.include_status_class {
-            labels.insert(
-                "status_class".to_string(),
-                status_class(summary.response_status_code),
-            );
+        for (name, value) in dynamic {
+            match value {
+                Some(value) => {
+                    labels.insert((*name).to_string(), (*value).to_string());
+                }
+                None => {
+                    labels.remove(*name);
+                }
+            }
         }
         labels
     }
 
+    fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
+        self.build_labels(&self.http_dynamic_labels(summary))
+    }
+
     fn build_stream_labels(&self, summary: &StreamTransactionSummary) -> BTreeMap<String, String> {
-        let mut labels = self.static_labels.clone();
-        if self.include_proxy_id {
-            labels.insert("proxy_id".to_string(), summary.proxy_id.clone());
+        self.build_labels(&self.stream_dynamic_labels(summary))
+    }
+}
+
+/// Most label sets one instance interns. Label sets vary only by proxy id and
+/// status class (HTTP) or protocol (streams), so a deployment normally needs
+/// far fewer; past the bound a set is built per entry, as before.
+const MAX_INTERNED_LABEL_SETS: usize = 256;
+
+/// Label sets shared by every queued entry that carries them (issue #7152).
+///
+/// Each entry used to deep-clone the static label map and insert its own
+/// labels. The finished map is now built once per distinct
+/// `(kind, per-entry labels)` and shared as an `Arc`; a lookup hashes the
+/// borrowed values and allocates nothing. A hit is used only when its kind and
+/// per-entry values match exactly, so a hash collision builds a fresh set
+/// rather than reusing a wrong one.
+struct LokiLabelSets {
+    sets: dashmap::DashMap<u64, (LabelSetKind, Arc<BTreeMap<String, String>>)>,
+    hasher: std::collections::hash_map::RandomState,
+    interned: AtomicUsize,
+}
+
+impl LokiLabelSets {
+    fn new(shard_amount: usize) -> Self {
+        Self {
+            sets: dashmap::DashMap::with_shard_amount(shard_amount),
+            hasher: std::collections::hash_map::RandomState::new(),
+            interned: AtomicUsize::new(0),
         }
-        labels.insert("protocol".to_string(), summary.protocol.clone());
+    }
+
+    fn get_or_build(
+        &self,
+        config: &LabelConfig,
+        kind: LabelSetKind,
+        dynamic: &DynamicLabels<'_>,
+    ) -> Arc<BTreeMap<String, String>> {
+        use std::hash::{BuildHasher, Hash, Hasher};
+
+        let mut hasher = self.hasher.build_hasher();
+        kind.hash(&mut hasher);
+        for (_, value) in dynamic {
+            value.hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        if let Some(cached) = self.sets.get(&key) {
+            let (cached_kind, labels) = cached.value();
+            if *cached_kind == kind
+                && dynamic
+                    .iter()
+                    .all(|(name, value)| labels.get(*name).map(String::as_str) == *value)
+            {
+                return Arc::clone(labels);
+            }
+            return Arc::new(config.build_labels(dynamic));
+        }
+        let labels = Arc::new(config.build_labels(dynamic));
+        if self.interned.load(Ordering::Relaxed) < MAX_INTERNED_LABEL_SETS {
+            let entry = self.sets.entry(key);
+            if let dashmap::mapref::entry::Entry::Vacant(vacant) = entry {
+                vacant.insert((kind, Arc::clone(&labels)));
+                self.interned.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         labels
     }
 }
@@ -314,6 +425,7 @@ pub struct LokiLogging {
     logger: DeferredBatchingLogger<LokiEntry>,
     endpoint_hostname: String,
     label_config: LabelConfig,
+    label_sets: LokiLabelSets,
     schema: Option<Arc<SummarySchema>>,
     byte_budget: Arc<LokiByteBudget>,
     max_entry_bytes: usize,
@@ -340,7 +452,12 @@ impl LokiLogging {
             return Err("loki_logging: config must be an object".to_string());
         };
 
-        validate_known_config_fields(config_object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            LOKI_LOGGING_CONFIG_KEYS,
+            "loki_logging: `config`: ",
+        )?;
 
         let (endpoint_url, endpoint_hostname) =
             parse_http_endpoint(config, "loki_logging", http_client.backend_allow_ips())?;
@@ -420,6 +537,7 @@ impl LokiLogging {
         validate_minimum_entry_budget(&label_config, schema.as_deref(), max_entry_bytes)?;
         let mut batch_config = build_batch_config(config, "loki_logging", batch_defaults)?;
         batch_config.retry = retry;
+        let label_sets = LokiLabelSets::new(http_client.pool_shard_amount());
         let flush_config = LokiFlushConfig {
             endpoint_url,
             endpoint_url_for_logs,
@@ -445,6 +563,7 @@ impl LokiLogging {
             logger: DeferredBatchingLogger::for_plugin("loki_logging"),
             endpoint_hostname,
             label_config,
+            label_sets,
             schema,
             byte_budget: Arc::new(LokiByteBudget::with_ceiling(buffer_max_bytes, ceiling)),
             max_entry_bytes,
@@ -454,7 +573,7 @@ impl LokiLogging {
     fn queue_entry<T, F>(&self, value: &T, kind: &str, build_labels: F)
     where
         T: serde::Serialize,
-        F: FnOnce() -> BTreeMap<String, String>,
+        F: FnOnce() -> Arc<BTreeMap<String, String>>,
     {
         // Slot first, then provisional aggregate bytes, then serialize/labels.
         let Some(permit) = self.logger.try_reserve() else {
@@ -470,20 +589,31 @@ impl LokiLogging {
             return;
         };
         permit.send(LokiEntry {
-            labels: Arc::new(labels),
+            labels,
             line,
             _lease: lease,
         });
     }
 
-    /// Build labels for an HTTP/gRPC/WebSocket transaction.
-    fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
-        self.label_config.build_http_labels(summary)
+    /// Labels for an HTTP/gRPC/WebSocket transaction (shared when interned).
+    fn build_http_labels(&self, summary: &TransactionSummary) -> Arc<BTreeMap<String, String>> {
+        self.label_sets.get_or_build(
+            &self.label_config,
+            LabelSetKind::Http,
+            &self.label_config.http_dynamic_labels(summary),
+        )
     }
 
-    /// Build labels for a TCP/UDP stream transaction.
-    fn build_stream_labels(&self, summary: &StreamTransactionSummary) -> BTreeMap<String, String> {
-        self.label_config.build_stream_labels(summary)
+    /// Labels for a TCP/UDP stream transaction (shared when interned).
+    fn build_stream_labels(
+        &self,
+        summary: &StreamTransactionSummary,
+    ) -> Arc<BTreeMap<String, String>> {
+        self.label_sets.get_or_build(
+            &self.label_config,
+            LabelSetKind::Stream,
+            &self.label_config.stream_dynamic_labels(summary),
+        )
     }
 }
 
@@ -531,20 +661,6 @@ fn validate_custom_header_name_lengths(config: &Value) -> Result<(), String> {
         return Err(format!(
             "loki_logging: custom_headers name is \"{}\" bytes; maximum is {LOKI_MAX_CUSTOM_HEADER_NAME_BYTES}",
             name.len()
-        ));
-    }
-    Ok(())
-}
-
-fn validate_known_config_fields(config: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let mut unknown = config
-        .keys()
-        .filter(|key| !LOKI_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
-        .collect::<Vec<_>>();
-    unknown.sort_unstable();
-    if let Some(key) = unknown.first() {
-        return Err(format!(
-            "loki_logging: unknown configuration field {key:?} at `config`"
         ));
     }
     Ok(())
@@ -688,7 +804,7 @@ fn admit_under_byte_budget<T, F>(
 ) -> Option<LokiProvisionalAdmission>
 where
     T: serde::Serialize,
-    F: FnOnce() -> BTreeMap<String, String>,
+    F: FnOnce() -> Arc<BTreeMap<String, String>>,
 {
     let lease = byte_budget.try_acquire(max_entry_bytes)?;
     let mut writer = BoundedJsonWriter::new(max_entry_bytes);
@@ -890,7 +1006,7 @@ pub(crate) fn probe_loki_provisional_admission_for_test(
             labels_called.store(true, Ordering::SeqCst);
             let mut labels = BTreeMap::new();
             labels.insert("service".to_string(), "ferrum-edge".to_string());
-            labels
+            Arc::new(labels)
         },
     );
 
@@ -1071,13 +1187,13 @@ pub(crate) fn probe_loki_payload_json_for_test(
 }
 
 /// Map an HTTP status code to its class string (low cardinality).
-fn status_class(status: u16) -> String {
+fn status_class(status: u16) -> &'static str {
     match status {
-        200..=299 => "2xx".to_string(),
-        300..=399 => "3xx".to_string(),
-        400..=499 => "4xx".to_string(),
-        500..=599 => "5xx".to_string(),
-        _ => "other".to_string(),
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
     }
 }
 
@@ -1626,6 +1742,59 @@ mod tests {
         let labels = plugin.build_http_labels(&summary);
         assert_eq!(labels.get("proxy_id").map(String::as_str), Some("p-3"));
         assert_eq!(labels.get("status_class").map(String::as_str), Some("2xx"));
+    }
+
+    /// Issue #7152: entries with the same per-entry labels share one interned
+    /// map, which equals a fresh build; a different proxy or status class gets
+    /// its own set, and a static `proxy_id` label still yields to the entry's.
+    #[test]
+    fn label_sets_are_interned_and_match_a_fresh_build() {
+        let plugin = must(
+            LokiLogging::new(
+                &json!({
+                    "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
+                    "labels": {"env": "prod", "proxy_id": "static"},
+                }),
+                client(),
+            ),
+            "loki_logging config should be valid",
+        );
+        let first = plugin.build_http_labels(&make_summary(200, Some("p-1")));
+        let second = plugin.build_http_labels(&make_summary(204, Some("p-1")));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same labels must share one map"
+        );
+        assert_eq!(
+            *first,
+            plugin
+                .label_config
+                .build_http_labels(&make_summary(200, Some("p-1")))
+        );
+        assert_eq!(first.get("proxy_id").map(String::as_str), Some("p-1"));
+        assert_eq!(first.get("env").map(String::as_str), Some("prod"));
+
+        let other_status = plugin.build_http_labels(&make_summary(503, Some("p-1")));
+        assert!(!Arc::ptr_eq(&first, &other_status));
+        assert_eq!(
+            other_status.get("status_class").map(String::as_str),
+            Some("5xx")
+        );
+        let no_proxy = plugin.build_http_labels(&make_summary(200, None));
+        assert_eq!(no_proxy.get("proxy_id").map(String::as_str), Some("static"));
+
+        let mut stream = minimum_stream_summary();
+        stream.proxy_id = "p-1".to_string();
+        let stream_labels = plugin.build_stream_labels(&stream);
+        assert!(!stream_labels.contains_key("status_class"));
+        assert_eq!(
+            stream_labels.get("protocol").map(String::as_str),
+            Some(stream.protocol.as_str())
+        );
+        assert!(Arc::ptr_eq(
+            &stream_labels,
+            &plugin.build_stream_labels(&stream)
+        ));
     }
 
     #[test]

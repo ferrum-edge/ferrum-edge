@@ -16,7 +16,7 @@ use uuid::Uuid;
 use super::utils::rate_limit::{
     LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
     STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitKey, WsRateLimitOp,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_ws_frame_rate_bounds, validate_ws_frame_rate_params,
 };
 use super::{
@@ -357,15 +357,10 @@ impl WsRateLimiting {
         self.maybe_evict_at(now)
     }
 
-    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    /// Run the shared idle-state prune at `now`. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn apply_cleanup_branch_for_test(
-        &self,
-        now: Instant,
-        over_capacity: bool,
-        max_entries: usize,
-    ) {
-        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    pub(crate) fn prune_stale_for_test(&self, now: Instant) {
+        self.limiter.prune_stale_at(now);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -558,7 +553,7 @@ impl WsRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+                self.limiter.prune_stale_at(now);
                 return self.limiter.tracked_keys_count() >= MAX_STATE_ENTRIES;
             }
             return true;
@@ -575,7 +570,7 @@ impl WsRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, false);
+                self.limiter.prune_stale_at(now);
             }
         }
 

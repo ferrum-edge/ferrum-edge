@@ -31,7 +31,7 @@ use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, ByteBudget, ByteLease,
     DeferredBatchingLogger, PluginHttpClient, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
-    bind_connected_udp_socket, build_batch_config, parse_socket_host, resolve_udp_endpoint,
+    bind_connected_udp_socket, build_batch_config, parse_socket_host, resolve_socket_endpoint,
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
@@ -121,22 +121,6 @@ const STREAM_TAG_NATIVE: &[(&str, &str)] = &[
 ];
 
 const WS_TAG_NATIVE: &[(&str, &str)] = &[("proxy", "proxy_id")];
-
-fn reject_unknown_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let mut unknown: Vec<&str> = config
-        .keys()
-        .filter(|key| !STATSD_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "statsd_logging: `config`: unknown configuration key(s): {unknown:?}; allowed keys: `{}`",
-        STATSD_LOGGING_CONFIG_KEYS.join("`, `")
-    ))
-}
 
 /// Emit a `warn!` for any inline `schema:` keys that the statsd
 /// emitter does not honor. Only `rename`, `omit`, and `summary_type`
@@ -589,7 +573,12 @@ impl StatsdLogging {
                 STATSD_LOGGING_CONFIG_KEYS.join(", ")
             ));
         };
-        reject_unknown_config_keys(config_object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            STATSD_LOGGING_CONFIG_KEYS,
+            "statsd_logging: `config`: ",
+        )?;
 
         let raw_host = config
             .get("host")
@@ -1436,7 +1425,7 @@ async fn send_batch(
     };
 
     if socket.is_none() {
-        let resolved_addr = resolve_udp_endpoint(
+        let resolved_addr = resolve_socket_endpoint(
             &cfg.hostname,
             cfg.port,
             cfg.dns_cache.as_ref(),
@@ -1451,7 +1440,7 @@ async fn send_batch(
 
     if last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
         last_resolve = Instant::now();
-        if let Ok(new_addr) = resolve_udp_endpoint(
+        if let Ok(new_addr) = resolve_socket_endpoint(
             &cfg.hostname,
             cfg.port,
             cfg.dns_cache.as_ref(),

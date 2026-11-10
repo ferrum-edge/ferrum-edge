@@ -287,7 +287,14 @@ fn parse_allowlist(config: &Value) -> Result<PiiAllowlist, String> {
     if !block.is_object() {
         return Err("ai_response_guard: `allowlist` must be an object".to_string());
     }
-    reject_unknown_keys(block, ALLOWLIST_CONFIG_KEYS, "allowlist")?;
+    block.as_object().map_or(Ok(()), |object| {
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "allowlist",
+            ALLOWLIST_CONFIG_KEYS,
+            "ai_response_guard: `allowlist`: ",
+        )
+    })?;
     let mut allowlist = PiiAllowlist::default();
     if let Some(values) = block.get("values") {
         let Some(values) = values.as_array() else {
@@ -779,7 +786,14 @@ impl AiResponseGuard {
         if !config.is_object() {
             return Err("ai_response_guard: config must be an object".to_string());
         }
-        reject_unknown_keys(config, CONFIG_KEYS, "config")?;
+        config.as_object().map_or(Ok(()), |object| {
+            crate::util::unknown_keys::reject_unknown_keys(
+                object,
+                "config",
+                CONFIG_KEYS,
+                "ai_response_guard: `config`: ",
+            )
+        })?;
 
         let action = match optional_string(config, "action")?.unwrap_or("reject") {
             "reject" => GuardAction::Reject,
@@ -869,11 +883,14 @@ impl AiResponseGuard {
                         "ai_response_guard: `custom_pii_patterns[{idx}]` must be an object"
                     ));
                 }
-                reject_unknown_keys(
-                    entry,
-                    &["name", "regex"],
-                    &format!("custom_pii_patterns[{idx}]"),
-                )?;
+                entry.as_object().map_or(Ok(()), |object| {
+                    crate::util::unknown_keys::reject_unknown_keys(
+                        object,
+                        &format!("custom_pii_patterns[{idx}]"),
+                        &["name", "regex"],
+                        &format!("ai_response_guard: `custom_pii_patterns[{idx}]`: "),
+                    )
+                })?;
                 let name = required_non_empty_string(entry, "custom_pii_patterns", idx, "name")?;
                 check_custom_pattern_name("custom_pii_patterns", idx, name)?;
                 let regex_str =
@@ -963,11 +980,14 @@ impl AiResponseGuard {
                         "ai_response_guard: `blocked_patterns[{idx}]` must be an object"
                     ));
                 }
-                reject_unknown_keys(
-                    entry,
-                    &["name", "regex"],
-                    &format!("blocked_patterns[{idx}]"),
-                )?;
+                entry.as_object().map_or(Ok(()), |object| {
+                    crate::util::unknown_keys::reject_unknown_keys(
+                        object,
+                        &format!("blocked_patterns[{idx}]"),
+                        &["name", "regex"],
+                        &format!("ai_response_guard: `blocked_patterns[{idx}]`: "),
+                    )
+                })?;
                 let name = required_non_empty_string(entry, "blocked_patterns", idx, "name")?;
                 check_custom_pattern_name("blocked_patterns", idx, name)?;
                 let regex_str = required_non_empty_string(entry, "blocked_patterns", idx, "regex")?;
@@ -4009,7 +4029,14 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
     if !grpc.is_object() {
         return Err("ai_response_guard: `grpc` must be an object".to_string());
     }
-    reject_unknown_keys(grpc, AI_RESPONSE_GUARD_GRPC_CONFIG_KEYS, "grpc")?;
+    grpc.as_object().map_or(Ok(()), |object| {
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "grpc",
+            AI_RESPONSE_GUARD_GRPC_CONFIG_KEYS,
+            "ai_response_guard: `grpc`: ",
+        )
+    })?;
 
     let descriptor_path = optional_string(grpc, "descriptor_path")?
         .map(str::trim)
@@ -4055,11 +4082,14 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
         if !method_config.is_object() {
             return Err("ai_response_guard: a `grpc.methods` entry must be an object".to_string());
         }
-        reject_unknown_keys(
-            method_config,
-            AI_RESPONSE_GUARD_GRPC_METHOD_KEYS,
-            "grpc.methods",
-        )?;
+        method_config.as_object().map_or(Ok(()), |object| {
+            crate::util::unknown_keys::reject_unknown_keys(
+                object,
+                "grpc.methods",
+                AI_RESPONSE_GUARD_GRPC_METHOD_KEYS,
+                "ai_response_guard: `grpc.methods`: ",
+            )
+        })?;
         let response_type = optional_string(method_config, "response_type")?
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -6467,18 +6497,6 @@ fn collect_function_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, 
     };
     collect_string_value(value.get("name"), texts);
     collect_argument_value(value.get("arguments"), texts);
-}
-
-fn reject_unknown_keys(value: &Value, allowed: &[&str], path: &str) -> Result<(), String> {
-    let Some(object) = value.as_object() else {
-        return Ok(());
-    };
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "ai_response_guard: unknown field `{path}` key {key:?}"
-        ));
-    }
-    Ok(())
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {

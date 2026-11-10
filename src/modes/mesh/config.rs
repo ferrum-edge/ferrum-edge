@@ -9586,9 +9586,8 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
 /// ([`crate::plugins::fault_injection::runtime_overlay`]). Accepted slices also
 /// fan the remaining process-wide knobs out through
 /// [`crate::modes::mesh::runtime_overlay_consumers::apply_overlay`]:
-/// request/response transformer gates
-/// ([`crate::plugins::request_transformer::runtime_overlay`],
-/// [`crate::plugins::response_transformer::runtime_overlay`]), and the
+/// the response transformer gate map
+/// ([`crate::plugins::response_transformer::runtime_overlay`]) and the
 /// gateway-wide tracing filter ([`crate::logging::runtime_overlay`]).
 ///
 /// Wire compatibility: the type is an optional field on `MeshSlice` with

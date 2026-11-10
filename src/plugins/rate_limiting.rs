@@ -21,8 +21,8 @@ use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
     RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
-    validate_max_requests, validate_window_seconds,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_max_requests,
+    validate_window_seconds,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -653,15 +653,10 @@ impl RateLimiting {
         self.maybe_evict_stale_entries_at(now);
     }
 
-    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    /// Run the shared idle-state prune at `now`. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn apply_cleanup_branch_for_test(
-        &self,
-        now: Instant,
-        over_capacity: bool,
-        max_entries: usize,
-    ) {
-        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    pub(crate) fn prune_stale_for_test(&self, now: Instant) {
+        self.limiter.prune_stale_at(now);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -693,7 +688,7 @@ impl RateLimiting {
         // atomic admission reservation. The below-cap cooldown must not
         // suppress this branch once pressure is seen on a sampled pass.
         if len > self.max_state_entries {
-            apply_rate_limit_cleanup(&self.limiter, self.max_state_entries, now, true);
+            self.limiter.prune_stale_at(now);
             self.last_periodic_sweep_secs
                 .store(now_secs, Ordering::Release);
             return;
@@ -714,7 +709,7 @@ impl RateLimiting {
             return;
         }
 
-        apply_rate_limit_cleanup(&self.limiter, self.max_state_entries, now, false);
+        self.limiter.prune_stale_at(now);
     }
 
     fn request_key(&self, ctx: &RequestContext) -> String {

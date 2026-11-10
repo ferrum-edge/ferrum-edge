@@ -129,7 +129,7 @@ fn unknown_config_keys_are_rejected_even_with_another_valid_policy() {
             .insert(typo.to_string(), json!(true));
         let error = AiRequestGuard::new(&config).err().unwrap();
         assert!(
-            error.contains("unknown config field") && error.contains(typo),
+            error.contains("unknown configuration key") && error.contains(typo),
             "unexpected error for {typo}: {error}"
         );
     }

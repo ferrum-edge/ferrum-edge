@@ -242,7 +242,7 @@ impl SecurityHeaders {
         let object = config
             .as_object()
             .ok_or_else(|| "security_headers: config must be an object".to_string())?;
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "security_headers",
             &[
@@ -256,6 +256,7 @@ impl SecurityHeaders {
                 "remove",
                 "override_existing",
             ],
+            "security_headers: `security_headers`: ",
         )?;
 
         let override_existing = parse_bool(object, "override_existing", true)?;
@@ -755,10 +756,11 @@ fn parse_hsts(object: &serde_json::Map<String, Value>) -> Result<Option<String>,
             Ok(Some(value.clone()))
         }
         Some(Value::Object(map)) => {
-            reject_unknown_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 map,
                 "security_headers.hsts",
                 &["max_age", "include_subdomains", "preload"],
+                "security_headers: `security_headers.hsts`: ",
             )?;
             let max_age = match map.get("max_age") {
                 None | Some(Value::Null) => 31_536_000u64,
@@ -909,26 +911,6 @@ fn validate_header_value(key: &str, value: &str) -> Result<(), String> {
     HeaderValue::from_str(value)
         .map(|_| ())
         .map_err(|_| invalid_value())
-}
-
-fn reject_unknown_keys(
-    object: &serde_json::Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !allowed.contains(key))
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "security_headers: unknown configuration key(s) under `{path}`: {:?}",
-        unknown.join(", ")
-    ))
 }
 
 fn parse_bool(

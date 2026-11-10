@@ -113,16 +113,17 @@ impl StdoutLogging {
             return Err("stdout_logging: config must be an object".to_string());
         }
         if let Some(config) = config.as_object() {
-            reject_unknown_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 config,
                 "stdout_logging",
                 &["filter", "sampling", "schema", "schema_ref"],
+                "stdout_logging: `stdout_logging`: ",
             )?;
         }
         let filter = match config.get("filter") {
             Some(Value::Null) | None => None,
             Some(Value::Object(filter_config)) => {
-                reject_unknown_keys(
+                crate::util::unknown_keys::reject_unknown_keys(
                     filter_config,
                     "stdout_logging.filter",
                     &[
@@ -132,6 +133,7 @@ impl StdoutLogging {
                         "errors_only",
                         "expression",
                     ],
+                    "stdout_logging: `stdout_logging.filter`: ",
                 )?;
                 let status_code_min = parse_optional_status_code(filter_config, "status_code_min")?;
                 let status_code_max = parse_optional_status_code(filter_config, "status_code_max")?;
@@ -382,26 +384,6 @@ fn transaction_summary_from_ws_disconnect(ctx: &WsDisconnectContext) -> Transact
     }
 }
 
-fn reject_unknown_keys(
-    config: &Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let mut unknown: Vec<String> = config
-        .keys()
-        .filter(|key| !allowed.contains(&key.as_str()))
-        .map(|key| format!("{path}.{key}"))
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "stdout_logging: unknown configuration key(s) at `{path}`: {:?}",
-        unknown.join(", ")
-    ))
-}
-
 /// `errors_only` is a serde unit-like node (`{"op":"errors_only"}`). Internally
 /// tagged unit variants ignore `deny_unknown_fields`, so extra keys such as
 /// `value: false` would otherwise be dropped before tree validation. Walk the
@@ -411,21 +393,12 @@ fn reject_unknown_errors_only_fields(value: &Value, path: &str) -> Result<(), St
         return Ok(());
     };
     match obj.get("op").and_then(Value::as_str) {
-        Some("errors_only") => {
-            let mut unknown: Vec<String> = obj
-                .keys()
-                .filter(|key| key.as_str() != "op")
-                .map(|key| format!("{path}.{key}"))
-                .collect();
-            if unknown.is_empty() {
-                return Ok(());
-            }
-            unknown.sort_unstable();
-            Err(format!(
-                "stdout_logging: unknown configuration key(s) at `{path}`: {:?}",
-                unknown.join(", ")
-            ))
-        }
+        Some("errors_only") => crate::util::unknown_keys::reject_unknown_keys(
+            obj,
+            path,
+            &["op"],
+            &format!("stdout_logging: `{path}`: "),
+        ),
         Some("and") | Some("or") => {
             if let Some(left) = obj.get("left") {
                 reject_unknown_errors_only_fields(left, &format!("{path}.left"))?;
@@ -519,10 +492,11 @@ fn parse_optional_status_code(
 
 /// Parse `sampling`. A rate of `1` keeps every record and needs no sampler.
 fn parse_sampling(sampling: &Map<String, Value>) -> Result<Option<Sampler>, String> {
-    reject_unknown_keys(
+    crate::util::unknown_keys::reject_unknown_keys(
         sampling,
         "stdout_logging.sampling",
         &["rate", "always_log_errors"],
+        "stdout_logging: `stdout_logging.sampling`: ",
     )?;
     let Some(rate) = sampling.get("rate") else {
         return Err("stdout_logging: `sampling.rate` is required".to_string());

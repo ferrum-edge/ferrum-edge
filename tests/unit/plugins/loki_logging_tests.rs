@@ -1290,7 +1290,7 @@ async fn test_loki_logging_listen_path_key_is_unknown() {
     );
     let err = result.err().expect("unknown key should be rejected");
     assert!(
-        err.contains("unknown configuration field") && err.contains("include_listen_path_label"),
+        err.contains("unknown configuration key") && err.contains("include_listen_path_label"),
         "got: {err}"
     );
 }

@@ -4104,11 +4104,11 @@ fn test_unknown_and_null_fields_are_rejected() {
     for (config, expected) in [
         (
             json!({"max_deadline_ms": 30000, "reject_no_deadine": true}),
-            "unknown configuration property in `config`: \"reject_no_deadine\"",
+            "`config`: unknown configuration key(s): \"config.reject_no_deadine\"",
         ),
         (
             json!({"MAX_DEADLINE_MS": 30000}),
-            "unknown configuration property in `config`: \"MAX_DEADLINE_MS\"",
+            "`config`: unknown configuration key(s): \"config.MAX_DEADLINE_MS\"",
         ),
         (
             json!({"max_deadline_ms": null}),
@@ -4117,7 +4117,7 @@ fn test_unknown_and_null_fields_are_rejected() {
         (json!({"reject_no_deadline": null}), "must be a boolean"),
         (
             json!({"max_deadline_ms": 30000, "unexpected": {"nested": true}}),
-            "unknown configuration property in `config`: \"unexpected\"",
+            "`config`: unknown configuration key(s): \"config.unexpected\"",
         ),
     ] {
         let error = create_plugin("grpc_deadline", &config)
@@ -6284,7 +6284,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({token: true}),
             "`config`",
-            "unknown configuration property",
+            "unknown configuration key(s)",
         ),
         (
             json!({"default_deadline_ms": 918273641, "max_deadline_ms": 1}),

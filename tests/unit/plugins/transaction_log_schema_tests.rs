@@ -145,7 +145,10 @@ fn test_unknown_outer_config_key_rejected_with_path() {
         "strict": true
     }))
     .expect_err("unknown outer config keys must be rejected");
-    assert!(err.contains("unknown config key \"strict\""), "got: {err}");
+    assert!(
+        err.contains("unknown configuration key(s): \"config.strict\""),
+        "got: {err}"
+    );
     assert!(err.contains("`config`"), "got: {err}");
 }
 

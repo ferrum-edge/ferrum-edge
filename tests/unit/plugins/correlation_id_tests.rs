@@ -45,7 +45,8 @@ fn test_constructor_rejects_one_and_multiple_unknown_fields_deterministically() 
         .expect("unknown field must be rejected");
     assert_eq!(
         one,
-        "correlation_id: unknown config field(s): \"echo_downsteam\""
+        "correlation_id: `config`: unknown configuration key(s): \"config.echo_downsteam\" \
+         (did you mean `echo_downstream`?)"
     );
 
     let multiple = CorrelationId::new(&json!({
@@ -57,7 +58,8 @@ fn test_constructor_rejects_one_and_multiple_unknown_fields_deterministically() 
     .expect("multiple unknown fields must be rejected");
     assert_eq!(
         multiple,
-        "correlation_id: unknown config field(s): \"a_unknown, z_unknown\""
+        "correlation_id: `config`: unknown configuration key(s): \"config.a_unknown\", \
+         \"config.z_unknown\""
     );
 }
 
@@ -1476,8 +1478,8 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     for (config, field, reason) in [
         (
             json!({token: true}),
-            "correlation_id",
-            "unknown config field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"header_name": 918273641}),

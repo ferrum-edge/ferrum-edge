@@ -4423,6 +4423,13 @@ pub mod _test_support {
         crate::plugins::request_deduplication::redis_record_payload_is_valid_for_test(data)
     }
 
+    pub fn request_deduplication_completed_redis_record_for_test(
+        fingerprint: &str,
+        payload: Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        crate::plugins::request_deduplication::completed_redis_record_for_test(fingerprint, payload)
+    }
+
     pub async fn request_deduplication_redis_record_state_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
         key: &str,
@@ -6970,14 +6977,8 @@ pub mod _test_support {
             self.rate_limiting.tracked_keys_count()
         }
 
-        pub fn rate_limiting_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.rate_limiting
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn rate_limiting_prune_stale(&self, now: std::time::Instant) {
+            self.rate_limiting.prune_stale_for_test(now);
         }
 
         pub fn seed_ai(&self, key: &str, now: std::time::Instant) {
@@ -7011,14 +7012,8 @@ pub mod _test_support {
             self.ai.tracked_keys_count()
         }
 
-        pub fn ai_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.ai
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn ai_prune_stale(&self, now: std::time::Instant) {
+            self.ai.prune_stale_for_test(now);
         }
 
         pub fn seed_graphql(&self, key: &str, now: std::time::Instant) {
@@ -7052,14 +7047,8 @@ pub mod _test_support {
             self.graphql.tracked_keys_count()
         }
 
-        pub fn graphql_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.graphql
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn graphql_prune_stale(&self, now: std::time::Instant) {
+            self.graphql.prune_stale_for_test(now);
         }
 
         pub fn seed_grpc(&self, key: &str, now: std::time::Instant) {
@@ -7093,14 +7082,8 @@ pub mod _test_support {
             self.grpc.tracked_keys_count()
         }
 
-        pub fn grpc_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.grpc
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn grpc_prune_stale(&self, now: std::time::Instant) {
+            self.grpc.prune_stale_for_test(now);
         }
 
         pub fn seed_ws(&self, connection_id: u64, now: std::time::Instant) {
@@ -7138,14 +7121,8 @@ pub mod _test_support {
             self.ws.tracked_keys_count()
         }
 
-        pub fn ws_apply_branch(
-            &self,
-            now: std::time::Instant,
-            over_capacity: bool,
-            max_entries: usize,
-        ) {
-            self.ws
-                .apply_cleanup_branch_for_test(now, over_capacity, max_entries);
+        pub fn ws_prune_stale(&self, now: std::time::Instant) {
+            self.ws.prune_stale_for_test(now);
         }
     }
 

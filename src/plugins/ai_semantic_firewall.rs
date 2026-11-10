@@ -9476,20 +9476,6 @@ fn ensure_unique_id(ids: &mut HashSet<String>, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn reject_unknown_keys(
-    object: &serde_json::Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!(
-            "ai_semantic_firewall: unknown property in `{path}`: {key:?}; allowed properties: `{}`",
-            allowed.join("`, `")
-        ));
-    }
-    Ok(())
-}
-
 /// Keep runtime admission as strict as the OpenAPI schema. This runs before
 /// ordinary type/value parsing so a valid sibling field or default built-in
 /// pack can never mask a misspelled security policy.
@@ -9522,12 +9508,22 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
         "response_leakage",
     ];
 
-    reject_unknown_keys(config, "config", ROOT)?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        config,
+        "config",
+        ROOT,
+        "ai_semantic_firewall: `config`: ",
+    )?;
     if let Some(object) = config.get("inspect").and_then(Value::as_object) {
-        reject_unknown_keys(object, "config.inspect", &["request", "response"])?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config.inspect",
+            &["request", "response"],
+            "ai_semantic_firewall: `config.inspect`: ",
+        )?;
     }
     if let Some(object) = config.get("streaming").and_then(Value::as_object) {
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config.streaming",
             &[
@@ -9543,10 +9539,11 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                 "max_hold_ms",
                 "on_hold_timeout",
             ],
+            "ai_semantic_firewall: `config.streaming`: ",
         )?;
     }
     if let Some(object) = config.get("provider").and_then(Value::as_object) {
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config.provider",
             &[
@@ -9560,32 +9557,41 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                 "max_concurrent_requests",
                 "allow_plaintext",
             ],
+            "ai_semantic_firewall: `config.provider`: ",
         )?;
     }
     if let Some(object) = config.get("builtins").and_then(Value::as_object) {
-        reject_unknown_keys(object, "config.builtins", BUILTIN_NAMES)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config.builtins",
+            BUILTIN_NAMES,
+            "ai_semantic_firewall: `config.builtins`: ",
+        )?;
         for builtin in BUILTIN_NAMES {
             if let Some(pack) = object.get(*builtin).and_then(Value::as_object) {
-                reject_unknown_keys(
+                crate::util::unknown_keys::reject_unknown_keys(
                     pack,
                     &format!("config.builtins.{builtin}"),
                     &["enabled", "examples_mode", "examples"],
+                    &format!("ai_semantic_firewall: `config.builtins.{builtin}`: "),
                 )?;
             }
         }
     }
     if let Some(object) = config.get("extraction").and_then(Value::as_object) {
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config.extraction",
             &["request_json_paths", "response_json_paths"],
+            "ai_semantic_firewall: `config.extraction`: ",
         )?;
     }
     if let Some(object) = config.get("privacy").and_then(Value::as_object) {
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             object,
             "config.privacy",
             &["include_snippet_hash", "snippet_hash_salt"],
+            "ai_semantic_firewall: `config.privacy`: ",
         )?;
     }
 
@@ -9620,7 +9626,12 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
         if let Some(items) = config.get(field).and_then(Value::as_array) {
             for (index, item) in items.iter().enumerate() {
                 if let Some(object) = item.as_object() {
-                    reject_unknown_keys(object, &format!("config.{field}[{index}]"), allowed)?;
+                    crate::util::unknown_keys::reject_unknown_keys(
+                        object,
+                        &format!("config.{field}[{index}]"),
+                        allowed,
+                        &format!("ai_semantic_firewall: `config.{field}[{index}]`: "),
+                    )?;
                 }
             }
         }

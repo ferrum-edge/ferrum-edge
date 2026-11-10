@@ -4,13 +4,15 @@
 //!
 //! - `ferrum.response_transformer.<scope>.enabled` → `Bool`
 //!
-//! Mirrors the `request_transformer` overlay consumer
+//! Mirrors the `request_transformer` overlay keys
 //! ([`crate::plugins::request_transformer::runtime_overlay`]) — the two
-//! plugins maintain independent gate maps so an operator can disable one
+//! plugins use independent gate namespaces so an operator can disable one
 //! direction without affecting the other. As on the request side, the gate that
 //! actually governs rule application is bound into the candidate instance
 //! config on the cold path and published with its `RequestEpoch`
-//! (GHSA-83rc-23c9-3g9x); this store is provenance only.
+//! (GHSA-83rc-23c9-3g9x). The store below exists for its policy identity
+//! ([`policy_stamp`]), which retained-representation caches bind to; the gate
+//! values in it are provenance only.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -26,9 +28,11 @@ static GATES: LazyLock<BoolGateStore> = LazyLock::new(runtime_bool_gate::new_sto
 
 pub type GateSnapshot = runtime_bool_gate::BoolGateSnapshot;
 
-/// The live published gate map. Provenance/observability only; see the
-/// `request_transformer` counterpart for why no plugin phase consults it and why
-/// the `#[allow(dead_code)]` is required.
+/// The live published gate map. Provenance/observability only: no plugin
+/// phase consults it, since the gate that governs rule application is bound
+/// into the instance config and resolved at construction
+/// (GHSA-83rc-23c9-3g9x). Reachable from `tests/` but not consumed by the
+/// binary build path, hence the `#[allow(dead_code)]`.
 #[allow(dead_code)]
 pub fn current_gates() -> GateSnapshot {
     runtime_bool_gate::current_snapshot(&GATES)
@@ -53,8 +57,9 @@ pub fn scope_gates(overlay: &MeshRuntimeOverlay) -> HashMap<String, bool> {
     transformer_gate::scope_gates(overlay, KEY_PREFIX, ENABLED_SUFFIX)
 }
 
-/// Same contract as
-/// [`crate::plugins::request_transformer::runtime_overlay::reset_for_test`].
+/// Reset state for tests in external crates. `pub` + `#[doc(hidden)]` so the
+/// symbol is reachable from `tests/` without ad-hoc visibility hacks; the
+/// binary build path does not consume it, hence the `#[allow(dead_code)]`.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn reset_for_test() {

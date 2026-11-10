@@ -618,12 +618,14 @@ const TRACING_ENVELOPE_FIELDS_KEYS: [&str; 1] = ["message"];
 
 /// An order-preserving JSON document, used only by [`redact_log_record`].
 ///
-/// `serde_json::Value` stores objects in a `BTreeMap` — the `preserve_order`
-/// feature is deliberately not enabled crate-wide, since it would change every
-/// admin API response body — so round-tripping a record through it would
-/// alphabetize the fields of every access-log line that happened to contain a
-/// resolved value. Redaction must change values and nothing else, so objects
-/// are held here as an ordered key/value list.
+/// Redaction must change values and nothing else, so field order has to
+/// survive the round trip. Whether `serde_json::Value` keeps object order
+/// depends on its `preserve_order` cargo feature, which any crate in the graph
+/// can turn on (today `bson`, through `mongodb`, does) and which could equally
+/// be turned off by a dependency change; without it objects are a `BTreeMap`
+/// and every access-log line that contained a resolved value would come out
+/// alphabetized. Objects are therefore held here as an explicit ordered
+/// key/value list, independent of that feature.
 ///
 /// Depth is bounded by `serde_json`'s own recursion limit on the parse, which
 /// also bounds the redaction walk and the reserialization.

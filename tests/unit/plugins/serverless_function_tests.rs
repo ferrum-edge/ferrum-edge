@@ -6254,12 +6254,13 @@ fn sigv4_authorization_for(url: &str) -> String {
 #[parallel(serverless_env)]
 fn test_aws_sigv4_canonical_host_includes_a_nondefault_port() {
     use ferrum_edge::plugins::utils::aws_sigv4;
+    use ferrum_edge::plugins::utils::cert_hash::sha256_hex_lower;
 
     let authorization = sigv4_authorization_for(
         "http://127.0.0.1:59816/2015-03-31/functions/strict/invocations?Qualifier=%24LATEST",
     );
 
-    let payload_hash = aws_sigv4::sha256_hex(b"{}");
+    let payload_hash = sha256_hex_lower(b"{}");
     let canonical_headers = format!(
         "content-type:application/json\nhost:127.0.0.1:59816\nx-amz-content-sha256:{payload_hash}\nx-amz-date:20240115T120000Z\n"
     );
@@ -6268,7 +6269,7 @@ fn test_aws_sigv4_canonical_host_includes_a_nondefault_port() {
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n20240115T120000Z\n20240115/us-east-1/lambda/aws4_request\n{}",
-        aws_sigv4::sha256_hex(canonical_request.as_bytes())
+        sha256_hex_lower(canonical_request.as_bytes())
     );
     let signing_key = aws_sigv4::derive_signing_key(
         "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -6314,10 +6315,11 @@ fn test_aws_sigv4_canonical_host_omits_scheme_default_ports() {
 #[parallel(serverless_env)]
 fn test_aws_sigv4_canonical_host_brackets_ipv6_literals() {
     use ferrum_edge::plugins::utils::aws_sigv4;
+    use ferrum_edge::plugins::utils::cert_hash::sha256_hex_lower;
 
     let authorization =
         sigv4_authorization_for("http://[2001:db8::30]:4566/2015-03-31/f/invocations");
-    let payload_hash = aws_sigv4::sha256_hex(b"{}");
+    let payload_hash = sha256_hex_lower(b"{}");
     let canonical_headers = format!(
         "content-type:application/json\nhost:[2001:db8::30]:4566\nx-amz-content-sha256:{payload_hash}\nx-amz-date:20240115T120000Z\n"
     );
@@ -6326,7 +6328,7 @@ fn test_aws_sigv4_canonical_host_brackets_ipv6_literals() {
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n20240115T120000Z\n20240115/us-east-1/lambda/aws4_request\n{}",
-        aws_sigv4::sha256_hex(canonical_request.as_bytes())
+        sha256_hex_lower(canonical_request.as_bytes())
     );
     let signing_key = aws_sigv4::derive_signing_key(
         "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -6976,13 +6978,13 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         ),
         (
             json!({token: true}),
-            "serverless_function",
-            "unknown configuration field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"provider": null, token: null}),
-            "serverless_function",
-            "unknown configuration field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"provider": token}),

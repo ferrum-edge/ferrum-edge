@@ -2354,7 +2354,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
 | `response_caching` | ✓ | | | | | HTTP-only response cache lookup and store |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
-| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
+| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli, zstd) |
 | `ai_prompt_compressor` | ✓ | | | | | HTTP-only JSON prompt compression; native gRPC wire frames are not rewritten |
 | `ai_federation` | ✓ | | | | | HTTP-only; routes final OpenAI JSON bodies to providers, normalizes bounded responses, and relays committed provider SSE incrementally |
 | `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |

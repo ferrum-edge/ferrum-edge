@@ -156,18 +156,12 @@ impl KeyAuth {
                 config = config.to_string()
             )
         })?;
-        let mut unknown_fields: Vec<&str> = config_obj
-            .keys()
-            .map(String::as_str)
-            .filter(|key| !matches!(*key, "key_location" | "hide_credentials"))
-            .collect();
-        unknown_fields.sort_unstable();
-        if !unknown_fields.is_empty() {
-            return Err(format!(
-                "key_auth: unknown configuration field(s): {:?}; allowed fields are `key_location` and `hide_credentials`",
-                unknown_fields.join(", ")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            &["key_location", "hide_credentials"],
+            "key_auth: `config`: ",
+        )?;
 
         let hide_credentials = match config_obj.get("hide_credentials") {
             Some(value) => value

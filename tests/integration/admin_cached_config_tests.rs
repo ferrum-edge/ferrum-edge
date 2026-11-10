@@ -2348,7 +2348,7 @@ async fn transaction_log_schema_admin_rejects_unknown_closed_object_keys() {
         (
             "unknown-outer",
             json!({"schemas": {"audit": {}}, "strict": true}),
-            "unknown config key \"strict\" at `config`",
+            "`config`: unknown configuration key(s): \"config.strict\"",
         ),
         (
             "unknown-derived",
@@ -3025,7 +3025,10 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
             body["error"]
                 .as_str()
                 .expect("admin error string")
-                .contains(&format!("jwt_auth: unknown config key {unknown_key:?}")),
+                .contains(&format!(
+                    "jwt_auth: `config`: unknown configuration key(s): {:?}",
+                    format!("config.{unknown_key}")
+                )),
             "unexpected admin validation response: {body}"
         );
     }
@@ -3382,7 +3385,7 @@ async fn test_admin_create_rejects_malformed_correlation_id_configs() {
         (
             "correlation-unknown-key",
             json!({"echo_downsteam": false}),
-            "correlation_id: unknown config field(s): \"echo_downsteam\"",
+            "correlation_id: `config`: unknown configuration key(s): \"config.echo_downsteam\"",
         ),
         (
             "correlation-managed-header",
@@ -3577,7 +3580,8 @@ async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
         let error = body["error"].as_str().expect("admin error string");
         assert!(
             error.contains(&format!(
-                "ai_prompt_compressor: unknown config field(s): {unknown_key:?}"
+                "ai_prompt_compressor: `config`: unknown configuration key(s): {:?}",
+                format!("config.{unknown_key}")
             )),
             "unexpected admin validation response: {body}"
         );
@@ -3682,7 +3686,9 @@ async fn test_admin_create_rejects_unknown_adaptive_concurrency_policy_keys() {
         body["error"]
             .as_str()
             .expect("admin error string")
-            .contains("adaptive_concurrency: unknown config key \"max_limt\""),
+            .contains(
+                "adaptive_concurrency: `config`: unknown configuration key(s): \"config.max_limt\""
+            ),
         "unexpected admin validation response: {body}"
     );
 }

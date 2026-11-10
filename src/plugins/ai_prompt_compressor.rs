@@ -444,19 +444,12 @@ impl AiPromptCompressor {
         let object = config
             .as_object()
             .ok_or_else(|| "ai_prompt_compressor: config must be an object".to_string())?;
-        let mut unknown: Vec<&str> = object
-            .keys()
-            .map(String::as_str)
-            .filter(|key| !CONFIG_FIELDS.contains(key))
-            .collect();
-        if !unknown.is_empty() {
-            unknown.sort_unstable();
-            return Err(format!(
-                "ai_prompt_compressor: unknown config field(s): {:?} (allowed: `{}`)",
-                unknown.join(", "),
-                CONFIG_FIELDS.join("`, `")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            CONFIG_FIELDS,
+            "ai_prompt_compressor: `config`: ",
+        )?;
 
         let compress_roles: HashSet<String> = match optional_string_vec(config, "compress_roles")? {
             Some(roles) => {

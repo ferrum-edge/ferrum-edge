@@ -4775,10 +4775,6 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
         );
         assert!(err.contains(typo), "error must name the typo: {err}");
         assert!(
-            err.contains("allowed keys"),
-            "error must list the allowed-key contract: {err}"
-        );
-        assert!(
             err.contains("did you mean"),
             "typo diagnostics should include a suggestion for {typo}: {err}"
         );
@@ -4786,9 +4782,6 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
             err.contains(canonical),
             "suggestion should name the canonical key {canonical}: {err}"
         );
-        for key in REQUEST_MIRROR_CONFIG_KEYS {
-            assert!(err.contains(key), "missing allowed key {key} in: {err}");
-        }
 
         let shared = validate_plugin_config("request_mirror", &config)
             .expect_err("shared admission must reject the same typo");
@@ -4803,7 +4796,7 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
         .err()
         .expect("arbitrary unknown key must be rejected");
     assert!(err.contains("zzz_arbitrary_unknown"), "got: {err}");
-    assert!(err.contains("allowed keys"), "got: {err}");
+    assert!(err.starts_with("request_mirror: `config`: "), "got: {err}");
 }
 
 #[test]
@@ -6611,7 +6604,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         ),
         (
             json!({"mirror_host": "example.com", token: true}),
-            "allowed keys",
+            "`config`",
             "unknown configuration key",
         ),
         (

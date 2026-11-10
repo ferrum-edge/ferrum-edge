@@ -168,10 +168,7 @@ fn throttle_plugin_config() -> PluginConfig {
         plugin_name: "tcp_connection_throttle".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
-            "max_connections_per_key": 1,
-            // Disable the background sweep so the test isn't racing
-            // against periodic cleanup of zero-count entries.
-            "cleanup_interval_seconds": 0
+            "max_connections_per_key": 1
         }),
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),

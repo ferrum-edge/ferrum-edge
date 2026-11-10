@@ -622,9 +622,9 @@ async fn test_response_transformer_rejects_unknown_top_level_key() {
     }))
     .err()
     .expect("expected error for unknown top-level key");
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("runtime_overlay_scpoe"), "got: {err}");
-    assert!(err.contains("under `config`"), "got: {err}");
+    assert!(err.contains("`config`: unknown"), "got: {err}");
 }
 
 #[tokio::test]
@@ -642,7 +642,7 @@ async fn test_response_transformer_rejects_unknown_header_rule_key() {
     }))
     .err()
     .expect("expected error for unknown header rule key");
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("vaule"), "got: {err}");
     assert!(err.contains("config.rules[0]"), "got: {err}");
 }
@@ -662,7 +662,7 @@ async fn test_response_transformer_rejects_unknown_body_rule_key() {
     }))
     .err()
     .expect("expected error for unknown body rule key");
-    assert!(err.contains("unknown config key"), "got: {err}");
+    assert!(err.contains("unknown configuration key"), "got: {err}");
     assert!(err.contains("extra_field"), "got: {err}");
     assert!(err.contains("config.rules[0]"), "got: {err}");
 }
@@ -2922,7 +2922,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({"rules": [{token: true}]}),
             "`config.rules[0]`",
-            "unknown config key",
+            "unknown configuration key",
         ),
         (
             json!({"rules": [{"target": true}]}),
@@ -2939,4 +2939,114 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
     }
+}
+
+// ── Backend number lexeme preservation (issue #7149) ─────────────────────
+
+/// Parse a JSON object into its members' raw lexemes, so assertions compare
+/// the exact bytes the client receives rather than two values already rounded
+/// through the same `serde_json::Value` representation.
+fn raw_response_members(body: &[u8]) -> HashMap<String, String> {
+    let members: HashMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_slice(body).expect("transformed body is a JSON object");
+    members
+        .into_iter()
+        .map(|(name, raw)| (name, raw.get().to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn response_body_rewrite_preserves_backend_number_lexemes_exactly() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let body = br#"{"id":18446744073709551617,"neg":-9223372036854775809,"pi":3.14159265358979323846264338327950288,"price":1.50,"tiny":2.5e-3,"zero":-0,"plain":42,"nested":[1.10,{"x":123456789012345678901234567890}],"debug":true}"#;
+    let out = plugin
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("the remove rule rewrites the body");
+    let members = raw_response_members(&out);
+    assert!(!members.contains_key("debug"));
+    assert_eq!(members["id"], "18446744073709551617");
+    assert_eq!(members["neg"], "-9223372036854775809");
+    assert_eq!(members["pi"], "3.14159265358979323846264338327950288");
+    assert_eq!(members["price"], "1.50");
+    assert_eq!(members["tiny"], "2.5e-3");
+    assert_eq!(members["zero"], "-0");
+    assert_eq!(members["plain"], "42");
+    assert_eq!(
+        members["nested"],
+        r#"[1.10,{"x":123456789012345678901234567890}]"#
+    );
+}
+
+#[tokio::test]
+async fn response_body_rename_and_update_keep_number_lexemes_where_they_land() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "amount", "new_key": "total"},
+            {"operation": "update", "target": "body", "key": "rate", "value": 5}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"amount":1.000000000000000000001,"rate":0.30000000000000000000001,"keep":98765432109876543210}"#;
+    let out = plugin
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("rename + update rewrite the body");
+    let members = raw_response_members(&out);
+    assert!(!members.contains_key("amount"));
+    assert_eq!(members["total"], "1.000000000000000000001");
+    assert_eq!(
+        members["rate"], "5",
+        "an overwritten number takes the rule value"
+    );
+    assert_eq!(members["keep"], "98765432109876543210");
+}
+
+/// The lexeme-preserving rewrite still serializes through the retained
+/// ceiling: output exactly at the ceiling passes, one byte over is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn response_lexeme_preserving_rewrite_honours_the_retained_ceiling() {
+    use ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test;
+
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    // Keys already sorted, so the expected bytes hold whether or not the map
+    // keeps insertion order.
+    let body = br#"{"debug":true,"id":18446744073709551617,"price":1.50}"#;
+    let expected = br#"{"id":18446744073709551617,"price":1.50}"#;
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let mut ctx = make_ctx();
+    ctx.max_response_body_size_bytes = expected.len();
+    let out = plugin
+        .transform_response_body_with_context(&mut ctx, body, Some("application/json"), &headers)
+        .await
+        .expect("output exactly at the ceiling passes");
+    assert_eq!(out.as_slice(), expected.as_slice());
+    assert!(!take_buffered_response_capacity_refusal_pending_for_test(
+        &mut ctx
+    ));
+
+    let mut ctx = make_ctx();
+    ctx.max_response_body_size_bytes = expected.len() - 1;
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                body,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "an over-ceiling lexeme-preserving rewrite must be refused"
+    );
+    assert!(take_buffered_response_capacity_refusal_pending_for_test(
+        &mut ctx
+    ));
 }

@@ -482,18 +482,12 @@ impl TransactionDebugger {
             "transaction_debugger",
             SchemaCapabilities::TRANSACTION_DEBUGGER,
         )?;
-        let mut unknown_keys: Vec<&str> = object
-            .keys()
-            .map(String::as_str)
-            .filter(|key| !TRANSACTION_DEBUGGER_CONFIG_KEYS.contains(key))
-            .collect();
-        if !unknown_keys.is_empty() {
-            unknown_keys.sort_unstable();
-            return Err(format!(
-                "transaction_debugger: unknown configuration keys at `config`: {:?}",
-                unknown_keys.join(", ")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            TRANSACTION_DEBUGGER_CONFIG_KEYS,
+            "transaction_debugger: `config`: ",
+        )?;
 
         let mut extra_redacted_headers =
             optional_header_names(config, "redacted_headers")?.unwrap_or_default();

@@ -372,9 +372,9 @@ fn unknown_config_properties_are_rejected_with_qualified_paths() {
         let error = AiSemanticFirewall::new(&config, PluginHttpClient::default())
             .err()
             .expect("unknown property must reject configuration");
-        let (scope, key) = path.rsplit_once('.').unwrap();
+        let (scope, _key) = path.rsplit_once('.').unwrap();
         assert!(error.contains(&format!("`{scope}`")), "{error}");
-        assert!(error.contains(&format!("{key:?}")), "{error}");
+        assert!(error.contains(&format!("{path:?}")), "{error}");
     }
 }
 
@@ -4068,7 +4068,7 @@ fn token_window_config_admission_is_field_specific() {
         ),
         (
             json!({"window": "tokens", "tokenizer": "chars4", "token_encoding": "x"}),
-            "unknown property in `config.streaming`: \"token_encoding\"",
+            "`config.streaming`: unknown configuration key(s): \"config.streaming.token_encoding\"",
         ),
     ];
 
@@ -6272,7 +6272,7 @@ fn max_hold_ms_bounded_admission_is_field_specific() {
         ),
         (
             json!({"max_hold_seconds": 5}),
-            "unknown property in `config.streaming`: \"max_hold_seconds\"",
+            "`config.streaming`: unknown configuration key(s): \"config.streaming.max_hold_seconds\"",
         ),
     ];
 

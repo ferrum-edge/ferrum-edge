@@ -44,7 +44,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::config::BackendEgressPolicy;
 use crate::plugins::utils::http_client::PluginHttpClient;
-use crate::plugins::utils::{parse_socket_host, resolve_tcp_endpoint};
+use crate::plugins::utils::{parse_socket_host, resolve_socket_endpoint};
 
 use super::super::notification::{Notification, NotificationField};
 use super::super::templating::{render_template_bounded, validate_template};
@@ -700,7 +700,7 @@ impl EmailChannel {
 
         let addr = tokio::time::timeout(
             self.connect_timeout,
-            resolve_tcp_endpoint(
+            resolve_socket_endpoint(
                 &self.smtp_host,
                 self.smtp_port,
                 http.dns_cache(),

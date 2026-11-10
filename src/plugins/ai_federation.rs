@@ -1415,7 +1415,12 @@ impl AiFederation {
             .as_object()
             .ok_or_else(|| "ai_federation: config must be an object".to_string())?;
         reject_unsupported_streaming_config(config, "config", true)?;
-        reject_unknown_config_keys(config_object, "config", AI_FEDERATION_CONFIG_KEYS)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            AI_FEDERATION_CONFIG_KEYS,
+            "ai_federation: `config`: ",
+        )?;
         let streaming = parse_streaming_policy(config)?;
 
         let providers_val = config
@@ -1444,10 +1449,11 @@ impl AiFederation {
                 .as_object()
                 .ok_or_else(|| format!("ai_federation: `providers[{i}]` must be an object"))?;
             reject_unsupported_streaming_config(pv, &format!("provider[{i}]"), false)?;
-            reject_unknown_config_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 provider_object,
                 &format!("provider[{i}]"),
                 AI_FEDERATION_PROVIDER_KEYS,
+                &format!("ai_federation: `provider[{i}]`: "),
             )?;
 
             let name = optional_str(pv, "name")?
@@ -1735,27 +1741,6 @@ const AI_FEDERATION_PROVIDER_KEYS: &[&str] = &[
 const PROVIDER_CIRCUIT_KEYS: &[&str] =
     &["failure_threshold", "cooldown_seconds", "success_threshold"];
 
-fn reject_unknown_config_keys(
-    object: &serde_json::Map<String, Value>,
-    scope: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let mut unknown = object
-        .keys()
-        .filter(|key| !allowed.contains(&key.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort();
-    Err(format!(
-        "ai_federation: `{scope}` contains unknown field(s): {:?}; allowed fields: `{}`",
-        unknown.join(", "),
-        allowed.join("`, `")
-    ))
-}
-
 fn validate_provider_field_types(provider: &Value) -> Result<(), String> {
     for field in [
         "api_key",
@@ -1804,10 +1789,11 @@ fn parse_provider_circuit(
     let object = value.as_object().ok_or_else(|| {
         format!("ai_federation: provider {name:?} `circuit_breaker` must be an object")
     })?;
-    reject_unknown_config_keys(
+    crate::util::unknown_keys::reject_unknown_keys(
         object,
         "config.providers[].circuit_breaker",
         PROVIDER_CIRCUIT_KEYS,
+        "ai_federation: `config.providers[].circuit_breaker`: ",
     )?;
 
     let failure_threshold = u32::try_from(optional_u64(value, "failure_threshold")?.unwrap_or(3))
@@ -1916,7 +1902,12 @@ fn parse_streaming_policy(config: &Value) -> Result<StreamingPolicy, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "ai_federation: `streaming` must be an object".to_string())?;
-    reject_unknown_config_keys(object, "streaming", AI_FEDERATION_STREAMING_KEYS)?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        "streaming",
+        AI_FEDERATION_STREAMING_KEYS,
+        "ai_federation: `streaming`: ",
+    )?;
 
     let enabled = optional_bool(value, "enabled")?.unwrap_or(false);
     let max_event_bytes = match optional_u64(value, "max_event_bytes")? {

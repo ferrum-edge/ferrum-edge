@@ -217,13 +217,12 @@ impl IssuerFilter {
                 val = val.to_string()
             )
         })?;
-        for key in obj.keys() {
-            if !matches!(key.as_str(), "cn" | "o" | "ou" | "ca_certificate_pem") {
-                return Err(format!(
-                    "mtls_auth: `{context}` contains unsupported issuer field {key:?}"
-                ));
-            }
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            obj,
+            context,
+            &["cn", "o", "ou", "ca_certificate_pem"],
+            &format!("mtls_auth: `{context}`: "),
+        )?;
         let ca_certificate_pem = string_field(obj, "ca_certificate_pem", context)?.ok_or_else(|| {
             format!(
                 "mtls_auth: `{context}.ca_certificate_pem` is required to cryptographically pin the issuer"
@@ -968,17 +967,16 @@ fn validate_top_level_keys(config: &Value) -> Result<(), String> {
     let obj = config
         .as_object()
         .ok_or_else(|| "mtls_auth: config must be an object".to_string())?;
-    for key in obj.keys() {
-        if !matches!(
-            key.as_str(),
-            "cert_field" | "allowed_issuers" | "allowed_ca_fingerprints_sha256"
-        ) {
-            return Err(format!(
-                "mtls_auth: config contains unsupported field {key:?}"
-            ));
-        }
-    }
-    Ok(())
+    crate::util::unknown_keys::reject_unknown_keys(
+        obj,
+        "config",
+        &[
+            "cert_field",
+            "allowed_issuers",
+            "allowed_ca_fingerprints_sha256",
+        ],
+        "mtls_auth: `config`: ",
+    )
 }
 
 fn string_field(

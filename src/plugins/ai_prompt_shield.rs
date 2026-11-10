@@ -847,15 +847,12 @@ impl AiPromptShield {
             return Err("ai_prompt_shield: config must be an object".to_string());
         };
 
-        if let Some(unknown) = config_object
-            .keys()
-            .find(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
-        {
-            return Err(format!(
-                "ai_prompt_shield: unknown config field {unknown:?}; allowed fields: `{}`",
-                ALLOWED_CONFIG_KEYS.join("`, `")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            ALLOWED_CONFIG_KEYS,
+            "ai_prompt_shield: `config`: ",
+        )?;
 
         let action = match optional_string(config, "action")?.unwrap_or("reject") {
             "reject" => ShieldAction::Reject,
@@ -959,15 +956,12 @@ impl AiPromptShield {
                         "ai_prompt_shield: `custom_patterns[{index}]` must be an object"
                     ));
                 };
-                if let Some(unknown) = entry_object
-                    .keys()
-                    .find(|key| !ALLOWED_CUSTOM_PATTERN_KEYS.contains(&key.as_str()))
-                {
-                    return Err(format!(
-                        "ai_prompt_shield: unknown config field `custom_patterns[{index}]` key {unknown:?}; allowed fields: `{}`",
-                        ALLOWED_CUSTOM_PATTERN_KEYS.join("`, `")
-                    ));
-                }
+                crate::util::unknown_keys::reject_unknown_keys(
+                    entry_object,
+                    &format!("custom_patterns[{index}]"),
+                    ALLOWED_CUSTOM_PATTERN_KEYS,
+                    &format!("ai_prompt_shield: `custom_patterns[{index}]`: "),
+                )?;
                 let name = entry_object
                     .get("name")
                     .and_then(Value::as_str)

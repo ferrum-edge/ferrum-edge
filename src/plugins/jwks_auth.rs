@@ -485,7 +485,12 @@ impl JwksAuth {
                 config = config.to_string()
             )
         })?;
-        reject_unknown_fields(config_obj, &root_config_fields(), "config")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            &root_config_fields(),
+            "jwks_auth: `config`: ",
+        )?;
 
         // A blank id would collapse every jwks_auth config in a namespace onto
         // one replay domain; fail closed rather than merge them.
@@ -649,7 +654,12 @@ impl JwksAuth {
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
-            reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
+            crate::util::unknown_keys::reject_unknown_keys(
+                prov_obj,
+                &format!("provider[{idx}]"),
+                PROVIDER_FIELDS,
+                &format!("jwks_auth: `provider[{idx}]`: "),
+            )?;
 
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
             let discovery_endpoint = parse_url_field(prov_obj, "discovery_url", idx)?;
@@ -2616,19 +2626,6 @@ fn default_dpop_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> Str
     prefix
 }
 
-fn reject_unknown_fields(
-    config: &Map<String, Value>,
-    allowed: &[&str],
-    context: &str,
-) -> Result<(), String> {
-    for field in config.keys() {
-        if !allowed.contains(&field.as_str()) {
-            return Err(format!("jwks_auth: unknown field {field:?} in `{context}`"));
-        }
-    }
-    Ok(())
-}
-
 fn optional_u64(
     config: &Map<String, Value>,
     field: &str,
@@ -3083,10 +3080,11 @@ fn parse_token_locations(
                     header = header.to_string()
                 )
             })?;
-            reject_unknown_fields(
+            crate::util::unknown_keys::reject_unknown_keys(
                 object,
-                &["name", "prefix"],
                 &format!("provider[{provider_idx}].from_headers[{idx}]"),
+                &["name", "prefix"],
+                &format!("jwks_auth: `provider[{provider_idx}].from_headers[{idx}]`: "),
             )?;
             let name_value = object.get("name").ok_or_else(|| {
                 format!(

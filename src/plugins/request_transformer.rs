@@ -141,7 +141,7 @@
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
@@ -609,27 +609,6 @@ fn contains_crlf(s: &str) -> bool {
     s.bytes().any(|b| b == b'\r' || b == b'\n')
 }
 
-fn reject_unknown_keys(
-    object: &Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !allowed.contains(key))
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "request_transformer: unknown config key(s) under `{path}`: {:?}; allowed keys: `{}`",
-        unknown.join(", "),
-        allowed.join("`, `")
-    ))
-}
-
 /// Validate a configured header value the same way outbound Hyper / H3 /
 /// reqwest adapters do (`HeaderValue::from_str`), while keeping the
 /// historical CR/LF-specific diagnostic for injection typos.
@@ -668,7 +647,12 @@ impl RequestTransformer {
                 CONFIG_KEYS.join("`, `")
             )
         })?;
-        reject_unknown_keys(config_obj, "config", CONFIG_KEYS)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            CONFIG_KEYS,
+            "request_transformer: `config`: ",
+        )?;
 
         let mut header_rules: Vec<HeaderRule> = Vec::new();
         let mut query_rules: Vec<QueryRule> = Vec::new();
@@ -682,7 +666,12 @@ impl RequestTransformer {
                     format!("request_transformer: `rule[{idx}]`: rule must be an object")
                 })?;
                 let rule_path = format!("config.rules[{idx}]");
-                reject_unknown_keys(rule_obj, &rule_path, RULE_KEYS)?;
+                crate::util::unknown_keys::reject_unknown_keys(
+                    rule_obj,
+                    &rule_path,
+                    RULE_KEYS,
+                    &format!("request_transformer: `{rule_path}`: "),
+                )?;
 
                 let target = match r.get("target") {
                     Some(Value::String(s)) => s.as_str(),

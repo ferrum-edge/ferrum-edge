@@ -1799,8 +1799,11 @@ fn every_unknown_root_config_key_is_rejected_with_allowed_key_list() {
     ] {
         let err = AiTokenMetrics::new(&json!({(key): true})).err().unwrap();
         assert!(err.contains(key), "got: {err}");
-        assert!(err.contains("allowed keys"), "got: {err}");
-        assert!(err.contains("metadata_prefix"), "got: {err}");
+        assert!(
+            err.contains("ai_token_metrics: `config`: unknown configuration key(s)"),
+            "got: {err}"
+        );
+        assert!(err.contains("did you mean `"), "got: {err}");
     }
 }
 

@@ -3362,9 +3362,9 @@ fn test_unknown_root_and_nested_config_keys_are_rejected() {
         ),
     ] {
         let error = AiResponseGuard::new(&config).err().unwrap();
-        let (scope, key) = path.rsplit_once('.').unwrap();
+        let (scope, _key) = path.rsplit_once('.').unwrap();
         assert!(error.contains(&format!("`{scope}`")), "{error}");
-        assert!(error.contains(&format!("{key:?}")), "{error}");
+        assert!(error.contains(&format!("{path:?}")), "{error}");
     }
 }
 

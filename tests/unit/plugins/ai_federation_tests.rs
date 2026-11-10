@@ -2654,7 +2654,7 @@ fn strict_config_rejects_unknown_root_provider_and_circuit_fields() {
         let error = ai_federation::AiFederation::new(&config, create_test_http_client())
             .err()
             .expect("misspelled configuration must fail closed");
-        assert!(error.contains("unknown field"), "got: {error}");
+        assert!(error.contains("unknown configuration key"), "got: {error}");
     }
 }
 

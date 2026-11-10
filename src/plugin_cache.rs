@@ -3032,7 +3032,6 @@ fn create_tcp_connection_throttle_plugin(
         identity,
         TcpConnectionThrottleInstance {
             state: plugin.shared_state(),
-            cleanup_interval_seconds: plugin.cleanup_interval_seconds(),
         },
     );
     Ok(Some(Arc::new(plugin)))
@@ -3979,7 +3978,6 @@ struct TcpConnectionThrottlePolicyId {
 #[derive(Clone)]
 struct TcpConnectionThrottleInstance {
     state: Arc<TcpConnectionThrottleState>,
-    cleanup_interval_seconds: u64,
 }
 
 type TcpConnectionThrottleInstanceMap =
@@ -7141,14 +7139,6 @@ impl PluginCacheInner {
         }
     }
 
-    fn apply_tcp_connection_throttle_cleanup_intervals(&self) {
-        for instance in self.tcp_connection_throttle_instances.values() {
-            instance
-                .state
-                .set_cleanup_interval(instance.cleanup_interval_seconds);
-        }
-    }
-
     pub(crate) fn prepare_adaptive_concurrency_generations(&self) {
         for instance in self.adaptive_concurrency_instances.values() {
             instance
@@ -8062,20 +8052,10 @@ impl PluginCache {
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
-        let previous = self.inner.load_full();
         inner.prepare_adaptive_concurrency_generations();
         self.inner.store(Arc::clone(&inner));
         commit_background_tasks(&inner.proxy_plugins, &inner.global_plugins);
         inner.commit_adaptive_concurrency_generations();
-        for (identity, instance) in &previous.tcp_connection_throttle_instances {
-            if !inner
-                .tcp_connection_throttle_instances
-                .contains_key(identity)
-            {
-                instance.state.set_cleanup_interval(0);
-            }
-        }
-        inner.apply_tcp_connection_throttle_cleanup_intervals();
     }
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
