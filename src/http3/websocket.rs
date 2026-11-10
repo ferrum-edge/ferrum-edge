@@ -1444,7 +1444,7 @@ pub(crate) async fn handle_h3_websocket(
 
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %current_backend_url,
+                    backend_url = %crate::proxy::strip_query_params(&current_backend_url),
                     error_kind = retry::error_class_log_kind(ws_error_class),
                     error_class = %ws_error_class,
                     error = %e,

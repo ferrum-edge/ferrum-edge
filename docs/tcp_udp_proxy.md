@@ -1113,7 +1113,7 @@ Notes:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_STREAM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for all TCP/UDP listeners |
+| `FERRUM_STREAM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for all TCP/UDP listeners; must be an IP address, or startup is refused |
 | `FERRUM_DTLS_CERT_PATH` | (none) | Leaf-first PEM certificate bundle for frontend DTLS termination (ECDSA P-256 or P-384 leaf) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` used for TCP. |

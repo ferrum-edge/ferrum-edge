@@ -6082,3 +6082,35 @@ fn route_rebase_invalidates_offsets_but_preserves_base_path_semantics() {
         }
     }
 }
+
+/// Issue #7155: the H1/H2 route-protocol admission `403` and circuit-breaker
+/// open `503` answer a gRPC-Web client in its own framing (status in a body
+/// trailer frame), like their `allowed_methods` and gRPC deadline siblings,
+/// not as a native-gRPC Trailers-Only header block it cannot read.
+#[test]
+fn route_admission_and_open_breaker_rejects_are_grpc_web_aware() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    let admission = source
+        .split("if omitted_policy_exemption == Some(false) {")
+        .nth(1)
+        .expect("route-protocol admission refusal")
+        .split("// Per-proxy HTTP method filtering")
+        .next()
+        .expect("bounded route-protocol admission refusal");
+    assert!(admission.contains("build_grpc_web_reject_response("));
+    assert!(admission.contains("grpc_web_response_content_type"));
+    assert!(admission.contains("if let Some(response) = grpc_web_response {"));
+
+    let breaker = source
+        .split("match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {")
+        .nth(1)
+        .expect("H1/H2 circuit-breaker admission")
+        .split("// GHSA-4cq4-3f3f-mq76")
+        .next()
+        .expect("bounded circuit-breaker open refusal");
+    assert!(breaker.contains("finalize_reject_response_with_after_proxy_hooks_and_commit_policy("));
+    assert!(breaker.contains("grpc_web_response_content_type.is_none()"));
+    assert!(breaker.contains("build_grpc_web_reject_response("));
+    assert!(breaker.contains("if let Some(response) = grpc_web_response {"));
+}

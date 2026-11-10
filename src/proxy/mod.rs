@@ -11437,17 +11437,17 @@ impl ProxyState {
             health_check_restart_rx.clone(),
         ));
 
-        // Parse stream proxy bind address
+        // `EnvConfig::validate` refuses an unparseable stream bind address at
+        // startup. Never fall back to another address here: that would bind
+        // stream listeners an operator meant to restrict on a wider interface.
         let stream_bind_addr: std::net::IpAddr = env_config_arc
             .stream_proxy_bind_address
             .parse()
-            .unwrap_or_else(|_| {
-                // Fall back to the proxy bind address, then to IPv4 unspecified
-                env_config_arc
-                    .proxy_bind_address
-                    .parse()
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-            });
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid FERRUM_STREAM_PROXY_BIND_ADDRESS: expected a valid IP address (e.g., 0.0.0.0 or ::)"
+                )
+            })?;
 
         let adaptive_buffer = Arc::new(crate::adaptive_buffer::AdaptiveBufferTracker::new(
             env_config_arc.adaptive_buffer_enabled,
@@ -16288,7 +16288,10 @@ pub fn try_acquire_per_ip_slot(
     try_acquire_per_ip_slot_with_prefix(counts, ip, max, 64)
 }
 
-fn try_acquire_per_ip_slot_with_prefix(
+/// Same as [`try_acquire_per_ip_slot`], but groups IPv6 sources by
+/// `ipv6_prefix` (the configured `FERRUM_PER_IP_IPV6_PREFIX`) instead of the
+/// fixed /64. Masking an already-masked key at the same prefix is a no-op.
+pub fn try_acquire_per_ip_slot_with_prefix(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     ip: &str,
     max: u64,
@@ -16675,6 +16678,9 @@ async fn handle_websocket_request_authenticated(
     ) {
         Ok(url) => url,
         Err(_) => {
+            // Counted like every sibling reject of this handler (issue #7156).
+            ctx.terminal_record.mark_counted();
+            record_request(&state, 500);
             cb_probe.release_neutral();
             return Ok(build_websocket_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -16693,6 +16699,9 @@ async fn handle_websocket_request_authenticated(
         Some(on_upgrade) => on_upgrade,
         None => {
             error!("Failed to extract OnUpgrade extension from WebSocket request");
+            // Counted like every sibling reject of this handler (issue #7156).
+            ctx.terminal_record.mark_counted();
+            record_request(&state, 500);
             // The caller's CB check may have claimed a HALF_OPEN probe slot —
             // release it (gateway-side reject, not a backend outcome) so the
             // breaker can admit the next probe instead of wedging.
@@ -17276,7 +17285,7 @@ async fn handle_websocket_request_authenticated(
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 https_to_plaintext::maybe_warn_https_to_plaintext_backend(
                     &proxy,
-                    &current_backend_url,
+                    strip_query_params(&current_backend_url),
                     e.as_ref(),
                 );
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
@@ -17536,7 +17545,7 @@ async fn handle_websocket_request_authenticated(
                 // than the misleading hardcoded `connect_failure`.
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %current_backend_url,
+                    backend_url = %strip_query_params(&current_backend_url),
                     error_kind = retry::error_class_log_kind(ws_error_class),
                     error_class = %ws_error_class,
                     error = %e,
@@ -18280,7 +18289,8 @@ async fn handle_websocket_request_authenticated(
 
     info!(
         "WebSocket upgrade response sent for authenticated connection: {} -> {}",
-        proxy.id, current_backend_url
+        proxy.id,
+        strip_query_params(&current_backend_url)
     );
 
     Ok(upgrade_response)
@@ -19668,7 +19678,10 @@ pub(crate) async fn connect_websocket_backend(
         }
     };
 
-    debug!("Connected to backend WebSocket server: {}", backend_url);
+    debug!(
+        "Connected to backend WebSocket server: {}",
+        strip_query_params(backend_url)
+    );
     debug!("Backend response status: {}", backend_response.status());
 
     let negotiated_subprotocol = backend_response
@@ -37133,6 +37146,12 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        // gRPC-Web carries the status in a body trailer frame, never as
+        // response header fields (issue #7155), exactly like the
+        // `allowed_methods` refusal below.
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, StatusCode::FORBIDDEN.as_u16());
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
@@ -37144,6 +37163,9 @@ async fn handle_proxy_request_inner(
             0,
         )
         .await;
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
         return Ok(build_response_from_normalized_reject(reject));
     }
 
@@ -38870,13 +38892,17 @@ async fn handle_proxy_request_inner(
         ) {
             Ok(value) => value,
             Err(_) => {
-                return Ok(build_pre_plugin_reject_response(
+                // Counted like every other H1/H2 terminal (issue #7156).
+                let response = build_pre_plugin_reject_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Invalid backend path coordinates",
+                    br#"{"error":"Invalid backend path coordinates"}"#,
                     &HashMap::new(),
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
-                ));
+                );
+                ctx.terminal_record.mark_counted();
+                record_request(&state, response.status().as_u16());
+                return Ok(response);
             }
         };
         if let Some(response) = run_backend_path_plugins_or_build_reject(
@@ -39651,7 +39677,9 @@ async fn handle_proxy_request_inner(
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
-                let mut reject = finalize_reject_response_with_after_proxy_hooks(
+                // A gRPC-Web reject runs the committed observers once, while
+                // translating to the body-trailer representation (issue #7155).
+                let mut reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -39660,6 +39688,7 @@ async fn handle_proxy_request_inner(
                     ),
                     circuit_breaker_open_reject_headers(),
                     is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
                 )
                 .await;
                 restore_authoritative_gateway_error_header(
@@ -39667,6 +39696,13 @@ async fn handle_proxy_request_inner(
                     X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
                 );
                 apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
                 // Use `original_request_path` so the log records the path the
                 // client actually requested, not the VirtualService-rewritten
                 // backend path stored in `ctx.path` after the rewrite above.
@@ -39682,6 +39718,9 @@ async fn handle_proxy_request_inner(
                 .await;
                 ctx.terminal_record.mark_counted();
                 record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
                 return Ok(build_response_from_normalized_reject(reject));
             }
         };
@@ -40485,13 +40524,17 @@ async fn handle_proxy_request_inner(
         ) {
             Ok(value) => value,
             Err(_) => {
-                return Ok(build_pre_plugin_reject_response(
+                // Counted like every other H1/H2 terminal (issue #7156).
+                let response = build_pre_plugin_reject_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Invalid backend path coordinates",
+                    br#"{"error":"Invalid backend path coordinates"}"#,
                     &HashMap::new(),
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
-                ));
+                );
+                ctx.terminal_record.mark_counted();
+                record_request(&state, response.status().as_u16());
+                return Ok(response);
             }
         };
         let backend_start = Instant::now();
@@ -44313,13 +44356,17 @@ async fn handle_proxy_request_inner(
         Ok(value) => value,
         Err(_) => {
             cb_probe.release_neutral();
-            return Ok(build_pre_plugin_reject_response(
+            // Counted like every other H1/H2 terminal (issue #7156).
+            let response = build_pre_plugin_reject_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                b"Invalid backend path coordinates",
+                br#"{"error":"Invalid backend path coordinates"}"#,
                 &HashMap::new(),
                 request_uses_grpc_content_type,
                 grpc_web_response_content_type,
-            ));
+            );
+            ctx.terminal_record.mark_counted();
+            record_request(&state, response.status().as_u16());
+            return Ok(response);
         }
     };
     let backend_start = Instant::now();

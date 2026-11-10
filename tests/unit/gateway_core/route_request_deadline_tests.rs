@@ -829,6 +829,10 @@ fn native_http3_route_deadline_races_every_parked_client_write() {
     assert!(helper.contains("Some(ErrorClass::DispatchPolicyRejected)"));
     assert!(helper.contains("body_error_class: Some(ErrorClass::ReadWriteTimeout)"));
     assert!(helper.contains("client_disconnected: false"));
+    // GHSA-3c72-7f45-wvr2: the cut reaches the termination hooks as a route
+    // policy cut, or `ai_federation` charges the provider for it.
+    assert!(helper.contains("route_deadline_cut: true"));
+    assert!(!helper.contains("route_deadline_cut: false"));
 }
 
 /// The bridge's buffered writer settles the backend exchange BEFORE its first
