@@ -39629,10 +39629,12 @@ mod tests {
         runtime
     }
 
-    fn reviews_peer_auth_selector() -> config::WorkloadSelector {
-        config::WorkloadSelector {
-            labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
-            namespace: None,
+    fn reviews_peer_auth_scope() -> config::PolicyScope {
+        config::PolicyScope::WorkloadSelector {
+            selector: config::WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+                namespace: Some("default".to_string()),
+            },
         }
     }
 
@@ -39643,8 +39645,7 @@ mod tests {
         config::PeerAuthentication {
             name: "ns-policy".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: Some(reviews_peer_auth_selector()),
+            scope: reviews_peer_auth_scope(),
             mtls_mode: config::MtlsMode::Permissive,
             port_overrides: HashMap::from([(port, mode)]),
         }
@@ -39654,8 +39655,9 @@ mod tests {
         config::PeerAuthentication {
             name: "ns-policy".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: None,
+            scope: config::PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }
@@ -39697,8 +39699,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "mixed".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -39725,8 +39726,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "selector-scoped".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -39756,8 +39756,7 @@ mod tests {
             peer_authentications: vec![config::PeerAuthentication {
                 name: "service-port-is-not-an-app-port".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (80, config::MtlsMode::Disable),
@@ -39784,8 +39783,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "ingress".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -39925,10 +39923,9 @@ mod tests {
         let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
             name: "namespace-strict".to_string(),
             namespace: "default".to_string(),
-            scope: Some(config::PolicyScope::WorkloadSelector {
-                selector: empty_selector.clone(),
-            }),
-            selector: Some(empty_selector),
+            scope: config::PolicyScope::WorkloadSelector {
+                selector: empty_selector,
+            },
             mtls_mode: config::MtlsMode::Strict,
             port_overrides: HashMap::from([(8080, config::MtlsMode::Disable)]),
         }]);
@@ -39972,8 +39969,7 @@ mod tests {
             let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "transport-port-collision".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([(transport_port, config::MtlsMode::Permissive)]),
             }]);

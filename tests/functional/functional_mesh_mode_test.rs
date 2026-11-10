@@ -2325,8 +2325,9 @@ fn disable_peer_auth_slice(node_id: &str) -> MeshSlice {
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-disable".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Disable,
             port_overrides: HashMap::new(),
         }],
@@ -2663,8 +2664,9 @@ fn strict_peer_auth_slice(node_id: &str) -> MeshSlice {
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -3638,8 +3640,9 @@ fn inbound_authz_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -3906,8 +3909,9 @@ fn cross_namespace_workload_entry_inbound_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "vms".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "vms".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -4725,8 +4729,9 @@ fn egress_service_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -6932,8 +6937,9 @@ fn cross_cluster_dest_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -8115,8 +8121,9 @@ fn cross_cluster_ambient_dest_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -10307,8 +10314,9 @@ fn udp_dest_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -11051,8 +11059,9 @@ fn third_workload_refusal_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -11744,8 +11753,9 @@ fn sidecar_ingress_stream_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -11823,8 +11833,9 @@ fn sidecar_ingress_mesh_document(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -12520,8 +12531,9 @@ fn target_refs_waypoint_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: WAYPOINT_TARGET_REFS_NAMESPACE.to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -13639,8 +13651,9 @@ fn live_source_capture_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-strict".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -15778,8 +15791,9 @@ fn live_xc_dest_slice(
         peer_authentications: vec![PeerAuthentication {
             name: "strict-live-cross-cluster".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
@@ -17991,8 +18005,9 @@ fn unix_ingress_mesh_document(server_spiffe: &str, entries: &[UnixIngressEntry])
         peer_authentications: vec![PeerAuthentication {
             name: "mesh-disable".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
             mtls_mode: MtlsMode::Disable,
             port_overrides: HashMap::new(),
         }],

@@ -490,10 +490,9 @@ mod node_waypoint_capture_inventory {
         PeerAuthentication {
             name: format!("{namespace}-default"),
             namespace: namespace.to_string(),
-            scope: Some(PolicyScope::Namespace {
+            scope: PolicyScope::Namespace {
                 namespace: namespace.to_string(),
-            }),
-            selector: None,
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }
@@ -685,11 +684,12 @@ mod node_waypoint_capture_inventory {
         let dtls_overlay = PeerAuthentication {
             name: "dtls-echo".to_string(),
             namespace: "ferrum".to_string(),
-            scope: None,
-            selector: Some(WorkloadSelector {
-                labels: HashMap::from([("app".to_string(), "dtls-echo".to_string())]),
-                namespace: None,
-            }),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "dtls-echo".to_string())]),
+                    namespace: Some("ferrum".to_string()),
+                },
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::from([(DTLS_PORT, MtlsMode::Permissive)]),
         };

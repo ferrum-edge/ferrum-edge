@@ -1310,8 +1310,9 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
         peer_authentications: vec![PeerAuthentication {
             name: name("peer-auth"),
             namespace: "shared".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "shared".to_string(),
+            },
             mtls_mode: MtlsMode::default(),
             port_overrides: HashMap::new(),
         }],

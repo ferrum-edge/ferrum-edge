@@ -1220,18 +1220,11 @@ fn peer_authentication(
 
     let selector = object.spec.get("selector");
     let scope = istio_policy_scope(options, object, selector);
-    let selector = match &scope {
-        PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-        PolicyScope::MeshWide | PolicyScope::Namespace { .. } | PolicyScope::TargetRefs { .. } => {
-            None
-        }
-    };
 
     Ok(PeerAuthentication {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
-        scope: Some(scope),
-        selector,
+        scope,
         mtls_mode: effective_mtls_mode,
         port_overrides,
     })
@@ -9633,7 +9626,7 @@ mod tests {
             let mesh = result.config.mesh.expect("mesh config");
             assert!(matches!(
                 mesh.peer_authentications[0].scope,
-                Some(PolicyScope::MeshWide)
+                PolicyScope::MeshWide
             ));
         }
     }
@@ -9664,13 +9657,9 @@ mod tests {
             assert!(
                 matches!(
                     &peer_auth.scope,
-                    Some(PolicyScope::Namespace { namespace }) if namespace == "default"
+                    PolicyScope::Namespace { namespace } if namespace == "default"
                 ),
-                "{case} selector must use namespace scope"
-            );
-            assert!(
-                peer_auth.selector.is_none(),
-                "{case} selector must not become a workload selector"
+                "{case} selector must use namespace scope, not a workload selector"
             );
             assert_eq!(
                 crate::modes::mesh::slice::resolve_effective_mtls_mode(

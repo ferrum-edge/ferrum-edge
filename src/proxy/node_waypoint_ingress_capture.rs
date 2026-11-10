@@ -561,11 +561,12 @@ mod tests {
             PeerAuthentication {
                 name: name.to_string(),
                 namespace: namespace.to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels,
-                    namespace: Some(namespace.to_string()),
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels,
+                        namespace: Some(namespace.to_string()),
+                    },
+                },
                 mtls_mode: mode,
                 port_overrides: HashMap::new(),
             }
@@ -746,10 +747,9 @@ mod tests {
             let payments_strict = PeerAuthentication {
                 name: "payments-default".to_string(),
                 namespace: "payments".to_string(),
-                scope: Some(PolicyScope::Namespace {
+                scope: PolicyScope::Namespace {
                     namespace: "payments".to_string(),
-                }),
-                selector: None,
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             };
@@ -787,10 +787,9 @@ mod tests {
             mesh.peer_authentications = vec![PeerAuthentication {
                 name: "own-view-permissive".to_string(),
                 namespace: "payments".to_string(),
-                scope: Some(PolicyScope::Namespace {
+                scope: PolicyScope::Namespace {
                     namespace: "payments".to_string(),
-                }),
-                selector: None,
+                },
                 mtls_mode: MtlsMode::Permissive,
                 port_overrides: HashMap::new(),
             }];

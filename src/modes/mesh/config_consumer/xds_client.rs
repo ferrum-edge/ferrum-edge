@@ -5884,11 +5884,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "selector-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -6533,11 +6534,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "selector-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -6585,11 +6587,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "selector-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("app".to_string(), "web".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "web".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -6641,11 +6644,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "role-api-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("role".to_string(), "api".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -6710,22 +6714,24 @@ mod tests {
                 PeerAuthentication {
                     name: "app-shared-strict".to_string(),
                     namespace: "default".to_string(),
-                    scope: None,
-                    selector: Some(WorkloadSelector {
-                        labels: HashMap::from([("app".to_string(), "shared".to_string())]),
-                        namespace: None,
-                    }),
+                    scope: PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([("app".to_string(), "shared".to_string())]),
+                            namespace: Some("default".to_string()),
+                        },
+                    },
                     mtls_mode: MtlsMode::Strict,
                     port_overrides: HashMap::new(),
                 },
                 PeerAuthentication {
                     name: "role-api-permissive".to_string(),
                     namespace: "default".to_string(),
-                    scope: None,
-                    selector: Some(WorkloadSelector {
-                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
-                        namespace: None,
-                    }),
+                    scope: PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                            namespace: Some("default".to_string()),
+                        },
+                    },
                     mtls_mode: MtlsMode::Permissive,
                     port_overrides: HashMap::new(),
                 },
@@ -6787,11 +6793,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "role-api-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("role".to_string(), "api".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],

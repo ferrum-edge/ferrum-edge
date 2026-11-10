@@ -99,8 +99,9 @@ fn mesh_config() -> MeshConfig {
         peer_authentications: vec![PeerAuthentication {
             name: "default-mtls".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: None,
+            scope: PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
         }],
