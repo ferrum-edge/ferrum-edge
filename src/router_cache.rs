@@ -3275,14 +3275,13 @@ impl RouterCache {
             }
         }
 
-        // Sort prefix route lists by listen_path length descending (longest first)
-        // and build HashMap indexes for O(path_depth) lookups
-        for routes in exact_hosts.values_mut() {
-            routes.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
-        }
+        // Build HashMap indexes for O(path_depth) longest-prefix lookups. The
+        // index groups candidates by exact listen_path, so the insertion order
+        // of different paths does not matter; same-path candidates keep their
+        // input order.
         let exact_hosts_indexed: HashMap<String, IndexedPrefixRoutes> = exact_hosts
             .into_iter()
-            .map(|(host, routes)| (host, IndexedPrefixRoutes::from_sorted(routes)))
+            .map(|(host, routes)| (host, IndexedPrefixRoutes::from_entries(routes)))
             .collect();
         let exact_hosts_exact_path_indexed: HashMap<String, IndexedExactPathRoutes> =
             exact_hosts_exact_paths
@@ -3291,14 +3290,11 @@ impl RouterCache {
                 .collect();
 
         let mut wildcard_vec: Vec<(String, Vec<RouteEntry>)> = wildcard_hosts.into_iter().collect();
-        for (_, routes) in &mut wildcard_vec {
-            routes.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
-        }
         // Sort wildcard patterns by length descending (more-specific wildcards first)
         wildcard_vec.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
         let wildcard_indexed: Vec<(String, IndexedPrefixRoutes)> = wildcard_vec
             .into_iter()
-            .map(|(pattern, routes)| (pattern, IndexedPrefixRoutes::from_sorted(routes)))
+            .map(|(pattern, routes)| (pattern, IndexedPrefixRoutes::from_entries(routes)))
             .collect();
         let mut wildcard_exact_path_vec: Vec<(String, Vec<RouteEntry>)> =
             wildcard_hosts_exact_paths.into_iter().collect();
@@ -3309,8 +3305,7 @@ impl RouterCache {
                 .map(|(pattern, routes)| (pattern, IndexedExactPathRoutes::from_entries(routes)))
                 .collect();
 
-        catch_all.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
-        let catch_all_indexed = IndexedPrefixRoutes::from_sorted(catch_all);
+        let catch_all_indexed = IndexedPrefixRoutes::from_entries(catch_all);
         let catch_all_exact_path_indexed =
             IndexedExactPathRoutes::from_entries(catch_all_exact_paths);
 
@@ -3452,10 +3447,12 @@ impl IndexedExactPathRoutes {
 }
 
 impl IndexedPrefixRoutes {
-    /// Build from a pre-sorted Vec<RouteEntry> (must already be sorted by length descending).
-    fn from_sorted(sorted: Vec<RouteEntry>) -> Self {
+    /// Group route entries by exact `listen_path`. Lookup walks the request
+    /// path's segment boundaries longest-first, so entry order across paths
+    /// is irrelevant; same-path candidates keep their input order.
+    fn from_entries(entries: Vec<RouteEntry>) -> Self {
         let mut path_index: HashMap<String, Vec<PortScopedProxy>> = HashMap::new();
-        for entry in sorted {
+        for entry in entries {
             path_index
                 .entry(entry.listen_path)
                 .or_default()
