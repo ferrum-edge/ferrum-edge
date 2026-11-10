@@ -103,7 +103,6 @@ pub fn send_rpc(
 mod tests {
     use super::*;
     use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
-    use std::collections::HashMap;
     use std::os::unix::net::UnixListener;
     use std::thread;
 
@@ -143,7 +142,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let resp =
@@ -165,7 +163,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let err = send_rpc(

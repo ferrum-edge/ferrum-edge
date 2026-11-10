@@ -898,7 +898,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let labels = HashMap::new();
@@ -925,7 +924,6 @@ mod tests {
             container_id: "ctr-1".to_string(),
             ifname: None,
             netns_path: None,
-            args: HashMap::new(),
             valid_attachments: Vec::new(),
         };
         let labels = HashMap::new();
@@ -1159,7 +1157,6 @@ mod tests {
                     container_id: "c".to_string(),
                     ifname: None,
                     netns_path: None,
-                    args: HashMap::new(),
                     valid_attachments: Vec::new(),
                 },
                 respond: _resp,
@@ -1177,7 +1174,6 @@ mod tests {
                 container_id: "c".to_string(),
                 ifname: None,
                 netns_path: None,
-                args: HashMap::new(),
                 valid_attachments: Vec::new(),
             },
             respond: resp_tx,
