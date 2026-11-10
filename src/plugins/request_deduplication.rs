@@ -2367,41 +2367,33 @@ impl RequestDeduplication {
             return RedisPublication::Unavailable;
         }
 
+        // The admitted payload is the replay member itself: it is serialized
+        // once (for the entry-size check) and embedded verbatim in the record,
+        // never rebuilt and re-serialized (issue #7152). Admission already
+        // requires complete provenance.
         let replay = response.and_then(|response| {
-            // A retained replay must carry complete provenance: `Rejected`
-            // already covers an incomplete value, and the digests are read from
-            // the same provenance the admission check validated.
-            let (gate, presentation) = response.response_policy.complete()?;
             match self.redis_payload_for_response(fingerprint, response) {
-                RedisPayloadAdmission::Admitted(_) => Some(SerializableCachedResponse {
-                    fingerprint: fingerprint.to_string(),
-                    response_policy: SerializableResponsePolicyProvenance::encode(
-                        gate,
-                        presentation,
-                    ),
-                    status_code: response.status_code,
-                    headers: response.headers.clone(),
-                    body: response.body.to_vec(),
-                }),
+                RedisPayloadAdmission::Admitted(payload) => String::from_utf8(payload)
+                    .ok()
+                    .and_then(|payload| serde_json::value::RawValue::from_string(payload).ok()),
                 RedisPayloadAdmission::Rejected => None,
             }
         });
-        let mut record = SerializableDedupRecord::completed(fingerprint, replay);
-        let Ok(mut record_bytes) = serde_json::to_vec(&record) else {
+        let Some(mut record_bytes) = completed_record_bytes(fingerprint, replay.as_deref()) else {
             return RedisPublication::Unavailable;
         };
+        let mut replayable = replay.is_some();
         // Peers bound their record read at `redis_record_read_cap()`. A record
         // they would refuse must never be published as a replay; degrade it to
         // the non-replayable completion tombstone instead. Unreachable while
         // the envelope stays within `REDIS_RECORD_ENVELOPE_BYTES`.
-        if record.replay.is_some() && record_bytes.len() > self.redis_record_read_cap() {
-            record.replay = None;
-            let Ok(tombstone) = serde_json::to_vec(&record) else {
+        if replayable && record_bytes.len() > self.redis_record_read_cap() {
+            replayable = false;
+            let Some(tombstone) = completed_record_bytes(fingerprint, None) else {
                 return RedisPublication::Unavailable;
             };
             record_bytes = tombstone;
         }
-        let replayable = record.replay.is_some();
         // A record with no replay payload, and the fixed external-operation
         // tombstone, exist only to refuse re-execution. Publishing either for
         // `ttl_seconds` when `inflight_ttl_seconds` is longer would free the key
@@ -3436,16 +3428,55 @@ impl SerializableDedupRecord {
             replay: None,
         }
     }
+}
 
-    fn completed(fingerprint: &str, replay: Option<SerializableCachedResponse>) -> Self {
-        Self {
-            record_version: DEDUP_REDIS_RECORD_VERSION,
-            state: DEDUP_RECORD_STATE_COMPLETED.to_string(),
-            fingerprint: fingerprint.to_string(),
-            owner_token: None,
-            replay,
+/// Write side of a completed [`SerializableDedupRecord`].
+///
+/// Same field order and omission rules, so the bytes are exactly what
+/// serializing a completed `SerializableDedupRecord` (no owner token) would
+/// produce, but the replay member is the already-serialized
+/// [`SerializableCachedResponse`] payload embedded verbatim.
+#[derive(serde::Serialize)]
+struct CompletedDedupRecordWire<'a> {
+    record_version: u32,
+    state: &'a str,
+    fingerprint: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay: Option<&'a serde_json::value::RawValue>,
+}
+
+/// Serialize the completed record for `fingerprint`, with `replay` (an
+/// admitted [`SerializableCachedResponse`] payload) or as the non-replayable
+/// tombstone.
+fn completed_record_bytes(
+    fingerprint: &str,
+    replay: Option<&serde_json::value::RawValue>,
+) -> Option<Vec<u8>> {
+    serde_json::to_vec(&CompletedDedupRecordWire {
+        record_version: DEDUP_REDIS_RECORD_VERSION,
+        state: DEDUP_RECORD_STATE_COMPLETED,
+        fingerprint,
+        replay,
+    })
+    .ok()
+}
+
+/// The completed record `redis_publish_completed` writes for an admitted
+/// replay `payload` (or the tombstone for `None`).
+// External tests reach this through `crate::_test_support`; the binary target
+// still sees the crate-private helper itself as unused.
+#[allow(dead_code)]
+pub(crate) fn completed_redis_record_for_test(
+    fingerprint: &str,
+    payload: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let replay = match payload {
+        Some(payload) => {
+            Some(serde_json::value::RawValue::from_string(String::from_utf8(payload).ok()?).ok()?)
         }
-    }
+        None => None,
+    };
+    completed_record_bytes(fingerprint, replay.as_deref())
 }
 
 fn serialize_cached_response_body<S>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error>

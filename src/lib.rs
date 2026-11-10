@@ -4429,6 +4429,13 @@ pub mod _test_support {
         crate::plugins::request_deduplication::redis_record_payload_is_valid_for_test(data)
     }
 
+    pub fn request_deduplication_completed_redis_record_for_test(
+        fingerprint: &str,
+        payload: Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        crate::plugins::request_deduplication::completed_redis_record_for_test(fingerprint, payload)
+    }
+
     pub async fn request_deduplication_redis_record_state_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
         key: &str,
