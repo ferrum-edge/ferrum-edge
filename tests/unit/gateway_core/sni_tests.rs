@@ -2498,3 +2498,61 @@ fn normalize_received_server_name_strips_one_trailing_dot_and_lowercases() {
         );
     }
 }
+
+// ── L4 stream_match refusals and the inspected-prefix forward (issue #7185) ──
+
+#[test]
+fn l4_stream_match_refusals_share_the_sni_admission_taxonomy() {
+    // An `__l4_{port}` refusal is the same gateway decision as an SNI
+    // admission refusal: no backend was selected, so it is
+    // DispatchPolicyRejected / GatewayPolicy / Unknown and health-neutral.
+    let unmatched = ferrum_edge::_test_support::no_matching_l4_route_error_for_test(21582);
+    assert_sni_admission_taxonomy(
+        &unmatched,
+        "No matching L4 stream_match proxy on port 21582",
+    );
+    let denied =
+        ferrum_edge::_test_support::l4_stream_match_denied_error_for_test("ferrum", "tcp-a", 21582);
+    assert_sni_admission_taxonomy(
+        &denied,
+        "Stream proxy ferrum/tcp-a stream_match denied connection on port 21582",
+    );
+}
+
+#[test]
+fn a_failed_inspected_prefix_forward_is_a_post_wire_backend_failure() {
+    let error = ferrum_edge::_test_support::backend_first_bytes_forward_error_for_test(
+        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset"),
+    );
+    assert_eq!(
+        error.to_string(),
+        "failed forwarding inspected first bytes to backend: peer reset"
+    );
+    // The accept loop uses the SETUP-phase classifier, but the dial already
+    // succeeded: a reset here must stay post-wire, never `ConnectionRefused`.
+    let class = classify_stream_setup_error(&error);
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert_eq!(
+        pre_copy_disconnect_cause_for_test(&error, &class),
+        DisconnectCause::BackendError
+    );
+    assert_eq!(
+        pre_copy_disconnect_direction_for_test(&error, &class),
+        Direction::BackendToClient
+    );
+
+    let broken_pipe = ferrum_edge::_test_support::backend_first_bytes_forward_error_for_test(
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe"),
+    );
+    assert_eq!(
+        classify_stream_setup_error(&broken_pipe),
+        ErrorClass::ConnectionClosed
+    );
+    let untyped = ferrum_edge::_test_support::backend_first_bytes_forward_error_for_test(
+        std::io::Error::other("write failed"),
+    );
+    assert_eq!(
+        classify_stream_setup_error(&untyped),
+        ErrorClass::RequestError
+    );
+}

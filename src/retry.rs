@@ -589,7 +589,15 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         // keep the unmatched-SNI catch-all; mapping ConnectionRefused would
         // keep the `"refused"` substring trap on the Display string. The
         // typed kind is the only signal that yields DispatchPolicyRejected.
-        StreamSetupKind::SniAdmissionRefused => ErrorClass::DispatchPolicyRejected,
+        // The L4 `stream_match` refusal is the same decision on an
+        // `__l4_{port}` listener (issue #7185).
+        StreamSetupKind::SniAdmissionRefused | StreamSetupKind::L4RouteRefused => {
+            ErrorClass::DispatchPolicyRejected
+        }
+        // A failed inspected-prefix write after a successful dial. The typed
+        // chain walk classifies its retained io source as post-wire first;
+        // this is the post-wire catch-all for a source it cannot type.
+        StreamSetupKind::BackendFirstBytesForward => ErrorClass::RequestError,
     }
 }
 
@@ -823,6 +831,17 @@ fn classify_typed_chain(
         }
         if let Some(setup_err) = err.downcast_ref::<crate::proxy::stream_error::StreamSetupError>()
         {
+            // The inspected-prefix forward failed AFTER the dial, so bytes may
+            // already have reached the backend: its io source is classified
+            // post-wire whatever phase the caller reports (issue #7185), so a
+            // reset there never becomes a pre-wire `ConnectionRefused`.
+            if setup_err.kind
+                == crate::proxy::stream_error::StreamSetupKind::BackendFirstBytesForward
+                && let Some(class) =
+                    classify_typed_chain(std::error::Error::source(setup_err), false)
+            {
+                return Some(class);
+            }
             return Some(classify_stream_setup_kind(setup_err.kind));
         }
         if let Some(ws_err) = err.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {

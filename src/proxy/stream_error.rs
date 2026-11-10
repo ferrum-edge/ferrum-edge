@@ -136,6 +136,20 @@ pub enum StreamSetupKind {
     /// `Unknown` because no backend leg existed, and
     /// [`Self::disconnect_cause`] is `GatewayPolicy` rather than `RecvError`.
     SniAdmissionRefused,
+    /// An `__l4_{port}` listener's Istio `stream_match` admission refused the
+    /// connection before any backend was selected: no candidate's criteria
+    /// matched, or a single-listener proxy's configured matcher denied it (or
+    /// is uncompiled, which fails closed). The L4 sibling of
+    /// [`Self::SniAdmissionRefused`] (issue #7185), classified identically:
+    /// health-neutral, `Unknown` direction, `GatewayPolicy` cause,
+    /// `DispatchPolicyRejected` class.
+    L4RouteRefused,
+    /// The backend dial succeeded and the backend then failed the write of the
+    /// inspected first bytes a first-bytes plugin peeked from the client
+    /// (issue #7185). Backend-side and post-connect: bytes may already have
+    /// reached the backend, so the class comes from the retained io source
+    /// classified as post-wire, never from the connect-phase mapping.
+    BackendFirstBytesForward,
 }
 
 impl StreamSetupKind {
@@ -158,7 +172,9 @@ impl StreamSetupKind {
             | Self::UnsupportedStreamPolicy
             | Self::AuthorizationExpired
             | Self::ClientTrustWithdrawn
-            | Self::SniAdmissionRefused => None,
+            | Self::SniAdmissionRefused
+            | Self::L4RouteRefused
+            | Self::BackendFirstBytesForward => None,
         }
     }
 
@@ -184,6 +200,7 @@ impl StreamSetupKind {
                 | Self::AuthorizationExpired
                 | Self::ClientTrustWithdrawn
                 | Self::SniAdmissionRefused
+                | Self::L4RouteRefused
         )
     }
 
@@ -196,7 +213,7 @@ impl StreamSetupKind {
     /// so attributing either copy direction would invent a socket that was
     /// never opened (issue #4407).
     pub fn direction(self) -> crate::plugins::Direction {
-        if matches!(self, Self::SniAdmissionRefused) {
+        if self.is_listener_admission_refusal() {
             return crate::plugins::Direction::Unknown;
         }
         if self.is_client_side() {
@@ -209,11 +226,12 @@ impl StreamSetupKind {
     /// Cause attribution for [`crate::plugins::StreamTransactionSummary::disconnect_cause`].
     ///
     /// Most client-side kinds map to `RecvError` and most backend-side kinds
-    /// to `BackendError`. [`Self::SniAdmissionRefused`] is a gateway policy
-    /// decision with no backend, so it maps to `GatewayPolicy` rather than
-    /// overloading `RecvError` (a client-socket read) or `BackendError`.
+    /// to `BackendError`. The listener admission refusals
+    /// ([`Self::SniAdmissionRefused`], [`Self::L4RouteRefused`]) are gateway
+    /// policy decisions with no backend, so they map to `GatewayPolicy` rather
+    /// than overloading `RecvError` (a client-socket read) or `BackendError`.
     pub fn disconnect_cause(self) -> crate::plugins::DisconnectCause {
-        if matches!(self, Self::SniAdmissionRefused) {
+        if self.is_listener_admission_refusal() {
             return crate::plugins::DisconnectCause::GatewayPolicy;
         }
         if self.is_client_side() {
@@ -261,7 +279,18 @@ impl StreamSetupKind {
                 crate::proxy::tcp_proxy::STREAM_ERR_CLIENT_TRUST_WITHDRAWN
             }
             Self::SniAdmissionRefused => crate::proxy::tcp_proxy::STREAM_ERR_SNI_ADMISSION_REFUSED,
+            Self::L4RouteRefused => crate::proxy::tcp_proxy::STREAM_ERR_L4_ROUTE_REFUSED,
+            Self::BackendFirstBytesForward => {
+                crate::proxy::tcp_proxy::STREAM_ERR_BACKEND_FIRST_BYTES_FORWARD_FAILED
+            }
         }
+    }
+
+    /// A listener admission refusal decided before any backend leg existed
+    /// (opaque-TLS SNI or L4 `stream_match` routing): `Unknown` direction and
+    /// `GatewayPolicy` cause.
+    fn is_listener_admission_refusal(self) -> bool {
+        matches!(self, Self::SniAdmissionRefused | Self::L4RouteRefused)
     }
 }
 
@@ -465,6 +494,7 @@ mod tests {
             StreamSetupKind::AuthorizationExpired,
             StreamSetupKind::ClientTrustWithdrawn,
             StreamSetupKind::SniAdmissionRefused,
+            StreamSetupKind::L4RouteRefused,
         ] {
             assert!(
                 kind.is_client_side(),
@@ -482,6 +512,7 @@ mod tests {
             StreamSetupKind::CircuitBreakerOpen,
             StreamSetupKind::BackendMaxConnectionsExceeded,
             StreamSetupKind::UnsupportedStreamPolicy,
+            StreamSetupKind::BackendFirstBytesForward,
         ] {
             assert!(
                 !kind.is_client_side(),
@@ -561,6 +592,11 @@ mod tests {
         assert_eq!(
             StreamSetupKind::SniAdmissionRefused.prefix(),
             "SNI-routed stream listener"
+        );
+        assert_eq!(StreamSetupKind::L4RouteRefused.prefix(), "stream_match");
+        assert_eq!(
+            StreamSetupKind::BackendFirstBytesForward.prefix(),
+            "failed forwarding inspected first bytes to backend"
         );
     }
 
