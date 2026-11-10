@@ -653,6 +653,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache stayed on the old ones, so later incremental builds constructed
   loggers against schemas that were never accepted. The registry is now
   promoted only after every step succeeds.
+- **Completing an ACME order skips authorizations that are already valid**
+  (#7195). Driving a persisted order to `ready` looked up the configured
+  challenge type on every authorization, so an authorization that had become
+  valid elsewhere (CAs reuse valid authorizations across orders, and a reused
+  one may list only the challenge that validated it) failed the order on every
+  scan. Valid authorizations are now skipped, pending ones are driven as
+  before, and invalid, revoked, expired or deactivated ones fail closed with a
+  fixed diagnostic. Preparing a new order still requires the configured
+  challenge on every authorization.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
