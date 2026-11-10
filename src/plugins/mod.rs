@@ -5557,9 +5557,11 @@ impl RequestContext {
     }
 
     /// Correlation id for the concrete response-stream inspector chain, when
-    /// one attached to this request. Streaming plugins can key bounded shared
-    /// state by this id in `response_stream_inspector`, then remove and fold it
-    /// into `ctx.metadata` from `on_response_stream_terminated`.
+    /// one attached to this request. To pass inspector state to
+    /// `on_response_stream_terminated`, use [`Self::response_stream_handoff`]
+    /// with a per-instance key rather than a plugin-owned map keyed by this
+    /// id: the handoff drops with the request even when the terminal hook is
+    /// cancelled.
     pub fn response_stream_id(&self) -> Option<u64> {
         self.response_stream_id
     }
