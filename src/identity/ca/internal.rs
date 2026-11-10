@@ -24,7 +24,7 @@
 //!
 //! - Intermediate CAs and key escrow.
 //! - CRL / OCSP publication.
-//! - Cross-trust-domain federation (the upstream wrappers handle that).
+//! - Cross-trust-domain federation.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

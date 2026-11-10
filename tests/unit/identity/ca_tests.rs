@@ -436,7 +436,6 @@ fn ca_backend_default_is_none() {
 fn spire_agent_ca_config_default_socket_path() {
     let cfg = ferrum_edge::identity::ca::spire::SpireAgentCaConfig::default();
     assert_eq!(cfg.socket_path, "/run/spire/sockets/agent.sock");
-    assert_eq!(cfg.cert_ttl_secs, 3600);
 }
 
 #[test]
@@ -444,5 +443,15 @@ fn spire_agent_ca_default_socket_constant() {
     assert_eq!(
         ferrum_edge::identity::ca::spire::DEFAULT_SPIRE_AGENT_SOCKET,
         "/run/spire/sockets/agent.sock"
+    );
+}
+
+#[test]
+fn fetch_loop_default_socket_matches_the_spire_agent_default() {
+    // The fetch loop and the SPIRE CA adapter dial the same agent, so their
+    // defaults must agree (they once named two different paths).
+    assert_eq!(
+        ferrum_edge::identity::workload_api::FetchLoopConfig::default().socket_path,
+        ferrum_edge::identity::ca::spire::DEFAULT_SPIRE_AGENT_SOCKET
     );
 }

@@ -501,45 +501,14 @@ impl WorkloadApiService {
         &self,
         identity: &crate::identity::attestation::WorkloadIdentity,
     ) -> Result<X509svidResponse, Status> {
-        let svid = self
-            .ca
-            .issue_svid(IssuanceRequest::Generate {
-                spiffe_id: identity.spiffe_id.clone(),
-                ttl_secs: self.svid_ttl_secs,
-            })
-            .await
-            .map_err(|e| ca_status("issue_svid", &e))?;
-
-        let bundle = self
-            .ca
-            .trust_bundle(&self.trust_domain)
-            .await
-            .map_err(|e| ca_status("trust_bundle", &e))?;
-
-        let chain_concat: Vec<u8> = svid.cert_chain_der.iter().flatten().copied().collect();
-        let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
-        let federated_bundles =
-            Self::build_federated_x509_bundle_map(&self.ca, &self.federated_trust_domains)
-                .await
-                .map_err(|e| ca_status("federated_trust_bundle", &e))?;
-
-        let proto_svid = X509svid {
-            spiffe_id: svid.spiffe_id.to_string(),
-            x509_svid: chain_concat,
-            x509_svid_key: svid.private_key_pkcs8_der.to_vec(),
-            bundle: bundle_concat,
-            // The SPIFFE Workload API `hint` field is an operator-specified
-            // workload-matching hint (string), not a timestamp. We have no
-            // hint to propagate today; the cert's NotAfter is in the cert
-            // itself and is what consumers parse for rotation.
-            hint: String::new(),
-        };
-
-        Ok(X509svidResponse {
-            svids: vec![proto_svid],
-            crl: Vec::new(),
-            federated_bundles,
-        })
+        Self::build_x509_svid_response_static(
+            &self.ca,
+            &self.trust_domain,
+            &identity.spiffe_id,
+            self.svid_ttl_secs,
+            &self.federated_trust_domains,
+        )
+        .await
     }
 
     async fn build_x509_svid_response_static(
@@ -573,6 +542,10 @@ impl WorkloadApiService {
             x509_svid: chain_concat,
             x509_svid_key: svid.private_key_pkcs8_der.to_vec(),
             bundle: bundle_concat,
+            // The SPIFFE Workload API `hint` field is an operator-specified
+            // workload-matching hint (string), not a timestamp. We have no
+            // hint to propagate today; the cert's NotAfter is in the cert
+            // itself and is what consumers parse for rotation.
             hint: String::new(),
         };
 

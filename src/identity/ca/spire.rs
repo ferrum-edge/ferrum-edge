@@ -23,7 +23,7 @@
 //! mint a new certificate on every call. Instead it returns the current
 //! SVID from the agent-supplied snapshot. Callers that need per-workload
 //! SVIDs (the in-process Workload API server) should use the internal CA
-//! or Vault PKI backend instead.
+//! instead.
 //!
 //! ## JWT trust material (issue #3617)
 //!
@@ -85,17 +85,12 @@ const INITIAL_SVID_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct SpireAgentCaConfig {
     /// Path to the SPIRE Agent's Workload API UDS.
     pub socket_path: String,
-    /// SVID lifetime hint (seconds). The SPIRE agent may ignore this — it
-    /// controls the actual TTL. Stored so `issue_svid` can populate
-    /// `SignedSvid.not_after` from the agent-issued leaf.
-    pub cert_ttl_secs: u64,
 }
 
 impl Default for SpireAgentCaConfig {
     fn default() -> Self {
         Self {
             socket_path: DEFAULT_SPIRE_AGENT_SOCKET.to_string(),
-            cert_ttl_secs: 3600,
         }
     }
 }

@@ -1,19 +1,17 @@
 //! Certificate Authority abstraction for the mesh identity subsystem.
 //!
 //! `CertificateAuthority` is the seam between an "identity issuer" (Ferrum's
-//! own internal CA, a Vault PKI mount, cert-manager, or a SPIRE server) and
-//! the rest of the codebase. The Workload API server uses one of these to
+//! own internal CA or a SPIRE agent) and the rest of the codebase. The Workload API server uses one of these to
 //! mint SVIDs in response to attested workloads; the rotation task uses the
 //! same trait when refreshing Ferrum's own SVID.
 //!
-//! The trait is `async` because most real implementations talk to a remote
-//! service (Vault, K8s certificates.k8s.io, SPIRE). The internal CA
+//! The trait is `async` because a real implementation can talk to a remote
+//! service (the SPIRE agent's Workload API). The internal CA
 //! ([`internal::InternalCa`]) is the synchronous reference implementation.
 
 pub mod bootstrap;
 pub mod internal;
 pub mod spire;
-pub mod upstream;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

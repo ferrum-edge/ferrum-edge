@@ -205,7 +205,7 @@ pub struct FetchLoopConfig {
 impl Default for FetchLoopConfig {
     fn default() -> Self {
         Self {
-            socket_path: super::client::DEFAULT_WORKLOAD_API_SOCKET.to_string(),
+            socket_path: crate::identity::ca::spire::DEFAULT_SPIRE_AGENT_SOCKET.to_string(),
             expected_spiffe_id: None,
             reconnect_backoff: Duration::from_secs(1),
             max_reconnect_backoff: Duration::from_secs(30),
