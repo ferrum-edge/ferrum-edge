@@ -10275,21 +10275,6 @@ impl Upstream {
         }
     }
 
-    /// Resolve the effective backend connect timeout for a request destined to
-    /// `port`. Per-port `port_overrides[port].connect_timeout_ms` wins over
-    /// `proxy_default_ms` (the Proxy's own `backend_connect_timeout_ms`).
-    ///
-    /// No dispatch path calls this today (only tests do); the mesh pools read
-    /// the per-port override themselves. `0` from either source means
-    /// "disabled".
-    #[inline]
-    pub fn effective_connect_timeout_ms(&self, port: u16, proxy_default_ms: u64) -> u64 {
-        self.port_overrides
-            .get(&port)
-            .and_then(|ovr| ovr.connect_timeout_ms)
-            .unwrap_or(proxy_default_ms)
-    }
-
     /// Validate all fields of an upstream for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();

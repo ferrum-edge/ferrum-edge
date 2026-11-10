@@ -31298,13 +31298,15 @@ mod tests {
             .expect("port 8080 override");
         assert_eq!(port_8080.connect_timeout_ms, Some(2222));
         assert_eq!(port_8080.algorithm, Some(LoadBalancerAlgorithm::Random));
-
-        // Proof that the override is actually consulted at dispatch time via
-        // the helper the hot path uses — port 8080 wins, other ports fall
-        // back to the proxy default.
-        let upstream = &config.upstreams[0];
-        assert_eq!(upstream.effective_connect_timeout_ms(8080, 1111), 2222);
-        assert_eq!(upstream.effective_connect_timeout_ms(9090, 1111), 1111);
+        // Other ports carry no connect-timeout override, so dispatch keeps the
+        // proxy default.
+        assert!(
+            config.upstreams[0]
+                .port_overrides
+                .get(&9090)
+                .and_then(|ovr| ovr.connect_timeout_ms)
+                .is_none()
+        );
     }
 
     #[test]
@@ -31388,14 +31390,14 @@ mod tests {
             Some(LoadBalancerAlgorithm::ConsistentHashing)
         );
         assert_eq!(p9090.hash_on.as_deref(), Some("header:x-user"));
-
-        // Effective-timeout helper is what the dispatch hot path consults.
-        // Each port's own override wins; an unrelated port falls back to the
-        // proxy default (here passed in as 5000ms).
-        let upstream = &config.upstreams[0];
-        assert_eq!(upstream.effective_connect_timeout_ms(8080, 5000), 750);
-        assert_eq!(upstream.effective_connect_timeout_ms(9090, 5000), 3000);
-        assert_eq!(upstream.effective_connect_timeout_ms(7777, 5000), 5000);
+        // An unrelated port carries no connect-timeout override.
+        assert!(
+            config.upstreams[0]
+                .port_overrides
+                .get(&7777)
+                .and_then(|ovr| ovr.connect_timeout_ms)
+                .is_none()
+        );
     }
 
     #[test]
