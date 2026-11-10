@@ -403,7 +403,7 @@ where {
             tls_info: self.tls_info,
             #[cfg(feature = "__tls")]
             user_agent: self.user_agent,
-            connect_timeout: None,
+            connect_timeout: self.timeout,
             simple_timeout: None,
             #[cfg(feature = "socks")]
             resolver: self.resolver.unwrap_or_else(DynResolver::gai),
@@ -835,10 +835,12 @@ impl ConnectorService {
                 unreachable!("connect_socks is only called for socks proxies");
             }
         };
+        let connect_timeout = self.request_connect_timeout();
 
         match &mut self.inner {
             #[cfg(feature = "__native-tls")]
             Inner::NativeTls(http, tls) => {
+                http.set_connect_timeout(connect_timeout);
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     let host = dst.host().ok_or("no host in url")?.to_string();
                     let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
@@ -856,6 +858,7 @@ impl ConnectorService {
             }
             #[cfg(feature = "__rustls")]
             Inner::RustlsTls { http, tls, .. } => {
+                http.set_connect_timeout(connect_timeout);
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     use std::convert::TryFrom;
                     use tokio_rustls::TlsConnector as RustlsConnector;
@@ -881,6 +884,7 @@ impl ConnectorService {
             }
             #[cfg(not(feature = "__tls"))]
             Inner::Http(http) => {
+                http.set_connect_timeout(connect_timeout);
                 let conn = socks::connect(proxy, dst, dns, &self.resolver, http).await?;
                 return Ok(Conn {
                     inner: self.verbose.wrap(TokioIo::new(conn)),
@@ -892,6 +896,7 @@ impl ConnectorService {
 
         let resolver = &self.resolver;
         let http = self.inner.get_http_connector();
+        http.set_connect_timeout(connect_timeout);
         socks::connect(proxy, dst, dns, resolver, http)
             .await
             .map(|tcp| Conn {
@@ -912,9 +917,11 @@ impl ConnectorService {
         // Ferrum patch 004: not every feature/target combination reaches a
         // branch that can report a descriptor.
         let _ = &established;
+        let connect_timeout = self.request_connect_timeout();
         match self.inner {
             #[cfg(not(feature = "__tls"))]
             Inner::Http(mut http) => {
+                http.set_connect_timeout(connect_timeout);
                 let io = http.call(dst).await?;
                 // Ferrum patch 004.
                 #[cfg(unix)]
@@ -931,6 +938,7 @@ impl ConnectorService {
             #[cfg(feature = "__native-tls")]
             Inner::NativeTls(http, tls) => {
                 let mut http = http.clone();
+                http.set_connect_timeout(connect_timeout);
 
                 // Disable Nagle's algorithm for TLS handshake
                 //
@@ -970,6 +978,7 @@ impl ConnectorService {
             #[cfg(feature = "__rustls")]
             Inner::RustlsTls { http, tls, .. } => {
                 let mut http = http.clone();
+                http.set_connect_timeout(connect_timeout);
 
                 // Disable Nagle's algorithm for TLS handshake
                 //
@@ -1104,6 +1113,7 @@ impl ConnectorService {
         // this connector can see.
         let _ = &established;
         log::debug!("proxy({proxy:?}) intercepts '{:?}'", dst.host());
+        let connect_timeout = self.request_connect_timeout();
 
         #[cfg(feature = "socks")]
         match proxy.uri().scheme_str().ok_or("proxy scheme expected")? {
@@ -1126,8 +1136,9 @@ impl ConnectorService {
                 if dst.scheme() == Some(&Scheme::HTTPS) {
                     log::trace!("tunneling HTTPS over proxy");
                     let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
-                    let inner =
-                        hyper_tls::HttpsConnector::from((http.clone(), tls_connector.clone()));
+                    let mut http = http.clone();
+                    http.set_connect_timeout(connect_timeout);
+                    let inner = hyper_tls::HttpsConnector::from((http, tls_connector.clone()));
                     // TODO: we could cache constructing this
                     let mut tunnel =
                         hyper_util::client::legacy::connect::proxy::Tunnel::new(proxy_dst, inner);
@@ -1171,7 +1182,8 @@ impl ConnectorService {
                     use tokio_rustls::TlsConnector as RustlsConnector;
 
                     log::trace!("tunneling HTTPS over proxy");
-                    let http = http.clone();
+                    let mut http = http.clone();
+                    http.set_connect_timeout(connect_timeout);
                     let inner = hyper_rustls::HttpsConnector::from((http, tls_proxy.clone()));
                     // TODO: we could cache constructing this
                     let mut tunnel =

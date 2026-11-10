@@ -73,7 +73,7 @@ done
 if [[ -n "$effort" ]]; then
   case "$effort" in
     medium|high|xhigh|max)
-      printf '[opencode-agents] ignoring --effort %s: opencode zen models have no effort tiers\n' \
+      printf '[opencode-laguna-agents] ignoring --effort %s: opencode zen models have no effort tiers\n' \
         "$effort" >&2
       ;;
     *)
@@ -126,7 +126,7 @@ opencode_bin=$(resolve_agent_bin opencode OPENCODE_BIN \
 
 cd "$physical_worktree"
 
-printf '[opencode-agents] dispatch model=%s worktree=%s bin=%s\n' \
+printf '[opencode-laguna-agents] dispatch model=%s worktree=%s bin=%s\n' \
   "$model" "$physical_worktree" "$opencode_bin" >&2
 
 # `run` reads the prompt from stdin; --auto bypasses permission prompts (worktree

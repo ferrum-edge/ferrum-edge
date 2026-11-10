@@ -149,6 +149,59 @@ fn assert_serde_component_field_parity<T>(
     );
 }
 
+/// The admin API is part of the crate's SemVer surface
+/// (`docs/support_policy.md`), so the spec document is versioned with the
+/// crate: a release that bumps `Cargo.toml` must bump `info.version` with it
+/// (issue #7304).
+#[test]
+fn openapi_info_version_matches_crate_version() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    assert_eq!(
+        spec.pointer("/info/version")
+            .and_then(|value| value.as_str()),
+        Some(env!("CARGO_PKG_VERSION")),
+        "openapi.yaml info.version must equal the Cargo.toml package version"
+    );
+}
+
+/// Every runtime Redis key-prefix default is derived from `FERRUM_NAMESPACE`
+/// (and, for the limiters, the plugin-config id), which no static schema
+/// `default` can express. A client that fills in defaults would write the
+/// placeholder text literally, so no component may advertise one (issue
+/// #7304); the description carries the derived value instead.
+#[test]
+fn redis_key_prefix_properties_advertise_no_static_default() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schemas = spec
+        .pointer("/components/schemas")
+        .and_then(|value| value.as_object())
+        .expect("components.schemas is an object");
+    let mut checked = 0;
+    for (name, schema) in schemas {
+        let Some(prefix) = schema.pointer("/properties/redis_key_prefix") else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            prefix.get("default").is_none(),
+            "{name}.redis_key_prefix must not advertise a static default"
+        );
+        assert!(
+            prefix
+                .get("description")
+                .and_then(|value| value.as_str())
+                .is_some_and(|description| description.contains("{FERRUM_NAMESPACE}")),
+            "{name}.redis_key_prefix must document its namespace-derived default"
+        );
+    }
+    assert!(
+        checked >= 8,
+        "expected the rate-limit, dedup and cache prefixes; found {checked}"
+    );
+}
+
 #[test]
 fn admin_pagination_schema_matches_runtime_bounds_and_coercion() {
     let spec: serde_json::Value =
@@ -20174,6 +20227,114 @@ fn mesh_authz_component_matches_runtime_admission() {
         ])),
     ] {
         assert_component_validity(&spec, "MeshAuthzConfig", &invalid, false);
+    }
+}
+
+/// `mesh_authz` and `workload_metrics` admit `trusted_hbone_assertors` through
+/// one parser (`parse_trusted_hbone_assertors`), so both components must
+/// reference one shared schema and agree with both constructors on every case,
+/// including `null` read as absent and Unicode whitespace trimmed like
+/// `str::trim` (issue #7304).
+#[test]
+fn trusted_hbone_assertor_schema_is_shared_and_matches_both_constructors() {
+    use ferrum_edge::plugins::mesh::authz::MeshAuthz;
+    use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let shared = json!("#/components/schemas/MeshTrustedHboneAssertors");
+    for pointer in [
+        "/components/schemas/MeshAuthzConfig/properties/trusted_hbone_assertors/$ref",
+        "/components/schemas/WorkloadMetricsConfig/properties/trusted_hbone_assertors/$ref",
+        "/components/schemas/WorkloadMetricsConfig/properties/_effective_mesh_authz_baggage_gates/items/properties/trusted_hbone_assertors/$ref",
+    ] {
+        assert_eq!(spec.pointer(pointer), Some(&shared), "{pointer}");
+    }
+
+    let spiffe = "spiffe://cluster.local/ns/istio-system/sa/ztunnel";
+    let cases = [
+        (json!(null), true),
+        (json!([]), true),
+        (json!(["ztunnel", "waypoint"]), true),
+        (json!([" waypoint "]), true),
+        (json!([spiffe]), true),
+        (json!([{"assertor": "waypoint"}]), true),
+        (json!([{"assertor": "waypoint", "scope": null}]), true),
+        (
+            json!([{"assertor": "waypoint", "scope": " same_namespace\t"}]),
+            true,
+        ),
+        // `str::trim` strips every Unicode White_Space code point.
+        (
+            json!([{"assertor": "waypoint", "scope": "\u{a0}same_namespace\u{3000}"}]),
+            true,
+        ),
+        (json!([{"assertor": spiffe, "scope": "mesh_wide"}]), true),
+        // A `null` grant field is absent, so it does not conflict.
+        (
+            json!([{"assertor": spiffe, "asserts": null, "scope": "mesh_wide"}]),
+            true,
+        ),
+        (json!([{"assertor": "waypoint", "asserts": []}]), true),
+        (
+            json!([{"assertor": "waypoint",
+                    "asserts": ["spiffe://cluster.local/ns/prod/sa/payments"],
+                    "scope": null}]),
+            true,
+        ),
+        (json!("waypoint"), false),
+        (json!([7]), false),
+        (json!([""]), false),
+        (json!(["   "]), false),
+        (json!(["\u{3000}\u{a0}"]), false),
+        (json!(["https://example.com/sa/waypoint"]), false),
+        (json!([{"assertor": " "}]), false),
+        (json!([{"scope": "same_namespace"}]), false),
+        (json!([{"assertor": "waypoint", "extra": true}]), false),
+        (
+            json!([{"assertor": "waypoint", "asserts": [], "scope": "same_namespace"}]),
+            false,
+        ),
+        (
+            json!([{"assertor": "waypoint", "scope": "mesh_wide"}]),
+            false,
+        ),
+        (
+            json!([{"assertor": "waypoint", "scope": "\u{a0}mesh_wide"}]),
+            false,
+        ),
+        (json!([{"assertor": "waypoint", "scope": "cluster"}]), false),
+        (
+            json!([{"assertor": "waypoint", "asserts": ["not-a-spiffe-id"]}]),
+            false,
+        ),
+        (json!([{"assertor": "waypoint", "asserts": ["  "]}]), false),
+    ];
+
+    for (assertors, expected_valid) in cases {
+        let config = json!({"trusted_hbone_assertors": assertors.clone()});
+        assert_component_validity(&spec, "MeshAuthzConfig", &config, expected_valid);
+        assert_component_validity(&spec, "WorkloadMetricsConfig", &config, expected_valid);
+        assert_eq!(
+            MeshAuthz::new(&config).is_ok(),
+            expected_valid,
+            "mesh_authz constructor disagrees with the schema for {config}"
+        );
+        assert_eq!(
+            WorkloadMetrics::new(&config).is_ok(),
+            expected_valid,
+            "workload_metrics constructor disagrees with the schema for {config}"
+        );
+
+        let gate = json!({"_effective_mesh_authz_baggage_gates": [
+            {"trusted_hbone_assertors": assertors}
+        ]});
+        assert_component_validity(&spec, "WorkloadMetricsConfig", &gate, expected_valid);
+        assert_eq!(
+            WorkloadMetrics::new(&gate).is_ok(),
+            expected_valid,
+            "workload_metrics baggage gate disagrees with the schema for {gate}"
+        );
     }
 }
 
