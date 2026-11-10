@@ -3019,11 +3019,6 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         mode: &BatchConfigWriteMode,
     ) -> Result<AtomicBatchCounts, anyhow::Error>;
 
-    async fn batch_create_proxies(
-        &self,
-        proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error>;
     async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],

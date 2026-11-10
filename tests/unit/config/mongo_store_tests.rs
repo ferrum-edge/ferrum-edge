@@ -369,7 +369,7 @@ fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
         "create_plugin_config(&self, pc: &PluginConfig)",
         "update_plugin_config_inner(",
         "delete_plugin_config_inner(",
-        "batch_create_proxies(",
+        "batch_create_proxies_without_plugins(",
         "batch_create_plugin_configs(",
         "submit_api_spec_bundle(",
         "delete_api_spec(&self, namespace: &str, id: &str)",
@@ -1020,7 +1020,7 @@ fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
     }
 
     for method_name in [
-        "batch_create_proxies(",
+        "batch_create_proxies_without_plugins(",
         "batch_create_upstreams(",
         "batch_create_consumers(",
         "batch_create_plugin_configs(",

@@ -14423,7 +14423,10 @@ mod inner {
             self.write_conditional_namespace(restore, mode).await
         }
 
-        async fn batch_create_proxies(
+        // MongoDB embeds plugin references in the proxy document, so there is
+        // no separate association write to skip: the SQL backend's
+        // "without plugins" split exists only for its junction table.
+        async fn batch_create_proxies_without_plugins(
             &self,
             proxies: &[Proxy],
             mode: &BatchConfigWriteMode,
@@ -14488,7 +14491,7 @@ mod inner {
                         })
                         .await
                         .map_err(anyhow::Error::new)
-                        .context("batch_create_proxies transaction failed")?;
+                        .context("batch proxy insert transaction failed")?;
                     let namespaces: HashSet<String> = proxies
                         .iter()
                         .map(|proxy| proxy.namespace.clone())
@@ -14545,17 +14548,6 @@ mod inner {
             .await?;
             Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
-        }
-
-        async fn batch_create_proxies_without_plugins(
-            &self,
-            proxies: &[Proxy],
-            mode: &BatchConfigWriteMode,
-        ) -> Result<usize, anyhow::Error> {
-            // In MongoDB, plugins are embedded in the proxy document, so this
-            // is the same as batch_create_proxies. The distinction only matters
-            // for the SQL backend where plugin associations are in a junction table.
-            self.batch_create_proxies(proxies, mode).await
         }
 
         async fn batch_attach_proxy_plugins(

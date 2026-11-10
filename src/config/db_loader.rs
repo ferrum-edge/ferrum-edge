@@ -7395,31 +7395,14 @@ impl DatabaseStore {
     /// `FERRUM_DB_FULL_LOAD_PAGE_SIZE`.
     const DEFAULT_FULL_LOAD_PAGE_SIZE: i64 = 10_000;
 
-    /// Batch-create multiple proxies, chunked into transactions of
-    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
-    #[allow(dead_code)]
-    pub async fn batch_create_proxies(
-        &self,
-        proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, true, mode)
-            .await
-    }
-
+    /// Batch-create multiple proxies without their plugin associations,
+    /// chunked into transactions of [`BATCH_CHUNK_SIZE`] for large-scale
+    /// imports. Associations are written afterwards by
+    /// [`Self::batch_attach_proxy_plugins`], once the referenced plugin
+    /// configs exist.
     pub async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, false, mode)
-            .await
-    }
-
-    async fn batch_create_proxies_internal(
-        &self,
-        proxies: &[Proxy],
-        attach_plugins: bool,
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let start = Instant::now();
@@ -7428,11 +7411,9 @@ impl DatabaseStore {
         }
         let mut total = 0usize;
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self
-                .batch_create_proxies_chunk(chunk, attach_plugins, mode)
-                .await?;
+            total += self.batch_create_proxies_chunk(chunk, mode).await?;
         }
-        self.check_slow_query("batch_create_proxies", start);
+        self.check_slow_query("batch_create_proxies_without_plugins", start);
         Ok(total)
     }
 
@@ -7440,7 +7421,6 @@ impl DatabaseStore {
     async fn batch_create_proxies_chunk(
         &self,
         proxies: &[Proxy],
-        attach_plugins: bool,
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.begin_write_tx().await?;
@@ -7457,7 +7437,7 @@ impl DatabaseStore {
         self.lock_config_change_sequences_tx(&mut tx, &admission_namespaces)
             .await?;
         let mut touched_namespaces = HashSet::new();
-        self.insert_proxies_in_tx(&mut tx, proxies, attach_plugins, &mut touched_namespaces)
+        self.insert_proxies_in_tx(&mut tx, proxies, &mut touched_namespaces)
             .await?;
 
         if mode.validates_mtls_dns() {
@@ -7474,24 +7454,22 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    /// Insert one chunk of proxies into a caller-owned transaction.
+    /// Insert one chunk of proxies into a caller-owned transaction, without
+    /// their plugin associations.
     ///
     /// Shared by the chunk-per-transaction import path and the
     /// single-transaction atomic batch graph write so both write identical rows
-    /// and change records. The caller owns the namespace admission lock, the
-    /// post-write admission re-validation, change-log compaction, and the
-    /// commit.
+    /// and change records. Associations are attached in a later phase, once
+    /// the referenced plugin configs exist. The caller owns the namespace
+    /// admission lock, the post-write admission re-validation, change-log
+    /// compaction, and the commit.
     async fn insert_proxies_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         proxies: &[Proxy],
-        attach_plugins: bool,
         touched_namespaces: &mut HashSet<String>,
     ) -> Result<(), anyhow::Error> {
         let insert_sql = self.q(Self::PROXY_INSERT_SQL);
-        let assoc_sql = self.q(
-            "INSERT INTO proxy_plugins (namespace, proxy_id, plugin_config_id) VALUES (?, ?, ?)",
-        );
 
         for proxy in proxies {
             self.ensure_proxy_route_unique_tx(&mut *tx, proxy, None)
@@ -7622,16 +7600,6 @@ impl DatabaseStore {
                 .execute(&mut **tx)
                 .await?;
 
-            if attach_plugins {
-                for assoc in &proxy.plugins {
-                    sqlx::query(&assoc_sql)
-                        .bind(&proxy.namespace)
-                        .bind(&proxy.id)
-                        .bind(&assoc.plugin_config_id)
-                        .execute(&mut **tx)
-                        .await?;
-                }
-            }
             self.record_config_change_tx(&mut *tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
                 .await?;
             touched_namespaces.insert(proxy.namespace.clone());
@@ -8196,7 +8164,7 @@ impl DatabaseStore {
         for (index, chunk) in graph.proxies.chunks(chunk_size).enumerate() {
             // Associations are attached in their own phase below so a plugin
             // config submitted in the same graph is already present.
-            self.insert_proxies_in_tx(&mut tx, chunk, false, &mut touched_namespaces)
+            self.insert_proxies_in_tx(&mut tx, chunk, &mut touched_namespaces)
                 .await?;
             Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Proxies, index + 1)?;
         }
@@ -12985,14 +12953,6 @@ impl DatabaseBackend for DatabaseStore {
         mode: &BatchConfigWriteMode,
     ) -> Result<AtomicBatchCounts, anyhow::Error> {
         DatabaseStore::batch_create_config_graph_atomically(self, graph, mode).await
-    }
-
-    async fn batch_create_proxies(
-        &self,
-        proxies: &[Proxy],
-        mode: &BatchConfigWriteMode,
-    ) -> Result<usize, anyhow::Error> {
-        DatabaseStore::batch_create_proxies(self, proxies, mode).await
     }
 
     async fn batch_create_proxies_without_plugins(
