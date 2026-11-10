@@ -3791,6 +3791,58 @@ impl ApiChargeback {
         namespace: &str,
         shard_amount: usize,
     ) -> Result<Self, String> {
+        let parsed = ParsedApiChargebackConfig::from_config(config)?;
+
+        // Resolve (and, on first use, create) the process-global registry only
+        // once every currency, tunable, and pricing check has passed, so a
+        // config that fails validation never claims the singleton (issue
+        // #7109). Shared Admin / CP validation never reaches this point: it
+        // uses the shape-only [`Self::validate_config`], whose validation HTTP
+        // client does not carry the node's `FERRUM_POOL_SHARD_AMOUNT`.
+        let registry = global_registry_with_shard_amount(shard_amount);
+
+        // Construction stays side-effect free on the process-global registry.
+        // A staged plugin-cache generation builds an instance, and a candidate
+        // that is later rejected must not have repointed the shared budgets,
+        // render TTLs, or cleanup schedule that the live generation is still
+        // using. The resolved tunables are applied in
+        // `commit_background_tasks`, which runs only after the generation is
+        // atomically installed.
+        let scope = InstanceScope::new(parsed.currency, namespace);
+
+        Ok(Self {
+            registry,
+            pricing: parsed.pricing,
+            scope,
+            tunables: parsed.tunables,
+            render_schema: parsed.render_schema,
+        })
+    }
+
+    /// Shape-only validation for shared Admin / CP / config-load admission.
+    ///
+    /// Runs every check construction runs — unknown keys, `schema` /
+    /// `schema_ref`, currency, shared tunables, and pricing — without resolving
+    /// the process-global registry, so a validation sweep (whose HTTP client
+    /// reports auto sharding) can never claim the singleton before an accepted
+    /// generation sizes it with the node's configured shard count (issue
+    /// #7109).
+    pub fn validate_config(config: &Value) -> Result<(), String> {
+        ParsedApiChargebackConfig::from_config(config).map(|_| ())
+    }
+}
+
+/// Everything an `api_chargeback` config resolves to before the instance is
+/// bound to the process-global registry.
+struct ParsedApiChargebackConfig<'a> {
+    render_schema: Option<Arc<SummarySchema>>,
+    currency: &'a str,
+    tunables: SharedRegistryTunables,
+    pricing: PricingConfig,
+}
+
+impl<'a> ParsedApiChargebackConfig<'a> {
+    fn from_config(config: &'a Value) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "api_chargeback: `config` must be an object".to_string())?;
@@ -3827,30 +3879,16 @@ impl ApiChargeback {
             );
         }
 
-        // Resolve (and, on first use, create) the process-global registry only
-        // once every currency, tunable, and pricing check has passed, so a
-        // config that fails validation never claims the singleton (issue
-        // #7109).
-        let registry = global_registry_with_shard_amount(shard_amount);
-
-        // Construction stays side-effect free on the process-global registry.
-        // Admin validation and a staged plugin-cache generation both build an
-        // instance, and a candidate that is later rejected must not have
-        // repointed the shared budgets, render TTLs, or cleanup schedule that
-        // the live generation is still using. The resolved tunables are applied
-        // in `commit_background_tasks`, which runs only after the generation is
-        // atomically installed.
-        let scope = InstanceScope::new(currency, namespace);
-
         Ok(Self {
-            registry,
-            pricing,
-            scope,
-            tunables,
             render_schema,
+            currency,
+            tunables,
+            pricing,
         })
     }
+}
 
+impl ApiChargeback {
     /// The compiled `/charges` render projection this instance resolved.
     #[doc(hidden)]
     #[allow(dead_code)] // used only by external unit tests; dead in the production binary
