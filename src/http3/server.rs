@@ -8636,8 +8636,10 @@ async fn handle_h3_request(
         let mut h3_resp = match streaming_resp {
             Ok(r) => r,
             Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.contains("exceeds maximum size") {
+                // Typed, never the error text (issue #7187).
+                if e.client_request_fault()
+                    == Some(crate::http3::client::H3ClientRequestFault::BodyTooLarge)
+                {
                     // The attempt ends with the oversized upload (issue #5867).
                     ctx.record_backend_attempt(
                         Some(crate::retry::ErrorClass::RequestBodyTooLarge),
@@ -13032,7 +13034,8 @@ fn h3_malformed_client_request_status_body(
         )),
         Some(
             crate::http3::client::H3ClientRequestFault::Abort(_)
-            | crate::http3::client::H3ClientRequestFault::GatewayTerminated,
+            | crate::http3::client::H3ClientRequestFault::GatewayTerminated
+            | crate::http3::client::H3ClientRequestFault::BodyTooLarge,
         )
         | None => None,
     }
@@ -14663,9 +14666,7 @@ impl H3GrpcTerminatingUploadFault {
     /// Every variant is post-wire: the request HEADERS are already committed.
     fn as_pool_error(self) -> crate::http3::client::H3PoolError {
         match self {
-            Self::Oversize => crate::http3::client::H3PoolError::post_wire(anyhow::anyhow!(
-                "Request body exceeds maximum size"
-            )),
+            Self::Oversize => crate::http3::client::h3_request_body_too_large_error(),
             Self::MalformedTrailers => crate::http3::client::H3PoolError::client_request(
                 crate::http3::client::H3ClientRequestFault::MalformedTrailers,
                 anyhow::anyhow!("malformed client request trailers"),
@@ -15321,7 +15322,8 @@ where
     };
     crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
     let is_client_request_body_disconnect = is_h3_client_request_body_disconnect(&e);
-    let is_oversize = err_msg.contains("exceeds maximum size");
+    let is_oversize =
+        e.client_request_fault() == Some(crate::http3::client::H3ClientRequestFault::BodyTooLarge);
     let is_read_timeout = e.is_read_timeout();
     // A malformed/undecodable client request body or trailer block is a bad
     // CLIENT request, not backend unavailability — surface INVALID_ARGUMENT so
@@ -15335,7 +15337,8 @@ where
         }
         Some(
             crate::http3::client::H3ClientRequestFault::Abort(_)
-            | crate::http3::client::H3ClientRequestFault::GatewayTerminated,
+            | crate::http3::client::H3ClientRequestFault::GatewayTerminated
+            | crate::http3::client::H3ClientRequestFault::BodyTooLarge,
         )
         | None => None,
     };
@@ -22407,6 +22410,22 @@ mod h3_streaming_outcome_tests {
              connection failures"
         );
         assert_eq!(error_class, Some(ErrorClass::ReadWriteTimeout));
+    }
+
+    #[test]
+    fn an_oversized_upload_is_a_neutral_client_fault_not_a_malformed_one() {
+        // Issue #7187: the 413 / RESOURCE_EXHAUSTED arms read the typed fault.
+        let too_large = crate::http3::client::h3_request_body_too_large_error();
+        assert!(super::is_h3_client_request_body_disconnect(&too_large));
+        assert!(super::h3_malformed_client_request_status_body(&too_large).is_none());
+        assert!(!super::h3_pool_error_is_gateway_closed_upload(&too_large));
+        assert_eq!(too_large.proven_client_abort(), None);
+        assert_eq!(
+            super::H3GrpcTerminatingUploadFault::Oversize
+                .as_pool_error()
+                .client_request_fault(),
+            Some(crate::http3::client::H3ClientRequestFault::BodyTooLarge)
+        );
     }
 
     #[test]

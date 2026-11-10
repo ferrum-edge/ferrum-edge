@@ -1155,6 +1155,41 @@ pub(crate) enum H3ClientRequestFault {
     /// the cause is not observable: the gateway-closed `503` / `UNAVAILABLE`
     /// terminal, never a client abort.
     GatewayTerminated,
+    /// The client's upload exceeded the effective request-body limit: `413`
+    /// (gRPC `RESOURCE_EXHAUSTED`), typed so no consumer keys the refusal on
+    /// the error text (issue #7187).
+    BodyTooLarge,
+}
+
+/// The typed [`H3PoolError`] for a client upload that exceeded the effective
+/// request-body limit (issue #7187). The text is the operator-stable wording;
+/// consumers read [`H3ClientRequestFault::BodyTooLarge`], never the text.
+pub(crate) fn h3_request_body_too_large_error() -> H3PoolError {
+    H3PoolError::client_request(
+        H3ClientRequestFault::BodyTooLarge,
+        anyhow::anyhow!("Request body exceeds maximum size"),
+    )
+}
+
+/// The typed [`H3PoolError`] for a failed read of an HTTP/1.1 or HTTP/2
+/// client's upload while it is forwarded to a native-H3 backend (issue #7187).
+///
+/// Classified by the one H1/H2 upload-fault predicate the relayed-upload paths
+/// use (`upload_pump::client_upload_error_fault`): only typed proof the client
+/// went away (a reset or `GOAWAY` it sent, or a reset, aborted, or broken
+/// connection) is a client abort (`499`); anything else is a malformed or
+/// incomplete upload (`400`), never a client-closed request.
+fn h1h2_client_upload_read_error(error: &hyper::Error) -> H3PoolError {
+    match crate::proxy::upload_pump::client_upload_error_fault(error) {
+        crate::proxy::upload_pump::ClientUploadFault::Disconnected => H3PoolError::client_request(
+            H3ClientRequestFault::Abort(ProvenClientAbort::latched_upload_abort()),
+            anyhow::anyhow!("Client disconnected while sending request body: {}", error),
+        ),
+        crate::proxy::upload_pump::ClientUploadFault::Malformed => H3PoolError::client_request(
+            H3ClientRequestFault::MalformedBody,
+            anyhow::anyhow!("malformed client request body: {}", error),
+        ),
+    }
 }
 
 /// The typed [`H3PoolError`] for a failed read of the client's own upload.
@@ -3782,9 +3817,7 @@ impl Http3ConnectionPool {
             if max_request_body_size > 0 {
                 total_sent += len;
                 if total_sent > max_request_body_size {
-                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                        "Request body exceeds maximum size"
-                    )));
+                    return Err(h3_request_body_too_large_error());
                 }
             }
             if len == 0 {
@@ -4280,12 +4313,7 @@ impl Http3ConnectionPool {
         while let Some(frame_result) =
             await_h3_dispatch(auth, true, None, async { Ok(frontend_body.frame().await) }).await?
         {
-            let frame = frame_result.map_err(|e| {
-                H3PoolError::post_wire(anyhow::anyhow!(
-                    "Client disconnected while sending request body: {}",
-                    e
-                ))
-            })?;
+            let frame = frame_result.map_err(|e| h1h2_client_upload_read_error(&e))?;
             let Ok(mut chunk) = frame.into_data() else {
                 continue;
             };
@@ -4293,9 +4321,7 @@ impl Http3ConnectionPool {
             if max_request_body_size > 0 {
                 total_sent += len;
                 if total_sent > max_request_body_size {
-                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                        "Request body exceeds maximum size"
-                    )));
+                    return Err(h3_request_body_too_large_error());
                 }
             }
             if len == 0 {
@@ -4316,9 +4342,15 @@ impl Http3ConnectionPool {
             bytes_seen.fetch_add(len as u64, Ordering::Release);
         }
         if require_h2_end_stream && !hyper::body::Body::is_end_stream(&frontend_body) {
-            return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                "Client disconnected while sending request body: HTTP/2 stream reset before END_STREAM"
-            )));
+            // A reset hyper reported as a clean end carries no proof the
+            // client left (issue #6776): an incomplete upload, `400`, never a
+            // client-closed request.
+            return Err(H3PoolError::client_request(
+                H3ClientRequestFault::MalformedBody,
+                anyhow::anyhow!(
+                    "incomplete client request body: HTTP/2 stream ended before END_STREAM"
+                ),
+            ));
         }
         await_h3_write_under_authorization(
             auth,
@@ -5874,6 +5906,23 @@ mod h3_pool_error_tests {
             !e.request_on_wire(),
             "pre_wire constructor must report request_on_wire=false"
         );
+    }
+
+    #[test]
+    fn an_oversized_upload_is_a_typed_post_wire_client_fault() {
+        // Issue #7187: consumers key the 413 on the typed fault, never the text.
+        let e = h3_request_body_too_large_error();
+        assert_eq!(
+            e.client_request_fault(),
+            Some(H3ClientRequestFault::BodyTooLarge)
+        );
+        assert!(e.request_on_wire());
+        assert!(!e.connection_error());
+        assert_eq!(e.proven_client_abort(), None);
+        assert_eq!(e.to_string(), "Request body exceeds maximum size");
+        let text_only =
+            H3PoolError::post_wire(anyhow::anyhow!("Request body exceeds maximum size"));
+        assert_eq!(text_only.client_request_fault(), None);
     }
 
     #[test]

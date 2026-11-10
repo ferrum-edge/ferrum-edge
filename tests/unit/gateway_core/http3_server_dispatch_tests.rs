@@ -6204,7 +6204,9 @@ fn h3_native_streaming_oversize_exits_log_a_transaction_summary() {
         .expect("native streaming dispatch");
 
     let upload = streaming
-        .split("if err_msg.contains(\"exceeds maximum size\") {")
+        .split(
+            "== Some(crate::http3::client::H3ClientRequestFault::BodyTooLarge)\n                {",
+        )
         .nth(1)
         .expect("oversized upload arm")
         .split("return Ok(());")

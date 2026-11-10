@@ -694,7 +694,7 @@ fn native_h3_controls_keep_their_own_terminals() {
     ));
     assert!(malformed.contains("StatusCode::BAD_REQUEST"));
     assert!(malformed.contains(
-        "Some(crate::http3::client::H3ClientRequestFault::Abort(_)|crate::http3::client::H3ClientRequestFault::GatewayTerminated,)|None=>None"
+        "Some(crate::http3::client::H3ClientRequestFault::Abort(_)|crate::http3::client::H3ClientRequestFault::GatewayTerminated|crate::http3::client::H3ClientRequestFault::BodyTooLarge,)|None=>None"
     ));
     let failure = compact(region(
         SERVER,

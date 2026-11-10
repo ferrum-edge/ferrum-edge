@@ -66678,8 +66678,12 @@ async fn proxy_to_backend_http3(
                                 None,
                             );
                         }
-                        let error_str = e.to_string();
-                        if error_str.contains("exceeds maximum size") {
+                        // Typed, never the error text (issue #7187): the
+                        // pool names the client-upload fault it observed.
+                        let client_fault = e.client_request_fault();
+                        if client_fault
+                            == Some(crate::http3::client::H3ClientRequestFault::BodyTooLarge)
+                        {
                             (
                                 retry::BackendResponse {
                                     status_code: 413,
@@ -66698,29 +66702,36 @@ async fn proxy_to_backend_http3(
                                 },
                                 None,
                             )
-                        } else if error_str
-                            .to_ascii_lowercase()
-                            .contains("client disconnected while sending request body")
-                        {
-                            error!(
-                                proxy_id = %proxy.id,
-                                backend_url = %strip_query_params(backend_url),
-                                error = %e,
-                                "Client disconnected while sending request body (HTTP/3 streaming)"
-                            );
+                        } else if let Some(fault) = client_fault {
+                            // The H1/H2 client's own upload failed. Only typed
+                            // proof the client left is a client-closed request
+                            // (`499`); a malformed or incomplete upload is a
+                            // `400` (issue #6776's relayed-upload attribution).
+                            let termination = match fault {
+                                crate::http3::client::H3ClientRequestFault::Abort(_) => {
+                                    request_ctx.record_proven_client_upload_abort();
+                                    upload_pump::PreHeaderSendTermination::ClientAbort
+                                }
+                                crate::http3::client::H3ClientRequestFault::MalformedBody
+                                | crate::http3::client::H3ClientRequestFault::MalformedTrailers => {
+                                    upload_pump::PreHeaderSendTermination::MalformedUpload
+                                }
+                                // Never produced for an H1/H2 upload: the
+                                // gateway-closed terminal belongs to the H3
+                                // frontend, and the oversize arm is above.
+                                crate::http3::client::H3ClientRequestFault::GatewayTerminated
+                                | crate::http3::client::H3ClientRequestFault::BodyTooLarge => {
+                                    upload_pump::PreHeaderSendTermination::Transport
+                                }
+                            };
                             (
-                                retry::BackendResponse {
-                                    status_code: 499,
-                                    body: ResponseBody::buffered(
-                                        r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
-                                    ),
-                                    headers: HashMap::new(),
-                                    connection_error: false,
-                                    backend_resolved_ip: resolved_ip,
-                                    error_class: Some(retry::ErrorClass::ClientDisconnect),
-                                    request_on_wire: true,
-                                    buffered_trailers: None,
-                                },
+                                pre_header_upload_termination_response(
+                                    &proxy.id,
+                                    "http3",
+                                    termination,
+                                    false,
+                                    resolved_ip,
+                                ),
                                 None,
                             )
                         } else if e.is_read_timeout() {
