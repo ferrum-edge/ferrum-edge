@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **Gateway API HTTP/3 rebinds wait on the budget of the latest collision
+  classification** (#7178). A QUIC bind that hit `EADDRINUSE` re-classified
+  the collision after every attempt (in-process UDP handoff vs. this pass's
+  own retirement) but kept waiting on the deadline of its first
+  classification, so a port that moved to the handoff budget could give up
+  early and publish a spurious `BindFailed`. Each wait is now bounded by the
+  budget the current classification selects, as documented.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then
