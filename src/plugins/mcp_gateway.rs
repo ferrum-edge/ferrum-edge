@@ -192,6 +192,14 @@ const MCP_VALIDATION_KEYS: &[&str] = &[
 /// and flagged with `mcp.arguments_truncated`, so one call cannot put an
 /// arbitrarily large value into every transaction log line.
 const MAX_LOGGED_RAW_ARGUMENTS_BYTES: usize = 4096;
+/// Largest client-supplied identifier copied verbatim into log-allowlisted
+/// request metadata: `mcp.method`, `mcp.protocol_version`,
+/// `mcp.public_tool_name` / `mcp.item_name` (written before the catalog
+/// lookup), and `mcp.resource_uri` / `mcp.upstream_resource_uri`. A longer value
+/// is recorded by [`bounded_metadata_identifier`] as its prefix plus the
+/// SHA-256 of the whole value, so one request cannot write a multiple of its
+/// body size into every log sink (`GHSA-f5px-j9pq-7cxm`).
+const MAX_LOGGED_IDENTIFIER_BYTES: usize = 1024;
 const MCP_OBSERVABILITY_KEYS: &[&str] =
     &["emit_metadata", "log_argument_hash", "log_raw_arguments"];
 const MCP_SERVER_KEYS: &[&str] = &[
@@ -2073,8 +2081,10 @@ impl McpGateway {
         ctx.metadata
             .insert("mcp.jsonrpc".to_string(), envelope.jsonrpc.clone());
         if let Some(method) = envelope.method.as_deref() {
-            ctx.metadata
-                .insert("mcp.method".to_string(), method.to_string());
+            ctx.metadata.insert(
+                "mcp.method".to_string(),
+                bounded_metadata_identifier(method),
+            );
         }
     }
 
@@ -2096,8 +2106,10 @@ impl McpGateway {
                 })
             });
         if let Some(version) = version.as_deref() {
-            ctx.metadata
-                .insert("mcp.protocol_version".to_string(), version.to_string());
+            ctx.metadata.insert(
+                "mcp.protocol_version".to_string(),
+                bounded_metadata_identifier(version),
+            );
         }
         version
     }
@@ -5387,12 +5399,13 @@ impl McpGateway {
             }
         };
         if self.observability.emit_metadata {
+            let logged_name = bounded_metadata_identifier(&public_name);
             ctx.metadata
-                .insert("mcp.public_tool_name".to_string(), public_name.clone());
+                .insert("mcp.public_tool_name".to_string(), logged_name.clone());
             ctx.metadata
                 .insert("mcp.item_type".to_string(), "tool".to_string());
             ctx.metadata
-                .insert("mcp.item_name".to_string(), public_name.clone());
+                .insert("mcp.item_name".to_string(), logged_name);
         }
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
@@ -5958,13 +5971,15 @@ impl McpGateway {
         if self.observability.emit_metadata {
             ctx.metadata
                 .insert("mcp.item_type".to_string(), "resource".to_string());
-            ctx.metadata
-                .insert("mcp.resource_uri".to_string(), public_uri.clone());
+            ctx.metadata.insert(
+                "mcp.resource_uri".to_string(),
+                bounded_metadata_identifier(&public_uri),
+            );
             ctx.metadata
                 .insert("mcp.server_id".to_string(), server_id.clone());
             ctx.metadata.insert(
                 "mcp.upstream_resource_uri".to_string(),
-                upstream_uri.clone(),
+                bounded_metadata_identifier(&upstream_uri),
             );
         }
         self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
@@ -10830,6 +10845,22 @@ fn hash_value(value: &Value) -> String {
         Ok(bytes) => hex::encode(Sha256::digest(bytes)),
         Err(_) => hash_str(&value.to_string()),
     }
+}
+
+/// Record a client-supplied identifier in request metadata, bounded by
+/// [`MAX_LOGGED_IDENTIFIER_BYTES`]. A longer value keeps its prefix (cut at a
+/// UTF-8 boundary) followed by `...sha256:` and the hex SHA-256 of the complete
+/// value, so distinct long values stay distinguishable in logs without being
+/// copied in full (`GHSA-f5px-j9pq-7cxm`).
+fn bounded_metadata_identifier(value: &str) -> String {
+    if value.len() <= MAX_LOGGED_IDENTIFIER_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_LOGGED_IDENTIFIER_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...sha256:{}", &value[..end], hash_str(value))
 }
 
 fn hash_str(value: &str) -> String {

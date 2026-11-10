@@ -125,7 +125,7 @@ config:
 | `validation.max_batch_bytes` | uint | `1048576` | Greater than 0; must be at least `max_batch_item_bytes`. |
 | `validation.max_batch_item_bytes` | uint | `262144` | Greater than 0; must not exceed `max_batch_bytes`. |
 | `validation.max_batch_response_bytes` | uint | `1048576` | Greater than 0. |
-| `observability.emit_metadata` | bool | `true` | Gates the descriptive `mcp.*` transaction metadata. |
+| `observability.emit_metadata` | bool | `true` | Gates the descriptive `mcp.*` transaction metadata. Client-supplied identifiers copied into it — `mcp.method`, `mcp.protocol_version` (written whatever this flag says), `mcp.public_tool_name` / `mcp.item_name`, and `mcp.resource_uri` / `mcp.upstream_resource_uri` — are bounded at 1024 bytes: a longer value is recorded as its first 1024 bytes (cut at a UTF-8 boundary), `...sha256:`, and the hex SHA-256 of the complete value. |
 | `observability.log_argument_hash` | bool | `true` | Emits `mcp.arguments_hash`. Evaluated independently of `validation.validate_tool_arguments`. |
 | `observability.log_raw_arguments` | bool | `false` | Emits `mcp.arguments` verbatim up to 4096 bytes (a longer value is cut at a UTF-8 boundary and `mcp.arguments_truncated: "true"` is added) — arguments can carry secrets or PII. Also independent of `validation.validate_tool_arguments`. |
 | `servers.<id>.upstream_url` | string | — | **Required unless `openapi` is set** (exactly one of the two). `http://` or `https://`; credentials, query, and fragment are rejected, and literal-IP hosts are screened against the egress policy. |
