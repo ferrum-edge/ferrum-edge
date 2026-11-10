@@ -1342,7 +1342,7 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
     let _cap = ChangeLogCap::set("ferrum", 10_000);
     let db: Arc<dyn DatabaseBackend> = Arc::new(store);
     let proxy_state = scale_proxy_state();
-    let apply = RuntimeConfigApply::new("ferrum", 0);
+    let apply = RuntimeConfigApply::at_epoch("ferrum", 0, 0);
 
     // Seed the accepted cursor from the startup full load exactly as
     // database mode does.
@@ -1464,7 +1464,7 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
         "the poll after a fallback reload must be incremental, not another full reload"
     );
     assert_eq!(cursor.sequence, watermark);
-    assert_eq!(apply.accepted_sequence(), watermark);
+    assert_eq!(apply.accepted_cursor().sequence, watermark);
 
     // A write after the fallback is picked up incrementally from the
     // committed cursor, proving the reload neither skipped ahead of the rows
@@ -1485,7 +1485,7 @@ async fn saturated_change_log_fallback_converges_within_two_poll_cycles() {
         "a single post-reload write must apply incrementally"
     );
     assert_eq!(cursor.sequence, after_watermark);
-    assert_eq!(apply.accepted_sequence(), after_watermark);
+    assert_eq!(apply.accepted_cursor().sequence, after_watermark);
     assert_eq!(
         proxy_state.current_config().proxies.len(),
         SATURATED_BATCH_PROXIES + 1,
