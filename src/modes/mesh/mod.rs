@@ -13271,6 +13271,12 @@ fn build_egress_upstream_targets(
 /// re-encryption) is not an egress-gateway capability today; if that is ever
 /// needed it would be a distinct stream-family egress mode, not a remap of this
 /// scheme. See #1727.
+///
+/// `Http2` and `Grpc` also map to `Https`: the egress gateway always originates
+/// verified TLS to such a port, and a DestinationRule `tls.mode: DISABLE` does
+/// not undo it. That diverges from Istio, where these ports are plaintext unless
+/// a DestinationRule requests origination; `docs/mesh.md` lists it under Istio
+/// Compatibility Gaps (issue #7236).
 fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
         AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
