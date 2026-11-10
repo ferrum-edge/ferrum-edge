@@ -265,14 +265,8 @@ impl ManagedTlsStore {
         Self::open_with_limits(dir, max_material_bytes, max_records, None)
     }
 
-    /// Open a managed store with explicit material and record ceilings.
-    ///
-    /// Production callers should prefer [`Self::open`], which snapshots the
-    /// validated runtime policy. Tests inject small finite limits here instead
-    /// of mutating process-global policy state. Rejects `0` material bytes and
-    /// caps values above the hard maxima before any store I/O.
-    ///
-    /// `max_document_bytes` of `None` uses `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
+    /// As [`Self::open`], with an explicit material ceiling (the record ceiling
+    /// still comes from the environment).
     #[allow(dead_code)] // External unit tests; production uses open.
     pub fn open_with_material_limit(
         dir: impl Into<PathBuf>,
@@ -283,7 +277,15 @@ impl ManagedTlsStore {
         Self::open_with_limits(dir, max_material_bytes, max_records, None)
     }
 
-    /// Open with explicit material, record, and optional document ceilings.
+    /// Open a managed store with explicit material, record, and optional
+    /// document ceilings.
+    ///
+    /// Production callers should prefer [`Self::open`], which snapshots the
+    /// validated runtime policy. Tests inject small finite limits here instead
+    /// of mutating process-global policy state. Rejects `0` material bytes and
+    /// caps values above the hard maxima before any store I/O.
+    ///
+    /// `max_document_bytes` of `None` uses `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
     pub fn open_with_limits(
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,

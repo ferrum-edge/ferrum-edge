@@ -1,16 +1,13 @@
 //! Polymorphic TLS material sources.
 //!
-//! Phase 1 keeps existing path-oriented callers working while introducing the
-//! common source substrate used by later live-rotation work. Values parse as:
-//! inline PEM when they start with `-----BEGIN `, typed URI when the scheme is
-//! known, and filesystem path otherwise.
+//! Values parse as: inline PEM when they start with `-----BEGIN `, typed URI
+//! when the scheme is known, and filesystem path otherwise.
 
 pub mod subscription;
 #[cfg(windows)]
 mod windows_file;
 
 use crate::fips::approved::Sha256;
-use futures_util::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -669,9 +666,6 @@ fn uri_file_path(identifier: &str) -> Option<String> {
     if identifier.is_empty() {
         return None;
     }
-    if identifier.starts_with('/') {
-        return Some(identifier.to_string());
-    }
     Some(identifier.to_string())
 }
 
@@ -962,22 +956,7 @@ impl MaterializedMaterial {
     }
 }
 
-#[allow(dead_code)]
-pub enum MaterialWatch {
-    Fingerprint(BoxStream<'static, Result<MaterializedMaterial, MaterialError>>),
-    PollOnly { interval: Duration },
-}
-
-#[allow(dead_code)]
-#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
-#[async_trait::async_trait]
-pub trait MaterialLoader: Send + Sync + 'static {
-    fn scheme(&self) -> SourceScheme;
-    async fn load(&self, uri: &CertSourceUri) -> Result<MaterializedMaterial, MaterialError>;
-    async fn watch(&self, uri: &CertSourceUri) -> Result<MaterialWatch, MaterialError>;
-}
-
-/// Synchronous Phase 1 materialization for startup paths.
+/// Synchronous materialization for startup paths.
 pub fn load_material_blocking(
     source: &CertSource,
     fallback_kind: MaterialKind,
@@ -2722,47 +2701,6 @@ where
         Err(_) => {
             task.abort();
             Err("TLS source resolution deadline exceeded".to_string())
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub struct FileLoader;
-
-#[async_trait::async_trait]
-impl MaterialLoader for FileLoader {
-    fn scheme(&self) -> SourceScheme {
-        SourceScheme::File
-    }
-
-    async fn load(&self, uri: &CertSourceUri) -> Result<MaterializedMaterial, MaterialError> {
-        let source = CertSource::Uri(uri.clone());
-        let max_bytes = effective_tls_max_material_size_bytes()?;
-        load_material_with(&source, uri.kind, max_bytes).await
-    }
-
-    async fn watch(&self, _uri: &CertSourceUri) -> Result<MaterialWatch, MaterialError> {
-        Ok(MaterialWatch::PollOnly {
-            interval: Duration::from_secs(30),
-        })
-    }
-}
-
-#[allow(dead_code)]
-pub struct InlineLoader;
-
-impl InlineLoader {
-    #[allow(dead_code)]
-    pub fn load_source(
-        source: &CertSource,
-        kind: MaterialKind,
-    ) -> Result<MaterializedMaterial, MaterialError> {
-        match source {
-            CertSource::InlinePem(_) => load_material_blocking(source, kind),
-            other => Err(MaterialError::InvalidSource {
-                source_id: other.redacted_source_id(),
-                details: "InlineLoader only accepts inline PEM sources".to_string(),
-            }),
         }
     }
 }
