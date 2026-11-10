@@ -3761,7 +3761,7 @@ fn parse_l4_match_arm(
     m: &Value,
     kind: &str,
     vs_gateways: &[String],
-) -> Result<Option<crate::proxy::stream_match::StreamMatchArm>, K8sTranslateError> {
+) -> Result<crate::proxy::stream_match::StreamMatchArm, K8sTranslateError> {
     use crate::proxy::stream_match::{
         MAX_STREAM_MATCH_GATEWAY_LENGTH, MAX_STREAM_MATCH_GATEWAYS, MAX_STREAM_MATCH_LABELS,
         StreamMatchArm, canonicalize_gateway_name, valid_kubernetes_label_key,
@@ -3909,7 +3909,7 @@ fn parse_l4_match_arm(
         vs_gateways.to_vec()
     };
 
-    Ok(Some(arm))
+    Ok(arm)
 }
 
 fn parse_l4_cidr_list(
@@ -3973,14 +3973,8 @@ fn parse_l4_cidr_list(
     Ok(out)
 }
 
-fn attach_l4_stream_match(
-    proxy: &mut Proxy,
-    arm: Option<crate::proxy::stream_match::StreamMatchArm>,
-) {
-    if let Some(arm) = arm {
-        proxy.stream_match =
-            Some(crate::proxy::stream_match::StreamMatchCriteria { arms: vec![arm] });
-    }
+fn attach_l4_stream_match(proxy: &mut Proxy, arm: crate::proxy::stream_match::StreamMatchArm) {
+    proxy.stream_match = Some(crate::proxy::stream_match::StreamMatchCriteria { arms: vec![arm] });
 }
 
 /// Resolve L4 (`tcp[]`/`tls[]`) route destinations into Ferrum backends.
@@ -5293,7 +5287,6 @@ fn virtual_service_routes(
                     rewrite: route_rewrite_value.as_ref(),
                     redirect: route_redirect_value.as_ref(),
                 },
-                false,
             );
 
             let mut proxy = proxy_for_route(RouteProxySpec {
