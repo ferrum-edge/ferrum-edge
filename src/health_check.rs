@@ -5495,6 +5495,61 @@ mod tests {
         assert!(error.contains("record #2"), "got: {error}");
     }
 
+    /// Issue #7205: the gRPC probe transport is built once per spawn. A
+    /// TLS build failure becomes a fail-closed transport that reports every
+    /// probe unhealthy without dialing, and a plaintext probe reads no TLS
+    /// material at all.
+    #[tokio::test]
+    async fn grpc_probe_tls_is_built_once_and_fails_closed() {
+        ensure_crypto_provider();
+        let no_identity = HealthCheckClientIdentityPaths {
+            cert: &None,
+            key: &None,
+        };
+        let refused = BackendTlsConfig::refused();
+        assert!(matches!(
+            build_grpc_probe_tls(false, &refused, None, no_identity, false, &[]),
+            GrpcProbeTls::Plaintext
+        ));
+        let transport = build_grpc_probe_tls(true, &refused, None, no_identity, false, &[]);
+        let GrpcProbeTls::Unavailable(reason) = &transport else {
+            panic!("a refused destination must not get a gRPC probe TLS client");
+        };
+        assert!(reason.contains("refused"), "got: {reason}");
+
+        // Port 9 is never contacted: the probe fails before dialing.
+        let outcome = grpc_probe(
+            "localhost",
+            "127.0.0.1",
+            9,
+            Duration::from_millis(50),
+            "",
+            &refused,
+            &transport,
+        )
+        .await;
+        assert!(!outcome.success);
+        let failure = outcome.failure.expect("failure reason");
+        assert!(
+            failure.starts_with("grpc connect failed: "),
+            "got: {failure}"
+        );
+        assert!(failure.contains("refused"), "got: {failure}");
+
+        let verified = build_grpc_probe_tls(
+            true,
+            &BackendTlsConfig::default_verify(),
+            None,
+            no_identity,
+            false,
+            &[],
+        );
+        let GrpcProbeTls::Ready(client_config) = &verified else {
+            panic!("webpki-rooted probe TLS must build");
+        };
+        assert_eq!(client_config.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
     #[tokio::test]
     async fn grpc_no_verify_probe_rejects_all_malformed_client_chain_before_connect() {
         ensure_crypto_provider();
