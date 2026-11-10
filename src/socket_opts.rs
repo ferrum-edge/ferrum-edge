@@ -5,7 +5,8 @@
 //! kernel-level BDP-optimal buffer sizing, `SO_BUSY_POLL` for low-latency UDP,
 //! `UDP_GRO`/`UDP_SEGMENT` for kernel-level
 //! datagram batching, and `kTLS` for enabling splice(2) on TLS paths.
-//! All functions are no-ops on non-Linux platforms.
+//! Linux-only options are no-ops on other platforms, or fail closed where a
+//! caller's guarantee depends on them.
 
 #[cfg(target_os = "linux")]
 use tracing::debug;
@@ -551,11 +552,11 @@ fn apply_tcp_keepalive_inner(
 /// set. The DR override is additive and takes precedence; the global value
 /// remains the fallback so existing (non-mesh / no-DR) behavior is unchanged.
 ///
-/// IMPORTANT: keepalive is NOT part of the pool key (forbidden by the
-/// proxy-protocol rules — see `.claude/rules/proxy-protocols.md` "Never add
-/// policy fields ... keepalives to pool keys"). Because the setting is applied
-/// once at connection creation on a pooled+shared multiplexed connection, the
-/// "first proxy to materialize the pooled connection wins" tradeoff applies
+/// IMPORTANT: keepalive is NOT part of the pool key (see the first-materializer
+/// wording in `.claude/rules/proxy-protocols.md`, "Pool Keys And DNS"). Because
+/// the setting is applied once at connection creation on a pooled+shared
+/// multiplexed connection, the "first proxy to materialize the pooled
+/// connection wins" tradeoff applies
 /// (same as documented for `idleTimeout` / `maxRequestsPerConnection`): later
 /// dispatchers that differ only in keepalive reuse the existing connection and
 /// inherit the keepalive of whoever created it.
@@ -2583,8 +2584,6 @@ pub mod ktls {
         Ok(())
     }
 
-    /// Check if kTLS is available on this kernel.
-    ///
     /// Per-cipher kTLS availability, probed once at first call to
     /// `is_ktls_available()` / the per-cipher accessors. The three cipher
     /// suites kTLS supports landed in different kernel versions (AES-GCM
@@ -2853,11 +2852,6 @@ pub mod ktls {
             && matches!(observed_rx, Ok(seq) if seq == rx_seq)
     }
 
-    /// Attempts to load the TLS ULP module via `modprobe tls` (requires root).
-    /// Returns `true` if the module is already loaded or was loaded successfully.
-    /// This is a best-effort check — kTLS can still fail per-socket if the
-    /// negotiated cipher is unsupported.
-    ///
     /// Returns `true` iff ANY supported cipher (AES-128-GCM, AES-256-GCM, or
     /// ChaCha20-Poly1305) can be installed via the TLS ULP. Use the
     /// per-cipher accessors below to gate cipher-specific code paths before
@@ -2899,7 +2893,7 @@ pub mod ktls {
     /// `TlsCryptoInfo*` struct to install via `setsockopt(SOL_TLS, TLS_TX)`.
     ///
     /// All syscalls are raw libc. On any failure anywhere in setup, we close
-    /// whatever fds we managed to open and return `false`.
+    /// whatever fds we managed to open and return [`PROBE_SETUP_FAILED`].
     ///
     /// IMPORTANT: We MUST use real TCP sockets here, not AF_UNIX socketpair.
     /// TCP_ULP with IPPROTO_TCP is only valid on TCP sockets; an AF_UNIX socket

@@ -1515,7 +1515,6 @@ impl DnsCache {
         }
     }
 
-    /// Cache a DNS error to prevent hammering DNS for known-bad hostnames.
     /// Return the loopback address for localhost, respecting `dns_order`.
     /// If AAAA appears before A in the configured order, return `::1` (IPv6);
     /// otherwise return `127.0.0.1` (IPv4).  This mirrors what a real resolver
@@ -1532,6 +1531,7 @@ impl DnsCache {
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     }
 
+    /// Cache a DNS error to prevent hammering DNS for known-bad hostnames.
     fn cache_error(
         &self,
         hostname: &str,
@@ -1914,7 +1914,7 @@ impl DnsCache {
     /// `service_discovery::dns_sd::targets_from_srv_records`); tier SELECTION
     /// happens per request in the load balancer's candidate filter.
     ///
-    /// Distinct from the address-only SRV mode in `resolve_with_type`, which
+    /// Distinct from the address-only SRV mode in `do_resolve`, which
     /// answers "what IPs back this hostname", never dials the RR's port, and
     /// therefore deliberately does not reject port 0.
     pub async fn resolve_srv(&self, service_name: &str) -> Result<Vec<SrvAnswer>, anyhow::Error> {
@@ -2751,12 +2751,6 @@ impl DnsCache {
     /// Start a background task that proactively refreshes cache entries before
     /// they expire. Entries are refreshed when the configured percentage of their
     /// TTL has elapsed (default 90%), keeping DNS resolution off the hot request path.
-    #[allow(dead_code)]
-    pub fn start_background_refresh(&self) -> tokio::task::JoinHandle<()> {
-        self.start_background_refresh_with_shutdown(None)
-    }
-
-    /// Start background refresh with an optional shutdown signal.
     ///
     /// When `shutdown_rx` is provided, the task will exit cleanly when the
     /// shutdown signal is received. Without it, the task runs until aborted.

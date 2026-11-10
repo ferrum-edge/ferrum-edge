@@ -1,7 +1,7 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionTestHooks,
     await_pool_connect_with_timeout, database_store_reconnect_as_failover_for_test,
-    database_store_set_reconnect_transition_hooks_for_test, db_code_is_transient, db_diff_removed,
+    database_store_set_reconnect_transition_hooks_for_test, db_code_is_transient,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, effective_pool_connect_timeout_seconds,
     is_config_validation_rejection, lock_wait_timeout_sql, mysql_config_change_lock_insert_sql,
@@ -28,7 +28,6 @@ use ferrum_edge::config::types::{
 use serde_json::json;
 use sqlx::error::{DatabaseError, ErrorKind};
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
@@ -401,62 +400,6 @@ fn test_db_pool_config_default() {
     assert_eq!(config.max_lifetime_seconds, 300);
     assert_eq!(config.connect_timeout_seconds, 10);
     assert_eq!(config.statement_timeout_seconds, 30);
-}
-
-// ── diff_removed ─────────────────────────────────────────────────────────────
-
-#[test]
-fn test_diff_removed_empty_sets() {
-    let known = HashSet::new();
-    let current = HashSet::new();
-    assert!(db_diff_removed(&known, &current).is_empty());
-}
-
-#[test]
-fn test_diff_removed_no_deletions() {
-    let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let current = known.clone();
-    assert!(db_diff_removed(&known, &current).is_empty());
-}
-
-#[test]
-fn test_diff_removed_all_deleted() {
-    let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let current = HashSet::new();
-    let mut removed = db_diff_removed(&known, &current);
-    removed.sort();
-    assert_eq!(removed, vec!["a", "b", "c"]);
-}
-
-#[test]
-fn test_diff_removed_partial_deletion() {
-    let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let current: HashSet<String> = ["a", "c"].iter().map(|s| s.to_string()).collect();
-    let removed = db_diff_removed(&known, &current);
-    assert_eq!(removed, vec!["b"]);
-}
-
-#[test]
-fn test_diff_removed_current_has_new_ids() {
-    let known: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-    let current: HashSet<String> = ["a", "b", "d", "e"].iter().map(|s| s.to_string()).collect();
-    assert!(db_diff_removed(&known, &current).is_empty());
-}
-
-#[test]
-fn test_diff_removed_known_empty_current_has_items() {
-    let known = HashSet::new();
-    let current: HashSet<String> = ["x", "y"].iter().map(|s| s.to_string()).collect();
-    assert!(db_diff_removed(&known, &current).is_empty());
-}
-
-#[test]
-fn test_diff_removed_mixed_additions_and_deletions() {
-    let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let current: HashSet<String> = ["b", "d", "e"].iter().map(|s| s.to_string()).collect();
-    let mut removed = db_diff_removed(&known, &current);
-    removed.sort();
-    assert_eq!(removed, vec!["a", "c"]);
 }
 
 // ── parse_scheme ─────────────────────────────────────────────────────────────

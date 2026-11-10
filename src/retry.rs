@@ -10,7 +10,6 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::time::Duration;
-use tracing::warn;
 
 /// Human-friendly classification of backend connection/communication errors.
 ///
@@ -396,8 +395,8 @@ pub fn intern_http_metrics_error_class(value: &str) -> Option<&'static str> {
 /// `as_str` so `dns_lookup_error` stays distinguishable from
 /// `connection_refused`. When the rejection was gateway-authored and there
 /// is no `ErrorClass`, the matching gateway token is used. 2xx/3xx/4xx
-/// omit the label, as do backend 5xx with neither a class nor a gateway
-/// phase (select those by `status_code` alone).
+/// omit the label. A backend 5xx with neither a class nor a gateway phase
+/// carries `backend_error`, matching its `X-Gateway-Error` header.
 #[inline]
 pub fn http_metrics_error_class(
     error_class: Option<ErrorClass>,
@@ -424,7 +423,7 @@ pub fn http_metrics_error_class(
 
 /// Access-log `error_class` for an HTTP-family summary: always the granular
 /// [`ErrorClass::as_str`]. Gateway-authored 503s with no `ErrorClass` omit
-/// the field (same as `main`); join to `X-Gateway-Error` via
+/// the field; join to `X-Gateway-Error` via
 /// [`x_gateway_error_token_for_class`].
 #[inline]
 pub fn http_log_error_class(error_class: Option<ErrorClass>) -> Option<&'static str> {
@@ -1931,21 +1930,6 @@ impl BackendResponse {
             | ResponseBody::StreamingH3(_) => &[],
         }
     }
-
-    /// Consume the response and return the buffered body bytes.
-    /// Returns an empty Vec if the body is streaming.
-    #[allow(dead_code)]
-    pub fn into_buffered_body(self) -> Vec<u8> {
-        match self.body {
-            ResponseBody::Buffered(b) => b.into(),
-            ResponseBody::Streaming { .. }
-            | ResponseBody::StreamingH2(_)
-            | ResponseBody::StreamingH3(_) => {
-                warn!("attempted to extract buffered body from a streaming response");
-                Vec::new()
-            }
-        }
-    }
 }
 
 /// Determine if a request should be retried.
@@ -2109,6 +2093,8 @@ mod tests {
             ErrorClass::TlsError,
             ErrorClass::PortExhaustion,
             ErrorClass::ConnectionPoolError,
+            ErrorClass::BackendConnectionLimit,
+            ErrorClass::TrustWithdrawn,
         ] {
             assert!(
                 !request_reached_wire(class),
@@ -2131,6 +2117,7 @@ mod tests {
             ErrorClass::ProtocolError,
             ErrorClass::RequestBodyTooLarge,
             ErrorClass::ResponseBodyTooLarge,
+            ErrorClass::GatewayBufferCapacity,
             ErrorClass::ClientDisconnect,
             ErrorClass::GracefulRemoteClose,
             ErrorClass::DispatchPolicyRejected,
@@ -2167,27 +2154,11 @@ mod tests {
         // Sanity: every variant maps to a non-empty static label and labels
         // do not collide. Operators grep these strings across protocol logs;
         // duplicating one would silently merge two distinct failure modes.
-        let labels: Vec<&'static str> = [
-            ErrorClass::ConnectionRefused,
-            ErrorClass::ConnectionTimeout,
-            ErrorClass::ConnectionReset,
-            ErrorClass::ConnectionClosed,
-            ErrorClass::DnsLookupError,
-            ErrorClass::TlsError,
-            ErrorClass::ReadWriteTimeout,
-            ErrorClass::ProtocolError,
-            ErrorClass::PortExhaustion,
-            ErrorClass::ConnectionPoolError,
-            ErrorClass::ClientDisconnect,
-            ErrorClass::RequestBodyTooLarge,
-            ErrorClass::ResponseBodyTooLarge,
-            ErrorClass::GracefulRemoteClose,
-            ErrorClass::DispatchPolicyRejected,
-            ErrorClass::RequestError,
-        ]
-        .into_iter()
-        .map(error_class_log_kind)
-        .collect();
+        let labels: Vec<&'static str> = ErrorClass::ALL
+            .iter()
+            .copied()
+            .map(error_class_log_kind)
+            .collect();
         for label in &labels {
             assert!(!label.is_empty(), "log kind label must be non-empty");
         }

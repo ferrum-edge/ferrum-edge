@@ -4784,7 +4784,7 @@ mod tests {
     // loopback port and point the *production* dialer
     // ([`NativeRemoteSource`] -> `fetch_remote_slice`) at it, so the
     // real wire path is exercised end to end: channel dial, DP-JWT mint +
-    // server-side verification (the same `verify_grpc_jwt_metadata` the real
+    // server-side verification (the same `verify_grpc_jwt_metadata_with_audience` the real
     // `MeshGrpcServer` uses), `MeshSubscribe` streaming, heartbeat skipping,
     // slice-JSON decode, and workload/service extraction. This is the
     // in-process stand-in for a two-control-plane round trip; a true

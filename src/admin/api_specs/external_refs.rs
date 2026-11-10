@@ -733,7 +733,6 @@ pub fn load_external_documents(
     local_resources.insert(resource_uri_key(&policy.document_base));
     collect_local_resource_ids(root, &policy.document_base, &mut local_resources)?;
 
-    let mut active = HashSet::new();
     collect_refs_from_value(
         root,
         &policy.document_base,
@@ -743,7 +742,6 @@ pub fn load_external_documents(
             local_resources: &local_resources,
             pending: &mut pending,
             seen_refs: &mut seen_refs,
-            active: &mut active,
         },
     )?;
 
@@ -774,7 +772,6 @@ pub fn load_external_documents(
         let doc_base = doc.canonical_uri.clone();
         collect_local_resource_ids(&doc_root, &doc_base, &mut local_resources)?;
         loaded.insert(key, doc);
-        active.clear();
         collect_refs_from_value(
             &doc_root,
             &doc_base,
@@ -784,7 +781,6 @@ pub fn load_external_documents(
                 local_resources: &local_resources,
                 pending: &mut pending,
                 seen_refs: &mut seen_refs,
-                active: &mut active,
             },
         )?;
     }
@@ -868,7 +864,6 @@ struct CollectRefsState<'a> {
     local_resources: &'a HashSet<String>,
     pending: &'a mut VecDeque<(Url, usize)>,
     seen_refs: &'a mut usize,
-    active: &'a mut HashSet<String>,
 }
 
 fn collect_refs_from_value(
@@ -895,11 +890,7 @@ fn collect_refs_from_value(
                 if let Some(target) =
                     classify_external_target(reference, &child_base, state.local_resources)?
                 {
-                    let key = resource_uri_key(&target);
-                    if state.active.insert(key.clone()) {
-                        state.pending.push_back((target, depth));
-                        state.active.remove(&key);
-                    }
+                    state.pending.push_back((target, depth));
                 }
             }
             for (key, child) in map {

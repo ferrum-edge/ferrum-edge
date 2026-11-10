@@ -1845,7 +1845,7 @@ The frontend HTTP/2 listener applies the same conservative-by-default philosophy
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` | `32` | Maximum concurrent CONNECT-UDP tunnels per resolved client (IPv4 per address, IPv6 grouped by `FERRUM_PER_IP_IPV6_PREFIX`, default `/64`); `503` over the limit. The slot is held for the tunnel's lifetime and released on every close path. `0` disables the per-client cap. |
 | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` | `120` | Seconds a tunnel may carry no datagram in either direction (clamped 1–86400). The default is the two minutes RFC 9298 §3.2 says a UDP proxy SHOULD NOT go below. This value is also the floor for the frontend QUIC connection idle timeout while the profile is enabled, so the advertised tunnel lifetime is the one that actually holds. |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | `65,527` | Largest relayed UDP payload (clamped 1–65527, the RFC 9298 §5 Context ID 0 ceiling). Scales payload-dependent per-session buffers; the client-bound framing scratch has an independent initial capacity of 4096 bytes — see [Bounds and lifecycle](#bounds-and-lifecycle). |
-| `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |
+| `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU. Must be in `1200..=65527`; a value outside that range fails startup |
 
 ## Authorization lifetime at backend handoff
 

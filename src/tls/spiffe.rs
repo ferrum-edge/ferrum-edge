@@ -33,7 +33,6 @@
 //!   any-federated behavior (HBONE operator targets).
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use rustls::client::WantsClientCert;
 use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
     UnixTime,
@@ -359,14 +358,6 @@ impl SpiffeServerCertResolver {
     fn build_cert_key(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let snapshot = self.slot.load_full();
         cached_certified_key(&self.certified_key_cache, snapshot, "server")
-    }
-
-    pub fn validate_current(&self) -> Result<(), SpiffeTlsError> {
-        let snapshot = self.slot.load_full();
-        let bundle = snapshot.as_ref().as_ref().ok_or(SpiffeTlsError::NoSvid)?;
-        certified_key_from_bundle(bundle)
-            .map(|_| ())
-            .map_err(SpiffeTlsError::BadKeyMaterial)
     }
 }
 
@@ -1260,11 +1251,6 @@ fn verify_peer_against_bundle(
     );
     Ok(peer_id)
 }
-
-// re-export the ConfigBuilder marker types so the build steps above compile
-// without doc warnings on unused import lints.
-#[allow(dead_code)]
-fn _marker_imports(_x: WantsServerCert, _y: WantsClientCert) {}
 
 #[cfg(test)]
 mod tests {

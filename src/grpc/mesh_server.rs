@@ -310,23 +310,8 @@ impl MeshGrpcServer {
         MeshGrpcServerBuilder::new(config, jwt_secret)
     }
 
-    #[allow(dead_code)]
-    pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
-        self.cluster_domain = cluster_domain;
-        self
-    }
-
     pub fn into_service(self) -> MeshConfigSyncServer<Self> {
         MeshConfigSyncServer::new(self)
-    }
-
-    /// Shared admission controller, for asserting stream/node occupancy.
-    ///
-    /// Reachable only from the external `tests/` crate, so the bin target sees
-    /// it as dead — same as the constructors above.
-    #[allow(dead_code)]
-    pub fn admission(&self) -> CpGrpcAdmissionController {
-        self.admission.clone()
     }
 
     fn check_namespace(

@@ -442,7 +442,6 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     ///
     /// Diagnostic surface only; the store's correctness comes from the
     /// exclusive-lock read-modify-write, not from this counter.
-    #[allow(dead_code)]
     pub fn version(&self) -> Result<u64, SharedStoreError> {
         Ok(self.snapshot()?.store_version())
     }

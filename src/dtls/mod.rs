@@ -27,10 +27,6 @@ use crate::proxy::datagram_client_address::DatagramMetadataError;
 use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
-/// Default MTU for DTLS records. Conservative default that works over most networks.
-#[allow(dead_code)]
-const DEFAULT_MTU: usize = 1200;
-
 /// Default DTLS record overhead: 13-byte header + up to 16-byte auth tag (AES-GCM) +
 /// padding. Observed: 22 bytes for AES-128-GCM. 64 bytes gives conservative headroom
 /// for cipher suite variations and future DTLS versions.
@@ -1121,10 +1117,11 @@ fn policy_config_builder(
 /// Build a DTLS client config for backend connections (gateway → backend).
 ///
 /// Maps the proxy's `backend_tls_*` fields to dimpl `Config`:
-/// - `backend_tls_server_ca_cert_path` → used for peer cert validation callback
+/// - `backend_tls_server_ca_cert_path` → trust anchors for the rustls
+///   `ServerCertVerifier` that validates the backend certificate
 /// - `backend_tls_client_cert_path` + `backend_tls_client_key_path` → client certificate
 ///
-/// Returns `(config, certificate, trusted_ca_certs, skip_verify)`.
+/// Returns a [`BackendDtlsParams`].
 pub fn build_backend_dtls_config(
     proxy: &Proxy,
     backend_host: &str,
@@ -1913,9 +1910,9 @@ pub struct DtlsServer {
     ///
     /// Spawned sessions snapshot this once at construction so the running
     /// handshake / session cannot observe a partial rotation. Operators can
-    /// publish a new snapshot via [`Self::swap_frontend_config`] (used by mesh
-    /// PeerAuthentication live reload); new sessions pick it up on the next
-    /// ClientHello.
+    /// publish a new snapshot via [`Self::swap_frontend_config`] (used by
+    /// frontend DTLS live reload and the owner-scoped NodeWaypoint DTLS
+    /// publish); new sessions pick it up on the next ClientHello.
     active_config: ArcSwap<DtlsServerActiveConfig>,
     sessions: Arc<DashMap<SocketAddr, DtlsSessionState>>,
     active_sessions: Arc<AtomicUsize>,
@@ -3871,7 +3868,8 @@ impl DtlsServer {
         });
     }
 
-    /// Shut down the server (close underlying socket).
+    /// Signal the recv loop and every session driver to stop. The socket
+    /// closes once the last `Arc<UdpSocket>` (server and session drivers) drops.
     pub async fn close(&self) {
         self.shutdown_tx.send_replace(true);
         let session_shutdowns: Vec<mpsc::Sender<()>> = self
@@ -4182,12 +4180,6 @@ fn generate_ephemeral_cert() -> Result<DtlsCertificateChain, anyhow::Error> {
     dimpl::certificate::generate_self_signed_certificate()
         .map(DtlsCertificateChain::from)
         .map_err(|e| anyhow::anyhow!("Failed to generate ephemeral DTLS cert: {}", e))
-}
-
-/// Generate a self-signed DTLS certificate for testing.
-#[allow(dead_code)]
-pub fn generate_self_signed_cert() -> Result<DtlsCertificateChain, anyhow::Error> {
-    generate_ephemeral_cert()
 }
 
 /// Generate an ephemeral self-signed certificate for DTLS clients that don't
@@ -4829,7 +4821,7 @@ mod tests {
         let new_config = Config::builder().build().expect("build DTLS config");
         server.swap_frontend_config(FrontendDtlsConfig {
             dimpl_config: Arc::new(new_config),
-            certificate: new_certificate.clone(),
+            certificate: new_certificate,
             client_cert_verifier: None,
             client_trust: None,
         });
@@ -4838,21 +4830,6 @@ mod tests {
         assert_ne!(
             before, after,
             "swap_frontend_config must replace the active_config Arc"
-        );
-
-        // New session spawns must observe the swapped certificate. Drive a
-        // single session to validate the snapshot path: `spawn_session`
-        // captures the swapped `certificate` value rather than the
-        // original.
-        server.spawn_session(
-            "127.0.0.1:43210".parse().unwrap(),
-            client_hello_packet(),
-            None,
-            None,
-        );
-        assert!(
-            server.active_session_count() <= 1,
-            "spawn_session honored admission limits after a live-reload swap"
         );
     }
 }

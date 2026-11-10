@@ -2347,7 +2347,8 @@ pub struct EnvConfig {
     pub admin_jwt_max_ttl: u64,
     /// Optional required `aud` (audience) claim for externally minted Admin API
     /// JWT tokens. When set, verification requires the token to carry an `aud`
-    /// claim matching this value; when unset (default), audience is not checked.
+    /// claim matching this value; when unset (default), tokens that carry an
+    /// `aud` claim are rejected.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
     #[allow(dead_code)]
     pub admin_jwt_audience: Option<String>,
@@ -3086,11 +3087,14 @@ pub struct EnvConfig {
     // Kubernetes CRD controller (Layer 8)
     /// Enable the Kubernetes CRD controller in CP mode. When true, the CP
     /// watches Istio and Gateway API CRDs and reconciles them into Ferrum
-    /// config via `translate_k8s_objects()`. Default: false.
+    /// config via `translate_k8s_objects()`. Default: `true` when running
+    /// inside a Kubernetes pod (`KUBERNETES_SERVICE_HOST` set), `false`
+    /// otherwise; an explicit value always wins.
     pub k8s_controller_enabled: bool,
-    /// Enable core Kubernetes Pod/Service/EndpointSlice discovery. Default:
-    /// false for one release; when true, CP also watches core resources and
-    /// derives mesh services/workloads from ready pods.
+    /// Enable core Kubernetes Pod/Service/EndpointSlice discovery. Same
+    /// in-cluster default as `k8s_controller_enabled`; when true, the CP also
+    /// watches core resources and derives mesh services/workloads from ready
+    /// pods.
     pub k8s_pod_discovery_enabled: bool,
     /// `FERRUM_K8S_ALLOW_SELECTORLESS_EXTERNAL_ENDPOINTS`. Let a Gateway API
     /// backendRef to a selector-less Service in the route's own namespace
@@ -3917,7 +3921,6 @@ pub struct EnvConfig {
 
     // Stream proxy (TCP/UDP)
     /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
-    #[allow(dead_code)] // Used in Phase 2 (stream listener startup)
     pub stream_proxy_bind_address: String,
     /// Trusted listener-side gateway identity used by VirtualService L4
     /// `gateways` predicates. `None` means no binding, so those predicates
@@ -3989,9 +3992,8 @@ pub struct EnvConfig {
     /// plugin is enabled; must be a unique random value of at least 32 bytes.
     /// There is no default. Rotating it invalidates all existing Basic-auth
     /// password hashes.
-    /// Note: Also resolved via `resolve_ferrum_var()` in `basic_auth.rs` and
-    /// `admin/mod.rs` for use sites that don't have `EnvConfig` in scope.
-    #[allow(dead_code)]
+    /// Note: `basic_auth.rs` also resolves it via `resolve_ferrum_var()` because
+    /// the plugin has no `EnvConfig` in scope; `fips::policy` reads this field.
     pub basic_auth_hmac_secret: Option<String>,
 
     /// Shared secret authenticating the datagram client-address envelope on
@@ -6464,8 +6466,6 @@ impl EnvConfig {
         Ok(config)
     }
 
-    /// Build a `SocketAddr` from the proxy bind address and the given port.
-    /// The bind address is validated at config load time, so the parse is safe.
     /// Build an [`OverloadConfig`] from the parsed env vars.
     pub fn overload_config(&self) -> crate::overload::OverloadConfig {
         crate::overload::OverloadConfig {
@@ -6629,6 +6629,8 @@ impl EnvConfig {
         Ok(())
     }
 
+    /// Build a `SocketAddr` from the proxy bind address and the given port.
+    /// The bind address is validated at config load time, so the parse is safe.
     pub fn proxy_socket_addr(&self, port: u16) -> std::net::SocketAddr {
         let ip: std::net::IpAddr = self
             .proxy_bind_address

@@ -19,7 +19,7 @@
 //!
 //! **Key implementation details**:
 //! - Postgres `?` → `$N` placeholder rewrite via `q()` method (sqlx `Any` uses `?`)
-//! - `>500` IN-clause threshold switches to full-table fetch + in-memory filter
+//! - ID lookups are chunked by `ASSOCIATION_LOOKUP_CHUNK_SIZE` (500) per IN clause
 //! - The active pool is published atomically with its failover topology
 //!   (`DbFailoverTopologyState`), enabling zero-downtime DNS re-resolution on failover
 //! - Batch chunking (`BATCH_CHUNK_SIZE`) for large imports to stay within DB limits
@@ -2104,10 +2104,6 @@ impl DatabaseStore {
     }
 
     /// Run versioned schema migrations using the MigrationRunner.
-    ///
-    /// This replaces the old inline `CREATE TABLE IF NOT EXISTS` approach with
-    /// a tracked, versioned migration system. Existing databases are automatically
-    /// detected and bootstrapped into the new system.
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
         self.run_migrations_on_pool(self.pool()).await
     }
@@ -2618,8 +2614,7 @@ impl DatabaseStore {
         purpose: FullConfigLoadPurpose,
     ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
-        // Capture timestamp before queries so the incremental polling safety
-        // margin covers the full load duration.
+        // Config version stamp for this load; captured before the queries run.
         let loaded_at = Utc::now();
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
@@ -3764,40 +3759,28 @@ impl DatabaseStore {
 
     // ---- Proxy INSERT SQL helpers ----
     //
-    // The column list for a proxy INSERT appears in three places:
-    //   1. `create_proxy`           — direct admin POST /proxies
-    //   2. `batch_create_proxies_chunk` — bulk import
-    //   3. `submit_api_spec_bundle` — spec-owned INSERT (adds `api_spec_id` column)
+    // ── Drift-prevention contract for proxy write call sites ─────────────────
     //
-    // Sites 1 and 2 share `PROXY_INSERT_SQL` (no api_spec_id).
-    // Site 3 uses `PROXY_INSERT_WITH_SPEC_SQL` (adds api_spec_id before created_at).
+    // The 54-column proxy column list is canonical. When you add a new column
+    // to the `proxies` table, it must be added — in the same position — to ALL
+    // of:
     //
-    // IMPORTANT: when adding a new column to `proxies`, update BOTH constants and
-    // the corresponding `.bind()` chains in all three call sites.  The direct-admin
-    // `update_proxy` (also in this file) and `replace_api_spec_bundle` UPDATE paths
-    // are separate SQL strings and must be updated independently.
+    //   1. `PROXY_INSERT_SQL` and its `.bind()` chains in `create_proxy` (admin
+    //      POST /proxies) and `insert_proxies_in_tx` (bulk import)
+    //   2. the inline proxy INSERT in `restore_api_spec_bundle_inner`
+    //      (spec-owned; adds `api_spec_id` before `created_at`)
+    //   3. the `update_proxy` SET clause + bind chain
+    //   4. the proxy UPDATE in `replace_api_spec_bundle_inner`
+    //   5. the `proxies` entry of `DEPLOYMENT_KNOWN_COLUMNS`
+    //      (`src/config/deployment_mutation.rs`)
+    //   6. `PROXY_INSERT_PLACEHOLDER_COUNT` and
+    //      `PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT` below
     //
-    // NOTE: `submit_api_spec_bundle` uses a literal multi-line query string with
-    // `\` continuation rather than this const because it adds the `api_spec_id`
-    // column.  The `replace_api_spec_bundle` path uses UPDATE so it is out of scope.
-    // ── Drift-prevention contract for proxy INSERT call sites ────────────────
-    //
-    // The 54-column proxy column list is canonical and shared by THREE INSERT
-    // sites and ONE UPDATE site. When you add a new column to the `proxies`
-    // table, it must be added — in the same position — to ALL of:
-    //
-    //   1. PROXY_INSERT_SQL                         (direct admin path)
-    //   2. create_proxy() bind chain                (this file, ~line 790)
-    //   3. submit_api_spec_bundle() proxy INSERT    (this file, ~line 3387)
-    //   4. update_proxy() SET clause + bind chain   (this file, ~line 919)
-    //   5. PROXY_INSERT_PLACEHOLDER_COUNT below     (drift catcher)
-    //   6. PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT below
-    //
-    // The two `proxy_insert_sql_*_count_matches_bind_count` tests below count
-    // `?` placeholders in the SQL and assert against the constants here. If
-    // you forget to update the placeholder count, the test fails and points
-    // at the exact discrepancy. If you update the constant but forget to
-    // bind, sqlx returns "wrong number of parameters" at execute time.
+    // `proxy_insert_sql_placeholder_count_matches_const` (in
+    // `proxy_insert_sql_drift_tests`) counts the `?` placeholders in
+    // `PROXY_INSERT_SQL` and asserts against the constant. If you update the
+    // constant but forget to bind, sqlx returns "wrong number of parameters"
+    // at execute time.
     //
     // We chose this drift-catcher pattern over a fully-generic
     // `bind_proxy_base_columns` helper because the sqlx::Any generic makes
@@ -10306,7 +10289,7 @@ impl DatabaseStore {
         // This SQL differs from `Self::PROXY_INSERT_SQL` only by the addition of
         // the `api_spec_id` column before `created_at`.  When adding a new column
         // to `proxies`, update BOTH this query AND `Self::PROXY_INSERT_SQL` (and
-        // the corresponding `.bind()` chains in `create_proxy`, `batch_create_proxies_chunk`,
+        // the corresponding `.bind()` chains in `create_proxy`, `insert_proxies_in_tx`,
         // and the `replace_api_spec_bundle` UPDATE path).
         {
             let p = &bundle.proxy;
@@ -13344,7 +13327,6 @@ pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
     }
 }
 
-/// Parse a proxy row into a Proxy struct (shared by load_proxies and get_proxy).
 fn serialize_stream_match(proxy: &Proxy) -> Result<Option<String>, anyhow::Error> {
     proxy
         .stream_match
@@ -13360,6 +13342,7 @@ fn serialize_stream_match(proxy: &Proxy) -> Result<Option<String>, anyhow::Error
         })
 }
 
+/// Parse a proxy row into a Proxy struct.
 fn row_to_proxy(
     row: &AnyRow,
     id: String,
@@ -13892,7 +13875,6 @@ fn row_to_plugin_config_inner(
     })
 }
 
-/// Parse an upstream row into an Upstream struct.
 /// Decode one `gateway_trust_bundles` row (issue #3727).
 ///
 /// Failures are reported through the shared row-decode rejection marker so a
@@ -14003,6 +13985,7 @@ fn row_to_gateway_trust_bundle_inner(
     })
 }
 
+/// Parse an upstream row into an Upstream struct.
 fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")

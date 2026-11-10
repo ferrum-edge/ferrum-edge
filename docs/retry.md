@@ -206,7 +206,7 @@ The default backoff strategy (when `backoff` is not specified) is `!fixed { dela
 
 ## Retry with Load Balancing
 
-When a proxy has both `retry` and `upstream_id` configured, retries automatically select a **different target** from the upstream on each attempt. HTTP/H3 retry loops call `select_next_target()` with the previous **configured** sticky/routing identity excluded. TCP/stream `retry_on_connect_failure` rotation retains only the live `(host, dial port, policy lane)` and excludes through the endpoint-lane contract instead, so it never reselects that effective lane.
+When a proxy has both `retry` and `upstream_id` configured, retries automatically select a **different target** from the upstream on each attempt. HTTP/H3 retry loops call the `select_next_target*_from` snapshot selectors with the previous **configured** sticky/routing identity excluded. TCP/stream `retry_on_connect_failure` rotation retains only the live `(host, dial port, policy lane)` and excludes through the endpoint-lane contract instead, so it never reselects that effective lane.
 
 Rotation honors health state across **all protocols**: candidates that are actively unhealthy or passive-ejected (the `maxEjectionPercent` cap is evaluated against the post-exclusion candidate pool) are skipped. When every remaining candidate is unhealthy or ejected, rotation returns no alternate rather than synthesizing a dial to a known-unhealthy target — HTTP-family retries then re-attempt the previously tried target, and TCP `retry_on_connect_failure` rotation stops looking for an alternate.
 
