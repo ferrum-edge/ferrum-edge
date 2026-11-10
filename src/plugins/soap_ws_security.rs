@@ -8145,41 +8145,31 @@ fn resolve_soap_request_body<'a>(
     content_type: &str,
     media_class: &SoapMediaClass,
 ) -> Result<Option<Cow<'a, str>>, SoapBodyDecodeError> {
-    if let Some(bytes) = ctx.request_body_bytes.as_ref() {
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let (envelope_bytes, envelope_content_type) = match media_class {
-            // A bare XOP infoset has no package around it, so like plain XML the
-            // whole body is the envelope. It is only classified apart so an
-            // integrity-claiming policy can refuse it.
-            SoapMediaClass::Xml | SoapMediaClass::Xop => (&bytes[..], Cow::Borrowed(content_type)),
-            SoapMediaClass::Mtom { boundary, start } => {
-                let part = extract_mtom_root_part(bytes, boundary, start.as_deref())?;
-                (part.body, Cow::Owned(part.content_type))
-            }
-        };
-        if envelope_bytes.is_empty() {
-            return Ok(None);
-        }
-        return decode_soap_xml_body(envelope_bytes, &envelope_content_type).map(Some);
+    // The plugin opts into raw bytes (`needs_request_body_bytes`), and every
+    // proxy path supplies them for a governed body. Without them there is no
+    // wire representation for the final-body digest binding to cover, so the
+    // plugin-writable `metadata["request_body"]` text is never authenticated in
+    // their place: the request takes the empty-body disposition instead.
+    let Some(bytes) = ctx.request_body_bytes.as_ref() else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Ok(None);
     }
-    // Fixture-only fallback: production prefers raw bytes. Still enforce the
-    // UTF-8 XML-declaration contract so encoding validation is not bypassed.
-    // MTOM is never reachable here: the multipart wrapper is binary framing and
-    // the shared UTF-8 metadata copy is not a representation it can be unpacked
-    // from, so it fails closed rather than validating the wrong bytes.
-    if matches!(media_class, SoapMediaClass::Mtom { .. }) {
-        return Err(SoapBodyDecodeError::MalformedEncoding);
-    }
-    match ctx.metadata.get("request_body") {
-        Some(body) if body.is_empty() => Ok(None),
-        Some(body) => {
-            validate_xml_declaration_encoding(body, SoapXmlEncoding::Utf8)?;
-            Ok(Some(Cow::Borrowed(body.as_str())))
+    let (envelope_bytes, envelope_content_type) = match media_class {
+        // A bare XOP infoset has no package around it, so like plain XML the
+        // whole body is the envelope. It is only classified apart so an
+        // integrity-claiming policy can refuse it.
+        SoapMediaClass::Xml | SoapMediaClass::Xop => (&bytes[..], Cow::Borrowed(content_type)),
+        SoapMediaClass::Mtom { boundary, start } => {
+            let part = extract_mtom_root_part(bytes, boundary, start.as_deref())?;
+            (part.body, Cow::Owned(part.content_type))
         }
-        None => Ok(None),
+    };
+    if envelope_bytes.is_empty() {
+        return Ok(None);
     }
+    decode_soap_xml_body(envelope_bytes, &envelope_content_type).map(Some)
 }
 
 /// The SOAP root part of an MTOM/XOP `multipart/related` body.
