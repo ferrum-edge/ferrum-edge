@@ -7711,7 +7711,6 @@ The plugin stamps metric plans; configure `prometheus_metrics` to export those m
 | `allow_plaintext` | Boolean; omitted | Admit a cleartext `http://` provider URL whose host is not a loopback IP literal (`127.d.d.d` or `[::1]`). Without it, such a provider fails construction. Mesh injection writes `true` whenever a translated Telemetry/MeshConfig provider uses `http://`, so in-cluster collectors keep working and the cleartext posture stays visible in the injected config. |
 | `direction_emit` | Object or null; `{server: true, client: false}` | Boolean `server` and `client` members select inbound SERVER and outbound CLIENT spans; omitted members use those defaults. Unstamped direction uses `server`. Null selects defaults; unknown members are rejected. |
 | `span_reporting_disabled` | Boolean; `false` | Suppresses span export while preserving configuration and trace-context propagation (W3C, and B3 under a Zipkin provider). No span is built while export is inactive. |
-| `disable_span_reporting`, `disableSpanReporting` | Boolean; omitted | Aliases, in decreasing precedence after `span_reporting_disabled`. First present spelling wins, including explicit false. |
 | `service_name` | String; derived | Defaults to `ferrum-edge-mesh-<namespace>` for a nonblank namespace, otherwise `ferrum-edge-mesh`. Active exporters require a nonblank explicit value and trim it. |
 | `deployment_environment` | String; omitted | Exported `deployment.environment` resource attribute. Active exporters require a nonblank value and trim it. |
 | `batch_size` | Unsigned integer; `50` | Active exporter range: 1–10000 spans per batch. |
@@ -7733,7 +7732,7 @@ Direct providers use these envelopes (they are different from Istio's name-only 
 | `opentelemetry` | `endpoint` string | OTLP/HTTP JSON; supply the complete `/v1/traces` URL. |
 | `zipkin` | `url` string | Zipkin v2 JSON; supply the complete `/api/v2/spans` URL. |
 | `datadog` | `agent_url` string | Optional `service` string or null overrides the span service name; the exporter appends `/v0.3/traces` if needed. |
-| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `access_token_env` must name a `FERRUM_PLUGIN_SECRET_<NAME>` variable (any other variable is refused at admission, even while span reporting is disabled). `accessTokenEnv` is an accepted alias, but supplying both spellings is an error. |
+| `lightstep` | `collector_url`, `access_token_env` strings | OTLP with a local environment bearer token; `access_token_env` must name a `FERRUM_PLUGIN_SECRET_<NAME>` variable (any other variable is refused at admission, even while span reporting is disabled). The camelCase `accessTokenEnv` spelling belongs to Istio translation only; the plugin config rejects it. |
 
 Provider objects require `kind` and `config`; unknown keys in the envelope or in `config` are rejected. Active endpoint URLs must be absolute HTTP(S), have a host, and contain no embedded credentials. Lightstep's variable must be readable and its value valid for the bearer header.
 

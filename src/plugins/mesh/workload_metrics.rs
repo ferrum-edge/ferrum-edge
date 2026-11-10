@@ -205,8 +205,6 @@ pub const WORKLOAD_METRICS_CONFIG_KEYS: &[&str] = &[
     "tracing_providers",
     "direction_emit",
     "span_reporting_disabled",
-    "disable_span_reporting",
-    "disableSpanReporting",
     "service_name",
     "deployment_environment",
     "batch_size",
@@ -508,14 +506,13 @@ impl WorkloadMetrics {
                 return Err(format!("workload_metrics: `{key}` must be a string"));
             }
         }
-        for key in [
-            "span_reporting_disabled",
-            "disable_span_reporting",
-            "disableSpanReporting",
-        ] {
-            if config.get(key).is_some_and(|value| !value.is_boolean()) {
-                return Err(format!("workload_metrics: `{key}` must be a boolean"));
-            }
+        if config
+            .get("span_reporting_disabled")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(
+                "workload_metrics: `span_reporting_disabled` must be a boolean".to_string(),
+            );
         }
         for key in [
             "batch_size",
@@ -618,8 +615,6 @@ impl WorkloadMetrics {
         }
         let span_reporting_disabled = config
             .get("span_reporting_disabled")
-            .or_else(|| config.get("disable_span_reporting"))
-            .or_else(|| config.get("disableSpanReporting"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let service_name = string_config(config, "service_name").unwrap_or_else(|| {
@@ -1810,8 +1805,10 @@ fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {
 const TRACING_PROVIDER_ENVELOPE_KEYS: &[&str] = &["kind", "config"];
 const ZIPKIN_PROVIDER_CONFIG_KEYS: &[&str] = &["url"];
 const DATADOG_PROVIDER_CONFIG_KEYS: &[&str] = &["agent_url", "service"];
-const LIGHTSTEP_PROVIDER_CONFIG_KEYS: &[&str] =
-    &["collector_url", "access_token_env", "accessTokenEnv"];
+/// The direct plugin config takes only the snake_case spelling; Istio's
+/// `accessTokenEnv` belongs to mesh-config translation, which writes
+/// `access_token_env` into the injected plugin config.
+const LIGHTSTEP_PROVIDER_CONFIG_KEYS: &[&str] = &["collector_url", "access_token_env"];
 const OPENTELEMETRY_PROVIDER_CONFIG_KEYS: &[&str] = &["endpoint"];
 
 fn tracing_provider_config_keys(kind: &str) -> Option<&'static [&'static str]> {

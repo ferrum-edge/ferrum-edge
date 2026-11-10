@@ -9625,8 +9625,6 @@ fn workload_metrics_accepts_every_allowlisted_key() {
         "tracing_providers": [],
         "direction_emit": { "server": true, "client": true },
         "span_reporting_disabled": false,
-        "disable_span_reporting": false,
-        "disableSpanReporting": false,
         "service_name": "reviews",
         "deployment_environment": "staging",
         "batch_size": 128,

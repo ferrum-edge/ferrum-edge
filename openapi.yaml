@@ -28610,21 +28610,9 @@ components:
         - if:
             allOf:
               - not:
-                  anyOf:
-                    - required: [span_reporting_disabled]
-                      properties:
-                        span_reporting_disabled: {const: true}
-                    - required: [disable_span_reporting]
-                      not: {required: [span_reporting_disabled]}
-                      properties:
-                        disable_span_reporting: {const: true}
-                    - required: [disableSpanReporting]
-                      not:
-                        anyOf:
-                          - required: [span_reporting_disabled]
-                          - required: [disable_span_reporting]
-                      properties:
-                        disableSpanReporting: {const: true}
+                  required: [span_reporting_disabled]
+                  properties:
+                    span_reporting_disabled: {const: true}
               - anyOf:
                   - required: [tracing_providers]
                     properties:
@@ -29093,18 +29081,6 @@ components:
           description: |
             Delay between span export retries, in milliseconds. Read by the
             shared OTel exporter options off this same root config object.
-        disable_span_reporting:
-          type: boolean
-          description: |
-            Alias for `span_reporting_disabled`, accepted for parity with the
-            Istio Telemetry CRD field name. Ignored when
-            `span_reporting_disabled` is present.
-        disableSpanReporting:
-          type: boolean
-          description: |
-            camelCase alias for `span_reporting_disabled`, accepted for parity
-            with the Istio Telemetry CRD field name. Ignored when either
-            snake_case spelling is present.
         direction_emit:
           type: [object, "null"]
           additionalProperties: false
@@ -29187,17 +29163,10 @@ components:
                 config:
                   type: object
                   additionalProperties: false
-                  anyOf:
-                    - required: [collector_url, access_token_env]
-                    - required: [collector_url, accessTokenEnv]
-                  not: {required: [access_token_env, accessTokenEnv]}
+                  required: [collector_url, access_token_env]
                   properties:
                     collector_url: {type: string}
                     access_token_env:
-                      type: string
-                      maxLength: 256
-                      pattern: '^(?!.*_(?:FILE|VAULT|AWS|AZURE|GCP)$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
-                    accessTokenEnv:
                       type: string
                       maxLength: 256
                       pattern: '^(?!.*_(?:FILE|VAULT|AWS|AZURE|GCP)$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
