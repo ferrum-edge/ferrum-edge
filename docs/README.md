@@ -134,7 +134,6 @@ Contributing to Ferrum Edge itself.
 | [mesh_runtime_benchmark.md](mesh_runtime_benchmark.md) | Mesh data-plane head-to-head benchmark methodology |
 | [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md) | Rust CodeQL extraction diagnostic |
 | [unit_compile_diagnostics.md](unit_compile_diagnostics.md) | Retained CI unit-test compilation diagnostics |
-| [ghcr_cache_migration.md](ghcr_cache_migration.md) | Moving the BuildKit cache to GHCR |
 | [native_cache_envelope.md](native_cache_envelope.md) | Native compiler-cache container-envelope proof |
 | [native_compiler_store_transfer.md](native_compiler_store_transfer.md) | Native compiler-store transfer proof |
 | [release_profile_study.md](release_profile_study.md) | Release build profile (LTO / codegen units) study |
