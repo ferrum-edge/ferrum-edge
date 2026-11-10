@@ -606,6 +606,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured-prefix members intact, and the next hop merges every baggage
   field line. Every case-insensitive match is now filtered, as the
   ordered-list sibling already did.
+- **A TCPRoute and a TLSRoute with the same name no longer share one L4 proxy
+  id** (GHSA-4mjg-c4c6-vhw2). Only UDPRoute ids carried the route kind, so
+  TCPRoute `ns/db` and TLSRoute `ns/db` both derived
+  `gwapi-l4-ns-db-<rule>` and one silently replaced the other depending on
+  informer order, while both could report Programmed. Every L4 rule suffix is
+  now kind-scoped (`tcproute-<rule>`, `tlsroute-<rule>`, `udproute-<rule>`),
+  and the L4 path claims its proxy and upstream ids like the HTTPRoute path:
+  a second route object deriving an owned id is refused with a warning and a
+  refused-claim status instead of overwriting. **Operator note:** generated
+  TCPRoute/TLSRoute proxy ids change (`gwapi-l4-<ns>-<name>-0` becomes
+  `gwapi-l4-<ns>-<name>-tcproute-0` or `-tlsroute-0`); anything keyed on those
+  ids (dashboards, plugin `proxy_id` references) needs the new spelling.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
