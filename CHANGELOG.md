@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Removed
+- **Plugin readers for metadata and record shapes no built-in writes**
+  (#7115). `ai_transcript_audit` no longer exports the pre-namespace
+  `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity` keys in a
+  record's `cache` section (only `ai_semantic_cache.<id>.*` and
+  `request_deduplication.replayed`), and those keys are no longer on the
+  built-in safe log-metadata allowlist. `api_chargeback_sink` reads
+  `request_id` only from the canonical `request_id` metadata, not the
+  `x-request-id` / `correlation_id` spellings. `request_deduplication`
+  refuses a Redis replay record whose body is a JSON byte array instead of
+  the base64 string it writes, and `oidc_relying_party` no longer defaults a
+  session payload's `context_id` / `claims_expires_at_unix`.
 - **`ferrum_xds_warming_partial_applies_total` is no longer exported**
   (#7027). The xDS data plane only builds a mesh slice once every required
   type (CDS/EDS/LDS/RDS/ECDS) reports the same `version_info`, so a slice is
