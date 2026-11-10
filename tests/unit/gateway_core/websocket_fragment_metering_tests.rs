@@ -487,6 +487,68 @@ fn interleaved_control_frames_carry_no_fragment_charge() {
     assert_eq!(meter.take_reassembly_frames(), 0);
 }
 
+/// An unfragmented message is one physical frame and leaves no reassembly
+/// charge behind.
+#[test]
+fn unfragmented_message_leaves_no_fragment_charge() {
+    let meter = Arc::new(FragmentMeter::new());
+    let mut socket = tokio_tungstenite::tungstenite::protocol::WebSocket::from_raw_socket(
+        std::io::Cursor::new(vec![0x82, 0x03, 0x01, 0x02, 0x03]),
+        Role::Client,
+        None,
+    );
+    socket.set_fragment_accounting(Some(Arc::clone(&meter)), None, None);
+
+    assert_eq!(
+        socket.read().expect("message reads"),
+        Message::Binary(vec![1, 2, 3].into())
+    );
+    assert_eq!(meter.pending_reassembly_frames(), 0);
+}
+
+/// Accounting is per message: a completed message resets the frame bound, so
+/// a long-lived connection of legitimately fragmented messages is unaffected.
+#[test]
+fn fragment_bounds_reset_between_messages() {
+    let mut bytes = Vec::new();
+    for _ in 0..3 {
+        bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x80, 0x00]);
+    }
+    let meter = Arc::new(FragmentMeter::new());
+    let mut socket = tokio_tungstenite::tungstenite::protocol::WebSocket::from_raw_socket(
+        std::io::Cursor::new(bytes),
+        Role::Client,
+        None,
+    );
+    socket.set_fragment_accounting(Some(Arc::clone(&meter)), Some(2), None);
+
+    for _ in 0..3 {
+        assert_eq!(
+            socket.read().expect("each message stays inside the bound"),
+            Message::Text("".into())
+        );
+        assert_eq!(meter.take_reassembly_frames(), 2);
+    }
+}
+
+/// The default config keeps upstream behaviour: no incomplete-message bounds.
+#[test]
+fn fragment_bounds_default_to_unbounded() {
+    let config = WebSocketConfig::default();
+    assert_eq!(config.max_incomplete_message_frames, None);
+    assert_eq!(config.max_incomplete_message_duration, None);
+
+    let mut socket = tokio_tungstenite::tungstenite::protocol::WebSocket::from_raw_socket(
+        std::io::Cursor::new(zero_length_fragment_chain(64)),
+        Role::Client,
+        Some(config),
+    );
+    assert_eq!(
+        socket.read().expect("an unbounded chain reassembles"),
+        Message::Text("".into())
+    );
+}
+
 /// The async delegator (`tokio-tungstenite` patch 004): accounting installed
 /// on a `WebSocketStream` before `split()` keeps metering through the
 /// `SplitStream` that hides the codec — the shape the relay uses.

@@ -129,9 +129,12 @@ dependency-policy SLA.
   `vendor/tungstenite-0.29.0-ferrum-patched` (`--lib fragment` /
   `--lib incomplete_message`).
 - External unit: `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`
-  (metering, no-double-charge, both directions, observer exclusion, parser
-  bound → policy Close mapping, duration bound on final continuation and
-  interleaved Ping/Pong, peer Close exemption). Its `async_delegator_*` tests
+  (metering, unfragmented messages uncharged, per-message bound reset,
+  default-unbounded config, no-double-charge, both directions, observer
+  exclusion, parser bound → policy Close mapping, duration bound on final
+  continuation and interleaved Ping/Pong, peer Close exemption). This file
+  runs in the Unit Tests job and covers every vendored case above through the
+  public API. Its `async_delegator_*` tests
   cover the `tokio-tungstenite` `WebSocketStream::set_fragment_accounting`
   delegator: metering through a `split()` `SplitStream` and the forwarded
   incomplete-message frame bound.
