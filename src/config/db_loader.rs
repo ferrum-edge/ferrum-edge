@@ -8608,20 +8608,23 @@ impl DatabaseStore {
         if mode.validates_mtls_dns() {
             self.validate_mtls_dns_admission_tx(tx, namespace).await?;
         }
+        // Every row below is in this one namespace: take its change-sequence
+        // lock once instead of once per deleted resource (issue #7209).
+        self.lock_config_change_sequence_tx(tx, namespace).await?;
         for id in proxy_ids {
-            self.record_config_change_tx(tx, namespace, "proxy", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "proxy", &id, "delete")
                 .await?;
         }
         for id in plugin_config_ids {
-            self.record_config_change_tx(tx, namespace, "plugin_config", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "plugin_config", &id, "delete")
                 .await?;
         }
         for id in consumer_ids {
-            self.record_config_change_tx(tx, namespace, "consumer", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "consumer", &id, "delete")
                 .await?;
         }
         for id in upstream_ids {
-            self.record_config_change_tx(tx, namespace, "upstream", &id, "delete")
+            self.insert_config_change_row_tx(tx, namespace, "upstream", &id, "delete")
                 .await?;
         }
         self.compact_config_changes_tx(tx, namespace).await?;
