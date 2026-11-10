@@ -75,9 +75,7 @@ adding, removing, or materially changing a workflow.
 | `performance-regression.yml` | Performance Regression | Daily schedule on `main`, manual | Out-of-band self-relative overhead benchmark, Criterion microbenchmarks, and the protocol-perf / mesh-baseline static contracts. Not a PR or main-push check; a red run marks the daily `main` tip as regressed. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `h1-tls-post-regression.yml` | H1 TLS POST Historical Baseline | Daily schedule on `main`, manual | Paired same-runner HTTP/1.1 TLS POST/echo throughput of the `main` tip against the historical reference pinned in `tests/performance/multi_protocol/h1_tls_post_reference.json`; gates the paired ratio per payload size, alerts on rolling-ratio drift, downgrades noisy-runner verdicts to provisional. Manual dispatch accepts a reference SHA override for matched-host bisects. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md#historical-baseline-h1-tls-post-check). |
-| `grpc-deadline-ab-benchmark.yml` | gRPC Deadline A/B Benchmark | Manual; push to `perf/grpc-deadline-ab/**` | Paired same-runner A/B of the gRPC RPC-deadline response path (#6904): unary and server-streaming, open and `key_auth`, with and without `grpc-timeout`, between the revisions pinned in `tests/performance/multi_protocol/grpc_deadline_reference.json` or dispatched overrides. Proves from the backend that deadline cells carried `grpc-timeout`, probes stalled-stream termination and backend release, and reports the deadline-path difference-in-differences. Never a required check; see [protocol_perf_regression.md](protocol_perf_regression.md#grpc-rpc-deadline-ab-6904). |
 | `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-26.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
-| `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
 | `perf-benchmark.yml` | Multi Protocol Performance Benchmark | Manual | Multi-protocol benchmark suite for selected refs. |
 | `payload-size-benchmark.yml` | Payload Size Performance Benchmark | Manual | Payload-size benchmark suite for selected refs. |
@@ -103,13 +101,7 @@ adding, removing, or materially changing a workflow.
 | `h3-proof-preflight.yml` | H3 Proof Preflight | PRs on its own paths, manual | H3 observer compile and hosted self-tests. Optional. |
 | `h3-live-comparison.yml` | H3 Live Comparison | PRs on its own paths, manual | H3 feature contracts and fixtures on PRs; manual dispatch runs the calibrated H3 payload campaign. Optional. |
 | `rr-build-comparison.yml` | RoundRobin Build Comparison | PRs and push to `main` on its own paths, manual | Evidence-contract checks; manual dispatch runs a paired RoundRobin comparison against a chosen ancestor SHA. Optional. |
-| `stream-profile.yml` | Stream Profile | Push to `bench/5588-stream-**`, manual | Low-rate streaming latency profile for the response-aggregation window ([#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588)). Optional. |
-| `release-sbom-smoke.yml` | Release SBOM Smoke | PRs and push to `main` on its own paths | Read-only SPDX SBOM reproduction per image family/registry/architecture; no registry login, signing, or publication. Optional. |
-| `release-profile-study.yml` | Release Profile Study | Manual; PRs and push to `main` on its own paths run contracts only | Nonpublishing fat-vs-thin LTO build and benchmark study; see [release_profile_study.md](release_profile_study.md). |
-| `release-platform-study.yml` | Release Platform Build Study | Manual; PRs and push to `main` on its own paths run telemetry contracts only | Nonpublishing macOS/Windows release-build timing study; see [release_platform_build_study.md](release_platform_build_study.md). |
 | `windows-confinement.yml` | Windows File Confinement | PRs and push to `main` on `src/tls/source/**`, the confinement tests and their registration chain (`tests/unit_tests.rs`, `tests/unit/mod.rs`, `tests/unit/tls/mod.rs`), `src/lib.rs`, `src/config/file_loader.rs`, Cargo/toolchain/build configuration, or its own file; manual | Runs the Windows-only tenant-file confinement unit tests (`windows_confined_files`) natively on `windows-latest`, including the elevated case-sensitive NTFS directory test that is `#[ignore]`d elsewhere. Every unit shard runs on Linux, where these tests compile out ([#6540](https://github.com/ferrum-edge/ferrum-edge/issues/6540)). Fails when fewer tests run than the module holds. Optional. |
-| `native-cache-envelope.yml` | Native Cache Envelope Proof | Manual; PRs and push to `main` on its own paths run contracts only | Synthetic GHCR envelope proof for native compiler caches; see [native_cache_envelope.md](native_cache_envelope.md). |
-| `native-compiler-store.yml` | Native Compiler Store Transfer | Manual; PRs and push to `main` on its own paths | Real compiler-store transfer proof through GHCR; see [native_compiler_store_transfer.md](native_compiler_store_transfer.md). |
 | `codeql.yml` | CodeQL | PRs and pushes to `main` (actions, c-cpp, python); daily 01:11 UTC and manual (all four languages, including Rust) | CodeQL advanced setup replacing default setup. The ~2h Rust analysis runs only on the daily schedule and manual dispatch, never on PRs. Optional. |
 | `codeql-extraction-diagnostic.yml` | CodeQL Rust Extraction Diagnostic | Manual | Extraction-only default vs FIPS feature comparison; see [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md). |
 | `compose-fixture-qualification.yml` | Compose Fixture Qualification | PRs on `docker-compose.yml`, `docker-compose.tls-test.yml`, `setup_db_tls.sh`, `check_compose_fixtures.sh`, and the workflow itself; manual | Disposable Compose fixture boundary checks. Optional. |
@@ -973,7 +965,7 @@ PRs and fails if the prepared build no longer applies. Any new
 optional lane whose prepare script hashes files under `src/` (for example a
 `context_files` entry) must add those files to its `push` paths and a row here.
 Lanes that hash only their own assets or runtime evidence (the internal-profile
-and trace lanes, `native-cache-envelope.yml`) need no extra trigger.
+and trace lanes) need no extra trigger.
 
 ### Rust cache lanes
 
@@ -3874,12 +3866,6 @@ Required for pushing Docker Hub images. The workflows unconditionally run the Do
   `GITHUB_TOKEN` do not trigger **Release**. See
   [Creating a New Release](#creating-a-new-release).
 
-#### Pending-review cleanup
-
-- `REVIEW_TOKEN` - PAT of a named environment reviewer, used for every API call
-  in `cleanup-pending-reviews.yml` (`GITHUB_TOKEN` cannot approve or reject
-  deployment reviews).
-
 For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare
 job-level `permissions: { contents: write }` for release creation,
 `permissions: { contents: read, packages: write }` for Docker/GHCR publishing,
@@ -4517,9 +4503,8 @@ cold cache and a slow runner:
 
 - `build-release-binaries`: **`timeout-minutes: 180` at the job level with
   `timeout-minutes: 165` on the build step** — 1.32× the 136.3-minute worst
-  observed job. This matches the 180/165 pair the non-publishing
-  `release-platform-study.yml` uses for the same three cold shipping-profile
-  compiles.
+  observed job. The retired non-publishing release platform study used the
+  same 180/165 pair for the same three cold shipping-profile compiles.
 - `build-release-arm64-cross`: originally **`timeout-minutes: 120`** — 2.6×
   its 45m39s observed compile step. The v0.9.19 recovery uses **240 minutes**,
   twice that allowance and over 5× the observed compile, to include swap
@@ -4575,8 +4560,9 @@ swap:
 
 The timings capture and finite budgets have landed. The remaining work is:
 (1) agree an explicit tolerated throughput/p99 regression budget *before* any
-profile comparison is scored; (2) re-run the non-publishing studies in `release-platform-study.yml` /
-`release-profile-study.yml` against that budget, including protected ARM64
+profile comparison is scored; (2) re-run non-publishing release-profile and
+platform studies (the dated lanes were retired in #7279) against that budget,
+including protected ARM64
 Cross phase measurements and oldest-baseline ABI/install/image results on
 every platform whose compiler or linker settings change. No CI verification
 profile is ever published as a release, and exact-SHA publication gates,

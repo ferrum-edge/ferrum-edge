@@ -317,7 +317,7 @@ Details for every bullet live in `docs/ci_cd.md`.
 - Branch protection must directly require the nine dedicated checks: `Tests`, `Merge Coverage`, `Gateway API Conformance`, `Mesh E2E Sidecar Live`, `Trusted Cross Build Policy`, `Multicluster Federation Live`, `Multicluster Poller Partition Live`, `Ambient Host UDP Live`, and `FIPS Build & Test`. `NodeWaypoint eBPF Live`, `Istio Status CAS Live`, and `CNI Lifecycle Live` are **not** branch-protection-required. Do not add polling mirror jobs back to `ci.yml`.
 - `ci.yml` never publishes. Only `main-latest-image.yml` publishes from `main` (`main-<sha>` and a never-backwards `latest`); it never touches version tags, `-ebpf*` variants, or GitHub Releases, and `verify_main_latest_image_workflow.py` pins that contract.
 - Releases require the complete `.github/required-publication-checks.json` set for the exact commit: `release-dispatch.yml` verifies the selected main SHA and creates the `v*` tag; the tag-triggered `release.yml` publishes versioned binaries, Docker tags, and the GitHub Release.
-- Required secrets are `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, `RELEASE_TAG_TOKEN` (release-dispatch tag creation) and `REVIEW_TOKEN` (cleanup-pending-reviews); see `docs/ci_cd.md` -> GitHub Actions Secrets.
+- Required secrets are `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` and `RELEASE_TAG_TOKEN` (release-dispatch tag creation); see `docs/ci_cd.md` -> GitHub Actions Secrets.
 - GitHub Actions workflow permissions must be Read+Write for release automation.
 
 ## Test Structure

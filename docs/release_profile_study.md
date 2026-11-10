@@ -89,9 +89,9 @@ after its echo copy drains. No EOF error is exempted from measurement validation
 The pipelined writer/reader above was later replaced by the current bounded
 echo worker, and the former admission-race contract tests were retired with
 it. The focused hosted contract is now `tcp_echo_tests` in the `proto_bench`
-binary (selected by the `tcp-admission` job in
-`.github/workflows/release-profile-study.yml`, which fails if that selection
-ever comes up empty): complete, failing, and stalled stream shutdowns after
+binary (run by `.github/workflows/benchmark-harness-tests.yml` since this
+study's own lane was retired in #7279; the step fails if that selection ever
+comes up empty): complete, failing, and stalled stream shutdowns after
 measured echoes remain diagnostic (`transport_close_timed_out`) without being
 counted as measurement errors, under both the TCP and TCP+TLS labels.
 Backend logs are retained per round. A new full paired study is required

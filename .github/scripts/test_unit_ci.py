@@ -424,7 +424,7 @@ echo stopped > stopped.marker
             self.assertTrue((Path(root) / "stopped.marker").exists())
 
     def test_every_sampler_caller_uses_the_guarded_stop(self):
-        for workflow in (".github/workflows/ci.yml", ".github/workflows/scale-benchmark.yml"):
+        for workflow in (".github/workflows/ci.yml",):
             lines = Path(workflow).read_text().splitlines()
             stops = [line.strip() for line in lines if "unit_sampler_pid" in line]
             self.assertNotIn('kill "$unit_sampler_pid"', stops, workflow)

@@ -56,8 +56,7 @@ jobs:
     env:
       # `.cargo/config.toml` points every cargo invocation at mold, and a
       # runner- or user-level rustc-wrapper may select sccache. Neither is
-      # installed here, so clear both, exactly as the sibling harness
-      # job in `release-profile-study.yml` does. This lane does not pay for them
+      # installed here, so clear both. This lane does not pay for them
       # on purpose: the package's whole `test` profile compiles cold in about a
       # minute, which is less than installing the tools and carrying a separate
       # Actions cache entry would cost.
@@ -87,6 +86,16 @@ jobs:
         run: |
           cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml \
             --locked --test metrics_tests
+
+      # The TCP echo shutdown contract moved here when the release-profile
+      # study lane that hosted it was retired (#7279). Fail loudly if the
+      # selector goes stale and matches nothing.
+      - name: Verify TCP echo shutdown diagnostics without timing sleeps
+        run: |
+          set -euo pipefail
+          listing=$(cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_echo_tests -- --list)
+          grep -F "tcp_and_tls_shutdown_timeouts_remain_diagnostic_after_measured_echoes: test" <<<"$listing"
+          cargo test --manifest-path tests/performance/multi_protocol/Cargo.toml --locked --bin proto_bench tcp_echo_tests -- --nocapture
 
       # `payload_bench` against controlled HTTP/2 peers: stalled setups,
       # headers and bodies end as invalid runs instead of hanging, and setup
