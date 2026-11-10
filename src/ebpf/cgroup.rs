@@ -706,12 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn systemd_path_sanitizes_dashes_to_underscores() {
-        let sanitized = "abc-def-123".replace('-', "_");
-        assert_eq!(sanitized, "abc_def_123");
-    }
-
-    #[test]
     fn resolve_pod_cgroup_path_finds_systemd_burstable_pod() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir
