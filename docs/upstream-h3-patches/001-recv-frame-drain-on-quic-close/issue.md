@@ -33,7 +33,7 @@ The QUIC layer (quinn-proto / quinn) DOES preserve buffered stream data after CO
 
 ## Existing partial fix
 
-[Hyperium PR #NNN](https://github.com/hyperium/h3/pull/NNN) (commit `dbc9e09` in our downstream tree) recovered the recv_data case for response bodies via a `drain_h3_response_body` helper that re-buffers bytes at the application level and detects "graceful close after complete body." That change works around the symptom one layer up but doesn't fix the underlying frame-layer discard. The recv_response path (no headers parsed yet) cannot be similarly worked around because the application has no buffered bytes at that point — only h3 does.
+A downstream workaround in Ferrum Edge ([ferrum-edge/ferrum-edge#505](https://github.com/ferrum-edge/ferrum-edge/pull/505), commit `dbc9e09`) recovered the recv_data case for response bodies via a `drain_h3_response_body` helper that re-buffers bytes at the application level and detects "graceful close after complete body." That change works around the symptom one layer up but doesn't fix the underlying frame-layer discard. The recv_response path (no headers parsed yet) cannot be similarly worked around because the application has no buffered bytes at that point — only h3 does.
 
 ## Proposed fix
 

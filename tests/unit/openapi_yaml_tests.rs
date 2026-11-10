@@ -2362,6 +2362,43 @@ fn admin_tls_store_backed_operations_document_internal_server_error() {
     }
 }
 
+/// Every TLS/ACME DELETE handler in `src/admin/tls_management.rs` answers
+/// `200` with `{"deleted": true, "record": <summary>}`; the spec must document
+/// that body with the same record schema the matching GET returns.
+#[test]
+fn admin_tls_delete_operations_document_deleted_record_body() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    const DELETES: &[(&str, &str)] = &[
+        ("deleteAcmeCertificate", "AcmeCertificateRecord"),
+        ("deleteAcmeOrder", "AcmeOrder"),
+        ("deleteManagedTlsCertificate", "ManagedTlsRecord"),
+        ("deleteManagedTlsCaBundle", "ManagedTlsRecord"),
+        ("deleteManagedTlsCrl", "ManagedTlsRecord"),
+        ("deleteManagedTlsOcspResponse", "ManagedTlsRecord"),
+        ("deleteManagedTlsJwks", "ManagedTlsRecord"),
+    ];
+    for (operation_id, record_schema) in DELETES {
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        let schema = &operation["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            schema["required"],
+            json!(["deleted", "record"]),
+            "{method} {path} ({operation_id}) must require deleted and record"
+        );
+        assert_eq!(
+            schema["properties"]["deleted"]["type"], "boolean",
+            "{method} {path} ({operation_id}) must document a boolean deleted flag"
+        );
+        assert_eq!(
+            schema["properties"]["record"]["$ref"],
+            format!("#/components/schemas/{record_schema}"),
+            "{method} {path} ({operation_id}) must document the deleted record"
+        );
+    }
+}
+
 fn collect_openapi_inventory(
     value: &serde_json::Value,
     refs: &mut BTreeSet<String>,
@@ -4318,6 +4355,23 @@ fn request_deduplication_schema_matches_runtime_validation() {
     let schema = spec
         .pointer("/components/schemas/RequestDeduplicationConfig")
         .expect("RequestDeduplicationConfig component exists");
+
+    // The omitted prefix is `{FERRUM_NAMESPACE}:dedup`, which no static
+    // default can express: a schema-driven client that materialized
+    // `ferrum:dedup` would pin other namespaces to the `ferrum` prefix.
+    let prefix = &schema["properties"]["redis_key_prefix"];
+    assert!(
+        prefix.get("default").is_none(),
+        "redis_key_prefix must not advertise a static OpenAPI default; got {:?}",
+        prefix.get("default")
+    );
+    assert!(
+        prefix["description"]
+            .as_str()
+            .expect("redis_key_prefix description")
+            .contains("{FERRUM_NAMESPACE}:dedup"),
+        "OpenAPI must document the namespace-derived runtime default"
+    );
 
     // Issue #2604: the published schema must reject the same malformed
     // configurations the runtime constructor rejects.
