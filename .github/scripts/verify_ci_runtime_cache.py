@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -224,7 +225,6 @@ FIPS_ALLOWED_ACTION_COUNTS = {
     DOWNLOAD_ARTIFACT: 5,
     UPLOAD_ARTIFACT: 2,
 }
-FIPS_ALLOWED_ACTION_USES = frozenset(FIPS_ALLOWED_ACTION_COUNTS)
 FIPS_CHECKOUT_COUNT = FIPS_ALLOWED_ACTION_COUNTS[CHECKOUT]
 # Closed checkout `with:` contract: current repo, default ref, default root.
 CHECKOUT_ALLOWED_WITH_KEYS = frozenset({"persist-credentials", "fetch-depth"})
@@ -5361,6 +5361,31 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     )
 
 
+def tracked_repository_files(failures: list[str]) -> list[Path]:
+    """Tracked files only: never `target/`, caches, or untracked scratch.
+
+    A recursive walk of the checkout read build output and untracked files,
+    which made the scan slow and let local leftovers fail or pass it
+    (issue #7283). A `git ls-files` failure fails closed.
+    """
+
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        failures.append(f"cannot enumerate tracked repository files: {error}")
+        return []
+    return [
+        REPO_ROOT / name
+        for name in listing.decode("utf-8", "surrogateescape").split("\0")
+        if name
+    ]
+
+
 def check_dockerfile(failures: list[str]) -> None:
     dockerfile = read_pinned(DOCKERFILE)
     require(
@@ -5396,7 +5421,7 @@ def check_dockerfile(failures: list[str]) -> None:
     ):
         check_dockerfile_image_pins(label, text, failures)
     repository_files: list[tuple[str, str]] = []
-    for path in REPO_ROOT.rglob("*"):
+    for path in tracked_repository_files(failures):
         if (
             not path.is_file()
             or path.is_symlink()
@@ -5434,6 +5459,17 @@ def check_dockerfile(failures: list[str]) -> None:
 
 def self_test() -> int:
     failures: list[str] = []
+    tracked_failures: list[str] = []
+    tracked = tracked_repository_files(tracked_failures)
+    tracked_roots = {path.relative_to(REPO_ROOT).parts[0] for path in tracked}
+    require(
+        not tracked_failures
+        and REPO_ROOT / "Dockerfile" in tracked
+        and "target" not in tracked_roots
+        and ".git" not in tracked_roots,
+        "self-test: the Dockerfile scan must enumerate tracked files only",
+        failures,
+    )
     source_digest = "a" * 64
     other_digest = "b" * 64
     source_dockerfile = (
@@ -9283,13 +9319,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     failures: list[str] = []
-    if self_test() != 0:
-        failures.append("verify_ci_runtime_cache internal self-test failed")
-    if plan_self_test() != 0:
-        failures.append("ci_runtime_plan.py self-test failed")
-    if telemetry_self_test() != 0:
-        failures.append("ci_runtime_telemetry.py self-test failed")
     if args.self_test:
+        # The self-tests run only when asked for. verify_required_ci.py calls
+        # `--self-test` and then the plain contract check, so each runs once
+        # (issue #7283).
+        if self_test() != 0:
+            failures.append("verify_ci_runtime_cache internal self-test failed")
+        if plan_self_test() != 0:
+            failures.append("ci_runtime_plan.py self-test failed")
+        if telemetry_self_test() != 0:
+            failures.append("ci_runtime_telemetry.py self-test failed")
         for failure in failures:
             print(f"::error::{failure}", file=sys.stderr)
         return 1 if failures else 0
