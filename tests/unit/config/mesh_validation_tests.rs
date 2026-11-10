@@ -1109,6 +1109,28 @@ fn service_entry_requires_hosts() {
 }
 
 #[test]
+fn service_entry_rejects_empty_namespace() {
+    let se = ServiceEntry {
+        name: "se".into(),
+        namespace: " ".into(),
+        hosts: vec!["api.example.com".into()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: Vec::new(),
+        export_to: Vec::new(),
+        workload_selector: None,
+    };
+    let errors = validate_mesh_config(&[], &[], &[], &[], &[se], &[], None);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("ServiceEntry \"se\".namespace") && e.contains("must not be empty")),
+        "expected an empty-namespace error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn service_entry_endpoints_only_with_static_resolution() {
     let se = ServiceEntry {
         name: "se".into(),
@@ -2076,7 +2098,7 @@ fn ingress_resolve_rejects_unknown_protocol() {
     // `unknown → HTTP` convention (a separate predicate).
     assert_eq!(
         ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080").resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol),
+        Err(IngressListenerUnsupported::UnmodeledProtocol),
         "an Unknown-protocol ingress listener must defer, never route as HTTP"
     );
 }
@@ -2101,7 +2123,7 @@ fn ingress_omitted_protocol_deserializes_to_unknown_then_defers() {
     );
     assert_eq!(
         entry.resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol),
+        Err(IngressListenerUnsupported::UnmodeledProtocol),
         "an omitted (Unknown) protocol defers fail-closed, it does not route"
     );
 
@@ -2115,7 +2137,7 @@ fn ingress_omitted_protocol_deserializes_to_unknown_then_defers() {
     assert_eq!(explicit.protocol, AppProtocol::Unknown);
     assert_eq!(
         explicit.resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol)
+        Err(IngressListenerUnsupported::UnmodeledProtocol)
     );
 }
 
@@ -2376,7 +2398,7 @@ fn ingress_carrier_revalidates_unix_socket_shape() {
 #[test]
 fn ingress_resolve_accepts_stream_protocols() {
     // Issue #3260: recognized stream-family protocols resolve to a routable
-    // listener (raw-TCP inbound relay), not NonHttpProtocol.
+    // listener (raw-TCP inbound relay), not UnmodeledProtocol.
     for protocol in [
         AppProtocol::Tcp,
         AppProtocol::Tls,
@@ -2401,11 +2423,11 @@ fn ingress_resolve_accepts_stream_protocols() {
 fn ingress_resolve_rejects_unrecognized_or_udp_protocol() {
     assert_eq!(
         ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080").resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol)
+        Err(IngressListenerUnsupported::UnmodeledProtocol)
     );
     assert_eq!(
         ingress_entry(8443, AppProtocol::Udp, "127.0.0.1:8080").resolve(),
-        Err(IngressListenerUnsupported::NonHttpProtocol)
+        Err(IngressListenerUnsupported::UnmodeledProtocol)
     );
 }
 

@@ -50,8 +50,7 @@ pub struct MeshSliceRequest {
     pub sidecar_egress_dry_run: bool,
     /// When `true`, and only when Sidecar egress narrowing is also enabled and
     /// applicable, the slice builder filters `workloads` to identities
-    /// referenced by admitted services. Defaults to `false` for a one-release
-    /// dry-run window.
+    /// referenced by admitted services. Defaults to `false`.
     pub enforce_sidecar_identity_narrowing: bool,
     /// Keep the namespace-visible AuthorizationPolicy candidate superset needed
     /// for destination-side Ambient UDP per-pod source scoping. The consumer

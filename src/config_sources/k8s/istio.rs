@@ -22063,7 +22063,7 @@ extensionProviders:
     fn sidecar_ingress_unrecognized_protocol_is_deferred() {
         // A TYPO like `HTPS` must NOT be routed as HTTP or guessed as TCP. The
         // ingress-specific classifier maps it to `Unknown` so resolution defers
-        // it (`NonHttpProtocol`) instead of exposing a mistyped listener.
+        // it (`UnmodeledProtocol`) instead of exposing a mistyped listener.
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
@@ -22085,7 +22085,7 @@ extensionProviders:
         assert!(
             matches!(
                 entry.resolve(),
-                Err(crate::modes::mesh::config::IngressListenerUnsupported::NonHttpProtocol)
+                Err(crate::modes::mesh::config::IngressListenerUnsupported::UnmodeledProtocol)
             ),
             "a mistyped protocol must defer, not route"
         );

@@ -3815,9 +3815,8 @@ pub enum IngressListenerUnsupported {
     /// `port` or the parsed endpoint port was `0`.
     ZeroPort,
     /// The listener protocol is not a modeled HTTP-family or stream-family
-    /// token (`Unknown` typo / native omitted, or `Udp`). Historical name
-    /// retained for status/test stability; stream protocols are modeled.
-    NonHttpProtocol,
+    /// token (`Unknown` typo / native omitted, `Udp`, or `Dtls`).
+    UnmodeledProtocol,
     /// The listener protocol is HTTP-family but Ferrum cannot speak it over a
     /// Unix stream, so a `unix://` `defaultEndpoint` for it is refused with a
     /// field-specific reason rather than materialized into a listener that
@@ -3915,7 +3914,7 @@ impl MeshSidecarIngress {
     /// later by the data plane.
     pub fn resolve(&self) -> Result<ResolvedIngressListener, IngressListenerUnsupported> {
         if !is_modeled_ingress_app_protocol(self.protocol) {
-            return Err(IngressListenerUnsupported::NonHttpProtocol);
+            return Err(IngressListenerUnsupported::UnmodeledProtocol);
         }
         if self.port == 0 {
             return Err(IngressListenerUnsupported::ZeroPort);
@@ -7655,6 +7654,14 @@ fn validate_mesh_config_internal(
     // ServiceEntries
     for se in service_entries {
         validate_non_empty_string("ServiceEntry.name".to_string(), &se.name, &mut errors);
+        // An empty namespace makes the entry visible to no workload
+        // (accepted-but-inert), so reject it like every other namespaced
+        // resource.
+        validate_non_empty_string(
+            format!("ServiceEntry {:?}.namespace", se.name),
+            &se.namespace,
+            &mut errors,
+        );
         if se.hosts.is_empty() {
             errors.push(format!(
                 "ServiceEntry {:?}: hosts must not be empty",
@@ -7780,7 +7787,7 @@ fn validate_mesh_config_internal(
         // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
         // `subsets[].trafficPolicy`.
         validate_dr_connection_pool(
-            &format!("MeshDestinationRule {:?}.trafficPolicy", dr.name),
+            &format!("MeshDestinationRule {:?}.traffic_policy", dr.name),
             dr.traffic_policy.as_ref(),
             &mut errors,
         );
@@ -7803,7 +7810,7 @@ fn validate_mesh_config_internal(
             );
             validate_dr_connection_pool(
                 &format!(
-                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"].trafficPolicy",
+                    "MeshDestinationRule {:?}.port_level_settings[\"{}\"]",
                     dr.name, port
                 ),
                 Some(policy),
@@ -7828,7 +7835,7 @@ fn validate_mesh_config_internal(
             }
             validate_dr_connection_pool(
                 &format!(
-                    "MeshDestinationRule {:?}.subsets[{}].trafficPolicy",
+                    "MeshDestinationRule {:?}.subsets[{}].traffic_policy",
                     dr.name, i
                 ),
                 subset.traffic_policy.as_ref(),
@@ -8855,14 +8862,14 @@ fn validate_dr_connection_pool(
     };
     if policy.max_connections == Some(0) {
         errors.push(format!(
-            "{context}.connectionPool.tcp.maxConnections must be positive (0 would refuse every backend connection)"
+            "{context}.max_connections must be positive (Istio `connectionPool.tcp.maxConnections`; 0 would refuse every backend connection)"
         ));
     }
     if let Some(idle) = policy.tcp_idle_timeout_seconds
         && idle > crate::config::types::MAX_TCP_IDLE_TIMEOUT
     {
         errors.push(format!(
-            "{context}.connectionPool.tcp.idleTimeout must be between 0 and {} seconds (got \"{idle}\")",
+            "{context}.tcp_idle_timeout_seconds must be between 0 and {} seconds (Istio `connectionPool.tcp.idleTimeout`; got \"{idle}\")",
             crate::config::types::MAX_TCP_IDLE_TIMEOUT
         ));
     }
@@ -8871,17 +8878,17 @@ fn validate_dr_connection_pool(
     };
     if http.http1_max_pending_requests == Some(0) {
         errors.push(format!(
-            "{context}.connectionPool.http.http1MaxPendingRequests must be positive (0 would shed every HTTP/1.1 request)"
+            "{context}.connection_pool_http.http1_max_pending_requests must be positive (Istio `connectionPool.http.http1MaxPendingRequests`; 0 would shed every HTTP/1.1 request)"
         ));
     }
     if http.http2_max_requests == Some(0) {
         errors.push(format!(
-            "{context}.connectionPool.http.http2MaxRequests must be positive (0 would shed every request to the destination)"
+            "{context}.connection_pool_http.http2_max_requests must be positive (Istio `connectionPool.http.http2MaxRequests`; 0 would shed every request to the destination)"
         ));
     }
     if http.max_concurrent_streams == Some(0) {
         errors.push(format!(
-            "{context}.connectionPool.http.maxConcurrentStreams must be positive (0 would stall every HTTP/2 stream to the destination)"
+            "{context}.connection_pool_http.max_concurrent_streams must be positive (Istio `connectionPool.http.maxConcurrentStreams`; 0 would stall every HTTP/2 stream to the destination)"
         ));
     }
 }

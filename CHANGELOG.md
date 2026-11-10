@@ -620,6 +620,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   label-less subscribers logged a warning per neighbour policy, and every
   subscriber's slice changed whenever any workload's policy did. Those slices
   now keep only the policies that apply to their own workload.
+- **Native mesh config: empty ServiceEntry namespace rejected, native field
+  paths in DestinationRule pool errors** (#7243). A `ServiceEntry` with an
+  empty `namespace` was accepted although no workload could see it; it is now
+  rejected like every other namespaced mesh resource. Native/file
+  DestinationRule connection-pool errors now name the native field
+  (`traffic_policy.connection_pool_http.http1_max_pending_requests`,
+  `max_connections`, `tcp_idle_timeout_seconds`, …) with the Istio name in
+  parentheses, instead of Istio paths that do not exist in the native schema.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
