@@ -465,8 +465,8 @@ proxies:
 ```
 
 Route header transforms with the eligible consumers they require. Without the two
-transformer instances the rule still forwards to the backend, but neither header
-change is applied:
+transformer instances this configuration is refused at admission (see
+[Route transforms need a consumer](#route-transforms-need-a-consumer)):
 
 ```yaml
 version: "1"
