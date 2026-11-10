@@ -5367,17 +5367,6 @@ impl GatewayConfig {
             .collect()
     }
 
-    /// Validate only the cross-Consumer `jwt` secret constraint.
-    pub fn validate_unique_jwt_credentials(&self) -> Result<(), Vec<String>> {
-        let duplicates = self.jwt_credential_uniqueness_errors();
-
-        if duplicates.is_empty() {
-            Ok(())
-        } else {
-            Err(duplicates)
-        }
-    }
-
     /// Validate the cross-Consumer `jwt` secret constraint for collisions that
     /// involve one of `consumer_ids`. Admin candidate checks use this narrower
     /// surface so a pre-existing duplicate between two other Consumers (which
@@ -5401,16 +5390,6 @@ impl GatewayConfig {
         } else {
             Err(duplicates)
         }
-    }
-
-    /// Fail-closed handling of Consumer `jwt` credential policy at full-load
-    /// time, for a snapshot judged on its own (no earlier generation).
-    ///
-    /// See [`Self::quarantine_invalid_jwt_credentials_against`]; this is
-    /// that function with an empty history, returning only the messages.
-    pub fn quarantine_invalid_jwt_credentials(&mut self) -> Vec<String> {
-        self.quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default())
-            .messages
     }
 
     /// Fail-closed handling of Consumer `jwt` credential policy at full-load

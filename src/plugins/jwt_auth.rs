@@ -12,7 +12,7 @@
 //! Because the signer chooses the identity claim, a secret shared by two
 //! Consumers would let either sign as the other: config admission refuses
 //! such duplicates and every load/swap quarantines them on all holders
-//! (`GatewayConfig::quarantine_invalid_jwt_credentials`). The verifier itself
+//! (`GatewayConfig::quarantine_invalid_jwt_credentials_against`). The verifier itself
 //! never checks a signature against a stored secret below the
 //! non-whitespace length floor.
 //!

@@ -1944,7 +1944,11 @@ fn test_unique_consumer_credentials_rejects_jwt_secret_shared_across_consumers()
         !errors[0].contains(secret),
         "the secret must never be echoed"
     );
-    assert!(config.validate_unique_jwt_credentials().is_err());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "eve"])
+            .is_err()
+    );
 }
 
 #[test]
@@ -1960,7 +1964,11 @@ fn test_unique_jwt_credentials_rejects_collision_introduced_by_a_rotation_entry(
         ),
     ];
 
-    assert!(config.validate_unique_jwt_credentials().is_err());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "eve"])
+            .is_err()
+    );
     assert!(config.validate_unique_consumer_credentials().is_err());
 }
 
@@ -1974,9 +1982,18 @@ fn test_unique_jwt_credentials_allow_same_consumer_rotation_and_other_namespaces
     let mut config = empty_config();
     config.consumers = vec![tenant_a, tenant_b];
 
-    assert!(config.validate_unique_jwt_credentials().is_ok());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "bob"])
+            .is_ok()
+    );
     assert!(config.validate_unique_consumer_credentials().is_ok());
-    assert!(config.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages
+            .is_empty()
+    );
     assert!(
         config
             .consumers
@@ -2030,7 +2047,9 @@ fn test_quarantine_jwt_strips_shared_secret_from_every_holder() {
         jwt_consumer("mallory", "mallory", &[secret]),
     ];
 
-    let messages = config.quarantine_invalid_jwt_credentials();
+    let messages = config
+        .quarantine_invalid_jwt_credentials_against(&Default::default())
+        .messages;
     assert_eq!(messages.len(), 3, "{messages:?}");
     assert!(messages.iter().all(|message| !message.contains(secret)));
     let holders: Vec<(&str, bool)> = config
@@ -2049,7 +2068,11 @@ fn test_quarantine_jwt_strips_shared_secret_from_every_holder() {
             ("mallory", false)
         ]
     );
-    assert!(config.validate_unique_jwt_credentials().is_ok());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "bob", "eve", "mallory"])
+            .is_ok()
+    );
 }
 
 #[test]
@@ -2075,7 +2098,9 @@ fn test_quarantine_jwt_strips_weak_or_malformed_credentials() {
         let mut config = empty_config();
         config.consumers = vec![consumer];
 
-        let messages = config.quarantine_invalid_jwt_credentials();
+        let messages = config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages;
         assert_eq!(messages.len(), 1, "shape not quarantined: {shape}");
         assert!(!messages[0].contains("test-jwt-secret"));
         assert!(!config.consumers[0].credentials.contains_key("jwt"));
@@ -2107,7 +2132,9 @@ fn test_quarantine_jwt_counts_holders_whose_own_credential_is_malformed() {
             jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
         ];
 
-        let messages = config.quarantine_invalid_jwt_credentials();
+        let messages = config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages;
         assert_eq!(messages.len(), 2, "eve shape {eve_shape}: {messages:?}");
         assert!(messages.iter().all(|message| !message.contains(shared)));
         assert!(
@@ -2146,7 +2173,11 @@ fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
     // Generation 2: a point delta re-delivers Alice with the same secret on
     // top of the stripped snapshot (Eve's stripped credential is gone).
     config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
-    assert!(config.validate_unique_jwt_credentials().is_ok());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "eve"])
+            .is_ok()
+    );
     let messages = config
         .quarantine_invalid_jwt_credentials_against(&history)
         .messages;
@@ -2158,7 +2189,12 @@ fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
     // Without history (a fresh authoritative load) the same snapshot passes.
     config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
     let mut fresh = config.clone();
-    assert!(fresh.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        fresh
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages
+            .is_empty()
+    );
 
     // A new distinct secret restores Alice, and the history is namespace
     // bound: another namespace may still use the once-shared value.
@@ -2433,7 +2469,12 @@ fn test_quarantine_jwt_keeps_strong_secrets_and_legacy_selector_fields() {
         jwt_consumer("strong", "strong", &[strong_secret.as_str()]),
     ];
 
-    assert!(config.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages
+            .is_empty()
+    );
     assert!(
         config
             .consumers
