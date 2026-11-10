@@ -175,7 +175,7 @@ Immutable publication and recovery records for individual releases.
 | [releases/v0.9.16-arm64-recovery.md](releases/v0.9.16-arm64-recovery.md) | ARM64 recovery after the v0.9.16 production failure |
 | [releases/v0.9.18-candidate.md](releases/v0.9.18-candidate.md) | v0.9.18 candidate provenance |
 | [releases/v0.9.18-arm64-recovery.md](releases/v0.9.18-arm64-recovery.md) | ARM64 OOM recovery after the unpublished v0.9.18 tag |
-| [releases/v0.9.19-candidate.md](releases/v0.9.19-candidate.md) | v0.9.19 publication record |
+| [releases/v0.9.19-publication.md](releases/v0.9.19-publication.md) | v0.9.19 publication record |
 | [releases/v0.9.20-publication.md](releases/v0.9.20-publication.md) | v0.9.20 publication record |
 
 ## Reference data

@@ -952,7 +952,7 @@ That immutable tag was created, but production ARM64 failed and attempts 2 and 3
 proved host OOM during fat LTO; no GitHub Release was published for it. 0.9.19
 was published on 2026-10-27 from commit
 `510ce7121c3d9754110d330a30a3bd9b7a7b278e`; see the
-[publication record](docs/releases/v0.9.19-candidate.md).
+[publication record](docs/releases/v0.9.19-publication.md).
 
 This release is the production-launch hardening pass across the plugin
 catalog. Every built-in plugin was independently reviewed. The resulting fixes
