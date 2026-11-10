@@ -2321,7 +2321,7 @@ fn mesh_request_key_from_shadow(
     let source_workload = label_or(MeshLabel::SourceWorkload, unknown);
     let destination_workload = match shadow.get_arc(MeshLabel::DestinationWorkload) {
         Some(workload) => Arc::clone(workload),
-        None => Arc::from(
+        None => shared_label(
             summary
                 .proxy_name
                 .as_deref()
