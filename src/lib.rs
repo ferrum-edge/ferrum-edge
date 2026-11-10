@@ -10889,6 +10889,16 @@ pub mod _test_support {
         (transformed, result)
     }
 
+    /// The listen port a WebSocket session's disconnect metadata reports
+    /// (issue #7164).
+    pub fn websocket_session_listen_port_for_test(
+        ctx: &crate::plugins::RequestContext,
+        is_tls: bool,
+        env_config: &crate::config::EnvConfig,
+    ) -> u16 {
+        crate::proxy::websocket_session_listen_port(ctx, is_tls, env_config)
+    }
+
     /// Stage a typed AI usage snapshot on `ctx`, as a built-in AI plugin
     /// does, so hook hand-back tests can observe which context's value wins.
     pub fn stage_ai_usage_export_for_test(

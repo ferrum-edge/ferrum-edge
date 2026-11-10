@@ -6147,3 +6147,42 @@ fn route_rebase_invalidates_offsets_but_preserves_base_path_semantics() {
         }
     }
 }
+
+/// Issue #7164: WebSocket disconnect metadata reports the listener the client
+/// connected to (a Gateway API / mesh listener included), not the
+/// process-global proxy port. H1/H2 and H3 share this helper.
+#[test]
+fn websocket_session_listen_port_reports_the_accepting_listener() {
+    use ferrum_edge::_test_support::websocket_session_listen_port_for_test;
+
+    let env = ferrum_edge::config::EnvConfig {
+        proxy_http_port: 8000,
+        proxy_https_port: 8443,
+        ..ferrum_edge::config::EnvConfig::default()
+    };
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/ws".to_string(),
+    );
+
+    ctx.frontend_listen_port = Some(18080);
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, false, &env),
+        18080
+    );
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, true, &env),
+        18080
+    );
+
+    ctx.frontend_listen_port = None;
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, false, &env),
+        8000
+    );
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, true, &env),
+        8443
+    );
+}

@@ -296,13 +296,6 @@ impl<T> Drop for AbortOnDropJoinHandle<T> {
     }
 }
 
-/// Listen-port label for the `WsSessionMeta` that backs on_ws_disconnect.
-/// H3 always lands on the HTTPS port (port 0 disables H3 entirely; the
-/// listener wouldn't be running).
-fn h3_listen_port(state: &ProxyState) -> u16 {
-    state.env_config.proxy_https_port
-}
-
 /// Convert any `h3::quic::RecvStream` `impl Buf` chunk into an owned
 /// `Bytes` value. The h3 API returns `Result<Option<impl Buf>, ...>` —
 /// `impl Buf` is opaque, so we materialise it before crossing the
@@ -1887,7 +1880,7 @@ pub(crate) async fn handle_h3_websocket(
         http_method: "CONNECT".to_string(),
         request_path: original_request_path.clone(),
         handshake_status_code: 200,
-        listen_port: h3_listen_port(&state),
+        listen_port: crate::proxy::websocket_session_listen_port(&ctx, true, &state.env_config),
         connection_id: ws_conn_id,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,

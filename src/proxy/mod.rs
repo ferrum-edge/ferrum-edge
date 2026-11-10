@@ -16576,6 +16576,28 @@ fn build_websocket_error_fallback_response(status: StatusCode) -> Response<Proxy
     response
 }
 
+/// Listen-port label for a WebSocket session's disconnect metadata
+/// (`WsSessionMeta.listen_port`, emitted by `ws_logging` and other
+/// `on_ws_disconnect` consumers): the port the client actually connected to.
+///
+/// `ctx.frontend_listen_port` already carries the accepting listener's port on
+/// every frontend, including a dynamically bound Gateway API or mesh listener,
+/// so per-port dashboards attribute the session to the right listener
+/// (issue #7164). The process-global proxy port for the frontend's scheme is
+/// only the fallback when no listener port was recorded. H1/H2 and H3
+/// (`is_tls = true`) share this one helper.
+pub(crate) fn websocket_session_listen_port(
+    ctx: &RequestContext,
+    is_tls: bool,
+    env_config: &EnvConfig,
+) -> u16 {
+    ctx.frontend_listen_port.unwrap_or(if is_tls {
+        env_config.proxy_https_port
+    } else {
+        env_config.proxy_http_port
+    })
+}
+
 /// Handle WebSocket requests AFTER authentication and authorization plugins have run.
 ///
 /// Supports both HTTP/1.1 Upgrade (101 Switching Protocols) and HTTP/2 Extended CONNECT
@@ -18076,16 +18098,7 @@ async fn handle_websocket_request_authenticated(
     // on_ws_disconnect. Building this here (vs. inside run_websocket_proxy) is
     // effectively free when ws_disconnect_plugins is empty because the strings
     // are moved, not cloned, into an owned struct.
-    // WebSocket upgrades arrive on either the plaintext HTTP proxy listener or
-    // the TLS HTTPS/H2 listener. Choose the matching port so disconnect
-    // metadata, logging plugins, and downstream alerts key on the port the
-    // client actually connected to instead of always reporting the plaintext
-    // port (which is misleading — or `0` — on TLS-only deployments).
-    let listen_port = if is_tls {
-        state.env_config.proxy_https_port
-    } else {
-        state.env_config.proxy_http_port
-    };
+    let listen_port = websocket_session_listen_port(ctx, is_tls, &state.env_config);
     let session_meta = WsSessionMeta {
         namespace: proxy.namespace.clone(),
         proxy_name: proxy.name.clone(),
