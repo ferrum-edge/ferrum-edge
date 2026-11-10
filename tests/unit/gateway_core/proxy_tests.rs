@@ -942,11 +942,11 @@ fn test_no_match() {
 
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
-    apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    direct_h2_uses_limit_adapter, extract_grpc_reject_message,
-    finalize_plugin_rejection_parts_for_test, finalized_upload_deadline_response_for_test,
-    insert_grpc_error_metadata, map_http_reject_status_to_grpc_status, normalize_reject_response,
-    request_may_have_body, set_grpc_deadline_budget_for_test,
+    apply_request_body_plugins, can_use_direct_http2_pool, direct_h2_uses_limit_adapter,
+    extract_grpc_reject_message, finalize_plugin_rejection_parts_for_test,
+    finalized_upload_deadline_response_for_test, insert_grpc_error_metadata,
+    map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
+    set_grpc_deadline_budget_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -4026,24 +4026,6 @@ fn test_direct_http2_pool_requires_http2_without_retries_or_request_buffering() 
     assert!(!can_use_direct_http2_pool(true, false, true));
 }
 
-#[test]
-fn test_direct_http2_pool_dispatch_allows_nonzero_body_limits() {
-    // Issue #3622: nonzero body limits are enforced in-path on direct-H2
-    // (413 / 502), so they must not disqualify ordinary dispatch.
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 1, 0));
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 1));
-    assert!(can_dispatch_direct_http2_pool(
-        true, false, false, 10_485_760, 10_485_760
-    ));
-    // Retry body replay / request-body buffering still force reqwest.
-    assert!(!can_dispatch_direct_http2_pool(true, true, false, 0, 0));
-    assert!(!can_dispatch_direct_http2_pool(
-        true, false, true, 10_485_760, 10_485_760
-    ));
-    assert!(!can_dispatch_direct_http2_pool(false, false, false, 0, 0));
-}
-
 /// Issue #3942: operator `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` is unlimited
 /// and must skip `SizeLimitedIncoming` on ordinary unauthenticated direct-H2.
 /// A real cap, an upload-completion gate, or gRPC message counting still
@@ -4542,24 +4524,6 @@ async fn masked_h2_client_reset_collects_without_end_stream() {
     let (collected, ended) = buffered_h2_upload_outcome(false).await;
     assert!(collected, "a complete upload collects");
     assert!(ended, "a complete upload ends with END_STREAM");
-}
-
-#[test]
-fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
-    // Ordinary and SNI routes share the same body-compat gate; body-size
-    // limits no longer fork the predicate.
-    assert_eq!(
-        can_use_direct_http2_pool(true, false, false),
-        can_dispatch_direct_http2_pool(true, false, false, 10_485_760, 10_485_760)
-    );
-    assert_eq!(
-        can_use_direct_http2_pool(true, true, false),
-        can_dispatch_direct_http2_pool(true, true, false, 0, 0)
-    );
-    assert_eq!(
-        can_use_direct_http2_pool(true, false, true),
-        can_dispatch_direct_http2_pool(true, false, true, 0, 0)
-    );
 }
 
 #[test]

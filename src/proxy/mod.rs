@@ -3515,7 +3515,14 @@ fn parse_reqwest_method(method: &str) -> Result<reqwest::Method, ()> {
 ///
 /// Request-body plugins require buffering and transformation before forwarding,
 /// which the direct H2 path does not implement. Those requests must stay on the
-/// reqwest path so the final backend body matches the plugin output.
+/// reqwest path so the final backend body matches the plugin output; retry body
+/// replay forces reqwest the same way.
+///
+/// `get_sender()` may dial or probe the backend, so callers must use this
+/// predicate before opening an H2 sender. Body-size limits do not gate it: they
+/// are enforced in-path on the direct-H2 sender / response collectors (413 /
+/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`), including frame by
+/// frame when `Content-Length` is absent.
 pub(crate) fn can_use_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
@@ -3524,38 +3531,12 @@ pub(crate) fn can_use_direct_http2_pool(
     enable_http2 && !retain_request_body && !requires_request_body_buffering
 }
 
-/// Whether HTTPS requests may dispatch over the direct hyper HTTP/2 backend pool.
-///
-/// `get_sender()` may dial or probe the backend, so callers must use this
-/// predicate before opening an H2 sender. Body-size limits are enforced
-/// in-path on the direct-H2 sender / response collectors (413 /
-/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`) — including
-/// frame-by-frame when `Content-Length` is absent — so nonzero
-/// `FERRUM_MAX_*_BODY_SIZE_BYTES` no longer disqualifies ordinary
-/// (non-SNI) routes from the multiplexed pool. The retained size-limit
-/// parameters keep call-site signatures stable; they do not gate
-/// dispatch. Retry body replay and request-body-buffering plugins still
-/// force the reqwest path via [`can_use_direct_http2_pool`].
-pub(crate) fn can_dispatch_direct_http2_pool(
-    enable_http2: bool,
-    retain_request_body: bool,
-    requires_request_body_buffering: bool,
-    _max_request_body_size_bytes: usize,
-    _max_response_body_size_bytes: usize,
-) -> bool {
-    can_use_direct_http2_pool(
-        enable_http2,
-        retain_request_body,
-        requires_request_body_buffering,
-    )
-}
-
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
 /// folding in the DestinationRule `connectionPool.http.h2UpgradePolicy`
 /// override on top of the capability-registry verdict.
 ///
 /// `can_dispatch` is the body-compat/`enable_http2` gate
-/// ([`can_dispatch_direct_http2_pool`]). `supports` is the registry's
+/// ([`can_use_direct_http2_pool`]). `supports` is the registry's
 /// `h2_tls == Supported`; `known_unsupported` is `h2_tls == Unsupported`
 /// (absence / `Unknown` is neither). `requires_sni` forces direct-H2 because
 /// reqwest cannot apply a per-request backend SNI.
@@ -52200,12 +52181,10 @@ async fn proxy_to_backend(
         // response collectors (413 / 502), including for ordinary
         // (non-SNI) routes — same semantics as the SNI arm and the
         // reqwest path's ErrorClass / connection_error contracts.
-        let direct_h2_can_dispatch = can_dispatch_direct_http2_pool(
+        let direct_h2_can_dispatch = can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-            effective_max_request_body_size_bytes,
-            effective_max_response_body_size_bytes,
         );
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
         // (projected onto the effective proxy) into the registry verdict. Scope

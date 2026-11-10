@@ -10699,22 +10699,6 @@ pub mod _test_support {
         )
     }
 
-    pub fn can_dispatch_direct_http2_pool(
-        enable_http2: bool,
-        retain_request_body: bool,
-        requires_request_body_buffering: bool,
-        max_request_body_size_bytes: usize,
-        max_response_body_size_bytes: usize,
-    ) -> bool {
-        crate::proxy::can_dispatch_direct_http2_pool(
-            enable_http2,
-            retain_request_body,
-            requires_request_body_buffering,
-            max_request_body_size_bytes,
-            max_response_body_size_bytes,
-        )
-    }
-
     /// Issue #3942: ordinary unlimited direct-H2 must not wrap
     /// `SizeLimitedIncoming` (the adapter treats `max_bytes = 0` as deny-all
     /// and a `usize::MAX` wrap still costs a per-frame atomic + limit compare).
