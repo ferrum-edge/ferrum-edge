@@ -28,6 +28,15 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Restore refuses `api_specs` section version `"1"` and empty `resource_hash` (#7218)
+
+`POST /restore` now accepts only `api_specs.section_version: "2"` (what every
+current `GET /backup` writes) and requires each item's `resource_hash` to be
+64 lowercase hex characters (every spec writer records it). A backup taken
+with an older build that carries section version `"1"` or an empty
+`resource_hash` is refused with `400`; take a fresh `GET /backup` from the
+running deployment before upgrading.
+
 ### Undocumented TLS source option spellings are no longer read (#7218)
 
 A TLS material source URI sets its refresh cadence only with the documented

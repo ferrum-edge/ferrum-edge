@@ -3303,7 +3303,7 @@ fn api_spec_restore_section_requires_an_object_and_preserves_absence() {
     for accepted in [
         json!({}),
         json!({"api_specs": null}),
-        json!({"api_specs": {"section_version": "1", "items": []}}),
+        json!({"api_specs": {"section_version": "2", "items": []}}),
     ] {
         restore_envelope_admission_for_test(&serde_json::to_vec(&accepted).unwrap()).unwrap();
     }

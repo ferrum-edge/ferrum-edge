@@ -20970,9 +20970,8 @@ components:
         section_version:
           type: string
           description: |
-            Section contract version. Current exports use `"2"` (optional
-            external-`$ref` snapshot fields). Restore also accepts `"1"`
-            (no snapshot fields).
+            Section contract version. Exports and restore use `"2"` (optional
+            external-`$ref` snapshot fields); any other value is rejected.
           example: "2"
         items:
           type: array
@@ -21052,8 +21051,8 @@ components:
           type: integer
         resource_hash:
           type: string
-          pattern: "^$|^[0-9a-f]{64}$"
-          description: Empty for legacy records or lowercase hex SHA-256 of the generated resource bundle
+          pattern: "^[0-9a-f]{64}$"
+          description: Lowercase hex SHA-256 of the generated resource bundle
         external_ref_snapshot_base64:
           type: string
           description: |

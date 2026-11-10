@@ -707,8 +707,7 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
     max_total_spec_bytes: usize,
 ) -> Result<Vec<ApiSpec>, Vec<String>> {
     let mut errors = Vec::new();
-    if section.section_version != "1" && section.section_version != API_SPECS_BACKUP_SECTION_VERSION
-    {
+    if section.section_version != API_SPECS_BACKUP_SECTION_VERSION {
         errors.push("Unsupported api_specs.section_version".to_string());
         return Err(errors);
     }
@@ -770,15 +769,16 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
             ));
             continue;
         }
-        if !item.resource_hash.is_empty()
-            && (item.resource_hash.len() != 64
-                || !item
-                    .resource_hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        // Every spec writer records the generated bundle's hash, so a backup
+        // item always carries one; build-out keeps no legacy empty form.
+        if item.resource_hash.len() != 64
+            || !item
+                .resource_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             errors.push(format!(
-                "api_spec '{}': resource_hash must be empty or lowercase SHA-256 hex",
+                "api_spec '{}': resource_hash must be lowercase SHA-256 hex",
                 item.id
             ));
             continue;
@@ -1450,7 +1450,7 @@ mod tests {
         let present: RestorePayload = serde_json::from_value(json!({
             "proxies": [],
             "api_specs": {
-                "section_version": "1",
+                "section_version": "2",
                 "items": []
             }
         }))
@@ -1646,7 +1646,35 @@ mod tests {
             .expect_err("resource hash must be bounded");
         assert!(
             err.iter()
-                .any(|e| e.contains("resource_hash must be empty or lowercase SHA-256 hex"))
+                .any(|e| e.contains("resource_hash must be lowercase SHA-256 hex"))
+        );
+    }
+
+    #[test]
+    fn validate_api_specs_section_rejects_retired_shapes() {
+        // Issue #7218: build-out keeps no legacy restore shapes — section
+        // version "1" and an empty `resource_hash` are refused.
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
+        let v1 = ApiSpecsBackupSection {
+            section_version: "1".to_string(),
+            items: vec![sample_spec_item("spec-1", "proxy-1", raw)],
+        };
+        let err = validate_restore_api_specs_section(&v1, &proxies, &[], &[], 25)
+            .expect_err("section version 1 is retired");
+        assert_eq!(err, vec!["Unsupported api_specs.section_version"]);
+
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.resource_hash = String::new();
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("an empty resource hash is retired");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("resource_hash must be lowercase SHA-256 hex"))
         );
     }
 
