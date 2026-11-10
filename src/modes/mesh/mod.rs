@@ -17577,7 +17577,6 @@ fn start_mesh_admin_listeners(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,

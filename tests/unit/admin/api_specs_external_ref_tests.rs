@@ -99,7 +99,6 @@ async fn load_production_http(
     let loader = DefaultExternalDocumentLoader {
         egress: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         dns_cache: None,
-        fixtures: Default::default(),
     };
     // Arm the total deadline at the blocking load boundary. Computing it before
     // `spawn_blocking` schedules lets coverage-induced worker delay burn the
@@ -410,7 +409,7 @@ impl ExternalDocumentLoader for RedirectAliasLoader {
             canonical_uri: Url::parse("https://schemas.example.com/final.json").unwrap(),
             content_digest: "redirected-document".to_string(),
             format: "json",
-            raw_bytes: serde_json::to_vec(&root).unwrap(),
+            raw_len: serde_json::to_vec(&root).unwrap().len(),
             root,
         })
     }
@@ -1162,7 +1161,6 @@ async fn http_fixture_listener_resolves_under_explicit_http_allowlist() {
     let loader = ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader {
         egress: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
         dns_cache: None,
-        fixtures: Default::default(),
     };
 
     let uri = format!("{origin}/schema.json");

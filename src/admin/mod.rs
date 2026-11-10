@@ -476,7 +476,9 @@ pub struct AdminState {
     /// Process-level OpenAPI external `$ref` gate and budgets (from EnvConfig).
     pub external_ref_policy: std::sync::Arc<crate::admin::api_specs::ExternalRefProcessPolicy>,
     /// Loader used when external `$ref` resolution is effectively enabled.
-    pub external_ref_loader: std::sync::Arc<crate::admin::api_specs::DefaultExternalDocumentLoader>,
+    /// Serving modes install [`crate::admin::api_specs::DefaultExternalDocumentLoader`];
+    /// tests substitute their own in-memory loader through the trait.
+    pub external_ref_loader: std::sync::Arc<dyn crate::admin::api_specs::ExternalDocumentLoader>,
     /// Database-mode coordinator that waits for the poll-loop reload to publish
     /// a covering `config_changes` watermark before admin mutations return 2xx
     /// (issue #3926). `None` in every other mode and in tests that do not run
