@@ -1484,8 +1484,11 @@ async fn send_batch_once(
     body_bytes: Bytes,
     content_encoding: Option<&'static str>,
 ) -> LokiAttemptOutcome {
+    // An unavailable client means a CRL-generation rebuild failed; the next
+    // call retries it, so this attempt is retryable rather than a terminal
+    // verdict on the batch (issue #7110).
     let Ok(client) = cfg.http_client.get() else {
-        return LokiAttemptOutcome::Terminal("plugin HTTP client unavailable".to_string());
+        return LokiAttemptOutcome::Retryable("plugin HTTP client unavailable".to_string());
     };
     let mut req = client
         .post(&cfg.endpoint_url)

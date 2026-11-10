@@ -5050,6 +5050,10 @@ async fn post_json_each_row(
     post_json_each_row_bytes(cfg, body.bytes(), event_count).await
 }
 
+/// Diagnostic for a delivery attempt whose plugin HTTP client could not be
+/// obtained for the current CRL generation.
+const CLIENT_UNAVAILABLE_MESSAGE: &str = "plugin HTTP client unavailable";
+
 /// Send a refcounted JSONEachRow range whose owner keeps the corresponding
 /// retained-byte reservation alive across this call.
 ///
@@ -5062,31 +5066,28 @@ async fn post_json_each_row_bytes(
     event_count: usize,
 ) -> DeliveryOutcome {
     let start = Instant::now();
-    let mut request = match &cfg.http {
-        ClickHouseHttpClient::Shared(client) => match client.get() {
-            Ok(shared) => shared.post(&cfg.insert_url),
-            Err(_) => {
-                return DeliveryOutcome::Permanent {
-                    status: 502,
-                    message: "plugin HTTP client unavailable".to_string(),
-                };
-            }
-        },
-        ClickHouseHttpClient::Dedicated(client) => match client.current() {
-            Ok(dedicated) => dedicated.post(&cfg.insert_url),
-            Err(_) => {
-                return DeliveryOutcome::Permanent {
-                    status: 502,
-                    message: "plugin HTTP client unavailable".to_string(),
-                };
-            }
-        },
-    }
-    .timeout(cfg.timeout)
-    .header(CONTENT_TYPE, "application/json")
-    // `Bytes` is a refcount/range handle; retries and isolation do not copy the
-    // attacker-shaped payload owned by the caller's charged batch.
-    .body(body);
+    // An unavailable client is a local, transient condition (a CRL-generation
+    // rebuild failed and is retried on the next call), not a destination
+    // verdict on these rows. `Permanent` would make spool replay dead-letter
+    // every row ClickHouse never saw (issue #7110), so it is `Retryable`, and
+    // counted like any other failed attempt.
+    let client = match &cfg.http {
+        ClickHouseHttpClient::Shared(client) => client.get(),
+        ClickHouseHttpClient::Dedicated(client) => client.current(),
+    };
+    let Ok(client) = client else {
+        let message = CLIENT_UNAVAILABLE_MESSAGE.to_string();
+        cfg.metrics
+            .record_failure(FailureReason::Tls, message.clone());
+        return DeliveryOutcome::Retryable { message };
+    };
+    let mut request = client
+        .post(&cfg.insert_url)
+        .timeout(cfg.timeout)
+        .header(CONTENT_TYPE, "application/json")
+        // `Bytes` is a refcount/range handle; retries and isolation do not copy the
+        // attacker-shaped payload owned by the caller's charged batch.
+        .body(body);
     if let Some(username) = cfg.username.as_deref() {
         request = request.basic_auth(username, cfg.password.clone());
     }
