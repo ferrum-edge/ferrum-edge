@@ -9493,7 +9493,9 @@ pub mod _test_support {
     pub fn permessage_deflate_answer_for_test(
         headers: &hyper::HeaderMap,
     ) -> Option<hyper::header::HeaderValue> {
-        crate::proxy::permessage_deflate_answer(headers)
+        crate::proxy::backend_extensions_answer(headers)
+            .as_ref()
+            .and_then(crate::proxy::permessage_deflate_answer_from)
     }
 
     /// Finish a `websocket_permessage_deflate: terminate` negotiation against
@@ -15400,7 +15402,7 @@ pub mod _test_support {
         deadline: Option<tokio::time::Instant>,
         attempt: F,
     ) -> Result<F::Output, &'static str> {
-        crate::proxy::await_route_request_deadline(deadline, None, attempt)
+        crate::proxy::await_backend_attempt_route_deadline(deadline, None, None, attempt)
             .await
             .map_err(route_deadline_expiry_label)
     }
@@ -15433,9 +15435,10 @@ pub mod _test_support {
                 &mut armed_deadline,
             ),
         };
-        let outcome = crate::proxy::await_route_request_deadline(deadline, budget, attempt)
-            .await
-            .map_err(route_deadline_expiry_label);
+        let outcome =
+            crate::proxy::await_backend_attempt_route_deadline(deadline, budget, None, attempt)
+                .await
+                .map_err(route_deadline_expiry_label);
         (outcome, armed_deadline)
     }
 

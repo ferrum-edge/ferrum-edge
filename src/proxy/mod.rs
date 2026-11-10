@@ -16262,23 +16262,14 @@ pub fn try_acquire_websocket_connection_permit(
 }
 
 /// Try to admit one upgraded WebSocket session for `ip` against the per-source
-/// session budget.
+/// session budget, grouping IPv6 sources by the configured
+/// `FERRUM_PER_IP_IPV6_PREFIX`.
 ///
 /// `counts == None` or `max == 0` means the dimension is disabled (`Ok(None)`).
 /// The returned guard must be moved into the session task so the slot is
 /// released on every disconnect path. Source identity is the caller's
 /// resolved `client_ip` — forwarding headers must already have been accepted
 /// only from a trusted peer.
-pub fn try_acquire_per_ip_websocket_session(
-    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
-    ip: &str,
-    max: u64,
-) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
-    try_acquire_per_ip_slot(counts, ip, max)
-}
-
-/// Same as [`try_acquire_per_ip_websocket_session`], but groups IPv6 sources by
-/// the configured `FERRUM_PER_IP_IPV6_PREFIX` instead of the fixed /64.
 pub fn try_acquire_per_ip_websocket_session_with_prefix(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     ip: &str,
@@ -18665,13 +18656,6 @@ pub(crate) fn permessage_deflate_answer_from(
 ) -> Option<hyper::header::HeaderValue> {
     let answer = retain_permessage_deflate_extensions(answer.to_str().ok()?)?;
     hyper::header::HeaderValue::from_str(&answer).ok()
-}
-
-/// The `permessage-deflate` part of a backend handshake answer, or `None`.
-pub(crate) fn permessage_deflate_answer(
-    headers: &hyper::HeaderMap,
-) -> Option<hyper::header::HeaderValue> {
-    permessage_deflate_answer_from(&backend_extensions_answer(headers)?)
 }
 
 fn push_forwardable_header_override(
@@ -51480,7 +51464,7 @@ async fn proxy_to_backend(
     // BACKEND — every gateway- and client-side step (buffered client-body
     // collection, request-body hooks, DNS, backend admission) is complete and
     // the backend dial / stream open / send begins. A route request deadline
-    // (`await_route_request_deadline`) that cancels the attempt before this
+    // (`await_backend_attempt_route_deadline`) that cancels the attempt before this
     // point is health-neutral; one that cancels it afterwards is charged to
     // the backend. The route's per-attempt budget (`RouteAttemptBudget`)
     // starts here, which is why the wrapper observes this marker while the
@@ -58546,7 +58530,10 @@ pub(crate) fn earliest_deadline(
 }
 
 /// Await one backend attempt under a route rule's total request deadline and
-/// its per-attempt budget.
+/// its per-attempt budget. Every poll of the attempt runs in the attempt's
+/// `otel_tracing` scope when the attempt was begun with
+/// `RequestContext::begin_backend_attempt_span` (issue #5864); with `trace`
+/// `None` no span is entered.
 ///
 /// With neither (`None`, `None`) this is the unbounded fast path: the attempt
 /// is polled directly and no timer exists. A total deadline that has already
@@ -58557,21 +58544,6 @@ pub(crate) fn earliest_deadline(
 /// upload, and pooled stream exactly as a client disconnect would. When both
 /// have elapsed the total deadline wins, so a spent transaction is never
 /// retried.
-pub(crate) fn await_route_request_deadline<F>(
-    deadline: Option<tokio::time::Instant>,
-    attempt_budget: Option<RouteAttemptBudget<'_>>,
-    attempt: F,
-) -> RouteDeadlineAttempt<'_, F>
-where
-    F: std::future::Future,
-{
-    await_backend_attempt_route_deadline(deadline, attempt_budget, None, attempt)
-}
-
-/// [`await_route_request_deadline`] for a backend attempt begun with
-/// `RequestContext::begin_backend_attempt_span`: every poll of the attempt runs
-/// in the attempt's `otel_tracing` scope (issue #5864). With `trace` `None`
-/// this is exactly [`await_route_request_deadline`].
 pub(crate) fn await_backend_attempt_route_deadline<F>(
     deadline: Option<tokio::time::Instant>,
     attempt_budget: Option<RouteAttemptBudget<'_>>,
@@ -58592,7 +58564,7 @@ where
 }
 
 pin_project_lite::pin_project! {
-    /// Future returned by [`await_route_request_deadline`].
+    /// Future returned by [`await_backend_attempt_route_deadline`].
     ///
     /// Hand-written rather than an `async fn` so the (large) backend attempt
     /// future is stored exactly once (production dispatch passes a boxed child).

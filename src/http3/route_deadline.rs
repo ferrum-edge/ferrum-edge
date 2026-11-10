@@ -4,7 +4,7 @@
 //! `request_timeout_ms`, Gateway API `HTTPRoute.rules[].timeouts.request`) and
 //! a per-attempt total bound (`attempt_timeout_ms`, `timeouts.backendRequest`).
 //! Proxy core enforces both for HTTP/1.1 and HTTP/2 around every backend
-//! attempt ([`crate::proxy::await_route_request_deadline`]) and on the committed
+//! attempt ([`crate::proxy::await_backend_attempt_route_deadline`]) and on the committed
 //! response body (`ProxyBody::with_route_request_deadline`). The native HTTP/3
 //! relays write the response head and body from inside their own dispatch, so
 //! they apply the same bounds at the same phases with the helpers here:
