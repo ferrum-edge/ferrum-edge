@@ -1,5 +1,6 @@
 //! Generated from the Public Suffix List bundled with `psl` 2.1.248
-//! (`data/rules.txt`). Do not edit by hand.
+//! (`data/rules.txt`). Do not edit by hand: regenerate with
+//! `python3 scripts/generate_cors_psl_ancestors.py`.
 //!
 //! Every domain that is NOT itself a public suffix but has a PSL rule strictly
 //! beneath it (for example `amazonaws.com`, above `s3.amazonaws.com`). A

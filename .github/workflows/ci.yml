@@ -1857,6 +1857,15 @@ jobs:
         # synthetic self-tests before repository parity.
         run: python3 scripts/check_vendored_patch_lifecycle.py
 
+      - name: CORS PSL ancestor index parity
+        # src/plugins/cors_psl_ancestors.rs feeds the credentialed-wildcard
+        # interlock and is generated from the `data/rules.txt` bundled with the
+        # locked `psl` crate. The checker downloads that crate, verifies its
+        # SHA-256 against Cargo.lock, and fails when the committed index differs
+        # from the regenerated one (a stale `psl` bump or a hand edit). The unit
+        # test only compares the header version; this compares every entry.
+        run: python3 scripts/generate_cors_psl_ancestors.py --check
+
   standalone-cargo:
     # Formatting and compile gate for every standalone Cargo workspace (issues
     # #5703 and #5707). The root package declares no [workspace], so the root
