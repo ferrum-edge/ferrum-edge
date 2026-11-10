@@ -321,20 +321,6 @@ impl MeshTopology {
         }
     }
 
-    /// Whether this topology terminates HBONE inbound on the shared waypoint
-    /// listener (port 15008 by default). True for `Ambient`, `NodeWaypoint`,
-    /// and `ServiceWaypoint`. No runtime path consults it: listener spawning
-    /// derives the HBONE listener from `listener_plan()`. Only the topology
-    /// conformance matrix and integration tests read it.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn terminates_hbone(self) -> bool {
-        matches!(
-            self,
-            Self::Ambient | Self::NodeWaypoint | Self::ServiceWaypoint
-        )
-    }
-
     /// Whether this topology is a waypoint flavor (node or service scope).
     /// Used by slice-filter and admin-endpoint dispatch to identify the
     /// shared-listener topologies that need extra scoping beyond Ambient's
