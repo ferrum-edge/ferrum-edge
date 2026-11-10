@@ -16288,7 +16288,10 @@ pub fn try_acquire_per_ip_slot(
     try_acquire_per_ip_slot_with_prefix(counts, ip, max, 64)
 }
 
-fn try_acquire_per_ip_slot_with_prefix(
+/// Same as [`try_acquire_per_ip_slot`], but groups IPv6 sources by
+/// `ipv6_prefix` (the configured `FERRUM_PER_IP_IPV6_PREFIX`) instead of the
+/// fixed /64. Masking an already-masked key at the same prefix is a no-op.
+pub fn try_acquire_per_ip_slot_with_prefix(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     ip: &str,
     max: u64,

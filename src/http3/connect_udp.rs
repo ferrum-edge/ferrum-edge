@@ -1733,7 +1733,9 @@ pub fn try_acquire_connect_udp_client_slot(
         return Ok(None);
     }
     let key = connect_udp_client_key(client_ip, ipv6_prefix);
-    crate::proxy::try_acquire_per_ip_slot(Some(counts), &key, max)
+    // Keep the configured prefix: the fixed-/64 `try_acquire_per_ip_slot`
+    // would re-mask a finer key (/96, /128) back to its /64.
+    crate::proxy::try_acquire_per_ip_slot_with_prefix(Some(counts), &key, max, ipv6_prefix)
 }
 
 /// Everything the handler needs that is not already an `Arc` on `ProxyState`.

@@ -2916,6 +2916,49 @@ mod per_client_tunnel_cap {
         drop((held, outside_prefix));
     }
 
+    /// GHSA-grwg-8jpx-q8p9: a prefix finer than /64 must not be re-masked to
+    /// the /64 by the slot primitive, or every host in that /64 shares one
+    /// budget despite the operator's per-host setting.
+    #[test]
+    fn per_client_cap_uses_configured_slash_128_prefix() {
+        let counts = counts();
+        let held = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1", 128, 1)
+            .expect("first IPv6 tunnel admitted")
+            .expect("cap enabled");
+        assert!(
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1", 128, 1).is_err(),
+            "the same /128 host stays capped"
+        );
+        let neighbour =
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::2", 128, 1)
+                .expect("another host in the same /64 is an independent client at /128");
+        assert!(neighbour.is_some());
+        assert_eq!(live(&counts, "2001:db8:1:2::1"), 1);
+        assert_eq!(live(&counts, "2001:db8:1:2::2"), 1);
+        assert_eq!(live(&counts, "2001:db8:1:2::"), 0);
+        drop((held, neighbour));
+    }
+
+    #[test]
+    fn per_client_cap_uses_configured_slash_96_prefix() {
+        let counts = counts();
+        let held = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1:1", 96, 1)
+            .expect("first IPv6 tunnel admitted")
+            .expect("cap enabled");
+        assert!(
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::ffff", 96, 1)
+                .is_err(),
+            "addresses in one /96 must share a budget when /96 is configured"
+        );
+        let other_slash_96 =
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2:0:1::1", 96, 1)
+                .expect("a different /96 inside the same /64 is an independent client");
+        assert!(other_slash_96.is_some());
+        assert_eq!(live(&counts, "2001:db8:1:2::"), 1);
+        assert_eq!(live(&counts, "2001:db8:1:2:0:1::"), 1);
+        drop((held, other_slash_96));
+    }
+
     #[test]
     fn handler_holds_the_per_client_slot_for_the_tunnel_lifetime() {
         let squeezed = super::squeeze(super::connect_udp_handler_source());
