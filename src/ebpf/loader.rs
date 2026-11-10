@@ -549,19 +549,6 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn attach_ingress_redirect(&mut self, iface: &str) -> Result<(), String> {
-        // Without both scope maps the classifier could only match on pod IP and
-        // would capture every port of an enrolled pod, and every enrollment
-        // would then fail to scope it. Refuse to arm it instead.
-        if !self
-            .maps
-            .as_ref()
-            .is_some_and(BpfMaps::supports_inbound_redirect_scope)
-        {
-            return Err(format!(
-                "Refusing to attach '{INGRESS_REDIRECT_PROGRAM}': the loaded ELF lacks the \
-                 inbound redirect scope maps"
-            ));
-        }
         let bpf = self.bpf_mut()?;
         let prog: &mut SchedClassifier = bpf
             .program_mut(INGRESS_REDIRECT_PROGRAM)
@@ -870,10 +857,11 @@ impl EbpfBackend for AyaEbpfBackend {
         if self.bpf.is_none() {
             return Err("BPF programs are not loaded".to_string());
         }
-        let Some(maps) = self.maps.as_ref() else {
+        // `BpfMaps::from_ebpf` refuses an ELF missing any Ferrum map, so
+        // initialized maps are complete for every capture topology.
+        if self.maps.is_none() {
             return Err("BPF maps are not initialized".to_string());
-        };
-        maps.validate_required(require_sock_ops)?;
+        }
         if require_sock_ops && self.sock_ops_link_id.is_none() {
             return Err("SOCK_OPS identity bridge is not attached".to_string());
         }
@@ -891,7 +879,7 @@ impl EbpfBackend for AyaEbpfBackend {
         let reply_source_gate_error = self
             .maps
             .as_mut()
-            .and_then(|maps| maps.disable_udp_reply_sources_for_cleanup().err());
+            .and_then(|maps| maps.set_udp_reply_sources_enabled(false).err());
         // Detach the node-level ingress redirect explicitly and BEFORE dropping
         // `Ebpf`. This is the genuine retry the callers treat it as: the links
         // are owned by this backend (not by the program's link map, which

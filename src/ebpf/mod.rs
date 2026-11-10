@@ -1211,11 +1211,6 @@ pub struct MockEbpfBackend {
     /// publication the node-agent could not apply is NOT recorded as converged
     /// and is retried, and that a failed retraction never reports success.
     pub fail_replace_udp_reply_sources: bool,
-    /// When `true`, the reply-source maps are treated as ABSENT from the loaded
-    /// program, mirroring `BpfMaps::replace_udp_reply_sources`: every generation,
-    /// including an empty withdrawal, is a hard error because both families
-    /// must be scanned and applied before it may be acknowledged.
-    pub udp_reply_source_maps_absent: bool,
     /// When `true`, the IPv4 half of the replacement succeeds and the operation
     /// then fails before IPv6, mirroring a partial family failure in the real
     /// remove-before-insert sequence. The generation must remain unacknowledged.
@@ -1224,12 +1219,6 @@ pub struct MockEbpfBackend {
     /// generation whose SENDER proof could not be applied is never acknowledged
     /// and never leaves the source proof authorized on its own.
     pub fail_replace_udp_relay_cgroups: bool,
-    /// Treat `FERRUM_UDP_RELAY_CGROUPS` as ABSENT from the loaded program.
-    /// Every generation, including an empty withdrawal, is then a hard error:
-    /// without that map the classifier has no sender proof to consult.
-    pub udp_relay_cgroup_map_absent: bool,
-    /// Treat the shared reply-source gate map as absent.
-    pub udp_reply_source_gate_absent: bool,
     /// Inject a hard failure while closing the shared gate. The mock leaves the
     /// previous value unchanged, matching a failed map update.
     pub fail_disable_udp_reply_sources: bool,
@@ -1463,12 +1452,6 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String> {
-        if self.udp_reply_source_gate_absent {
-            return Err(
-                "injected absent NodeWaypoint UDP reply-source gate; authorization cannot be fenced"
-                    .to_string(),
-            );
-        }
         if (!enabled && self.fail_disable_udp_reply_sources)
             || (enabled && self.fail_enable_udp_reply_sources)
         {
@@ -1489,12 +1472,6 @@ impl EbpfBackend for MockEbpfBackend {
                 "injected NodeWaypoint UDP reply-source publication failure for {} source(s)",
                 sources.len()
             ));
-        }
-        if self.udp_reply_source_maps_absent {
-            return Err(
-                "injected absent NodeWaypoint UDP reply-source maps; the set cannot be authorized"
-                    .to_string(),
-            );
         }
         if self.fail_replace_udp_reply_sources_after_ipv4 {
             let desired4: HashSet<(IpAddr, u16)> = sources
@@ -1534,13 +1511,6 @@ impl EbpfBackend for MockEbpfBackend {
                 "injected NodeWaypoint UDP relay cgroup publication failure for {} id(s)",
                 cgroup_ids.len()
             ));
-        }
-        if self.udp_relay_cgroup_map_absent {
-            return Err(
-                "injected absent NodeWaypoint UDP relay cgroup map; the sender proof cannot be \
-                 authorized"
-                    .to_string(),
-            );
         }
         let desired: HashSet<u64> = cgroup_ids.iter().copied().collect();
         self.udp_relay_cgroups.retain(|id| desired.contains(id));
@@ -1739,21 +1709,6 @@ impl EbpfBackend for MockEbpfBackend {
         }
         if self.capture_config.is_none() {
             return Err("BPF capture config map not initialized".to_string());
-        }
-        if require_sock_ops && self.udp_relay_cgroup_map_absent {
-            return Err(format!(
-                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_RELAY_CGROUPS}"
-            ));
-        }
-        if require_sock_ops && self.udp_reply_source_maps_absent {
-            return Err(format!(
-                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_REPLY_SOURCES}, {BPF_MAP_UDP_REPLY_SOURCES6}"
-            ));
-        }
-        if require_sock_ops && self.udp_reply_source_gate_absent {
-            return Err(format!(
-                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_REPLY_SOURCE_GATE}"
-            ));
         }
         if require_sock_ops && self.sock_ops_attached_cgroup_root.is_none() {
             return Err("SOCK_OPS identity bridge is not attached".to_string());
