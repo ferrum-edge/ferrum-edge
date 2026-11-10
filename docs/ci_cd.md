@@ -2145,19 +2145,23 @@ No release version or build-profile change is part of this rotation.
 
 ##### Trusted-base relevance for required live gates
 
-`mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
-required status checks that may legitimately skip their expensive live job when
-a pull request touches nothing relevant. That skip is a security boundary: if
+`gateway-api-conformance.yml`, `mesh-e2e-sidecar-live.yml`,
+`multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`, and
+`ambient-host-udp-live.yml` publish required status checks that may legitimately
+skip their expensive live job when a pull request touches nothing relevant. That skip is a security boundary: if
 the relevance verdict were computed by the pull request's own copy of
 `.github/scripts/live_suite_path_filter.py`, a pull request could widen
 `SUITE_PATTERNS`, declare itself irrelevant, skip the live job, and still turn
 the required gate green.
 
-Both workflows therefore share one byte-identical relevance job, frozen in the
+These workflows therefore share one byte-identical relevance job, frozen in the
 trusted verifier as `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` and enforced absolutely
 by `live_suite_relevance_errors` in exact validation *and* in pull-request
 comparison. Only the display name, temp-file slug, and `--suite` selector
-differ. Its load-bearing properties:
+differ. `Gateway API Conformance` joined the contract for GHSA-c57q-j5hg-w4vc:
+its `changes` job had run the pull request's own copy of the filter, so a pull
+request could make its own diff irrelevant and turn the required `gate` green
+without the lab. Its load-bearing properties:
 
 - The relevance script comes from the base-branch tip of the **base**
   repository, never from the pull-request checkout. This holds for fork pull

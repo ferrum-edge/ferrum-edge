@@ -2025,20 +2025,27 @@ def main() -> int:
         "changes",
     )
     if (
-        'git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"'
+        'git diff --name-only --no-renames "${trusted_sha}...HEAD" \\\n'
+        '              | sort > "$changed_files"'
         not in gateway_changes_body
     ):
         planner_errors.append(
-            "jobs.changes in gateway-api-conformance.yml must disable rename "
-            "detection when collecting pull_request changed files"
+            "jobs.changes in gateway-api-conformance.yml must diff against the "
+            "pinned trusted base with rename detection disabled"
         )
+    # GHSA-c57q-j5hg-w4vc: relevance for this required gate comes from the
+    # trusted-base filter blob (verify_cross_build_policy.py freezes the job
+    # as LIVE_SUITE_RELEVANCE_JOB_TEMPLATE); the checkout's copy never runs.
     if (
-        'git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"'
+        'git cat-file blob "$entry_object" > "$trusted_filter"'
         not in gateway_changes_body
+        or "filter_args=(--suite gateway-api " not in gateway_changes_body
+        or "python3 .github/scripts/live_suite_path_filter.py" in gateway_changes_body
     ):
         planner_errors.append(
-            "jobs.changes in gateway-api-conformance.yml must diff merge_group "
-            "commits with rename detection disabled"
+            "jobs.changes in gateway-api-conformance.yml must run the trusted-base "
+            "live_suite_path_filter.py for --suite gateway-api, never the "
+            "pull request's own copy"
         )
 
     # The performance regression check runs out of band (daily schedule and

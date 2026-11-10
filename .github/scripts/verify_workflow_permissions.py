@@ -91,6 +91,7 @@ POLICY_FROZEN_CHECKOUT_JOBS = frozenset(
         ("ambient-host-udp-live.yml", "changes"),
         ("ambient-host-udp-live.yml", "ambient-host-udp-live"),
         ("cni-lifecycle-live.yml", "changes"),
+        ("gateway-api-conformance.yml", "changes"),
         ("istio-status-cas-live.yml", "changes"),
         ("mesh-e2e-sidecar-live.yml", "changes"),
         ("multicluster-federation-live.yml", "changes"),

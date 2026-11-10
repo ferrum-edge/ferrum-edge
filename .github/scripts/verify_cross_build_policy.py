@@ -2354,8 +2354,9 @@ def derive_release_family_transition(
 # ---------------------------------------------------------------------------
 # Trusted-base relevance contract for the required live-datapath gates
 # ---------------------------------------------------------------------------
-# `mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`, and
-# `multicluster-poller-partition-live.yml` publish REQUIRED status checks that
+# `gateway-api-conformance.yml`, `mesh-e2e-sidecar-live.yml`,
+# `multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`,
+# and `ambient-host-udp-live.yml` publish REQUIRED status checks that
 # may skip their expensive live job when a pull request touches nothing
 # relevant. That skip is a security boundary: if the relevance verdict is
 # computed by a script the PULL REQUEST supplies, the pull request can widen
@@ -2575,6 +2576,16 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
         "CNI lifecycle trigger",
         "cni-lifecycle",
         "cni-lifecycle",
+    ),
+    # GHSA-c57q-j5hg-w4vc: `Gateway API Conformance` is a required check whose
+    # `gate` passes on `relevant == 'false'`; it used to run the pull request's
+    # own filter copy, so a PR could declare itself irrelevant.
+    "gateway-api-conformance.yml": (
+        "changes",
+        "gateway-api-conformance",
+        "Gateway API conformance trigger",
+        "gateway-api-conformance",
+        "gateway-api",
     ),
     "istio-status-cas-live.yml": (
         "changes",
@@ -29596,6 +29607,69 @@ pre_build = []
     if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
         failures.append("the trusted-base relevance contract was rejected")
 
+    # GHSA-c57q-j5hg-w4vc: the required Gateway API gate must not decide its
+    # relevance with the pull request's own filter copy, either by running it
+    # directly (the pre-advisory shape) or by reading it from the checkout
+    # instead of the pinned trusted blob.
+    gateway_name = "gateway-api-conformance.yml"
+    gateway_contract = LIVE_SUITE_RELEVANCE_CONTRACTS.get(gateway_name)
+    if gateway_contract is None or gateway_contract[4] != "gateway-api":
+        failures.append(
+            "Gateway API Conformance must decide relevance through the trusted-base "
+            "gateway-api suite contract"
+        )
+    else:
+        gateway_trusted_job = live_suite_relevance_job(
+            gateway_contract[2], gateway_contract[3], gateway_contract[4]
+        )
+        pr_supplied_gateway_job = (
+            "  changes:\n"
+            f"    name: {gateway_contract[2]}\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    outputs:\n"
+            "      relevant: ${{ steps.filter.outputs.relevant }}\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
+            "      - id: filter\n"
+            "        run: |\n"
+            "          python3 .github/scripts/live_suite_path_filter.py --self-test\n"
+            "          plan=\"$(python3 .github/scripts/live_suite_path_filter.py "
+            "--suite gateway-api --changed-files changed.txt)\"\n"
+            "          printf '%s\\n' \"$plan\" | sed -n 's/^relevant=//p' "
+            ">> \"$GITHUB_OUTPUT\"\n"
+        )
+        checkout_read_gateway_job = gateway_trusted_job.replace(
+            'git cat-file blob "$entry_object" > "$trusted_filter"',
+            'cp -- "$filter_path" "$trusted_filter"',
+            1,
+        )
+        if checkout_read_gateway_job == gateway_trusted_job:
+            failures.append(
+                "self-test: the checkout-read Gateway API fixture must alter the job"
+            )
+        for label, job in (
+            ("runs the pull request's own filter", pr_supplied_gateway_job),
+            ("reads the filter from the checkout", checkout_read_gateway_job),
+        ):
+            mutated = dict(relevance_workflows)
+            mutated[gateway_name] = mutated[gateway_name].replace(
+                gateway_trusted_job, job, 1
+            )
+            if mutated[gateway_name] == relevance_workflows[gateway_name]:
+                failures.append(
+                    f"self-test: Gateway API relevance fixture that {label} "
+                    "did not alter the workflow"
+                )
+                continue
+            if not any(
+                f"{gateway_name} job 'changes' must be exactly the trusted-base "
+                "relevance contract" in error
+                for error in live_suite_relevance_errors(mutated, "self-test workflows")
+            ):
+                failures.append(
+                    f"a Gateway API relevance job that {label} was accepted"
+                )
+
     registry_workflows = dict(relevance_workflows)
     ambient_name = "ambient-host-udp-live.yml"
     registry_workflows[ambient_name] = registry_workflows[ambient_name].replace(
@@ -29986,7 +30060,8 @@ pre_build = []
         **relevance_workflows,
         **node_waypoint_fixture,
         **isolated_fixture,
-        GATEWAY_WORKFLOW_FILENAME: gateway_validation_workflow,
+        # `relevance_workflows` already carries the governed
+        # gateway-api-conformance.yml fixture (GHSA-c57q-j5hg-w4vc).
         CROSS_IMAGE_REFRESH_WORKFLOW: "name: Cross image inventory\n"
         + CROSS_IMAGE_REFRESH_TRIGGER
         + "jobs:\n"

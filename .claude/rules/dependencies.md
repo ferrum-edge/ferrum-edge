@@ -100,8 +100,10 @@ sections:
   PR-mutable parity check). → "Publish-blocking required checks".
 - Live-suite relevance (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`,
   `LIVE_SUITE_RELEVANCE_CONTRACTS`): required live gates decide relevance from a
-  pinned trusted-base `live_suite_path_filter.py`, and governed live workflows
-  carry no workflow-level `paths:` filter. Extending the contract set is
+  pinned trusted-base `live_suite_path_filter.py` (Gateway API Conformance,
+  the mesh/multicluster/Ambient live gates, and the optional Istio status CAS
+  and CNI lifecycle suites), and governed live workflows carry no
+  workflow-level `paths:` filter. Extending the contract set is
   direct-to-`main`. `NodeWaypoint eBPF Live`, `Istio Status CAS Live`, and
   `CNI Lifecycle Live` are not branch-protection-required; never add them to
   `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`. →
