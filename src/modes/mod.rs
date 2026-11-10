@@ -226,7 +226,7 @@ pub(crate) fn start_acme_renewal_scheduler(
             );
             return None;
         };
-        crate::tls::acme::start_renewal_scheduler(
+        let handle = crate::tls::acme::start_renewal_scheduler(
             crate::tls::acme::AcmeRenewalSchedulerConfig {
                 enabled: true,
                 renew_when_remaining_days: env_config.acme_renew_when_remaining_days,
@@ -239,7 +239,14 @@ pub(crate) fn start_acme_renewal_scheduler(
                 dns_cache,
             },
             shutdown_rx,
-        )
+        );
+        if handle.is_some() {
+            info!(
+                challenge_type = challenge_type.as_str(),
+                "ACME renewal scheduler started"
+            );
+        }
+        handle
     }
 }
 

@@ -2739,7 +2739,7 @@ impl AcmeRenewalChallengeType {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Http01 => "http01",
             Self::TlsAlpn01 => "tls_alpn01",
