@@ -18,8 +18,8 @@
 //! - **Plain flavor — request body streamed via an mpsc bridge.**
 //!   `reqwest::Body::wrap_stream` requires a `'static + Send + Sync`
 //!   stream, which cannot directly hold a `&mut RequestStream` borrow.
-//!   The bridge uses a `tokio::sync::mpsc` channel: one task (inlined via
-//!   `tokio::join!`) reads `RequestStream::recv_data()` and pushes `Bytes`
+//!   The bridge uses a `tokio::sync::mpsc` channel: a reader future polled in
+//!   the dispatch `select!` loop reads `RequestStream::recv_data()` and pushes `Bytes`
 //!   chunks into the Sender; the `Receiver` is wrapped via
 //!   `stream::unfold` and handed to `Body::wrap_stream` (the Receiver
 //!   owns its own state and is `'static`). Backpressure is provided by
@@ -27,9 +27,9 @@
 //!   `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY`, default 32). When the H3
 //!   recv half is drained OR the backend cancels, both sides unwind
 //!   cleanly without a dangling task. If the caller pre-buffered the
-//!   body (plugin phase already collected it), the buffered bytes are
-//!   passed to reqwest directly via `Body::from(Vec<u8>)` — one
-//!   allocation, no bridge.
+//!   body (plugin phase already collected it), the buffered bytes ride the
+//!   gateway-owned buffered-upload write-watermark pump
+//!   (`install_buffered_upload_write_watermark`) instead of the bridge.
 //!
 //! - **gRPC flavor — duplex streaming when replay is unnecessary.**
 //!   With no retry, request/response body buffering, or pre-buffered body, the
@@ -42,7 +42,7 @@
 //!
 //! - **Size limits.** The Plain path enforces `max_request_body_size_bytes`
 //!   inline in the streaming reader (413 on overflow mid-stream — a shared
-//!   `AtomicBool` signals the post-join branch so the reqwest stream error
+//!   `AtomicBool` signals the dispatch loop so the reqwest stream error
 //!   isn't misclassified as 502). Streaming gRPC enforces
 //!   `max_grpc_recv_size_bytes` incrementally in `GrpcBody::Channel`; buffered
 //!   gRPC enforces the same ceiling in `drain_h3_body`.
@@ -11602,7 +11602,7 @@ fn normalized_h3_grpc_deadline() -> crate::proxy::NormalizedRejectResponse {
 // ---------------------------------------------------------------------------
 // Streaming response writers — one per backend body type. Both implement
 // the same coalesce-min / coalesce-max / flush-interval window as the
-// native H3 pool write loop (server.rs:1339-1418), so operators see the
+// native H3 pool write loop in `server.rs`, so operators see the
 // same QUIC-level frame cadence across H3-pool and cross-protocol paths.
 // ---------------------------------------------------------------------------
 
@@ -13669,10 +13669,7 @@ where
     })
 }
 
-/// Handle a `PluginResult::Reject` from `on_final_request_body` by
-/// emitting the right wire format for the flavor: trailers-only gRPC for
-/// Grpc, HTTP + headers for Plain, 501 is never reached (WebSocket is
-/// rejected upstream).
+/// Byte and timing accounting carried into a final-body reject write.
 struct RejectWriteAccounting {
     backend_start: Instant,
     bytes_sent: u64,
@@ -14013,6 +14010,10 @@ enum FinalRejectHooks {
     ChargedAfterDecoratedHead,
 }
 
+/// Handle a `PluginResult::Reject` from `on_final_request_body` by
+/// emitting the right wire format for the flavor: trailers-only gRPC for
+/// Grpc, HTTP + headers for Plain, 501 is never reached (WebSocket is
+/// rejected upstream).
 #[allow(clippy::too_many_arguments)]
 async fn write_final_body_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -14560,21 +14561,6 @@ mod pool_client_fault {
     }
 }
 
-/// Extract a plugin reject body into a gRPC-safe header value for the H3
-/// test path. Reuses the shared H1/H2 JSON/body extraction logic, then
-/// strips bytes `HeaderValue::from_str` rejects on this response path.
-#[cfg(test)]
-fn reject_body_as_h3_grpc_message(body: &[u8], status: StatusCode) -> String {
-    crate::proxy::extract_grpc_reject_message(body)
-        .map(|message| sanitize_h3_grpc_message_for_header(&message))
-        .filter(|message| !message.is_empty())
-        .unwrap_or_else(|| {
-            sanitize_h3_grpc_message_for_header(
-                status.canonical_reason().unwrap_or("Request rejected"),
-            )
-        })
-}
-
 /// Keep H3 `grpc-message` header values builder-safe by normalizing CR/LF
 /// to spaces and dropping NUL bytes before trim. `HeaderValue::from_str`
 /// accepts UTF-8 here, so we do not strip non-ASCII.
@@ -14907,10 +14893,11 @@ where
     })
 }
 
-/// Small helper duplicated from `proxy/mod.rs::parse_reqwest_method` to
-/// keep this module self-contained without promoting the original to
-/// `pub(crate)` (it's a hot-path leaf function that benefits from being
-/// inlined inside its home module).
+/// Local counterpart of `proxy/mod.rs::parse_reqwest_method` (returning
+/// `Option` rather than `Result`), kept here so this module stays
+/// self-contained without promoting the original to `pub(crate)` (it's a
+/// hot-path leaf function that benefits from being inlined inside its home
+/// module).
 fn parse_reqwest_method(method: &str) -> Option<reqwest::Method> {
     match method {
         "GET" => Some(reqwest::Method::GET),
@@ -14992,9 +14979,8 @@ mod tests {
         apply_h3_grpc_reject_metadata, build_h3_grpc_backend_headers, build_plain_request_builder,
         cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
         normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
-        record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
-        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
-        should_skip_cross_protocol_backend_header,
+        record_cross_protocol_connection_start, sanitize_h3_grpc_message_for_header,
+        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
     use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy, UpstreamTarget};
@@ -15174,15 +15160,6 @@ mod tests {
     fn h3_grpc_message_sanitizer_strips_invalid_header_bytes() {
         assert_eq!(
             sanitize_h3_grpc_message_for_header("  bad\r\n\0message  "),
-            "bad  message"
-        );
-    }
-
-    #[test]
-    fn h3_grpc_reject_body_message_is_header_safe() {
-        let body = br#"{"message":"bad\r\n\u0000message"}"#;
-        assert_eq!(
-            reject_body_as_h3_grpc_message(body, StatusCode::BAD_REQUEST),
             "bad  message"
         );
     }
@@ -15376,250 +15353,6 @@ mod tests {
                 .get("x-frame-options")
                 .map(|value| value.as_str()),
             Some("SAMEORIGIN")
-        );
-    }
-
-    /// Regression test for the cross-protocol `select!` race: when the
-    /// backend resolves before the request-body reader finishes, the
-    /// reader must be notified (not dropped mid-stream). This mirrors
-    /// the `halt_notify` + drain + timeout loop in `dispatch_plain`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn backend_early_response_notifies_reader_instead_of_dropping_it() {
-        use std::pin::pin;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-        use tokio::sync::Notify;
-
-        let halt_notify = Arc::new(Notify::new());
-        let reader_halted = Arc::new(AtomicBool::new(false));
-
-        let reader_halt = Arc::clone(&halt_notify);
-        let reader_flag = Arc::clone(&reader_halted);
-        let reader_future = async move {
-            tokio::select! {
-                biased;
-                _ = reader_halt.notified() => {
-                    reader_flag.store(true, Ordering::Release);
-                }
-                () = std::future::pending::<()>() => {}
-            }
-        };
-
-        // Simulates `send_future` completing first (backend responded
-        // while the client was still uploading). Kept at 1 ms so the
-        // reader_future loses the race deterministically on the same
-        // runtime without needing `tokio::test(start_paused)`.
-        let send_future = async {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            "ok"
-        };
-
-        let drain_ms = 5_u64;
-        let result: &str = {
-            let mut send_future = pin!(send_future);
-            let mut reader_future = pin!(reader_future);
-            let mut reader_done = false;
-            loop {
-                tokio::select! {
-                    result = &mut send_future => {
-                        if !reader_done {
-                            if drain_ms > 0 {
-                                let drain_deadline = Duration::from_millis(drain_ms);
-                                if let Ok(()) = tokio::time::timeout(
-                                    drain_deadline,
-                                    &mut reader_future,
-                                ).await {
-                                    reader_done = true;
-                                }
-                            }
-                            if !reader_done {
-                                halt_notify.notify_one();
-                                let halt_deadline = Duration::from_millis(100);
-                                let _ = tokio::time::timeout(
-                                    halt_deadline,
-                                    &mut reader_future,
-                                ).await;
-                            }
-                        }
-                        break result;
-                    }
-                    _ = &mut reader_future, if !reader_done => {
-                        reader_done = true;
-                    }
-                }
-            }
-        };
-
-        assert_eq!(result, "ok");
-        assert!(
-            reader_halted.load(Ordering::Acquire),
-            "reader must be notified and halted when backend wins the race"
-        );
-    }
-
-    /// Regression test for the backpressure-parked reader: even when
-    /// the reader is wedged inside an uncancellable region (modelling
-    /// `tx.send().await` blocking on a full mpsc channel after reqwest
-    /// stopped draining once the backend response arrived), the
-    /// bridge must still call `halt_request_body` after dropping the
-    /// reader future. Without the post-bridge halt the recv half
-    /// surfaces as RESET_STREAM(0x0) on the QUIC wire — the exact
-    /// failure mode this PR removes from the early-response paths.
-    ///
-    /// Real time (no `start_paused`), although the dev-dependency tokio
-    /// enables `test-util`. Drain + halt deadlines are kept short
-    /// (10 ms each) so the test runs in well under 100 ms while still
-    /// giving the reader_future a deterministic chance to stay wedged.
-    #[tokio::test(flavor = "current_thread")]
-    async fn parked_reader_still_halts_after_reader_future_dropped() {
-        use std::pin::pin;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-
-        // 1 s sleep with no halt-observing branch — guaranteed to
-        // outlast the 10 + 10 ms drain + halt deadlines and not
-        // short-circuit on halt_notify. This is what a `tx.send()`
-        // parked on a full mpsc channel looks like to the bridge:
-        // an opaque, uncancellable await.
-        let reader_future = async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
-
-        let send_future = async {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            Ok::<&'static str, &'static str>("ok")
-        };
-
-        let post_bridge_halted = Arc::new(AtomicBool::new(false));
-        let post_bridge_halted_clone = Arc::clone(&post_bridge_halted);
-        let halt_notify = Arc::new(tokio::sync::Notify::new());
-        let drain_ms = 10_u64;
-        let halt_deadline_ms = 10_u64;
-        let result = {
-            let mut send_future = pin!(send_future);
-            let mut reader_future = pin!(reader_future);
-            let mut reader_done = false;
-            let outcome = loop {
-                tokio::select! {
-                    result = &mut send_future => {
-                        if !reader_done {
-                            let backend_succeeded = result.is_ok();
-                            if backend_succeeded && drain_ms > 0 {
-                                let drain_deadline = Duration::from_millis(drain_ms);
-                                if let Ok(()) = tokio::time::timeout(
-                                    drain_deadline,
-                                    &mut reader_future,
-                                ).await {
-                                    reader_done = true;
-                                }
-                            }
-                            if !reader_done {
-                                halt_notify.notify_one();
-                                let halt_deadline = Duration::from_millis(halt_deadline_ms);
-                                let _ = tokio::time::timeout(
-                                    halt_deadline,
-                                    &mut reader_future,
-                                ).await;
-                            }
-                        }
-                        break result;
-                    }
-                    _ = &mut reader_future, if !reader_done => {
-                        reader_done = true;
-                    }
-                }
-            };
-            // Models the post-bridge `halt_request_body(stream)` call.
-            // Reachable only after the pinned reader_future is dropped
-            // — i.e. after stream's mutable borrow is released.
-            post_bridge_halted_clone.store(true, Ordering::Release);
-            outcome
-        };
-
-        assert_eq!(result, Ok("ok"));
-        assert!(
-            post_bridge_halted.load(Ordering::Acquire),
-            "halt_request_body must run after the reader future is dropped, \
-             even when the reader was wedged in an uncancellable region"
-        );
-    }
-
-    /// Regression test for the doc promise that error responses halt
-    /// immediately. When `send_future` returns Err, the bridge must
-    /// skip the FERRUM_H3_REQUEST_BODY_DRAIN_MS courtesy window and
-    /// notify halt right away — otherwise backend transport failures
-    /// pay up to the configured drain budget in extra latency before
-    /// the 502 is written. The witness flag captures whether the
-    /// drain branch ran; timing is intentionally not asserted because
-    /// the test runs on real time, where the comparison would be flaky.
-    #[tokio::test(flavor = "current_thread")]
-    async fn backend_error_skips_drain_window() {
-        use std::pin::pin;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-        use tokio::sync::Notify;
-
-        let halt_notify = Arc::new(Notify::new());
-        let drain_was_applied = Arc::new(AtomicBool::new(false));
-
-        // Reader that responds to halt_notify promptly so the halt
-        // deadline can resolve cleanly inside the test.
-        let reader_halt = Arc::clone(&halt_notify);
-        let reader_future = async move {
-            reader_halt.notified().await;
-        };
-
-        // send_future immediately returns an Err — backend transport
-        // failure case (BAD_GATEWAY).
-        let send_future = async { Err::<&'static str, &'static str>("backend down") };
-
-        // Use a generous drain budget so we'd notice if it ran.
-        let drain_ms = 500_u64;
-        let drain_witness = Arc::clone(&drain_was_applied);
-        let result = {
-            let mut send_future = pin!(send_future);
-            let mut reader_future = pin!(reader_future);
-            let mut reader_done = false;
-            loop {
-                tokio::select! {
-                    result = &mut send_future => {
-                        if !reader_done {
-                            let backend_succeeded = result.is_ok();
-                            if backend_succeeded && drain_ms > 0 {
-                                drain_witness.store(true, Ordering::Release);
-                                let drain_deadline = Duration::from_millis(drain_ms);
-                                if let Ok(()) = tokio::time::timeout(
-                                    drain_deadline,
-                                    &mut reader_future,
-                                ).await {
-                                    reader_done = true;
-                                }
-                            }
-                            if !reader_done {
-                                halt_notify.notify_one();
-                                let halt_deadline = Duration::from_millis(50);
-                                let _ = tokio::time::timeout(
-                                    halt_deadline,
-                                    &mut reader_future,
-                                ).await;
-                            }
-                        }
-                        break result;
-                    }
-                    _ = &mut reader_future, if !reader_done => {
-                        reader_done = true;
-                    }
-                }
-            }
-        };
-
-        assert_eq!(result, Err("backend down"));
-        assert!(
-            !drain_was_applied.load(Ordering::Acquire),
-            "drain window must be skipped when backend returns Err"
         );
     }
 

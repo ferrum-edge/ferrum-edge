@@ -1415,8 +1415,7 @@ pub struct StreamListenerManager {
     node_waypoint_udp_listener_generation: AtomicU64,
     /// Serving-owner fence: shutdown clears this under the listener-map lock
     /// before retracting so a bind-success watcher cannot republish after
-    /// teardown. Lock order is listener map, then the steering mutex; a
-    /// listener task joined under the map lock must not await that map.
+    /// teardown. Lock order is listener map, then the steering mutex.
     node_waypoint_udp_steering_open: Arc<AtomicBool>,
     /// Test fence: bind-watch after `started`, before the listener-map lock.
     node_waypoint_udp_steer_before_map_hold:
@@ -1497,73 +1496,6 @@ pub struct StreamListenerManager {
 impl StreamListenerManager {
     #[allow(dead_code, clippy::too_many_arguments)]
     pub fn new(
-        bind_addr: IpAddr,
-        config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
-        dns_cache: DnsCache,
-        request_epoch: Arc<RequestEpochStore>,
-        circuit_breaker_cache: Arc<CircuitBreakerCache>,
-        frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
-        tls_no_verify: bool,
-        tls_ca_bundle_path: Option<String>,
-        tcp_idle_timeout_seconds: u64,
-        tcp_half_close_max_wait_seconds: u64,
-        frontend_tls_handshake_timeout_seconds: u64,
-        udp_max_sessions: usize,
-        udp_cleanup_interval_seconds: u64,
-        tls_policy: Option<Arc<TlsPolicy>>,
-        crls: crate::tls::CrlList,
-        adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
-        udp_recvmmsg_batch_size: usize,
-        tcp_fastopen_enabled: bool,
-        tcp_listen_backlog: u32,
-        accept_threads: usize,
-        tcp_fastopen_queue_len: u16,
-        overload: Arc<crate::overload::OverloadState>,
-        ktls_enabled: bool,
-        io_uring_splice_enabled: bool,
-        record_mesh_mtls_metric: bool,
-        so_busy_poll_us: u32,
-        udp_gro_enabled: bool,
-        udp_gso_enabled: bool,
-        udp_pktinfo_enabled: bool,
-        trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
-    ) -> Self {
-        Self::new_with_epoch(
-            bind_addr,
-            config,
-            dns_cache,
-            request_epoch,
-            circuit_breaker_cache,
-            frontend_tls_config,
-            tls_no_verify,
-            tls_ca_bundle_path,
-            tcp_idle_timeout_seconds,
-            tcp_half_close_max_wait_seconds,
-            frontend_tls_handshake_timeout_seconds,
-            udp_max_sessions,
-            udp_cleanup_interval_seconds,
-            tls_policy,
-            crls,
-            adaptive_buffer,
-            udp_recvmmsg_batch_size,
-            tcp_fastopen_enabled,
-            tcp_listen_backlog,
-            accept_threads,
-            tcp_fastopen_queue_len,
-            overload,
-            ktls_enabled,
-            io_uring_splice_enabled,
-            record_mesh_mtls_metric,
-            so_busy_poll_us,
-            udp_gro_enabled,
-            udp_gso_enabled,
-            udp_pktinfo_enabled,
-            trusted_proxies,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_epoch(
         bind_addr: IpAddr,
         config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
         dns_cache: DnsCache,
@@ -3780,10 +3712,10 @@ impl StreamListenerManager {
                         exited_for_exit.store(true, Ordering::Release);
                     }
                     if owner_for_exit && let Some(steering) = node_waypoint_udp_steering {
-                        // Do not await the listener map here: reconcile joins this
-                        // task while holding that lock. A helper observes the
-                        // non-serving mark and generation fence once the owner
-                        // releases.
+                        // Retract from a helper task so this listener task never
+                        // blocks its own exit on the listener map. The helper
+                        // observes the non-serving mark and generation fence once
+                        // the owner releases.
                         tokio::spawn(async move {
                             retract_owned_node_waypoint_udp_listener(
                                 &listeners_for_exit,
@@ -4768,9 +4700,9 @@ async fn await_stream_listener_shutdown(listener_key: &str, handle: ListenerHand
             join_handle.abort();
             // Bound the post-abort join too. Abort only takes effect at the
             // task's next await point, so a task wedged in synchronous code
-            // would otherwise hang this await — and reconcile holds the
-            // listeners mutex, so a single wedged listener would deadlock
-            // every future reconcile. Giving up here is safe: reconcile never
+            // would otherwise hang this await — and reconcile holds
+            // `reconcile_serial` across this await, so a single wedged listener
+            // would block every future reconcile. Giving up here is safe: reconcile never
             // crashes, and if the old socket is still held the replacement's
             // bind probe fails and skips only the conflicting proxy until the
             // next reconcile.

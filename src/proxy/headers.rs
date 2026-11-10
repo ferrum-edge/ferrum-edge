@@ -1917,7 +1917,7 @@ fn canonicalize_preserved_content_length(headers: &mut std::collections::HashMap
 /// on paths that replace or retranslate the body (native H3 gRPC streaming,
 /// gRPC-Web translation, stream inspectors, deadline replacement) use this only
 /// to drop a length that internal accounting must not read either — the
-/// gateway's own `content_length_header_value` captures happen *after* those
+/// gateway's own `preserved_response_content_length` captures happen *after* those
 /// omissions, and a stale backend length there would misclassify a truncated or
 /// retranslated body. It remains mandatory before
 /// [`ClientResponseFraming::Head`], which still preserves a valid value.
@@ -1941,10 +1941,9 @@ pub fn remove_content_length_header(headers: &mut std::collections::HashMap<Stri
 /// trimmed value is a `1*DIGIT` decimal that fits `u64`, and `None` for any
 /// status that forbids a message body.
 ///
-/// It is deliberately NOT [`content_length_header_value`], which returns the
-/// first `parse()`-able variant: that accepts a signed `+42` and silently picks
-/// one of several conflicting duplicates, neither of which may inform gateway
-/// truncation decisions.
+/// It deliberately does not return the first `parse()`-able variant: that would
+/// accept a signed `+42` and silently pick one of several conflicting
+/// duplicates, neither of which may inform gateway truncation decisions.
 pub fn preserved_response_content_length(
     headers: &std::collections::HashMap<String, String>,
     status: u16,
@@ -3662,7 +3661,7 @@ mod tests {
     fn intentional_content_length_omit_before_streaming_sanitize_drops_mixed_case() {
         // Paths that must omit length (H3 gRPC streaming, gRPC-Web translation,
         // inspectors, deadline replacement) strip first so the gateway's own
-        // `content_length_header_value` capture cannot read a stale backend
+        // `preserved_response_content_length` capture cannot read a stale backend
         // length; Streaming sanitization then drops any remaining variant.
         let mut headers = std::collections::HashMap::from([
             ("Content-Length".to_string(), "999".to_string()),

@@ -33,12 +33,13 @@
 //!    partially stripped carrier cannot silently downgrade h2c to HTTP/1.1.
 //!    h2c carries native gRPC over the socket with full request/response
 //!    streaming, deadlines, cancellation, and trailers, because it reuses the
-//!    sidecar mesh-mTLS dispatch body (see [`dial_unix_h2c_sender`]).
+//!    sidecar mesh-mTLS dispatch body (see [`handshake_unix_h2c_sender`]).
 //! 4. **Establishment is bounded, and it is the PEER's preface that ends it.**
 //!    hyper's h2c `handshake()` writes the client connection preface and never
 //!    reads, so it resolves against a peer that accepted the socket and then
-//!    went silent. [`dial_unix_h2c_sender`] therefore waits for the peer's own
-//!    initial `SETTINGS` frame (see `crate::proxy::h2c_preface`) and runs
+//!    went silent. [`handshake_unix_h2c_sender`] therefore waits for the peer's
+//!    own initial `SETTINGS` frame (see `crate::proxy::h2c_preface`), and the
+//!    pool's h2c checkout (`UnixBackendConnectionPool::checkout_h2c`) runs
 //!    admission, connect, handshake, and that wait inside ONE end-to-end
 //!    `backend_connect_timeout_ms` budget, so a wedged local app cannot pin a
 //!    request task that the caller supplied no deadline for.
@@ -710,13 +711,12 @@ pub async fn handshake_unix_h2c_sender(
 /// terminal-trailer forwarding are the SAME code on both transports and cannot
 /// drift apart.
 ///
-/// Production dispatch uses the pooled carrier in
-/// [`crate::proxy::unix_backend_pool`], whose cold path calls
-/// [`admit_and_connect`] + [`handshake_unix_h2c_sender`] directly so it can
-/// retain the admitted identity on the pooled entry. This 1:1 helper remains
-/// the focused admission/handshake compatibility surface for external unit
-/// tests that prove the connect-budget and SETTINGS-preface contracts without
-/// constructing a pool.
+/// Production dispatch never calls this: it uses the pooled carrier in
+/// [`crate::proxy::unix_backend_pool`], whose cold path admits the socket,
+/// calls [`connect_admitted`] + [`handshake_unix_h2c_sender`] directly so it
+/// can retain the admitted identity on the pooled entry, and owns the driver.
+/// This unpooled 1:1 helper exists only for external unit tests that prove the
+/// connect-budget and SETTINGS-preface contracts without constructing a pool.
 #[cfg(unix)]
 #[allow(dead_code)] // External unit tests call this; the binary/pool cold path uses the split primitives.
 pub async fn dial_unix_h2c_sender(
@@ -739,17 +739,4 @@ pub async fn dial_unix_h2c_sender(
     let (sender, driver) = handshake_unix_h2c_sender(stream, deadline, timeout_ms).await?;
     tokio::spawn(driver);
     Ok(sender)
-}
-
-/// Non-Unix build: there is no Unix-domain socket to dial, so the shared
-/// dispatch body refuses instead of losing the transport gate at compile time.
-/// Sidecar mesh deployments are Linux-only, so this is unreachable in practice.
-#[cfg(not(unix))]
-pub async fn dial_unix_h2c_sender(
-    _path: &str,
-    _connect_timeout_ms: u64,
-    _allowed_roots: &[String],
-    _allowed_uids: &[u32],
-) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
-    Err(UnixBackendError::PlatformUnsupported)
 }

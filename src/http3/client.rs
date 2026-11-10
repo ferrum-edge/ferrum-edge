@@ -812,9 +812,8 @@ pub(crate) fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
 /// Map an h3 [`StreamError`](h3::error::StreamError) returned by
 /// `recv_response()` into the corresponding [`H3PoolError`] variant.
 ///
-/// Centralises the four identical `.map_err` closures across the pool's
-/// inner request helpers (`do_request`, `do_request_streaming`,
-/// `do_request_streaming_body`, `do_request_streaming_incoming_body`) so
+/// Centralises the mapping for the pool's response-head readers
+/// (`recv_h3_response_with_timeout` and `recv_h3_backend_response_head`) so
 /// the graceful-close detection cannot drift between sites on future
 /// edits.
 ///
@@ -2828,7 +2827,6 @@ impl Http3ConnectionPool {
     ///
     /// Round-robins across `connections_per_backend` connections to distribute
     /// QUIC frame processing across multiple driver tasks.
-    /// Send an HTTP/3 request, reusing a cached QUIC connection if available.
     ///
     /// The `tls_config_fn` closure is only called on cache miss (when a new
     /// QUIC connection must be established), avoiding the overhead of cloning
@@ -3548,7 +3546,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -3673,7 +3670,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -3791,7 +3787,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -3958,7 +3953,6 @@ impl Http3ConnectionPool {
     #[allow(clippy::too_many_arguments)]
     async fn do_open_bidi_backend_stream(
         send_request: &mut H3SendRequest,
-        proxy: &Proxy,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -3969,7 +3963,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -4020,7 +4013,6 @@ impl Http3ConnectionPool {
             let mut sr = pooled.send_request;
             match Self::do_open_bidi_backend_stream(
                 &mut sr,
-                proxy,
                 method,
                 backend_url,
                 headers,
@@ -4085,7 +4077,6 @@ impl Http3ConnectionPool {
         let mut sr_for_request = pooled.send_request;
         Self::do_open_bidi_backend_stream(
             &mut sr_for_request,
-            proxy,
             method,
             backend_url,
             headers,
@@ -4134,7 +4125,6 @@ impl Http3ConnectionPool {
             let mut sr = pooled.send_request;
             match Self::do_open_bidi_backend_stream(
                 &mut sr,
-                proxy,
                 method,
                 backend_url,
                 headers,
@@ -4204,7 +4194,6 @@ impl Http3ConnectionPool {
         let mut sr_for_request = pooled.send_request;
         Self::do_open_bidi_backend_stream(
             &mut sr_for_request,
-            proxy,
             method,
             backend_url,
             headers,
@@ -4248,7 +4237,6 @@ impl Http3ConnectionPool {
     ) -> Result<H3StreamingResponse, (H3PoolError, Option<Incoming>)> {
         let backend_stream = match Self::open_streaming_incoming_backend_stream(
             send_request,
-            proxy,
             method,
             backend_url,
             headers,
@@ -4282,7 +4270,6 @@ impl Http3ConnectionPool {
     /// fails.
     async fn open_streaming_incoming_backend_stream(
         send_request: &mut H3SendRequest,
-        proxy: &Proxy,
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
@@ -4292,7 +4279,6 @@ impl Http3ConnectionPool {
             .parse()
             .map_err(|e| H3PoolError::pre_wire(anyhow::anyhow!("Invalid backend URL: {}", e)))?;
 
-        let _host = uri.host().unwrap_or(&proxy.backend_host);
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req_method: http::Method = method.parse().map_err(|_| {
@@ -5073,7 +5059,8 @@ impl Http3ConnectionPool {
     }
 
     /// Send an HTTP/3 request, returning headers and a stream handle for the
-    /// response body. Same pool key / fallback / reconnect logic as `request()`.
+    /// response body. Same pool key / fallback / reconnect logic as the
+    /// buffered `request()` path.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_streaming_under_authorization<TlsFut>(
         &self,

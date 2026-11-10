@@ -45,9 +45,10 @@
 //!
 //! Linux-only (`setns`, `/proc/<pid>/ns/net`); non-Linux targets compile to a
 //! stub that reports unsupported. The reconcile bookkeeping and the registry
-//! parser are unit-tested with a mock backend; the `setns`/`bind` path and the
-//! full pod-loopback datapath are **not** unit- or CI-testable (they need a live
-//! multi-pod node) and are exercised only in a real cluster. Always on for
+//! parser are unit-tested with a mock backend; the `setns`/`bind` primitive is
+//! exercised by the privileged `live_netns_tests` module below (CI job
+//! `netns-capture-live`). The full eBPF-redirected pod-loopback datapath needs a
+//! live cluster (`node-waypoint-ebpf-live`). Always on for
 //! NodeWaypoint topology; the registry directory path is configurable via
 //! `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
 
@@ -1225,7 +1226,6 @@ impl NetnsBackend for ProxyNetnsBackend {
                 conn_semaphore,
                 stop_rx,
                 mesh_direction,
-                0,
                 SourceIpOverride::Dynamic(source_ip_rx),
                 Some(expected_pod_uid),
                 None,

@@ -41,9 +41,9 @@
 //! by construction. Passive-health/outlier
 //! recording is intentionally absent, matching the stream-proxy paths (raw
 //! TCP has no response status to classify); HBONE connection failures still
-//! feed the HBONE relay failure metric, and both transports feed the LB's
-//! least-connection accounting. A transport-labelled raw-TCP egress connection
-//! counter is a planned observability follow-up.
+//! feed the HBONE relay failure metric, both transports feed the LB's
+//! least-connection accounting, and every relayed connection increments
+//! `ferrum_mesh_tcp_egress_connections_total{transport,result}`.
 
 use std::sync::Arc;
 

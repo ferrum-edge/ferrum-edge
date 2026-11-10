@@ -1116,37 +1116,8 @@ impl GrpcConnectionPool {
         });
     }
 
-    /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
-    /// Adding fields causes pool fragmentation and P95 latency regressions.
-    /// See `ConnectionPool::create_pool_key` for detailed rationale.
-    ///
-    /// Includes all fields that affect connection *identity*: destination,
-    /// TLS mode, DNS override, CA cert, mTLS client cert, and server cert verification.
-    /// Uses `|` as field delimiter to avoid ambiguity with `:` in IPv6 addresses.
-    ///
-    /// Writes the base key (without shard suffix) into `buf`. For shard keys,
-    /// `write_shard_key_inplace()` appends `#N` by truncating to the base length.
-    ///
-    /// Not called directly after the thread-local buffer refactor (the free
-    /// function `with_grpc_pool_key` calls `write_grpc_pool_key` instead),
-    /// but retained for parity with the HTTP2 pool's internal API surface.
-    #[allow(dead_code)]
-    fn write_pool_key(buf: &mut String, proxy: &Proxy) {
-        write_grpc_pool_key(
-            buf,
-            &proxy.backend_host,
-            proxy.backend_port,
-            proxy,
-            &PoolConfig::default(),
-            proxy.resolved_tls.client_cert_path.as_deref(),
-            proxy.resolved_tls.client_key_path.as_deref(),
-            None,
-        );
-    }
-
-    /// Allocating version of the pool key — only used for warmup deduplication
-    /// where the key must outlive the thread-local buffer. Currently unused
-    /// post-refactor (gRPC pool warms lazily); retained for future re-enablement.
+    /// Allocating version of the pool key, used by [`Self::pool_key_for_warmup`]
+    /// where the key must outlive the thread-local buffer.
     #[allow(dead_code)]
     fn pool_key_owned(proxy: &Proxy) -> String {
         grpc_pool_key_owned(proxy, None, &PoolConfig::default())
@@ -5302,7 +5273,7 @@ pub fn grpc_buffered_body_capacity_hint(headers: &hyper::HeaderMap) -> usize {
 /// Streaming gRPC response — headers received, body streams frame-by-frame with trailers.
 ///
 /// The `body` field is an `Incoming` body from hyper. When passed through as
-/// a `CoalescingH2Body`, hyper's HTTP/2 server forwards coalesced DATA frames
+/// a `Coalescing<S>` body, hyper's HTTP/2 server forwards coalesced DATA frames
 /// and TRAILERS frames to the downstream client as they arrive,
 /// preserving gRPC streaming semantics without buffering the full response.
 pub struct GrpcStreamingResponse {
@@ -6728,7 +6699,7 @@ pub(crate) async fn proxy_grpc_request_core(
     );
 
     // Streaming mode: return the live Incoming body without buffering.
-    // The caller (mod.rs) wraps it in CoalescingH2Body so hyper
+    // The caller (mod.rs) wraps it in a `Coalescing<S>` body so hyper
     // forwards DATA frames and TRAILERS to the downstream client as they arrive.
     if stream_response {
         return Ok(GrpcResponseKind::Streaming(GrpcStreamingResponse {
@@ -7041,11 +7012,6 @@ pub(crate) fn buffered_grpc_trailers_to_header_map(
     trailers
 }
 
-/// Check if a request is a gRPC request based on content-type.
-pub fn is_grpc_request(req: &Request<Incoming>) -> bool {
-    is_grpc_content_type(req.headers())
-}
-
 /// Check if headers indicate a native gRPC request.
 ///
 /// Delegates to the canonical [`super::backend_dispatch::is_native_grpc_content_type`]
@@ -7232,12 +7198,6 @@ pub(crate) fn streaming_post_header_upload_timeout_ms_after_proxy_headers(
 #[cfg(test)]
 mod tests {
     //! Inline tests for private internals of the gRPC proxy.
-    //!
-    //! These guard the specific changes in
-    //! `perf/h2-pool-sender-ready-and-grpc-trailer-stall`:
-    //! * Fix 3: the buffered-response `Vec<u8>` starting capacity moved
-    //!   from `unwrap_or(256)` to a 16 KiB default so that large responses
-    //!   with no `content-length` stop hitting ~14 reallocations.
 
     // -----------------------------------------------------------------------
     // GRPC_POOL_KEY_BUF thread-local helper tests
@@ -7676,112 +7636,16 @@ mod tests {
         );
     }
 
-    /// Fix 3: source-level assertion that the pathological
-    /// `unwrap_or(256)` default on buffered body collection is gone.
-    ///
-    /// Why: a 5 MB gRPC response with no `content-length` header grew
-    /// from 256 bytes via doubling, hitting ~14 reallocations and
-    /// ~14 memcpys of ever-larger prefixes — visible in the HTTP/2
-    /// large-payload benchmark.
-    ///
-    /// We assert that the constant `DEFAULT_GRPC_BUFFERED_CAPACITY` is
-    /// present AND that it is ≥ 16 KiB. Combined these catch both a
-    /// revert to `256` and an accidental drop in default size.
+    /// The buffered-response collector's starting capacity for a response with
+    /// no `content-length` must not regress to the old 256-byte default: a
+    /// 5 MB gRPC response would then grow through ~14 reallocations.
     #[test]
     fn grpc_buffered_default_capacity_is_not_tiny() {
-        let src = include_str!("grpc_proxy.rs");
-        // Token the constant declaration lives on — see Fix 3 edit.
-        assert!(
-            src.contains("DEFAULT_GRPC_BUFFERED_CAPACITY"),
-            "expected DEFAULT_GRPC_BUFFERED_CAPACITY constant in grpc_proxy.rs \
-             — Fix 3 introduced this to replace the 256-byte default."
-        );
-
-        // Find the literal line and parse out the numeric value. We
-        // accept any reasonable size ≥ 16 KiB (16 * 1024 = 16384).
-        let line = src
-            .lines()
-            .find(|l| l.contains("DEFAULT_GRPC_BUFFERED_CAPACITY") && l.contains(":"))
-            .expect("const declaration line not found");
-        // Simple heuristic: reject values equal to or lower than the
-        // regressed default (256). This keeps the test tolerant to
-        // style changes (e.g., `16 * 1024` vs `16_384` vs `16384`).
-        assert!(
-            !line.contains("= 256"),
-            "regression: DEFAULT_GRPC_BUFFERED_CAPACITY reverted to 256 — \
-             large streaming responses will hit >10 reallocations"
-        );
-    }
-
-    /// Fix 3: 5 MB worth of `extend_from_slice` on a `Vec` pre-sized at
-    /// 16 KiB should grow through only ~9 reallocations
-    /// (16K → 32K → 64K → ... → 8M = 10 doublings from 16K to 16M).
-    /// Pre-sizing at 256 instead would take ~15 doublings, which is the
-    /// pattern we are preventing.
-    ///
-    /// We can't observe `Vec`'s internal realloc count directly, but we
-    /// can assert that the final `capacity()` is within `2×` of the
-    /// actual filled size — which holds for `amortised doubling` when
-    /// the initial capacity is appropriate.
-    #[test]
-    fn five_mb_vec_growth_from_16k_default_is_within_two_x_capacity() {
-        const DEFAULT_GRPC_BUFFERED_CAPACITY: usize = 16 * 1024;
-        let mut v: Vec<u8> = Vec::with_capacity(DEFAULT_GRPC_BUFFERED_CAPACITY);
-
-        // Fill with 64 KiB frames (realistic gRPC backend frame size)
-        // until we reach ~5 MB.
-        let frame = vec![0u8; 64 * 1024];
-        let target = 5 * 1024 * 1024;
-        while v.len() < target {
-            v.extend_from_slice(&frame);
-        }
-
-        let cap = v.capacity();
-        let len = v.len();
-        assert!(
-            cap <= len * 2,
-            "vec grew to capacity={} with len={} — final capacity should be \
-             within 2x of filled size under amortised doubling from 16 KiB start \
-             (regression would be cap >> 2*len)",
-            cap,
-            len
-        );
-        // Also guard that we are not starting from a pathologically
-        // small capacity (Vec::extend_from_slice could in theory
-        // jump straight to the exact size, but in practice doubling
-        // dominates). Final cap must be at least `len` — trivially
-        // true — and at least the starting pre-size.
-        assert!(cap >= DEFAULT_GRPC_BUFFERED_CAPACITY);
-    }
-
-    /// Fix 3: same growth test starting from the OLD pathological 256
-    /// default. This encodes the "before" state so a future reader can
-    /// see the magnitude of the waste. The `capacity()` assertion is
-    /// loose — we only demand that the final buffer is large enough
-    /// to hold the data, because under 256-start the growth pattern
-    /// still terminates at a power-of-2 cap ≥ len.
-    #[test]
-    fn five_mb_vec_growth_from_256_default_is_wasteful() {
-        let mut v: Vec<u8> = Vec::with_capacity(256);
-        let frame = vec![0u8; 64 * 1024];
-        let target = 5 * 1024 * 1024;
-        let mut grow_events = 0usize;
-        let mut last_cap = v.capacity();
-        while v.len() < target {
-            v.extend_from_slice(&frame);
-            if v.capacity() != last_cap {
-                grow_events += 1;
-                last_cap = v.capacity();
-            }
-        }
-        // Starting from 256 we expect ≥ 10 grow events to reach 5 MB
-        // (256 → 512 → 1K → 2K → 4K → 8K → 16K → 32K → 64K → 128K → ... → 8M).
-        // The 16 KiB default eliminates the first ~6 of those.
-        assert!(
-            grow_events >= 7,
-            "expected many realloc events from 256 starting cap, got {} \
-             — this test documents the regression we are fixing, not the fix",
-            grow_events
+        const _: () = assert!(DEFAULT_GRPC_BUFFERED_CAPACITY >= 16 * 1024);
+        assert_eq!(
+            grpc_buffered_body_capacity_hint(&hyper::HeaderMap::new()),
+            DEFAULT_GRPC_BUFFERED_CAPACITY,
+            "a response without content-length must preallocate the default capacity"
         );
     }
 

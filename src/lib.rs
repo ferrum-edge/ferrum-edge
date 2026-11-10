@@ -17914,7 +17914,7 @@ pub mod _test_support {
         crate::proxy::inbound_request_declares_body(ctx)
     }
 
-    /// The exact replay-safety gate `proxy_to_backend_inner` applies at the top
+    /// The exact replay-safety gate `handle_proxy_request_inner` applies at the top
     /// of its retry loop, covering the mesh, native-H3, and reqwest replay
     /// transports. `false` means the loop refuses to replay and surfaces the
     /// original backend failure instead.

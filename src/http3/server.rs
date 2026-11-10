@@ -931,42 +931,6 @@ pub struct Http3FrontendTlsReload {
     pub revision_rx: tokio::sync::watch::Receiver<u64>,
 }
 
-/// Start the HTTP/3 (QUIC) proxy listener.
-///
-/// HTTP/3 (QUIC) mandates TLS 1.3. If the provided TLS policy does not include
-/// TLS 1.3, this function will override it to force TLS 1.3 for the QUIC listener
-/// and log a warning.
-#[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
-#[allow(clippy::too_many_arguments)]
-pub async fn start_http3_listener(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Arc<rustls::ServerConfig>,
-    h3_config: Http3ServerConfig,
-    tls_policy: &TlsPolicy,
-    client_ca_bundle_path: Option<String>,
-    client_crls: CrlList,
-) -> Result<(), anyhow::Error> {
-    start_http3_listener_with_signal(
-        addr,
-        state,
-        shutdown,
-        tls_config,
-        h3_config,
-        tls_policy,
-        Http3ListenerOptions {
-            client_ca_bundle_path,
-            client_crls,
-            started_tx: None,
-            accept_gate: None,
-            frontend_tls_reload: None,
-            udp_port_hold: None,
-        },
-    )
-    .await
-}
-
 /// Load the configured client-CA bundle and CRLs into one coherent
 /// [`crate::tls::AcceptedClientTrust`] (issue #3857).
 ///
@@ -12689,7 +12653,6 @@ pub(crate) fn finalize_h3_response_gateway_headers(
     owned
 }
 
-/// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
 /// Inject a sticky-session `Set-Cookie` header when the LB strategy is
 /// cookie-based and the response must (re)bind the client to a backend.
 ///
@@ -12781,6 +12744,7 @@ fn h3_connection_error(
         )
 }
 
+/// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
 fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::ErrorClass {
     if e.authorization_expiry().is_some() || e.client_deadline_expired() {
         return crate::retry::ErrorClass::ClientDisconnect;
@@ -19637,8 +19601,6 @@ async fn send_h3_backend_failure_response(
     }
 }
 
-/// Send an HTTP/3 rejection response with custom headers. Same recv-half
-/// halt contract as `send_h3_response`.
 /// Whether an `after_proxy` reject already carries a `Content-Type` header
 /// (case-insensitive). When it does, `send_h3_reject_response` must not add its
 /// own default, because `http::response::Builder::header` *appends* rather than
@@ -19684,6 +19646,8 @@ fn finalize_h3_gateway_error_headers(
     }
 }
 
+/// Send an HTTP/3 rejection response with custom headers. Same recv-half
+/// halt contract as `send_h3_response`.
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,

@@ -391,8 +391,9 @@ fn parse_canonical_u64(token: &str) -> Option<u64> {
 
 /// Strictly parse the relay-identity header field.
 ///
-/// `Some(None)` is the `-` sentinel (no relay identity, valid only for an empty
-/// generation); `Some(Some(uid))` is a pod UID; `None` refuses the manifest.
+/// `Some(None)` is the `-` sentinel (no relay identity, valid only for an
+/// inactive generation); `Some(Some(uid))` is a pod UID; `None` refuses the
+/// manifest.
 ///
 /// The charset is deliberately narrower than "any pod UID a control plane might
 /// mint": lowercase alphanumerics and interior dashes only, bounded length, no

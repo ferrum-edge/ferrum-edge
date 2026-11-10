@@ -158,11 +158,9 @@ pub struct MeshUdpCaptureConfig {
     /// Address+port to bind. The port is the Stage-2 TPROXY listener port
     /// (`FERRUM_MESH_CAPTURE_UDP_PORT`, default 15011).
     pub addr: StdSocketAddr,
-    /// Shared proxy state — threaded in for Stage 4 so the listener can consult
-    /// the `mesh_udp_egress` route table, LB-select a workload, gate on the
-    /// gateway SVID + HBONE capability, and open the datagram-over-HBONE tunnel.
-    /// (Stage 3 dropped captured datagrams and needed no state; this is the
-    /// enabling refactor.)
+    /// Shared proxy state, so the listener can consult the `mesh_udp_egress`
+    /// route table, LB-select a workload, gate on the gateway SVID and
+    /// transport capability, and open the egress tunnel.
     pub state: std::sync::Arc<super::ProxyState>,
     /// Per-listener shutdown receiver (config-driven removal).
     pub shutdown: watch::Receiver<bool>,
@@ -443,9 +441,8 @@ pub(crate) fn bind_mesh_udp_capture_socket_with_pktinfo(
             if !v4_origdst && !v6_origdst {
                 // Without orig-dst recovery a captured datagram cannot be routed
                 // to its real destination, so refuse rather than bind a listener
-                // that can only drop-without-knowing-where. (Stage 3 drops anyway,
-                // but Stage 4 relies on this; failing here surfaces a bad kernel
-                // early.)
+                // that can only drop-without-knowing-where. Failing here surfaces
+                // a bad kernel early.
                 return Err(anyhow::anyhow!(
                     "mesh UDP capture: IP_RECVORIGDSTADDR setsockopt failed on both v4 and v6 (kernel lacks orig-dst recovery)"
                 ));
@@ -628,13 +625,13 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
         addr = %addr,
         v4_origdst,
         v6_origdst,
-        "Mesh UDP capture listener started (capture→datagram-over-HBONE egress; Ambient only)"
+        "Mesh UDP capture listener started (capture→datagram-over-mesh egress)"
     );
 
     // Idle-session sweep — reaps captured sessions whose last datagram is older
     // than the idle timeout, so a spoofed-source flood ages out instead of
     // accumulating. Mirrors `udp_proxy::spawn_session_cleanup`'s identity-aware
-    // expiry, simplified (no backend leg / plugins in Stage 3).
+    // expiry, simplified (no backend leg or plugins).
     spawn_capture_session_cleanup(
         sessions.clone(),
         session_limiter.clone(),
@@ -652,7 +649,7 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
         tokio::select! {
             completed = session_tasks.join_next(), if !session_tasks.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    warn!(%error, "Ambient UDP capture session task failed");
+                    warn!(%error, "Mesh UDP capture session task failed");
                 }
             }
             _ = shutdown_rx.changed() => {
@@ -1259,9 +1256,8 @@ fn enqueue_egress_datagram(
 ///
 /// All the fail-closed gates from the raw-TCP egress path apply (LB selection,
 /// gateway SVID present, HBONE capability proven, pinned-peer identity intact);
-/// any gate failure logs and ends the session (the recv loop already created the
-/// map entry, so it is cleaned up by the idle sweep — the channel just goes
-/// undrained and fills, which drop-on-full handles harmlessly).
+/// any gate failure logs and ends the session, and the task then removes its own
+/// map entry (the idle sweep is only a backstop for a live but quiescent task).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn spawn_udp_egress_session(

@@ -156,6 +156,7 @@ thread_local! {
 /// so in-path 413 enforcement is unchanged. The limiter treats
 /// `max_bytes = 0` as deny-all — callers must never pass the operator
 /// spelling `0` into it (issue #3942).
+///
 /// One checked-out direct-H2 transport.
 ///
 /// Its socket is deliberately not exposed for a per-request post-EOS drain
@@ -164,8 +165,7 @@ thread_local! {
 /// request.
 ///
 /// Deref/DerefMut to the sender so every existing `ready()` / `send_request()` /
-/// `is_closed()` call site is unchanged; cloning is one `Arc` bump on top of
-/// hyper's own clone.
+/// `is_closed()` call site is unchanged; cloning is hyper's own sender clone.
 #[derive(Clone, Debug)]
 pub struct Http2Sender {
     inner: http2::SendRequest<DirectH2RequestBody>,
@@ -565,7 +565,7 @@ impl Http2PoolManager {
                     let mut tls_config = inputs.builder().build_rustls()?;
                     // Advertise both `h2` and `http/1.1` — the backend picks.
                     // If it picks h2 we use this pool; if it picks http/1.1 the
-                    // caller (create_tls_connection) returns
+                    // caller (`create_connection`) returns
                     // `BackendSelectedHttp1` so the dispatcher can route via
                     // reqwest. Advertising only `h2` would fail the handshake
                     // against h1-only servers with no graceful recovery.
@@ -2623,8 +2623,8 @@ impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
             },
             // Coalesced waiters must see the SAME typed over-cap refusal the
             // creator produced, so `get_sender`'s already-established-shard
-            // fallback and `classify_http2_pool_error`'s pre-wire
-            // `ConnectionPoolError` apply to them identically. Reconstructing it
+            // fallback and `classify_http2_pool_error`'s pre-wire, health-neutral
+            // `BackendConnectionLimit` apply to them identically. Reconstructing it
             // as `BackendUnavailable` would keep the ErrorClass but lose the
             // structural signal.
             SharedPoolCreateKind::MaxConnections => Self::MaxConnectionsExceeded { message },

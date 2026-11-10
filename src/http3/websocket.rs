@@ -2047,7 +2047,7 @@ pub(crate) async fn handle_h3_websocket(
 }
 
 /// Emit a `TransactionSummary` describing the successful WebSocket
-/// upgrade. Mirrors the H1/H2 path at `proxy/mod.rs` line ~4300 so log
+/// upgrade. Mirrors the H1/H2 summary in `handle_websocket_request_authenticated` so log
 /// plugins see a consistent shape across frontends.
 ///
 /// `proxy_headers` is the source of truth for the backend-bound header
@@ -2298,12 +2298,11 @@ mod tests {
             );
         }
         // Subprotocol IS forwarded — the backend WS client re-negotiates it
-        // with the upstream server. Extensions (e.g. permessage-deflate) are
-        // NOT forwarded: the gateway's WebSocket bridge cannot encode/decode
-        // compressed frames, so a deflate-capable backend that accepted the
-        // offer would set rsv1 and the session would be torn down with a
-        // protocol error. Mirrors the H1/H2 strip in
-        // proxy::headers::is_websocket_handshake_strip_header.
+        // with the upstream server. The client's extension offer is stripped
+        // here (mirroring the H1/H2 strip in
+        // proxy::headers::is_websocket_handshake_strip_header);
+        // `forward_permessage_deflate_offer` / `begin_permessage_deflate_termination`
+        // re-add it per the proxy's `websocket_permessage_deflate` mode.
         assert_eq!(value_for(&out, "sec-websocket-protocol"), Some("chat"));
     }
 
@@ -2376,33 +2375,8 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_lookup_lives_on_proxy_headers_not_ctx() {
-        // Regression guard: the H3 dispatcher in `src/http3/server.rs`
-        // builds `proxy_headers` by either cloning `ctx.headers` (when
-        // identity injection is needed) or `std::mem::take`-ing it (the
-        // common case). In the take-path `ctx.headers` is empty by the
-        // time `handle_h3_websocket` runs, so the TransactionSummary
-        // helpers MUST read `request_user_agent` from `proxy_headers`,
-        // not from `ctx.headers`. This test pins the expected source of
-        // truth so a future refactor doesn't silently re-introduce the
-        // bug (which was caught in PR 784 review).
-        let proxy_headers = make_headers(&[("user-agent", "ferrum-test/1.0")]);
-        let ctx_headers_after_take: HashMap<String, String> = HashMap::new();
-        assert_eq!(
-            proxy_headers.get("user-agent").map(String::as_str),
-            Some("ferrum-test/1.0"),
-            "proxy_headers must carry user-agent (the post-take source)"
-        );
-        assert!(
-            !ctx_headers_after_take.contains_key("user-agent"),
-            "ctx.headers is moved-out and empty in the common dispatch path"
-        );
-    }
-
-    #[test]
     fn h3_ws_send_pump_buffer_is_smaller_than_duplex_capacity() {
-        assert_eq!(H3_WS_DUPLEX_BUFFER_BYTES, 64 * 1024);
-        assert_eq!(H3_WS_SEND_PUMP_READ_BUFFER_BYTES, 16 * 1024);
+        const _: () = assert!(H3_WS_SEND_PUMP_READ_BUFFER_BYTES < H3_WS_DUPLEX_BUFFER_BYTES);
     }
 
     #[test]

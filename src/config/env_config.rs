@@ -3266,7 +3266,7 @@ pub struct EnvConfig {
     /// 0 = disabled (always stream). Default: 65536 (64 KiB).
     pub response_buffer_cutoff_bytes: usize,
     /// Target chunk size (bytes) for HTTP/2 response body coalescing.
-    /// The `CoalescingH2Body` adapter accumulates small HTTP/2 DATA frames into
+    /// The `Coalescing<S>` adapter accumulates small HTTP/2 DATA frames into
     /// chunks of at least this size before forwarding to the client, reducing
     /// per-frame overhead on gRPC and HTTP/2 direct pool paths.
     /// Default: 131072 (128 KiB). Minimum: 16384 (16 KiB). Maximum: 1048576 (1 MiB).

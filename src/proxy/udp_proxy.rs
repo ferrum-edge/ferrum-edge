@@ -3158,8 +3158,8 @@ async fn drain_gso_to_sendmmsg_or_direct(
 ///
 /// This collapses three near-identical GSO→sendmmsg fallback blocks that
 /// previously existed inline in `create_session`. Centralising it means the
-/// "post-flush push dropped the datagram" silent-drop guard (tracked as MED-5
-/// in the PR review) only has to be fixed in one place.
+/// "post-flush push dropped the datagram" silent-drop guard only has to be
+/// fixed in one place.
 ///
 /// `gso_failed` is set to `true` if we have to abandon GSO for this session.
 /// The caller must stop calling this helper after that and drive `send_batch`
@@ -9147,8 +9147,8 @@ async fn create_session(
     // flow, including the error the spawned setup task may still observe, so
     // setup must never emit again even if the session is removed first.
     progress.mark_published();
-    // Note: active_sessions is reserved by the receive loop before the
-    // background setup task calls create_session, avoiding TOCTOU races.
+    // Note: active_sessions is reserved by `process_new_session_datagram`
+    // after admission, before it calls create_session, avoiding TOCTOU races.
     metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
 
     debug!(
@@ -9233,9 +9233,9 @@ async fn create_session(
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
         'reply: loop {
-            // Listener/global shutdown may already be set; borrow() also
-            // advances each watch "seen" version so the cancel future's
-            // changed() waits for a subsequent change.
+            // Listener/global shutdown may already be set. `borrow()` does not
+            // mark the value seen: an already-`true` value breaks here, and an
+            // unchanged one parks the cancel future in `changed()`.
             if *reply_listener_shutdown.borrow()
                 || reply_global_shutdown
                     .as_ref()
