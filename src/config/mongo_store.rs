@@ -17933,6 +17933,10 @@ mod inner {
         async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
             MongoStore::prune_audit_events(self, namespace).await
         }
+
+        async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+            MongoStore::prune_expired_audit_events(self).await
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -17967,6 +17971,46 @@ mod inner {
         pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
             self.prune_audit_events_with_mode(namespace, /* force_max_rows */ true)
                 .await
+        }
+
+        /// Periodic age-retention sweep across every namespace that holds
+        /// audit rows (parity with SQL; see
+        /// [`DatabaseBackend::prune_expired_audit_events`]). Namespaces are
+        /// walked one seek at a time on the `{namespace, ts, id}` index.
+        pub async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+            let Some(days) = self.audit_retention.retention_days else {
+                return Ok(0);
+            };
+            let start = std::time::Instant::now();
+            let mut deleted = 0u64;
+            let mut previous: Option<String> = None;
+            loop {
+                let filter = match previous.as_deref() {
+                    None => doc! {},
+                    Some(after) => doc! { "namespace": { "$gt": after } },
+                };
+                let options = FindOptions::builder()
+                    .sort(doc! { "namespace": 1 })
+                    .limit(Some(1))
+                    .projection(doc! { "_id": 0, "namespace": 1 })
+                    .build();
+                let audit_events = self.audit_events();
+                let mut cursor = audit_events.find(filter).with_options(options).await?;
+                if !cursor.advance().await? {
+                    break;
+                }
+                let doc = cursor.deserialize_current()?;
+                let namespace = doc
+                    .get("namespace")
+                    .and_then(Bson::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("audit_events row missing string namespace"))?
+                    .to_string();
+                deleted =
+                    deleted.saturating_add(self.prune_audit_events_by_age(&namespace, days).await?);
+                previous = Some(namespace);
+            }
+            self.check_slow_query("prune_expired_audit_events", start);
+            Ok(deleted)
         }
 
         async fn prune_audit_events_with_mode(

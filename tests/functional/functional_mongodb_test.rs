@@ -3728,3 +3728,100 @@ async fn test_mongodb_buildout_baseline_initialization() {
     }
     db.drop().await.unwrap();
 }
+
+/// The periodic audit age-retention sweep must reach MongoDB namespaces that
+/// receive no new audit events (insert-path pruning never revisits them), and
+/// must prune by age only.
+#[tokio::test]
+#[ignore = "requires a live MongoDB server"]
+async fn test_mongodb_audit_retention_sweep_ages_out_idle_namespaces() {
+    use ferrum_edge::admin::audit::{AuditEvent, AuditListFilter, AuditRetentionPolicy};
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::mongo_store::MongoStore;
+
+    let url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !continue_if_backend_available("mongodb", mongodb_is_available(&url).await, "unreachable") {
+        return;
+    }
+    let database_name = format!("ferrum_audit_sweep_{}", Uuid::new_v4().simple());
+    let mut store = MongoStore::connect(
+        &url,
+        &database_name,
+        None,
+        None,
+        None,
+        Some(10),
+        Some(10),
+        false,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    store.run_migrations().await.unwrap();
+    // Seed with retention disabled so no insert-path prune runs.
+    store.set_audit_retention_policy(AuditRetentionPolicy {
+        retention_days: None,
+        max_rows_per_namespace: None,
+    });
+    for (namespace, id, days_ago) in [
+        ("idle-a", "old-a", 10),
+        ("idle-a", "new-a", 1),
+        ("idle-b", "old-b", 10),
+        ("idle-b", "older-b", 20),
+        ("idle-c", "new-c-1", 1),
+        ("idle-c", "new-c-2", 2),
+        ("idle-c", "new-c-3", 3),
+    ] {
+        store
+            .insert_audit_event(&AuditEvent {
+                id: id.to_string(),
+                ts: Utc::now() - chrono::Duration::days(days_ago),
+                actor: "tester".to_string(),
+                action: "update".to_string(),
+                resource_type: "proxy".to_string(),
+                resource_id: id.to_string(),
+                namespace: namespace.to_string(),
+                namespace_at_event: namespace.to_string(),
+                source_address: String::new(),
+                request_id: String::new(),
+                outcome: String::new(),
+                diff: json!({ "after": { "id": id } }),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.prune_expired_audit_events().await.unwrap(), 0);
+
+    store.set_audit_retention_policy(AuditRetentionPolicy {
+        retention_days: Some(7),
+        max_rows_per_namespace: Some(1),
+    });
+    assert_eq!(store.prune_expired_audit_events().await.unwrap(), 3);
+    for (namespace, expected) in [("idle-a", 1), ("idle-b", 0), ("idle-c", 3)] {
+        let listed = store
+            .list_audit_events(
+                namespace,
+                &AuditListFilter {
+                    limit: 50,
+                    offset: 0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.total, expected, "namespace {namespace}");
+    }
+    assert_eq!(store.prune_expired_audit_events().await.unwrap(), 0);
+
+    MongoClient::with_uri_str(&url)
+        .await
+        .unwrap()
+        .database(&database_name)
+        .drop()
+        .await
+        .unwrap();
+}

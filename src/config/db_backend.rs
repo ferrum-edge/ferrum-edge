@@ -3644,6 +3644,15 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Namespace-scoped, bounded audit retention prune. No-op when retention
     /// policy is unset. Must never delete rows belonging to another namespace.
     async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+
+    /// Periodic age-retention sweep: apply the `retention_days` half of the
+    /// policy to every namespace that holds audit rows, including namespaces
+    /// that no longer receive inserts (insert-path pruning never revisits
+    /// them). Each namespace is pruned separately with the same bounded,
+    /// chunked delete as [`Self::prune_audit_events`], so a larger backlog
+    /// drains over successive sweeps. The row cap is not evaluated: an idle
+    /// namespace cannot grow. No-op when age retention is unset.
+    async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error>;
 }
 
 /// The poll path holds `Arc<dyn DatabaseBackend>`, so the narrow drift surface

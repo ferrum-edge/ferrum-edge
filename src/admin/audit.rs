@@ -338,6 +338,80 @@ pub fn audit_retention_hit_prune_batch_budget(deleted: u64) -> bool {
             .saturating_mul(u64::from(AUDIT_RETENTION_PRUNE_MAX_BATCHES))
 }
 
+/// Mean interval between periodic audit age-retention sweeps. Each wait is
+/// jittered by ±25% ([`crate::util::backoff::jittered_backoff`]) so replicas
+/// started together do not sweep in lockstep.
+pub const AUDIT_RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Start the periodic age-retention sweep for `FERRUM_AUDIT_RETENTION_DAYS`.
+///
+/// Insert-path pruning reaches a namespace only when that namespace receives
+/// a new audit event, so without this sweep a namespace that goes idle would
+/// keep rows past the configured age forever. Returns `None` (no task) when
+/// age retention is unset. Called by the modes that own the configuration
+/// database (database and CP); the task exits when `shutdown_rx` fires.
+pub fn start_retention_sweep(
+    retention_days: Option<u64>,
+    db: Arc<dyn DatabaseBackend>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    let retention_days = retention_days?;
+    info!(
+        retention_days,
+        interval_secs = AUDIT_RETENTION_SWEEP_INTERVAL.as_secs(),
+        "Audit retention sweep started"
+    );
+    Some(spawn_retention_sweep(
+        db,
+        AUDIT_RETENTION_SWEEP_INTERVAL,
+        shutdown_rx,
+    ))
+}
+
+/// Run [`DatabaseBackend::prune_expired_audit_events`] after every jittered
+/// `interval` until `shutdown_rx` fires; shutdown also cancels a sweep in
+/// progress. A failed sweep is logged and retried on the next interval.
+pub fn spawn_retention_sweep(
+    db: Arc<dyn DatabaseBackend>,
+    interval: Duration,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let delay = crate::util::backoff::jittered_backoff(interval.as_secs());
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown_rx.changed() => {
+                    info!("Audit retention sweep shutting down");
+                    return;
+                }
+            }
+            tokio::select! {
+                result = db.prune_expired_audit_events() => match result {
+                    Ok(deleted) => {
+                        if deleted > 0 {
+                            info!(deleted, "Audit retention sweep pruned expired audit events");
+                        }
+                    }
+                    Err(_error) => {
+                        warn!(
+                            error = "database error (details withheld)",
+                            "Audit retention sweep failed; retrying on the next interval"
+                        );
+                    }
+                },
+                _ = shutdown_rx.changed() => {
+                    info!("Audit retention sweep shutting down");
+                    return;
+                }
+            }
+        }
+    })
+}
+
 /// Per-namespace audit-event retention policy from env/config.
 ///
 /// Distinct from delivery-loss hardening (#2421): this only bounds durable

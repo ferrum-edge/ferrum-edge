@@ -2118,6 +2118,15 @@ pub async fn run(
     // for a later mutation to lazily spawn the worker. A process that receives
     // no new mutations still has to drain the backlog it inherited.
     crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
+    // Age retention must also reach namespaces that stop receiving audit
+    // events; insert-path pruning alone never revisits them.
+    if let Some(handle) = crate::admin::audit::start_retention_sweep(
+        env_config.audit_retention_days,
+        db.clone(),
+        shutdown_tx.subscribe(),
+    ) {
+        background_handles.push(handle);
+    }
 
     let initial_runtime_cursor = initial_change_cursor
         .unwrap_or_else(|| LiveApplyCursor::new(db.config_topology_epoch(), 0));

@@ -12032,6 +12032,42 @@ impl DatabaseStore {
             .await
     }
 
+    /// Periodic age-retention sweep across every namespace that holds audit
+    /// rows (see [`DatabaseBackend::prune_expired_audit_events`]). Namespaces
+    /// are walked one index seek at a time on
+    /// `idx_audit_events_namespace_ts_id`, never with a full `DISTINCT` scan.
+    pub async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+        let Some(days) = self.audit_retention.retention_days else {
+            return Ok(0);
+        };
+        let start = std::time::Instant::now();
+        let first_sql = self.q("SELECT namespace FROM audit_events ORDER BY namespace LIMIT 1");
+        let next_sql = self
+            .q("SELECT namespace FROM audit_events WHERE namespace > ? ORDER BY namespace LIMIT 1");
+        let mut deleted = 0u64;
+        let mut previous: Option<String> = None;
+        loop {
+            let row = match previous.as_deref() {
+                None => sqlx::query(&first_sql).fetch_optional(&self.pool()).await?,
+                Some(after) => {
+                    sqlx::query(&next_sql)
+                        .bind(after)
+                        .fetch_optional(&self.pool())
+                        .await?
+                }
+            };
+            let Some(row) = row else {
+                break;
+            };
+            let namespace: String = row.try_get("namespace")?;
+            deleted =
+                deleted.saturating_add(self.prune_audit_events_by_age(&namespace, days).await?);
+            previous = Some(namespace);
+        }
+        self.check_slow_query("prune_expired_audit_events", start);
+        Ok(deleted)
+    }
+
     async fn prune_audit_events_with_mode(
         &self,
         namespace: &str,
@@ -13275,6 +13311,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::prune_audit_events(self, namespace).await
+    }
+
+    async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+        DatabaseStore::prune_expired_audit_events(self).await
     }
 }
 
