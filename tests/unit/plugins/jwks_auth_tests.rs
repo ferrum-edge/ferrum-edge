@@ -2305,7 +2305,7 @@ async fn test_jwks_auth_validates_with_audience() {
         &json!({
             "providers": [{
                 "jwks_uri": jwks_uri,
-                "audience": "my-api"
+                "audiences": ["my-api"]
             }]
         }),
         default_client(),
@@ -2321,6 +2321,22 @@ async fn test_jwks_auth_validates_with_audience() {
         .insert("authorization".to_string(), format!("Bearer {}", token));
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
+}
+
+/// Issue #7114: a provider takes only `audiences`; the singular `audience`
+/// spelling (formerly merged into it) is an unknown field.
+#[test]
+fn provider_singular_audience_is_an_unknown_field() {
+    let error = JwksAuth::new(
+        &json!({"providers": [{"jwks": {"keys": []}, "audience": "my-api"}]}),
+        default_client(),
+    )
+    .map(|_| ())
+    .expect_err("singular audience must be rejected");
+    assert!(
+        error.contains("unknown field") && error.contains("audience"),
+        "{error}"
+    );
 }
 
 const GENERIC_JWKS_401: &str = r#"{"error":"Invalid or unrecognized JWT"}"#;

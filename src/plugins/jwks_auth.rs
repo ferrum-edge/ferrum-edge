@@ -382,7 +382,6 @@ const PROVIDER_FIELDS: &[&str] = &[
     "discovery_url",
     "jwks",
     "issuer",
-    "audience",
     "audiences",
     "from_headers",
     "from_params",
@@ -3118,16 +3117,7 @@ fn parse_audiences(
     config: &Map<String, Value>,
     provider_idx: usize,
 ) -> Result<Vec<String>, String> {
-    let legacy_audience = optional_non_empty_string(config, "audience", provider_idx)?;
-    let mut audiences = parse_string_array(config, "audiences", provider_idx)?;
-
-    if let Some(audience) = legacy_audience
-        && !audiences.iter().any(|known| known == &audience)
-    {
-        audiences.push(audience);
-    }
-
-    Ok(audiences)
+    parse_string_array(config, "audiences", provider_idx)
 }
 
 fn parse_string_array(

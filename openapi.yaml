@@ -24669,11 +24669,6 @@ components:
                   must also agree on dpop_replay_scope and, for process scope,
                   dpop_replay_max_entries. A non-DPoP sibling for the same
                   issuer is refused as a bearer-only bypass.
-              audience:
-                type: string
-                minLength: 1
-                pattern: "\\S"
-                description: Expected JWT aud claim; presence is required when set (same contract as audiences). Must not be blank.
               audiences:
                 type: array
                 items:
