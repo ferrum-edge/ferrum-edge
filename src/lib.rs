@@ -187,7 +187,7 @@ pub mod _test_support {
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =
-        crate::proxy::grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS;
+        crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 
     /// Mark a request context as already counted by its handler, as every
     /// H1/H2 handler counting site does (issue #6768 client-abort scope tests).

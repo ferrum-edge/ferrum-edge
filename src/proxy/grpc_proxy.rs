@@ -49,6 +49,7 @@ use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
 use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolCreateCaller, PoolManager};
+use crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 use crate::proxy::hbone_pool::HbonePoolError;
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
@@ -3093,13 +3094,6 @@ pub(crate) fn http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
         _ => grpc_status::INTERNAL,
     }
 }
-
-/// The non-standard `499 Client Closed Request` status the gateway records for
-/// a client that disconnected before the response. Defined once in
-/// [`crate::proxy::client_abort`] (issue #6772); this path stays valid for
-/// every existing user.
-pub(crate) const CLIENT_CLOSED_REQUEST_STATUS: u16 =
-    crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 
 /// Map a gRPC status code to the closest HTTP status — the reverse of
 /// [`http_reject_status_to_grpc_status`]. Used to feed the adaptive-concurrency
