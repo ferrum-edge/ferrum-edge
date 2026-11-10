@@ -48,7 +48,7 @@ use super::utils::{
     BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, JSON_ARRAY_FRAMING_BYTES,
     PluginHttpClient, QueuedSummaryPayload, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
     admit_http_summary, admit_stream_summary, assemble_json_array, bind_connected_udp_socket,
-    build_batch_config, json_array_len, parse_socket_host, resolve_udp_endpoint,
+    build_batch_config, json_array_len, parse_socket_host, resolve_socket_endpoint,
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
@@ -851,7 +851,7 @@ async fn resolve_endpoint(
     {
         return Ok(addr);
     }
-    resolve_udp_endpoint(&cfg.host, cfg.port, dns_cache, "udp_logging").await
+    resolve_socket_endpoint(&cfg.host, cfg.port, dns_cache, "udp_logging").await
 }
 
 async fn create_sender(

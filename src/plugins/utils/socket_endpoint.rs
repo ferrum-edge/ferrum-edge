@@ -6,8 +6,9 @@ use super::socket_addr_lookup_input;
 
 /// Resolve `host:port` to a `SocketAddr` via the gateway's shared `DnsCache`.
 ///
-/// Mirrors `resolve_udp_endpoint` for plugins that open their own TCP
-/// connections (log shippers, side-channel clients).
+/// The one resolver for plugins and notification channels that open their own
+/// TCP connections or UDP sockets (log shippers, side-channel clients); the
+/// transport makes no difference to resolution (issue #7150).
 ///
 /// **Authoritative when a cache is present.** `DnsCache::resolve` errors
 /// encode configured policy decisions — per-proxy / global static DNS
@@ -18,7 +19,7 @@ use super::socket_addr_lookup_input;
 ///
 /// The OS resolver is consulted **only** when no cache is attached — the
 /// rare test/fallback `PluginHttpClient` path that has `dns_cache == None`.
-pub async fn resolve_tcp_endpoint(
+pub async fn resolve_socket_endpoint(
     host: &str,
     port: u16,
     dns_cache: Option<&DnsCache>,

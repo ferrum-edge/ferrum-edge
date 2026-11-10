@@ -54,12 +54,12 @@ pub mod scope_role_check;
 pub mod session_cookie;
 pub mod sink_loss;
 pub mod size_limit;
+pub mod socket_endpoint;
 pub mod socket_host;
 pub mod sse;
 pub mod structured_fields;
 pub mod summary_log_budget;
 pub mod synthetic_response;
-pub mod tcp_endpoint;
 pub mod token_extract;
 pub mod transformer_gate;
 pub mod udp_endpoint;
@@ -91,6 +91,6 @@ pub use log_helpers::{
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT,
     handle_http_batch_response,
 };
+pub use socket_endpoint::resolve_socket_endpoint;
 pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
-pub use tcp_endpoint::resolve_tcp_endpoint;
-pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, resolve_udp_endpoint};
+pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket};

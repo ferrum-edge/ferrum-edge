@@ -31,7 +31,7 @@ use super::utils::sink_loss::SinkLossReason;
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, ByteBudget, ByteLease,
     DeferredBatchingLogger, PluginHttpClient, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
-    bind_connected_udp_socket, build_batch_config, parse_socket_host, resolve_udp_endpoint,
+    bind_connected_udp_socket, build_batch_config, parse_socket_host, resolve_socket_endpoint,
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
@@ -1447,7 +1447,7 @@ async fn send_batch(
     };
 
     if socket.is_none() {
-        let resolved_addr = resolve_udp_endpoint(
+        let resolved_addr = resolve_socket_endpoint(
             &cfg.hostname,
             cfg.port,
             cfg.dns_cache.as_ref(),
@@ -1462,7 +1462,7 @@ async fn send_batch(
 
     if last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
         last_resolve = Instant::now();
-        if let Ok(new_addr) = resolve_udp_endpoint(
+        if let Ok(new_addr) = resolve_socket_endpoint(
             &cfg.hostname,
             cfg.port,
             cfg.dns_cache.as_ref(),
