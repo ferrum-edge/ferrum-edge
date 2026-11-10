@@ -3081,6 +3081,109 @@ async fn aggregate_tools_list_accepts_upstream_sse_response() {
     );
 }
 
+/// Read one HTTP/1.1 request (head plus `Content-Length` body) and return it
+/// as lossy text.
+async fn read_one_http_request(socket: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        let read = socket.read(&mut buf).await.unwrap_or(0);
+        if read == 0 {
+            return String::from_utf8_lossy(&request).into_owned();
+        }
+        request.extend_from_slice(&buf[..read]);
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+    let content_length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while request.len() < head_end + content_length {
+        let read = socket.read(&mut buf).await.unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..read]);
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// An upstream that answers `tools/list` with an SSE body written three bytes
+/// per HTTP chunk, so every event delimiter straddles the chunks the gateway
+/// reads. Every other request gets an empty `202`. One request per connection.
+async fn start_chunked_sse_tools_server() -> String {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let request = read_one_http_request(&mut socket).await;
+                if !request.contains("tools/list") {
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+                let body = ": warming up\r\n\r\n\
+                            event: message\r\n\
+                            data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\r\n\r\n\
+                            event: message\r\n\
+                            data: {\"jsonrpc\":\"2.0\",\"id\":\"tools\",\"result\":{\"tools\":[{\"name\":\"chunked_tool\",\"inputSchema\":{\"type\":\"object\"}}]}}\r\n\r\n";
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                          transfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                for piece in body.as_bytes().chunks(3) {
+                    let mut frame = format!("{:x}\r\n", piece.len()).into_bytes();
+                    frame.extend_from_slice(piece);
+                    frame.extend_from_slice(b"\r\n");
+                    if socket.write_all(&frame).await.is_err() {
+                        return;
+                    }
+                    let _ = socket.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            });
+        }
+    });
+    format!("http://{address}/mcp")
+}
+
+/// Issue #7137: the SSE reader resumes its delimiter search where the previous
+/// chunk left off. A response trickled in three-byte chunks, with CRLF
+/// delimiters split across chunks and non-response events before it, still
+/// yields the JSON-RPC response.
+#[tokio::test]
+async fn aggregate_tools_list_reads_an_upstream_sse_response_split_across_chunks() {
+    let upstream = start_chunked_sse_tools_server().await;
+    let mut config = aggregate_config(&upstream);
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({"default_action": "allow"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 32).await,
+        vec!["github.chunked_tool"]
+    );
+}
+
 #[tokio::test]
 async fn aggregate_tools_list_treats_upstream_json_rpc_errors_as_failures() {
     let server = start_mcp_error_server().await;

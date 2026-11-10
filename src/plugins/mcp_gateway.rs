@@ -4003,19 +4003,27 @@ impl McpGateway {
                 Some(cursor) => json!({ "cursor": cursor }),
                 None => json!({}),
             };
-            let response = self
+            let mut response = self
                 .request_upstream_json(ctx, downstream_session_id, server, method, params)
                 .await?;
             let result = response
-                .get("result")
-                .and_then(Value::as_object)
+                .get_mut("result")
+                .and_then(Value::as_object_mut)
                 .ok_or_else(|| format!("upstream MCP {method} response missing result"))?;
-            let page_items = result
-                .get(result_key)
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    format!("upstream MCP {method} response missing result.{result_key}")
-                })?;
+            let next_cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            // The page is owned, so its items move into the catalog list
+            // instead of being cloned.
+            let page_items = match result.get_mut(result_key) {
+                Some(Value::Array(page_items)) => std::mem::take(page_items),
+                _ => {
+                    return Err(format!(
+                        "upstream MCP {method} response missing result.{result_key}"
+                    ));
+                }
+            };
             for item in page_items {
                 if items.len() >= max_items {
                     warn!(
@@ -4028,7 +4036,7 @@ impl McpGateway {
                         "upstream MCP {method} catalog exceeded {max_items} items"
                     ));
                 }
-                let item_bytes = serde_json::to_vec(item).map_err(|error| {
+                let item_bytes = serialized_json_len(&item).map_err(|error| {
                     warn!(
                         server_id = %server.server_id,
                         method,
@@ -4037,7 +4045,7 @@ impl McpGateway {
                     );
                     format!("upstream MCP {method} catalog item could not be measured: {error}")
                 })?;
-                if total_item_bytes.saturating_add(item_bytes.len()) > max_bytes {
+                if total_item_bytes.saturating_add(item_bytes) > max_bytes {
                     warn!(
                         server_id = %server.server_id,
                         method,
@@ -4048,13 +4056,10 @@ impl McpGateway {
                         "upstream MCP {method} catalog exceeded {max_bytes} bytes"
                     ));
                 }
-                total_item_bytes += item_bytes.len();
-                items.push(item.clone());
+                total_item_bytes += item_bytes;
+                items.push(item);
             }
-            cursor = result
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
+            cursor = next_cursor;
             if cursor.is_none() {
                 return Ok(items);
             }
@@ -5154,17 +5159,20 @@ impl McpGateway {
                     })
                     && self.bridge_tool_allowed_on_route(route_ctx, entry)
             })
-            .map(tool_entry_to_public_value)
+            .map(PublicToolItem::from_entry)
             .collect();
-        json_response(
-            200,
-            json!({
-                "jsonrpc": "2.0",
-                "id": envelope.id.clone().unwrap_or(Value::Null),
-                "result": { "tools": tools }
-            }),
-            None,
-        )
+        // Serialized straight from the catalog's shared schemas: building a
+        // `Value` per tool would deep-clone every input and output schema on
+        // every `tools/list`.
+        let response = ToolsListResponse {
+            jsonrpc: "2.0",
+            id: envelope.id.as_ref().unwrap_or(&Value::Null),
+            result: ToolsListResult { tools },
+        };
+        match serde_json::to_string(&response) {
+            Ok(body) => json_body_response(200, body, None),
+            Err(_) => json_rpc_error(None, -32603, "MCP response serialization failed", None),
+        }
     }
 
     async fn aggregate_prompts_list(
@@ -9631,6 +9639,10 @@ async fn upstream_sse_json_rpc_response(
 ) -> Result<Value, String> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
+    // Bytes of `buffer` already searched without finding an event delimiter.
+    // Each chunk resumes the search just before this point instead of
+    // rescanning the whole buffer.
+    let mut scanned = 0usize;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             warn!(
@@ -9653,10 +9665,8 @@ async fn upstream_sse_json_rpc_response(
                 "upstream MCP SSE event exceeded {MAX_UPSTREAM_SSE_EVENT_BYTES} bytes"
             ));
         }
-        while let Some((event_end, delimiter_len)) = find_sse_event_delimiter(&buffer) {
-            let event = buffer[..event_end].to_vec();
-            buffer.drain(..event_end + delimiter_len);
-            let event = std::str::from_utf8(&event).map_err(|error| {
+        while let Some((event_end, delimiter_len)) = find_sse_event_delimiter(&buffer, scanned) {
+            let event = std::str::from_utf8(&buffer[..event_end]).map_err(|error| {
                 warn!(
                     server_id,
                     method,
@@ -9668,7 +9678,10 @@ async fn upstream_sse_json_rpc_response(
             if let Some(value) = parse_sse_json_rpc_response(event) {
                 return Ok(value);
             }
+            buffer.drain(..event_end + delimiter_len);
+            scanned = 0;
         }
+        scanned = buffer.len();
     }
 
     if !buffer.is_empty() {
@@ -9693,7 +9706,17 @@ async fn upstream_sse_json_rpc_response(
     Err("upstream MCP SSE response did not contain a JSON-RPC response".to_string())
 }
 
-fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+/// Earliest SSE event delimiter in `buffer`, searching from just before
+/// `scanned` (the prefix a previous call already searched). Backing up by one
+/// byte less than the longest delimiter finds a delimiter that straddles the
+/// previous end; one wholly inside the searched prefix would have been found
+/// then, so the earliest delimiter is never missed.
+fn find_sse_event_delimiter(buffer: &[u8], scanned: usize) -> Option<(usize, usize)> {
+    const LONGEST_DELIMITER: usize = 4;
+    let start = scanned
+        .saturating_sub(LONGEST_DELIMITER - 1)
+        .min(buffer.len());
+    let tail = &buffer[start..];
     [
         b"\n\n".as_slice(),
         b"\r\n\r\n".as_slice(),
@@ -9701,10 +9724,9 @@ fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
     ]
     .into_iter()
     .filter_map(|delimiter| {
-        buffer
-            .windows(delimiter.len())
+        tail.windows(delimiter.len())
             .position(|window| window == delimiter)
-            .map(|position| (position, delimiter.len()))
+            .map(|position| (start + position, delimiter.len()))
     })
     .min_by_key(|(position, _)| *position)
 }
@@ -10281,13 +10303,22 @@ fn json_response(
     body: Value,
     session_header: Option<(&str, &str)>,
 ) -> PluginResult {
+    json_body_response(status_code, body.to_string(), session_header)
+}
+
+/// [`json_response`] for a body that is already serialized JSON.
+fn json_body_response(
+    status_code: u16,
+    body: String,
+    session_header: Option<(&str, &str)>,
+) -> PluginResult {
     let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     if let Some((name, value)) = session_header {
         headers.insert(name.to_ascii_lowercase(), value.to_string());
     }
     PluginResult::Reject {
         status_code,
-        body: body.to_string(),
+        body,
         headers,
     }
 }
@@ -10595,26 +10626,67 @@ fn build_bridge_tool_parts(
     built
 }
 
-fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
-    let mut object = Map::new();
-    object.insert("name".to_string(), Value::String(entry.public_name.clone()));
-    if let Some(title) = &entry.title {
-        object.insert("title".to_string(), Value::String(title.clone()));
+/// `tools/list` response, serialized by reference from the session catalog.
+#[derive(serde::Serialize)]
+struct ToolsListResponse<'a> {
+    jsonrpc: &'static str,
+    id: &'a Value,
+    result: ToolsListResult<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct ToolsListResult<'a> {
+    tools: Vec<PublicToolItem<'a>>,
+}
+
+/// One public `tools/list` item. Borrows the entry's `Arc`-shared schemas
+/// instead of cloning them; only the namespaced description is built.
+#[derive(serde::Serialize)]
+struct PublicToolItem<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "inputSchema")]
+    input_schema: &'a Value,
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    output_schema: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<&'a Value>,
+}
+
+impl<'a> PublicToolItem<'a> {
+    fn from_entry(entry: &'a ToolCatalogEntry) -> Self {
+        Self {
+            name: &entry.public_name,
+            title: entry.title.as_deref(),
+            description: entry
+                .description
+                .as_ref()
+                .map(|description| format!("[{}] {}", entry.namespace, description)),
+            input_schema: &entry.input_schema,
+            output_schema: entry.output_schema.as_deref(),
+            annotations: entry.annotations.as_ref(),
+        }
     }
-    if let Some(description) = &entry.description {
-        object.insert(
-            "description".to_string(),
-            Value::String(format!("[{}] {}", entry.namespace, description)),
-        );
+}
+
+/// Serialized size of `value` as compact JSON, without allocating the bytes.
+fn serialized_json_len(value: &Value) -> serde_json::Result<usize> {
+    struct ByteCounter(usize);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    object.insert("inputSchema".to_string(), Value::clone(&entry.input_schema));
-    if let Some(output_schema) = &entry.output_schema {
-        object.insert("outputSchema".to_string(), Value::clone(output_schema));
-    }
-    if let Some(annotations) = &entry.annotations {
-        object.insert("annotations".to_string(), annotations.clone());
-    }
-    Value::Object(object)
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 fn prompt_entry_to_public_value(entry: &PromptCatalogEntry) -> Value {
