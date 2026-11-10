@@ -334,6 +334,9 @@ fn next_consecutive_generation(generation: u64) -> u64 {
 
 /// Health state for a single target.
 struct TargetHealth {
+    /// Active-probe success streak. Passive checks never maintain it: a
+    /// passive success needs no streak (issue #7207), so the per-response
+    /// success path stays write-free on this cache line.
     consecutive_successes: AtomicU32,
     /// Native windowed-mode consecutive-failure counter. Not the ejection
     /// decision in that mode (the failure ring is); kept so a success can
@@ -2197,8 +2200,6 @@ impl HealthChecker {
             };
 
             if connection_error || config.unhealthy_status_codes.contains(&status_code) {
-                state.consecutive_successes.store(0, Ordering::Relaxed);
-
                 if config.consecutive_error_mode {
                     let (my_generation, my_streak) = state.record_consecutive_failure();
                     if let Some(hook) = hooks.after_failure_count.as_mut() {
@@ -2327,7 +2328,6 @@ impl HealthChecker {
                     }
                 }
             } else {
-                state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
                 if config.consecutive_error_mode {
                     let retired_generation = state.record_consecutive_success();
                     if let Some(hook) = hooks.after_success_reset.as_mut() {
@@ -2366,22 +2366,20 @@ impl HealthChecker {
                         state.consecutive_failures.store(0, Ordering::Relaxed);
                     }
 
+                    // One success restores a windowed-mode ejection.
                     if proxy_state.unhealthy.contains_key(buf.as_str()) {
-                        let successes = state.consecutive_successes.load(Ordering::Relaxed);
-                        if successes >= 1 {
-                            info!(
-                                "Passive health check: marking target {} as healthy again for proxy {}",
-                                buf.as_str(), proxy_id
+                        info!(
+                            "Passive health check: marking target {} as healthy again for proxy {}",
+                            buf.as_str(),
+                            proxy_id
+                        );
+                        if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str()) {
+                            state.lock_recent_failures().clear();
+                            self.reset_latency_after_passive_recovery(
+                                namespace,
+                                &ejection.upstream_id,
+                                target,
                             );
-                            if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str())
-                            {
-                                state.lock_recent_failures().clear();
-                                self.reset_latency_after_passive_recovery(
-                                    namespace,
-                                    &ejection.upstream_id,
-                                    target,
-                                );
-                            }
                         }
                     }
                 }
@@ -4799,7 +4797,6 @@ fn recover_due_passive_ejections_inner(
                 if current.consecutive_generation.is_none() {
                     state.consecutive_failures.store(0, Ordering::Release);
                 }
-                state.consecutive_successes.store(0, Ordering::Relaxed);
                 state.lock_recent_failures().clear();
             }
 
