@@ -7122,6 +7122,35 @@ pub(crate) fn boxed_apply_request_body_plugins_with_context<'a>(
     })
 }
 
+/// Hand the final-request-body hook context's state back to the live request
+/// context. Every H1/H2 dispatch path that runs `run_final_request_body_hooks`
+/// on a `clone_for_final_request_body_hooks` copy adopts it through this one
+/// helper, so the hand-back cannot drift between paths (issue #7161).
+///
+/// Order matters: the gateway deadline mark and the typed terminals are
+/// adopted BEFORE the metadata move so the finalizer on the live context knows
+/// it is publishing a gateway-authored payload. `clone_for_final_request_body_hooks`
+/// omits `request_body`, so the live value is carried across the metadata swap
+/// (no on_final hook touches it). `ai_usage_export` is the typed companion of
+/// the metadata it replaces and moves with it.
+pub(crate) fn adopt_final_request_body_hook_context(
+    ctx: &mut RequestContext,
+    mut hook_ctx: RequestContext,
+) {
+    if hook_ctx.gateway_deadline_response_selected() {
+        ctx.mark_gateway_deadline_response_selected();
+    }
+    ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
+    ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
+    let request_body = ctx.metadata.remove("request_body");
+    ctx.metadata = hook_ctx.metadata;
+    ctx.ai_usage_export = hook_ctx.ai_usage_export;
+    if let Some(body) = request_body {
+        ctx.metadata.insert("request_body".to_string(), body);
+    }
+    ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
+}
+
 pub(crate) async fn run_final_request_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     mut ctx: Option<&mut RequestContext>,
@@ -39414,19 +39443,8 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                if let Some(mut body_hook_ctx) = body_hook_ctx {
-                    // Typed gateway terminals selected by the representation gate
-                    // inside the hook stage. Adopted BEFORE the metadata move so the
-                    // finalizer on the real context knows it is publishing a
-                    // gateway-authored error payload rather than an application one.
-                    ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-                    ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-                    let request_body = ctx.metadata.remove("request_body");
-                    ctx.metadata = body_hook_ctx.metadata;
-                    if let Some(body) = request_body {
-                        ctx.metadata.insert("request_body".to_string(), body);
-                    }
-                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    adopt_final_request_body_hook_context(&mut ctx, body_hook_ctx);
                 }
                 // Irreversible outbound egress runs here and nowhere earlier:
                 // `transformed` is the backend-visible body and every final
@@ -39936,23 +39954,8 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                if let Some(mut body_hook_ctx) = body_hook_ctx {
-                    if body_hook_ctx.gateway_deadline_response_selected() {
-                        ctx.mark_gateway_deadline_response_selected();
-                    }
-                    // Typed gateway terminals selected by the representation gate
-                    // inside the hook stage. Adopted BEFORE the metadata move so the
-                    // finalizer on the real context knows it is publishing a
-                    // gateway-authored error payload rather than an application one.
-                    ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-                    ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-                    let request_body = ctx.metadata.remove("request_body");
-                    ctx.metadata = body_hook_ctx.metadata;
-                    ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
-                    if let Some(body) = request_body {
-                        ctx.metadata.insert("request_body".to_string(), body);
-                    }
-                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    adopt_final_request_body_hook_context(&mut ctx, body_hook_ctx);
                 }
                 // Finalized-request-egress boundary (GHSA-4vr5-4wm3-x5xv): the
                 // backend-visible body has been transformed and accepted by every
@@ -40831,26 +40834,8 @@ async fn handle_proxy_request_inner(
                 &grpc_req_body,
             )
             .await;
-            if let Some(mut body_hook_ctx) = body_hook_ctx {
-                if body_hook_ctx.gateway_deadline_response_selected() {
-                    ctx.mark_gateway_deadline_response_selected();
-                }
-                // `clone_for_final_request_body_hooks` omits `request_body`; carry
-                // the original across the metadata swap (no on_final hook touches
-                // it). Disjoint field assignments avoid a whole-`ctx` borrow.
-                // Typed gateway terminals selected by the representation gate
-                // inside the hook stage. Adopted BEFORE the metadata move so the
-                // finalizer on the real context knows it is publishing a
-                // gateway-authored error payload rather than an application one.
-                ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-                ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-                let request_body = ctx.metadata.remove("request_body");
-                ctx.metadata = body_hook_ctx.metadata;
-                ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
-                if let Some(body) = request_body {
-                    ctx.metadata.insert("request_body".to_string(), body);
-                }
-                ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+            if let Some(body_hook_ctx) = body_hook_ctx {
+                adopt_final_request_body_hook_context(&mut ctx, body_hook_ctx);
             }
             // Finalized-request-egress boundary for native gRPC
             // (GHSA-4vr5-4wm3-x5xv). `grpc_req_body` is the transformed,
@@ -44697,26 +44682,8 @@ async fn handle_proxy_request_inner(
                 &mut route_request_timeout_phase,
             ),
         };
-        if let Some(mut body_hook_ctx) = body_hook_ctx.take() {
-            if body_hook_ctx.gateway_deadline_response_selected() {
-                ctx.mark_gateway_deadline_response_selected();
-            }
-            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
-            // original across the metadata swap (no on_final hook touches it).
-            // Disjoint field assignments avoid a whole-`ctx` borrow.
-            // Typed gateway terminals selected by the representation gate
-            // inside the hook stage. Adopted BEFORE the metadata move so the
-            // finalizer on the real context knows it is publishing a
-            // gateway-authored error payload rather than an application one.
-            ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-            ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-            let request_body = ctx.metadata.remove("request_body");
-            ctx.metadata = body_hook_ctx.metadata;
-            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
-            if let Some(body) = request_body {
-                ctx.metadata.insert("request_body".to_string(), body);
-            }
-            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+        if let Some(body_hook_ctx) = body_hook_ctx.take() {
+            adopt_final_request_body_hook_context(&mut ctx, body_hook_ctx);
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -45559,26 +45526,8 @@ async fn handle_proxy_request_inner(
                 &mut route_request_timeout_phase,
             ),
         };
-        if let Some(mut body_hook_ctx) = body_hook_ctx {
-            if body_hook_ctx.gateway_deadline_response_selected() {
-                ctx.mark_gateway_deadline_response_selected();
-            }
-            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
-            // original across the metadata swap (no on_final hook touches it).
-            // Disjoint field assignments avoid a whole-`ctx` borrow.
-            // Typed gateway terminals selected by the representation gate
-            // inside the hook stage. Adopted BEFORE the metadata move so the
-            // finalizer on the real context knows it is publishing a
-            // gateway-authored error payload rather than an application one.
-            ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-            ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-            let request_body = ctx.metadata.remove("request_body");
-            ctx.metadata = body_hook_ctx.metadata;
-            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
-            if let Some(body) = request_body {
-                ctx.metadata.insert("request_body".to_string(), body);
-            }
-            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+        if let Some(body_hook_ctx) = body_hook_ctx {
+            adopt_final_request_body_hook_context(&mut ctx, body_hook_ctx);
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {

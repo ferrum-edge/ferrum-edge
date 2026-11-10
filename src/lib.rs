@@ -10885,14 +10885,17 @@ pub mod _test_support {
             &transformed,
         )
         .await;
-        ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
-        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
-        let request_body = ctx.metadata.remove("request_body");
-        ctx.metadata = hook_ctx.metadata;
-        if let Some(body) = request_body {
-            ctx.metadata.insert("request_body".to_string(), body);
-        }
+        crate::proxy::adopt_final_request_body_hook_context(ctx, hook_ctx);
         (transformed, result)
+    }
+
+    /// Stage a typed AI usage snapshot on `ctx`, as a built-in AI plugin
+    /// does, so hook hand-back tests can observe which context's value wins.
+    pub fn stage_ai_usage_export_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        export: crate::plugins::AiUsageExport,
+    ) {
+        ctx.stage_ai_usage_export(export);
     }
 
     pub async fn apply_buffered_request_body_normalization_before_before_proxy_for_test(

@@ -719,3 +719,92 @@ fn every_plugin_state_mut_call_site_is_behind_a_documented_gate() {
         );
     }
 }
+
+// ── Issue #7161: one hand-back for every final-request-body hook context ─────
+//
+// The H1/H2 final-request-body hooks run on a compatibility clone. The terminal
+// `final_body_before_backend_dispatch` path used to hand that clone back without
+// the gateway-deadline mark and the typed `ai_usage_export`, while its four
+// siblings carried both. Every path now goes through one shared helper, which
+// `run_buffered_request_body_hook_round_trip_for_test` executes.
+
+struct FinalHookStagesDeadlineAndUsage;
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::Plugin for FinalHookStagesDeadlineAndUsage {
+    fn name(&self) -> &str {
+        "final_hook_stages_deadline_and_usage"
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        true
+    }
+
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &std::collections::HashMap<String, String>,
+        _body: &[u8],
+    ) -> ferrum_edge::plugins::PluginResult {
+        ferrum_edge::_test_support::mark_gateway_deadline_response_selected_for_test(ctx);
+        ferrum_edge::_test_support::stage_ai_usage_export_for_test(
+            ctx,
+            ferrum_edge::plugins::AiUsageExport {
+                prefix: std::sync::Arc::from("ai"),
+                provider: "openai",
+                prompt_tokens: Some(3),
+                completion_tokens: Some(4),
+                total_tokens: Some(7),
+                cost: None,
+            },
+        );
+        ctx.metadata
+            .insert("final_hook.seen".to_string(), "true".to_string());
+        ferrum_edge::plugins::PluginResult::Continue
+    }
+}
+
+#[tokio::test]
+async fn final_request_body_hook_hand_back_adopts_deadline_and_ai_usage() {
+    let plugins: Vec<std::sync::Arc<dyn ferrum_edge::plugins::Plugin>> =
+        vec![std::sync::Arc::new(FinalHookStagesDeadlineAndUsage)];
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/chat".into());
+    ctx.metadata
+        .insert("request_body".to_string(), "original".to_string());
+    assert!(!ferrum_edge::_test_support::gateway_deadline_response_selected_for_test(&ctx));
+    assert!(ctx.authoritative_ai_usage_export().is_none());
+
+    let headers = std::collections::HashMap::new();
+    let (_body, result) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &headers,
+            b"{}".to_vec(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    assert!(
+        ferrum_edge::_test_support::gateway_deadline_response_selected_for_test(&ctx),
+        "a deadline the hook selected must mark the live context"
+    );
+    let export = ctx
+        .authoritative_ai_usage_export()
+        .expect("the hook's typed usage snapshot must reach the live context");
+    assert_eq!(export.provider, "openai");
+    assert_eq!(export.total_tokens, Some(7));
+    assert_eq!(
+        ctx.metadata.get("final_hook.seen").map(String::as_str),
+        Some("true"),
+        "hook metadata replaces the live metadata"
+    );
+    assert_eq!(
+        ctx.metadata.get("request_body").map(String::as_str),
+        Some("original"),
+        "the live request_body survives the metadata swap"
+    );
+}

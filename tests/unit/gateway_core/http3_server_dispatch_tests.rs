@@ -1499,12 +1499,19 @@ fn h1_h2_request_plugin_awaits_and_body_hook_clones_preserve_deadline_provenance
         !proxy.contains("await_request_plugin_deadline("),
         "proxy request hooks must retain typed timeout provenance until conversion with the live context"
     );
+    // Every final-body compatibility-clone merge goes through the one shared
+    // hand-back, which propagates terminal deadline ownership (issue #7161);
+    // `run_buffered_request_body_hook_round_trip_for_test` executes it.
     assert!(
         proxy
-            .matches("body_hook_ctx.gateway_deadline_response_selected()")
+            .matches("adopt_final_request_body_hook_context(&mut ctx, body_hook_ctx)")
             .count()
-            >= 4,
-        "every final-body compatibility-clone merge must propagate terminal deadline ownership"
+            >= 5,
+        "every final-body compatibility-clone merge must use the shared hand-back"
+    );
+    assert!(
+        !proxy.contains("ctx.metadata = body_hook_ctx.metadata"),
+        "no dispatch path may hand the hook context back field by field"
     );
 }
 
