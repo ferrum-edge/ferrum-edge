@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Changed
+- **V001 baseline: namespace-scoped credential index and structured MySQL
+  duplicate-index check** (issue #7228). `idx_consumer_credential_index_consumer_id`
+  now covers `(namespace, consumer_id)`, matching its foreign key and the
+  namespace-scoped delete, so MySQL no longer creates a second implicit FK
+  index. On MySQL, V001 now tolerates only the structured server error 1061
+  when an index already exists; any other failure (even one whose text
+  contains "1061") fails the migration. The V001 checksum changes: recreate
+  development databases.
 - **Mesh HTTP/2 backend connections use the same builder settings as the
   direct-H2 and gRPC pools** (issue #7071).
   - Sidecar mesh-mTLS connections and the nested HTTP/2 connection a native
