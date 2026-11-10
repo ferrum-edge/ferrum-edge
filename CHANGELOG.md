@@ -658,6 +658,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ids already were): ids change only for names containing `-` or `.`, for
   example `__mesh-ew-svc-<ns>-foo-bar.p8080` becomes
   `__mesh-ew-svc-<ns>-foo_dash_bar.p8080`.
+- **Mesh, node-agent and injector settings that silently fell back now fail
+  startup on an invalid value** (issue #7237). **Operator action:** a value
+  that was previously ignored now aborts startup.
+  - `FERRUM_MESH_DNS_PROXY_ENABLED`, `FERRUM_INJECTOR_REQUIRE_ANNOTATION` and
+    `FERRUM_INJECTOR_ALLOW_PLAINTEXT` accept `true`/`false`/`1`/`0`
+    (case-insensitive, trimmed; blank keeps the default) like every other
+    mesh boolean. Before, `yes` or `True ` silently disabled the DNS proxy,
+    and `0`, `False` or a padded value made the injector fall back to its
+    default.
+  - The node-agent parses `FERRUM_MESH_TOPOLOGY` with the mesh proxy's
+    parser, so an unknown topology is refused instead of being treated as
+    "not ambient" (which disabled the Ambient pod registry and UDP readiness
+    guard).
+  - `FERRUM_NODE_AGENT_FALLBACK_MODE` is trimmed before parsing.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

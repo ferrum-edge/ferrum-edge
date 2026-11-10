@@ -2292,6 +2292,55 @@ fn mesh_runtime_config_parses_stock_xds_allow_plaintext_canonical_forms() {
     }
 }
 
+/// Issue #7237: `FERRUM_MESH_DNS_PROXY_ENABLED` used to treat anything other
+/// than `true`/`1` as `false`, so `yes` silently disabled the DNS proxy. It now
+/// parses like every sibling mesh bool.
+#[test]
+fn mesh_runtime_config_rejects_malformed_dns_proxy_enabled() {
+    use ferrum_edge::modes::mesh::MeshRuntimeConfig;
+
+    use crate::unit::env_lock::EnvGuard;
+
+    for raw in ["yes", "on", "tru"] {
+        let env = EnvGuard::new(&["FERRUM_MESH_DNS_PROXY_ENABLED"]);
+        env.set("FERRUM_MESH_DNS_PROXY_ENABLED", raw);
+
+        let err = MeshRuntimeConfig::from_env_config(&mesh_runtime_env_config())
+            .expect_err("malformed explicit bool must fail startup");
+        assert!(err.contains("FERRUM_MESH_DNS_PROXY_ENABLED"), "{err}");
+        assert!(err.contains("true, false, 1, or 0"), "{err}");
+    }
+}
+
+#[test]
+fn mesh_runtime_config_parses_dns_proxy_enabled_canonical_forms() {
+    use ferrum_edge::modes::mesh::MeshRuntimeConfig;
+
+    use crate::unit::env_lock::EnvGuard;
+
+    let cases = [
+        (None, false),
+        (Some("   "), false),
+        (Some("false"), false),
+        (Some("0"), false),
+        (Some("TRUE"), true),
+        (Some(" True "), true),
+        (Some("1"), true),
+    ];
+
+    for (value, expected) in cases {
+        let env = EnvGuard::new(&["FERRUM_MESH_DNS_PROXY_ENABLED"]);
+        match value {
+            Some(raw) => env.set("FERRUM_MESH_DNS_PROXY_ENABLED", raw),
+            None => env.unset("FERRUM_MESH_DNS_PROXY_ENABLED"),
+        }
+
+        let runtime = MeshRuntimeConfig::from_env_config(&mesh_runtime_env_config())
+            .unwrap_or_else(|err| panic!("canonical form {:?} must parse: {err}", value));
+        assert_eq!(runtime.dns_enabled, expected, "value {:?}", value);
+    }
+}
+
 /// Issue #4531. A CP that answers `RESOURCE_EXHAUSTED` is demonstrably alive:
 /// its stream admission controller refused this workload for capacity or
 /// tenancy reasons and named the saturated budget in the status message.

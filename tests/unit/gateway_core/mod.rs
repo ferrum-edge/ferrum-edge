@@ -150,6 +150,7 @@ mod mesh_capture_boundary_tests;
 mod mesh_config_consumer_client_tests;
 mod mesh_dns_env_bounds_tests;
 mod mesh_dual_stack_capture_tests;
+mod mesh_env_bool_parsing_tests;
 mod mesh_host_udp_capture_plan_tests;
 mod mesh_injector_ca_crd_helm_tests;
 mod mesh_listener_direction_ports_tests;

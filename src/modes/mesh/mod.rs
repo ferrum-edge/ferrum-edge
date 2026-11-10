@@ -902,9 +902,13 @@ impl MeshRuntimeConfig {
         let unix_socket_allowed_roots = env_config.mesh_unix_socket_allowed_roots.clone();
         let unix_socket_allowed_uids = env_config.mesh_unix_socket_allowed_uids.clone();
 
-        let dns_enabled = resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(DEFAULT_DNS_ENABLED);
+        // Strict like every sibling mesh bool: a typo such as `yes` fails
+        // startup instead of silently disabling the DNS proxy.
+        let dns_enabled = match resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED") {
+            None => DEFAULT_DNS_ENABLED,
+            Some(raw) if raw.trim().is_empty() => DEFAULT_DNS_ENABLED,
+            Some(raw) => bool::parse_env(raw.trim(), "FERRUM_MESH_DNS_PROXY_ENABLED")?,
+        };
         let dns_listen_addr = parse_socket_addr(
             "FERRUM_MESH_DNS_LISTEN_ADDR",
             resolve_ferrum_var("FERRUM_MESH_DNS_LISTEN_ADDR")

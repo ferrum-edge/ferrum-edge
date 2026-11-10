@@ -360,6 +360,16 @@ fn validate_bpf_fs_path(raw: Option<String>) -> Result<String, String> {
     ))
 }
 
+/// `FERRUM_MESH_TOPOLOGY` as the node-agent sees it: parsed by the same
+/// [`crate::modes::mesh::MeshTopology::parse`] the mesh proxy uses (default
+/// `sidecar` when unset), so a typo fails node-agent startup instead of being
+/// read as "not ambient" (issue #7237).
+fn node_agent_mesh_topology() -> Result<crate::modes::mesh::MeshTopology, String> {
+    crate::modes::mesh::MeshTopology::parse(
+        &resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string()),
+    )
+}
+
 impl NodeAgentConfig {
     pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let node_name = resolve_ferrum_var("FERRUM_NODE_AGENT_NODE_NAME").ok_or(
@@ -520,13 +530,12 @@ impl NodeAgentConfig {
         // before publishing this entry. The host-veth tc guard drops pod UDP until
         // the producer installs its guard/socket/rules and publishes
         // `.udp-ready/<uid>`.
-        let mesh_topology =
-            resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string());
-        let ambient_topology = mesh_topology.trim().eq_ignore_ascii_case("ambient");
+        let mesh_topology = node_agent_mesh_topology()?;
+        let ambient_topology = mesh_topology == crate::modes::mesh::MeshTopology::Ambient;
         let udp_capture_requested = capture_config.udp_capture_enabled;
         if udp_capture_requested && !ambient_topology {
             warn!(
-                mesh_topology = %crate::startup::sanitize_startup_scalar(mesh_topology.trim()),
+                mesh_topology = ?mesh_topology,
                 "FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient; the Ambient UDP readiness guard is disabled and registry publication remains topology-dependent"
             );
         }
@@ -1163,6 +1172,10 @@ pub async fn run(
     shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     let config = NodeAgentConfig::from_env_config(&env_config).map_err(anyhow::Error::msg)?;
+    // Read before any listener starts, so the `?` needs no cleanup.
+    // `from_env_config` already refused an unparseable value.
+    let ambient_topology = node_agent_mesh_topology().map_err(anyhow::Error::msg)?
+        == crate::modes::mesh::MeshTopology::Ambient;
     let metrics = Arc::new(NodeAgentMetrics::default());
     crate::plugins::prometheus_metrics::global_registry().set_node_agent_metrics(metrics.clone());
     let startup_ready = Arc::new(AtomicBool::new(false));
@@ -1197,8 +1210,6 @@ pub async fn run(
     // pod-netns-only; see `handle_fallback_with`). Refuse startup with an
     // actionable error rather than silently break either lifecycle phase,
     // mirroring `create_backend`'s refusal to no-op when eBPF is unavailable.
-    let ambient_topology = resolve_ferrum_var("FERRUM_MESH_TOPOLOGY")
-        .is_some_and(|topology| topology.trim().eq_ignore_ascii_case("ambient"));
     if ambient_udp_registry_requires_ebpf(
         probe.supports_ebpf(),
         ambient_topology,
