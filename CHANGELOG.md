@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **`ai_rate_limiter` reserves every output cap `ai_request_guard`
+  evaluates** (#7135). The limiter read caps only as JSON unsigned integers
+  and only as `generationConfig.maxOutputTokens` /
+  `generation_config.max_output_tokens`, while the guard also accepts
+  integral floats and exponents (`4096.0`, `1e5`), quoted integers, and the
+  mixed Gemini spellings. A request such as `{"max_tokens": 1e5}` was judged
+  as a 100000-token completion by the guard but reserved nothing in
+  `count_mode: completion_tokens`. Both plugins now share one integer parser,
+  the limiter reads all four Gemini spellings, and the prompt estimate
+  excludes caps at exactly the same paths and values.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then
