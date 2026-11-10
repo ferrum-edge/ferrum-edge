@@ -41,8 +41,9 @@ impl ConfigMigrator {
 
     /// Migrate a `serde_json::Value` config from its current version to the target version.
     ///
-    /// Returns the number of migration steps applied. If the config is already at or
-    /// beyond the target version, returns 0.
+    /// Returns the number of migration steps applied. If the config is already at
+    /// the target version, returns 0; a version with no migration path to the
+    /// target is an error.
     pub fn migrate_value(
         value: &mut serde_json::Value,
         target_version: &str,
@@ -271,7 +272,8 @@ impl ConfigMigrator {
     }
 
     /// Migrate a serde_json::Value in memory (for use during config loading).
-    /// Returns the migrated value, or the original if no migration was needed.
+    /// Migrates `value` in place and returns the number of steps applied (0 if
+    /// it was already at the current version).
     pub fn migrate_in_memory(value: &mut serde_json::Value) -> Result<u32, anyhow::Error> {
         let target = CURRENT_CONFIG_VERSION;
         let current = value

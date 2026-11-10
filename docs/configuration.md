@@ -434,7 +434,7 @@ SQL pool settings apply to PostgreSQL, MySQL, and SQLite. MongoDB uses driver co
 | `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | No | `600` | Max idle age before a SQL connection is closed |
 | `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | No | `300` | Max SQL connection lifetime |
 | `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | No | `10` | Max time for each PostgreSQL/MySQL pool connect attempt (initial, failover, replica, reconnect, migrate); `0` disables. Enforced around sqlx pool creation — not a DSN query parameter |
-| `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | No | `30` | Per-statement SQL timeout; on MySQL also applied as `innodb_lock_wait_timeout` so a write blocked on an abandoned transaction's row lock cannot pile up; `0` disables |
+| `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | No | `30` | Per-statement SQL timeout; on MySQL also applied as `innodb_lock_wait_timeout` so a write blocked on an abandoned transaction's row lock cannot pile up; `0` disables. Maximum `3600`; larger values are clamped with a startup warning |
 
 ### MongoDB
 
@@ -1044,7 +1044,7 @@ Admin listener TLS and mTLS variables are listed in [Admin API](#admin-api).
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` | No | `32` | Maximum concurrent CONNECT-UDP tunnels per resolved client, held for the tunnel's lifetime so one client cannot occupy every `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS` slot. IPv4 is counted per address; IPv6 addresses within `FERRUM_PER_IP_IPV6_PREFIX` share one budget (default `/64`). Uses the same client IP resolution as other per-IP limits (socket peer, or `X-Forwarded-For` / `FERRUM_REAL_IP_HEADER` only when the direct peer is in `FERRUM_TRUSTED_PROXIES`). Independent of `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP`, which is released once the tunnel is established. Over the limit the gateway returns 503 before any socket is created. `0` disables the per-client cap. |
 | `FERRUM_HTTP3_CONNECT_UDP_IDLE_TIMEOUT_SECONDS` | No | `120` | Seconds a CONNECT-UDP tunnel may carry no datagram in either direction before it is closed (clamped 1–86400). The default is the two minutes RFC 9298 §3.2 says a UDP proxy SHOULD NOT go below; a lower value is accepted but is a deliberate deviation. While the profile is enabled this value is also the **floor** for the frontend QUIC connection idle timeout (see `FERRUM_HTTP3_IDLE_TIMEOUT`), so the tunnel bound the gateway advertises is the one that actually holds. |
 | `FERRUM_HTTP3_CONNECT_UDP_MAX_DATAGRAM_BYTES` | No | `65527` | Largest UDP payload relayed in either direction (clamped 1–65527, the RFC 9298 §5 ceiling for Context ID 0). Larger datagrams from the target are silently dropped; a larger client capsule terminates the tunnel. Lower this to bound per-session buffers or to stay inside the path MTU. |
-| `FERRUM_HTTP3_INITIAL_MTU` | No | `1500` | Initial QUIC path MTU (clamped 1200–65527) |
+| `FERRUM_HTTP3_INITIAL_MTU` | No | `1500` | Initial QUIC path MTU. Must be in `1200..=65527`; a value outside that range fails startup and `ferrum-edge validate` |
 | `FERRUM_H3_REQUEST_BODY_DRAIN_MS` | No | `50` | Courtesy drain window before STOP_SENDING on small/successful H3 responses. Clamped to `0..=1000` |
 
 See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol bridge behavior, and WebSocket-over-H3 bridging.

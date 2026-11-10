@@ -1781,7 +1781,7 @@ pub struct ActiveHealthCheck {
     /// Use HTTPS for health check probes instead of HTTP.
     #[serde(default)]
     pub use_tls: bool,
-    /// Probe type: `http` (default), `tcp`, or `udp`.
+    /// Probe type: `http` (default), `tcp`, `udp`, or `grpc`.
     #[serde(default)]
     pub probe_type: HealthProbeType,
     /// Hex-encoded probe payload for UDP health checks.
@@ -2816,12 +2816,9 @@ pub enum BackendScheme {
 impl BackendScheme {
     /// True when this is a raw L4 stream proxy (TCP/UDP/TLS/DTLS).
     ///
-    /// Kept public (and annotated `#[allow(dead_code)]`) because
-    /// `BackendScheme` is re-exported from `lib.rs` for downstream consumers
-    /// (tests, future plugins) even when the gateway itself prefers the
-    /// pre-computed `DispatchKind::is_stream()` on the hot path.
+    /// Request-path dispatch prefers the pre-computed
+    /// `DispatchKind::is_stream()`.
     #[inline]
-    #[allow(dead_code)]
     pub fn is_stream(&self) -> bool {
         matches!(self, Self::Tcp | Self::Tcps | Self::Udp | Self::Dtls)
     }
@@ -2842,7 +2839,6 @@ impl BackendScheme {
 
     /// True when the backend connection uses TLS/DTLS.
     #[inline]
-    #[allow(dead_code)]
     pub fn is_tls_backend(&self) -> bool {
         matches!(self, Self::Https | Self::Tcps | Self::Dtls)
     }
@@ -3801,7 +3797,7 @@ pub struct GatewayConfig {
     /// authoritative configuration store (issue #3727).
     ///
     /// DERIVED, CONTROL-PLANE-IN-MEMORY ONLY: `#[serde(skip)]`, exactly like
-    /// `mesh_config_revision`. It must never ride the ConfigSync `config_json`
+    /// `mesh_revision`. It must never ride the ConfigSync `config_json`
     /// wire — both peers are `deny_unknown_fields`, and more importantly a
     /// multi-namespace CP holds EVERY served namespace's trust material here.
     /// Publication is per-subscriber through the `trust_bundles_json` side
@@ -4079,8 +4075,6 @@ pub fn validate_namespace(ns: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Auto-anchor a regex listen_path pattern for full-path matching.
-///
 /// Parse a backend host as a literal IP, stripping URI brackets first.
 ///
 /// `build_backend_url_with_target` preserves bracketed IPv6 literals
@@ -4193,6 +4187,8 @@ pub(crate) fn stream_literal_ip(host: &str) -> Option<std::net::IpAddr> {
         .ok()
 }
 
+/// Auto-anchor a regex listen_path pattern for full-path matching.
+///
 /// Wraps the operator pattern in a non-capturing group and anchors the group,
 /// ensuring alternation and other top-level regex operators still apply to the
 /// full request path. Operators who need prefix-style matching can end their
@@ -5128,10 +5124,10 @@ impl GatewayConfig {
     /// Validate that consumer ids, usernames, and custom_ids share one identity
     /// namespace.
     ///
-    /// In database mode the DB enforces this via UNIQUE constraints. In file
-    /// mode there's no DB, so this catches duplicates at config load time
-    /// and prevents the gateway from starting with ambiguous identity mappings
-    /// that would cause incorrect JWKS/JWT authentication.
+    /// In database mode the `consumer_identity_index` table/collection
+    /// enforces this. In file mode there's no DB, so this catches duplicates at
+    /// config load time and prevents the gateway from starting with ambiguous
+    /// identity mappings that would cause incorrect JWKS/JWT authentication.
     pub fn validate_unique_consumer_identities(&self) -> Result<(), Vec<String>> {
         let mut seen_identities: HashMap<&str, (&str, &'static str)> = HashMap::new();
         let mut duplicates = Vec::new();
@@ -6264,7 +6260,7 @@ impl GatewayConfig {
 
     /// Validate stream proxy (TCP/UDP) configuration.
     ///
-    /// - Stream proxies must have a `listen_port` in range 1024-65535.
+    /// - Stream proxies must have a `listen_port` in range 1-65535.
     /// - `listen_port` must be unique across all stream proxies, **unless** the
     ///   proxies sharing the port form one shared listener: an opaque-TLS SNI
     ///   group (all `passthrough: true`, or all ordinary `tcp` listeners with at
@@ -6851,8 +6847,6 @@ fn ambiguous_path_host_overlap(a: &[String], b: &[String]) -> bool {
 
 // ---- Field-level validation ----
 
-/// Check if a string contains ASCII control characters (excluding common whitespace).
-/// Rejects null bytes, backspace, escape, etc. that could cause log injection.
 /// Human-readable JSON value type name for error messages.
 fn elem_type_name(v: &serde_json::Value) -> &'static str {
     match v {
@@ -6865,6 +6859,8 @@ fn elem_type_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Check if a string contains ASCII control characters (excluding common whitespace).
+/// Rejects null bytes, backspace, escape, etc. that could cause log injection.
 fn contains_control_chars(s: &str) -> bool {
     s.bytes()
         .any(|b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r')
@@ -11816,7 +11812,7 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate the mesh portion of the config (Layer 2 — Phase A).
+    /// Validate the mesh portion of the config (Layer 2).
     ///
     /// Returns a flat `Vec<String>` of error messages so each mode can
     /// dispatch the result per its own policy:
@@ -11828,7 +11824,6 @@ impl GatewayConfig {
     /// mesh fields can fail independently — operators may want to
     /// experiment with mesh resources in dev without bricking their
     /// existing proxy config.
-    #[allow(dead_code)] // Phase A scaffolding — wired into modes in Phase B/C.
     pub fn validate_mesh_fields(&self) -> Vec<String> {
         match &self.mesh {
             Some(m) => m.validate(),
@@ -11837,7 +11832,6 @@ impl GatewayConfig {
     }
 
     /// Normalise hostname-bearing mesh fields (lower-case ASCII). Idempotent.
-    #[allow(dead_code)] // Phase A scaffolding — wired into loaders in Phase B/C.
     pub fn normalize_mesh_fields(&mut self) {
         if let Some(m) = &mut self.mesh {
             m.normalize();
