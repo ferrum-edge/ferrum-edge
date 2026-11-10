@@ -4551,10 +4551,13 @@ impl<'a> GrpcDispatchTransport<'a> {
     }
 
     /// Drop a stale pooled sender after a provably pre-wire cancellation or
-    /// protocol NACK. The mesh pools self-heal instead: the mesh-mTLS
-    /// cached-sender scans skip `is_closed()` senders, and the HBONE gRPC
-    /// transport dials a FRESH inner HTTP/2 connection per RPC, so neither has
-    /// a stale sender to invalidate.
+    /// protocol NACK. Only the direct pool is invalidated here. The mesh-mTLS
+    /// cached-sender scans skip `is_closed()` senders. The HBONE gRPC transport
+    /// can reuse a shared nested HTTP/2 carrier from
+    /// [`crate::proxy::hbone_inner_pool`] (issue #5042 step 2), whose checkout
+    /// also tests only `!is_closed()`; that pool has no per-entry eviction, so
+    /// a retry after one of these signals can check out the same carrier until
+    /// it reports closed (issue #7180).
     fn invalidate_on_pre_wire_cancel(&self, proxy: &Proxy) {
         if let Self::Direct(pool) = self {
             pool.invalidate_shards_for_proxy(proxy);
