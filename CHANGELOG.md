@@ -1016,6 +1016,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every slice apply that it "cannot be egress-routed": its direct pod-IP dials
   are routed, so the message is now a debug event; the UDP equivalent stays a
   warning but is sampled.
+- **Egress baggage stripping filters every spelling of the `baggage` header**
+  (GHSA-hq2p-8cgc-cg4v). On the HTTP/1.1, HTTP/2, native HTTP/3 and WebSocket
+  egress sites, the map-shaped strip filtered only one `baggage` key. When a
+  request-transforming plugin added a mixed-case `Baggage` header beside the
+  lowercase one, the second copy was forwarded with its reserved identity
+  members (`source.principal` and the other reserved prefixes) and any
+  configured-prefix members intact, and the next hop merges every baggage
+  field line. Every case-insensitive match is now filtered, as the
+  ordered-list sibling already did.
+- **A TCPRoute and a TLSRoute with the same name no longer share one L4 proxy
+  id** (GHSA-4mjg-c4c6-vhw2). Only UDPRoute ids carried the route kind, so
+  TCPRoute `ns/db` and TLSRoute `ns/db` both derived
+  `gwapi-l4-ns-db-<rule>` and one silently replaced the other depending on
+  informer order, while both could report Programmed. Every L4 rule suffix is
+  now kind-scoped (`tcproute-<rule>`, `tlsroute-<rule>`, `udproute-<rule>`),
+  and the L4 path claims its proxy and upstream ids like the HTTPRoute path:
+  a second route object deriving an owned id is refused with a warning and a
+  refused-claim status instead of overwriting. **Operator note:** generated
+  TCPRoute/TLSRoute proxy ids change (`gwapi-l4-<ns>-<name>-0` becomes
+  `gwapi-l4-<ns>-<name>-tcproute-0` or `-tlsroute-0`); anything keyed on those
+  ids (dashboards, plugin `proxy_id` references) needs the new spelling.
+- **A Sidecar `ingress[]` stream listener with a dedicated `bind` no longer
+  removes every mesh outbound HTTP route** (issue #7231). The mesh stream
+  proxy builders (dedicated-bind and inbound raw-TCP relay, east-west gateway
+  and service, stream EgressGateway, NodeWaypoint UDP/DTLS listener) left the
+  dispatch kind at its HTTP default until the final normalization, so the
+  outbound materializer read the host-less bind proxy as an HTTP catch-all and
+  skipped every `__mesh-outbound-*` route (logged at debug only), cutting all
+  HTTP-family mesh egress for that workload. They now set the dispatch kind
+  from their scheme, as the outbound raw-TCP relay already did; the
+  NodeWaypoint UDP listener port reservation and the non-Linux scoped-policy
+  UDP fail-closed strip now also see these proxies as stream proxies.
+- **DestinationRule top-level `connectTimeout` now reaches mesh raw-TCP
+  egress, and a non-hash `loadBalancer` clears a stale hash key** (issue
+  #7232). A top-level `connectionPool.tcp.connectTimeout` was applied only to
+  proxies that reference the upstream, plus the in-mesh UDP egress upstreams;
+  the raw-TCP egress upstreams (by Service VIP and by workload address) and
+  the external UDP egress upstreams are dialed only by synthesized relays, so
+  their tunnel dials kept the relay's 5 s default unless the value was
+  repeated under `portLevelSettings`. It is now seeded onto every target
+  policy port of those upstreams that has no per-port value. Separately, a
+  winning rule with a `simple` load balancer set the upstream algorithm but
+  left an earlier rule's (or the operator's) `hash_on` in place, which still
+  produced a per-request hash strategy; the upstream-level projection now
+  clears it, as the per-port projection already did.
+- **One ServiceEntry with a long host no longer fails every EgressGateway
+  slice apply** (issue #7234). The EgressGateway proxy/upstream ids embed the
+  ServiceEntry namespace, name and host through an expanding encoder and had
+  no length check, so a long but valid host produced an id over the 254-byte
+  resource id limit and the whole slice was rejected (last-good retained, or
+  no start). That host/port is now skipped with a warning, without claiming
+  its stream listen port, and the other entries still materialize.
+- **East-west gateway service routes no longer collide across namespaces**
+  (issue #7235). Every per-service east-west proxy/upstream is stamped with
+  the gateway's namespace, but its id joined the service namespace and name
+  with `-`, so services `a/b-c` and `a-b/c` on one port derived the same id
+  and one lost its SNI passthrough route on a slice spanning namespaces. The
+  namespace and name are now encoded injectively (as the Sidecar ingress bind
+  ids already were): ids change only for names containing `-` or `.`, for
+  example `__mesh-ew-svc-<ns>-foo-bar.p8080` becomes
+  `__mesh-ew-svc-<ns>-foo_dash_bar.p8080`.
+- **Mesh, node-agent and injector settings that silently fell back now fail
+  startup on an invalid value** (issue #7237). **Operator action:** a value
+  that was previously ignored now aborts startup.
+  - `FERRUM_MESH_DNS_PROXY_ENABLED`, `FERRUM_INJECTOR_REQUIRE_ANNOTATION` and
+    `FERRUM_INJECTOR_ALLOW_PLAINTEXT` accept `true`/`false`/`1`/`0`
+    (case-insensitive, trimmed; blank keeps the default) like every other
+    mesh boolean. Before, `yes` or `True ` silently disabled the DNS proxy,
+    and `0`, `False` or a padded value made the injector fall back to its
+    default.
+  - The node-agent parses `FERRUM_MESH_TOPOLOGY` with the mesh proxy's
+    parser, so an unknown topology is refused instead of being treated as
+    "not ambient" (which disabled the Ambient pod registry and UDP readiness
+    guard).
+  - `FERRUM_NODE_AGENT_FALLBACK_MODE` is trimmed before parsing.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

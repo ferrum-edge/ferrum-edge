@@ -902,9 +902,13 @@ impl MeshRuntimeConfig {
         let unix_socket_allowed_roots = env_config.mesh_unix_socket_allowed_roots.clone();
         let unix_socket_allowed_uids = env_config.mesh_unix_socket_allowed_uids.clone();
 
-        let dns_enabled = resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(DEFAULT_DNS_ENABLED);
+        // Strict like every sibling mesh bool: a typo such as `yes` fails
+        // startup instead of silently disabling the DNS proxy.
+        let dns_enabled = match resolve_ferrum_var("FERRUM_MESH_DNS_PROXY_ENABLED") {
+            None => DEFAULT_DNS_ENABLED,
+            Some(raw) if raw.trim().is_empty() => DEFAULT_DNS_ENABLED,
+            Some(raw) => bool::parse_env(raw.trim(), "FERRUM_MESH_DNS_PROXY_ENABLED")?,
+        };
         let dns_listen_addr = parse_socket_addr(
             "FERRUM_MESH_DNS_LISTEN_ADDR",
             resolve_ferrum_var("FERRUM_MESH_DNS_LISTEN_ADDR")
@@ -2893,7 +2897,7 @@ fn node_waypoint_udp_listener_proxy(
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(BackendScheme::Udp),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(BackendScheme::Udp),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -4655,7 +4659,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         hosts: gateway.sni_hosts.clone(),
         listen_path: None,
         backend_scheme: Some(BackendScheme::Tcp),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(BackendScheme::Tcp),
         backend_host: gateway.host.clone(),
         backend_port: gateway.port,
         backend_path: None,
@@ -5245,7 +5249,7 @@ fn east_west_service_proxy(
         hosts: vec![sni_hostname.to_string()],
         listen_path: None,
         backend_scheme: Some(BackendScheme::Tcp),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(BackendScheme::Tcp),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -5310,45 +5314,34 @@ fn east_west_service_proxy(
     }
 }
 
-/// Sanitize one namespace/name component of an internal east-west id. These ids
-/// are purely internal registry keys (a `Proxy.id`/`Upstream.id`, never emitted
-/// to Kubernetes, DNS, SNI/TLS, or any wire protocol — the SNI is built
-/// independently by [`cross_cluster_service_sni`]), so the only requirement is
-/// intra-component uniqueness. `/` and `.` are folded to `-` so a hostile or
-/// malformed component cannot smuggle the reserved `.` port-marker separator
-/// (see [`mesh_east_west_service_proxy_id`]) into the middle of an id. A
-/// well-formed Kubernetes namespace/service name (DNS-1035/1123 label) contains
-/// neither character, so this is a no-op for real inputs.
-fn sanitize_mesh_id_component(component: &str) -> String {
-    component.replace(['/', '.'], "-")
-}
-
 /// East-west per-service proxy id. `sni_label` is the port's alias label from
 /// [`cross_cluster_service_sni_label`] (`p<port>`, or `p<port>-udp` for a UDP
 /// port), matching the SNI scheme where every port takes an explicit
 /// `<label>.<fqdn>` alias.
 ///
-/// The port marker is joined with `.` — a character DNS-1035/1123 labels forbid,
-/// so it CANNOT appear in a Kubernetes namespace or service name (codex #2040
-/// Finding B). This makes the per-port id `__mesh-ew-svc-<ns>-<name>.p<port>`
-/// unambiguous: a distinct service literally named `<name>-p<port>` yields
-/// `__mesh-ew-svc-<ns>-<name>-p<port>` (no dot) and a service named `<name>.p<port>`
-/// is not a valid k8s name (impossible), so neither can collide in the
-/// materializer's id-keyed upsert map. The ns/name components are individually
-/// sanitized (`/`,`.` → `-`) BEFORE the `.p<port>` marker is appended so a
-/// malformed component can never forge the structural separator, while the
-/// intentional marker dot is preserved (never collapsed).
+/// These ids are purely internal registry keys (a `Proxy.id`/`Upstream.id`,
+/// never emitted to Kubernetes, DNS, SNI/TLS, or any wire protocol — the SNI is
+/// built independently by [`cross_cluster_service_sni`]) and are forward-derived,
+/// never parsed. Every materialized proxy/upstream is stamped with the GATEWAY's
+/// namespace, so services from different namespaces share one id space: the
+/// namespace and name are each encoded with the injective
+/// [`sanitize_egress_host_id_part`], whose output contains neither `-` nor `.`.
+/// The `-` between them is therefore an unambiguous separator (`a`/`b-c` and
+/// `a-b`/`c` stay distinct, issue #7235), and the `.` before the port marker
+/// cannot be forged by a component: a service literally named `<name>-p<port>`
+/// yields `__mesh-ew-svc-<ns>-<name>_dash_p<port>.p<port>` (codex #2040 Finding
+/// B).
 fn mesh_east_west_service_proxy_id(namespace: &str, name: &str, sni_label: &str) -> String {
-    let namespace = sanitize_mesh_id_component(namespace);
-    let name = sanitize_mesh_id_component(name);
+    let namespace = sanitize_egress_host_id_part(namespace);
+    let name = sanitize_egress_host_id_part(name);
     format!("__mesh-ew-svc-{namespace}-{name}.{sni_label}")
 }
 
-/// East-west per-service upstream id; `sni_label` semantics and the
+/// East-west per-service upstream id; component encoding and the
 /// collision-free `.p<port>` marker mirror [`mesh_east_west_service_proxy_id`].
 fn mesh_east_west_service_upstream_id(namespace: &str, name: &str, sni_label: &str) -> String {
-    let namespace = sanitize_mesh_id_component(namespace);
-    let name = sanitize_mesh_id_component(name);
+    let namespace = sanitize_egress_host_id_part(namespace);
+    let name = sanitize_egress_host_id_part(name);
     format!("__mesh-ew-upstream-{namespace}-{name}.{sni_label}")
 }
 
@@ -5433,20 +5426,23 @@ pub(crate) fn is_mesh_ingress_bind_route_id(id: &str) -> bool {
     id.starts_with(MESH_INGRESS_BIND_PROXY_ID_PREFIX)
 }
 
-/// LATENT-COLLISION HAZARD (shared by this whole `mesh_*_id` family —
-/// `mesh_ingress_proxy_id`, `mesh_outbound_proxy_id`,
-/// `mesh_outbound_upstream_id`, `mesh_outbound_tcp_upstream_id`,
-/// `mesh_east_west_*_id`, etc.): the `{namespace}-{name}-{port}` join uses `-`
-/// as the field separator, but `replace(['/', '.'], "-")` ALSO emits `-`, so
-/// `(ns="a-b", name="c")` and `(ns="a", name="b-c")` would map to the same id.
-/// SAFE TODAY because every in-scope materializer consumes a SINGLE-namespace
-/// service set (the slice is scoped to one namespace), so the `namespace`
-/// segment is constant and only `name`+`port` vary — and a `name` cannot
-/// borrow a `-` from a fixed `namespace`. Dedicated Sidecar ingress bind ids
-/// (`mesh_ingress_bind_proxy_id`) are the exception: they already use the
-/// reversible `sanitize_egress_host_id_part` scheme so the id space stays
-/// injective across namespaces. Before any MULTI-namespace caller is added to
-/// the rest of this family, switch those constructors the same way. See #1727.
+/// LOSSY JOIN (shared by the `mesh_inbound_proxy_id`, `mesh_ingress_proxy_id`,
+/// `mesh_outbound_proxy_id`, `mesh_outbound_upstream_id`,
+/// `mesh_outbound_tcp_upstream_id` family): the `{namespace}-{name}-{port}` join
+/// uses `-` as the field separator, but `replace(['/', '.'], "-")` ALSO emits
+/// `-`, so `(ns="a-b", name="c")` and `(ns="a", name="b-c")` map to the same
+/// id string. The service sets are NOT single-namespace (an enforced `Sidecar`
+/// or a ServiceWaypoint carries services from every namespace); these ids stay
+/// distinct only because each materialized resource is stamped with its OWNING
+/// service's namespace and every consumer keys on `(namespace, id)`, so two
+/// services can share an id string only inside one namespace, where their names
+/// differ. Never parse these ids back into namespace/name (see
+/// `mesh_outbound_service_groups`), and never stamp them with a namespace other
+/// than the owning service's. Families that ARE stamped with a shared namespace
+/// encode each component with the injective `sanitize_egress_host_id_part`
+/// instead: dedicated Sidecar ingress bind ids (`mesh_ingress_bind_proxy_id`)
+/// and the east-west per-service ids (`mesh_east_west_service_proxy_id`, stamped
+/// with the gateway's namespace). See #1727 and #7235.
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
@@ -7509,7 +7505,7 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(BackendScheme::Tcp),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(BackendScheme::Tcp),
         backend_host: route.backend_addr.ip().to_string(),
         backend_port: route.backend_addr.port(),
         backend_path: None,
@@ -8401,6 +8397,21 @@ pub(crate) fn mesh_external_udp_upstream_id(
 ) -> String {
     format!("{MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX}{namespace}-{service_entry}-{port}-{dest_ip}")
         .replace(['/', '.', ':'], "-")
+}
+
+/// True for the mesh egress upstream families that no `config.proxies` entry
+/// references: each is dialed only through a relay proxy the router table
+/// synthesizes, which reads per-port DestinationRule policy from its
+/// `dispatch_port_overrides`. Covers raw TCP by VIP
+/// ([`mesh_outbound_tcp_upstream_id`]), raw TCP by workload
+/// ([`mesh_outbound_tcp_bywl_upstream_id`]), in-mesh UDP
+/// ([`mesh_outbound_udp_upstream_id`]) and external UDP
+/// ([`mesh_external_udp_upstream_id`]).
+fn is_proxyless_mesh_relay_upstream_id(id: &str) -> bool {
+    id.starts_with("__mesh-out-tcp-upstream-")
+        || id.starts_with("__mesh-out-tcp-bywl-upstream-")
+        || id.starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
+        || id.starts_with(MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX)
 }
 
 /// Build the synthesized relay proxy backing one SOURCE-side external UDP egress
@@ -11216,25 +11227,31 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                 upstream.resolved_subset_tls.clear();
             }
 
-            // Top-level `trafficPolicy.connectTimeout` for a UDP egress upstream
-            // (codex r6 P2). The top-level timeout is applied to `config.proxies`
-            // below, but a UDP egress upstream (`__mesh-out-udp-upstream-*`) is
-            // referenced by NO config proxy — it materializes a synthesized relay
-            // proxy in the router table that dials via
-            // `hbone_pool::get_datagram_tunnel`, which reads the connect timeout
-            // from `dispatch_port_overrides` (projected from `port_overrides`) and
-            // otherwise falls back to the relay proxy's hardcoded default. Seed the
-            // top-level value onto each materialized target policy port carrying no
-            // per-port `portLevelSettings.connectTimeout`, so the UDP relay honors
-            // the operator's top-level connectTimeout instead of the 5s default.
+            // Top-level `trafficPolicy.connectTimeout` for a proxy-less relay
+            // upstream (codex r6 P2, issue #7232). The top-level timeout is
+            // applied to `config.proxies` below, but the raw-TCP
+            // (`__mesh-out-tcp-upstream-*`, `__mesh-out-tcp-bywl-upstream-*`) and
+            // UDP (`__mesh-out-udp-upstream-*`, `__mesh-out-udp-ext-upstream-*`)
+            // egress upstreams are referenced by NO config proxy. Each
+            // materializes a synthesized relay proxy in the router table whose
+            // `dispatch_port_overrides` are projected from `port_overrides`; the
+            // relay dials (`HboneConnectionPool::get_tunnel_via`,
+            // `MeshMtlsConnectionPool::open_connect_tunnel`,
+            // `hbone_pool::get_datagram_tunnel`) read the per-port connect
+            // timeout from there and otherwise fall back to the relay proxy's
+            // hardcoded default. Seed the top-level value onto each materialized
+            // target policy port carrying no per-port
+            // `portLevelSettings.connectTimeout`, so the relay honors the
+            // operator's top-level connectTimeout instead of the 5s default.
             // Per-port entries written above already win (only unset slots are
-            // seeded); other lanes are unaffected — raw-TCP relay proxies do not
-            // read `dispatch_port_overrides`, and HTTP upstreams reach config
-            // proxies. Keyed by the selected target's policy port because
-            // `get_datagram_tunnel` receives both the dial app port and the owning
-            // Service-port policy key for targetPort-remapped UDP services.
+            // seeded). HTTP upstreams are deliberately not seeded: they reach
+            // config proxies below, and a seeded port slot would outrank a
+            // selected subset's `connectTimeout` there. Keyed by the selected
+            // target's policy port because the relay dials receive both the dial
+            // app port and the owning Service-port policy key for
+            // targetPort-remapped services.
             if let Some(timeout_ms) = connect_timeout_ms
-                && upstream.id.starts_with("__mesh-out-udp-upstream-")
+                && is_proxyless_mesh_relay_upstream_id(&upstream.id)
             {
                 let mut target_policy_ports: Vec<u16> = upstream
                     .targets
@@ -11863,9 +11880,11 @@ fn apply_traffic_policy_to_upstream(
 ) -> Result<(), anyhow::Error> {
     if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
         upstream.algorithm = algorithm;
-    }
-    if let Some(hash_on) = mesh_hash_on_to_ferrum(&policy.load_balancer) {
-        upstream.hash_on = Some(hash_on);
+        // Unconditional, like the per-port slot: switching the upstream to a
+        // non-hash algorithm clears a stale hash key, which
+        // `HashOnStrategy::parse` would otherwise still turn into a
+        // per-request hash strategy.
+        upstream.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
 
     // Outlier detection -> passive health check.
@@ -12926,14 +12945,17 @@ fn build_http_egress_for_entry(
             continue;
         }
 
-        materialized_http_hosts.insert(host.clone());
-
         let upstream_id =
             mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port_spec.port);
+        let proxy_id = mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
+        if !egress_resource_ids_fit(entry, &proxy_id, &upstream_id) {
+            continue;
+        }
+
+        materialized_http_hosts.insert(host.clone());
 
         upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
 
-        let proxy_id = mesh_egress_proxy_id(&entry.namespace, &entry.name, host, port_spec.port);
         let proxy = egress_gateway_proxy(
             &proxy_id,
             host,
@@ -13071,22 +13093,28 @@ fn build_stream_egress_for_entry(
         return;
     }
 
-    materialized_stream_ports.insert(port_spec.port);
-
     let upstream_id = mesh_egress_upstream_id(
         &entry.namespace,
         &entry.name,
         representative_host,
         port_spec.port,
     );
-    upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
-
     let proxy_id = mesh_egress_proxy_id(
         &entry.namespace,
         &entry.name,
         representative_host,
         port_spec.port,
     );
+    // Checked before the port is claimed, so a skipped entry does not block a
+    // valid ServiceEntry on the same listen_port.
+    if !egress_resource_ids_fit(entry, &proxy_id, &upstream_id) {
+        return;
+    }
+
+    materialized_stream_ports.insert(port_spec.port);
+
+    upstreams.push(build_egress_upstream(&upstream_id, namespace, targets, now));
+
     let proxy = stream_egress_gateway_proxy(
         &proxy_id,
         representative_host,
@@ -13420,7 +13448,7 @@ fn stream_egress_gateway_proxy(
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(backend_scheme),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(backend_scheme),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -13508,6 +13536,29 @@ fn stream_egress_gateway_proxy(
         updated_at: now,
         pending_limit_scope: None,
     }
+}
+
+/// Whether an EgressGateway proxy/upstream id pair fits the runtime resource-id
+/// bound. The ids embed the ServiceEntry namespace, name and host through an
+/// expanding encoder and do not start with `__mesh`, so
+/// `validate_runtime_resource_ids` applies `MAX_ID_LENGTH` to them: one
+/// over-long id would fail the whole slice apply. An entry host/port whose ids
+/// do not fit is skipped with a warning instead, like an over-long
+/// NodeWaypoint UDP listener id.
+fn egress_resource_ids_fit(entry: &ServiceEntry, proxy_id: &str, upstream_id: &str) -> bool {
+    let max = crate::config::types::MAX_ID_LENGTH;
+    if proxy_id.len() <= max && upstream_id.len() <= max {
+        return true;
+    }
+    warn!(
+        service_entry = %sanitize_startup_scalar(entry.name.to_string()),
+        namespace = %sanitize_startup_scalar(entry.namespace.to_string()),
+        field = "hosts[]",
+        "Skipping egress ServiceEntry host/port: its generated EgressGateway proxy/upstream id \
+         would exceed the resource id length limit. Shorten the ServiceEntry namespace, name \
+         or host"
+    );
+    false
 }
 
 fn mesh_egress_proxy_id(namespace: &str, name: &str, host: &str, port: u16) -> String {

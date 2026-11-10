@@ -851,7 +851,7 @@ pub enum FallbackMode {
 
 impl FallbackMode {
     pub fn parse(raw: &str) -> Result<Self, String> {
-        match raw.to_ascii_lowercase().as_str() {
+        match raw.trim().to_ascii_lowercase().as_str() {
             "iptables" => Ok(Self::Iptables),
             "fail" => Ok(Self::Fail),
             other => Err(format!(

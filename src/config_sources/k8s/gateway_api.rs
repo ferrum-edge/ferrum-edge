@@ -8506,7 +8506,7 @@ fn l4_route_proxies_for_namespace(
         } else {
             materialized_listener_bindings.clone()
         };
-        let rule_suffix = l4_rule_suffix(scheme, rule_index);
+        let rule_suffix = l4_rule_suffix(&object.kind, rule_index);
 
         // One leg dispatches directly; a set of legs becomes one namespaced
         // upstream whose weighted targets preserve the declared relative
@@ -8526,6 +8526,28 @@ fn l4_route_proxies_for_namespace(
                 &object.metadata.name,
                 &rule_suffix,
             );
+            // A second route object deriving this key must not replace the
+            // owner's weighted backend set.
+            if let Some(key) =
+                namespaced_resource_key(&object.metadata.namespace, upstream_id.as_str())
+                && !acc.claim_gateway_api_route_upstream(&key, object)
+            {
+                acc.warnings.push(format!(
+                    "{} {:?}/{:?} rule {rule_index} is refused: another route object already \
+                     derived upstream id {:?} in namespace {:?}",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    upstream_id,
+                    object.metadata.namespace
+                ));
+                acc.record_gateway_api_refused_route_claims(
+                    object,
+                    &materialized_parent_refs,
+                    None,
+                );
+                continue;
+            }
             acc.upsert_upstream(upstream_for_route(
                 upstream_id.clone(),
                 object.metadata.namespace.clone(),
@@ -8561,6 +8583,27 @@ fn l4_route_proxies_for_namespace(
                     &suffix,
                 )
             };
+            // A second route object deriving this key must not replace the
+            // owner's proxy (`upsert_proxy` would, silently).
+            if let Some(key) = namespaced_resource_key(config_namespace, id.as_str())
+                && !acc.claim_gateway_api_route_proxy(&key, object)
+            {
+                acc.warnings.push(format!(
+                    "{} {:?}/{:?} is refused on this listener: another route object already \
+                     derived proxy id {:?} in namespace {:?}",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    id,
+                    config_namespace
+                ));
+                acc.record_gateway_api_refused_route_claims(
+                    object,
+                    &materialized_parent_refs,
+                    None,
+                );
+                continue;
+            }
             proxies.push({
                 let mut proxy = proxy_for_route(RouteProxySpec {
                     id,
@@ -8737,18 +8780,15 @@ fn l4_route_declares_parent_ref(object: &K8sObject) -> bool {
     object.spec.get("parentRefs").is_some()
 }
 
-/// Proxy/upstream id suffix for one L4 rule.
+/// Proxy/upstream id suffix for one L4 rule: `{kind}-{rule index}`
+/// (`tcproute-0`, `tlsroute-0`, `udproute-0`).
 ///
-/// `UDPRoute` ids are kind-scoped. The historical L4 id encodes only
-/// `(namespace, route name, rule index)`, so a `UDPRoute` and a same-named
-/// `TCPRoute` in one namespace would upsert over each other's proxy. Existing
-/// `TCPRoute`/`TLSRoute` ids stay byte-identical.
-fn l4_rule_suffix(scheme: BackendScheme, rule_index: usize) -> String {
-    if scheme.is_udp() {
-        format!("udproute-{rule_index}")
-    } else {
-        rule_index.to_string()
-    }
+/// Every L4 route kind shares the `gwapi-l4` id space and one namespace's
+/// proxy/upstream keyspace, so the suffix carries the route kind: a
+/// `TCPRoute`, `TLSRoute` and `UDPRoute` with the same name in one namespace
+/// must derive distinct ids, or one would upsert over another's proxy.
+fn l4_rule_suffix(route_kind: &str, rule_index: usize) -> String {
+    format!("{}-{rule_index}", route_kind.to_ascii_lowercase())
 }
 
 /// Gateway API v1.5.1 bounds `UDPRouteSpec.rules` and `UDPRouteRule.backendRefs`
