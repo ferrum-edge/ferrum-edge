@@ -5245,7 +5245,6 @@ async fn handle_tcp_connection_inner(
     let mut current_port = params.backend_port;
     let mut current_policy_port = params.backend_policy_port;
     let mut current_cb_info = cb_info;
-    let mut last_connect_err: Option<anyhow::Error> = None;
 
     let mut attempt = 0u32;
     let backend_addr = loop {
@@ -5425,7 +5424,6 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
-                    last_connect_err = Some(setup_err);
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
                     // it is bounded by the same absolute plan — and the same
@@ -5521,14 +5519,6 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
-                    last_connect_err = Some(
-                        StreamSetupError::with_source(
-                            StreamSetupKind::BackendMaxConnectionsExceeded,
-                            format!("for {}", format_backend_target(&current_host, current_port)),
-                            reason,
-                        )
-                        .into(),
-                    );
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
                     // it is bounded by the same absolute plan — and the same
@@ -5721,7 +5711,6 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
-                    last_connect_err = Some(e);
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
                     // it is bounded by the same absolute plan — and the same
@@ -5760,7 +5749,6 @@ async fn handle_tcp_connection_inner(
     let idle_timeout =
         (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
     let (_backend_socket_addr, mut backend_stream, _backend_inflight_guard) = backend_addr;
-    let _ = last_connect_err; // consumed by retry loop logging
     let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
 
     // If first-bytes inspection consumed a decrypted opening prefix from a
