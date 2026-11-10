@@ -3344,6 +3344,12 @@ impl super::Plugin for OidcRelyingParty {
                     };
                 }
             }
+            // A reject without `content-type` is labelled `application/json`
+            // by the frontend, which would make a browser show the markup.
+            headers.insert(
+                "content-type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            );
             PluginResult::Reject {
                 status_code: 200,
                 body: "<html><body>Logged out</body></html>".to_string(),

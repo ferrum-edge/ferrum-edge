@@ -3570,6 +3570,11 @@ async fn logout_requires_a_sealed_session_and_encodes_the_id_token_hint() {
             } else {
                 assert_eq!(status_code, 200);
                 assert!(body.contains("Logged out"));
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("text/html; charset=utf-8"),
+                    "the local logged-out page is HTML, not the default JSON reject type"
+                );
                 assert!(!headers.contains_key("location"));
             }
         }
