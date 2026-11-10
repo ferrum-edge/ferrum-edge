@@ -1238,36 +1238,6 @@ impl ResolvedPortOverride {
             && self.http1_max_pending_requests.is_none()
     }
 
-    /// Field-by-field materialization of inherited `connectionPool.http`
-    /// fields from a proxy fallback onto an explicit per-port entry.
-    ///
-    /// For each supported `connectionPool.http` field, the per-port value wins
-    /// when set; otherwise the fallback's value is inherited. This mirrors
-    /// Ferrum's documented field-level merge. Inherited top-level/subset values
-    /// are carried separately on `Proxy.dispatch_port_override_fallback`.
-    /// Runtime dispatch resolves the same field precedence directly through
-    /// borrowed references so it does not clone this structure per request; an
-    /// unrelated per-port field (e.g. `connectTimeout`/`tls`) therefore does not
-    /// wipe an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
-    ///
-    /// Only `connectionPool.http` fields are merged; the fallback only ever
-    /// carries those (it is built solely from the DR top-level
-    /// `connectionPool.http` block), so non-`connectionPool.http` fields
-    /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
-    /// this per-port entry already has them.
-    pub fn seed_connection_pool_http_from_fallback(&mut self, fallback: &ResolvedPortOverride) {
-        self.http_idle_timeout_ms = self.http_idle_timeout_ms.or(fallback.http_idle_timeout_ms);
-        self.http2_max_requests = self.http2_max_requests.or(fallback.http2_max_requests);
-        self.h2_max_concurrent_streams = self
-            .h2_max_concurrent_streams
-            .or(fallback.h2_max_concurrent_streams);
-        self.h2_upgrade_policy = self.h2_upgrade_policy.or(fallback.h2_upgrade_policy);
-        self.max_retries = self.max_retries.or(fallback.max_retries);
-        self.http1_max_pending_requests = self
-            .http1_max_pending_requests
-            .or(fallback.http1_max_pending_requests);
-    }
-
     /// Overlay the subset-inheritable HTTP connection-pool fields onto this
     /// inherited fallback. This is a replacement at the subset tier: an
     /// explicitly configured subset value wins over the top-level value.

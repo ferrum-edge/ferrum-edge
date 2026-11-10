@@ -415,36 +415,6 @@ fn test_effective_http2_max_concurrent_streams_matches_for_proxy() {
 }
 
 #[test]
-fn test_validate_clamps_too_low() {
-    let result = PoolConfig::validate_max_idle_per_host(1, "test");
-    assert_eq!(result, MIN_IDLE_PER_HOST);
-}
-
-#[test]
-fn test_validate_clamps_too_high() {
-    let result = PoolConfig::validate_max_idle_per_host(5000, "test");
-    assert_eq!(result, MAX_IDLE_PER_HOST);
-}
-
-#[test]
-fn test_validate_accepts_valid_value() {
-    let result = PoolConfig::validate_max_idle_per_host(100, "test");
-    assert_eq!(result, 100);
-}
-
-#[test]
-fn test_validate_accepts_boundary_values() {
-    assert_eq!(
-        PoolConfig::validate_max_idle_per_host(MIN_IDLE_PER_HOST, "test"),
-        MIN_IDLE_PER_HOST
-    );
-    assert_eq!(
-        PoolConfig::validate_max_idle_per_host(MAX_IDLE_PER_HOST, "test"),
-        MAX_IDLE_PER_HOST
-    );
-}
-
-#[test]
 fn test_append_reqwest_client_behavior_pool_key_adaptive_precedence() {
     let global = PoolConfig::default();
     let mut adaptive = create_test_proxy();

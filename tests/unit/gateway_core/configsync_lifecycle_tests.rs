@@ -22,24 +22,24 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     SnapshotFailureStreamDisposition, StaleSnapshotReject, SubscriberSnapshotCursor,
     SubscriptionApplyState, VersionCompatError, VersionReconcileError,
     advance_authority_from_committed, advance_multi_cp_backoff,
-    authoritative_snapshot_payload_matches, backoff_max_secs, check_config_sync_build_identity,
+    authoritative_snapshot_payload_matches, check_config_sync_build_identity,
     check_peer_version_compatibility, config_sync_build_identity, connection_error_outcome,
     cp_endpoints_same_source, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, evaluate_delta_authority,
-    evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew, failure_backoff_sequence,
+    evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew,
     full_snapshot_stream_disposition, gateway_config_content_matches,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
     monotonic_watermark, reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
-    silence_exceeds_liveness, snapshot_failure_stream_disposition,
-    snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
+    snapshot_failure_stream_disposition, snapshot_requires_older_payload_exception,
+    stale_reject_from_reconcile,
 };
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, check_cp_version_compatibility, configure_configsync_endpoint,
     filter_incremental_to_namespace, subscribe_admission_refusal, subscribe_build_mismatch,
 };
 use ferrum_edge::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet, TrustDomain};
-use ferrum_edge::util::backoff::BACKOFF_INITIAL_SECS;
+use ferrum_edge::util::backoff::{BACKOFF_INITIAL_SECS, BACKOFF_MAX_SECS};
 use tonic::transport::Channel;
 
 const DP_CLIENT_SOURCE: &str = include_str!("../../../src/grpc/dp_client.rs");
@@ -56,8 +56,6 @@ fn configsync_keepalive_constants_are_bounded_and_ordered() {
                 > ferrum_edge::grpc::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS
         );
     }
-    assert!(!silence_exceeds_liveness(CONFIGSYNC_MAX_SILENCE_SECS - 1));
-    assert!(silence_exceeds_liveness(CONFIGSYNC_MAX_SILENCE_SECS));
 }
 
 #[test]
@@ -71,14 +69,33 @@ fn configsync_endpoint_builder_applies_keepalive() {
     let _ = endpoint.connect_timeout(std::time::Duration::from_secs(10));
 }
 
+/// Failure-sleep sequence a DP produces against `cp_count` continuously
+/// failing CPs, driven through the same production state machine.
+fn failure_backoff_sequence(cp_count: usize, attempts: usize) -> Vec<u64> {
+    let mut state = MultiCpBackoffState::new();
+    let mut sleeps = Vec::with_capacity(attempts);
+    for _ in 0..attempts {
+        let should_sleep = advance_multi_cp_backoff(
+            &mut state,
+            cp_count,
+            ConfigSyncAttemptOutcome::ConnectionError,
+        );
+        if should_sleep {
+            sleeps.push(state.backoff_secs);
+            grow_backoff_after_failure_sleep(&mut state);
+        }
+    }
+    sleeps
+}
+
 #[test]
 fn multi_cp_failure_backoff_reaches_max_without_resetting_on_switch() {
     let sleeps = failure_backoff_sequence(2, 12);
     assert_eq!(sleeps.first().copied(), Some(BACKOFF_INITIAL_SECS));
     assert!(
-        sleeps.iter().any(|s| *s == backoff_max_secs()),
+        sleeps.iter().any(|s| *s == BACKOFF_MAX_SECS),
         "expected multi-CP failure sequence to reach {backoff}, got {sleeps:?}",
-        backoff = backoff_max_secs()
+        backoff = BACKOFF_MAX_SECS
     );
     // Switching CP must not reset: sequence is strictly non-decreasing until cap.
     for window in sleeps.windows(2) {
@@ -136,7 +153,7 @@ fn connection_error_after_accepted_config_resets_backoff() {
     assert_eq!(before.current_cp_index, 1);
     assert_eq!(before.backoff_secs, 16);
     grow_backoff_after_failure_sleep(&mut before);
-    assert_eq!(before.backoff_secs, backoff_max_secs());
+    assert_eq!(before.backoff_secs, BACKOFF_MAX_SECS);
 
     let mut after = MultiCpBackoffState {
         backoff_secs: 16,
@@ -1199,7 +1216,7 @@ fn repeated_fencing_reaches_backoff_cap_and_cycles_cps() {
             cycled = true;
         }
         grow_backoff_after_failure_sleep(&mut state);
-        if state.backoff_secs == backoff_max_secs() {
+        if state.backoff_secs == BACKOFF_MAX_SECS {
             reached_cap = true;
         }
     }

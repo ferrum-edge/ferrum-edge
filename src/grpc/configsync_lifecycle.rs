@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::FERRUM_VERSION;
 use crate::config::types::GatewayConfig;
 use crate::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet};
-use crate::util::backoff::{BACKOFF_INITIAL_SECS, BACKOFF_MAX_SECS, next_backoff_secs};
+use crate::util::backoff::{BACKOFF_INITIAL_SECS, next_backoff_secs};
 
 /// HTTP/2 PING interval on the DP→CP ConfigSync channel.
 pub const CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 30;
@@ -1135,44 +1135,11 @@ pub fn grow_backoff_after_failure_sleep(state: &mut MultiCpBackoffState) {
     state.backoff_secs = next_backoff_secs(state.backoff_secs, true);
 }
 
-/// Deterministic failure-sleep sequence for continuously failing CPs.
-///
-/// Used by tests to prove N≥2 dead CPs still reach [`BACKOFF_MAX_SECS`].
-#[allow(dead_code)] // external unit-test contract; production grows the live state directly
-pub fn failure_backoff_sequence(cp_count: usize, attempts: usize) -> Vec<u64> {
-    let mut state = MultiCpBackoffState::new();
-    let mut sleeps = Vec::with_capacity(attempts);
-    for _ in 0..attempts {
-        let should_sleep = advance_multi_cp_backoff(
-            &mut state,
-            cp_count,
-            ConfigSyncAttemptOutcome::ConnectionError,
-        );
-        if should_sleep {
-            sleeps.push(state.backoff_secs);
-            grow_backoff_after_failure_sleep(&mut state);
-        }
-    }
-    sleeps
-}
-
 /// A heartbeat frame is admissible only after this subscription has accepted
 /// its authoritative FULL_SNAPSHOT base. Heartbeats are liveness-only and must
 /// never establish that state.
 pub fn heartbeat_frame_admissible(subscription_base_applied: bool) -> bool {
     subscription_base_applied
-}
-
-/// True when a silence interval exceeds the ConfigSync liveness bound.
-#[allow(dead_code)] // external unit-test contract for the liveness boundary
-pub fn silence_exceeds_liveness(silence_secs: u64) -> bool {
-    silence_secs >= CONFIGSYNC_MAX_SILENCE_SECS
-}
-
-/// Cap used by tests/docs — exported so callers can assert the documented max.
-#[allow(dead_code)] // external unit-test contract for the documented ceiling
-pub fn backoff_max_secs() -> u64 {
-    BACKOFF_MAX_SECS
 }
 
 /// Map a transport/RPC failure onto the backoff outcome using whether this

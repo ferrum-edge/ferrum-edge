@@ -3962,7 +3962,6 @@ pub mod _test_support {
         pub outcome: TestLeaseRenewalOutcome,
         pub renewals: u32,
         pub retries: u32,
-        pub reclaims: u32,
         pub still_held: bool,
     }
 
@@ -3999,7 +3998,6 @@ pub mod _test_support {
             outcome,
             renewals: report.counters.renewals,
             retries: report.counters.retries,
-            reclaims: report.counters.reclaims,
             still_held,
         }
     }
