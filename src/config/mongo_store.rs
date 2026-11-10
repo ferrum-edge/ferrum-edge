@@ -4082,7 +4082,11 @@ mod inner {
             let doc =
                 Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
             self.config_changes().insert_one(doc).await?;
-            self.compact_config_changes(namespace).await?;
+            // The change row is durable at this point. Compaction is
+            // housekeeping: a failure must not turn the write into an error
+            // that makes a standalone caller roll back a resource whose change
+            // row already exists (issue #7210). The next write retries it.
+            self.compact_config_changes_best_effort(namespace).await;
             // Checked, never defaulted: a zero sequence is not the monotonic
             // key the revision contract assumes.
             if sequence == 0 {
@@ -4123,9 +4127,11 @@ mod inner {
                 .collect();
             self.config_changes().insert_many(docs).await?;
 
+            // Rows are durable; compaction failures are logged, never
+            // propagated (see `record_config_change_returning_sequence`).
             let namespaces: HashSet<&str> = changes.iter().map(|change| change.namespace).collect();
             for namespace in namespaces {
-                self.compact_config_changes(namespace).await?;
+                self.compact_config_changes_best_effort(namespace).await;
             }
 
             Ok(())
@@ -15341,22 +15347,26 @@ mod inner {
                         // Clear api_specs so restore doesn't leave orphaned spec metadata
                         // pointing to proxies that no longer exist.
                         self.api_specs().delete_many(ns_filter).await?;
-                        for id in proxy_ids {
-                            self.record_config_change(namespace, "proxy", &id, "delete")
-                                .await?;
-                        }
-                        for id in consumer_ids {
-                            self.record_config_change(namespace, "consumer", &id, "delete")
-                                .await?;
-                        }
-                        for id in plugin_config_ids {
-                            self.record_config_change(namespace, "plugin_config", &id, "delete")
-                                .await?;
-                        }
-                        for id in upstream_ids {
-                            self.record_config_change(namespace, "upstream", &id, "delete")
-                                .await?;
-                        }
+                        // One sequence reservation, one insert and one
+                        // compaction probe for the whole wipe instead of one
+                        // of each per deleted id (issue #7210).
+                        let changes: Vec<ConfigChangeWrite<'_>> = [
+                            ("proxy", &proxy_ids),
+                            ("consumer", &consumer_ids),
+                            ("plugin_config", &plugin_config_ids),
+                            ("upstream", &upstream_ids),
+                        ]
+                        .into_iter()
+                        .flat_map(|(resource_type, ids)| {
+                            ids.iter().map(move |id| ConfigChangeWrite {
+                                namespace,
+                                resource_type,
+                                resource_id: id.as_str(),
+                                operation: "delete",
+                            })
+                        })
+                        .collect();
+                        self.record_config_changes_batch(&changes).await?;
                     }
                     Ok(mode)
                 })

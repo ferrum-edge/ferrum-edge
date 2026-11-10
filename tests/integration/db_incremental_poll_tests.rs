@@ -1070,6 +1070,55 @@ mod mongo_incremental_poll_contract {
         );
     }
 
+    fn mongo_method_body(marker: &str) -> &'static str {
+        let start = MONGO_STORE_SOURCE
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} must exist"));
+        let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
+        let end = tail
+            .find("\n        async fn ")
+            .unwrap_or_else(|| panic!("{marker} must be followed by another method"));
+        &MONGO_STORE_SOURCE[start..start + marker.len() + end]
+    }
+
+    /// Issue #7210: once the change row is inserted, a compaction failure must
+    /// not propagate. Every standalone write rolls its resource back on an
+    /// error from these helpers, which would leave a durable change row that
+    /// points at a rolled-back resource.
+    #[test]
+    fn change_row_writers_compact_best_effort_after_the_row_is_durable() {
+        for marker in [
+            "async fn record_config_change_returning_sequence(",
+            "async fn record_config_changes_batch(",
+        ] {
+            let body = mongo_method_body(marker);
+            assert!(
+                body.contains("self.compact_config_changes_best_effort(namespace).await;"),
+                "{marker} must compact through the best-effort helper:\n{body}"
+            );
+            assert!(
+                !body.contains("self.compact_config_changes(namespace).await?"),
+                "{marker} must not propagate a compaction failure:\n{body}"
+            );
+        }
+    }
+
+    /// Issue #7210: the standalone namespace wipe records its delete rows in
+    /// one batch (one reservation, one compaction probe), not one row and one
+    /// compaction probe per deleted id.
+    #[test]
+    fn standalone_delete_all_resources_records_changes_in_one_batch() {
+        let body = mongo_method_body("async fn delete_all_resources(");
+        assert!(
+            body.contains("self.record_config_changes_batch(&changes).await?"),
+            "delete_all_resources must record its delete rows in one batch:\n{body}"
+        );
+        assert!(
+            !body.contains("self.record_config_change(namespace,"),
+            "delete_all_resources must not record one change row per id:\n{body}"
+        );
+    }
+
     #[test]
     fn every_sequence_reader_shares_the_widened_decoder() {
         for marker in [
