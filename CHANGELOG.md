@@ -605,6 +605,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orphaned upstream alive and suppressed its delete change record. The check
   now counts proxies in the deleting namespace only, as standalone MongoDB
   and the SQL backends already did.
+- **Managed TLS and ACME deletes no longer collide on id prefixes** (#7199).
+  `DELETE /admin/tls/certificates/{id}` (and the other managed collections and
+  ACME certificates) decided whether a record was still referenced by
+  substring-matching the id against every source reference, so deleting an
+  unused `prod` was refused with `409` naming the users of `prod-2`, and an id
+  such as `cert` or `ca` matched every reference. The guard now compares the
+  record id exactly against the last path segment of each reference.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
