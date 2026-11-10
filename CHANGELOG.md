@@ -613,6 +613,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duration" and failed the whole HTTPRoute rule, `BackendLBPolicy` or
   `XBackendTrafficPolicy`. It is now parsed with the same multi-component
   parser as `timeouts` and `retry.backoff` (`1h30m` → `Max-Age=5400`).
+- **Data planes run the ACME renewal scheduler** (#7251). With
+  `FERRUM_ACME_AUTO_RENEW_ENABLED=true`, only file and database mode started
+  the scheduler; a DP accepted the setting, armed the frontend/admin
+  live-reload watchers for its `acme://` sources and then never renewed, so
+  the certificate expired without warning. DP mode now starts the scheduler
+  and joins it at shutdown like the other serving modes.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

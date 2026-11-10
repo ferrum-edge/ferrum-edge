@@ -176,6 +176,15 @@ pub async fn run(
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
+    // ACME auto-renewal (`FERRUM_ACME_AUTO_RENEW_ENABLED`), as in file and
+    // database mode. The DP arms the frontend/admin live-reload watchers the
+    // same way, so renewed material published to the shared ACME store reaches
+    // its listeners (issue #7251).
+    let acme_renewal_handle = crate::modes::start_acme_renewal_scheduler(
+        &env_config,
+        proxy_state.dns_cache.clone(),
+        shutdown_tx.subscribe(),
+    );
 
     // Config-staleness evaluator (issue #3726). CP events (connect, disconnect,
     // applied snapshot) evaluate inline and `/health` evaluates on demand; the
@@ -1113,6 +1122,9 @@ pub async fn run(
     background_handles.push(runtime_system_handle);
     background_handles.push(runtime_window_handle);
     if let Some(h) = per_ip_cleanup_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = acme_renewal_handle {
         background_handles.push(h);
     }
     let mut health_check_handles = health_check_handles;
