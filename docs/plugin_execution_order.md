@@ -1750,9 +1750,17 @@ The authenticated `GET /metrics/runtime` snapshot additionally carries three
 | `missing_decision_carriers` | contextless hooks that ran because no decision was carried (compatibility path) |
 
 They have no labels at all: no trigger input, route, identity, header value,
-plugin-controlled string, or secret can reach them. A sustained nonzero
-`missing_decision_carriers` on a deployment that uses triggers means some summary
-or session path is not stamping the carrier.
+plugin-controlled string, or secret can reach them.
+
+`missing_decision_carriers` also counts instances whose decision is undecided
+by design. A trigger that reads `consumer` or `auth_method` is never decided at
+or before the authentication boundary: it does not gate stream connections at
+all, so a mixed-protocol plugin with such a trigger counts one missing carrier
+on every TCP/UDP/DTLS disconnect and flow, and an HTTP request that ends at or
+before `authenticate` (an authentication refusal, an early termination) counts
+one for its terminal `log`. A steady nonzero rate is therefore expected on a
+deployment with identity-reading triggers. Without them, a sustained nonzero
+rate means some summary or session path is not stamping the carrier.
 
 ## Priority Bands
 
