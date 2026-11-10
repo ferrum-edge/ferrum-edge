@@ -8,7 +8,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::plugins::{ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::backend_dispatch::detect_http_flavor;
 use ferrum_edge::proxy::run_authentication_phase;
-use ferrum_edge::{ConsumerIndex, PluginCache, PluginCapabilities};
+use ferrum_edge::{ConsumerIndex, PluginCache};
 use http::Request;
 use serde_json::{Map, Value, json};
 
@@ -193,11 +193,6 @@ fn websocket_upgrade_uses_websocket_protocol_for_auth_plugin_lookup() {
     let auth_plugins = ws_view.auth_plugins();
     assert_eq!(auth_plugins.len(), 1);
     assert_eq!(auth_plugins[0].name(), "key_auth");
-    assert!(
-        ws_view
-            .capabilities()
-            .has(PluginCapabilities::HAS_AUTH_PLUGINS)
-    );
 
     let tcp_view = cache.request_view("ferrum", PROXY_ID, ProxyProtocol::Tcp);
     assert!(

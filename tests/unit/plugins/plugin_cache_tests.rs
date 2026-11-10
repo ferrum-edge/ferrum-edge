@@ -13787,12 +13787,6 @@ fn test_auth_plugins_precomputed_for_protocol() {
     assert_eq!(auth.len(), 1);
     assert_eq!(auth[0].name(), "key_auth");
 
-    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
-    assert!(
-        caps.has(PluginCapabilities::HAS_AUTH_PLUGINS),
-        "key_auth should set HAS_AUTH_PLUGINS"
-    );
-
     // TCP should not have key_auth (HTTP_FAMILY only)
     let tcp_auth = cache.get_auth_plugins("ferrum", "p1", ProxyProtocol::Tcp);
     assert_eq!(
@@ -13925,10 +13919,6 @@ fn test_request_view_contains_all_precomputed_fields() {
     assert!(
         view.capabilities()
             .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
-    );
-    assert!(
-        view.capabilities()
-            .has(PluginCapabilities::HAS_AUTH_PLUGINS)
     );
 
     // Buffering flags

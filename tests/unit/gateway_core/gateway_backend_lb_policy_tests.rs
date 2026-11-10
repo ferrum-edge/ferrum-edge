@@ -176,7 +176,11 @@ fn backend_lb_policy_cookie_affinity_selects_stable_target_on_lb_path() {
 
     let cache = LoadBalancerCache::new(&result.config);
     assert_eq!(
-        cache.get_hash_on_strategy(&upstream.namespace, &upstream.id),
+        LoadBalancerCache::get_hash_on_strategy_from(
+            &cache.load(),
+            &upstream.namespace,
+            &upstream.id
+        ),
         HashOnStrategy::Cookie(cookie_name.to_string())
     );
 

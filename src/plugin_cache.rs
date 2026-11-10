@@ -5811,7 +5811,8 @@ fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> 
 pub struct PluginCapabilities(u32);
 
 impl PluginCapabilities {
-    pub const HAS_AUTH_PLUGINS: u32 = 1 << 0;
+    // `1 << 0` was `HAS_AUTH_PLUGINS`; no frontend read it (they check
+    // `auth_plugins()` directly).
     pub const MODIFIES_REQUEST_HEADERS: u32 = 1 << 1;
     pub const MODIFIES_REQUEST_BODY: u32 = 1 << 2;
     pub const HAS_BODY_BEFORE_BEFORE_PROXY: u32 = 1 << 3;
@@ -6067,7 +6068,6 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
             grpc_deadline.push(Arc::clone(p));
         }
         if p.is_auth_plugin() {
-            caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
             auth.push(Arc::clone(p));
         }
         if p.is_authorize_plugin() {

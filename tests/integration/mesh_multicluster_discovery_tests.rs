@@ -375,9 +375,14 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
 
     // All healthy: every selection lands on the local (same-region) endpoint.
     for i in 0..20 {
-        let selection = lb
-            .select_target("default", upstream_id, &i.to_string(), None)
-            .expect("target");
+        let selection = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            upstream_id,
+            &i.to_string(),
+            None,
+        )
+        .expect("target");
         assert_eq!(
             selection.target.host, "10.1.0.1",
             "healthy local endpoint must win the same-region tier"
@@ -401,9 +406,14 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     // Failover: with the local endpoint ejected, the LB falls through to the
     // remote endpoint tier.
     for i in 0..20 {
-        let selection = lb
-            .select_target("default", upstream_id, &i.to_string(), Some(&health))
-            .expect("failover target");
+        let selection = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            upstream_id,
+            &i.to_string(),
+            Some(&health),
+        )
+        .expect("failover target");
         assert_eq!(
             selection.target.host, "10.2.0.1",
             "remote endpoint must receive traffic once local is unhealthy"
