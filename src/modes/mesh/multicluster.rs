@@ -2006,12 +2006,16 @@ fn enforce_remote_trust_domain(
         belongs
     });
 
+    // Key by the namespace of the Service the workload attaches to, not the
+    // workload's own namespace: a WorkloadEntry in namespace `vm` attached to a
+    // Service in `prod` (`service_namespace: prod`) is referenced from the
+    // `prod` service, as everywhere else that matches workloads to services.
     let surviving_workload_refs: HashSet<(String, String)> = endpoints
         .workloads
         .iter()
         .map(|workload| {
             (
-                workload.namespace.clone(),
+                workload.attached_service_namespace().to_string(),
                 workload.spiffe_id.as_str().to_string(),
             )
         })
@@ -2803,6 +2807,46 @@ mod tests {
         assert!(service_names.contains(&"payments"));
         assert!(!service_names.contains(&"orphaned"));
         assert_eq!(endpoints.services[0].workloads.len(), 1);
+    }
+
+    #[test]
+    fn enforce_remote_trust_domain_keeps_refs_to_cross_namespace_attached_workloads() {
+        // A remote WorkloadEntry living in namespace `vm` but attached to a
+        // Service in `prod` (`service_namespace: prod`) is in-domain: the
+        // `prod` service's ref to it must survive the trust-domain filter.
+        let declared = td("eu-west-1.example.com");
+        let vm_spiffe = "spiffe://eu-west-1.example.com/ns/vm/sa/legacy";
+        let attached = Workload {
+            namespace: "vm".to_string(),
+            service_namespace: Some("prod".to_string()),
+            ..workload(vm_spiffe, "legacy", "10.9.0.5", None)
+        };
+        let mut prod_service = service("legacy", &[vm_spiffe]);
+        prod_service.namespace = "prod".to_string();
+        // A service in the workload's own namespace does not own the ref: the
+        // workload attaches to `prod`, so this ref is orphaned and dropped.
+        let mut vm_service = service("legacy", &[vm_spiffe]);
+        vm_service.namespace = "vm".to_string();
+
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: vec![attached],
+            services: vec![prod_service, vm_service],
+        };
+
+        enforce_remote_trust_domain(&mut endpoints, &declared, "eu-west-1");
+
+        assert_eq!(endpoints.workloads.len(), 1);
+        assert_eq!(
+            endpoints.services.len(),
+            1,
+            "only the service the workload attaches to keeps it"
+        );
+        assert_eq!(endpoints.services[0].namespace, "prod");
+        assert_eq!(endpoints.services[0].workloads.len(), 1);
+        assert_eq!(
+            endpoints.services[0].workloads[0].spiffe_id.as_str(),
+            vm_spiffe
+        );
     }
 
     #[test]

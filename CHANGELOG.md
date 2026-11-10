@@ -597,6 +597,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **Remote-cluster endpoints attached to a Service in another namespace
+  survive the trust-domain filter** (#7247). The multi-cluster
+  cross-trust-domain guard matched each service's workload refs against
+  surviving workloads in the workload's own namespace instead of the
+  namespace of the Service it attaches to (`service_namespace`), so an
+  in-domain remote `WorkloadEntry` in `vm` attached to a Service in `prod` had
+  its ref dropped with a misleading trust-domain warning, and a service whose
+  refs were all of that kind was dropped from cross-cluster failover. Refs now
+  match on the attached Service namespace, as service discovery does.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
