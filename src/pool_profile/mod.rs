@@ -285,7 +285,10 @@ pub fn render_prometheus() -> String {
         ("schema", 1),
         ("sample_every", schema::SAMPLE_EVERY),
         ("pid", u64::from(std::process::id())),
-        ("allocator_installed", u64::from(!cfg!(windows))),
+        (
+            "allocator_installed",
+            u64::from(crate::h1_profile::allocator_installed()),
+        ),
         ("registered_slots", snapshot.registered_slots),
         ("slot_capacity", store::THREAD_SLOTS as u64),
         ("missing_slots", snapshot.missing_slots),
