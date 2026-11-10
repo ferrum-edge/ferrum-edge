@@ -1369,7 +1369,11 @@ impl Waf {
     }
 
     /// URL-side encoding specials. `url` lets a special with query-parameter
-    /// exclusions judge the URL without its excluded pairs.
+    /// exclusions judge the URL without its excluded pairs. As on the body
+    /// side, double-encoding and percent-null markers belong to FE-ENCODING-001
+    /// and overlong UTF-8 only to FE-ENCODING-002, so one marker is scored
+    /// once and each rule's mode, override, or disablement governs its own
+    /// markers.
     fn scan_encoding_specials(
         &self,
         outcome: &mut ScanOutcome,
@@ -1379,9 +1383,7 @@ impl Waf {
     ) {
         if let Some(rule_index) = self.specials.encoding {
             let judged = self.url_for_rule(rule_index, value, url);
-            if decode::has_double_encoded_marker(&judged)
-                || decode::has_percent_null_byte(&judged)
-                || decode::has_overlong_utf8_marker(&judged)
+            if decode::has_double_encoded_marker(&judged) || decode::has_percent_null_byte(&judged)
             {
                 self.push_special(outcome, rule_index, &judged, subject, url);
             }

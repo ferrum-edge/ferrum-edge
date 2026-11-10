@@ -1039,6 +1039,62 @@ async fn encoding_specials_judge_the_url_without_excluded_parameters() {
 }
 
 #[tokio::test]
+async fn url_encoding_rules_ignore_valid_multibyte_text_and_score_overlong_once() {
+    // Issue #7142: FE-ENCODING-002's URL regex matched every `%E0..` / `%F0..`
+    // lead byte, so URL-encoded emoji and Indic/Thai text raised an encoding
+    // hit; and an overlong marker on a URL was also reported under
+    // FE-ENCODING-001, so disabling 002 did not stop it.
+    let plugin = recommended_with_overrides(json!({
+        "FE-ENCODING-001": { "action": "enforce" },
+        "FE-ENCODING-002": { "action": "enforce" }
+    }));
+    for valid in [
+        "q=%F0%9F%98%80",          // emoji
+        "q=%E0%A4%A8%E0%A4%AE",    // Devanagari
+        "q=%E0%B8%AA%E0%B8%A7",    // Thai
+        "q=%f0%9f%91%8d%e0%ae%a4", // lowercase emoji + Tamil
+    ] {
+        let (_, request) = query(&plugin, valid).await;
+        for rule in ["FE-ENCODING-001", "FE-ENCODING-002"] {
+            assert!(
+                !listed(&request, "waf.rule_hits", rule),
+                "{rule} must not flag valid UTF-8 {valid}: {:?}",
+                meta(&request, "waf.rule_hits")
+            );
+        }
+    }
+
+    for overlong in [
+        "p=%c0%ae%c0%ae",
+        "p=%C0%AF",
+        "p=%e0%80%af",
+        "p=%F0%80%80%AF",
+    ] {
+        let (result, request) = query(&plugin, overlong).await;
+        assert!(matches!(result, PluginResult::Reject { .. }), "{overlong}");
+        assert!(
+            listed(&request, "waf.rule_hits", "FE-ENCODING-002"),
+            "{overlong}: {:?}",
+            meta(&request, "waf.rule_hits")
+        );
+        assert!(
+            !listed(&request, "waf.rule_hits", "FE-ENCODING-001"),
+            "overlong UTF-8 belongs to FE-ENCODING-002 only ({overlong})"
+        );
+    }
+
+    // With FE-ENCODING-002 disabled, an overlong URL marker raises nothing.
+    let plugin = recommended_with_overrides(json!({
+        "FE-ENCODING-001": { "action": "enforce" },
+        "FE-ENCODING-002": { "action": "disabled" }
+    }));
+    let (_, request) = query(&plugin, "p=%c0%ae%c0%ae").await;
+    for rule in ["FE-ENCODING-001", "FE-ENCODING-002"] {
+        assert!(!listed(&request, "waf.rule_hits", rule), "{rule}");
+    }
+}
+
+#[tokio::test]
 async fn a_method_override_exclusion_covers_the_override_special() {
     // `FE-HEADER-002` fires on the override header's name and, through its
     // special, on an override that differs from the request method. A header

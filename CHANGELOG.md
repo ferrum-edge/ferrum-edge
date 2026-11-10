@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **WAF `FE-ENCODING-002` no longer flags URL-encoded emoji and Indic/Thai
+  text** (#7142). Its URL regex `(?i)%(?:c0|e0|f0)%` matched every valid
+  `%E0..` and `%F0..` UTF-8 sequence, so `?q=%F0%9F%98%80` recorded a Medium
+  hit (3 of the default anomaly threshold 7) and was blocked once the rule was
+  promoted to `enforce`. The regex now matches exactly the overlong pairs the
+  rule's special checks (`%c0%ae`, `%c0%af`, `%e0%80`, `%f0%80`). On URLs an
+  overlong marker is also no longer reported under `FE-ENCODING-001` as well:
+  it belongs to `FE-ENCODING-002` only, as it already did for bodies, so one
+  marker scores once and disabling `FE-ENCODING-002` stops it.
 - **`proxy_alerts` no longer counts cooled-down reminders as dropped alerts**
   (#7141). An `Active` incident maps every breaching sample to a Trigger, and
   the dispatch permit was taken before the cooldown was consulted, so with the
