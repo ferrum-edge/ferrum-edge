@@ -57,9 +57,14 @@
 //! Istio CRDs, so `patch_status` works against any standard Istio install.
 //! If a cluster has stripped the subresource (rare; usually an intentional
 //! admission-policy decision), `patch_status` returns
-//! `kube::Error::Api(_)` with `code: 404` — the writer logs a single warn
-//! and otherwise no-ops, never panics, never aborts reconcile. The
-//! Gateway API path uses the same defensive pattern; see [`status.rs`].
+//! `kube::Error::Api(_)` with `code: 404` — the writer skips that object's
+//! write with a warn and an `istio_status_unsupported` count, never panics,
+//! never aborts reconcile. Nothing remembers the outcome: the planner keeps
+//! emitting an update for every such object whose live status differs (always,
+//! when no write can land), so each reconcile costs one `get_status` and one
+//! warn per affected object until the subresource is restored or
+//! `watch_istio` is turned off. The Gateway API path uses the same defensive
+//! pattern; see [`status.rs`].
 //!
 //! ## Concurrency
 //!
