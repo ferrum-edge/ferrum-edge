@@ -7,7 +7,7 @@
     "Preserve Ferrum behavioral regression tests; drop vendor-only tests that no longer apply.",
     "Respect co-retirement groups — retire grouped patches in the same change.",
     "Remove the matching [patch.crates-io] entries and vendor directories.",
-    "Update docs/dependency-policy.md, per-patch READMEs, docs/vendored-patch-lifecycle.json, vendor/VENDOR_INTEGRITY.sha256, and mirrored standalone [patch.crates-io] tables (tests/performance/mesh/Cargo.toml)."
+    "Update docs/dependency-policy.md, per-patch READMEs, docs/vendored-patch-lifecycle.json, vendor/VENDOR_INTEGRITY.sha256, and mirrored standalone [patch.crates-io] tables (fuzz/Cargo.toml and tests/performance/mesh/Cargo.toml) and their lockfiles."
   ],
   "co_retirement_groups": [
     {
@@ -1078,7 +1078,7 @@
       },
       "reaffirmation": null,
       "retirement": {
-        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The assigned-send-capacity patch must also retire before removing the vendored crate.",
+        "trigger": "An h2 release containing hyperium/h2#903 (or another change that batches DATA frames into one write) is adopted, or Ferrum stops using h2. The assigned-send-capacity (003) and reset-origin (004) patches must also retire before removing the vendored crate.",
         "co_retirement_group": null,
         "compatible_release_test": {
           "status": "not_started",

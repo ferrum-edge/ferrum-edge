@@ -646,7 +646,7 @@ Why the split matters:
 
 - Without it, `compression` (4050) would encode the body before WAF's and
   `body_validator`'s final response hooks and before `ai_response_guard`'s
-  redaction transform: the WAF would match gzip/Brotli octets, the validator
+  redaction transform: the WAF would match gzip/Brotli/zstd octets, the validator
   would read them as non-UTF-8 and skip, and a promised redaction could not
   parse them while its metadata already claimed one.
 - `ai_response_guard` inspects at phase 9, before `response_transformer`. Its
@@ -1204,10 +1204,11 @@ Fragmentation and compression need no WAF-side state. Tungstenite reassembles
 Text/Binary continuations before the hook, incomplete messages are bounded by
 `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
 `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`, and `permessage-deflate` is
-never negotiated end to end (the client's `Sec-WebSocket-Extensions` offer is
-stripped before the backend handshake and no negotiated extension is echoed
-back), so payloads reaching the hook are complete and uncompressed on H1
-upgrade and on H2/H3 Extended CONNECT alike.
+never negotiated end to end on a route the WAF protects (config validation
+refuses `websocket_permessage_deflate: passthrough` wherever a `waf` instance is
+effective, and under `terminate` the gateway inflates every message before the
+relay parses it), so payloads reaching the hook are complete and uncompressed
+on H1 upgrade and on H2/H3 Extended CONNECT alike.
 
 Fail-closed behavior mirrors the HTTP body path. A message larger than
 `max_scan_bytes` is decided by `on_body_too_large`: `fail_closed` (default)
@@ -1249,7 +1250,8 @@ Plugins execute in priority order (lower number runs first):
 |---|--------|----------|----------|
 | 1 | `ws_message_size_limiting` | 2810 | Pre-read actual-frame and bounded-reassembly policy; closes both peers with 1009 |
 | 2 | `ws_rate_limiting` | 2910 | Per-connection (or `limit_by` consumer/IP/service aggregate) token-bucket rate limiting, charged per physical frame (fragments batched via `on_ws_reassembly_frames`); aggregate identity bound once via `bind_ws_session`, connection state released on `on_ws_disconnect` |
-| 3 | `ws_frame_logging` | 9050 | Logs final delivered frame metadata (and policy Close decisions); never mutates |
+| 3 | `waf` | 2930 | Inspects reassembled Text/Binary messages when WebSocket message inspection is active (see the WAF subsection above) |
+| 4 | `ws_frame_logging` | 9050 | Logs final delivered frame metadata (and policy Close decisions); never mutates |
 
 ### Zero-Overhead Opt-In
 
@@ -1301,6 +1303,8 @@ Session Established (on_stream_connect already ran)
 | # | Plugin | Priority | Behavior |
 |---|--------|----------|----------|
 | 1 | `udp_rate_limiting` | 2915 | Per-client-IP datagram and byte rate limiting |
+| 2 | `waf` | 2930 | Datagram payload inspection (see `waf` in the Complete Execution Order) |
+| 3 | `fault_injection` | 2940 | Datagram fault injection |
 
 ### Silent Drop Semantics
 
@@ -1916,7 +1920,7 @@ That ordering has a few practical effects:
 - A later `HIT`/`REVALIDATED` synthetic replay marks a private finalized-response capability so ordinary presentation transforms (including `response_transformer` body and header sequences) are not applied a second time, while inspectors, final-body validators, and reject-path observability hooks still run over the replayed bytes.
 - Backend `Vary` headers are respected when building the cache key, so variants such as `Accept-Encoding: gzip` stay isolated from uncompressed responses.
 - Fresh cached validators (`ETag`, `Last-Modified`) can satisfy conditional requests at the edge with a `304 Not Modified` response.
-- The `compression` plugin (4050) generates gzip/brotli responses at the gateway during the response-body transform phase. `response_caching` stores the final encoded representation in `on_final_response_body` (which runs after all response-body transforms), so cache entries contain the gateway-compressed bytes and `Content-Encoding` header — not the uncompressed backend response. A cache `HIT` replays those stored bytes and headers directly from `response_caching::before_proxy` (3500), short-circuiting before `compression::before_proxy` (4050) runs, so no second compression pass occurs and compression-setting changes do not rewrite existing entries. `max_entry_size_bytes` compares the encoded body length; `max_total_size_bytes` and per-entry accounting use the stored entry's approximate footprint, including that body and its headers. The `body_validator` plugin separately decompresses gzip-compressed gRPC frames for protobuf validation — this is internal to the validation path and does not affect the forwarded body.
+- The `compression` plugin (4050) generates gzip/brotli (or opt-in zstd) responses at the gateway during the response-body transform phase. `response_caching` stores the final encoded representation in `on_final_response_body` (which runs after all response-body transforms), so cache entries contain the gateway-compressed bytes and `Content-Encoding` header — not the uncompressed backend response. A cache `HIT` replays those stored bytes and headers directly from `response_caching::before_proxy` (3500), short-circuiting before `compression::before_proxy` (4050) runs, so no second compression pass occurs and compression-setting changes do not rewrite existing entries. `max_entry_size_bytes` compares the encoded body length; `max_total_size_bytes` and per-entry accounting use the stored entry's approximate footprint, including that body and its headers. The `body_validator` plugin separately decompresses gzip-compressed gRPC frames for protobuf validation — this is internal to the validation path and does not affect the forwarded body.
 
 ### OTel tracing runs first (priority 25)
 
@@ -1974,7 +1978,7 @@ Rate limiting sits late in the Admission band (priority 2900) so it can enforce 
 
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, and `x-ratelimit-window` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed. The limiter key/identity is deliberately never injected as a header: for `limit_by: "consumer"`/`"spiffe_identity"` it would disclose the gateway's internal notion of the caller identity (consumer username) or the peer workload SVID to the downstream client.
 
-**Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis; in its default `limit_by: connection` mode only to externalize its per-connection counters: because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. Its aggregate `limit_by` budgets (`consumer`, `ip`, `service`) are keyed by that identity and coordinated across replicas. When Redis is unavailable, behavior is governed by `redis_failure_policy`, which defaults to `local_fallback` for `rate_limiting`: the plugin enforces the configured quota independently in each pod's memory during an outage and switches back when connectivity is restored. Explicit `fail_closed` returns `503` while centralized enforcement is unavailable. The other five rate-limit plugins retain the `fail_closed` default and require explicit `local_fallback` for per-process budgets. `request_deduplication` expresses the same choice through its own `on_redis_unavailable` field (also fail-closed by default) and does not accept `redis_failure_policy`; `ai_semantic_cache` keeps automatic local fallback because a cache miss carries no enforcement consequence. The shared client reconnects in the background under either policy. Redis Cluster is not supported and is screened rather than assumed: the client runs `INFO CLUSTER` on every newly established connection and reacts to `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN`; a proven Cluster endpoint is refused terminally for the life of the client. HTTP/GraphQL/gRPC quota admission is charge-then-compensate: one atomic `MULTI`/`EXEC` charges every configured window (`GET` previous, `INCR` current, `EXPIRE` current) so the decision is tied to that increment rather than to a stale read, and any refusal issues one compensating atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it charged, so a refused request leaves no lasting charge on any window and a tighter window's refusal never consumes a looser window's budget. Between the two transactions the transient charge is visible to a concurrent request for the same identity, which can refuse slightly early under contention but never over-admits. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis; in its default `limit_by: connection` mode only to externalize its per-connection counters: because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. Its aggregate `limit_by` budgets (`consumer`, `ip`, `service`) are keyed by that identity and coordinated across replicas. When Redis is unavailable, behavior is governed by `redis_failure_policy`, which defaults to `local_fallback` for `rate_limiting`: the plugin enforces the configured quota independently in each pod's memory during an outage and switches back when connectivity is restored. Explicit `fail_closed` returns `503` while centralized enforcement is unavailable. The other five rate-limit plugins retain the `fail_closed` default and require explicit `local_fallback` for per-process budgets. `request_deduplication` expresses the same choice through its own `on_redis_unavailable` field (also fail-closed by default) and does not accept `redis_failure_policy`; `ai_semantic_cache` keeps automatic local fallback because a cache miss carries no enforcement consequence. The shared client reconnects in the background under either policy. Redis Cluster is not supported and is screened rather than assumed: the client runs `INFO CLUSTER` on every newly established connection and reacts to `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN`; a proven Cluster endpoint is refused terminally for the life of the client. HTTP/GraphQL/gRPC quota admission is charge-then-compensate: one atomic `MULTI`/`EXEC` charges every configured window on the 16-sub-bucket trailing-window ladder (bounded `GETRANGE` reads of the older sub-buckets, `INCR` + `EXPIRE` of the sub-bucket the request lands in, and one `TIME` so sub-buckets follow the Redis server clock) so the decision is tied to that increment rather than to a stale read, and any refusal issues one compensating atomic `MULTI`/`EXEC` (`DECR` + `EXPIRE`) over every window it charged, so a refused request leaves no lasting charge on any window and a tighter window's refusal never consumes a looser window's budget. Between the two transactions the transient charge is visible to a concurrent request for the same identity, which can refuse slightly early under contention but never over-admits. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet, provided the store implements `MULTI`/`EXEC` and `TIME`: the request-quota plugins (`rate_limiting`, `graphql`, `grpc_method_router`) require `TIME` (see the Redis ACL requirement under [`rate_limiting`](plugins.md#rate_limiting)).
 
 ### OpenAPI client validation precedes before_proxy (priority 2960)
 
@@ -2433,7 +2437,7 @@ An **absent** `Content-Type` is treated as JSON, and the representation gate's c
 
 ## gRPC Compatibility
 
-All plugins in the execution pipeline work transparently with gRPC requests. gRPC metadata maps directly to HTTP/2 headers, so:
+Plugins whose [protocol matrix](#per-plugin-protocol-matrix) row includes `Grpc` run for native gRPC requests; HTTP-only plugins are skipped, or the request is refused when the skipped plugin gates admission (see [Protocol Support](#protocol-support)). For the supported plugins, gRPC metadata maps directly to HTTP/2 headers, so:
 
 - **Authentication plugins** split by credential location. JWKS, JWT, and Basic inspect the `authorization` header, which gRPC clients send as metadata. `key_auth` uses its configured `key_location` and defaults to `x-api-key` metadata (`header:X-API-Key`); it does not read `authorization` unless you set `key_location: header:Authorization`. Configure `key_location: query:<name>` only when the gRPC request URI actually carries that query parameter.
 - **Rate limiting** works identically for gRPC — keyed by IP or consumer identity.

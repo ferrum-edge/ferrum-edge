@@ -50,7 +50,7 @@ Running and securing a gateway.
 | [proxy_alerts.md](proxy_alerts.md) | The `proxy_alerts` plugin |
 | [prometheus_metrics.md](prometheus_metrics.md) | The Prometheus metric contract |
 | [runbooks/gateway.md](runbooks/gateway.md) | First-response procedure for every alert the `ferrum-gateway` chart ships |
-| [admin_metrics.md](admin_metrics.md) | `/metrics/runtime` JSON diagnostics |
+| [admin_metrics.md](admin_metrics.md) | `GET /admin/metrics` JSON runtime-state snapshot and the related `/metrics`, `/live`, `/health` summary |
 | [log_schema.md](log_schema.md) | Customizing transaction log output |
 | [error_classification.md](error_classification.md) | How failures are classified and surfaced |
 | [node_agent.md](node_agent.md) | Node agent capture contract |
@@ -251,6 +251,8 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
   ([patch](upstream-hyper-patches/006-h2-stream-termination-origin/hyper-h2-stream-termination-origin.patch))
 - 007 — [absolute HTTP/2 client request-body deadline](upstream-hyper-patches/007-h2-request-body-deadline/README.md)
   ([patch](upstream-hyper-patches/007-h2-request-body-deadline/hyper-h2-request-body-deadline.patch))
+- 008 — [bound how long an HTTP/2 response body may wait for client window](upstream-hyper-patches/008-h2-response-write-timeout/README.md)
+  ([patch](upstream-hyper-patches/008-h2-response-write-timeout/hyper-h2-response-write-timeout.patch))
 
 ### h2
 
@@ -268,6 +270,8 @@ text. Governance lives in [dependency-policy.md](dependency-policy.md).
 - 001 — [release an HTTP/1 sender once its dispatcher stops reading](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md)
   ([issue](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/issue.md),
   [patch](upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/hyper-util-release-h1-sender-on-dispatch-close.patch))
+- 002 — [forward the HTTP/2 response write-stall bound from the auto builder](upstream-hyper-util-patches/002-forward-h2-response-write-timeout/README.md)
+  ([patch](upstream-hyper-util-patches/002-forward-h2-response-write-timeout/hyper-util-forward-h2-response-write-timeout.patch))
 
 ### reqwest
 

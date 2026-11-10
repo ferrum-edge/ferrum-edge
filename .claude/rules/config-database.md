@@ -53,7 +53,7 @@ paths:
 
 - New config fields go in `src/config/types.rs` with `#[serde(default)]` when optional.
 - Env-driven fields also update `src/config/env_config.rs`, `docs/configuration.md`, and `ferrum.conf`.
-- SQL storage changes are folded into `src/config/migrations/v001_initial_schema.rs` during build-out, with parsing in `db_loader.rs`.
+- SQL storage changes are folded into the V001 baseline in `src/config/migrations/sql_dialect.rs` (`v001_initial_schema.rs` only delegates to it) during build-out, with parsing in `db_loader.rs`.
 - MongoDB persists through serde BSON unless a queried field needs an index in
   `src/config/mongo_index_plan.rs` (consumed by `MongoStore::run_migrations()`,
   migrate dry-run, and migrate status).

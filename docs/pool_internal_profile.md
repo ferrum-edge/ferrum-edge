@@ -186,6 +186,6 @@ debug artifacts accompany the raw paired samples.
 `--pool-profile calibration|profile` selects the new manifest/schema explicitly.
 Without that selector the harness behaves as before: the ordinary disabled
 `experiment.json`, H1 reports, frozen benchmark workflow and immutable policy
-files are unaffected. CPU, stream-credit and streaming attribution for issue
-#5588 remain open. Nothing here closes #5588 or asserts measured cost,
-materiality or throughput gain.
+files are unaffected. Issue #5588 was closed on 2026-10-02 without CPU,
+stream-credit or streaming attribution from this lane. Nothing here asserts
+measured cost, materiality or throughput gain.

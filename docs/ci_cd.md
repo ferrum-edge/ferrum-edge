@@ -110,6 +110,7 @@ adding, removing, or materially changing a workflow.
 | `windows-confinement.yml` | Windows File Confinement | PRs and push to `main` on `src/tls/source/**`, the confinement tests and their registration chain (`tests/unit_tests.rs`, `tests/unit/mod.rs`, `tests/unit/tls/mod.rs`), `src/lib.rs`, `src/config/file_loader.rs`, Cargo/toolchain/build configuration, or its own file; manual | Runs the Windows-only tenant-file confinement unit tests (`windows_confined_files`) natively on `windows-latest`, including the elevated case-sensitive NTFS directory test that is `#[ignore]`d elsewhere. Every unit shard runs on Linux, where these tests compile out ([#6540](https://github.com/ferrum-edge/ferrum-edge/issues/6540)). Fails when fewer tests run than the module holds. Optional. |
 | `native-cache-envelope.yml` | Native Cache Envelope Proof | Manual; PRs and push to `main` on its own paths run contracts only | Synthetic GHCR envelope proof for native compiler caches; see [native_cache_envelope.md](native_cache_envelope.md). |
 | `native-compiler-store.yml` | Native Compiler Store Transfer | Manual; PRs and push to `main` on its own paths | Real compiler-store transfer proof through GHCR; see [native_compiler_store_transfer.md](native_compiler_store_transfer.md). |
+| `codeql.yml` | CodeQL | PRs and pushes to `main` (actions, c-cpp, python); daily 01:11 UTC and manual (all four languages, including Rust) | CodeQL advanced setup replacing default setup. The ~2h Rust analysis runs only on the daily schedule and manual dispatch, never on PRs. Optional. |
 | `codeql-extraction-diagnostic.yml` | CodeQL Rust Extraction Diagnostic | Manual | Extraction-only default vs FIPS feature comparison; see [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md). |
 | `compose-fixture-qualification.yml` | Compose Fixture Qualification | PRs on `docker-compose.yml`, `docker-compose.tls-test.yml`, `setup_db_tls.sh`, `check_compose_fixtures.sh`, and the workflow itself; manual | Disposable Compose fixture boundary checks. Optional. |
 | `h2-cpu-profile.yml` | H2 and gRPC CPU Profile | PRs on its own paths, manual | H2/gRPC CPU profile contracts on PRs; manual dispatch runs the profile campaign; see [h2_cpu_profile.md](h2_cpu_profile.md). Optional. |
@@ -1063,8 +1064,9 @@ MeshSubscribe client. The deliberate drops from the old `run_ebpf_live` union �
 exercised by any of the three ci.yml live jobs and stay out of their gates;
 they are instead covered by the dedicated live workflows or the always-run
 cargo jobs. The shared `tests/k8s/lib/` Kind/SPIRE harness is likewise not a
-ci.yml live input: `node-waypoint-ebpf-live.yml` owns it through its
-`pull_request.paths` (`tests/k8s/lib/**`) and its scoped planner suite.
+ci.yml live input, and it is not NodeWaypoint-sensitive on a pull request either
+(see [NodeWaypoint relevance](#nodewaypoint-relevance)); the dedicated live
+workflows exercise it on every push to `main`.
 Non-PR events, empty or unavailable diffs, and
 edits to `GATE_CONTROLLER_PATHS` (`pr_ci_plan.py`, `live_suite_path_filter.py`)
 force every gated suite on. Missing/invalid planner outputs fail closed to
@@ -1222,8 +1224,8 @@ prove each rejection dimension) in the `Tests` aggregate.
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
 planner-gated Secret Backends / PKCS#11 / Helm gates, per-suite eBPF
-kernel / netns-capture / two-cluster live gates, performance, and the
-cross-platform build matrix. When the planner marks `run_secrets_backends` or
+kernel / netns-capture / two-cluster live gates, Fuzz Smoke, Standalone Cargo
+Workspaces, and the platform build gate. When the planner marks `run_secrets_backends` or
 `run_pkcs11` false, the aggregate accepts a skipped Secret Backends or PKCS#11
 job; when the planner marks either true, that job must succeed. In light mode
 it requires successful planning and CI Policy with `verified=true`, and accepts
@@ -1246,7 +1248,7 @@ workflow triggers on every pull request and on `merge_group`, and fails closed
 on planning or validation failures. They are required directly rather than
 mirrored by runner-holding polling jobs in `ci.yml`. See
 [Required checks and merge queue](#required-checks-and-merge-queue) for the
-operator contract, queue SHA semantics, and staged enablement procedure.
+operator contract and queue SHA semantics.
 
 `cross-build-policy.yml` runs under `pull_request_target`, so it always
 executes the default branch's copy. Ordinary pull requests must not modify the
@@ -1840,8 +1842,8 @@ refs, including BuildKit caches, against the 10 GB repository quota; group
 by lane to track measured compressed sizes over time. A
 newly created replacement key is not survival evidence. Confirm `Restored
 from cache key …` in Unit Tests, Lint, and Build Test Artifacts logs, and
-record Unit Tests' precompile duration. Keep #4643 open until that evidence
-is observed; no local execution can establish these acceptance criteria.
+record Unit Tests' precompile duration. No local execution can establish these
+acceptance criteria (#4643 was closed on 2026-09-08).
 
 #### 5c. CNI Install Lifecycle Live Workflow
 
@@ -2725,10 +2727,9 @@ references `.github/scripts/build_linux_gnu_sysroot.sh`, so a revision that
 predates the builder is unaffected and the trusted-policy predecessor could
 land before the workflow change.
 
-For each of the two producers — `build-binaries` in `ci.yml` and
-`build-release-binaries` in `release.yml` (`release.yml` has no separate table
-or contract of its own: the binding includes the job name, so a `release.yml`
-job is named here directly) — the check requires the job to:
+For the one producer — `build-release-binaries` in `release.yml` (`release.yml`
+has no separate table or contract of its own: the binding includes the job name,
+so a `release.yml` job is named here directly) — the check requires the job to:
 
 - run the pinned sysroot builder exactly once, under
   `matrix.target == 'x86_64-unknown-linux-gnu'`;
@@ -2765,7 +2766,7 @@ that publishing path was removed by the version-tag release split.
 
 The identity now lives in the trusted base, in two places that must agree:
 
-1. Each producer job pins `LINUX_GNU_SYSROOT_IMAGE`,
+1. The producer job pins `LINUX_GNU_SYSROOT_IMAGE`,
    `LINUX_GNU_PROTOC_SHA256`, `LINUX_GNU_SMOKE_FLOOR_IMAGE`, and
    `LINUX_GNU_SMOKE_UBUNTU2204_IMAGE` in its own job-level `env:`.
    `build_linux_gnu_sysroot.sh` and `smoke_linux_gnu_baseline.sh` already
@@ -2787,8 +2788,8 @@ The identity now lives in the trusted base, in two places that must agree:
    identity; a matching checksum alone cannot admit a mismatched URL or version.
 
 A deliberate image or protoc bump is consequently a direct-to-`main`
-predecessor: the constants in `verify_cross_build_policy.py`, the two producer
-`env:` blocks, and the TOML all move in one commit. The policy's `--self-test`
+predecessor: the constants in `verify_cross_build_policy.py`, the producer
+`env:` block, and the TOML all move in one commit. The policy's `--self-test`
 drives both halves with fixtures: a producer missing the pins or the
 credential-free checkout, and a contract file with a substituted digest,
 registry, repository, protoc host, or smoke image.
@@ -3362,6 +3363,8 @@ gh release download v0.2.0
 sha256sum -c *.sha256
 
 # Expected output:
+# ferrum-cni-linux-aarch64: OK
+# ferrum-cni-linux-x86_64: OK
 # ferrum-edge-linux-x86_64: OK
 # ferrum-edge-linux-aarch64: OK
 # ferrum-edge-macos-x86_64: OK
@@ -3414,7 +3417,7 @@ The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto
 
 ## Image Signatures, SBOMs, and Provenance
 
-**Open release verification follow-up ([#4856](https://github.com/ferrum-edge/ferrum-edge/issues/4856)):**
+**Release verification follow-up ([#4856](https://github.com/ferrum-edge/ferrum-edge/issues/4856), closed on 2026-09-09):**
 [release run 33984483575, job 101372033947](https://github.com/ferrum-edge/ferrum-edge/actions/runs/33984483575/job/101372033947)
 failed on 2026-09-05 after pulling the pinned Syft image. Its combined scan/jq
 step returned 1 without identifying the failed operation; signing and
@@ -4289,8 +4292,8 @@ compilation completed before a later test failed. It can still read a previously
 completed archive. This tradeoff prevents the observed fetch-only archive from
 remaining the exact-key baseline indefinitely. The runtime-cache verifier covers
 enabled, commented-out, expression-based and duplicate failure-save regressions.
-Hosted adoption and subsequent main reuse must be verified before treating
-#4643 as resolved; this policy does not by itself bring all archives under quota.
+#4643 was closed on 2026-09-08; this policy does not by itself bring all
+archives under quota.
 
 The action's frozen trusted-base comparison requires the explicitly authorized
 reviewed policy adoption. No generation admission or ruleset change is retained.
@@ -4365,8 +4368,7 @@ the week-long baseline recorded on that issue (2026-08-30 → 2026-09-05:
 p50/p95 exact-SHA required-set readiness of 94.1/220.9 min for PR heads and
 64.7/115.3 min for merge groups, 91.7% main-push cancellation, and 1,635.2
 CI-only runner-minutes per merged PR). This tool makes that comparison
-repeatable; it does not perform it. Collect a complete post-change week with
-the same definitions before treating the issue as satisfied.
+repeatable; it does not perform it. #4672 was closed on 2026-09-09.
 
 #### Merge-queue batching and coordinated cadence (evaluation, not a decision)
 

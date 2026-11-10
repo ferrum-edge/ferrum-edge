@@ -300,8 +300,9 @@ UID/GID and `fsGroup`; an `emptyDir` loses the database when its Pod is deleted.
 
 ## Ferrum Mesh Helm Chart Contract
 
-The `charts/ferrum-mesh` chart defaults to scaffolding only. It creates the
-shared ServiceAccount, but runtime components that need external material are
+The `charts/ferrum-mesh` chart defaults to scaffolding only. It renders only the
+Ferrum-owned CRD (each component's ServiceAccount is created with that
+component), and runtime components that need external material are
 disabled by default:
 
 - `controlPlane.enabled=false`
@@ -1032,6 +1033,11 @@ env:
 ## Control Plane / Data Plane Layout
 
 For CP/DP mode, keep the Control Plane private and expose only the Data Plane proxy service.
+
+The Control Plane and Data Plane manifests below read `cp-dp-grpc-jwt-secret` from
+the `ferrum-edge-secrets` Secret. Add that key (at least 32 characters, distinct
+from `admin-jwt-secret`) to the Secret shown in the single-node example before
+applying them.
 
 > **Admin bind for CP/DP admin Services.** The admin Services below publish ports
 > `9000`/`9443`, but admin binds to loopback by default (see "Admin bind address"

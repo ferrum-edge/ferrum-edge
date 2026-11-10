@@ -1253,6 +1253,7 @@ covers, so it must not be replaced with a prebuilt artifact.
 - `docs/upstream-sqlx-patches/`, `docs/upstream-reqwest-patches/`,
   `docs/upstream-h3-patches/`, `docs/upstream-h3-quinn-patches/`,
   `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/`,
-  `docs/upstream-hyper-util-patches/`, `docs/upstream-hyper-patches/` —
+  `docs/upstream-hyper-util-patches/`, `docs/upstream-hyper-patches/`,
+  `docs/upstream-h2-patches/` —
   per-patch detail and retirement plans.
 - `Cargo.toml` `[patch.crates-io]` — the active vendored patches.

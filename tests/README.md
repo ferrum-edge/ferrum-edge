@@ -40,7 +40,6 @@ tests/
 ├── scaffolding/                  # Protocol backends/clients, port registry, harness
 ├── scenarios/                    # Catalog of scripted failure modes
 ├── support/                      # Tracing/diagnostic capture helpers
-├── helpers/bin/                  # Standalone test server binaries
 ├── scripts/                      # Setup scripts (e.g. setup_db_tls.sh)
 │
 ├── k8s/                          # Kubernetes live suites (kind), shared lib/
@@ -77,9 +76,10 @@ cargo test --test functional_tests -- --ignored --nocapture
 ### Mesh Conformance and Live Evidence
 
 `tests/conformance/ga_contract.yaml` is the machine-readable GA product
-contract for mesh semantic coverage. `cargo test --test conformance_tests`
-validates the manifest and emits `target/conformance/coverage.json` plus
-`target/conformance/coverage.md`.
+contract for mesh semantic coverage. `cargo test --test conformance_tests --
+--test-threads=1` validates the manifest and emits
+`target/conformance/coverage.json` plus `target/conformance/coverage.md` (a
+multi-threaded run can emit an incomplete matrix).
 
 Kubernetes live suites should source helpers from `tests/k8s/lib/`:
 

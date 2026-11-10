@@ -253,6 +253,20 @@ tags:
     description: TLS inventory/events/validation/forced reload require operator; persisted certificate, key, trust, JWKS, and ACME state mutations require admin
   - name: Gateway Trust
     description: Namespace-keyed gateway/mesh trust bundles distributed to data planes through CP/DP ConfigSync; reads require operator, writes require admin
+  - name: System
+    description: Gateway-wide operational state, such as live-apply cursor classification
+  - name: Mesh Egress Scope
+    description: Inspect and dry-run the resolved Sidecar egress scope for this workload (mesh-only)
+  - name: Mesh Federation
+    description: Inspect the live SPIFFE trust-bundle federation snapshot (mesh-only)
+  - name: Mesh Remote Clusters
+    description: Inspect the data plane's view of multicluster east-west discovery (mesh-only)
+  - name: Mesh Runtime Overlay
+    description: Inspect the xDS RTDS runtime overlay for this workload (mesh-only)
+  - name: Mesh Config Drift
+    description: Inspect mesh slice convergence and drift, and reset a data plane's accepted mesh config revision
+  - name: Mesh Policy Denies
+    description: Aggregated recent mesh_authz denies for ad-hoc triage (mesh-only)
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -723,6 +737,18 @@ paths:
       responses:
         "200":
           description: ACME certificate deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted, record]
+                properties:
+                  deleted:
+                    type: boolean
+                  record:
+                    $ref: "#/components/schemas/AcmeCertificateRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -944,6 +970,18 @@ paths:
       responses:
         "200":
           description: ACME order deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted, record]
+                properties:
+                  deleted:
+                    type: boolean
+                  record:
+                    $ref: "#/components/schemas/AcmeOrder"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1843,8 +1881,11 @@ paths:
                     items:
                       type: string
                   gateway_svid_revision:
-                    type: integer
+                    type: [integer, "null"]
                     format: uint64
+                    description: >-
+                      `null` on the `all` surface when no gateway SVID source
+                      is configured; absent for individual watcher surfaces.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -2461,7 +2502,8 @@ paths:
 
         **CP mode**: Lists all currently connected Data Plane nodes and
         Mesh nodes. Each entry includes `node_id`, `version`, `namespace`,
-        `status`, `connected_at`, and `last_sync_at`. Disconnected nodes
+        `status`, `connected_at`, and `last_sync_at`; mesh node entries also
+        include `last_heartbeat_at`. Disconnected nodes
         are automatically removed from their respective registries.
         Data Plane entries also carry the backend egress policy metadata the
         DP reported on ConfigSync Subscribe (`backend_egress_policy_attestation`
@@ -2542,6 +2584,7 @@ paths:
                         namespace: ferrum
                         status: online
                         connected_at: "2025-01-15T10:32:00Z"
+                        last_heartbeat_at: "2025-01-15T10:35:30Z"
                         last_sync_at: "2025-01-15T10:35:00Z"
                 dp_mode_online:
                   summary: DP connected to primary CP
@@ -2877,7 +2920,7 @@ paths:
                   error:
                     type: string
 
-  # ── Node-Waypoint identities (mesh NodeWaypoint topology) ───────────
+  # ── Diagnostics ─────────────────────────────────────────────────────
   /diagnostics/v1/refs/{ref}:
     get:
       operationId: getDiagnosticRef
@@ -3101,6 +3144,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
 
+  # ── Node-Waypoint identities (mesh NodeWaypoint topology) ───────────
   /node-waypoint/identities:
     get:
       operationId: getNodeWaypointIdentities
@@ -4029,12 +4073,7 @@ paths:
         (wrong mode)" and "200 with no `last_received_at`" (mesh mode, not
         converged yet).
 
-        Future work: a CP-side endpoint that reports the latest published
-        slice version per connected DP would let external tooling diff
-        what the CP thinks each DP should have against what each DP
-        reports here, without having to walk every DP in lock-step.
-        Superseded by `GET /mesh/slice-drift` on the control plane
-        (issue #3265).
+        For the CP-side per-DP view see `GET /mesh/slice-drift`.
       tags: [Mesh Config Drift]
       security:
         - bearerAuth: []
@@ -7990,12 +8029,7 @@ paths:
           description: |
             Sort direction. `desc` (default) = largest/newest first; `asc` =
             smallest/oldest first. Any other value returns 400.
-        - name: X-Ferrum-Namespace
-          in: header
-          required: false
-          schema:
-            type: string
-          description: Namespace to operate in. Defaults to `FERRUM_NAMESPACE` when omitted.
+        - $ref: "#/components/parameters/XFerrumNamespace"
       responses:
         "403":
           $ref: "#/components/responses/Forbidden"
@@ -8162,12 +8196,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
-        - name: X-Ferrum-Namespace
-          in: header
-          required: false
-          schema:
-            type: string
-          description: Namespace to operate in. Defaults to `FERRUM_NAMESPACE` when omitted.
+        - $ref: "#/components/parameters/XFerrumNamespace"
       requestBody:
         required: true
         content:
@@ -8315,12 +8344,7 @@ paths:
         can contain sensitive upstream or plugin configuration.
       tags: [API Specs]
       parameters:
-        - name: X-Ferrum-Namespace
-          in: header
-          required: false
-          schema:
-            type: string
-          description: Namespace to operate in.
+        - $ref: "#/components/parameters/XFerrumNamespace"
         - name: If-None-Match
           in: header
           required: false
@@ -8447,12 +8471,7 @@ paths:
         - $ref: "#/components/parameters/DeploymentIfMatch"
         - $ref: "#/components/parameters/ProvisionedBy"
         - $ref: "#/components/parameters/LiveApplyMode"
-        - name: X-Ferrum-Namespace
-          in: header
-          required: false
-          schema:
-            type: string
-          description: Namespace to operate in.
+        - $ref: "#/components/parameters/XFerrumNamespace"
       requestBody:
         required: true
         content:
@@ -8614,12 +8633,7 @@ paths:
       tags: [API Specs]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
-        - name: X-Ferrum-Namespace
-          in: header
-          required: false
-          schema:
-            type: string
-          description: Namespace to operate in.
+        - $ref: "#/components/parameters/XFerrumNamespace"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -8682,12 +8696,7 @@ paths:
         can contain sensitive upstream or plugin configuration.
       tags: [API Specs]
       parameters:
-        - name: X-Ferrum-Namespace
-          in: header
-          required: false
-          schema:
-            type: string
-          description: Namespace to operate in.
+        - $ref: "#/components/parameters/XFerrumNamespace"
         - name: If-None-Match
           in: header
           required: false
@@ -14659,8 +14668,10 @@ components:
             format: uint16
             minimum: 100
             maximum: 599
-          default: [502, 503, 504]
-          description: HTTP status codes eligible for retry
+          default: []
+          description: >-
+            HTTP status codes eligible for retry. Empty by default: no
+            status-code retries occur unless codes are listed.
         retryable_methods:
           type: array
           items:
@@ -17054,6 +17065,13 @@ components:
           $ref: "#/components/schemas/LoggingSinkSnapshot"
         log_sink_record_loss:
           $ref: "#/components/schemas/LogSinkRecordLossSnapshot"
+        kafka_logging:
+          type: array
+          description: >-
+            Delivery health of each live `kafka_logging` producer generation.
+            Empty when no `kafka_logging` instance is active.
+          items:
+            $ref: "#/components/schemas/KafkaSinkSnapshot"
         ai_transcript_audit:
           type: array
           description: >-
@@ -17598,6 +17616,7 @@ components:
           rejected_total,
           apply_failed_total,
           stale_transitions_total,
+          cp_admission_refused_total,
         ]
       properties:
         stale:
@@ -17690,6 +17709,14 @@ components:
           type: integer
           format: uint64
           description: Transitions into the stale state since process start.
+        cp_admission_refused_total:
+          type: integer
+          format: uint64
+          description: >
+            ConfigSync subscriptions the control plane refused with
+            `RESOURCE_EXHAUSTED` because a CP gRPC stream admission budget is
+            saturated, since process start. Recorded as a reconnect, never as
+            authority loss, so it never latches the bound.
 
     JwksTrustHealthSnapshot:
       type: object
@@ -19089,6 +19116,113 @@ components:
               format: uint64
         sinks:
           $ref: "#/components/schemas/LoggingSinkSnapshot"
+        kafka_logging:
+          type: array
+          description: >-
+            Delivery health of each live `kafka_logging` producer generation.
+            Empty when no `kafka_logging` instance is active.
+          items:
+            $ref: "#/components/schemas/KafkaSinkSnapshot"
+
+    KafkaSinkSnapshot:
+      type: object
+      description: >-
+        Delivery health and counters for one `kafka_logging` producer
+        generation, identified by `generation_id`. Counters are cumulative for
+        that generation.
+      required:
+        - generation_id
+        - healthy
+        - accepting
+        - finalized
+        - flush_timeout_seconds
+        - max_entry_bytes
+        - buffer_max_bytes
+        - retained_bytes
+        - admitted_total
+        - delivered_total
+        - delivery_failed_total
+        - queue_rejected_total
+        - ferrum_dropped_total
+        - entry_oversize_total
+        - byte_budget_exhausted_total
+        - flush_failures_total
+        - flush_timeouts_total
+        - shutdown_incomplete_total
+        - in_flight
+        - last_failure
+      properties:
+        generation_id:
+          type: integer
+          format: uint64
+        healthy:
+          type: boolean
+        accepting:
+          type: boolean
+        finalized:
+          type: boolean
+        flush_timeout_seconds:
+          type: integer
+          format: uint64
+        max_entry_bytes:
+          type: integer
+          format: uint64
+        buffer_max_bytes:
+          type: integer
+          format: uint64
+        retained_bytes:
+          type: integer
+          format: uint64
+        admitted_total:
+          type: integer
+          format: uint64
+        delivered_total:
+          type: integer
+          format: uint64
+        delivery_failed_total:
+          type: integer
+          format: uint64
+        queue_rejected_total:
+          type: integer
+          format: uint64
+        ferrum_dropped_total:
+          type: integer
+          format: uint64
+        entry_oversize_total:
+          type: integer
+          format: uint64
+        byte_budget_exhausted_total:
+          type: integer
+          format: uint64
+        flush_failures_total:
+          type: integer
+          format: uint64
+        flush_timeouts_total:
+          type: integer
+          format: uint64
+        shutdown_incomplete_total:
+          type: integer
+          format: uint64
+        in_flight:
+          type: integer
+          format: int32
+        last_failure:
+          oneOf:
+            - $ref: "#/components/schemas/KafkaSinkFailure"
+            - type: "null"
+
+    KafkaSinkFailure:
+      type: object
+      description: Most recent failure recorded for a `kafka_logging` producer generation.
+      required: [operation, error_kind, occurred_at]
+      properties:
+        operation:
+          type: string
+        error_kind:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
 
     LoggingSinkSnapshot:
       type: object
@@ -19134,8 +19268,8 @@ components:
             only for the reasons with a non-zero count. Keys are the closed
             sink set (`ai_transcript_audit`, `api_chargeback_sink`,
             `http_logging`, `kafka_logging`, `loki_logging`, `otel_tracing`,
-            `other`, `statsd_logging`, `tcp_logging`, `udp_logging`,
-            `ws_logging`).
+            `other`, `statsd_logging`, `stdout_logging`, `tcp_logging`,
+            `udp_logging`, `ws_logging`).
           additionalProperties:
             type: object
             description: >-
@@ -26837,8 +26971,8 @@ components:
         trust_domain:
           type: [string, "null"]
           minLength: 1
-          maxLength: 240
-          pattern: "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
+          maxLength: 255
+          pattern: "^[a-z0-9._-]+$"
           description: Exact source trust domain.
         trust_domain_pattern:
           type: [string, "null"]
@@ -27161,16 +27295,16 @@ components:
           items:
             type: string
             minLength: 1
-            maxLength: 240
-            pattern: "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
+            maxLength: 255
+            pattern: "^[a-z0-9._-]+$"
           description: |
             Additional SPIFFE trust domains accepted as equivalent to the
             peer cert's trust domain when authorising HBONE baggage
             `source.principal`. Empty (default) means strict same-trust-domain
             match. `null` is accepted and treated as absent. Each entry must be
-            a valid SPIFFE trust domain: lowercase, at most 240 bytes, letters
-            / digits / `.` / `-` / `_` only, no `/`, and never starting or
-            ending with `.`, `-`, or `_`.
+            a valid SPIFFE trust domain (SPIFFE-ID section 2.1): lowercase, at
+            most 255 bytes, and composed only of `[a-z0-9._-]`, including at
+            the first and last byte.
         per_pod_policy_scoping:
           type: boolean
           default: false
@@ -41370,8 +41504,8 @@ components:
         `serde_json::Map`-backed document, so it has no HTTP/stream summary
         type, no RFC3339 timestamp field, no metadata map, and no member order
         under the projection's control: `summary_type`, `timestamp_format`,
-        `metadata`, and `order` are rejected at construction rather than
-        silently ignored. `omit` names and `rename` sources must be native
+        `metadata`, `order`, and `transforms` are rejected at construction
+        rather than silently ignored. `omit` names and `rename` sources must be native
         billing-row fields, and `summary_kind` is the only derived kind
         representable from a row that spans many transactions (it has no single
         status, backend, or outcome). See docs/log_schema.md.
@@ -41731,8 +41865,8 @@ components:
             `total_charges`, `by_status`, `bandwidth`, `stream`). Billing
             identity, charge accounting, registry keys, and the Prometheus
             exposition are unaffected. `summary_type`, `timestamp_format`,
-            `metadata`, `order`, and every derived kind except `summary_kind`
-            are rejected for this surface. Process-global: every enabled
+            `metadata`, `order`, `transforms`, and every derived kind except
+            `summary_kind` are rejected for this surface. Process-global: every enabled
             api_chargeback instance must resolve to the same projection because
             one render cache serves them all. See docs/log_schema.md.
 
@@ -41770,8 +41904,8 @@ components:
       description: >-
         Projection of the exported charge-event record. Supports omit, rename,
         order, static_fields, and derived_fields. The summary_type,
-        timestamp_format, and metadata keys are forbidden, even with null or
-        default values. received_at remains an epoch-nanosecond integer.
+        timestamp_format, metadata, and transforms keys are forbidden, even
+        with null or default values. received_at remains an epoch-nanosecond integer.
         Derived kinds are status_class (from billable status_code), summary_kind
         (always charge_event), and outcome (error for status_code >= 500 or a
         nonzero grpc_status, otherwise ok). backend_host is unavailable.
@@ -42489,7 +42623,8 @@ components:
             identities, or the snapshot keys. Renaming a field renames the
             ClickHouse column the row inserts into, so the target table must
             agree. `summary_type`, `timestamp_format`, the `metadata` policy,
-            and the `backend_host` derived kind are rejected for this surface:
+            `transforms`, and the `backend_host` derived kind are rejected for
+            this surface:
             a charge event has no RFC3339 timestamp field, no metadata map, and
             no backend target. See docs/log_schema.md.
 
@@ -43005,6 +43140,57 @@ components:
                 Events dropped because the bounded in-memory queue was full and
                 no durable overflow path accepted ownership. Shutdown or
                 unavailable admission is not counted here.
+            retained_bytes:
+              type: integer
+              minimum: 0
+              description: Bytes currently charged to this instance's retained-byte budget.
+            buffer_max_bytes:
+              type: integer
+              minimum: 0
+              description: This instance's retained-byte budget.
+            byte_budget_exhausted_total:
+              type: integer
+              minimum: 0
+              description: Events refused because the retained-byte budget was exhausted.
+        snapshot:
+          type: object
+          description: >-
+            Snapshot-mode accumulator state for this generation. All counters
+            are zero when the instance runs no snapshot accumulator.
+          required:
+            - entries
+            - retained_bytes
+            - max_entries
+            - max_retained_bytes
+            - overflow_spooled_total
+            - overflow_pending_total
+            - cardinality_rejections_total
+          properties:
+            entries:
+              type: integer
+              minimum: 0
+            retained_bytes:
+              type: integer
+              minimum: 0
+            max_entries:
+              type: integer
+              minimum: 0
+            max_retained_bytes:
+              type: integer
+              minimum: 0
+            overflow_spooled_total:
+              type: integer
+              minimum: 0
+            overflow_pending_total:
+              type: integer
+              minimum: 0
+            cardinality_rejections_total:
+              type: integer
+              minimum: 0
+            recovery:
+              type: string
+              enum: [compact]
+              description: Present only while a compact recovery finalization is pending.
         spool:
           type: object
           properties:
@@ -43022,6 +43208,22 @@ components:
               description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, corrupt quarantine, and dead-letter payload/metadata files).
             drops_total:
               type: integer
+            delivery_queue_depth:
+              type: integer
+              minimum: 0
+              description: Jobs waiting in the spool-delivery queue.
+            jobs_enqueued_total:
+              type: integer
+              minimum: 0
+            jobs_written_total:
+              type: integer
+              minimum: 0
+            jobs_lost_total:
+              type: integer
+              minimum: 0
+            events_lost_total:
+              type: integer
+              minimum: 0
             replay_attempts_total:
               type: integer
               minimum: 0
@@ -43471,7 +43673,7 @@ components:
 
     ConnectedMeshNode:
       type: object
-      required: [node_id, version, namespace, status, connected_at, last_sync_at]
+      required: [node_id, version, namespace, status, connected_at, last_heartbeat_at, last_sync_at]
       properties:
         node_id:
           type: string
@@ -43490,6 +43692,12 @@ components:
           type: string
           format: date-time
           description: When the mesh node's gRPC stream was established
+        last_heartbeat_at:
+          type: string
+          format: date-time
+          description: >-
+            When the CP last produced a MeshSubscribe stream item for this node
+            (initial snapshot, config delta or full snapshot, or heartbeat)
         last_sync_at:
           type: string
           format: date-time
@@ -44502,9 +44710,6 @@ components:
         proxy_id:
           type: string
           description: ID of the proxy owned by this spec
-        namespace:
-          type: string
-          description: Namespace in which this spec and its resources live
         spec_version:
           type: string
           description: OpenAPI/Swagger version string detected from the document
@@ -44573,10 +44778,6 @@ components:
             Aggregate digest of the external-`$ref` admission snapshot when
             external refs were enabled for this import; omitted/`null`
             otherwise. Snapshot bytes stay internal (storage/backup only).
-        content_encoding:
-          type: string
-          enum: [gzip]
-          description: Encoding used for stored spec content (always `gzip`)
         created_at:
           type: string
           format: date-time
@@ -44672,8 +44873,8 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, upstream_graph, plugin, plugin_composition, plugin_graph, restore_snapshot]
-                description: Kind of resource, upstream/plugin graph, or pre-delete restore snapshot that failed
+                enum: [proxy, upstream, upstream_graph, plugin, plugin_composition, plugin_graph, proxy_plugin_association, restore_snapshot]
+                description: Kind of resource, upstream/plugin graph, proxy plugin association list, or pre-delete restore snapshot that failed
               id:
                 type: string
                 description: ID of the resource (from the extension object)

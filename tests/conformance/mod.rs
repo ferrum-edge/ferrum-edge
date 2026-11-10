@@ -25,11 +25,10 @@ mod mesh_topology_matrix;
 mod stock_xds_interop;
 mod xds_type_urls;
 
-// `emit_coverage_artifacts` is the last test in the suite — it forces a flush
-// of the registry to disk. Cargo's test runner does not guarantee ordering,
-// but the reporter's `Drop`-on-`Lazy` strategy + this test's name being
-// lexicographically after every other test keeps the artifact emit reliable
-// without relying on `#[ctor]` or a `lib.rs` shim.
+// `z_emit_coverage_artifacts` flushes the registry to disk. Its name sorts
+// after every other test, so under `--test-threads=1` (how CI runs this
+// target) it runs last and the artifacts are complete; a multi-threaded run
+// can snapshot the registry while other tests are still registering.
 #[test]
 fn z_emit_coverage_artifacts() {
     report::emit_artifacts().expect("coverage artifacts must serialize cleanly");

@@ -22,7 +22,7 @@ Update the runtime-cache verifier and CI documentation with the workflow activat
 
 After the supported generation is active and verified, retire the old Actions-cache generation in a follow-up policy change. The NodeWaypoint eBPF smoke now shares Ambient’s registry cache. Its ordinary runtime uses the separate reader/writer contract below. The manual protocol benchmark remains a separate follow-up.
 
-Keep issue #4643 open until Unit, Lint, and test-artifact lanes restore retained caches after a subsequent main push. Fuzz cache retention and the monolithic unit compilation footprint remain separate measurements.
+Issue #4643 was closed on 2026-09-08. Fuzz cache retention and the monolithic unit compilation footprint remain separate measurements.
 
 Sources: [GitHub Packages billing](https://docs.github.com/en/billing/concepts/product-billing/github-packages), [Container registry permissions and visibility](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry), [Docker registry cache](https://docs.docker.com/build/cache/backends/registry/).
 

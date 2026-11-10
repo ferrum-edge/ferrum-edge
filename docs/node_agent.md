@@ -1873,7 +1873,7 @@ In a cluster with heterogeneous kernels, the recommended pattern is:
 2. If you intentionally want degraded nodes to keep routing while kernels are upgraded, run a node-agent image that includes `/bin/sh`, `iptables`, and `ip6tables` — the published `:<tag>-ebpf-tools` variant, or your own equivalent — then set `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` for those nodes.
 3. The admission webhook (`FERRUM_MODE=injector`) applies one cluster-wide `FERRUM_MESH_CAPTURE_MODE`; it has no per-node selector, so it cannot give only pods on degraded nodes iptables init containers. Keep workloads that require capture off degraded nodes (for example with node affinity) until those nodes are upgraded.
 
-The mesh control plane is not changed by node-level degradation: slice apply, `mesh_authz`, `mesh_workload_metrics`, and HBONE all continue to function as ambient. Only the per-pod capture mechanism on the affected node changes.
+The mesh control plane is not changed by node-level degradation: slice apply, `mesh_authz`, `workload_metrics`, and HBONE all continue to function as ambient. Only the per-pod capture mechanism on the affected node changes.
 
 The node agent starts the read-only admin listeners independently for HTTP and HTTPS, matching the other serving modes:
 

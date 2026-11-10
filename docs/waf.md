@@ -79,7 +79,7 @@ default: deploy the WAF, watch what it flags, then enforce deliberately. It
 also means that with the default monitor-only pack and no other reachable
 enforcement path, `mode: enforce` is rejected at construction. Opt rules into
 enforcement, or configure one of the separately documented enforcement paths.
-There are three ways:
+There are four ways:
 
 1. **`default_rule_action`** — bulk-set the action of built-in rules that
    inherit it. `default_rule_action: "enforce"` enforces the low-false-positive
@@ -460,7 +460,7 @@ Runtime aliases map onto those targets: `request_headers` → `header_values`,
 
 A `body_json_path` rule parses every reading of the body the WAF inspects: the
 raw bytes (a leading UTF-8 byte-order mark is skipped) and each UTF-16 / UTF-32
-view described under decoded variants below, so a JSON body re-encoded in a
+view described under [Decode / normalization](#decode--normalization) above, so a JSON body re-encoded in a
 wide charset is matched like its UTF-8 form. Duplicated object members are not
 collapsed: the path follows every occurrence of each member name (including a
 `\u`-escaped spelling of the same name), at the leaf and on enclosing objects,
@@ -1602,14 +1602,15 @@ When `log_to_metadata` is true (default), every WAF-evaluated request carries
 logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.rule_hits`, `waf.target`, `waf.severity`, `waf.score` /
 `waf.instances.<id>.score` / `waf.instance_scores`, `waf.action`
-(`blocked` / `monitored` / `clean`), `waf.first_blocking_rule`,
+(`blocked` / `monitored` / `clean` / `stream_uninspected`), `waf.first_blocking_rule`,
 `waf.block_reason`, `waf.scoring_instance`, `waf.would_block_reason`,
 `waf.paranoia`, `waf.detection_rule_hits` / `waf.detection_paranoia` (see
 [Detection paranoia level](#detection-paranoia-level)), plus `waf.scan_truncated` / `waf.scan_timed_out` /
 `waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
 `response_body`) / `waf.body_uninspected` (`content_type`, `grpc_compressed`,
 `grpc_malformed_framing`, or `grpc_message_count`) /
-`waf.body_uninspected_target` (`request_body` or `response_body`). All of these are
+`waf.body_uninspected_target` (`request_body` or `response_body`) /
+`waf.response_stream_uninspectable`. All of these are
 fixed-cardinality; body bytes are never logged.
 
 `waf.matched_fields` names the fields that matched rule hits came from, so a
@@ -1631,8 +1632,8 @@ backend dispatch and still produce a transaction summary carrying these fields,
 so blocks are visible in the same per-request log line as allowed traffic.
 
 `waf.block_reason` names why a request was blocked: `rule`, `score`,
-`body_too_large`, `content_type`, `grpc_message_uninspectable`, or
-`scan_timeout` for HTTP-family traffic, and
+`body_too_large`, `content_type`, `grpc_message_uninspectable`,
+`unbounded_response_stream`, or `scan_timeout` for HTTP-family traffic, and
 `tcp_require_tls`, `first_bytes_unavailable`, or `signature` for stream (TCP/UDP)
 traffic. Stream
 inspection additionally records `waf.would_block_reason` (the same stream value
@@ -1674,7 +1675,7 @@ fire, then switch to `enforce`.
 | `default_rule_action` | string | _(unset)_ | Bulk action for built-in rules that inherit it: `enforce`, `monitor`, or `disabled`. Unset keeps the safe monitor-only default. Encoding-evasion heuristics (`FE-ENCODING-001`, `FE-ENCODING-002`) stay monitor under bulk `enforce` until an explicit `rule_modes` or `rule_overrides.action` entry promotes them. |
 | `rule_overrides` | object | `{}` | Per-rule overrides keyed by rule ID (built-in or custom): `action`, `severity`, `score`, `paranoia_min`, `fp_filters`, `conditions`, and `exclude` — `{ "query_params": [...], "headers": [...], "cookies": [...] }` field exclusions that stop that one rule inspecting the named fields while it keeps inspecting everything else. `full_url` rules re-verify a whole-URL match against the URL without the excluded pairs. Exclusions that do not fit the rule's target are rejected. `rule_overrides.<id>.action` sets the action of a rule that is already enforced by level; only `rule_modes: enforce` promotes a rule above `paranoia_level` (including a detection-band rule). See [Field exclusions](waf.md#field-exclusions). |
 | `scoring` | object | _(none)_ | Optional anomaly scoring. Configure `block_threshold` and optional severity weights so multiple monitored hits can block when **that instance's** accumulated score crosses the threshold. Scores are isolated per WAF plugin-config instance; see [Anomaly scoring](waf.md#anomaly-scoring). |
-| `custom_rules` | object[] | `[]` | Additional rules. See custom rule fields below. |
+| `custom_rules` | object[] | `[]` | Additional rules. See [Custom rules](#custom-rules). |
 | `global_exemptions` | object | `{}` | Request-level exemptions and false-positive filters. |
 | `request_inspection` | bool | `true` | Inspect request path, query, headers, cookies, method, and configured request bodies. |
 | `request_body_inspection` | bool | `true` | Enable request body rules when request inspection is active. |

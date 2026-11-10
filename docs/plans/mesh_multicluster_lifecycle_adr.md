@@ -52,8 +52,8 @@ Remote discovery also enforces production transport posture:
 - production mode accepts only `https://` and `grpcs://` remote
   `control_plane_url` values;
 - plaintext `http://` and `grpc://` remain available for local/dev/test;
-- `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is refused in production when remote
-  discovery is enabled.
+- `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` is rejected at startup in every mode (it
+  never disabled verification), so remote discovery cannot run unverified.
 
 HTTPS with system roots remains valid. Operators can still supply
 `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` and client certificate/key material when
@@ -113,7 +113,7 @@ audience-bearing token, preserving `jsonwebtoken`'s strict `validate_aud`
 posture.
 
 Every other check is unchanged and still applies first: HS256 signature against
-the per-remote or shared secret, required `exp`/`iat`/`sub`/`iss`, pinned
+the per-remote secret, required `exp`/`iat`/`sub`/`iss`, pinned
 issuer, the `ns` namespace claim, TLS/production transport posture, and
 fail-closed per-remote credential resolution. (DP tokens still *mint* a
 `role: data_plane` claim for operator/tooling conventions; the CP gRPC

@@ -586,10 +586,6 @@ DB uniqueness can silently diverge from the runtime's byte-keyed indexes.
 Startup is not blocked. See
 [configuration.md → MySQL minimum version](configuration.md#mysql-minimum-version).
 
-### "Database has duplicate listen_path values"
-
-This is a data integrity error, not a migration error. It means two proxies in the database have the same `listen_path`. Fix this by removing or updating one of the conflicting proxies via the Admin API.
-
 ### Recovering from a failed migration
 
 If a migration fails partway through:

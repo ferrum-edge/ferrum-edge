@@ -5,7 +5,7 @@ the concrete actions an agent asks a client runtime (or an upstream agent/tool)
 to execute: file writes, ticket creation, deploys, DB queries, code execution,
 account changes.
 
-`ai_tool_governor` complements [`ai_semantic_firewall`](../plugin_execution_order.md):
+`ai_tool_governor` complements [`ai_semantic_firewall`](ai_semantic_firewall.md):
 the firewall catches *intent* with semantic policy; the governor enforces
 *deterministic* policy on concrete **tool names, arguments, JSON Schema,
 regexes, risk, caller identity, proxy, and model/provider metadata**, plus an
@@ -324,7 +324,7 @@ the hold cap is released uninspected). An earlier inspector's deferred cut can
 still end the chain in either mode: the governor drops a pending unit at that
 cut, including in dry-run. This is a consequence of the earlier cut, not a
 governor policy decision. Apart from that case, dry-run never disrupts traffic.
-includes ambiguous JSON: dry-run forwards the original bytes unchanged and
+The forward-uninspected posture includes ambiguous JSON: dry-run forwards the original bytes unchanged and
 records a sanitized fixed-cardinality observation —
 `ai_tool_governor.decision=dry_run` plus
 `ai_tool_governor.uninspectable_reason=ambiguous_json` — and never claims
