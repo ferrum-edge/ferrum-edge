@@ -1624,7 +1624,13 @@ order with the CA while the original remains active:
     `valid` is left alone (a crashed holder can leave the order pending with a
     challenge already in flight), an `invalid` challenge fails closed, and the
     order is polled to `ready` under `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS`,
-    then finalized once;
+    then finalized once. An authorization that is already `valid` (the CA
+    reused it, RFC 8555 §7.1.3, possibly validated with a different challenge
+    type) needs no challenge and is skipped, at preparation and at completion;
+    an `invalid`, `expired`, `revoked` or `deactivated` authorization fails
+    closed. An order whose authorizations were all valid when it was prepared
+    records no challenge and resumes without one; meeting a pending
+    authorization on such an order fails closed;
   - `ready` — exactly one finalize request is sent, carrying the persisted CSR;
     no key or CSR is ever generated at this point;
   - `processing` — the crashed renewer's finalize already landed, so **no second

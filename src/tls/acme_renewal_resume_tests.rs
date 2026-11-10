@@ -323,7 +323,7 @@ async fn expired_claim_takeover_resumes_a_persisted_http01_order() {
         "resumption must reuse the persisted account credentials"
     );
     let inferred = infer_persisted_challenge_type(&resumed).expect("infer");
-    assert_eq!(inferred, AcmeRenewalChallengeType::Http01);
+    assert_eq!(inferred, Some(AcmeRenewalChallengeType::Http01));
     // The record is left in place, so the shared HTTP-01 resolver keeps serving
     // the prior renewer's token while completion is polled.
     let served = fixture.orders.http01_key_authorization(TOKEN);
@@ -338,7 +338,7 @@ async fn expired_claim_takeover_resumes_a_persisted_tls_alpn01_order() {
     let resumed = expect_resume(plan_after_claim(&fixture).await);
     assert_eq!(resumed.id, ORDER_ID);
     let inferred = infer_persisted_challenge_type(&resumed).expect("infer");
-    assert_eq!(inferred, AcmeRenewalChallengeType::TlsAlpn01);
+    assert_eq!(inferred, Some(AcmeRenewalChallengeType::TlsAlpn01));
     let served = fixture.orders.tls_alpn01_key_authorization("example.com");
     assert_eq!(served.as_deref(), Some(KEY_AUTHORIZATION));
 }
@@ -352,7 +352,7 @@ async fn expired_claim_takeover_resumes_a_persisted_dns01_order() {
     let resumed = expect_resume(plan_after_claim(&fixture).await);
     assert_eq!(resumed.id, ORDER_ID);
     let inferred = infer_persisted_challenge_type(&resumed).expect("infer");
-    assert_eq!(inferred, AcmeRenewalChallengeType::Dns01);
+    assert_eq!(inferred, Some(AcmeRenewalChallengeType::Dns01));
     assert_eq!(resumed.dns01_challenges.len(), 1);
 }
 
@@ -455,11 +455,11 @@ async fn terminal_and_absent_orders_plan_a_new_order() {
     expect_new_order(plan, "no persisted order");
 }
 
-/// Ambiguous or missing challenge state is an explicit failure, never a
-/// fallback to whatever challenge type is configured now. The diagnostics name
-/// the order and nothing else.
+/// Ambiguous challenge state is an explicit failure, never a fallback to
+/// whatever challenge type is configured now. The diagnostics name the order
+/// and nothing else. An order with no challenge records needs no type.
 #[test]
-fn ambiguous_or_missing_challenge_families_fail_closed() {
+fn ambiguous_challenge_families_fail_closed_and_none_needs_no_type() {
     let ambiguous = OrderSpec {
         dns01: true,
         ..OrderSpec::http01()
@@ -474,19 +474,19 @@ fn ambiguous_or_missing_challenge_families_fail_closed() {
     );
     assert_no_challenge_disclosure(&rendered);
 
+    // Issue #7195: an order prepared when every authorization was already
+    // valid records no challenge. It needs no challenge type; completion
+    // refuses any pending authorization it meets instead.
     let empty = OrderSpec {
         http01: false,
         ..OrderSpec::http01()
     }
     .build();
-    let error = infer_persisted_challenge_type(&empty)
-        .expect_err("no challenge families must not infer a type");
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("no persisted challenge records"),
-        "unexpected inference error: {rendered}"
+    assert!(!empty.has_challenge_records());
+    assert_eq!(
+        infer_persisted_challenge_type(&empty).expect("an all-valid order resumes"),
+        None
     );
-    assert_no_challenge_disclosure(&rendered);
 }
 
 /// The whole point of persisting the material during preparation: it has to be
