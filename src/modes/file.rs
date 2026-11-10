@@ -1051,7 +1051,7 @@ pub async fn serve(
     ) {
         Ok(Some(candidate)) => {
             let mut config = candidate.config;
-            info!("Loading TLS configuration with client certificate verification...");
+            info!("Loading TLS configuration...");
             tls::enable_early_data(&mut config, &tls_policy);
             if env_config.ktls_enabled.could_be_enabled() {
                 tls::enable_secret_extraction_for_ktls(&mut config);
