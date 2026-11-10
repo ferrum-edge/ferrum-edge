@@ -11,8 +11,7 @@ use tracing::warn;
 use super::utils::rate_limit::{
     LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
     STANDALONE_RATE_LIMIT_CONFIG_ID, UdpRateLimitAlgorithm, UdpRateLimitOp,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
-    validate_window_seconds,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_window_seconds,
 };
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
@@ -540,7 +539,7 @@ impl UdpRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                apply_rate_limit_cleanup(&self.limiter, max_entries, now, true);
+                self.limiter.prune_stale_at(now);
             }
             return true;
         }
@@ -557,7 +556,7 @@ impl UdpRateLimiting {
                 // below the hard cap. A later at-cap observation keeps the
                 // new-key guard active and reclaims idle state at most once
                 // per second after pruning.
-                apply_rate_limit_cleanup(&self.limiter, max_entries, now, false);
+                self.limiter.prune_stale_at(now);
             }
         }
 

@@ -608,9 +608,13 @@ where
 
     /// Drop idle entries according to the algorithm's activity predicate.
     ///
-    /// This is the below-cap periodic cleanup path: it never force-evicts
-    /// still-active keys and is safe to invoke on a sampled schedule even when
-    /// the map sits under the hard capacity ceiling.
+    /// This is the only cleanup, below the cap and under capacity pressure
+    /// alike: it never force-evicts still-active keys, which would reset
+    /// consumed windows and weaken enforcement (GHSA-3xxf-5m26-c8pv). Hard
+    /// cardinality is enforced by atomic reservation on admission
+    /// ([`Self::check_at_with_capacity`] /
+    /// [`RateLimitBackend::check_with_redis_key_and_local_capacity`]), which
+    /// refuses previously unseen keys at the configured cap.
     pub fn prune_stale_at(&self, now: Instant) {
         self.state.retain(|_, state| {
             if self.algorithm.is_state_active(state, now) {
@@ -620,21 +624,6 @@ where
                 false
             }
         });
-    }
-
-    /// Reclaim idle state under capacity pressure.
-    ///
-    /// Hard cardinality is enforced by atomic reservation on admission
-    /// ([`Self::check_at_with_capacity`] /
-    /// [`RateLimitBackend::check_with_redis_key_and_local_capacity`]). This
-    /// helper only prunes idle entries — it never deletes still-active
-    /// budgets, which would reset consumed windows and weaken enforcement
-    /// (GHSA-3xxf-5m26-c8pv). `max_entries` is retained for call-site
-    /// compatibility with shared cleanup wrappers; admission already refuses
-    /// previously unseen local/fallback keys at the configured cap.
-    pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
-        let _ = max_entries;
-        self.prune_stale_at(now);
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
@@ -1016,10 +1005,6 @@ where
 
     pub fn prune_local_stale_at(&self, now: Instant) {
         self.fallback.prune_stale_at(now);
-    }
-
-    pub fn enforce_local_capacity(&self, max_entries: usize, now: Instant) {
-        self.fallback.enforce_capacity(max_entries, now);
     }
 
     pub fn contains_local_key(&self, key: &K) -> bool {
@@ -1805,13 +1790,6 @@ where
         }
     }
 
-    pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
-        match self {
-            Self::Local(local) => local.enforce_capacity(max_entries, now),
-            Self::Failover(failover) => failover.enforce_local_capacity(max_entries, now),
-        }
-    }
-
     /// Seed or refresh a local/fallback key at a controllable instant.
     ///
     /// Test-support only: production admission always uses wall-clock `check`.
@@ -1922,30 +1900,6 @@ where
             Self::Local(_) => None,
             Self::Failover(failover) => failover.health_observer_abort_for_test(),
         }
-    }
-}
-
-/// Shared consumer cleanup branch: below-cap prune vs over-cap stale reclaim.
-///
-/// Every rate-limit consumer wrapper routes through this helper so omitted or
-/// reversed `prune_stale_at` / `enforce_capacity` wiring is a single shared
-/// failure mode rather than six divergent copies. Both arms only drop idle
-/// state — live budgets are never force-evicted. Hard cardinality is enforced
-/// by atomic admission reservation, not by deleting active keys.
-#[inline]
-pub fn apply_rate_limit_cleanup<K, A>(
-    limiter: &RateLimitBackend<K, A>,
-    max_entries: usize,
-    now: Instant,
-    over_capacity: bool,
-) where
-    K: Eq + Hash + Clone + Send + Sync + 'static,
-    A: RateLimitAlgorithm + Clone,
-{
-    if over_capacity {
-        limiter.enforce_capacity(max_entries, now);
-    } else {
-        limiter.prune_stale_at(now);
     }
 }
 
@@ -5278,7 +5232,7 @@ mod tests {
     }
 
     #[test]
-    fn local_limiter_enforce_capacity_preserves_active_entries() {
+    fn local_limiter_prune_at_capacity_preserves_active_entries() {
         let limiter = LocalLimiter::new(
             TestAlgorithm {
                 redis_ok: Arc::new(AtomicBool::new(true)),
@@ -5306,7 +5260,7 @@ mod tests {
         );
 
         // Cleanup must not delete still-active budgets to make room.
-        limiter.enforce_capacity(3, now);
+        limiter.prune_stale_at(now);
         assert_eq!(limiter.tracked_keys_count(), 5);
         for idx in 0..5 {
             assert!(limiter.contains_key(&format!("key:{idx}")));
@@ -5340,34 +5294,6 @@ mod tests {
         assert!(limiter.contains_key(&"active".to_string()));
         assert!(!limiter.contains_key(&"stale-a".to_string()));
         assert!(!limiter.contains_key(&"stale-b".to_string()));
-    }
-
-    #[test]
-    fn local_limiter_enforce_capacity_prunes_stale_below_cap() {
-        let limiter = LocalLimiter::new(
-            TestAlgorithm {
-                redis_ok: Arc::new(AtomicBool::new(true)),
-            },
-            crate::util::sharding::pool_shard_amount(0),
-        );
-        let op = TestOp;
-        let t0 = Instant::now();
-
-        for idx in 0..4 {
-            assert!(limiter.check_at(format!("stale:{idx}"), &op, t0).allowed);
-        }
-        let t_active = t0 + Duration::from_secs(20);
-        assert!(
-            limiter
-                .check_at("active".to_string(), &op, t_active)
-                .allowed
-        );
-        assert_eq!(limiter.tracked_keys_count(), 5);
-
-        // Cap is above current length; stale pruning must still run.
-        limiter.enforce_capacity(100, t_active);
-        assert_eq!(limiter.tracked_keys_count(), 1);
-        assert!(limiter.contains_key(&"active".to_string()));
     }
 
     #[tokio::test]
@@ -5778,8 +5704,8 @@ mod tests {
                         limiter.prune_stale_at(Instant::now() + Duration::from_secs(30));
                     }
                     if i.is_multiple_of(23) {
-                        // Over-cap cleanup must only prune idle state.
-                        limiter.enforce_capacity(max_entries, Instant::now());
+                        // Pressure cleanup must only prune idle state.
+                        limiter.prune_stale_at(Instant::now());
                     }
                 }
             }));
@@ -5791,7 +5717,7 @@ mod tests {
             handle.join().expect("worker joins");
         }
 
-        limiter.enforce_capacity(max_entries, Instant::now());
+        limiter.prune_stale_at(Instant::now());
         let tracked = limiter.tracked_keys_count();
         let map_len = limiter.map_len_for_test();
         assert_eq!(
