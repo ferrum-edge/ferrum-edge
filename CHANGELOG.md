@@ -288,6 +288,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `count_mode: completion_tokens`. Both plugins now share one integer parser,
   the limiter reads all four Gemini spellings, and the prompt estimate
   excludes caps at exactly the same paths and values.
+- **Proxy transaction logs and retries agree across frontends** (#7158,
+  #7159, #7160, #7161, #7162, #7164).
+  - HTTP/3 now logs an open-breaker `503` as
+    `rejection_phase=circuit_breaker_open`, as HTTP/1.1 and HTTP/2 always did;
+    the H3-only `circuit_breaker` spelling is gone from the metrics-token and
+    diagnostic-reference phase sets. Update any log query or alert that
+    matched `circuit_breaker`.
+  - After an Istio `rewrite.uri` or `mesh_route_dispatch` path override,
+    HTTP/3 rejections (circuit breaker, backend admission, upload deadline,
+    final request-body policy, streaming `after_proxy`) log the client's
+    original `request_path`, not the rewritten backend path.
+  - An HTTP/1.1 or HTTP/2 request whose retry rotated to another upstream
+    target logs that target as `backend_target` (and in streaming-latency
+    records), not the target that failed.
+  - WebSocket disconnect records (`ws_logging` and other `on_ws_disconnect`
+    consumers) report the port of the listener the client connected to,
+    including Gateway API and mesh listeners, instead of the global proxy port.
+  - Retries share the retained request body instead of copying it outside the
+    request-buffer budget. A native HTTP/3 retry declares the replayed body's
+    `Content-Length` like the first attempt and refuses a `dns_override`
+    denied by the backend egress policy before dialing.
+  - Multi-mode authentication's RPC-deadline rejection now carries the
+    session cookies an earlier mechanism staged, as single mode does, and
+    no longer leaves them in request metadata. The final request-body hook
+    hand-back on the terminal dispatch path now keeps the hook's deadline
+    selection and AI usage snapshot.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

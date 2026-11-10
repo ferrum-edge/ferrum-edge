@@ -4609,15 +4609,19 @@ impl RequestContext {
     /// Hand a final-request-body hook context's state back to this live
     /// context once the `on_final_request_body` hooks have run on it.
     ///
-    /// Adopts the gateway terminals first, so the finalizer on the live
-    /// context knows it is publishing a gateway-authored error payload, then
-    /// the transferred plugin state, then swaps in the hook context's
-    /// `metadata` while keeping the live `request_body` (the clone omits it
-    /// and no final hook touches it), and finally `ai_usage_export` and
-    /// `waf_metadata_initialized`. Every proxy dispatch path and the
-    /// `_test_support` round-trip seam call this one function so the hand-back
-    /// cannot diverge between them (issue #7223).
+    /// Adopts the gateway deadline selection and the gateway terminals first,
+    /// so the finalizer on the live context knows it is publishing a
+    /// gateway-authored error payload, then the transferred plugin state, then
+    /// swaps in the hook context's `metadata` while keeping the live
+    /// `request_body` (the clone omits it and no final hook touches it), and
+    /// finally `ai_usage_export` and `waf_metadata_initialized`. Every proxy
+    /// dispatch path (the terminal-body arm included) and the `_test_support`
+    /// round-trip seam call this one function so the hand-back cannot diverge
+    /// between them (issues #7161, #7223).
     pub(crate) fn adopt_final_request_body_hook_context(&mut self, mut hook_ctx: RequestContext) {
+        if hook_ctx.gateway_deadline_response_selected() {
+            self.mark_gateway_deadline_response_selected();
+        }
         self.adopt_final_request_body_hook_terminals(&hook_ctx);
         self.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
         let request_body = self.metadata.remove("request_body");

@@ -621,21 +621,20 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
                         .get(crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG)
                         .map(String::as_str)
                 });
-            let hbone_peer_spiffe = crate::proxy::hbone_pool::target_expected_peer_spiffe(target)
-                .ok()
-                .flatten()
-                .map(|spiffe| spiffe.to_string())
+            // The raw tag, borrowed: a valid SPIFFE ID renders exactly as the
+            // tag it was parsed from, and an invalid one is keyed by its raw
+            // value anyway, so parsing and re-rendering it here would only add
+            // per-request allocations (issue #7166). Same precedence as
+            // `hbone_pool::target_expected_peer_spiffe`.
+            let hbone_peer_spiffe = target
+                .tags
+                .get(crate::proxy::hbone_pool::HBONE_PEER_SPIFFE_ID_TAG)
                 .or_else(|| {
                     target
                         .tags
-                        .get(crate::proxy::hbone_pool::HBONE_PEER_SPIFFE_ID_TAG)
-                        .or_else(|| {
-                            target
-                                .tags
-                                .get(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG)
-                        })
-                        .cloned()
-                });
+                        .get(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG)
+                })
+                .map(String::as_str);
             (hbone_port, hbone_dial_host, hbone_peer_spiffe)
         });
     buf.push_str(scheme.to_scheme_str());
@@ -658,7 +657,7 @@ fn write_capability_key(buf: &mut String, proxy: &Proxy, target: Option<&Upstrea
         buf.push('|');
         append_optional_pool_key_component(buf, dial_host);
         buf.push('|');
-        append_optional_pool_key_component(buf, peer_spiffe.as_deref());
+        append_optional_pool_key_component(buf, peer_spiffe);
     }
 }
 

@@ -4962,6 +4962,7 @@ async fn handle_h3_request(
                     plugin_execution_ns,
                     authorization_expiry,
                     upload_bound.route_wins(),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -5191,6 +5192,7 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                         authorization_expiry,
                         upload_bound.route_wins(),
+                        None,
                     )
                     .await?;
                     return Ok(());
@@ -5497,6 +5499,7 @@ async fn handle_h3_request(
                     plugin_execution_ns,
                     authorization_expiry,
                     upload_bound.route_wins(),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -6836,6 +6839,7 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                         authorization_expiry,
                         false,
+                        Some(&original_request_path),
                     )
                     .await?;
                     return Ok(());
@@ -7205,13 +7209,14 @@ async fn handle_h3_request(
                 };
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 record_request(&state, log_status_code);
-                log_rejected_request(
+                log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     log_status_code,
                     start_time,
-                    "circuit_breaker",
+                    "circuit_breaker_open",
                     plugin_execution_ns,
+                    Some(&original_request_path),
                 )
                 .await;
                 if deadline_replaced && grpc_web_response_content_type.is_some() {
@@ -7301,6 +7306,7 @@ async fn handle_h3_request(
                 start_time,
                 plugin_execution_ns,
                 &cb_probe,
+                Some(&original_request_path),
             )
             .await?
             {
@@ -7393,6 +7399,7 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                         authorization_expiry,
                         false,
+                        Some(&original_request_path),
                     )
                     .await?;
                     return Ok(());
@@ -8229,6 +8236,7 @@ async fn handle_h3_request(
                                 plugin_execution_ns,
                                 authorization_expiry,
                                 false,
+                                Some(&original_request_path),
                             )
                             .await?;
                             return Ok(());
@@ -8462,6 +8470,7 @@ async fn handle_h3_request(
             start_time,
             plugin_execution_ns,
             &cb_probe,
+            Some(&original_request_path),
         )
         .await?
         {
@@ -9163,7 +9172,7 @@ async fn handle_h3_request(
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
                 http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
-                request_path: path.clone(),
+                request_path: original_request_path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),
                 backend_target: Some(strip_query_params(&backend_url).to_string()),
@@ -10168,6 +10177,7 @@ async fn handle_h3_request(
                     plugin_execution_ns,
                     authorization_expiry,
                     false,
+                    Some(&original_request_path),
                 )
                 .await?;
                 return Ok(());
@@ -10354,13 +10364,14 @@ async fn handle_h3_request(
                 &headers,
             );
             record_request(&state, log_status_code);
-            log_rejected_request(
+            log_rejected_request_with_path(
                 &plugins,
                 &ctx,
                 log_status_code,
                 start_time,
                 "on_final_request_body",
                 plugin_execution_ns,
+                Some(&original_request_path),
             )
             .await;
             send_h3_plugin_reject_flavor_aware(
@@ -10397,6 +10408,7 @@ async fn handle_h3_request(
                 start_time,
                 plugin_execution_ns,
                 &cb_probe,
+                Some(&original_request_path),
             )
             .await?
             {
@@ -11176,6 +11188,7 @@ async fn handle_h3_request(
                     start_time,
                     plugin_execution_ns,
                     &cb_probe,
+                    Some(&original_request_path),
                 )
                 .await?
                 {
@@ -11292,7 +11305,7 @@ async fn handle_h3_request(
                             attempt_headers,
                         ),
                         current_target.as_deref(),
-                        Some(&body_data[..]),
+                        Some(&body_data),
                         false,
                         &plugins,
                         &ctx,
@@ -12351,6 +12364,9 @@ async fn run_h3_backend_admission_or_send_reject(
     start_time: std::time::Instant,
     plugin_execution_ns: u64,
     cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    // The client's path before any route-override rewrite, recorded as the
+    // summary's `request_path` (issue #7158). `None` only before the rewrite.
+    original_request_path: Option<&str>,
 ) -> Result<Result<Option<BackendAdmissionPermitSet>, ()>, anyhow::Error> {
     match crate::proxy::backend_dispatch::run_backend_admission_plugins(
         state,
@@ -12417,13 +12433,14 @@ async fn run_h3_backend_admission_or_send_reject(
                 &rejection.plugin_name,
                 log_status_code,
             );
-            log_rejected_request(
+            log_rejected_request_with_path(
                 plugins,
                 ctx,
                 log_status_code,
                 start_time,
                 &rejection.plugin_name,
                 plugin_execution_ns,
+                original_request_path,
             )
             .await;
             if deadline_replaced && grpc_web_response_content_type.is_some() {
@@ -15941,6 +15958,7 @@ async fn dispatch_grpc_native_h3(
         start_time,
         *plugin_execution_ns,
         cb_probe,
+        Some(original_request_path),
     )
     .await?
     {
@@ -20226,6 +20244,9 @@ async fn finalize_h3_upload_deadline_rejection(
     // #6008). Captured at composition, because the rule is not armed on `ctx`
     // until `before_proxy` selects it.
     early_route_won: bool,
+    // The client's path before any route-override rewrite, recorded as the
+    // summary's `request_path` (issue #7158). `None` only before the rewrite.
+    original_request_path: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(ctx);
     let route_timeout =
@@ -20312,13 +20333,14 @@ async fn finalize_h3_upload_deadline_rejection(
     .await;
     let log_status =
         h3_reject_log_status_and_metadata(ctx, flavor, http_status, &reject.body, &reject.headers);
-    log_rejected_request(
+    log_rejected_request_with_path(
         plugins,
         ctx,
         log_status,
         start_time,
         rejection_phase,
         plugin_execution_ns,
+        original_request_path,
     )
     .await;
     record_request(state, log_status);

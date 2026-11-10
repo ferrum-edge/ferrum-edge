@@ -3035,6 +3035,37 @@ pub mod _test_support {
         .await
     }
 
+    /// One native-H3 retry attempt (`proxy_to_backend_http3_retry`) for a
+    /// plain `GET` with no body, upstream target, or plugins.
+    pub async fn proxy_to_backend_http3_retry_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        backend_url: &str,
+    ) -> crate::retry::BackendResponse {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        crate::proxy::proxy_to_backend_http3_retry(
+            state,
+            proxy,
+            backend_url,
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            false,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            true,
+            hyper::Version::HTTP_3,
+        )
+        .await
+    }
+
     pub fn request_method_is_allowed_for_test(allowed: &[String], method: &str) -> bool {
         crate::proxy::request_method_is_allowed(allowed, method)
     }
@@ -10875,6 +10906,25 @@ pub mod _test_support {
         .await;
         ctx.adopt_final_request_body_hook_context(hook_ctx);
         (transformed, result)
+    }
+
+    /// The listen port a WebSocket session's disconnect metadata reports
+    /// (issue #7164).
+    pub fn websocket_session_listen_port_for_test(
+        ctx: &crate::plugins::RequestContext,
+        is_tls: bool,
+        env_config: &crate::config::EnvConfig,
+    ) -> u16 {
+        crate::proxy::websocket_session_listen_port(ctx, is_tls, env_config)
+    }
+
+    /// Stage a typed AI usage snapshot on `ctx`, as a built-in AI plugin
+    /// does, so hook hand-back tests can observe which context's value wins.
+    pub fn stage_ai_usage_export_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        export: crate::plugins::AiUsageExport,
+    ) {
+        ctx.stage_ai_usage_export(export);
     }
 
     pub async fn apply_buffered_request_body_normalization_before_before_proxy_for_test(

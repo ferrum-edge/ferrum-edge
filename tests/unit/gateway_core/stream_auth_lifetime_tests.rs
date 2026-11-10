@@ -2142,7 +2142,7 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
     assert_buffered_upload_region_stays_bounded(
         "http3",
         "\nasync fn proxy_to_backend_http3(",
-        "\nasync fn proxy_to_backend_http3_retry(",
+        "\npub(crate) async fn proxy_to_backend_http3_retry(",
     );
 }
 
