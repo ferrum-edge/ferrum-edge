@@ -703,6 +703,18 @@ pub(crate) enum SourceKind {
     GatewayApi,
 }
 
+/// What [`K8sAccumulator::upsert_proxy`] did with a candidate proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyUpsert {
+    /// No proxy held the `(namespace, id)`; the candidate was added.
+    Inserted,
+    /// The candidate replaced the proxy that held the `(namespace, id)`.
+    Replaced,
+    /// The candidate was dropped; the proxy already holding the
+    /// `(namespace, id)` (or none, for an empty key) stays.
+    Ignored,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct K8sResourceKey {
     pub api_version: String,
@@ -1496,13 +1508,17 @@ impl K8sAccumulator {
         self.proxy_sources.get(&key).copied()
     }
 
-    pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) {
+    /// Materialize `proxy` under its `(namespace, id)`, resolving an overlap
+    /// with an already-materialized proxy by source precedence. The returned
+    /// [`ProxyUpsert`] tells the caller whether `proxy` is now the one serving
+    /// that key, so proxy-scoped plugins can follow their proxy.
+    pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) -> ProxyUpsert {
         let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
             self.warnings.push(format!(
                 "proxy with empty namespace or id was ignored (namespace={:?}, id={:?})",
                 proxy.namespace, proxy.id
             ));
-            return;
+            return ProxyUpsert::Ignored;
         };
         if let Some(existing_source) = self.proxy_sources.get(&key).copied() {
             let istio_wins = self.options.prefer_istio_on_overlap
@@ -1517,7 +1533,7 @@ impl K8sAccumulator {
                     "Gateway API proxy {:?}/{:?} ignored because Istio resource has precedence",
                     proxy.namespace, proxy.id
                 ));
-                return;
+                return ProxyUpsert::Ignored;
             }
 
             if let Some(existing) = self.config.proxies.iter_mut().find(|candidate| {
@@ -1526,13 +1542,15 @@ impl K8sAccumulator {
                 if istio_wins || !self.options.prefer_istio_on_overlap {
                     *existing = proxy;
                     self.proxy_sources.insert(key, source);
+                    return ProxyUpsert::Replaced;
                 }
-                return;
+                return ProxyUpsert::Ignored;
             }
         }
 
         self.proxy_sources.insert(key, source);
         self.config.proxies.push(proxy);
+        ProxyUpsert::Inserted
     }
 
     /// Withdraw one already-materialized proxy and everything keyed to it.

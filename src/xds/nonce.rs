@@ -11,7 +11,6 @@ struct NonceKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NonceState {
     last_issued_nonce: String,
-    last_acked_nonce: Option<String>,
     last_version: String,
     last_error: Option<String>,
 }
@@ -54,15 +53,10 @@ impl XdsNonceTracker {
             node_id: node_id.to_string(),
             type_url: type_url.to_string(),
         };
-        let previous_ack = self
-            .states
-            .get(&key)
-            .and_then(|state| state.last_acked_nonce.clone());
         self.states.insert(
             key,
             NonceState {
                 last_issued_nonce: nonce.clone(),
-                last_acked_nonce: previous_ack,
                 last_version: version.to_string(),
                 last_error: None,
             },
@@ -90,10 +84,14 @@ impl XdsNonceTracker {
             return AckOutcome::UnknownNonce;
         };
 
+        // `actual` in `StaleNonce` / `VersionDrift` is peer-supplied and is
+        // Debug-formatted into the server's "ACK ignored" warn line, so it is
+        // bounded here like the NACK message below. The `expected` halves are
+        // server-generated.
         if state.last_issued_nonce != response_nonce {
             return AckOutcome::StaleNonce {
                 expected: state.last_issued_nonce.clone(),
-                actual: response_nonce.to_string(),
+                actual: super::bounded_xds_log_value(response_nonce),
             };
         }
 
@@ -109,11 +107,10 @@ impl XdsNonceTracker {
         if !version_info.is_empty() && version_info != state.last_version {
             return AckOutcome::VersionDrift {
                 expected: state.last_version.clone(),
-                actual: version_info.to_string(),
+                actual: super::bounded_xds_log_value(version_info),
             };
         }
 
-        state.last_acked_nonce = Some(response_nonce.to_string());
         state.last_error = None;
         AckOutcome::Acked
     }

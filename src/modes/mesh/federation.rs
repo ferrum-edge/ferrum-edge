@@ -97,6 +97,11 @@ pub struct FederationSnapshot {
 pub struct FederatedBundle {
     pub bundle: TrustBundle,
     pub fetched_at_unix_seconds: u64,
+    /// Origin (`scheme://host[:port]`) of the federation endpoint the bundle
+    /// was fetched from, as reduced by `sanitize_endpoint_for_logging`. The
+    /// configured URL may carry credentials in its userinfo, path, query or
+    /// fragment, and this value is served by `GET /mesh/federation`, so the
+    /// full URL is never stored here.
     pub endpoint: String,
     pub cluster_name: String,
 }
@@ -1101,7 +1106,7 @@ async fn fetch_and_install_bundle(
     let federated = FederatedBundle {
         bundle,
         fetched_at_unix_seconds: now,
-        endpoint: endpoint.to_string(),
+        endpoint: endpoint_for_logs.clone(),
         cluster_name: cluster_name.to_string(),
     };
     let installed = store.install(
@@ -1205,17 +1210,11 @@ fn reject_unsafe_ipv4(ip: &std::net::Ipv4Addr) -> Result<(), String> {
     if ip.is_loopback() {
         return Ok(());
     }
+    // 169.254.0.0/16 covers the cloud metadata address 169.254.169.254.
     if ip.is_link_local() {
         return Err(format!(
             "federation_endpoint refuses link-local host \"{ip}\" (defends against cloud \
              metadata SSRF)"
-        ));
-    }
-    // 169.254.169.254 is link-local already, but call it out explicitly for
-    // the operator-readable error message.
-    if ip.octets() == [169, 254, 169, 254] {
-        return Err(format!(
-            "federation_endpoint refuses cloud metadata IP \"{ip}\""
         ));
     }
     if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
@@ -1227,6 +1226,11 @@ fn reject_unsafe_ipv4(ip: &std::net::Ipv4Addr) -> Result<(), String> {
 }
 
 fn reject_unsafe_ipv6(ip: &std::net::Ipv6Addr) -> Result<(), String> {
+    // An IPv4-mapped literal (`[::ffff:169.254.169.254]`) is dialed over IPv4,
+    // so it must face the IPv4 screen rather than the IPv6 one.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return reject_unsafe_ipv4(&v4);
+    }
     if ip.is_loopback() {
         return Ok(());
     }
@@ -2144,6 +2148,23 @@ mod tests {
         let err = validate_federation_endpoint("https://[fe80::1]/x")
             .expect_err("IPv6 link-local must be rejected");
         assert!(err.contains("link-local"));
+    }
+
+    #[test]
+    fn validate_federation_endpoint_screens_ipv4_mapped_literals_as_ipv4() {
+        let err = validate_federation_endpoint("https://[::ffff:169.254.169.254]/x")
+            .expect_err("IPv4-mapped cloud metadata literal must be rejected");
+        assert!(err.contains("link-local"), "{err}");
+        let err = validate_federation_endpoint("https://[::ffff:0.0.0.0]:15012/x")
+            .expect_err("IPv4-mapped unspecified literal must be rejected");
+        assert!(err.contains("non-unicast"), "{err}");
+        let err = validate_federation_endpoint("https://[::ffff:255.255.255.255]/x")
+            .expect_err("IPv4-mapped broadcast literal must be rejected");
+        assert!(err.contains("non-unicast"), "{err}");
+        validate_federation_endpoint("https://[::ffff:127.0.0.1]:9090/x")
+            .expect("IPv4-mapped loopback is loopback, as in the IPv4 screen");
+        validate_federation_endpoint("https://[::ffff:203.0.113.10]/x")
+            .expect("IPv4-mapped public unicast literal must be accepted");
     }
 
     #[test]

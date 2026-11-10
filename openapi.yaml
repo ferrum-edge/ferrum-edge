@@ -3641,7 +3641,7 @@ paths:
         `MultiClusterConfig.remote_clusters[].federation_endpoint` at
         `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the
         validated bundle on `TrustBundleSet.federated`. Each entry includes
-        the originating cluster name, trust domain, endpoint URL, fetch
+        the originating cluster name, trust domain, endpoint origin, fetch
         timestamp, derived bundle age, and authority counts.
 
         Returns `404 Not Found` outside mesh mode (when the mesh runtime
@@ -3682,7 +3682,10 @@ paths:
                           description: SPIFFE trust domain.
                         endpoint:
                           type: string
-                          description: HTTPS endpoint the bundle was fetched from.
+                          description: >-
+                            Origin (`scheme://host[:port]`) of the HTTPS endpoint the bundle
+                            was fetched from. Userinfo, path, query, and fragment of the
+                            configured `federation_endpoint` are never returned.
                         fetched_at_unix_seconds:
                           type: integer
                           format: int64

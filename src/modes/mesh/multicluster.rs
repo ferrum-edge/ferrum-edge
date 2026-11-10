@@ -1657,6 +1657,15 @@ pub(crate) fn validate_control_plane_url_with_posture(
     let Some(host) = parsed.host() else {
         return Err("control_plane_url has no host".to_string());
     };
+    // An IPv4-mapped literal (`[::ffff:169.254.169.254]`) is dialed over IPv4,
+    // so it must face the IPv4 screen rather than the IPv6 one.
+    let host = match host {
+        url::Host::Ipv6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => url::Host::Ipv4(v4),
+            None => url::Host::Ipv6(ip),
+        },
+        other => other,
+    };
     match host {
         url::Host::Ipv4(ip) => {
             if ip.is_loopback() {
@@ -4156,6 +4165,19 @@ mod tests {
         assert!(validate_control_plane_url("ftp://cp.example").is_err());
         assert!(validate_control_plane_url("https://169.254.169.254/").is_err());
         assert!(validate_control_plane_url("not a url").is_err());
+    }
+
+    #[test]
+    fn validate_control_plane_url_screens_ipv4_mapped_literals_as_ipv4() {
+        let err = validate_control_plane_url("https://[::ffff:169.254.169.254]/")
+            .expect_err("IPv4-mapped cloud metadata literal must be rejected");
+        assert!(err.contains("link-local"), "{err}");
+        let err = validate_control_plane_url("http://[::ffff:0.0.0.0]:15012")
+            .expect_err("IPv4-mapped unspecified literal must be rejected");
+        assert!(err.contains("non-unicast IPv4"), "{err}");
+        assert!(validate_control_plane_url("grpc://[::ffff:224.0.0.1]:15012").is_err());
+        assert!(validate_control_plane_url("http://[::ffff:127.0.0.1]:15012").is_ok());
+        assert!(validate_control_plane_url("https://[::ffff:203.0.113.10]:15012").is_ok());
     }
 
     #[test]

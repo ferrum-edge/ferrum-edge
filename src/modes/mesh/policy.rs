@@ -599,7 +599,7 @@ fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest
             return false;
         }
         if !neg.not_namespace_patterns.is_empty()
-            && extract_namespace(source.as_str()).is_some_and(|namespace| {
+            && source.namespace().is_some_and(|namespace| {
                 neg.not_namespace_patterns
                     .iter()
                     .any(|pattern| wildcard_match(pattern, namespace))
@@ -755,7 +755,9 @@ fn principal_match(match_: &PrincipalMatch, source: Option<&SpiffeId>) -> bool {
         return false;
     }
     if let Some(pattern) = match_.namespace_pattern.as_ref()
-        && !extract_namespace(source.as_str()).is_some_and(|ns| wildcard_match(pattern, ns))
+        && !source
+            .namespace()
+            .is_some_and(|ns| wildcard_match(pattern, ns))
     {
         return false;
     }
@@ -1261,16 +1263,6 @@ fn istio_condition_string_match(pattern: &str, value: &str) -> bool {
         return value.starts_with(prefix);
     }
     pattern == value
-}
-
-fn extract_namespace(spiffe_id: &str) -> Option<&str> {
-    let mut segments = spiffe_id.split('/');
-    while let Some(segment) = segments.next() {
-        if segment == "ns" {
-            return segments.next();
-        }
-    }
-    None
 }
 
 /// Returns `true` when `ip` falls inside the CIDR (or bare IP) `cidr`.
@@ -3953,24 +3945,6 @@ mod tests {
             evaluate_mesh_authorization(&slice, &request),
             MeshAuthzDecision::Allow
         );
-    }
-
-    // ── Extract namespace ────────────────────────────────────────────────
-
-    #[test]
-    fn extract_namespace_from_spiffe_id() {
-        assert_eq!(
-            extract_namespace("spiffe://cluster.local/ns/default/sa/client"),
-            Some("default")
-        );
-        assert_eq!(
-            extract_namespace("spiffe://cluster.local/ns/prod/sa/admin"),
-            Some("prod")
-        );
-        // No "/ns/" segment.
-        assert_eq!(extract_namespace("spiffe://cluster.local/sa/client"), None);
-        // "/ns/" at the very end with no following segment.
-        assert_eq!(extract_namespace("spiffe://cluster.local/ns/"), Some(""));
     }
 
     // ── Istio-style negative-match (notMethods/notPaths/notHosts/notPorts) ─

@@ -889,6 +889,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#7268) instead of falling back to a process counter for the certificate
   serial, which produced predictable serials that repeated across restarts.
   The dev root bootstrap already failed this way; both now share one helper.
+- **Mesh security fixes from the 2026-11-10 audit** (advisories
+  GHSA-pwf8-cvp7-cm5w, GHSA-r5gx-h67m-fccv, GHSA-ccmw-4j34-w5vm,
+  GHSA-h592-fvhh-cm3h, GHSA-pr43-4rj8-h494, GHSA-qw5p-g8jx-pmv8).
+  - The control plane bounds the peer-supplied `response_nonce` and
+    `version_info` it logs for an ignored xDS ACK, as it already did for NACK
+    messages, so one authenticated data plane can no longer write
+    megabyte-long warn lines.
+  - The federation endpoint and remote control-plane URL screens treat an
+    IPv4-mapped IPv6 literal (`[::ffff:169.254.169.254]`, `[::ffff:0.0.0.0]`)
+    as the IPv4 address it dials, so it gets the same link-local, metadata,
+    unspecified, broadcast and multicast refusals.
+  - `mesh_authz` `from.source.namespaces` / `notNamespaces` read the namespace
+    from the SPIFFE path only. A peer whose trust domain is literally `ns`
+    (`spiffe://ns/ns/prod/sa/x`) was judged to be in namespace `ns`.
+  - Sidecar `egress.hosts` narrowing keeps only the admitted hosts of a
+    port-less multi-host ServiceEntry, as it already did for entries with
+    ports. Before, one matching host admitted every host of the entry into
+    the slice and the `REGISTRY_ONLY` registry.
+  - `GET /mesh/federation` reports only the origin (`scheme://host[:port]`) of
+    each federation endpoint. The configured URL, which may carry credentials
+    in its userinfo, path, query or fragment, is still used for polling but is
+    no longer stored in the served snapshot.
+  - Two VirtualServices in one namespace whose names derive the same route
+    proxy id (for example `my.app` and `my-app`) no longer publish two plugin
+    configs with one id. The refused route's plugins are dropped with it, so
+    the controller's duplicate-id check no longer rejects every later
+    Kubernetes reconcile. The second VirtualService's route is still dropped
+    without a status condition.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

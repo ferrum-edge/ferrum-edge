@@ -242,7 +242,12 @@ async fn federation_poller_populates_store_on_success() {
         .expect("expected trust domain present");
     assert_eq!(bundle.bundle.x509_authorities.len(), 1);
     assert_eq!(bundle.bundle.refresh_hint_seconds, Some(60));
-    assert_eq!(bundle.endpoint, mock.endpoint);
+    // Only the origin of the configured URL is retained (it is served by
+    // `GET /mesh/federation`); the path is dropped.
+    assert_eq!(
+        bundle.endpoint,
+        mock.endpoint.trim_end_matches("/.well-known/spiffe")
+    );
     assert_eq!(bundle.cluster_name, "remote");
     assert!(mock.request_count.load(Ordering::SeqCst) >= 1);
 
@@ -514,11 +519,19 @@ async fn mesh_federation_endpoint_returns_polled_bundles() {
     })
     .to_string();
     let mock = start_mock_federation_endpoint(body, 0).await;
+    // A credential-bearing endpoint (userinfo + signed query + fragment): the
+    // poller dials it as configured, but the admin view must expose only its
+    // origin (GHSA-pr43-4rj8-h494).
+    let credentialed_endpoint = format!(
+        "{}?sig=fed-query-secret#fed-fragment-secret",
+        mock.endpoint
+            .replacen("https://", "https://fed-user:fed-password-secret@", 1)
+    );
     let mesh_runtime = MeshRuntimeState::new();
     let multi_cluster = MultiClusterConfig {
         local_cluster: Some("local-cluster".to_string()),
         federation_endpoint: None,
-        remote_clusters: vec![remote_cluster("remote", &mock.endpoint)],
+        remote_clusters: vec![remote_cluster("remote", &credentialed_endpoint)],
         east_west_gateways: Vec::new(),
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -556,6 +569,18 @@ async fn mesh_federation_endpoint_returns_polled_bundles() {
     assert_eq!(bundles[0]["cluster"], "remote");
     assert_eq!(bundles[0]["x509_authorities"], 2);
     assert_eq!(bundles[0]["jwt_authorities"], 0);
+    assert_eq!(
+        bundles[0]["endpoint"],
+        mock.endpoint.trim_end_matches("/.well-known/spiffe"),
+        "the admin view must report only the endpoint origin"
+    );
+    let rendered = response.to_string();
+    for fragment in ["fed-user", "secret", ".well-known"] {
+        assert!(
+            !rendered.contains(fragment),
+            "GET /mesh/federation must not echo {fragment:?} of the configured endpoint: {rendered}"
+        );
+    }
 
     let _ = shutdown_tx.send(true);
     let _ = mock.shutdown.send(true);
