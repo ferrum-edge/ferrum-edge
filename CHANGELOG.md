@@ -70,6 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificate warnings, and no host, consumer-uniqueness, egress-policy or
   plugin-config warnings. The MongoDB full load now runs the same warning
   passes, in the same order, as the SQL full load. Nothing new is rejected.
+- **macOS FD count reports open descriptors** (#7212). The overload
+  monitor's macOS sampler divided the size hint from a NULL-buffer
+  `proc_pidinfo(PROC_PIDLISTFDS)` call (fd-table capacity plus slack) by the
+  entry size, so `fd_current` in `/overload` and the FD-pressure tier were
+  inflated and never shrank after a burst. It now counts the entries the call
+  writes, and a failed count fails closed (critical) as on Linux instead of
+  reporting `0`. Linux is unchanged.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then
