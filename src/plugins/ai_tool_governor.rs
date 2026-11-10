@@ -77,7 +77,7 @@
 //! into a denied `tools/call`, a disallowed `tools[]` definition, or an injected
 //! `choices[].message.tool_calls[]` is fail-closed before dispatch/delivery. When
 //! a later transform (e.g. the `compression` plugin) encoded the final response,
-//! the re-check decompresses the gateway's own `gzip`/`br` encoding FIRST and
+//! the re-check decompresses the gateway's own `gzip`/`br`/`zstd` encoding FIRST and
 //! applies the JSON-shape/content-type gates to the decoded bytes, so an
 //! injected-then-compressed (and possibly `Content-Type`-relabeled) tool call
 //! cannot slip through. Already-governed calls are skipped by a
@@ -96,7 +96,7 @@
 //! otherwise it stays buffered so buffered-SSE governance covers real SSE and
 //! the JSON-shape fallback catches Chat Completions JSON a transform
 //! relabeled as SSE. Buffered SSE bodies that carry a `Content-Encoding` are
-//! DECODED first (the same gzip/br decode as the final re-check) so the
+//! DECODED first (the same gzip/br/zstd decode as the final re-check) so the
 //! governed hash and extracted calls always reflect the plaintext frames; an
 //! encoded governed 2xx that cannot be decoded for inspection (unsupported
 //! encoding, corrupt bytes, or decoded output past the cap) fails closed in
@@ -3937,7 +3937,7 @@ impl Plugin for AiToolGovernor {
                 && let Some(encoding) = content_encoding_value(response_headers)
             {
                 // An SSE label with a `Content-Encoding`: DECODE FIRST (the
-                // same gzip/br decode the final re-check uses) and govern the
+                // same gzip/br/zstd decode the final re-check uses) and govern the
                 // decoded bytes. Feeding compressed bytes into the SSE
                 // extractor would find zero calls and record the COMPRESSED
                 // hash, letting the final re-check hash-skip denied deltas.
@@ -4054,7 +4054,7 @@ impl Plugin for AiToolGovernor {
                 // A JSON-labeled body that does not parse as plaintext but
                 // carries a `Content-Encoding` is usually a perfectly valid
                 // compressed Chat Completions response (an upstream that
-                // gzips its JSON): DECODE FIRST — the same gzip/br decode the
+                // gzips its JSON): DECODE FIRST — the same gzip/br/zstd decode the
                 // SSE branch above and the final re-check use — and govern
                 // the DECODED bytes. Fail closed only when decoding actually
                 // fails (unsupported/corrupt encoding, or output past the
@@ -4578,8 +4578,8 @@ impl Plugin for AiToolGovernor {
                 Some(decoded) => decoded,
                 None => {
                     let Some(decoded) = decompress_within_limit(encoding, body) else {
-                        // Unsupported/undecodable encoding (`deflate`/`zstd`,
-                        // corrupt gzip/br), or decoded output past the parse
+                        // Unsupported/undecodable encoding (e.g. `deflate`,
+                        // corrupt gzip/br/zstd), or decoded output past the parse
                         // limit: cannot verify a later transform did not inject a
                         // governed call. Header-time buffering already treated
                         // every non-framed-gRPC label (JSON, SSE, `text/plain`,

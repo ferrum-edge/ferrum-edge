@@ -112,8 +112,10 @@
 //! ([`redis_trailing_window_count`]). The trailing `K + 2` of those counters
 //! span `window + (1 + f) * (window / K)` of wall clock, where `f` is how far
 //! into its own sub-bucket the request arrived, so the sum covers the exact
-//! trailing window in full and over-counts by at most two sub-buckets of older
-//! history. (The forward counter is empty except under reordering or clock
+//! trailing window in full. Measured from that selection instant it
+//! over-counts by at most two sub-buckets of older history; the bound, measured
+//! from the instant the server executes the decision, is THREE (see below).
+//! (The forward counter is empty except under reordering or clock
 //! skew; see [`REDIS_WINDOW_SUB_BUCKET_KEYS`].)
 //!
 //! The `K + 1`-th old counter is structural, not padding: a retained charge's
@@ -3283,7 +3285,7 @@ impl RedisWindowCharges {
 
 /// Per-window trailing-window counts returned by one
 /// [`RedisRateLimitClient::charge_rate_limit_windows`]: for each configured
-/// window, the FULL sum of the sub-bucket this request charged, the `K`
+/// window, the FULL sum of the sub-bucket this request charged, the `K + 1`
 /// sub-buckets before it, and the one after it.
 ///
 /// The fold happens here rather than at the caller so the decision surface is
@@ -6203,22 +6205,22 @@ impl RedisRateLimitClient {
 
     /// Charge one request against EVERY configured rate-limit window in a
     /// single atomic `MULTI`/`EXEC`, returning each window's trailing-window
-    /// count (the charged sub-bucket, the `K` sub-buckets before it, and the one
-    /// after it, summed in full).
+    /// count (the charged sub-bucket, the `K + 1` sub-buckets before it, and the
+    /// one after it, summed in full).
     ///
     /// One round trip on the ordinary pooled multiplexed slots: no `WATCH`, no
     /// dedicated per-request connection, no optimistic-retry budget, and no
     /// server-side scripting — every command is plain RESP any Redis-compatible
-    /// server accepts. Per window the transaction issues `GET` on each of the
-    /// [`REDIS_WINDOW_TRAILING_SUB_BUCKETS`] older sub-buckets and on the one
-    /// after the charged bucket, then `INCR` and `EXPIRE` on the sub-bucket this
+    /// server accepts. Per window the transaction issues a bounded `GETRANGE` on
+    /// each of the [`REDIS_WINDOW_TRAILING_SUB_BUCKETS`] older sub-buckets and on
+    /// the one after the charged bucket, then `INCR` and `EXPIRE` on the sub-bucket this
     /// request lands in — twenty commands over nineteen keys — so the admission
     /// decision the caller derives is tied to its own mutation and can never be
     /// a stale read that two gateways both act on.
     ///
     /// The forward read is what makes the pair of decisions independent of the
     /// order two concurrent transactions reach the server in, and the extra old
-    /// `GET` is what keeps a peer's retained charge inside this ladder when its
+    /// `GETRANGE` is what keeps a peer's retained charge inside this ladder when its
     /// key is one bucket older than the bucket it executed in; see
     /// [`REDIS_WINDOW_SUB_BUCKET_KEYS`]. Neither covers a stall longer than one
     /// whole sub-bucket, nor a charge placed in the future — that is the
@@ -6965,8 +6967,9 @@ impl RedisRateLimitClient {
     /// Deterministic sub-bucket for a captured epoch offset.
     ///
     /// `index = floor(epoch_nanos / (window_nanos / REDIS_WINDOW_SUB_BUCKETS))`.
-    /// Every gateway sharing one Redis derives the same ladder because they
-    /// share the system epoch clock, exactly as the whole-window index did.
+    /// The ladder is a pure function of the instant passed in: request-quota
+    /// admission passes the Redis-server-corrected instant
+    /// (`RedisServerClock`), never a raw local sample.
     pub fn sub_bucket_at(now: Duration, window_seconds: u64) -> RedisSubBucket {
         let window_seconds = window_seconds.max(1);
         let sub_bucket_nanos = redis_sub_bucket_nanos(window_seconds);

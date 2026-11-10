@@ -512,7 +512,7 @@ struct StreamProvider {
     host: String,
     port: u16,
     /// Absolute backend path (includes leading `/`, no query). May contain a
-    /// literal `{model}` placeholder for future Gemini-style path routing.
+    /// literal `{model}` placeholder for Gemini-style path routing.
     path: String,
     /// Endpoint query string (no leading `?`), e.g. Azure-style
     /// `api-version=...`. Merged with the client's own query at claim time.

@@ -68,8 +68,8 @@
 //!
 //! This plugin is **not** a security boundary on its own — it observes and
 //! redacts, it does not enforce. Pair it with `ai_prompt_shield`,
-//! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
-//! `ai_semantic_firewall` for enforcement.
+//! `ai_semantic_firewall`, `ai_response_guard`, and `ai_tool_governor` for
+//! enforcement.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 

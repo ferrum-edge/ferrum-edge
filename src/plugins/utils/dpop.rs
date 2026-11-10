@@ -85,14 +85,6 @@ struct DpopClaims {
     ath: Option<String>,
 }
 
-/// Validate a DPoP proof and return the replay marker the caller must claim.
-///
-/// Returning the marker instead of claiming it here is deliberate: the claim is
-/// an `async` operation against a possibly shared authority, and it must happen
-/// **after** every check below. A caller that drops the returned marker has
-/// validated a proof without making it single-use, which is why the only
-/// production caller feeds it straight into
-/// [`crate::plugins::utils::replay_authority::ReplayAuthority::admit`].
 /// [`verify`] failure: the access token carries no `cnf.jkt` key binding.
 const TOKEN_BINDING_MISSING: &str = "DPoP token binding missing";
 /// [`verify`] failure: the access token is bound to a different key than the
@@ -130,6 +122,14 @@ pub fn is_token_binding_failure(reason: &str) -> bool {
     reason == TOKEN_BINDING_MISSING || reason == TOKEN_BINDING_MISMATCH
 }
 
+/// Validate a DPoP proof and return the replay marker the caller must claim.
+///
+/// Returning the marker instead of claiming it here is deliberate: the claim is
+/// an `async` operation against a possibly shared authority, and it must happen
+/// **after** every check below. A caller that drops the returned marker has
+/// validated a proof without making it single-use, which is why the only
+/// production caller feeds it straight into
+/// [`crate::plugins::utils::replay_authority::ReplayAuthority::admit`].
 #[must_use = "a validated DPoP proof is only single-use once its marker is claimed"]
 pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> {
     let header = decode_header(input.proof).map_err(|_| "Invalid DPoP proof")?;

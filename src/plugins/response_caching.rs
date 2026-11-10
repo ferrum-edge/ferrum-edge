@@ -490,15 +490,15 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
     })
 }
 
-/// Cache keys use `:` as a structural delimiter, but URL paths legitimately
-/// contain `:` (e.g. `/users:1/details`, matrix params, FHIR `$everything`).
-/// Encode path bytes into a cache-key-safe representation before joining so
-/// path/query boundaries can be recovered unambiguously and invalidation
-/// matches the full path rather than truncating at the first `:`.
+/// Encode a path for the invalidation path index (`path_index`). Cache keys
+/// themselves are fixed-length digests; this encoding only shapes the index
+/// entries that RFC 9111 unsafe-method invalidation matches against, so a path
+/// that legitimately contains `:` (e.g. `/users:1/details`, matrix params, FHIR
+/// `$everything`) is matched in full.
 ///
 /// The encoding must be bijective for raw URI paths. In particular, `%` must
 /// be escaped before `:` so `/users:1/details` and `/users%3A1/details` remain
-/// distinct cache keys.
+/// distinct index entries.
 fn encode_path_for_cache_key(path: &str) -> Cow<'_, str> {
     if !path.as_bytes().iter().any(|b| matches!(b, b'%' | b':')) {
         return Cow::Borrowed(path);
@@ -526,14 +526,12 @@ struct CacheEntry {
     corrected_initial_age: Duration,
     /// Byte length of the base-key prefix of this entry's full cache key.
     ///
-    /// A full cache key is always its base key optionally followed by
-    /// `:<vary dimensions>` (see [`ResponseCaching::build_cache_key`]), so
-    /// `&key[..base_key_len]` recovers the base key without re-parsing the
-    /// colon-delimited (and query-colon-bearing) structure.
-    /// [`prune_vary_index_locked`] uses it to reclaim `vary_index` mappings
-    /// whose base key has no surviving variant.
-    ///
-    /// [`prune_vary_index_locked`]: ResponseCaching::prune_vary_index_locked
+    /// A full cache key is its base-key digest optionally followed by
+    /// `CACHE_KEY_VARY_SEPARATOR` and the Vary digest (see
+    /// [`ResponseCaching::extend_base_key_with_vary`]), so
+    /// `&key[..base_key_len]` recovers the base key. `remove_entry_locked` uses
+    /// it to reclaim `vary_index` / `variant_counts` state when the last
+    /// variant of a base key leaves.
     base_key_len: usize,
     /// Monotonic insertion sequence, paired with this entry's key in the FIFO
     /// eviction queue. A queued `(key, seq)` pair only evicts the entry that is
@@ -571,9 +569,9 @@ struct CacheEntry {
     /// policy under the new identity. Since GHSA-83rc-23c9-3g9x a transformer's
     /// effective RTDS gate is materialized into its configuration, so this
     /// generation-local digest covers the gate as well as the static rules and
-    /// is the exact witness of what produced these bytes. `None` means this
-    /// Unknown policy is never stored: every replay consumer must fail closed
-    /// when the effective presentation policy cannot be established.
+    /// is the exact witness of what produced these bytes. An unknown
+    /// (unprovable) policy is never stored: every replay consumer must fail
+    /// closed when the effective presentation policy cannot be established.
     response_presentation_digest: [u8; 32],
 }
 
@@ -4101,8 +4099,9 @@ impl Plugin for ResponseCaching {
         // `vary_index` so the same dimension applies to every subsequent lookup
         // at this base key.
         //
-        // This is complementary to the per-principal `consumer_part` in
-        // `build_base_cache_key`: that isolates *authenticated* principals
+        // This is complementary to the per-principal caller partition
+        // `build_base_cache_key` appends through
+        // `replay_partition::append_caller_partition`: that isolates *authenticated* principals
         // (API key / mTLS / JWT) even when the credential rides a non-standard
         // header; this isolates the raw credential/session headers themselves,
         // including anonymous `Cookie`-only sessions that have no

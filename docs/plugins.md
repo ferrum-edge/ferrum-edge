@@ -6111,7 +6111,7 @@ Runs before `grpc_method_router` (275).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `expose_headers` | String[] \| null | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. When multiple `grpc_web` instances are effective, their lists are unioned in configured order. |
+| `expose_headers` | String[] \| null | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status`, `grpc-message`, and `grpc-status-details-bin` are always exposed. When multiple `grpc_web` instances are effective, their lists are unioned in configured order. |
 
 `expose_headers` accepts an array of strings or an explicit `null`; both an omitted field and `null` mean the empty list. Each item is trimmed of surrounding spaces and tabs and must then be a non-empty HTTP field name (token characters only), so `" X-Ok "` is accepted as `x-ok` while `""`, `" "`, `"bad name"`, and `"bad:name"` are rejected with a path-qualified diagnostic. Accepted names are lowercased and de-duplicated in first-seen order, so entries differing only in case collapse to one.
 

@@ -36717,8 +36717,9 @@ components:
           description: >-
             Additional response headers to include in
             Access-Control-Expose-Headers for browser CORS compatibility.
-            grpc-status and grpc-message are always exposed. Multiple grpc_web
-            instances union their lists in configured order. Explicit null is
+            grpc-status, grpc-message, and grpc-status-details-bin are always
+            exposed. Multiple grpc_web instances union their lists in configured
+            order. Explicit null is
             accepted at this field and means the empty list (unlike the plugin
             config object itself, where null is rejected). Each item is trimmed
             of surrounding spaces/tabs and must then be a non-empty HTTP field
@@ -40137,7 +40138,7 @@ components:
         inject_usage_options:
           type: [boolean, "null"]
           default: true
-          description: For openai/openai_compatible providers, inject stream_options.include_usage=true so the provider emits a final usage event.
+          description: For openai/openai_compatible/azure_openai providers, inject stream_options.include_usage=true so the provider emits a final usage event.
         normalize_response_stream:
           type: [boolean, "null"]
           default: true

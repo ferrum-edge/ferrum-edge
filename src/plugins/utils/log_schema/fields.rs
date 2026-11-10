@@ -2,7 +2,7 @@
 //! [`StreamTransactionSummary`], and WebSocket disconnect log entries.
 //!
 //! The schema customization layer validates operator-supplied field names
-//! (in `omit`, `rename`, `order`, derived `from`) against these tables.
+//! (in `omit`, `rename`, `order`, `transforms`) against these tables.
 //! Drift between this registry and the structs is caught by the integration
 //! test in `tests/integration/log_schema_registry_tests.rs`.
 

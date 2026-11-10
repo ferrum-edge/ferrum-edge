@@ -20,12 +20,15 @@
 //!   bounded by the parser
 //!   (`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
 //!   `..._SECONDS`), so this hook never has to hold partial state.
-//! * **Compression** — the gateway never negotiates `permessage-deflate`. The
-//!   client's `Sec-WebSocket-Extensions` offer is stripped before the backend
-//!   handshake (`headers::is_websocket_backend_request_strip_header`) and no negotiated
-//!   extension is echoed back to the client
-//!   (`WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS`), so no `rsv1` payload can
-//!   exist end to end on any frontend.
+//! * **Compression** — under the default `websocket_permessage_deflate:
+//!   strip`, the client's `Sec-WebSocket-Extensions` offer is stripped before
+//!   the backend handshake (`headers::is_websocket_backend_request_strip_header`)
+//!   and no negotiated extension is echoed back to the client
+//!   (`WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS`). With `terminate` the
+//!   gateway negotiates `permessage-deflate` with each peer itself and inflates
+//!   every message before the relay parses it. `passthrough` is refused at
+//!   config validation on any proxy where a `waf` is effective. Either way this
+//!   hook only ever sees uncompressed message payloads.
 //! * **Size** — the relay's parser ceilings (`EffectiveWsSizeLimits`) bound the
 //!   largest message that can ever reach this hook; the WAF's own
 //!   `max_scan_bytes` / `on_body_too_large` policy then decides an

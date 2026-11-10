@@ -7,8 +7,9 @@
 //! The cache is keyed by the resolved `jwks_uri` string. It is lazily
 //! initialized on first access and lives for the process lifetime.
 //!
-//! On config reload, [`retain_active_uris`] removes entries for JWKS URIs
-//! that are no longer referenced by any active JWKS consumer, aborting their
+//! On config reload, [`retain_active_requirements`] installs the committed
+//! generation's requirement map and reconciles: entries for JWKS URIs no
+//! longer referenced by any active JWKS consumer are removed, aborting their
 //! background refresh tasks after any retired in-flight consumers finish.
 //!
 //! The active set has two contributors, unioned by

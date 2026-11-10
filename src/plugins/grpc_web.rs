@@ -82,7 +82,8 @@
 //!
 //! - `expose_headers` (optional): Additional response headers to include in
 //!   `Access-Control-Expose-Headers` for browser CORS compatibility. The plugin
-//!   always exposes `grpc-status` and `grpc-message`.
+//!   always exposes `grpc-status`, `grpc-message`, and
+//!   `grpc-status-details-bin`.
 //!
 //! ## Multiple instances
 //!
@@ -887,6 +888,10 @@ fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
         .is_some_and(|decoded| binary_frames_are_complete(&decoded, true))
 }
 
+fn is_base64_alphabet(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+}
+
 /// Decode a gRPC-Web **text** body that may be a CONCATENATION of independently
 /// padded base64 segments, or `None` when the bytes are not a total base64 parse.
 ///
@@ -906,10 +911,6 @@ fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
 /// segment must itself decode. Anything else answers `None`, leaving the body
 /// claimed. A JSON document still never reaches the decoder — `{`, `[`, and `"`
 /// are outside the alphabet, so the very first group rejects.
-fn is_base64_alphabet(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
-}
-
 pub(crate) fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() || !data.len().is_multiple_of(4) {
         return None;
@@ -2047,11 +2048,12 @@ pub(crate) fn request_was_translated(ctx: &RequestContext) -> bool {
 }
 
 /// Retain a recognized client representation for gateway-generated errors
-/// without claiming that request translation occurred. H3 uses this for
-/// pass-through deployments that intentionally omit the `grpc_web` plugin:
-/// policy and error shaping remain gRPC-Web-aware, while backend dispatch
-/// stays on the original plain-HTTP transport because the mode marker above is
-/// absent.
+/// without claiming that request translation occurred. Test support only:
+/// the production frontends (H1/H2 and H3, including pass-through deployments
+/// that intentionally omit the `grpc_web` plugin) retain through
+/// [`retain_negotiated_response_content_type`], so policy and error shaping
+/// remain gRPC-Web-aware while backend dispatch stays on the original
+/// plain-HTTP transport.
 ///
 /// When `Accept` is present and valid, the retained type is the negotiated
 /// response media type (so early errors match what a successful response would
@@ -2182,7 +2184,7 @@ pub(crate) fn client_grpc_framing_representation(
 
 /// The negotiated (or defaulted) client-facing gRPC-Web response media type.
 ///
-/// Stored already-canonical by [`retain_client_content_type_for_errors`] /
+/// Stored already-canonical by [`retain_negotiated_response_content_type`] /
 /// `on_request_received`, so callers must not re-derive it from request
 /// `Content-Type` alone — that would ignore Accept negotiation.
 pub(crate) fn retained_response_content_type(ctx: &RequestContext) -> Option<&str> {
@@ -3882,7 +3884,7 @@ fn trailer_suffix_matches_reconciled(
     }
 }
 
-/// Pull-comparer: [`write_trailer_frame_payload`] expected bytes against an
+/// Pull-comparer: [`TrailerFramePlan::write`] expected bytes against an
 /// observed byte iterator (text-mode stream decode).
 struct PullByteComparer<'a, I: Iterator<Item = u8>> {
     iter: &'a mut I,
@@ -4140,7 +4142,7 @@ pub(crate) fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
 
 /// Append-only sink for the trailer-frame payload.
 ///
-/// The payload is built exactly once, by [`write_trailer_frame_payload`], for
+/// The payload is built exactly once, by [`TrailerFramePlan::write`], for
 /// two very different destinations: the gateway-authored error frames (which are
 /// fixed-shape and unbounded by construction) and the retained producer frame,
 /// whose upstream-controlled trailer values must not be able to materialise a
@@ -4240,8 +4242,8 @@ fn build_trailer_frame_with_full_provenance(
 ) -> Vec<u8> {
     let mut payload: Vec<u8> = Vec::new();
     // A `Vec` sink never refuses, so this is total for the gateway-authored
-    // callers; the bounded producer path uses `write_trailer_frame_payload`
-    // directly against a ceiling-bounded sink.
+    // callers; the bounded producer paths build a `TrailerFramePlan` and
+    // replay it against a ceiling-bounded sink.
     write_trailer_frame_payload(
         &mut payload,
         response_headers,

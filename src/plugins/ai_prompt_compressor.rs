@@ -2080,9 +2080,10 @@ impl Plugin for AiPromptCompressor {
         if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
-        // A transport-compressed body is opaque here (request-body decompression
-        // runs later in the `compression` plugin's transform hook), so defer to
-        // the wire-path `transform_request_body`, which sees decoded bytes.
+        // A transport-compressed body is opaque here (no `compression` plugin
+        // decoded it in the pre-`before_proxy` normalization phase), so defer to
+        // the wire-path `transform_request_body`, which runs after
+        // `compression`'s own transform and skips a body that is still encoded.
         if has_non_identity_content_encoding(headers) {
             return PluginResult::Continue;
         }

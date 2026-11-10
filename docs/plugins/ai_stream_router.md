@@ -39,7 +39,7 @@ config:
 | `enabled` | Boolean | `true` | Master switch. When false the plugin never claims a request. |
 | `fail_on_missing_model` | Boolean | `true` | Reject a streaming request that has no top-level string `model` with an OpenAI-shaped `400`. |
 | `fail_on_no_matching_provider` | Boolean | `true` | Reject a streaming request whose `model` matches no configured provider with an OpenAI-shaped `404`. |
-| `inject_usage_options` | Boolean | `true` | Inject `stream_options.include_usage: true` for `openai` / `openai_compatible` providers so a final usage event is emitted. |
+| `inject_usage_options` | Boolean | `true` | Inject `stream_options.include_usage: true` for `openai` / `openai_compatible` / `azure_openai` providers so a final usage event is emitted. |
 | `normalize_response_stream` | Boolean | `true` | Normalize provider-native SSE to OpenAI `chat.completion.chunk` SSE. Disabling forwards provider-native SSE verbatim. |
 | `max_stream_bytes` | Integer | `8388608` (8 MiB) | Cumulative provider plaintext one Anthropic/Gemini normalizer accepts before failing closed, `1048576`–`268435456`. A residual provider `Content-Encoding` is still decoded under the fixed 8 MiB per-layer residual-decode limit. |
 | `max_stream_events` | Integer | `100000` | Complete provider events one normalizer accepts, `1000`–`10000000`. |

@@ -2507,7 +2507,7 @@ fn redis_quota_retry_after_seconds(settled_at: Duration, window_seconds: u64) ->
 /// Lua, no `EVAL*`, no `WATCH`, no per-request connection, and no retry budget
 /// a hot key can exhaust:
 ///
-/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window (`GET` on each
+/// 1. ONE atomic `MULTI`/`EXEC` charges EVERY configured window (`GETRANGE` on each
 ///    older sub-bucket and on the one after the charged bucket, `INCR` +
 ///    `EXPIRE` on the sub-bucket this request lands in) and returns each
 ///    window's trailing-window count. The decision is read off the caller's own
@@ -2670,7 +2670,7 @@ fn redis_quota_retry_after_seconds(settled_at: Duration, window_seconds: u64) ->
 ///
 /// Bucket selection precedes connection acquisition, so every charge is
 /// slightly stale when the server executes it. One sub-bucket of that is
-/// covered by the forward `GET`: a request that selected bucket `b` sees a peer
+/// covered by the forward `GETRANGE`: a request that selected bucket `b` sees a peer
 /// that selected `b + 1` and vice versa, so the pair's decision does not depend
 /// on which transaction reached the server first. Past one sub-bucket it is not
 /// covered, so the server clock returned by that same `EXEC` settles it, in

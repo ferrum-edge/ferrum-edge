@@ -2597,21 +2597,14 @@ type TranslatedRequest = (String, Vec<(String, String)>, Vec<u8>);
 
 /// Detect whether an OpenAI-format request asks for a streamed response.
 ///
-/// This plugin uses the "terminate and respond" pattern: it makes a single
-/// non-streaming HTTP call to the provider and buffers the whole body before
-/// normalizing it with `serde_json::from_slice`. A streaming request cannot be
-/// served by that pattern:
-///   - OpenAI-compatible providers receive the `stream` flag verbatim
-///     (`translate_openai_compatible` clones the body) and reply with an SSE
-///     `text/event-stream`, which is not a single JSON document — normalization
-///     fails and the client gets an opaque 502.
-///   - Provider-specific paths either build non-streaming provider calls
-///     (Anthropic/Gemini/Bedrock) or can still request provider streaming
-///     without a relay/normalization path (Cohere).
-///
-/// Rather than break either way, the final-body hook rejects streaming requests it
-/// would otherwise intercept with a clear, OpenAI-shaped error. We only treat
-/// `stream: true` (a real boolean) as streaming. A missing field requests the
+/// This is the claim predicate of the streaming path (`streaming.enabled`):
+/// only a request it accepts can be claimed for a streamed provider call, and
+/// a claimed request whose final body no longer asks for a stream is refused.
+/// The buffered "terminate and respond" path makes a single non-streaming
+/// provider call and normalizes one JSON document, so an unclaimed streaming
+/// request that reaches `dispatch_finalized_request_egress` is refused there
+/// with a clear, OpenAI-shaped error rather than forwarded. Only
+/// `stream: true` (a real boolean) is streaming. A missing field requests the
 /// buffered path; any present non-boolean value is rejected by request-shape
 /// validation before provider I/O.
 fn request_wants_streaming(openai_body: &Value) -> bool {
