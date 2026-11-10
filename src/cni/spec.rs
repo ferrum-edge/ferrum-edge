@@ -60,20 +60,6 @@ pub enum CniCommand {
     Unsupported,
 }
 
-impl CniCommand {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Add => "ADD",
-            Self::Del => "DEL",
-            Self::Check => "CHECK",
-            Self::Status => "STATUS",
-            Self::Gc => "GC",
-            Self::Version => "VERSION",
-            Self::Unsupported => "UNSUPPORTED",
-        }
-    }
-}
-
 impl FromStr for CniCommand {
     type Err = ();
 
@@ -116,7 +102,7 @@ pub fn cni_version_supports_gc(version: &str) -> bool {
 /// so the rest of the CNI binary works on a normalized in-memory shape
 /// instead of poking `std::env` repeatedly. `cni_args` is the raw
 /// semicolon-separated form (e.g. `K8S_POD_NAMESPACE=foo;K8S_POD_NAME=bar`)
-/// — see [`parse_cni_args`] for the parsed map.
+/// — see [`ingest_cni_args`] for the strict parsed map.
 ///
 /// STATUS, GC, and VERSION do not carry attachment parameters; those
 /// commands leave `container_id` empty and optional fields unset.
@@ -138,17 +124,12 @@ impl CniInvocation {
             .map_err(|_| CniError::missing_env("CNI_COMMAND"))
     }
 
-    /// Read the CNI invocation from `std::env`.
+    /// Read the CNI invocation for `command` from `std::env`.
     ///
     /// Empty `CNI_NETNS` is normalized to `None`; the spec allows DEL to
     /// pass an empty netns when the sandbox is already gone, and treating
     /// `""` and unset identically here saves the node-agent server from
     /// having to do the same dance.
-    pub fn from_env() -> Result<Self, CniError> {
-        let command = Self::command_from_env()?;
-        Self::from_env_for_command(command)
-    }
-
     pub fn from_env_for_command(command: CniCommand) -> Result<Self, CniError> {
         match command {
             CniCommand::Version => Ok(Self {
@@ -230,26 +211,6 @@ impl CniInvocation {
             }
         }
     }
-}
-
-/// Parse `CNI_ARGS` into a key/value map.
-///
-/// The wire format is `K=V;K=V;...`. Tokens with no `=` are skipped (the
-/// spec is loose about that); empty values are kept (kubelet sometimes
-/// passes `IgnoreUnknown=1;K8S_POD_NAME=`). Keys are normalized to
-/// uppercase so `K8S_POD_NAMESPACE` and `k8s_pod_namespace` collapse to
-/// the same entry — kubelets in the wild are inconsistent.
-pub fn parse_cni_args(raw: &str) -> HashMap<String, String> {
-    raw.split(';')
-        .filter_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            let key = k.trim().to_ascii_uppercase();
-            if key.is_empty() {
-                return None;
-            }
-            Some((key, v.trim().to_string()))
-        })
-        .collect()
 }
 
 /// Strict, bounded CNI_ARGS ingestion for the executable boundary.
@@ -701,27 +662,6 @@ mod tests {
         assert!(is_supported_cni_version("1.1.0"));
         assert!(is_supported_cni_version("0.4.0"));
         assert!(!is_supported_cni_version("2.0.0"));
-    }
-
-    #[test]
-    fn parse_cni_args_decodes_kv_pairs() {
-        let args = parse_cni_args(
-            "IgnoreUnknown=1;K8S_POD_NAMESPACE=demo;K8S_POD_NAME=alpha;K8S_POD_UID=abc-123",
-        );
-        assert_eq!(args.get("IGNOREUNKNOWN").map(String::as_str), Some("1"));
-        assert_eq!(
-            args.get("K8S_POD_NAMESPACE").map(String::as_str),
-            Some("demo")
-        );
-        assert_eq!(args.get("K8S_POD_NAME").map(String::as_str), Some("alpha"));
-        assert_eq!(args.get("K8S_POD_UID").map(String::as_str), Some("abc-123"));
-    }
-
-    #[test]
-    fn parse_cni_args_ignores_malformed_tokens() {
-        let args = parse_cni_args("=value;onlykey;=;K8S_POD_NAME=ok");
-        assert_eq!(args.len(), 1, "only valid k=v pair should remain");
-        assert_eq!(args.get("K8S_POD_NAME").map(String::as_str), Some("ok"));
     }
 
     #[test]

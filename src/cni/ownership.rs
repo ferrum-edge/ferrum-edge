@@ -587,13 +587,6 @@ pub fn configure_cni_ownership_store(path: Option<PathBuf>) {
     };
 }
 
-/// Test/helper: current configured durable path.
-#[cfg(test)]
-#[allow(dead_code)]
-pub fn configured_cni_ownership_store_path() -> Option<PathBuf> {
-    lock_runtime().path().map(Path::to_path_buf)
-}
-
 /// Snapshot of the durable store lifecycle for the current configuration.
 pub fn cni_ownership_store_state() -> CniOwnershipStoreState {
     lock_runtime().clone()

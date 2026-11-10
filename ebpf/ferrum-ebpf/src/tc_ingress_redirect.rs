@@ -172,9 +172,10 @@ fn redirect_config() -> Option<RedirectConfig> {
     })
 }
 
-/// The three loop / self-capture guards. `true` means "leave this packet
+/// The four loop / self-capture guards. `true` means "leave this packet
 /// alone" — it is either already relayed, already redirected, or addressed to
-/// the relay listener itself. Delegates to the shared, unit-tested predicate.
+/// the capture or HBONE listener itself. Delegates to the shared, unit-tested
+/// predicate.
 #[inline(always)]
 fn is_already_owned_by_the_relay(mark: u32, dst_port: u16, config: &RedirectConfig) -> bool {
     config.config.ingress_redirect_bypass(mark, dst_port)

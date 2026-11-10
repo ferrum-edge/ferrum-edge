@@ -34,11 +34,13 @@ pub const DEFAULT_UDP_OUTBOUND_PORT: u16 = 15011;
 /// (`0x539`/`0x53a`/`0x111`/`0x222`), Cilium masked mark classes
 /// (`0x200`/`0xA00`/`0xF00`/`0x800`), and Calico (`0x10000`+) marks.
 ///
-/// Collision analysis (within Ferrum): Ferrum uses NO other packet marks
-/// anywhere (verified: the only `1337` is the proxy `--uid-owner` UID, a *socket
-/// owner* match in a disjoint namespace from `skb->mark`, and
-/// `node_agent_hbone_redirect_port` `16008` is a port, not a mark). Operators
-/// can override via `FERRUM_MESH_TPROXY_MARK`.
+/// Collision analysis (within Ferrum): Ferrum's other packet marks are the
+/// NodeWaypoint marks `NODE_WAYPOINT_INBOUND_AUTH_MARK` (`0x734`),
+/// `NODE_WAYPOINT_INGRESS_REDIRECT_MARK` (`0x735`) and
+/// [`NODE_WAYPOINT_UDP_STEER_MARK`] (`0x736`), all distinct from this default.
+/// `1337` is the proxy `--uid-owner` UID, a *socket owner* match in a disjoint
+/// namespace from `skb->mark`, and `node_agent_hbone_redirect_port` `16008` is
+/// a port, not a mark. Operators can override via `FERRUM_MESH_TPROXY_MARK`.
 pub const DEFAULT_TPROXY_MARK: u32 = 0x733;
 
 // Compile-time guards on the default mark, at MODULE level (NOT `cfg(test)`) so a
@@ -86,8 +88,8 @@ pub(crate) const TPROXY_MARK_MASK: u32 = 0xffff_ffff;
 /// Istio install owns `133`, so cleanup must never flush it. This high constant
 /// is unlikely to collide with another component's table; combined with
 /// exact-rule/exact-route teardown (never `ip route flush table`), Ferrum only
-/// ever removes routing state it created. Inert until the Stage 3 UDP listener
-/// binds.
+/// ever removes routing state it created. Used only when UDP capture is
+/// enabled.
 pub(crate) const TPROXY_ROUTE_TABLE: u16 = 33133;
 
 /// Explicit `ip rule` priority for the Ferrum UDP TPROXY fwmark selector.
@@ -845,9 +847,8 @@ pub struct CaptureConfig {
     /// destination and offers no per-datagram recoverable original address), so
     /// captured UDP uses TPROXY in the `mangle` table, which delivers the
     /// datagram WITHOUT rewriting its destination (recovered per-datagram from
-    /// the `IP_RECVORIGDSTADDR` cmsg by the Stage 3 listener). This stage emits
-    /// rules ONLY; the consuming UDP listener arrives in Stage 3, so leaving
-    /// this off keeps an upgraded injector from redirecting UDP into a void.
+    /// the `IP_RECVORIGDSTADDR` cmsg by the UDP capture listener or the
+    /// per-pod-netns producer).
     pub udp_capture_enabled: bool,
     /// UDP TPROXY listener port the captured datagrams are delivered to. Distinct
     /// from [`Self::outbound_port`] (the TCP REDIRECT target) because UDP+TCP
@@ -1282,8 +1283,7 @@ impl IncludeOutboundPorts {
 }
 
 /// One annotation's parse result, before two annotations get merged together.
-/// Kept private so the merge contract stays in
-/// [`include_outbound_ports_from_annotations`].
+/// The merge contract lives in [`include_outbound_ports_from_annotations`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParsedIncludePorts {
     Absent,
@@ -2621,9 +2621,9 @@ fn udp_guard_switch_commands(
 /// `! --dst-type LOCAL` discriminator and be TPROXY'd by the outbound chain
 /// (bypassing inbound exclusions). There is no host-netns-safe `addrtype`-style
 /// discriminator here without per-pod IP knowledge the iptables fallback does not
-/// carry, and this path is inert (flag-gated default-off, no Stage-3 listener,
-/// eBPF is the node-agent's primary/supported UDP capture path), so the
-/// host-netns case emits NO UDP TPROXY rules rather than silently
+/// carry, and the node-agent host-netns fallback has no UDP path (host UDP
+/// capture is the separate interface-scoped generator; eBPF UDP capture is a
+/// non-goal), so the host-netns case emits NO UDP TPROXY rules rather than silently
 /// mis-capturing inbound as outbound. See [`CaptureConfig::host_netns`].
 fn udp_tproxy_commands_for_family(
     binary: &str,
@@ -2637,8 +2637,9 @@ fn udp_tproxy_commands_for_family(
     // LOCAL` direction split below is only valid in the pod netns; in the host
     // netns it mis-captures inbound-to-pod UDP as outbound. Rather than wire a
     // wrong direction split, the host-netns iptables fallback emits no UDP TPROXY
-    // rules at all — eBPF is the node-agent's supported UDP capture path. The
-    // node-agent logs the limitation once when it would otherwise emit these.
+    // rules at all — host UDP capture is the separate interface-scoped
+    // generator. The node-agent logs the limitation once when it would
+    // otherwise emit these.
     if config.host_netns {
         return Vec::new();
     }
@@ -6557,8 +6558,8 @@ iptables() {{
         // delivering to the existing outbound listener), the UDP path must SKIP the
         // unqualified IPv4 `-j TPROXY` catch-all entirely — an unqualified UDP
         // TPROXY would divert ALL IPv4 UDP (DNS included) into the marked routing
-        // table though only IPv6 was selected, black-holing it (no Stage 3 listener
-        // yet). Capturing nothing for the unselected family is the safe failure.
+        // table though only IPv6 was selected, black-holing it. Capturing
+        // nothing for the unselected family is the safe failure.
         let mut config = udp_enabled_iptables_config();
         config.include_cidrs = vec!["fd00::/8".to_string()];
         config.include_cidrs_explicit = true;
