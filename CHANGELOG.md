@@ -604,6 +604,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-w`), the best-effort teardown scripts and the node-agent cleanup runner,
   which run without `set -e`, never returned. The delete failure now exits
   with its own status and an error message.
+- **The node-agent surfaces failed `includeOutboundPorts` removals and refuses
+  an unscoped inbound redirect** (#7266). Removing a pod's include-ports entry
+  from the eBPF map now tolerates only a missing entry and returns any other
+  map error, so the node-agent keeps retrying instead of leaving a narrowing
+  keyed by a cgroup inode that a later pod can reuse. The NodeWaypoint inbound
+  tc redirect now refuses to attach (failing startup) when the loaded BPF ELF
+  lacks the `FERRUM_POD_INBOUND_PORTS*` scope maps, as its comments and
+  warning already described, instead of arming a classifier that every pod
+  enrollment then fails to scope.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
