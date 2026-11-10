@@ -117,7 +117,7 @@ fn assert_policy_and_log(config: &EnvConfig, versions: &[ProtocolVersion]) {
         "FERRUM_TLS_MIN_VERSION",
         "FERRUM_TLS_MAX_VERSION",
         "FERRUM_TLS_CIPHER_SUITES",
-        "FERRUM_TLS_CURVES",
+        "FERRUM_TLS_KEY_EXCHANGE_GROUPS",
         "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER",
     ] {
         assert!(message.contains(field), "missing {field}: {output}");
