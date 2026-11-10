@@ -2331,7 +2331,9 @@ struct TcpAcceptLoopState {
     tcp_half_close_max_wait_seconds: u64,
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
-    sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
+    /// Shared so the per-connection clone in the accept loop is a refcount
+    /// bump, not a copy of every candidate id.
+    sni_proxy_ids: Option<Arc<[NamespacedResourceId]>>,
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     tcp_fastopen_enabled: bool,
     overload: Arc<crate::overload::OverloadState>,
@@ -2673,7 +2675,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         tcp_half_close_max_wait_seconds,
         frontend_tls_handshake_timeout_seconds,
         circuit_breaker_cache,
-        sni_proxy_ids,
+        sni_proxy_ids: sni_proxy_ids.map(Arc::from),
         adaptive_buffer,
         tcp_fastopen_enabled,
         overload,
