@@ -1537,3 +1537,166 @@ async fn retry_streams_sse_that_succeeds_before_the_final_attempt() {
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// A retry that rotates targets logs the target that answered (issue #7159).
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Two round-robin targets: A answers every request `503`, B answers `200`.
+// With `retryable_status_codes: [503]` a request that starts on A rotates to
+// B. Before the fix the H1/H2 transaction summary still named the FIRST
+// attempt's URL (A) as `backend_target` while health, circuit-breaker and
+// `backend_resolved_ip` accounting followed the final target.
+
+/// Plain HTTP/1.1 backend answering every `GET` with `status` and counting
+/// them. Anything that is not a `GET` request head (the capability refresh's
+/// h2c preface) is dropped uncounted.
+fn spawn_counting_status_backend(
+    listener: TcpListener,
+    status_line: &'static str,
+) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&hits);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let counter = std::sync::Arc::clone(&counter);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                    if head.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+                if !head.starts_with(b"GET ") {
+                    return;
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    hits
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn retry_rotation_logs_the_target_that_answered_as_backend_target() {
+    let a_reservation = reserve_port().await.expect("reserve target A port");
+    let a_port = a_reservation.port;
+    let b_reservation = reserve_port().await.expect("reserve target B port");
+    let b_port = b_reservation.port;
+    let a_hits =
+        spawn_counting_status_backend(a_reservation.into_listener(), "503 Service Unavailable");
+    let b_hits = spawn_counting_status_backend(b_reservation.into_listener(), "200 OK");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "retry-rotation-attribution",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": a_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "upstream_id": "retry-rotation-upstream",
+            "retry": {
+                "max_retries": 1,
+                "retryable_status_codes": [503],
+                "retryable_methods": ["GET"],
+                "retry_on_connect_failure": false,
+            },
+        }],
+        "consumers": [],
+        "upstreams": [{
+            "id": "retry-rotation-upstream",
+            "name": "retry-rotation-upstream",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": a_port, "weight": 1 },
+                { "host": "127.0.0.1", "port": b_port, "weight": 1 },
+            ],
+        }],
+        "plugin_configs": [{
+            "id": "retry-rotation-stdout",
+            "plugin_name": "stdout_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": {},
+        }],
+    });
+    let yaml = serde_yaml::to_string(&config).expect("yaml serialize");
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // Round robin alternates the first attempt between A and B, so two
+    // requests guarantee at least one starts on A and rotates to B.
+    let client = harness.http_client().expect("client");
+    for _ in 0..2 {
+        let response = client
+            .get(&harness.proxy_url("/api/rotated"))
+            .await
+            .expect("gateway response");
+        assert_eq!(
+            response.status.as_u16(),
+            200,
+            "a request that started on A must be served by B after rotation; response={response:?}"
+        );
+    }
+    assert!(
+        a_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "at least one request must have started on A, or the rotation was not exercised"
+    );
+    assert_eq!(b_hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    let access_entries = |logs: &str| -> Vec<serde_json::Value> {
+        logs.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| {
+                entry.get("proxy_id").and_then(serde_json::Value::as_str)
+                    == Some("retry-rotation-attribution")
+            })
+            .collect()
+    };
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| access_entries(logs).len() >= 2,
+            Duration::from_secs(5),
+        )
+        .await;
+    let entries = access_entries(&logs);
+    assert_eq!(
+        entries.len(),
+        2,
+        "one transaction summary per request:\n{logs}"
+    );
+    for entry in entries {
+        assert_eq!(entry["response_status_code"].as_u64(), Some(200), "{entry}");
+        let target = entry["backend_target"]
+            .as_str()
+            .unwrap_or_else(|| panic!("summary must name a backend target: {entry}"));
+        assert!(
+            target.contains(&format!(":{b_port}/")),
+            "backend_target must name the target that answered (B, port {b_port}), \
+             not the failed first attempt (A, port {a_port}): {entry}"
+        );
+    }
+}

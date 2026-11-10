@@ -44623,6 +44623,7 @@ async fn handle_proxy_request_inner(
     let mut last_attempt_recorded = false;
     // `mut`: the pre-commitment authorization terminal below neutralizes the
     // health inputs of a dispatch the gateway itself cancelled (#3815).
+    let mut final_backend_url: Option<String> = None;
     let (mut backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
@@ -45070,6 +45071,7 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 final_upstream_target = current_target.clone();
+                final_backend_url = Some(current_url.clone());
                 sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
@@ -45142,6 +45144,7 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 final_upstream_target = current_target.clone();
+                final_backend_url = Some(current_url.clone());
                 sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 // No backend attempt was made for the rotated target. Keep the
@@ -45194,6 +45197,7 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 final_upstream_target = current_target.clone();
+                final_backend_url = Some(current_url.clone());
                 sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
@@ -45216,6 +45220,7 @@ async fn handle_proxy_request_inner(
                     retry::ErrorClass::DispatchPolicyRejected,
                 );
                 final_upstream_target = current_target.clone();
+                final_backend_url = Some(current_url.clone());
                 sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
@@ -45477,6 +45482,7 @@ async fn handle_proxy_request_inner(
                 );
             }
             final_upstream_target = current_target.clone();
+            final_backend_url = Some(current_url.clone());
         }
         (result, current_cb_target_key, final_upstream_target)
     } else {
@@ -45599,6 +45605,13 @@ async fn handle_proxy_request_inner(
         };
         (resp, cb_target_key.clone(), upstream_target.clone())
     };
+    // The URL of the target `final_upstream_target` names (the one that served
+    // this response, or a refused rotated candidate), set wherever the retry
+    // loop sets that target; `None` means the initial `backend_url` (issue
+    // #7159). The summary's `backend_target` and the streaming latency labels
+    // read it, so a rotated retry is attributed to the backend that answered,
+    // not the one that failed.
+    let final_backend_url: &str = final_backend_url.as_deref().unwrap_or(&backend_url);
     if let Some(phase) = route_request_timeout_phase {
         ctx.mark_route_request_timeout_exceeded(phase);
         // No backend answered within the rule deadline, so the response below
@@ -46860,7 +46873,7 @@ async fn handle_proxy_request_inner(
                 request_path: original_request_path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),
-                backend_target: Some(strip_query_params(&backend_url).to_string()),
+                backend_target: Some(strip_query_params(final_backend_url).to_string()),
                 backend_resolved_ip,
                 response_status_code: response_status,
                 latency_total_ms: total_ms,
@@ -47464,7 +47477,7 @@ async fn handle_proxy_request_inner(
                         base,
                         backend_start,
                         &proxy,
-                        &backend_url,
+                        final_backend_url,
                         proxy.backend_read_timeout_ms,
                     )
                 } else {
@@ -47692,7 +47705,7 @@ async fn handle_proxy_request_inner(
                         body,
                         backend_start,
                         &proxy,
-                        &backend_url,
+                        final_backend_url,
                         h2_read_timeout_ms,
                     )
                 } else {
