@@ -556,6 +556,60 @@ fn grpc_snapshot_bounds_non_standard_terminal_status_cardinality() {
     assert_eq!(events[0].call_count, 2);
 }
 
+/// Issue #7112: a repeat charge for a live snapshot identity is found with a
+/// key borrowed from the request summary — including digest-bounded fields
+/// and optional metadata dimensions — so it refreshes the entry the owned key
+/// was stored under instead of creating a second identity.
+#[test]
+fn snapshot_refresh_finds_the_identity_with_a_borrowed_key() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.08,
+        charge_total: 0.08,
+        ..ChargeComputation::default()
+    };
+    let long_consumer = "c".repeat(4096);
+    let mut summary = grpc_summary("borrowed-key", "0");
+    summary.namespace = "n".repeat(4096);
+    summary
+        .metadata
+        .insert("consumer_name".to_string(), "Alice".to_string());
+    summary
+        .metadata
+        .insert("route_id".to_string(), "route-a".to_string());
+    let mut other_route = summary.clone();
+    other_route
+        .metadata
+        .insert("route_id".to_string(), "route-b".to_string());
+
+    accumulator.record_http_for_test(&summary, &long_consumer, charge);
+    accumulator.record_http_for_test(&summary, &long_consumer, charge);
+    accumulator.record_http_for_test(&other_route, &long_consumer, charge);
+    assert_eq!(accumulator.total_call_count_for_tests(), 3);
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-borrowed")
+        .unwrap();
+    events.sort_by(|a, b| a.route_id.cmp(&b.route_id));
+    assert_eq!(events.len(), 2, "one identity per route");
+    assert_eq!(events[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(events[0].call_count, 2, "the repeat refreshed one identity");
+    assert_eq!(events[0].consumer_name.as_deref(), Some("Alice"));
+    assert!(
+        events[0].consumer_id.len() < long_consumer.len(),
+        "the over-long consumer is digest-bounded in the key"
+    );
+    assert_eq!(events[1].route_id.as_deref(), Some("route-b"));
+    assert_eq!(events[1].call_count, 1);
+}
+
 #[tokio::test]
 async fn config_validation_accepts_valid_config() {
     let temp = tempfile::tempdir().unwrap();

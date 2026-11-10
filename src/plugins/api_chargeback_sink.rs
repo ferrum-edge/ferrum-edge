@@ -14840,7 +14840,11 @@ fn finalize_replayed_spool_file(
 /// The complete value is the typed accumulator key and is also copied into
 /// emitted `ChargeEvent`s. It must not be treated as first-writer-wins
 /// decoration on a coarser or delimiter-encoded identity.
-#[derive(Clone, Eq, Hash, PartialEq)]
+///
+/// `Hash` and map equality go through [`SnapshotKeyRef`], so the accumulator
+/// can look an identity up with a key borrowed from the request summary and
+/// build this owned key only when the identity is new (issue #7112).
+#[derive(Clone, Eq, PartialEq)]
 struct SnapshotMetadata {
     namespace: String,
     consumer_id: String,
@@ -14852,6 +14856,96 @@ struct SnapshotMetadata {
     http_status_code: Option<u16>,
     grpc_status: Option<u32>,
     protocol: String,
+}
+
+/// Borrowed form of a [`SnapshotMetadata`] identity: the same fields in the
+/// same order, borrowed from the request summary (already bounded).
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct SnapshotKeyRef<'a> {
+    namespace: &'a str,
+    consumer_id: &'a str,
+    consumer_name: Option<&'a str>,
+    proxy_id: &'a str,
+    proxy_name: &'a str,
+    route_id: Option<&'a str>,
+    status_code: u16,
+    http_status_code: Option<u16>,
+    grpc_status: Option<u32>,
+    protocol: &'a str,
+}
+
+impl SnapshotKeyRef<'_> {
+    fn to_metadata(self) -> SnapshotMetadata {
+        SnapshotMetadata {
+            namespace: self.namespace.to_owned(),
+            consumer_id: self.consumer_id.to_owned(),
+            consumer_name: self.consumer_name.map(str::to_owned),
+            proxy_id: self.proxy_id.to_owned(),
+            proxy_name: self.proxy_name.to_owned(),
+            route_id: self.route_id.map(str::to_owned),
+            status_code: self.status_code,
+            http_status_code: self.http_status_code,
+            grpc_status: self.grpc_status,
+            protocol: self.protocol.to_owned(),
+        }
+    }
+}
+
+/// The lookup view shared by owned and borrowed snapshot identities. The
+/// accumulator maps borrow their `SnapshotMetadata` keys as this trait object,
+/// and both forms hash and compare through [`SnapshotKeyView::key_ref`], so a
+/// borrowed probe finds exactly the entry the owned key was stored under.
+trait SnapshotKeyView {
+    fn key_ref(&self) -> SnapshotKeyRef<'_>;
+}
+
+impl SnapshotKeyView for SnapshotMetadata {
+    fn key_ref(&self) -> SnapshotKeyRef<'_> {
+        SnapshotKeyRef {
+            namespace: &self.namespace,
+            consumer_id: &self.consumer_id,
+            consumer_name: self.consumer_name.as_deref(),
+            proxy_id: &self.proxy_id,
+            proxy_name: &self.proxy_name,
+            route_id: self.route_id.as_deref(),
+            status_code: self.status_code,
+            http_status_code: self.http_status_code,
+            grpc_status: self.grpc_status,
+            protocol: &self.protocol,
+        }
+    }
+}
+
+impl SnapshotKeyView for SnapshotKeyRef<'_> {
+    fn key_ref(&self) -> SnapshotKeyRef<'_> {
+        *self
+    }
+}
+
+impl std::hash::Hash for SnapshotMetadata {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_ref().hash(state);
+    }
+}
+
+impl std::hash::Hash for dyn SnapshotKeyView + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_ref().hash(state);
+    }
+}
+
+impl PartialEq for dyn SnapshotKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_ref() == other.key_ref()
+    }
+}
+
+impl Eq for dyn SnapshotKeyView + '_ {}
+
+impl<'a> Borrow<dyn SnapshotKeyView + 'a> for SnapshotMetadata {
+    fn borrow(&self) -> &(dyn SnapshotKeyView + 'a) {
+        self
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
@@ -15240,21 +15334,34 @@ impl SnapshotAccumulator {
         outcome: HttpBillingOutcome,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
-        let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(proxy_name, MAX_FIELD_LEN),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: outcome.status_code,
-            http_status_code: Some(outcome.http_status_code),
-            grpc_status: snapshot_http_outcome(outcome).grpc_status,
-            protocol: infer_http_protocol(summary),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(
+            summary.proxy_id.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        let protocol = infer_http_protocol_cow(summary);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: &consumer_id,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: outcome.status_code,
+                http_status_code: Some(outcome.http_status_code),
+                grpc_status: snapshot_http_outcome(outcome).grpc_status,
+                protocol: &protocol,
+            },
+            charge,
+        )
     }
 
     fn record_stream(
@@ -15263,22 +15370,31 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(
-                summary.proxy_name.as_deref().unwrap_or("unknown"),
-                MAX_FIELD_LEN,
-            ),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: STREAM_STATUS_SENTINEL,
-            http_status_code: None,
-            grpc_status: None,
-            protocol: bound_key_field(&summary.protocol, MAX_FIELD_LEN),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(&summary.proxy_id, MAX_FIELD_LEN);
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        let protocol = bounded_key_field(&summary.protocol, MAX_FIELD_LEN);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: &consumer_id,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: STREAM_STATUS_SENTINEL,
+                http_status_code: None,
+                grpc_status: None,
+                protocol: &protocol,
+            },
+            charge,
+        )
     }
 
     fn record_websocket(
@@ -15287,38 +15403,47 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
-        let meta = SnapshotMetadata {
-            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
-            consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_key_field(
-                summary.proxy_name.as_deref().unwrap_or("unknown"),
-                MAX_FIELD_LEN,
-            ),
-            route_id: metadata_value(&summary.metadata, &["route_id"]),
-            status_code: STREAM_STATUS_SENTINEL,
-            http_status_code: None,
-            grpc_status: None,
-            protocol: "ws".to_string(),
-        };
-        self.record(meta, charge)
+        let namespace = bounded_key_field(&summary.namespace, MAX_FIELD_LEN);
+        let consumer_id = bounded_key_field(consumer, MAX_FIELD_LEN);
+        let consumer_name = metadata_value_cow(&summary.metadata, &["consumer_name"]);
+        let proxy_id = bounded_key_field(&summary.proxy_id, MAX_FIELD_LEN);
+        let proxy_name = bounded_key_field(
+            summary.proxy_name.as_deref().unwrap_or("unknown"),
+            MAX_FIELD_LEN,
+        );
+        let route_id = metadata_value_cow(&summary.metadata, &["route_id"]);
+        self.record(
+            SnapshotKeyRef {
+                namespace: &namespace,
+                consumer_id: &consumer_id,
+                consumer_name: consumer_name.as_deref(),
+                proxy_id: &proxy_id,
+                proxy_name: &proxy_name,
+                route_id: route_id.as_deref(),
+                status_code: STREAM_STATUS_SENTINEL,
+                http_status_code: None,
+                grpc_status: None,
+                protocol: "ws",
+            },
+            charge,
+        )
     }
 
-    fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) -> SnapshotRecordOutcome {
-        self.record_at(meta, charge, unix_timestamp_seconds())
+    fn record(&self, key: SnapshotKeyRef<'_>, charge: ChargeComputation) -> SnapshotRecordOutcome {
+        self.record_at(key, charge, unix_timestamp_seconds())
     }
 
     fn record_at(
         &self,
-        meta: SnapshotMetadata,
+        key: SnapshotKeyRef<'_>,
         charge: ChargeComputation,
         now: i64,
     ) -> SnapshotRecordOutcome {
         // Fast path: refresh an already-published identity in place with a
-        // borrowed lookup. No new admission is charged and no key copy is made
-        // for a same-key refresh; the owned key is cloned only on a miss.
-        if let Some(entry) = self.entries.get(&meta) {
+        // lookup borrowed from the request summary. No new admission is charged
+        // and no owned key is built for a same-key refresh; the owned
+        // `SnapshotMetadata` is materialized only on a miss.
+        if let Some(entry) = self.entries.get(&key as &dyn SnapshotKeyView) {
             entry.last_seen_at.store(now, Ordering::Relaxed);
             entry.revision.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = entry.totals.try_add(charge) {
@@ -15328,6 +15453,7 @@ impl SnapshotAccumulator {
             return SnapshotRecordOutcome::Accumulated;
         }
 
+        let meta = key.to_metadata();
         let entry_bytes = snapshot_metadata_retained_bytes(&meta);
         // Reserve the identity slot and its retained bytes against the hard
         // ceilings *before* publishing the key. Because the reservation is
@@ -15705,17 +15831,17 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) {
         let _ = self.record_at(
-            SnapshotMetadata {
-                namespace: namespace.to_string(),
-                consumer_id: consumer.to_string(),
+            SnapshotKeyRef {
+                namespace,
+                consumer_id: consumer,
                 consumer_name: None,
-                proxy_id: proxy_id.to_string(),
-                proxy_name: proxy_name.to_string(),
+                proxy_id,
+                proxy_name,
                 route_id: None,
                 status_code,
                 http_status_code: (protocol == "http").then_some(status_code),
                 grpc_status: None,
-                protocol: protocol.to_string(),
+                protocol,
             },
             charge,
             unix_timestamp_seconds(),
@@ -15739,17 +15865,17 @@ impl SnapshotAccumulator {
     ) -> bool {
         matches!(
             self.record_at(
-                SnapshotMetadata {
-                    namespace: namespace.to_string(),
-                    consumer_id: consumer.to_string(),
+                SnapshotKeyRef {
+                    namespace,
+                    consumer_id: consumer,
                     consumer_name: None,
-                    proxy_id: proxy_id.to_string(),
-                    proxy_name: proxy_name.to_string(),
+                    proxy_id,
+                    proxy_name,
                     route_id: None,
                     status_code,
                     http_status_code: (protocol == "http").then_some(status_code),
                     grpc_status: None,
-                    protocol: protocol.to_string(),
+                    protocol,
                 },
                 charge,
                 unix_timestamp_seconds(),
@@ -16404,26 +16530,37 @@ fn event_from_snapshot(
 }
 
 fn infer_http_protocol(summary: &TransactionSummary) -> String {
+    infer_http_protocol_cow(summary).into_owned()
+}
+
+fn infer_http_protocol_cow(summary: &TransactionSummary) -> std::borrow::Cow<'_, str> {
     if is_websocket_handshake(summary) {
-        return "ws".to_string();
+        return std::borrow::Cow::Borrowed("ws");
     }
     if let Some(protocol) = summary
         .metadata
         .get("request_protocol")
         .or_else(|| summary.metadata.get("mesh.request_protocol"))
     {
-        return bound_key_field(protocol, MAX_FIELD_LEN);
+        return bounded_key_field(protocol, MAX_FIELD_LEN);
     }
-    "http".to_string()
+    std::borrow::Cow::Borrowed("http")
 }
 
 fn metadata_value<MS: std::hash::BuildHasher>(
     metadata: &HashMap<String, String, MS>,
     keys: &[&str],
 ) -> Option<String> {
+    metadata_value_cow(metadata, keys).map(std::borrow::Cow::into_owned)
+}
+
+fn metadata_value_cow<'a, MS: std::hash::BuildHasher>(
+    metadata: &'a HashMap<String, String, MS>,
+    keys: &[&str],
+) -> Option<std::borrow::Cow<'a, str>> {
     keys.iter()
         .find_map(|key| metadata.get(*key))
-        .map(|value| bound_key_field(value, MAX_METADATA_FIELD_LEN))
+        .map(|value| bounded_key_field(value, MAX_METADATA_FIELD_LEN))
         .filter(|value| !value.is_empty())
 }
 
@@ -16887,7 +17024,12 @@ fn bound_string(value: &str, max_len: usize) -> String {
 /// in practice this path is reached only by long operator-configured Consumer
 /// usernames, display names, or route identifiers.
 fn bound_key_field(value: &str, max_len: usize) -> String {
-    crate::plugins::chargeback::bounded_billing_identity(value, max_len).into_owned()
+    bounded_key_field(value, max_len).into_owned()
+}
+
+/// [`bound_key_field`] without the copy when the value is already in bounds.
+fn bounded_key_field(value: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
+    crate::plugins::chargeback::bounded_billing_identity(value, max_len)
 }
 
 /// Snapshot-mode view of an HTTP billing outcome: a non-standard gRPC status
