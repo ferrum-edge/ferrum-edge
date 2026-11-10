@@ -40834,11 +40834,11 @@ components:
               default: true
             on_new_tool:
               type: [string, "null"]
-              enum: [allow, allow_immediately, expose, hide_until_configured, null]
+              enum: [allow, hide_until_configured, null]
               default: hide_until_configured
             on_schema_change:
               type: [string, "null"]
-              enum: [allow, allow_immediately, expose, hide_until_configured, null]
+              enum: [allow, hide_until_configured, null]
               default: hide_until_configured
         sessions:
           type: [object, "null"]
@@ -40882,9 +40882,8 @@ components:
                 partitions).
             initialize_upstreams:
               type: [string, "null"]
-              enum: [lazy, startup, passthrough, null]
+              enum: [lazy, passthrough, null]
               default: lazy
-              description: startup is accepted as a V1 alias for lazy because upstream MCP initialize requires a downstream client session.
             session_ttl_seconds:
               type: [integer, "null"]
               format: uint64
@@ -41130,8 +41129,8 @@ components:
                 default: false
               initialize_strategy:
                 type: [string, "null"]
-                enum: [lazy, startup, passthrough, null]
-                description: Overrides sessions.initialize_upstreams for this server; startup is accepted as a V1 alias for lazy.
+                enum: [lazy, passthrough, null]
+                description: Overrides sessions.initialize_upstreams for this server.
               headers:
                 type: [object, "null"]
                 maxProperties: 32
