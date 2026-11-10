@@ -2000,8 +2000,6 @@ pub struct AiTranscriptAudit {
     stream_handoff_id: u64,
     rate_limiter: Arc<RecordsPerMinute>,
     sink_healthy: Arc<AtomicBool>,
-    /// `true` when at least one capture path is enabled (validated in `new`).
-    active: bool,
     staging_ttl: Duration,
     /// Amortization interval between staging sweeps. Normally
     /// [`STAGING_SWEEP_INTERVAL_SECS`], but never longer than half the
@@ -2426,7 +2424,6 @@ impl AiTranscriptAudit {
         let staging_sweep_interval_secs = STAGING_SWEEP_INTERVAL_SECS
             .min(limits.max_stream_reservation.as_secs() / 2)
             .max(1);
-        let active = capture.request || capture.response || streaming != StreamingCapture::Off;
         let namespace = crate::config::conf_file::resolve_ferrum_var("FERRUM_NAMESPACE")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| crate::config::types::DEFAULT_NAMESPACE.to_string());
@@ -2461,7 +2458,6 @@ impl AiTranscriptAudit {
             stream_handoff_id: allocate_response_stream_handoff_id(),
             rate_limiter: Arc::new(RecordsPerMinute::new(sampling.max_records_per_minute)),
             sink_healthy,
-            active,
             staging_ttl: Duration::from_secs(60 * 60),
             staging_sweep_interval_secs,
             next_staging_sweep_at: AtomicU64::new(0),
@@ -4985,7 +4981,7 @@ impl Plugin for AiTranscriptAudit {
         headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> bool {
-        if !self.active || !self.fails_closed() || ctx.is_native_grpc_request() {
+        if !self.fails_closed() || ctx.is_native_grpc_request() {
             return false;
         }
         ctx.method.eq_ignore_ascii_case("POST")
@@ -5000,7 +4996,7 @@ impl Plugin for AiTranscriptAudit {
     /// depend on `grpc_method_router` to decide enrollment on the method the
     /// backend actually receives.
     fn requires_backend_path_resolution(&self) -> bool {
-        self.active && self.grpc.is_some()
+        self.grpc.is_some()
     }
 
     /// Stage a native-gRPC call whose BACKEND-EFFECTIVE method is enrolled
@@ -5034,7 +5030,7 @@ impl Plugin for AiTranscriptAudit {
         ctx: &mut RequestContext,
         backend_path: &str,
     ) -> PluginResult {
-        if !self.active || !ctx.is_native_grpc_request() {
+        if !ctx.is_native_grpc_request() {
             return PluginResult::Continue;
         }
         let Some(grpc) = self.grpc.as_ref() else {
@@ -5131,7 +5127,8 @@ impl Plugin for AiTranscriptAudit {
     // ---- request body capture ----
 
     fn requires_request_body_buffering(&self) -> bool {
-        self.active
+        // The constructor refuses an instance with no capture path enabled.
+        true
     }
 
     /// The request body must be prebuffered before `before_proxy` so the
@@ -5145,7 +5142,7 @@ impl Plugin for AiTranscriptAudit {
     /// - the final `forces_reqwest_dispatch` preference is evaluated (it checks
     ///   this instance's bounded staging entry).
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.active
+        true
     }
 
     /// Native protobuf routinely contains non-UTF-8 bytes, so the UTF-8-only
@@ -5168,7 +5165,7 @@ impl Plugin for AiTranscriptAudit {
     /// to be enrolled only after backend-path resolution is indistinguishable
     /// from one that does not, at the point this flag is read.
     fn needs_request_body_bytes(&self) -> bool {
-        self.active && self.grpc.is_some()
+        self.grpc.is_some()
     }
 
     /// Native gRPC selects buffering CONSERVATIVELY, before enrollment is
@@ -5192,9 +5189,6 @@ impl Plugin for AiTranscriptAudit {
     /// gRPC-enrolled instance: HTTP requests here, and every request on an
     /// instance without a `grpc` block, keep the JSON-POST fast path unchanged.
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        if !self.active {
-            return false;
-        }
         if self.grpc_enrollment_owns_request(ctx) {
             return true;
         }
@@ -5207,9 +5201,6 @@ impl Plugin for AiTranscriptAudit {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active {
-            return PluginResult::Continue;
-        }
         // Staging here is deliberately keyed on the PROVISIONAL (client-path)
         // method, because that is the only view a pre-routing short circuit
         // will ever have: a `before_proxy` reject or synthetic response never
@@ -5307,7 +5298,7 @@ impl Plugin for AiTranscriptAudit {
     /// advertise it; without this the context-free default would run instead
     /// and no metadata/staging would ever be written on the H1/H2 path.
     fn needs_final_request_body_context(&self) -> bool {
-        self.active
+        true
     }
 
     /// The AUTHORITATIVE gRPC enrollment decision for ordinary backend-dispatched
@@ -5331,9 +5322,6 @@ impl Plugin for AiTranscriptAudit {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.active {
-            return PluginResult::Continue;
-        }
         // Mark that the backend-visible request was captured, so the reject-path
         // `after_proxy` refresh knows this was NOT a `before_proxy` short-circuit.
         ctx.metadata
@@ -5438,11 +5426,11 @@ impl Plugin for AiTranscriptAudit {
     // ---- reject-path request refresh ----
 
     fn applies_after_proxy_on_reject(&self) -> bool {
-        self.active
+        true
     }
 
     fn may_replace_rejection_response(&self) -> bool {
-        self.active
+        true
     }
 
     /// On a `before_proxy` short-circuit (no backend dispatch, so no final
@@ -5470,10 +5458,7 @@ impl Plugin for AiTranscriptAudit {
         _response_status: u16,
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active
-            || !flag(&ctx.metadata, MD_CANDIDATE)
-            || !self.has_staged_candidate(&ctx.metadata)
-        {
+        if !flag(&ctx.metadata, MD_CANDIDATE) || !self.has_staged_candidate(&ctx.metadata) {
             return PluginResult::Continue;
         }
         if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN) {
@@ -6184,9 +6169,6 @@ impl Plugin for AiTranscriptAudit {
     // ---- fallback emission ----
 
     async fn log(&self, summary: &TransactionSummary) {
-        if !self.active {
-            return;
-        }
         let Some(record_id) = summary.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };

@@ -673,10 +673,6 @@ pub struct AiResponseGuard {
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_response_body.
     needs_body_transform: bool,
-    /// True when the plugin has any active validation rule (patterns, phrases,
-    /// `require_json`, `required_fields`, or `max_completion_length`). Drives
-    /// response-body buffering — when no rule applies, the plugin is a no-op.
-    has_validation_rules: bool,
     /// Optional: require response to be valid JSON.
     require_json: bool,
     /// Optional: required top-level JSON fields.
@@ -1085,7 +1081,6 @@ impl AiResponseGuard {
             scan_mode,
             max_scan_bytes,
             needs_body_transform,
-            has_validation_rules,
             require_json,
             required_fields,
             max_completion_length,
@@ -4339,7 +4334,8 @@ impl Plugin for AiResponseGuard {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        self.has_validation_rules
+        // The constructor refuses an instance without a validation rule.
+        true
     }
 
     /// A `grpc`-enrolled instance joins the backend-path boundary so the proxy
@@ -4376,11 +4372,11 @@ impl Plugin for AiResponseGuard {
         // enrolled: an un-enrolled method has no decodable contract, so pinning
         // it to the buffered path would cost streaming for no enforcement.
         if ctx.is_native_grpc_request() {
-            return self.has_validation_rules && self.grpc_inspection_applies(ctx);
+            return self.grpc_inspection_applies(ctx);
         }
         // Client-controlled streaming intent is not response evidence. Buffer
         // conservatively until the pristine backend Content-Type is known.
-        self.has_validation_rules
+        true
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -4594,8 +4590,7 @@ impl Plugin for AiResponseGuard {
         response_content_type: Option<&str>,
         _response_body: &[u8],
     ) -> bool {
-        self.has_validation_rules
-            && self.has_enforcing_disposition()
+        self.has_enforcing_disposition()
             && !ctx.is_native_grpc_request()
             && !response_content_type
                 .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
@@ -4607,9 +4602,7 @@ impl Plugin for AiResponseGuard {
     /// Configuration- and request-only over-approximation, consulted before the
     /// response `Content-Type` is known.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.has_validation_rules
-            && self.has_enforcing_disposition()
-            && !ctx.is_native_grpc_request()
+        self.has_enforcing_disposition() && !ctx.is_native_grpc_request()
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
