@@ -358,6 +358,9 @@ struct FakeBackendState {
     listener_exits: bool,
     listeners: usize,
     listener_stops: usize,
+    /// Thread each blocking datapath effect (guard / capture / teardown /
+    /// release script) ran on.
+    effect_threads: Vec<std::thread::ThreadId>,
 }
 
 #[derive(Clone, Default)]
@@ -368,6 +371,16 @@ struct FakeBackend {
 impl FakeBackend {
     fn record(&self, call: &str) {
         self.inner.lock().unwrap().calls.push(call.to_string());
+    }
+
+    fn record_effect(&self, call: &str) {
+        let mut state = self.inner.lock().unwrap();
+        state.calls.push(call.to_string());
+        state.effect_threads.push(std::thread::current().id());
+    }
+
+    fn effect_threads(&self) -> Vec<std::thread::ThreadId> {
+        self.inner.lock().unwrap().effect_threads.clone()
     }
 
     fn calls(&self) -> Vec<String> {
@@ -419,7 +432,7 @@ impl HostUdpCaptureBackend for FakeBackend {
     }
 
     fn install_guard(&self, ifaces: &[String]) -> Result<(), String> {
-        self.record(&format!("guard:{}", ifaces.join(",")));
+        self.record_effect(&format!("guard:{}", ifaces.join(",")));
         if self.inner.lock().unwrap().fail_install_guard {
             return Err("iptables guard failed".to_string());
         }
@@ -427,7 +440,7 @@ impl HostUdpCaptureBackend for FakeBackend {
     }
 
     fn install_capture(&self, ifaces: &[String]) -> Result<(), String> {
-        self.record(&format!("capture:{}", ifaces.join(",")));
+        self.record_effect(&format!("capture:{}", ifaces.join(",")));
         if self.inner.lock().unwrap().fail_install_capture {
             return Err("iptables failed".to_string());
         }
@@ -435,12 +448,12 @@ impl HostUdpCaptureBackend for FakeBackend {
     }
 
     fn teardown_capture_rules(&self) -> Result<(), String> {
-        self.record("teardown_capture");
+        self.record_effect("teardown_capture");
         Ok(())
     }
 
     fn release_guard(&self) -> Result<(), String> {
-        self.record("release_guard");
+        self.record_effect("release_guard");
         if self.inner.lock().unwrap().fail_release_guard {
             return Err("xtables lock timeout".to_string());
         }
@@ -448,7 +461,7 @@ impl HostUdpCaptureBackend for FakeBackend {
     }
 
     fn teardown_all(&self) -> Result<(), String> {
-        self.record("teardown_all");
+        self.record_effect("teardown_all");
         if self.inner.lock().unwrap().fail_teardown_all {
             return Err("xtables lock timeout".to_string());
         }
@@ -520,6 +533,37 @@ async fn reconcile_installs_the_guard_before_capture_and_releases_it_after() {
         "enrolled UDP egress must be dropped, never plaintext, for the whole rebuild"
     );
     assert_eq!(backend.listeners(), 1);
+}
+
+/// Every iptables / routing effect blocks on a child process (seconds under
+/// xtables-lock contention), so none may run on the runtime thread that drives
+/// the manager (issue #7170). The current-thread test runtime makes that
+/// thread observable: it is the test's own thread.
+#[tokio::test]
+async fn blocking_datapath_effects_never_run_on_the_runtime_thread() {
+    let source = Arc::new(FakeSource::default());
+    source.set(vec![target(POD_A_UID, "a", Some("10.244.1.5"))]);
+    let backend = FakeBackend::default();
+    backend.set_interface(POD_A_UID, "vetha", 11);
+    let mut manager = manager(Arc::clone(&source), backend.clone(), None);
+
+    manager.reconcile_once().await;
+    source.set(Vec::new());
+    manager.reconcile_once().await;
+    manager.shutdown().await;
+
+    let runtime_thread = std::thread::current().id();
+    let threads = backend.effect_threads();
+    assert!(
+        threads.len() >= 4,
+        "the reconcile and shutdown passes must have run datapath effects: {:?}",
+        backend.calls()
+    );
+    assert!(
+        threads.iter().all(|thread| *thread != runtime_thread),
+        "a blocking datapath effect ran on the runtime thread: {:?}",
+        backend.calls()
+    );
 }
 
 #[tokio::test]
