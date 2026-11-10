@@ -101,27 +101,22 @@ pub struct NodeWaypointUdpDestinationRoute {
     /// namespaced identity into `UdpSessionKey` without allocating or
     /// cloning namespace/id Strings per datagram. Hash/equality of the
     /// session key compare the inner `(namespace, id)`, not this pointer.
+    ///
+    /// The frontend posture (plain UDP or terminating DTLS) is not carried
+    /// here: one bound socket speaks one protocol, so mesh materialization
+    /// refuses every claimant of a port whose services disagree on it
+    /// (`mixed_frontend_posture`) before any route is built.
     pub proxy: Arc<NamespacedResourceId>,
-    /// Frontend posture of the owning route. Every route sharing one listener
-    /// must agree (a shared socket is built from one posture before any route
-    /// can be selected), which materialization enforces fail-closed.
-    pub terminates_dtls: bool,
 }
 
 impl NodeWaypointUdpDestinationRoute {
     /// Build a route whose owner identity is already `Arc`-backed for the
     /// receive hot path.
-    pub fn new(
-        destination: IpAddr,
-        listen_port: u16,
-        proxy: NamespacedResourceId,
-        terminates_dtls: bool,
-    ) -> Self {
+    pub fn new(destination: IpAddr, listen_port: u16, proxy: NamespacedResourceId) -> Self {
         Self {
             destination: canonical_destination_ip(destination),
             listen_port,
             proxy: Arc::new(proxy),
-            terminates_dtls,
         }
     }
 
