@@ -1,8 +1,8 @@
 //! Platform-specific socket optimizations inspired by Cloudflare Pingora.
 //!
 //! Provides `IP_BIND_ADDRESS_NO_PORT` (defers ephemeral port allocation to connect()),
-//! `TCP_FASTOPEN` (saves 1 RTT on repeat connections), `TCP_INFO` access for
-//! kernel-level BDP-optimal buffer sizing, `SO_BUSY_POLL` for low-latency UDP,
+//! `TCP_FASTOPEN` (saves 1 RTT on repeat connections), `SO_BUSY_POLL` for
+//! low-latency UDP,
 //! `UDP_GRO`/`UDP_SEGMENT` for kernel-level
 //! datagram batching, and `kTLS` for enabling splice(2) on TLS paths.
 //! Linux-only options are no-ops on other platforms, or fail closed where a
@@ -626,73 +626,6 @@ fn apply_pooled_tcp_keepalive_cfg(
     {
         let _ = (pool, stream, cfg);
     }
-}
-
-// ── TCP_INFO (BDP-optimal buffer sizing) ───────────────────────────────
-
-/// Kernel-level TCP connection metrics from `getsockopt(TCP_INFO)`.
-///
-/// Used to compute Bandwidth-Delay Product (BDP) for optimal buffer sizing
-/// on long-lived TCP stream connections. BDP = (rtt_us / 1_000_000) × cwnd × mss.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub struct TcpConnectionInfo {
-    /// Smoothed round-trip time in microseconds (SRTT).
-    pub rtt_us: u32,
-    /// Congestion window in segments.
-    pub snd_cwnd: u32,
-    /// Maximum segment size in bytes.
-    pub snd_mss: u32,
-}
-
-#[allow(dead_code)]
-impl TcpConnectionInfo {
-    /// Compute the Bandwidth-Delay Product in bytes.
-    ///
-    /// BDP represents the optimal amount of data in-flight between sender and
-    /// receiver. Socket buffers sized to BDP maximize throughput without waste.
-    pub fn bdp_bytes(&self) -> usize {
-        if self.rtt_us == 0 || self.snd_cwnd == 0 || self.snd_mss == 0 {
-            return 0;
-        }
-        // cwnd × mss gives the current congestion window in bytes.
-        // This already reflects the BDP as the kernel adjusts cwnd based on RTT.
-        (self.snd_cwnd as usize).saturating_mul(self.snd_mss as usize)
-    }
-}
-
-/// Retrieve TCP connection info from the kernel via `getsockopt(TCP_INFO)`.
-///
-/// Returns RTT, congestion window, and MSS for BDP-optimal buffer sizing.
-/// Linux 2.6+ only. No-op on non-Linux (returns `None`).
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-pub fn get_tcp_info(fd: std::os::unix::io::RawFd) -> Option<TcpConnectionInfo> {
-    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_INFO,
-            &mut info as *mut libc::tcp_info as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if ret != 0 {
-        return None;
-    }
-    Some(TcpConnectionInfo {
-        rtt_us: info.tcpi_rtt,
-        snd_cwnd: info.tcpi_snd_cwnd,
-        snd_mss: info.tcpi_snd_mss,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn get_tcp_info(_fd: i32) -> Option<TcpConnectionInfo> {
-    None
 }
 
 // ── Send-queue depth (SIOCOUTQ / SO_NWRITE) ────────────────────────────

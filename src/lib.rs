@@ -32,7 +32,6 @@ pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 pub mod custom_plugins;
 pub mod data_path_metrics;
-pub mod date_cache;
 pub mod diagnostic_ref;
 #[cfg(test)]
 #[path = "../tests/support/diagnostic_interest.rs"]

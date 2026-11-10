@@ -3,8 +3,8 @@
 //! The non-Linux stubs all return fixed values (Ok, None, false, Unsupported).
 //! These tests verify that every public function is callable and returns the
 //! expected stub value on macOS / non-Linux, and that platform-independent
-//! functions (monotonic_now_ms, TcpConnectionInfo::bdp_bytes,
-//! connect_with_socket_opts) work correctly on all platforms.
+//! functions (monotonic_now_ms, connect_with_socket_opts) work correctly on all
+//! platforms.
 
 use ferrum_edge::socket_opts::*;
 
@@ -38,73 +38,6 @@ fn monotonic_now_ms_advances_with_time() {
     );
 }
 
-// ── TcpConnectionInfo::bdp_bytes (platform-independent) ────────────────
-
-#[test]
-fn bdp_bytes_normal_values() {
-    let info = TcpConnectionInfo {
-        rtt_us: 10_000, // 10ms
-        snd_cwnd: 10,   // 10 segments
-        snd_mss: 1460,  // typical MSS
-    };
-    // BDP = cwnd * mss = 10 * 1460 = 14600
-    assert_eq!(info.bdp_bytes(), 14_600);
-}
-
-#[test]
-fn bdp_bytes_zero_rtt_returns_zero() {
-    let info = TcpConnectionInfo {
-        rtt_us: 0,
-        snd_cwnd: 10,
-        snd_mss: 1460,
-    };
-    assert_eq!(info.bdp_bytes(), 0);
-}
-
-#[test]
-fn bdp_bytes_zero_cwnd_returns_zero() {
-    let info = TcpConnectionInfo {
-        rtt_us: 10_000,
-        snd_cwnd: 0,
-        snd_mss: 1460,
-    };
-    assert_eq!(info.bdp_bytes(), 0);
-}
-
-#[test]
-fn bdp_bytes_zero_mss_returns_zero() {
-    let info = TcpConnectionInfo {
-        rtt_us: 10_000,
-        snd_cwnd: 10,
-        snd_mss: 0,
-    };
-    assert_eq!(info.bdp_bytes(), 0);
-}
-
-#[test]
-fn bdp_bytes_does_not_panic_on_large_values() {
-    let info = TcpConnectionInfo {
-        rtt_us: 1,
-        snd_cwnd: u32::MAX,
-        snd_mss: u32::MAX,
-    };
-    // saturating_mul prevents panic; on 64-bit the product fits in usize
-    let bdp = info.bdp_bytes();
-    assert!(bdp > 0);
-    assert_eq!(bdp, (u32::MAX as usize).saturating_mul(u32::MAX as usize));
-}
-
-#[test]
-fn bdp_bytes_large_realistic_values() {
-    let info = TcpConnectionInfo {
-        rtt_us: 100_000, // 100ms transatlantic
-        snd_cwnd: 500,   // large window
-        snd_mss: 1460,
-    };
-    // 500 * 1460 = 730_000 bytes ~= 712 KB
-    assert_eq!(info.bdp_bytes(), 730_000);
-}
-
 // ── Non-Linux socket option stubs ──────────────────────────────────────
 
 #[cfg(not(target_os = "linux"))]
@@ -126,11 +59,6 @@ mod non_linux_stubs {
     #[test]
     fn set_tcp_fastopen_client_noop() {
         assert!(set_tcp_fastopen_client(0).is_ok());
-    }
-
-    #[test]
-    fn get_tcp_info_returns_none() {
-        assert!(get_tcp_info(0).is_none());
     }
 
     #[test]
