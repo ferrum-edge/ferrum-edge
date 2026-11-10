@@ -2021,6 +2021,12 @@ fn connect_udp_precommit_gates_and_header_write_follow_the_captured_plan() {
         abort_log < abort_return,
         "the rejection summary must be the only access-log completion on a stalled 200 expiry"
     );
+    // Issue #7157: the stalled-200 expiry is counted exactly once, as the 401
+    // its access log records, after that log and before the return.
+    let abort_count = squeezed[abort..summary]
+        .find("crate::proxy::record_request(&state,StatusCode::UNAUTHORIZED.as_u16())")
+        .expect("stalled 200 expiry must be counted");
+    assert!(abort_log < abort_count && abort_count < abort_return);
 }
 
 #[test]

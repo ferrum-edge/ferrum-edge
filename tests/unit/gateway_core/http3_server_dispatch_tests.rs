@@ -6182,3 +6182,60 @@ fn h3_plain_authorization_failure_write_is_bounded_before_guard_settlement() {
     assert!(latch < write && write < permits && permits < connections && connections < summary);
     assert!(branch.contains("body_completed: reject_sent"));
 }
+
+/// Issue #7157: the inline native-H3 streaming path's oversized-upload `413`
+/// and oversized declared-response `502` exits emit a `TransactionSummary`
+/// (access logs and log-sink plugins) and count once, after the log, like the
+/// dispatch-failure arm beside them.
+#[test]
+fn h3_native_streaming_oversize_exits_log_a_transaction_summary() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let streaming = source
+        .split("// ===== STREAMING REQUEST + RESPONSE PATH =====")
+        .nth(1)
+        .expect("native streaming dispatch");
+
+    let upload = streaming
+        .split("if err_msg.contains(\"exceeds maximum size\") {")
+        .nth(1)
+        .expect("oversized upload arm")
+        .split("return Ok(());")
+        .next()
+        .expect("bounded oversized upload arm");
+    let write = upload
+        .find("StatusCode::PAYLOAD_TOO_LARGE")
+        .expect("413 write");
+    let summary = upload
+        .find("response_status_code: 413,")
+        .expect("413 transaction summary");
+    let log = upload
+        .find("crate::plugins::log_with_mirror(")
+        .expect("413 summary is logged");
+    let count = upload
+        .find("record_request(&state, 413);")
+        .expect("413 is counted");
+    assert!(write < summary && summary < log && log < count);
+    assert_eq!(upload.matches("record_request(").count(), 1);
+
+    let response = streaming
+        .split("\"HTTP/3 backend response body exceeds configured size limit\"")
+        .nth(1)
+        .expect("oversized declared response arm")
+        .split("return Ok(());")
+        .next()
+        .expect("bounded oversized declared response arm");
+    let write = response
+        .find("send_h3_response_too_large(")
+        .expect("502 write");
+    let summary = response
+        .find("response_status_code: 502,")
+        .expect("502 transaction summary");
+    let log = response
+        .find("crate::plugins::log_with_mirror(")
+        .expect("502 summary is logged");
+    let count = response
+        .find("record_request(&state, 502);")
+        .expect("502 is counted");
+    assert!(write < summary && summary < log && log < count);
+    assert!(response.contains("error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge)"));
+}

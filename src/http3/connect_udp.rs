@@ -2460,10 +2460,12 @@ pub(crate) async fn handle_h3_connect_udp(
     match header_write {
         crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {
-            // The helper already recorded the counter through the request latch.
-            // Latch the class into the summary, abort/reset without attempting
-            // another blocking terminal write, and release permit/socket/guards
-            // on return. A 200 was never committed, so it is not counted.
+            // The helper already recorded the termination counter through the
+            // request latch. Latch the class into the summary, abort/reset
+            // without attempting another blocking terminal write, and release
+            // permit/socket/guards on return. A 200 was never committed, so the
+            // request is counted once as the 401 its access log records, like
+            // every other terminal of this handler.
             ctx.record_authorization_termination_once(
                 termination,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
@@ -2485,6 +2487,7 @@ pub(crate) async fn handle_h3_connect_udp(
                 Some(&request_path),
             )
             .await;
+            crate::proxy::record_request(&state, StatusCode::UNAUTHORIZED.as_u16());
             drop(session_permit);
             drop(client_tunnel_guard);
             drop(request_guard);

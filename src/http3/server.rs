@@ -8635,17 +8635,19 @@ async fn handle_h3_request(
                         e.request_on_wire(),
                         None,
                     );
-                    record_request(&state, 413);
+                    const UPLOAD_TOO_LARGE_BODY: &str =
+                        r#"{"error":"Request body exceeds maximum size"}"#;
                     // Do NOT propagate a send error: the outcome record below
                     // releases the CB probe slot and the admission outcome, so
                     // a `?` here would skip them when the client disconnects
                     // during the 413 write.
-                    let _ = send_h3_response(
+                    let reject_sent = send_h3_response(
                         &mut stream,
                         StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        UPLOAD_TOO_LARGE_BODY,
                     )
-                    .await;
+                    .await
+                    .is_ok();
                     // Record the outcome for this early return too (the
                     // connection guard above releases the least-connections
                     // count on its own). An oversized client body is
@@ -8689,6 +8691,65 @@ async fn handle_h3_request(
                         Some(crate::retry::ErrorClass::ClientDisconnect),
                         backend_admission_start.elapsed(),
                     );
+                    // The refusal reaches access logs and log-sink plugins like
+                    // the dispatch-failure arm below (issue #7157), and is
+                    // counted once, after its log.
+                    // Heap-pinned: this handler's frame is close to the debug-build
+                    // worker stack budget (see `boxed_proxy_to_backend_h3_streaming`).
+                    Box::pin(async {
+                        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                        let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                        let plugin_external_io_ms = ctx
+                            .plugin_http_call_ns
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as f64
+                            / 1_000_000.0;
+                        let gateway_processing_ms = total_ms - backend_total_ms;
+                        let summary = TransactionSummary {
+                            namespace: proxy.namespace.clone(),
+                            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                            client_ip: ctx.client_ip.clone(),
+                            consumer_username: ctx.effective_identity().map(str::to_owned),
+                            auth_method: ctx.auth_method,
+                            http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
+                            request_path: original_request_path.clone(),
+                            proxy_id: Some(proxy.id.clone()),
+                            proxy_name: proxy.name.clone(),
+                            backend_target: Some(strip_query_params(&backend_url).to_string()),
+                            backend_resolved_ip: backend_resolved_ip.clone(),
+                            response_status_code: 413,
+                            latency_total_ms: total_ms,
+                            latency_gateway_processing_ms: gateway_processing_ms,
+                            latency_backend_ttfb_ms: backend_total_ms,
+                            latency_backend_total_ms: backend_total_ms,
+                            latency_plugin_execution_ms: plugin_execution_ms,
+                            latency_plugin_external_io_ms: plugin_external_io_ms,
+                            latency_gateway_overhead_ms: (gateway_processing_ms
+                                - plugin_execution_ms)
+                                .max(0.0),
+                            request_user_agent: proxy_headers.get("user-agent").cloned(),
+                            error_class: Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+                            body_completed: reject_sent,
+                            client_disconnected: !reject_sent,
+                            // Built after the H3 reject send settled.
+                            response_delivery: crate::plugins::ResponseDelivery::Observed,
+                            bytes_received: if reject_sent {
+                                UPLOAD_TOO_LARGE_BODY.len() as u64
+                            } else {
+                                0
+                            },
+                            bytes_sent: request_body_bytes_seen
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            metadata: crate::proxy::clone_log_metadata(&ctx),
+                            ai_usage_export: ctx.ai_usage_export.clone(),
+                            proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+                            ..TransactionSummary::default()
+                        };
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                    })
+                    .await;
+                    record_request(&state, 413);
                     return Ok(());
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
@@ -8906,7 +8967,7 @@ async fn handle_h3_request(
             // Do NOT propagate a send error: the outcome record below releases
             // the CB probe slot and the admission outcome, so a `?` here would
             // skip them when the client disconnects during the reject write.
-            let _ = send_h3_response_too_large(&mut stream, &ctx).await;
+            let reject_sent = send_h3_response_too_large(&mut stream, &ctx).await.is_ok();
 
             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 &state,
@@ -8941,6 +9002,58 @@ async fn handle_h3_request(
                 Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
                 backend_admission_response_elapsed,
             );
+            // The refusal reaches access logs and log-sink plugins like the
+            // dispatch-failure arm above and the refined/buffered relays'
+            // oversize terminal (issue #7157). Request bytes were forwarded; no
+            // backend response body was relayed.
+            // Heap-pinned: this handler's frame is close to the debug-build
+            // worker stack budget (see `boxed_proxy_to_backend_h3_streaming`).
+            Box::pin(async {
+                let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                let plugin_external_io_ms =
+                    ctx.plugin_http_call_ns
+                        .load(std::sync::atomic::Ordering::Relaxed) as f64
+                        / 1_000_000.0;
+                let gateway_processing_ms = total_ms - backend_total_ms;
+                let summary = TransactionSummary {
+                    namespace: proxy.namespace.clone(),
+                    timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                    client_ip: ctx.client_ip.clone(),
+                    consumer_username: ctx.effective_identity().map(str::to_owned),
+                    auth_method: ctx.auth_method,
+                    http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
+                    request_path: original_request_path.clone(),
+                    proxy_id: Some(proxy.id.clone()),
+                    proxy_name: proxy.name.clone(),
+                    backend_target: Some(strip_query_params(&backend_url).to_string()),
+                    backend_resolved_ip: backend_resolved_ip.clone(),
+                    response_status_code: 502,
+                    latency_total_ms: total_ms,
+                    latency_gateway_processing_ms: gateway_processing_ms,
+                    latency_backend_ttfb_ms: backend_admission_response_elapsed.as_secs_f64()
+                        * 1000.0,
+                    latency_backend_total_ms: backend_total_ms,
+                    latency_plugin_execution_ms: plugin_execution_ms,
+                    latency_plugin_external_io_ms: plugin_external_io_ms,
+                    latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms)
+                        .max(0.0),
+                    request_user_agent: proxy_headers.get("user-agent").cloned(),
+                    error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+                    body_completed: reject_sent,
+                    client_disconnected: !reject_sent,
+                    // Built after the H3 reject send settled.
+                    response_delivery: crate::plugins::ResponseDelivery::Observed,
+                    bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
+                    metadata: crate::proxy::clone_log_metadata(&ctx),
+                    ai_usage_export: ctx.ai_usage_export.clone(),
+                    proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+                    ..TransactionSummary::default()
+                };
+                crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+            })
+            .await;
             record_request(&state, 502);
             return Ok(());
         }
