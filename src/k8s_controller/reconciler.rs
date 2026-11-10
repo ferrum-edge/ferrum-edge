@@ -345,7 +345,8 @@ async fn run_reconcile_loop(
     let node_waypoint_inventory = NodeWaypointInventory::new();
     let pod_claim_inventory = PodClaimInventory::new();
 
-    // Initial reconciliation — block until first success.
+    // Initial reconciliation (single attempt; later attempts come from watch
+    // events and the full-sync timer).
     do_reconcile(
         Arc::clone(&store_set),
         ReconcileContext {

@@ -2706,10 +2706,6 @@ pub(crate) fn route_conflicts<'a>(
     conflicts
 }
 
-pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConflictKey> {
-    route_conflict_keys_for_acc(object, None)
-}
-
 /// One HTTPRoute / GRPCRoute participating in cross-kind conflict resolution,
 /// carrying the conflict keys it claims across every parent reference plus the
 /// concrete Gateway listeners each `(parentRef, hostname)` claim resolved to.

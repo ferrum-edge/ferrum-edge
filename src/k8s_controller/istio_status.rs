@@ -1876,7 +1876,7 @@ fn workload_entry_status(
 /// `ingress[]` custom inbound listeners. Egress narrowing is gated by
 /// `FERRUM_MESH_SIDECAR_ENFORCED` (Sidecars are always parsed/persisted).
 /// Ingress entries that Ferrum cannot represent (an inadmissible Unix-socket
-/// path, non-loopback `defaultEndpoint`, or non-HTTP-family protocol) stay in
+/// path, non-loopback `defaultEndpoint`, or unrecognized/UDP protocol) stay in
 /// `deferred_fields`; resolvable listeners are materialized and reported via
 /// `ingress_modeled`.
 ///

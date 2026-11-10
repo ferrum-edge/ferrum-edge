@@ -659,9 +659,6 @@ pub(super) fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulato
             }
         }
         status.listener_conflicts = listener_conflicts;
-        if !status.accepted && status.accepted_reason != "Accepted" && !saw_listener {
-            continue;
-        }
         if !saw_listener {
             continue;
         }
