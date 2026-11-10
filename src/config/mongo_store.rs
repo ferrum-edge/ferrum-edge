@@ -9746,33 +9746,23 @@ mod inner {
         mut doc: Document,
     ) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
         doc.remove("_id");
-        match doc.remove("ts") {
-            Some(Bson::DateTime(ts)) => {
-                let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
-                    .ok_or_else(|| anyhow::anyhow!("audit event ts is outside chrono range"))?;
-                doc.insert("ts", ts.to_rfc3339());
-            }
-            Some(other) => {
-                doc.insert("ts", other);
-            }
-            None => {}
-        }
-        let diff = match doc.remove("diff") {
-            Some(Bson::String(diff_json)) => Some(serde_json::from_str(&diff_json)?),
-            Some(other) => {
-                doc.insert("diff", other);
-                None
-            }
-            None => Some(serde_json::Value::Object(serde_json::Map::new())),
+        // `audit_event_to_doc` is the only writer: `ts` is always a BSON
+        // DateTime and `diff` always JSON text. Build-out keeps no decoders
+        // for other shapes (issue #7218).
+        let Some(Bson::DateTime(ts)) = doc.remove("ts") else {
+            anyhow::bail!("audit event ts must be a BSON DateTime");
         };
-        if diff.is_some() {
-            doc.insert("diff", Bson::Document(Document::new()));
-        }
+        let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
+            .ok_or_else(|| anyhow::anyhow!("audit event ts is outside chrono range"))?;
+        doc.insert("ts", ts.to_rfc3339());
+        let Some(Bson::String(diff_json)) = doc.remove("diff") else {
+            anyhow::bail!("audit event diff must be JSON text");
+        };
+        let diff: serde_json::Value = serde_json::from_str(&diff_json)?;
+        doc.insert("diff", Bson::Document(Document::new()));
 
         let mut event: crate::admin::audit::AuditEvent = mongodb::bson::from_document(doc)?;
-        if let Some(diff) = diff {
-            event.diff = diff;
-        }
+        event.diff = diff;
         Ok(event)
     }
 
@@ -9785,31 +9775,11 @@ mod inner {
         snapshot_projected: bool,
     ) -> Result<ApiSpec, anyhow::Error> {
         doc.remove("_id");
+        // `api_spec_to_doc` writes both blobs as BSON Binary; build-out keeps
+        // no decoder for the retired integer-array shape (issue #7218).
         let spec_content = match doc.remove("spec_content") {
             Some(Bson::Binary(binary)) => binary.bytes,
-            Some(Bson::Array(values)) => {
-                let mut bytes = Vec::with_capacity(values.len());
-                for value in values {
-                    let byte = match value {
-                        Bson::Int32(v) if (0..=u8::MAX as i32).contains(&v) => v as u8,
-                        Bson::Int64(v) if (0..=u8::MAX as i64).contains(&v) => v as u8,
-                        other => {
-                            anyhow::bail!(
-                                "api_specs.spec_content array contains non-byte value: {:?}",
-                                other
-                            );
-                        }
-                    };
-                    bytes.push(byte);
-                }
-                bytes
-            }
-            Some(other) => {
-                anyhow::bail!(
-                    "api_specs.spec_content has unexpected BSON type: {:?}",
-                    other
-                );
-            }
+            Some(_) => anyhow::bail!("api_specs.spec_content has an unexpected BSON type"),
             None => anyhow::bail!("api_specs.spec_content missing"),
         };
         let external_ref_snapshot = match doc.remove("external_ref_snapshot") {
@@ -9822,27 +9792,6 @@ mod inner {
                 Some(binary.bytes)
             }
             Some(Bson::Null) | None => None,
-            Some(Bson::Array(values)) => {
-                if values.len()
-                    > crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES
-                {
-                    anyhow::bail!("api_specs.external_ref_snapshot exceeds size limit");
-                }
-                let mut bytes = Vec::with_capacity(values.len());
-                for value in values {
-                    let byte = match value {
-                        Bson::Int32(v) if (0..=u8::MAX as i32).contains(&v) => v as u8,
-                        Bson::Int64(v) if (0..=u8::MAX as i64).contains(&v) => v as u8,
-                        _ => {
-                            anyhow::bail!(
-                                "api_specs.external_ref_snapshot array contains a non-byte value"
-                            );
-                        }
-                    };
-                    bytes.push(byte);
-                }
-                Some(bytes)
-            }
             Some(_) => {
                 anyhow::bail!("api_specs.external_ref_snapshot has an unexpected BSON type");
             }
@@ -19099,6 +19048,32 @@ mod inner {
             let round_trip = doc_to_audit_event(doc).expect("audit event round-trips");
             assert_eq!(round_trip.ts.timestamp_millis(), ts.timestamp_millis());
             assert_eq!(round_trip.diff, event.diff);
+        }
+
+        #[test]
+        fn decoders_refuse_shapes_no_writer_produces() {
+            // Issue #7218: build-out keeps no decoders for retired shapes.
+            let mut audit = doc! {
+                "_id": "event-1",
+                "ts": "2026-05-18T01:00:00Z",
+                "diff": "{}",
+            };
+            let Err(error) = doc_to_audit_event(audit.clone()) else {
+                panic!("a string audit ts must be refused");
+            };
+            assert!(error.to_string().contains("BSON DateTime"));
+            audit.insert("ts", Bson::DateTime(BsonDateTime::from_millis(0)));
+            audit.insert("diff", Bson::Document(Document::new()));
+            let Err(error) = doc_to_audit_event(audit) else {
+                panic!("a document audit diff must be refused");
+            };
+            assert!(error.to_string().contains("JSON text"));
+
+            let legacy_spec = doc! { "_id": "ferrum:spec-1", "spec_content": [1_i32, 2_i32] };
+            let Err(error) = doc_to_api_spec(legacy_spec) else {
+                panic!("an integer-array spec_content must be refused");
+            };
+            assert!(error.to_string().contains("unexpected BSON type"));
         }
 
         #[test]
