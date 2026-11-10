@@ -1593,8 +1593,11 @@ fn test_execute_health_escapes_untrusted_status_text() {
     );
 }
 
+/// A non-200 reason phrase is peer-controlled text: the error reports only the
+/// parsed numeric status (issue #7229), so neither a raw control nor any of
+/// the reason text reaches it.
 #[test]
-fn test_execute_health_escapes_non200_reason_text() {
+fn test_execute_health_omits_non200_reason_text() {
     let response = "HTTP/1.1 503 unsafe\u{85}reason\r\n\r\n";
     let (result, _) = run_health_against_response(false, response.as_bytes());
     let error = result.expect_err("503 must be unhealthy");
@@ -1602,10 +1605,7 @@ fn test_execute_health_escapes_non200_reason_text() {
         !error.contains('\u{85}'),
         "raw control reached error text: {error:?}"
     );
-    assert!(
-        error.contains("\\u{85}"),
-        "reason was not rendered safely: {error}"
-    );
+    assert_eq!(error, "Unhealthy: HTTP status 503");
 }
 
 #[test]
