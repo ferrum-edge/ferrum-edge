@@ -3114,16 +3114,12 @@ impl ApiChargebackSink {
         let redacted_insert_url = redacted_endpoint_url(&parsed_url);
         let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
         let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
-        // Build the spool-replay client before staging so a TLS/file failure
-        // cannot orphan an already-staged BatchingLogger or replayer task.
-        let replay_http = if self.config.spool.enabled {
-            Some(build_clickhouse_http_client(
-                &self.config.clickhouse,
-                &self.http_client,
-            )?)
-        } else {
-            None
-        };
+        // Spool replay shares the live delivery client and its connection pool,
+        // exactly as the default (shared plugin client) arm always has. A clone
+        // of the dedicated custom-TLS client shares its pool and CRL rotation,
+        // so the TLS files are read and their warnings logged once per
+        // activation (issue #7112).
+        let replay_http = self.config.spool.enabled.then(|| http.clone());
         let metrics = Arc::new(SinkMetrics::with_process_totals());
         let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let spool = if self.config.spool.enabled {

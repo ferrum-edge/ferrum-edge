@@ -12808,6 +12808,34 @@ fn insert_url_carries_params_but_redacted_form_does_not() {
     assert!(!redacted.contains("INSERT"));
 }
 
+/// Issue #7112: spool replay reuses the live delivery client, so activating a
+/// custom-TLS sink builds one dedicated ClickHouse client — its TLS files are
+/// read and its insecure-TLS warning is logged once, not once per pool.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn custom_tls_sink_builds_one_clickhouse_client_for_delivery_and_replay() {
+    const WARNING: &str = "ClickHouse TLS hostname verification is disabled";
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://clickhouse.example:8443");
+    config["clickhouse"]["tls"] = json!({ "verify_hostname": false });
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("custom-TLS sink with spool");
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    plugin
+        .start_background_tasks()
+        .expect("activate custom-TLS sink");
+    drop(guard);
+
+    assert_eq!(
+        logs.contents().matches(WARNING).count(),
+        1,
+        "one dedicated client serves live delivery and spool replay"
+    );
+    drop(plugin);
+}
+
 /// The custom-TLS (`Dedicated`) client path classifies its transport failure
 /// rather than rendering the `reqwest::Error`, so the INSERT URL cannot reach a
 /// log line or the returned replay error.
