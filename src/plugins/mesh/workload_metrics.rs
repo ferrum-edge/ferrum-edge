@@ -702,13 +702,14 @@ impl WorkloadMetrics {
     /// rebuilt from it with materialization's own UTF-8 rule
     /// ([`hbone_wire_folded_baggage`]), so an obs-text field-line the ASCII
     /// raw accessor skips still counts exactly as it did for authorization;
-    /// without a wire block the map's value is the only evidence.
+    /// without a wire block the map's value is the only evidence. `probe` must
+    /// describe `headers`.
     fn annotate_backend_http_context(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
+        probe: &TraceHeaderProbe<'_>,
     ) {
-        let probe = TraceHeaderProbe::scan(headers);
         let wire_folded = (ctx.has_raw_headers() && is_hbone_request(ctx))
             .then(|| hbone_wire_folded_baggage(ctx))
             .flatten();
@@ -717,7 +718,7 @@ impl WorkloadMetrics {
         } else {
             headers.get(BAGGAGE_HEADER).map(String::as_str)
         };
-        self.annotate_http_context_with_probe(ctx, headers, &probe, folded_baggage);
+        self.annotate_http_context_with_probe(ctx, headers, probe, folded_baggage);
     }
 
     /// Stamp the request's mesh telemetry metadata and labels.
@@ -928,16 +929,22 @@ impl WorkloadMetrics {
         }
     }
 
+    /// Reconcile the trace metadata captured in `on_request_received` with the
+    /// final backend-visible headers that `probe` describes.
+    ///
+    /// Only `ctx.metadata` is changed here; the header strips the decision
+    /// needs are returned so the caller can apply them and re-scan only when
+    /// the headers actually changed (issue #7146).
     fn reconcile_captured_trace_headers(
         &self,
         ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
-    ) -> bool {
+        probe: &TraceHeaderProbe<'_>,
+    ) -> TraceHeaderReconciliation {
         // Metrics-only instances compose labels and custom tags without owning
         // trace context. Clearing a sibling's trace IDs here would suppress all
         // of its span exporters because this instance cannot rebuild the IDs.
         if !self.trace_context_enabled() {
-            return false;
+            return TraceHeaderReconciliation::default();
         }
         // `otel_tracing` owns this request's SERVER span: the backend map's
         // `traceparent` is that span, not a replacement parent, and no early
@@ -946,7 +953,7 @@ impl WorkloadMetrics {
             ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA);
             ctx.metadata.remove(CAPTURED_B3_METADATA);
             ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA);
-            return false;
+            return TraceHeaderReconciliation::default();
         }
         // `on_request_received` imports inbound context early so authorization
         // rejects remain observable. For accepted requests, request_transformer
@@ -959,9 +966,9 @@ impl WorkloadMetrics {
         let captured_traceparent = ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA).is_some();
         let captured_b3 = ctx.metadata.remove(CAPTURED_B3_METADATA).is_some();
         let captured_tracestate = ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA).is_some();
-        let final_traceparent = has_valid_traceparent(headers);
-        let final_b3_context = !final_traceparent && has_b3_trace_context(headers);
-        let final_b3_sampling = !final_traceparent && b3_sampling_decision(headers).is_some();
+        let final_traceparent = probe.has_valid_traceparent();
+        let final_b3_context = !final_traceparent && probe.has_b3_trace_context();
+        let final_b3_sampling = !final_traceparent && probe.b3_sampling_decision().is_some();
         let final_trace_signal = final_traceparent || final_b3_context || final_b3_sampling;
         // A final `traceparent` that is exactly the gateway SERVER span this
         // request already established (a sibling tracing plugin, or an earlier
@@ -969,7 +976,7 @@ impl WorkloadMetrics {
         // parent. Re-deriving from it would mint a second SERVER span
         // parented under the first, which no exporter reports.
         let final_is_gateway_context = final_traceparent
-            && header_value(headers, TRACEPARENT_HEADER).is_some_and(|value| {
+            && probe.traceparent.is_some_and(|value| {
                 ctx.metadata
                     .get(TRACEPARENT_HEADER)
                     .is_some_and(|own| own == value)
@@ -979,29 +986,25 @@ impl WorkloadMetrics {
             clear_http_trace_metadata(&mut ctx.metadata);
         }
 
-        if captured_traceparent && !final_traceparent {
+        // A transformer may remove the captured parent, replace it with
+        // malformed hostile input, or leave/add tracestate independently.
+        // Every casing of both W3C headers is then removed so neither the
+        // cached parent nor an orphan tracestate can cross the proxy boundary.
+        let strip_w3c = captured_traceparent && !final_traceparent;
+        if strip_w3c {
             ctx.metadata.remove(TRACEPARENT_HEADER);
             ctx.metadata.remove(TRACESTATE_HEADER);
-            // A transformer may remove the captured parent, replace it with
-            // malformed hostile input, or leave/add tracestate independently.
-            // Remove every casing of both W3C headers so neither the cached
-            // parent nor an orphan tracestate can cross the proxy boundary.
-            headers.retain(|name, _| {
-                !name.eq_ignore_ascii_case(TRACEPARENT_HEADER)
-                    && !name.eq_ignore_ascii_case(TRACESTATE_HEADER)
-            });
         }
 
-        if captured_b3 && !final_traceparent && !final_b3_context && !final_b3_sampling {
+        let strip_b3 = captured_b3 && !final_traceparent && !final_b3_context && !final_b3_sampling;
+        if strip_b3 {
             ctx.metadata.remove(TRACEPARENT_HEADER);
-            headers.retain(|name, _| {
-                !B3_TRACE_HEADERS
-                    .iter()
-                    .any(|header| name.eq_ignore_ascii_case(header))
-            });
         }
 
-        if captured_tracestate && header_value(headers, TRACESTATE_HEADER).is_none() {
+        // The B3 strip never touches `tracestate`, and the W3C strip removes
+        // every casing of it.
+        let final_tracestate = !strip_w3c && probe.tracestate.is_some();
+        if captured_tracestate && !final_tracestate {
             ctx.metadata.remove(TRACESTATE_HEADER);
         }
 
@@ -1009,7 +1012,11 @@ impl WorkloadMetrics {
         if suppress_local_trace {
             clear_http_trace_metadata(&mut ctx.metadata);
         }
-        suppress_local_trace
+        TraceHeaderReconciliation {
+            strip_w3c,
+            strip_b3,
+            suppress_local_trace,
+        }
     }
 
     fn resolve_peer_source_identity(
@@ -1119,16 +1126,20 @@ impl WorkloadMetrics {
         headers: &HashMap<String, String>,
         probe: &TraceHeaderProbe<'_>,
     ) {
+        // The repeat stamp usually finds the same decision already recorded,
+        // so write only a changed value (issue #7146).
         if let Some(sampled) = existing_sampling_decision(metadata, probe) {
-            metadata.insert(
-                "trace_sampled".to_string(),
-                if sampled { "true" } else { "false" }.to_string(),
+            insert_metadata_if_changed(
+                metadata,
+                "trace_sampled",
+                if sampled { "true" } else { "false" },
             );
         } else if let Some(sampling_percentage) = self.sampling_percentage {
             let sampled = trace_sampled(sampling_percentage);
-            metadata.insert(
-                "trace_sampled".to_string(),
-                if sampled { "true" } else { "false" }.to_string(),
+            insert_metadata_if_changed(
+                metadata,
+                "trace_sampled",
+                if sampled { "true" } else { "false" },
             );
         }
         // This method runs both before authorization and after request
@@ -1505,9 +1516,21 @@ impl Plugin for WorkloadMetrics {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let suppress_local_trace = self.reconcile_captured_trace_headers(ctx, headers);
-        self.annotate_backend_http_context(ctx, headers);
-        if suppress_local_trace {
+        // One trace-header scan serves both the reconciliation and the stamp;
+        // the map is re-scanned only when the reconciliation stripped headers.
+        let reconciliation = {
+            let probe = TraceHeaderProbe::scan(headers);
+            let reconciliation = self.reconcile_captured_trace_headers(ctx, &probe);
+            if !reconciliation.strips_headers() {
+                self.annotate_backend_http_context(ctx, headers, &probe);
+            }
+            reconciliation
+        };
+        if reconciliation.strips_headers() {
+            reconciliation.strip_headers(headers);
+            self.annotate_backend_http_context(ctx, headers, &TraceHeaderProbe::scan(headers));
+        }
+        if reconciliation.suppress_local_trace {
             clear_http_trace_metadata(&mut ctx.metadata);
         }
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
@@ -3148,12 +3171,38 @@ fn traceparent_sampling_decision(value: &str) -> Option<bool> {
         .map(|flags| flags & 0x01 == 0x01)
 }
 
-fn b3_sampling_decision(headers: &HashMap<String, String>) -> Option<bool> {
-    TraceHeaderProbe::scan(headers).b3_sampling_decision()
+/// Header strips `WorkloadMetrics::reconcile_captured_trace_headers` decided
+/// on, applied by the caller once the read-only probe is released.
+#[derive(Debug, Clone, Copy, Default)]
+struct TraceHeaderReconciliation {
+    /// Remove every casing of `traceparent` and `tracestate`.
+    strip_w3c: bool,
+    /// Remove every casing of the B3 trace headers.
+    strip_b3: bool,
+    /// Drop locally derived trace metadata after the stamp.
+    suppress_local_trace: bool,
 }
 
-fn has_b3_trace_context(headers: &HashMap<String, String>) -> bool {
-    TraceHeaderProbe::scan(headers).has_b3_trace_context()
+impl TraceHeaderReconciliation {
+    fn strips_headers(self) -> bool {
+        self.strip_w3c || self.strip_b3
+    }
+
+    fn strip_headers(self, headers: &mut HashMap<String, String>) {
+        if self.strip_w3c {
+            headers.retain(|name, _| {
+                !name.eq_ignore_ascii_case(TRACEPARENT_HEADER)
+                    && !name.eq_ignore_ascii_case(TRACESTATE_HEADER)
+            });
+        }
+        if self.strip_b3 {
+            headers.retain(|name, _| {
+                !B3_TRACE_HEADERS
+                    .iter()
+                    .any(|header| name.eq_ignore_ascii_case(header))
+            });
+        }
+    }
 }
 
 /// Every trace-context header (plus `content-type`) a stamp consults, found in
@@ -3431,10 +3480,6 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 fn set_header_case_insensitive(headers: &mut HashMap<String, String>, name: &str, value: &str) {
     headers.retain(|header_name, _| !header_name.eq_ignore_ascii_case(name));
     headers.insert(name.to_string(), value.to_string());
-}
-
-fn has_valid_traceparent(headers: &HashMap<String, String>) -> bool {
-    TraceHeaderProbe::scan(headers).has_valid_traceparent()
 }
 
 /// Insert `key -> value` only when the current value differs.

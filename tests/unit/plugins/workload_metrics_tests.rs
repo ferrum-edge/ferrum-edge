@@ -870,6 +870,38 @@ fn immutable_metric_plans_are_not_recopied_on_every_stamp() {
     );
 }
 
+/// Issue #7146: the backend-side reconciliation and stamp share ONE
+/// trace-header scan; the map is re-scanned only on the branch that stripped
+/// headers, and the repeat stamp writes `trace_sampled` only when it changed.
+#[test]
+fn backend_trace_reconciliation_shares_one_header_scan() {
+    let source = workload_metrics_production_source();
+    let reconcile = source_between(
+        source,
+        "fn reconcile_captured_trace_headers(",
+        "fn resolve_peer_source_identity(",
+    );
+    assert!(
+        !reconcile.contains("TraceHeaderProbe::scan(") && !reconcile.contains("header_value("),
+        "reconciliation must read the caller's probe, not rescan the headers"
+    );
+    let before_proxy = source_between(source, "async fn before_proxy(", "async fn after_proxy(");
+    assert_eq!(
+        before_proxy.matches("TraceHeaderProbe::scan(").count(),
+        2,
+        "one shared scan plus one rescan after a header strip"
+    );
+    let stamp = source_between(
+        source,
+        "fn apply_telemetry_metadata_with_probe<",
+        "fn should_export_metadata<",
+    );
+    assert!(
+        !stamp.contains("\"trace_sampled\".to_string()"),
+        "trace_sampled must be written through insert_metadata_if_changed"
+    );
+}
+
 #[tokio::test]
 async fn repeated_stamps_keep_metric_plans_byte_identical() {
     let plugin = WorkloadMetrics::new(&json!({
