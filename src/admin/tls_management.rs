@@ -19,8 +19,8 @@ use super::{AdminState, PaginationParams};
 use crate::tls::acme::{AcmeCertificateRecord, AcmeError, AcmeIssuedCertificateInput};
 #[cfg(feature = "acme")]
 use crate::tls::acme::{
-    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput,
-    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
+    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeOrderFinalization, AcmeOrderInput,
+    AcmeOrderRecord, AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
 };
 use crate::tls::managed::{ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord};
 
@@ -801,7 +801,7 @@ pub(super) async fn handle_finalize_acme_order(
                 ));
             }
         };
-        let complete_config = crate::tls::acme::client::CompleteAcmeHttp01OrderConfig {
+        let complete_config = crate::tls::acme::client::CompleteAcmeOrderConfig {
             directory_url: order.directory_url.clone(),
             account_credentials_json: crate::tls::source::SecretString::new(
                 account_credentials_json,
@@ -2311,7 +2311,7 @@ async fn acme_order_record_from_request(
     }
 
     Ok((
-        AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        AcmeOrderRecord::new(AcmeOrderInput {
             id,
             certificate_id,
             domains: prepared.domains,
@@ -3071,7 +3071,7 @@ mod tests {
         finalization: Option<AcmeOrderFinalization>,
         domains: Vec<String>,
     ) -> AcmeOrderRecord {
-        let mut order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let mut order = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: domains.clone(),

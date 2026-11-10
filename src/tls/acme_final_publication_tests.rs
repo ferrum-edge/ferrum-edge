@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeError, AcmeHttp01ChallengeRecord,
-    AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderRecord,
+    AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderInput, AcmeOrderRecord,
     AcmeOrderStatus, AcmeOrderStore, FinalRenewalPublication, RenewalReloadReach,
     classify_renewal_reload_reach, commit_final_renewal_publication, has_active_renewal_order,
     inject_final_publication_certificate_write_fault_for_tests,
@@ -67,7 +67,7 @@ fn order_with(
     status: AcmeOrderStatus,
     order_url: Option<&str>,
 ) -> AcmeOrderRecord {
-    AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    AcmeOrderRecord::new(AcmeOrderInput {
         id: id.to_string(),
         certificate_id: Some(certificate_id.to_string()),
         domains: vec!["example.com".to_string()],

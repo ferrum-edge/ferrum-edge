@@ -7,7 +7,7 @@
 
 use crate::tls::acme::{
     AcmeAccountStore, AcmeCertificateRecord, AcmeCertificateStore, AcmeError,
-    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderRecord,
+    AcmeHttp01ChallengeRecord, AcmeIssuedCertificateInput, AcmeOrderInput, AcmeOrderRecord,
     AcmeOrderStatus, AcmeOrderStore,
 };
 use crate::tls::managed::{
@@ -58,7 +58,7 @@ fn sample_acme_certificate(id: &str, cert_pem: &str, key_pem: &str) -> AcmeCerti
 }
 
 fn sample_acme_order(id: &str, token: &str) -> AcmeOrderRecord {
-    AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+    AcmeOrderRecord::new(AcmeOrderInput {
         id: id.to_string(),
         certificate_id: Some("edge-cert".to_string()),
         domains: vec!["example.com".to_string()],

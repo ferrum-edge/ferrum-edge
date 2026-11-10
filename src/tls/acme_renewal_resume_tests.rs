@@ -21,10 +21,10 @@ use std::time::Duration;
 
 use crate::tls::acme::{
     AcmeCertificateRecord, AcmeCertificateStore, AcmeDns01ChallengeRecord,
-    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeIssuedCertificateInput,
-    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore,
-    AcmeRenewalChallengeType, AcmeTlsAlpn01ChallengeRecord, RenewalClaim, RenewalOrderPlan,
-    claim_and_plan_renewal, infer_persisted_challenge_type,
+    AcmeHttp01ChallengeRecord, AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderInput,
+    AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore, AcmeRenewalChallengeType,
+    AcmeTlsAlpn01ChallengeRecord, RenewalClaim, RenewalOrderPlan, claim_and_plan_renewal,
+    infer_persisted_challenge_type,
 };
 #[cfg(feature = "acme")]
 use crate::tls::acme::{AcmeRenewalSchedulerConfig, resume_persisted_renewal_order};
@@ -146,7 +146,7 @@ impl OrderSpec {
         } else {
             Vec::new()
         };
-        AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        AcmeOrderRecord::new(AcmeOrderInput {
             id: ORDER_ID.to_string(),
             certificate_id: Some(CERTIFICATE_ID.to_string()),
             domains: vec!["example.com".to_string()],
