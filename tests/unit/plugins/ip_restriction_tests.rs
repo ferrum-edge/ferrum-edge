@@ -24,6 +24,20 @@ fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
     )
 }
 
+/// Whether an allow-list plugin holding only `rule` admits `client_ip`
+/// through the production request hook. A rule the constructor refuses
+/// admits nothing.
+async fn admitted_by_allow_rule(client_ip: &str, rule: &str) -> bool {
+    let Ok(plugin) = IpRestriction::new(&json!({ "allow": [rule] })) else {
+        return false;
+    };
+    let mut ctx = create_context_with_ip(client_ip);
+    matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    )
+}
+
 // ── Allow mode tests ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -693,14 +707,12 @@ fn ipv4_too_many_octets_is_rejected() {
     assert!(result.is_err());
 }
 
-#[test]
-fn ipv6_only_literal_decorations_do_not_broaden_ipv4_rules() {
-    use ferrum_edge::plugins::ip_restriction::ip_matches;
-
-    assert!(!ip_matches("[192.0.2.1]", "192.0.2.1"));
-    assert!(!ip_matches("192.0.2.1%eth0", "192.0.2.1"));
-    assert!(!ip_matches("192.0.2.1", "[192.0.2.1]"));
-    assert!(!ip_matches("192.0.2.1", "192.0.2.1%eth0"));
+#[tokio::test]
+async fn ipv6_only_literal_decorations_do_not_broaden_ipv4_rules() {
+    assert!(!admitted_by_allow_rule("[192.0.2.1]", "192.0.2.1").await);
+    assert!(!admitted_by_allow_rule("192.0.2.1%eth0", "192.0.2.1").await);
+    assert!(!admitted_by_allow_rule("192.0.2.1", "[192.0.2.1]").await);
+    assert!(!admitted_by_allow_rule("192.0.2.1", "192.0.2.1%eth0").await);
 }
 
 #[tokio::test]
@@ -821,12 +833,10 @@ fn noncanonical_ipv4_rule_literals_reject_construction() {
     }
 }
 
-#[test]
-fn noncanonical_ipv4_client_literals_do_not_match() {
-    use ferrum_edge::plugins::ip_restriction::ip_matches;
-
-    assert!(!ip_matches("+10.1.2.3", "10.1.2.3"));
-    assert!(!ip_matches("010.1.2.3", "10.1.2.3"));
+#[tokio::test]
+async fn noncanonical_ipv4_client_literals_do_not_match() {
+    assert!(!admitted_by_allow_rule("+10.1.2.3", "10.1.2.3").await);
+    assert!(!admitted_by_allow_rule("010.1.2.3", "10.1.2.3").await);
 }
 
 #[test]
@@ -1010,16 +1020,14 @@ async fn zero_cidr_matches_same_family_client() {
     plugin_utils::assert_reject(result, Some(403));
 }
 
-#[test]
-fn ip_matches_zero_cidr_is_family_scoped() {
-    use ferrum_edge::plugins::ip_restriction::ip_matches;
-
-    assert!(!ip_matches("2001:db8::1", "0.0.0.0/0"));
-    assert!(!ip_matches("192.168.1.1", "::/0"));
-    assert!(ip_matches("10.0.0.1", "0.0.0.0/0"));
-    assert!(ip_matches("fe80::1", "::/0"));
-    assert!(!ip_matches("not-an-ip", "0.0.0.0/0"));
-    assert!(!ip_matches("not-an-ip", "::/0"));
+#[tokio::test]
+async fn zero_cidr_is_family_scoped() {
+    assert!(!admitted_by_allow_rule("2001:db8::1", "0.0.0.0/0").await);
+    assert!(!admitted_by_allow_rule("192.168.1.1", "::/0").await);
+    assert!(admitted_by_allow_rule("10.0.0.1", "0.0.0.0/0").await);
+    assert!(admitted_by_allow_rule("fe80::1", "::/0").await);
+    assert!(!admitted_by_allow_rule("not-an-ip", "0.0.0.0/0").await);
+    assert!(!admitted_by_allow_rule("not-an-ip", "::/0").await);
 }
 
 // ── Strict configuration contract ──────────────────────────────────
@@ -1339,14 +1347,12 @@ fn ipv6_rule_zone_must_be_non_empty_and_well_formed() {
     }
 }
 
-#[test]
-fn rule_zone_grammar_does_not_tighten_client_ip_parsing() {
-    use ferrum_edge::plugins::ip_restriction::ip_matches;
-
+#[tokio::test]
+async fn rule_zone_grammar_does_not_tighten_client_ip_parsing() {
     // The stricter grammar applies to configured rules only; a client
     // identity with an empty zone still resolves to its address.
-    assert!(ip_matches("fe80::1%", "fe80::1"));
-    assert!(ip_matches("fe80::1%", "fe80::/10"));
+    assert!(admitted_by_allow_rule("fe80::1%", "fe80::1").await);
+    assert!(admitted_by_allow_rule("fe80::1%", "fe80::/10").await);
 }
 
 #[tokio::test]
