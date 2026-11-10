@@ -123,7 +123,10 @@ fn destination_rule_connect_timeout_accepts_the_valid_range() {
 
 #[test]
 fn virtual_service_timeout_typo_refuses_instead_of_disabling_the_timeout() {
-    for raw in [json!("5"), json!("10 s"), json!("-1s"), json!(10)] {
+    // `parse_istio_duration_ms` trims around the number, so `"10 s"` parses as
+    // ten seconds (pre-existing leniency, not a disabled timeout); `"10sec"`
+    // is the unit typo that does not parse.
+    for raw in [json!("5"), json!("10sec"), json!("-1s"), json!(10)] {
         let error = translate_k8s_objects(&[virtual_service(raw.clone())], options())
             .map(|_| ())
             .expect_err("an unparseable route timeout must refuse the VirtualService");
