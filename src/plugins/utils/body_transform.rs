@@ -715,7 +715,7 @@ enum BodyRulesPass {
 pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyRulesOutcome {
     use crate::plugins::BoundedResponseBodyConstruction;
 
-    match run_body_rules(body, rules, usize::MAX, true) {
+    match run_body_rules(body, rules, usize::MAX) {
         BodyRulesPass::Construction(BoundedResponseBodyConstruction::Replaced(bytes)) => {
             RequestBodyRulesOutcome::Replaced(bytes)
         }
@@ -733,9 +733,11 @@ pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyR
 /// JSON input; an empty or unparseable body, or one no rule changed, returns
 /// [`crate::plugins::BoundedResponseBodyConstruction::Unchanged`].
 ///
-/// Unlike [`apply_request_body_rules`], this pass does not preserve number
-/// lexemes: a rewritten document re-serializes every number from
-/// `serde_json::Value` (issue #7149).
+/// Like [`apply_request_body_rules`], this pass preserves every backend number
+/// lexeme that is not an exactly representable 64-bit integer byte for byte,
+/// so a rewrite that only touched other fields cannot round or re-spell a
+/// backend value (issue #7149). The stand-in document is transient and the
+/// rewritten output still goes through the same bounded sink.
 ///
 /// The response side passes this response's retained ceiling so the rewritten
 /// JSON is serialized THROUGH a bounded sink: a rule set that amplifies a
@@ -752,18 +754,13 @@ pub(crate) fn apply_body_rules_bounded(
     rules: &[BodyRule],
     ceiling: usize,
 ) -> crate::plugins::BoundedResponseBodyConstruction {
-    match run_body_rules(body, rules, ceiling, false) {
+    match run_body_rules(body, rules, ceiling) {
         BodyRulesPass::Construction(construction) => construction,
         BodyRulesPass::Skipped(_) => crate::plugins::BoundedResponseBodyConstruction::Unchanged,
     }
 }
 
-fn run_body_rules(
-    body: &[u8],
-    rules: &[BodyRule],
-    ceiling: usize,
-    preserve_number_lexemes: bool,
-) -> BodyRulesPass {
+fn run_body_rules(body: &[u8], rules: &[BodyRule], ceiling: usize) -> BodyRulesPass {
     use crate::plugins::BoundedResponseBodyConstruction;
 
     if rules.is_empty() || body.is_empty() {
@@ -782,24 +779,22 @@ fn run_body_rules(
         return BodyRulesPass::Skipped(BodyRulesSkipReason::NoRuleApplied);
     }
 
-    if preserve_number_lexemes {
-        let mut scan = DocumentNumberScan::default();
-        scan_document_numbers(&json, &mut scan);
-        // Only a document that still holds an `f64` can have lost a lexeme:
-        // every integer serde_json kept as `u64` / `i64` re-serializes exactly.
-        // The stand-in generation is one no string in the document already
-        // uses, so a client string can never be mistaken for a stand-in and a
-        // stand-in-shaped client string never disables the preservation.
-        if scan.has_float {
-            let spans = lossy_number_spans(body);
-            if !spans.is_empty()
-                && let Some(generation) =
-                    (0u64..).find(|candidate| !scan.used_stand_in_generations.contains(candidate))
-                && let Some(construction) =
-                    rewrite_preserving_number_lexemes(body, &spans, rules, ceiling, generation)
-            {
-                return BodyRulesPass::Construction(construction);
-            }
+    let mut scan = DocumentNumberScan::default();
+    scan_document_numbers(&json, &mut scan);
+    // Only a document that still holds an `f64` can have lost a lexeme:
+    // every integer serde_json kept as `u64` / `i64` re-serializes exactly.
+    // The stand-in generation is one no string in the document already
+    // uses, so a client string can never be mistaken for a stand-in and a
+    // stand-in-shaped client string never disables the preservation.
+    if scan.has_float {
+        let spans = lossy_number_spans(body);
+        if !spans.is_empty()
+            && let Some(generation) =
+                (0u64..).find(|candidate| !scan.used_stand_in_generations.contains(candidate))
+            && let Some(construction) =
+                rewrite_preserving_number_lexemes(body, &spans, rules, ceiling, generation)
+        {
+            return BodyRulesPass::Construction(construction);
         }
     }
 
