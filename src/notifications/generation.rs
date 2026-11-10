@@ -38,7 +38,7 @@
 //! always rolled back.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::Notify;
@@ -71,7 +71,6 @@ pub struct DispatchGeneration {
     /// retirement immediately instead of on a polling cadence.
     cancel_signal: Notify,
     metrics: Arc<DeliveryMetrics>,
-    next_task_id: AtomicU64,
 }
 
 impl DispatchGeneration {
@@ -89,7 +88,6 @@ impl DispatchGeneration {
             drained: Notify::new(),
             cancel_signal: Notify::new(),
             metrics,
-            next_task_id: AtomicU64::new(1),
         })
     }
 
@@ -296,7 +294,6 @@ impl DispatchGeneration {
             return false;
         }
         let generation = Arc::clone(self);
-        let _task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
 
         // Reserve local drain accounting before asking the delivery registry so
         // a successful handoff cannot race a zero in-flight read on Drop. The

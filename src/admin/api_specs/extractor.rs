@@ -388,7 +388,7 @@ pub fn extract_with_external_refs(
     // --- info.title / info.version ---------------------------------------
     // Both fields are truncated at UTF-8 character boundaries so an operator
     // with a 25 MiB spec cannot store a 1 MiB title or version string.
-    // `description` was already bounded to 4096 bytes in `extract_spec_metadata`.
+    // `description` is bounded to 4096 bytes in `extract_spec_metadata` below.
     let title = root
         .get("info")
         .and_then(|i| i.get("title"))
@@ -4074,13 +4074,6 @@ const MAX_SCHEMA_INDEX_DEPTH: usize = 64;
 /// so hostile callback chains are rejected deterministically as schema depth,
 /// while ordinary Schema Object indexing retains its larger independent cap.
 const MAX_PATH_ITEM_INDEX_DEPTH: usize = 24;
-/// Synthetic document base for local-only URI resolution when no operator
-/// `document_base` is configured. Never fetched.
-///
-/// Kept as the extractor-side name for [`super::external_refs::DEFAULT_DOCUMENT_BASE`];
-/// [`EffectiveExternalRefPolicy::document_base`] already defaults to this value.
-#[allow(dead_code)]
-const LOCAL_SCHEMA_DOCUMENT_BASE: &str = super::external_refs::DEFAULT_DOCUMENT_BASE;
 type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
 
 /// Incremental cap for all materialized request/response entries in one
@@ -6433,8 +6426,9 @@ pub(crate) fn count_value_nodes(val: &serde_json::Value, budget: &mut usize) -> 
 
 /// Maximum recursion depth for [`find_forbidden_key`].
 ///
-/// serde_yaml's own parser enforces a depth limit of ~128 for the YAML
-/// document. We set an explicit, lower limit here (32) so the contract
+/// The bounded YAML parser enforces a depth limit of
+/// `bounded_yaml::MAX_YAML_DEPTH` (128) for the YAML document. We set an
+/// explicit, lower limit here (32) so the contract
 /// is documented in code rather than relying on the parser's internal
 /// behaviour.  Configs nested deeper than 32 levels are rejected with a
 /// synthetic `"__depth_exceeded__"` sentinel, causing the spec to be
@@ -7481,10 +7475,6 @@ x-ferrum-proxy:
             "got: {err}"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Counter-example: a `jwt` plugin with legitimate config is NOT flagged
-    // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
     // Fix 1: Upstream auto-link to proxy

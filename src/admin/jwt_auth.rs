@@ -188,8 +188,9 @@ impl AdminClaims {
     /// identical claim shapes (single string or array of strings). A missing
     /// claim yields `AllowedNamespaces::empty()`; malformed shapes are
     /// rejected (fail-closed) rather than treated as absent — a garbled
-    /// tenancy claim must never widen access. Only *enforced* against the
-    /// requested namespace when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`.
+    /// tenancy claim must never widen access. A present claim always bounds the
+    /// token; `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` additionally refuses
+    /// claim-less tokens on namespace-scoped routes.
     pub fn allowed_namespaces(&self) -> Result<crate::grpc::auth::AllowedNamespaces, String> {
         crate::grpc::auth::parse_ns_claim(&self.additional)
     }
@@ -845,7 +846,8 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
         resolve_ferrum_var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|| "ferrum-edge".to_string());
 
     // Optional: when set (and non-empty), Admin API tokens must carry a
-    // matching `aud` claim. Unset ⇒ audience is not validated.
+    // matching `aud` claim. Unset ⇒ tokens without `aud` are accepted and tokens
+    // that carry one are rejected (see `JwtConfig::audience`).
     let audience = resolve_ferrum_var("FERRUM_ADMIN_JWT_AUDIENCE").filter(|s| !s.is_empty());
 
     let config = JwtConfig {
