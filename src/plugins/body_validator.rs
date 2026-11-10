@@ -999,15 +999,27 @@ impl BodyValidator {
         // (the value-bearing `invalid type: ...` / `invalid value: ...` forms
         // are raised only by typed `Deserialize` impls, which this call does
         // not use). Keep the target as `Value` if this ever changes
-        // (`GHSA-5p2h-fq6q-gwh9`).
-        let mut parsed: Value =
-            serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+        // (`GHSA-5p2h-fq6q-gwh9`). The line/column still describe where the
+        // body stopped parsing, so only the request side — the caller's own
+        // payload — carries them; an upstream body's shape is never described
+        // back to the client (`GHSA-84xq-rr63-39pw`).
+        let mut parsed: Value = serde_json::from_str(body).map_err(|e| match direction {
+            Direction::Request => format!("Invalid JSON: {}", e),
+            Direction::Response => RESPONSE_INVALID_JSON_DETAIL.to_string(),
+        })?;
 
-        // Check required fields
+        // Check required fields. A request-side miss names the configured
+        // field so the caller can fix its own payload (the same class of name
+        // a schema-declared property in a request-side location is); a
+        // response-side miss never says which field the upstream omitted
+        // (`GHSA-84xq-rr63-39pw`).
         if let Value::Object(map) = &parsed {
             for field in required_fields {
                 if !map.contains_key(field) {
-                    return Err(format!("Missing required field: {}", field));
+                    return Err(match direction {
+                        Direction::Request => format!("Missing required field: {}", field),
+                        Direction::Response => RESPONSE_MISSING_REQUIRED_FIELD_DETAIL.to_string(),
+                    });
                 }
             }
         } else if !required_fields.is_empty() {
@@ -1148,9 +1160,14 @@ impl BodyValidator {
     ) -> Result<(), ProtobufFailure> {
         let mut reservation = ResponseBufferReservation::new();
         match representation {
-            GrpcRepresentation::Native => {
-                self.validate_protobuf_frame(body, descriptor, 0, &mut reservation, budget)
-            }
+            GrpcRepresentation::Native => self.validate_protobuf_frame(
+                body,
+                descriptor,
+                direction,
+                0,
+                &mut reservation,
+                budget,
+            ),
             GrpcRepresentation::WebBinary => self.validate_grpc_web_frames(
                 body,
                 descriptor,
@@ -1213,6 +1230,7 @@ impl BodyValidator {
             Some(frame) => self.validate_protobuf_frame(
                 frame,
                 descriptor,
+                direction,
                 concurrent_bytes,
                 reservation,
                 budget,
@@ -1253,6 +1271,7 @@ impl BodyValidator {
         &self,
         frame: &[u8],
         descriptor: &MessageDescriptor,
+        direction: Direction,
         concurrent_bytes: usize,
         reservation: &mut ResponseBufferReservation,
         budget: BudgetRef<'_>,
@@ -1268,6 +1287,7 @@ impl BodyValidator {
         let policy = ProtobufMessagePolicy {
             check_required: self.protobuf_pool_has_proto2,
             reject_unknown: self.protobuf_reject_unknown_fields,
+            name_missing_required: direction == Direction::Request,
         };
         let mut preflight = ProtobufDecodePreflight::default();
         if let Err(error) = preflight.charge_message() {
@@ -1832,6 +1852,22 @@ fn grpc_web_trailer_is_terminal_error(block: &[u8]) -> bool {
 /// Fixed diagnostic for a protobuf payload the wire preflight or the reflection
 /// decoder rejected.
 const PROTOBUF_DECODE_FAILED_DETAIL: &str = "Protobuf decode failed";
+
+/// Fixed response-side diagnostic for an upstream JSON body that does not
+/// parse. The parser's line/column would describe the upstream body's shape
+/// (`GHSA-84xq-rr63-39pw`).
+const RESPONSE_INVALID_JSON_DETAIL: &str = "Response body is not valid JSON";
+
+/// Fixed response-side diagnostic for an upstream JSON body that omits a
+/// configured `response_required_fields` entry; the field is never named
+/// (`GHSA-84xq-rr63-39pw`).
+const RESPONSE_MISSING_REQUIRED_FIELD_DETAIL: &str = "Response body is missing a required field";
+
+/// Fixed response-side diagnostic for an upstream protobuf message that omits
+/// a proto2 `required` field; the descriptor field path is never named
+/// (`GHSA-84xq-rr63-39pw`).
+const RESPONSE_MISSING_REQUIRED_PROTOBUF_FIELD_DETAIL: &str =
+    "Response message is missing a required protobuf field";
 
 /// Maximum number of field values (scalar elements included) one decoded
 /// message tree may carry. Every value becomes a reflected node, so this bounds
@@ -3005,6 +3041,10 @@ struct ProtobufMessagePolicy {
     check_required: bool,
     /// Enforce `protobuf_reject_unknown_fields` at every nesting level.
     reject_unknown: bool,
+    /// Name the missing `required` field's descriptor path in the diagnostic.
+    /// Request side only: a response-side diagnostic never says which field
+    /// an upstream message omitted (`GHSA-84xq-rr63-39pw`).
+    name_missing_required: bool,
 }
 
 impl ProtobufMessagePolicy {
@@ -3019,8 +3059,10 @@ impl ProtobufMessagePolicy {
 /// required scalar carrying its type's default value is present because proto2
 /// tracks it with a hasbit, and prost-reflect's `has_field` reflects exactly
 /// that. proto3 descriptors have no `Required` cardinality, so proto3 messages
-/// are unaffected. The error names the offending field path (descriptor
-/// metadata, configured by the operator) and never any payload value.
+/// are unaffected. A request-side error names the offending field path
+/// (descriptor metadata, configured by the operator) and never any payload
+/// value; a response-side error is the fixed
+/// [`RESPONSE_MISSING_REQUIRED_PROTOBUF_FIELD_DETAIL`].
 ///
 /// **Unknown fields.** `DynamicMessage::unknown_fields()` reports only the
 /// fields the decoder could not place in THIS message; nested message values
@@ -3064,6 +3106,9 @@ fn check_protobuf_message_at(
         let descriptor = message.descriptor();
         for field in descriptor.fields() {
             if field.cardinality() == Cardinality::Required && !message.has_field(&field) {
+                if !policy.name_missing_required {
+                    return Err(RESPONSE_MISSING_REQUIRED_PROTOBUF_FIELD_DETAIL.to_string());
+                }
                 let name = field.name();
                 return Err(format!("Missing required protobuf field: {path}{name}"));
             }
