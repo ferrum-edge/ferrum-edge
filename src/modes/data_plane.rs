@@ -1046,7 +1046,7 @@ pub async fn run(
             .wait_until_started(Duration::from_secs(10))
             .await?;
     }
-    proxy_state.set_h3_websocket_listener_started(h3_listener_started);
+    proxy_state.set_h3_listener_started(h3_listener_started);
 
     let dp_proxy_state = proxy_state.clone();
     let dp_shutdown = shutdown_tx.subscribe();

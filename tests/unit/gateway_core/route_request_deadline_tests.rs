@@ -1365,6 +1365,46 @@ fn config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConf
 }
 
 #[tokio::test]
+async fn global_alt_svc_waits_for_a_started_quic_listener() {
+    use ferrum_edge::config::env_config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+
+    // `FERRUM_ENABLE_HTTP3=true` alone: no frontend TLS material, so no serving
+    // mode starts the QUIC listener and nothing may advertise it (issue #7168).
+    let env_config = EnvConfig {
+        enable_http3: true,
+        ..Default::default()
+    };
+    let https_port = env_config.proxy_https_port;
+    let http_port = env_config.proxy_http_port;
+    let (state, _) = ProxyState::new(
+        config(vec![proxy("api", None)], Vec::new()),
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+
+    for port in [None, Some(https_port), Some(http_port)] {
+        assert!(
+            state.alt_svc_for_frontend_port(port).is_none(),
+            "Alt-Svc must stay off until the QUIC listener has started"
+        );
+    }
+
+    state.set_h3_listener_started(true);
+    assert_eq!(
+        state.alt_svc_for_frontend_port(Some(https_port)).as_deref(),
+        Some(format!("h3=\":{https_port}\"; ma=86400").as_str())
+    );
+
+    state.set_h3_listener_started(false);
+    assert!(state.alt_svc_for_frontend_port(None).is_none());
+}
+
+#[tokio::test]
 async fn the_gateway_advertises_http3_where_a_timed_rule_is_served() {
     use ferrum_edge::config::env_config::EnvConfig;
     use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -1387,6 +1427,8 @@ async fn the_gateway_advertises_http3_where_a_timed_rule_is_served() {
         None,
     )
     .expect("test proxy state should build");
+    // The serving mode reports its process-global QUIC listener as started.
+    state.set_h3_listener_started(true);
 
     // Native HTTP/3 enforces both route timeouts, so a timed rule no longer
     // costs the origin its HTTP/3 advertisement.

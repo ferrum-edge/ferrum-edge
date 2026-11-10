@@ -7851,8 +7851,15 @@ pub struct ProxyState {
     pub service_discovery_manager: Arc<ServiceDiscoveryManager>,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement on the
     /// process-global proxy ports. `None` when HTTP/3 is disabled; avoids a
-    /// `format!()` allocation per response.
+    /// `format!()` allocation per response. Advertised only while
+    /// [`Self::h3_listener_live`] is set.
     pub alt_svc_header: Option<Arc<str>>,
+    /// True only after the serving mode actually started the process-global
+    /// QUIC listener (see [`Self::set_h3_listener_started`]).
+    /// `FERRUM_ENABLE_HTTP3` alone is not enough: the listener also needs
+    /// frontend TLS material and a non-zero HTTPS port, and `Alt-Svc` must
+    /// never advertise a QUIC endpoint that does not exist (issue #7168).
+    pub h3_listener_live: Arc<AtomicBool>,
     /// Pre-computed Alt-Svc values for dynamically bound Gateway API listener
     /// ports that really have a QUIC socket, published by
     /// [`crate::proxy::gateway_listener::GatewayListenerManager`] on each
@@ -11708,6 +11715,7 @@ impl ProxyState {
             },
             http3_connect_udp_max_sessions_per_ip,
             h3_websocket_reachable: Arc::new(AtomicBool::new(false)),
+            h3_listener_live: Arc::new(AtomicBool::new(false)),
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
                     pool_shard_amount,
@@ -11988,6 +11996,9 @@ impl ProxyState {
     /// small-map lookup; no allocation and no lock.
     pub fn alt_svc_for_frontend_port(&self, frontend_port: Option<u16>) -> Option<Arc<str>> {
         let global = self.alt_svc_header.as_ref()?;
+        if !self.h3_listener_live.load(Ordering::Acquire) {
+            return None;
+        }
         match frontend_port {
             Some(port)
                 if port != self.env_config.proxy_https_port
@@ -12170,11 +12181,7 @@ impl ProxyState {
                     &upstream_id,
                 );
                 relay_proxy.dispatch_port_overrides =
-                    Self::projected_dispatch_overrides_for_upstream(
-                        config,
-                        &service.namespace,
-                        &upstream_id,
-                    );
+                    Self::projected_dispatch_overrides_for_upstream(upstream);
                 for target in &upstream.targets {
                     // Only Ambient `mesh.hbone` targets use the HBONE capability
                     // registry. Sidecar `mesh.mtls` raw-TCP targets dispatch over
@@ -12224,11 +12231,8 @@ impl ProxyState {
                 spec.canonical_ip,
                 &spec.upstream_id,
             );
-            relay_proxy.dispatch_port_overrides = Self::projected_dispatch_overrides_for_upstream(
-                config,
-                &spec.service.namespace,
-                &spec.upstream_id,
-            );
+            relay_proxy.dispatch_port_overrides =
+                Self::projected_dispatch_overrides_for_upstream(upstream);
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
@@ -12278,11 +12282,7 @@ impl ProxyState {
                     &upstream_id,
                 );
                 relay_proxy.dispatch_port_overrides =
-                    Self::projected_dispatch_overrides_for_upstream(
-                        config,
-                        &service.namespace,
-                        &upstream_id,
-                    );
+                    Self::projected_dispatch_overrides_for_upstream(upstream);
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
@@ -12315,13 +12315,38 @@ impl ProxyState {
             if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
                 continue;
             }
-            let Some(proxy_id) = plugin.proxy_id.as_deref() else {
-                continue;
+            // A Proxy-scoped instance names its proxy. Global and ProxyGroup
+            // instances reach every proxy they effectively attach to, resolved
+            // exactly as the plugin cache resolves them at runtime; skipping
+            // them left their rule destinations without a capability record,
+            // so native H3 / direct H2 never engaged for those routes
+            // (issue #7168).
+            let base_proxies: Vec<&Proxy> = match plugin.scope {
+                PluginScope::Proxy => plugin
+                    .proxy_id
+                    .as_deref()
+                    .and_then(|proxy_id| {
+                        proxy_map
+                            .get(&(plugin.namespace.as_str(), proxy_id))
+                            .copied()
+                    })
+                    .into_iter()
+                    .collect(),
+                PluginScope::Global | PluginScope::ProxyGroup => config
+                    .proxies
+                    .iter()
+                    .filter(|proxy| {
+                        crate::plugin_cache::plugin_config_effectively_applies_to_proxy(
+                            plugin, proxy, config,
+                        )
+                    })
+                    .collect(),
             };
-            let Some(base_proxy) = proxy_map.get(&(plugin.namespace.as_str(), proxy_id)) else {
-                continue;
-            };
-            if !base_proxy.dispatch_kind.is_http_family() {
+            let base_proxies: Vec<&Proxy> = base_proxies
+                .into_iter()
+                .filter(|proxy| proxy.dispatch_kind.is_http_family())
+                .collect();
+            if base_proxies.is_empty() {
                 continue;
             }
             let Ok(dispatch_config) =
@@ -12329,67 +12354,80 @@ impl ProxyState {
             else {
                 warn!(
                     plugin_id = %plugin.id,
-                    proxy_id = %proxy_id,
                     "Skipping mesh_route_dispatch capability targets: config failed to parse"
                 );
                 continue;
             };
 
-            for rule in dispatch_config.rules {
-                let destination = rule.destination;
-                let direct_backend_override = destination.upstream_id.is_none()
-                    && (destination.backend_host.is_some() || destination.backend_port.is_some());
-                let mut effective_proxy = (*base_proxy).clone();
-                if let Some(upstream_id) = destination.upstream_id {
-                    effective_proxy.upstream_id = Some(upstream_id.clone());
-                    let Some(upstream) =
-                        upstream_map.get(&(base_proxy.namespace.as_str(), upstream_id.as_str()))
-                    else {
-                        continue;
-                    };
-                    effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
-                    for target in &upstream.targets {
-                        // SKIP cross-cluster east-west HBONE targets — a
-                        // mesh_route_dispatch rule could point at the same mesh
-                        // egress upstream; same rationale as the proxy-driven
-                        // walk above (dispatch bypasses the registry for them,
-                        // probing dials the gateway with the wrong SNI).
-                        if crate::proxy::hbone_pool::target_hbone_cross_cluster(target) {
-                            continue;
-                        }
-                        let probe_target = BackendCapabilityProbeTarget::from_proxy(
-                            &effective_proxy,
-                            Some(target),
-                        );
-                        if seen.insert(probe_target.key.clone()) {
-                            targets.push(probe_target);
-                        }
-                    }
+            for base_proxy in base_proxies {
+                for rule in &dispatch_config.rules {
+                    Self::collect_mesh_route_dispatch_rule_targets(
+                        base_proxy,
+                        &rule.destination,
+                        upstream_map,
+                        seen,
+                        targets,
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_mesh_route_dispatch_rule_targets(
+        base_proxy: &Proxy,
+        destination: &crate::plugins::mesh_route_dispatch::RouteDestination,
+        upstream_map: &HashMap<(&str, &str), &Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        targets: &mut Vec<BackendCapabilityProbeTarget>,
+    ) {
+        let direct_backend_override = destination.upstream_id.is_none()
+            && (destination.backend_host.is_some() || destination.backend_port.is_some());
+        let mut effective_proxy = base_proxy.clone();
+        if let Some(upstream_id) = destination.upstream_id.as_deref() {
+            effective_proxy.upstream_id = Some(upstream_id.to_string());
+            let Some(upstream) = upstream_map.get(&(base_proxy.namespace.as_str(), upstream_id))
+            else {
+                return;
+            };
+            effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
+            for target in &upstream.targets {
+                // SKIP cross-cluster east-west HBONE targets — a
+                // mesh_route_dispatch rule could point at the same mesh
+                // egress upstream; same rationale as the proxy-driven
+                // walk above (dispatch bypasses the registry for them,
+                // probing dials the gateway with the wrong SNI).
+                if crate::proxy::hbone_pool::target_hbone_cross_cluster(target) {
                     continue;
                 }
-
-                if let Some(host) = destination.backend_host {
-                    effective_proxy.backend_host = host;
-                }
-                if let Some(port) = destination.backend_port {
-                    effective_proxy.backend_port = port;
-                }
-                if direct_backend_override {
-                    let reset_direct_tls = effective_proxy.upstream_id.is_some();
-                    effective_proxy.upstream_id = None;
-                    if reset_direct_tls {
-                        effective_proxy.resolved_tls = BackendTlsConfig::from_proxy(base_proxy);
-                    }
-                }
-                if let Some(tls) = destination.backend_tls {
-                    effective_proxy.resolved_tls = tls;
-                }
-
-                let probe_target = BackendCapabilityProbeTarget::from_proxy(&effective_proxy, None);
+                let probe_target =
+                    BackendCapabilityProbeTarget::from_proxy(&effective_proxy, Some(target));
                 if seen.insert(probe_target.key.clone()) {
                     targets.push(probe_target);
                 }
             }
+            return;
+        }
+
+        if let Some(host) = destination.backend_host.as_ref() {
+            effective_proxy.backend_host = host.clone();
+        }
+        if let Some(port) = destination.backend_port {
+            effective_proxy.backend_port = port;
+        }
+        if direct_backend_override {
+            let reset_direct_tls = effective_proxy.upstream_id.is_some();
+            effective_proxy.upstream_id = None;
+            if reset_direct_tls {
+                effective_proxy.resolved_tls = BackendTlsConfig::from_proxy(base_proxy);
+            }
+        }
+        if let Some(tls) = destination.backend_tls.as_ref() {
+            effective_proxy.resolved_tls = tls.clone();
+        }
+
+        let probe_target = BackendCapabilityProbeTarget::from_proxy(&effective_proxy, None);
+        if seen.insert(probe_target.key.clone()) {
+            targets.push(probe_target);
         }
     }
 
@@ -13989,13 +14027,16 @@ impl ProxyState {
             return false;
         }
 
+        // Serialize in place and drop the volatile timestamps from the value,
+        // rather than deep-cloning the proxy to overwrite them first (issue
+        // #7168). The normalized-JSON comparison itself is the same contract
+        // `projected_dr_dispatch_changed_upstreams` uses for upstreams.
         fn content_value(proxy: &Proxy) -> Option<serde_json::Value> {
-            let mut normalized = proxy.clone();
-            let epoch = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                .unwrap_or_else(chrono::Utc::now);
-            normalized.created_at = epoch;
-            normalized.updated_at = epoch;
-            serde_json::to_value(&normalized).ok()
+            let mut value = serde_json::to_value(proxy).ok()?;
+            let fields = value.as_object_mut()?;
+            fields.remove("created_at");
+            fields.remove("updated_at");
+            Some(value)
         }
 
         match (content_value(a), content_value(b)) {
@@ -14022,10 +14063,12 @@ impl ProxyState {
         let Some(mesh) = config.mesh.as_deref() else {
             return HashMap::new();
         };
-        let upstream_keys: std::collections::HashSet<(&str, &str)> = config
+        // One `(namespace, id)` index per projection instead of a linear scan
+        // of every upstream per mesh relay upstream (issue #7168).
+        let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|u| (u.namespace.as_str(), u.id.as_str()))
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
         let mut projection = HashMap::new();
 
@@ -14039,14 +14082,12 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
+                if let Some(upstream) =
+                    upstream_map.get(&(service.namespace.as_str(), upstream_id.as_str()))
+                {
                     projection.insert(
                         NamespacedResourceId::new(&service.namespace, &upstream_id),
-                        Self::projected_dispatch_overrides_for_upstream(
-                            config,
-                            &service.namespace,
-                            &upstream_id,
-                        ),
+                        Self::projected_dispatch_overrides_for_upstream(upstream),
                     );
                 }
             }
@@ -14056,14 +14097,12 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
+                if let Some(upstream) =
+                    upstream_map.get(&(service.namespace.as_str(), upstream_id.as_str()))
+                {
                     projection.insert(
                         NamespacedResourceId::new(&service.namespace, &upstream_id),
-                        Self::projected_dispatch_overrides_for_upstream(
-                            config,
-                            &service.namespace,
-                            &upstream_id,
-                        ),
+                        Self::projected_dispatch_overrides_for_upstream(upstream),
                     );
                 }
             }
@@ -14074,15 +14113,12 @@ impl ProxyState {
             &mesh.workloads,
             mesh.multi_cluster.as_ref(),
         ) {
-            if upstream_keys.contains(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
+            if let Some(upstream) =
+                upstream_map.get(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
             {
                 projection.insert(
                     NamespacedResourceId::new(&spec.service.namespace, &spec.upstream_id),
-                    Self::projected_dispatch_overrides_for_upstream(
-                        config,
-                        &spec.service.namespace,
-                        &spec.upstream_id,
-                    ),
+                    Self::projected_dispatch_overrides_for_upstream(upstream),
                 );
             }
         }
@@ -14091,14 +14127,8 @@ impl ProxyState {
     }
 
     fn projected_dispatch_overrides_for_upstream(
-        config: &GatewayConfig,
-        namespace: &str,
-        upstream_id: &str,
+        upstream: &Upstream,
     ) -> Option<HashMap<u16, crate::config::types::ResolvedPortOverride>> {
-        let upstream = config
-            .upstreams
-            .iter()
-            .find(|u| u.namespace == namespace && u.id == upstream_id)?;
         if upstream.port_overrides.is_empty() {
             return None;
         }
@@ -14404,14 +14434,19 @@ impl ProxyState {
         self.tls_inventory_cache.mark_stale();
     }
 
-    /// Record whether the serving mode actually started an H3 listener.
+    /// Record whether the serving mode actually started the process-global H3
+    /// listener.
     ///
     /// This must be set by mode startup after it evaluates the same gates used
     /// to spawn the listener: H3 enabled, HTTPS port available, and frontend
     /// TLS material or a dynamic TLS slot. Keeping this as a listener-start
     /// signal avoids warning about H3 WebSocket behavior in HTTP-only
-    /// deployments where env flags are enabled but no QUIC listener exists.
-    pub(crate) fn set_h3_websocket_listener_started(&self, h3_listener_started: bool) {
+    /// deployments where env flags are enabled but no QUIC listener exists,
+    /// and keeps `Alt-Svc` off the process-global ports until a QUIC listener
+    /// really serves them.
+    pub fn set_h3_listener_started(&self, h3_listener_started: bool) {
+        self.h3_listener_live
+            .store(h3_listener_started, Ordering::Release);
         let reachable = h3_websocket_reachable_from_listener(&self.env_config, h3_listener_started);
         let was_reachable = self
             .h3_websocket_reachable
@@ -14778,6 +14813,13 @@ impl ProxyState {
                         && !projected_lb_changed
                         && country_mmdb_plugin_cache.is_none()
                     {
+                        // Unchanged: still advance the stored snapshot (its
+                        // `loaded_at` is the DP's committed-version
+                        // watermark), but here, under the publication lock,
+                        // like every other `ProxyState.config` write — never
+                        // after the lock is released, where an older candidate
+                        // could overwrite a newer writer's (issue #7168).
+                        self.config.store(Arc::clone(&staged_config));
                         return Ok(None);
                     }
 
@@ -14861,9 +14903,9 @@ impl ProxyState {
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
+                // The staging closure already stored the unchanged candidate
+                // (and its `loaded_at`) under the publication lock.
                 debug!("Config poll: candidate valid but unchanged, skipping update");
-                // Still update loaded_at timestamp
-                self.config.store(Arc::clone(&staged_config));
                 return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
@@ -73979,6 +74021,35 @@ mod tests {
     }
 
     #[test]
+    fn proxy_content_eq_ignores_timestamps_but_not_same_timestamp_edits() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let original = route_delta_proxy("content", DispatchKind::HttpPool, t0);
+
+        let mut touched = original.clone();
+        touched.created_at = t1;
+        touched.updated_at = t1;
+        assert!(
+            ProxyState::proxy_content_eq(&original, &touched),
+            "a timestamp-only rewrite must not count as a route-content change"
+        );
+
+        let mut edited = original.clone();
+        edited.backend_port = original.backend_port.wrapping_add(1);
+        assert!(
+            !ProxyState::proxy_content_eq(&original, &edited),
+            "a same-timestamp content edit must be detected"
+        );
+
+        let old_config = route_delta_config(vec![original]);
+        let new_config = route_delta_config(vec![edited]);
+        assert!(ProxyState::projected_route_proxy_content_changed(
+            &old_config,
+            &new_config
+        ));
+    }
+
+    #[test]
     fn delta_routes_changed_ignores_stream_only_proxy_changes() {
         let t0 = chrono::Utc::now();
         let t1 = t0 + chrono::Duration::seconds(1);
@@ -76143,6 +76214,101 @@ mod tests {
     /// the dedup-contract tests only need a stable stand-in that ignores it.
     fn const_pool_key(key: &str) -> impl Fn(&Proxy) -> String + '_ {
         move |_: &Proxy| key.to_string()
+    }
+
+    fn mesh_route_dispatch_plugin_to_upstream(
+        id: &str,
+        scope: PluginScope,
+        proxy_id: Option<&str>,
+        upstream_id: &str,
+    ) -> PluginConfig {
+        let now = chrono::Utc::now();
+        PluginConfig {
+            labels: Default::default(),
+            id: id.to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": upstream_id}
+                }]
+            }),
+            scope,
+            proxy_id: proxy_id.map(str::to_string),
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_targets_expand_global_and_proxy_group_mesh_route_dispatch() {
+        // `grouped` carries the ProxyGroup instance, so the Global instance is
+        // overridden there and applies only to `plain`.
+        let mut grouped = warmup_test_proxy("grouped", BackendScheme::Https, "a.test", 443);
+        grouped.plugins = vec![PluginAssociation {
+            plugin_config_id: "mrd-group".to_string(),
+        }];
+        let plain = warmup_test_proxy("plain", BackendScheme::Https, "b.test", 443);
+        let config = GatewayConfig {
+            proxies: vec![grouped, plain],
+            upstreams: vec![
+                upstream_with_targets("group-canary", &[("group.test", 8443)]),
+                upstream_with_targets("global-canary", &[("global.test", 9443)]),
+                upstream_with_targets("orphan-canary", &[("orphan.test", 7443)]),
+            ],
+            plugin_configs: vec![
+                mesh_route_dispatch_plugin_to_upstream(
+                    "mrd-group",
+                    PluginScope::ProxyGroup,
+                    None,
+                    "group-canary",
+                ),
+                mesh_route_dispatch_plugin_to_upstream(
+                    "mrd-global",
+                    PluginScope::Global,
+                    None,
+                    "global-canary",
+                ),
+                // A ProxyGroup instance no proxy is associated with never runs.
+                mesh_route_dispatch_plugin_to_upstream(
+                    "mrd-orphan",
+                    PluginScope::ProxyGroup,
+                    None,
+                    "orphan-canary",
+                ),
+            ],
+            ..GatewayConfig::default()
+        };
+        let state = make_test_proxy_state(config);
+        let loaded = state.config.load_full();
+
+        let targets = state.collect_backend_capability_targets(&loaded);
+        let probed_for = |host: &str| -> Vec<String> {
+            targets
+                .iter()
+                .filter(|target| target.host() == host)
+                .map(|target| target.proxy.id.clone())
+                .collect()
+        };
+        assert_eq!(
+            probed_for("group.test"),
+            vec!["grouped".to_string()],
+            "a ProxyGroup mesh_route_dispatch destination must be probed for its attached proxy"
+        );
+        assert_eq!(
+            probed_for("global.test"),
+            vec!["plain".to_string()],
+            "a Global mesh_route_dispatch destination must be probed for every proxy it applies to"
+        );
+        assert!(
+            probed_for("orphan.test").is_empty(),
+            "an unattached ProxyGroup instance must not enroll capability targets"
+        );
     }
 
     #[tokio::test]

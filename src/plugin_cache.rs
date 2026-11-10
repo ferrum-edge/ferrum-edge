@@ -4035,7 +4035,7 @@ fn scoped_plugin_config_applies_to_proxy(
     }
 }
 
-fn plugin_config_effectively_applies_to_proxy(
+pub(crate) fn plugin_config_effectively_applies_to_proxy(
     pc: &PluginConfig,
     proxy: &crate::config::types::Proxy,
     config: &GatewayConfig,
