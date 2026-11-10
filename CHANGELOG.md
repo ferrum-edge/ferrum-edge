@@ -646,6 +646,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MAC on read; the envelope version is now 5. Entries written by an earlier
   build fail the version check and are quarantined like any other
   cross-version envelope, so a Redis-backed cache starts cold after upgrade.
+- **`ai_semantic_firewall` type errors name the full field path**
+  (issue #7132). A wrong-typed nested field was reported by its leaf name
+  only: `builtins: {jailbreak: {enabled: "yes"}}` said `` `enabled` must be a
+  boolean`` (which reads as the root switch) and `custom_rules[i]` errors had
+  no index. They now name the qualified path, for example
+  `` `builtins.jailbreak.enabled` `` or `` `custom_rules[0].action` ``.
 
 ### Performance
 - **`ai_tool_governor` drains its live SSE buffer once per chunk**

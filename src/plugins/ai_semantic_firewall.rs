@@ -908,8 +908,10 @@ impl AiSemanticFirewall {
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
         let inspect = optional_object(config, "inspect")?;
-        let inspect_request = optional_bool_in_object(inspect, "request")?.unwrap_or(true);
-        let inspect_response = optional_bool_in_object(inspect, "response")?.unwrap_or(true);
+        let inspect_request =
+            optional_bool_in_object(inspect, "inspect", "request")?.unwrap_or(true);
+        let inspect_response =
+            optional_bool_in_object(inspect, "inspect", "response")?.unwrap_or(true);
 
         let mode = match optional_string(config, "mode")?.unwrap_or("enforce") {
             "enforce" => EnforcementMode::Enforce,
@@ -974,22 +976,26 @@ impl AiSemanticFirewall {
         };
 
         let privacy_object = optional_object(config, "privacy")?;
-        if optional_bool_in_object(privacy_object, "log_raw_text")?.unwrap_or(false) {
+        if optional_bool_in_object(privacy_object, "privacy", "log_raw_text")?.unwrap_or(false) {
             return Err(
                 "ai_semantic_firewall: `privacy.log_raw_text` is reserved for future use and must be false"
                     .to_string(),
             );
         }
         let snippet_hash_salt = match privacy_object {
-            Some(obj) => optional_string_from_object(obj, "snippet_hash_salt")?
+            Some(obj) => optional_string_from_object(obj, "privacy", "snippet_hash_salt")?
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(|value| value.as_bytes().to_vec()),
             None => None,
         };
         let privacy = PrivacyConfig {
-            include_snippet_hash: optional_bool_in_object(privacy_object, "include_snippet_hash")?
-                .unwrap_or(true),
+            include_snippet_hash: optional_bool_in_object(
+                privacy_object,
+                "privacy",
+                "include_snippet_hash",
+            )?
+            .unwrap_or(true),
             snippet_hash_salt,
         };
 
@@ -1002,6 +1008,7 @@ impl AiSemanticFirewall {
         let extraction = ExtractionConfig {
             request_json_paths: optional_string_vec_in_object(
                 extraction_object,
+                "extraction",
                 "request_json_paths",
             )?
             .unwrap_or_else(|| {
@@ -1012,6 +1019,7 @@ impl AiSemanticFirewall {
             }),
             response_json_paths: optional_string_vec_in_object(
                 extraction_object,
+                "extraction",
                 "response_json_paths",
             )?
             .unwrap_or_else(|| {
@@ -3496,9 +3504,10 @@ fn builtin_pack_examples(
     match value {
         Value::Bool(enabled) => Ok(enabled.then(|| strings_to_vec(default_examples))),
         Value::Object(object) => {
-            let enabled = optional_bool_in_object(Some(object), "enabled")?.unwrap_or(true);
+            let path = format!("builtins.{key}");
+            let enabled = optional_bool_in_object(Some(object), &path, "enabled")?.unwrap_or(true);
             let examples_mode =
-                optional_string_from_object(object, "examples_mode")?.unwrap_or("append");
+                optional_string_from_object(object, &path, "examples_mode")?.unwrap_or("append");
             let custom_examples =
                 optional_examples_from_object(object, &format!("builtins.{key}.examples"))?;
 
@@ -3613,8 +3622,12 @@ fn parse_allow_topics(
             &format!("allow_topics[{index}].threshold"),
         )?
         .unwrap_or(0.74);
-        let action_on_no_match = match optional_string_from_object(object, "action_on_no_match")?
-            .unwrap_or("reject")
+        let action_on_no_match = match optional_string_from_object(
+            object,
+            &format!("allow_topics[{index}]"),
+            "action_on_no_match",
+        )?
+        .unwrap_or("reject")
         {
             "reject" => Action::Reject,
             "warn" => Action::Warn,
@@ -3626,7 +3639,12 @@ fn parse_allow_topics(
         };
         topics.push(AllowTopic {
             id,
-            description: optional_string_from_object(object, "description")?.map(str::to_string),
+            description: optional_string_from_object(
+                object,
+                &format!("allow_topics[{index}]"),
+                "description",
+            )?
+            .map(str::to_string),
             example_token_sets: precompute_example_token_sets(&examples),
             examples,
             threshold,
@@ -3663,7 +3681,8 @@ fn parse_deny_topics(
         )?
         .unwrap_or(0.78);
         let action = parse_action(
-            optional_string_from_object(object, "action")?.unwrap_or(default_action.as_str()),
+            optional_string_from_object(object, &format!("deny_topics[{index}]"), "action")?
+                .unwrap_or(default_action.as_str()),
             &format!("deny_topics[{index}].action"),
         )?;
         if action == Action::Allow {
@@ -3673,7 +3692,12 @@ fn parse_deny_topics(
         }
         rules.push(SemanticRule {
             id,
-            description: optional_string_from_object(object, "description")?.map(str::to_string),
+            description: optional_string_from_object(
+                object,
+                &format!("deny_topics[{index}]"),
+                "description",
+            )?
+            .map(str::to_string),
             direction: DirectionScope::Both,
             severity: Severity::High,
             action,
@@ -3718,15 +3742,18 @@ fn parse_custom_rules(
         )?
         .unwrap_or(0.80);
         let direction = parse_direction_scope(
-            optional_string_from_object(object, "direction")?.unwrap_or("both"),
+            optional_string_from_object(object, &format!("custom_rules[{index}]"), "direction")?
+                .unwrap_or("both"),
             &format!("custom_rules[{index}].direction"),
         )?;
         let severity = parse_severity(
-            optional_string_from_object(object, "severity")?.unwrap_or("high"),
+            optional_string_from_object(object, &format!("custom_rules[{index}]"), "severity")?
+                .unwrap_or("high"),
             &format!("custom_rules[{index}].severity"),
         )?;
         let action = parse_action(
-            optional_string_from_object(object, "action")?.unwrap_or(default_action.as_str()),
+            optional_string_from_object(object, &format!("custom_rules[{index}]"), "action")?
+                .unwrap_or(default_action.as_str()),
             &format!("custom_rules[{index}].action"),
         )?;
         if action == Action::Allow {
@@ -3736,7 +3763,12 @@ fn parse_custom_rules(
         }
         rules.push(SemanticRule {
             id,
-            description: optional_string_from_object(object, "description")?.map(str::to_string),
+            description: optional_string_from_object(
+                object,
+                &format!("custom_rules[{index}]"),
+                "description",
+            )?
+            .map(str::to_string),
             direction,
             severity,
             action,
@@ -3806,11 +3838,11 @@ fn parse_provider_config(
     let validated_endpoint =
         validate_provider_endpoint(&endpoint, allow_plaintext, backend_allow_ips)?;
 
-    let model = optional_string_from_object(provider, "model")?
+    let model = optional_string_from_object(provider, "provider", "model")?
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let api_key_env = optional_string_from_object(provider, "api_key_env")?
+    let api_key_env = optional_string_from_object(provider, "provider", "api_key_env")?
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
@@ -5683,7 +5715,7 @@ fn streaming_str<'a>(
     field: &str,
 ) -> Result<Option<&'a str>, String> {
     match streaming {
-        Some(obj) => optional_string_from_object(obj, field),
+        Some(obj) => optional_string_from_object(obj, "streaming", field),
         None => Ok(None),
     }
 }
@@ -9699,14 +9731,19 @@ fn optional_bool(config: &Value, field: &str) -> Result<Option<bool>, String> {
     }
 }
 
+/// `path` is the schema path of `object` (for example `inspect` or
+/// `custom_rules[2]`), so a nested type error names the full field path.
 fn optional_bool_in_object(
     object: Option<&serde_json::Map<String, Value>>,
+    path: &str,
     field: &str,
 ) -> Result<Option<bool>, String> {
     match object.and_then(|object| object.get(field)) {
         None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be a boolean")),
+        Some(_) => Err(format!(
+            "ai_semantic_firewall: `{path}.{field}` must be a boolean"
+        )),
     }
 }
 
@@ -9718,19 +9755,25 @@ fn optional_string<'a>(config: &'a Value, field: &str) -> Result<Option<&'a str>
     }
 }
 
+/// `path` is the schema path of `object`; see [`optional_bool_in_object`].
 fn optional_string_from_object<'a>(
     object: &'a serde_json::Map<String, Value>,
+    path: &str,
     field: &str,
 ) -> Result<Option<&'a str>, String> {
     match object.get(field) {
         None => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.as_str())),
-        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be a string")),
+        Some(_) => Err(format!(
+            "ai_semantic_firewall: `{path}.{field}` must be a string"
+        )),
     }
 }
 
+/// `path` is the schema path of `object`; see [`optional_bool_in_object`].
 fn optional_string_vec_in_object(
     object: Option<&serde_json::Map<String, Value>>,
+    path: &str,
     field: &str,
 ) -> Result<Option<Vec<String>>, String> {
     match object.and_then(|object| object.get(field)) {
@@ -9740,12 +9783,14 @@ fn optional_string_vec_in_object(
             .enumerate()
             .map(|(index, value)| {
                 value.as_str().map(str::to_string).ok_or_else(|| {
-                    format!("ai_semantic_firewall: `{field}[{index}]` must be a string")
+                    format!("ai_semantic_firewall: `{path}.{field}[{index}]` must be a string")
                 })
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
-        Some(_) => Err(format!("ai_semantic_firewall: `{field}` must be an array")),
+        Some(_) => Err(format!(
+            "ai_semantic_firewall: `{path}.{field}` must be an array"
+        )),
     }
 }
 
