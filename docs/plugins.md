@@ -1315,7 +1315,14 @@ that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
 phase or gateway admission gate that rejected the request. Possible values
 include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
 `route_protocol_admission`, `query_trigger_admission`, `route_not_found`,
-`grpc_backend_error`, and `websocket_backend_error`. Gateway-generated gRPC
+`grpc_backend_error`, and `websocket_backend_error`. Gateway-internal failures
+have their own phases: `invalid_backend_path` (a `500` when the matched route and
+target cannot form a backend path), `websocket_upgrade_unavailable` (a `500`
+when an upgrade request carries no upgrade handle), and
+`mesh_transport_dispatch_required` (the native HTTP/3 `502` for a target that
+needs mesh transport). A rejection decided before any proxy matched (an inbound
+HBONE relay-synthesis refusal) is logged under the gateway's serving namespace
+(`FERRUM_NAMESPACE`). Gateway-generated gRPC
 errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
 sinks can distinguish gRPC failures even though the downstream HTTP status is
 `200`.

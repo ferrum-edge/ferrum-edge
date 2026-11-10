@@ -203,6 +203,18 @@ pub const ROUTE_PROTOCOL_ADMISSION_PHASE: &str = "route_protocol_admission";
 /// chain with a query-reading plugin execution trigger (issue #6655).
 pub const QUERY_TRIGGER_ADMISSION_PHASE: &str = "query_trigger_admission";
 
+/// Rejection phase of a gateway `500` whose backend-effective path could not
+/// be built from the matched route and target (issue #7156).
+pub const INVALID_BACKEND_PATH_PHASE: &str = "invalid_backend_path";
+
+/// Rejection phase of a gateway `500` for a WebSocket upgrade whose request
+/// carried no upgrade handle to complete (issue #7156).
+pub const WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE: &str = "websocket_upgrade_unavailable";
+
+/// Rejection phase of the native-H3 `502` for a backend target that requires
+/// mesh transport dispatch the native-H3 path cannot provide (issue #7157).
+pub const MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE: &str = "mesh_transport_dispatch_required";
+
 /// Plugin hook phases. A rejection recorded in one of them is a plugin
 /// rejection even when the rejecting plugin's name is not known.
 const PLUGIN_HOOK_PHASES: [&str; 9] = [
@@ -227,6 +239,9 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     ROUTE_PROTOCOL_ADMISSION_PHASE,
     QUERY_TRIGGER_ADMISSION_PHASE,
     BACKEND_ADMISSION_PHASE,
+    INVALID_BACKEND_PATH_PHASE,
+    WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE,
+    MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE,
     "h1_framing_unverified",
     "config_stale",
     "client_trust_withdrawn",

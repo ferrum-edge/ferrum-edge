@@ -1217,16 +1217,20 @@ fn h1_h2_internal_error_exits_are_counted() {
         "the H1/H2 body must be JSON, not raw text"
     );
     for (index, site) in sites.iter().enumerate().take(4) {
-        // The counting statements sit just before (WebSocket) or just after
-        // (pre-plugin builder) the body literal.
-        let before = &site[site.len().saturating_sub(400)..];
+        // The log and counting statements sit just before (WebSocket) or
+        // just after (pre-plugin builder) the body literal.
+        let before = &site[site.len().saturating_sub(700)..];
         let after = sites[index + 1];
-        let after = &after[..after.len().min(400)];
+        let after = &after[..after.len().min(700)];
         let window = format!("{before}{after}");
         assert!(
             window.contains("ctx.terminal_record.mark_counted();")
                 && window.contains("record_request(&state,"),
             "invalid backend path exit {index} must be marked counted and recorded"
+        );
+        assert!(
+            window.contains("crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE"),
+            "invalid backend path exit {index} must log its rejection phase"
         );
     }
 
@@ -1239,4 +1243,5 @@ fn h1_h2_internal_error_exits_are_counted() {
         .expect("bounded missing OnUpgrade exit");
     assert!(on_upgrade.contains("ctx.terminal_record.mark_counted();"));
     assert!(on_upgrade.contains("record_request(&state,500);"));
+    assert!(on_upgrade.contains("crate::diagnostic_ref::WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE"));
 }

@@ -7665,14 +7665,24 @@ async fn handle_h3_request(
         Ok(url) => url,
         Err(_) => {
             cb_probe.release_neutral();
-            record_request(
-                &state,
-                if matches!(http_flavor, HttpFlavor::Grpc) {
-                    200
-                } else {
-                    500
-                },
-            );
+            let log_status_code = if matches!(http_flavor, HttpFlavor::Grpc) {
+                200
+            } else {
+                500
+            };
+            // Logged under the H1/H2 sibling's phase before the count (issue
+            // #7156); boxed out of line for this handler's stack budget.
+            crate::proxy::boxed_log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                log_status_code,
+                start_time,
+                crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+                plugin_execution_ns,
+                Some(&original_request_path),
+            )
+            .await;
+            record_request(&state, log_status_code);
             send_h3_error_flavor_aware_with_policy(
                 &mut stream,
                 http_flavor,
@@ -7847,6 +7857,18 @@ async fn handle_h3_request(
             MESH_DISPATCH_REQUIRED_REJECT_BODY,
             &reason_headers,
         );
+        // Logged before the count like every sibling reject (issue #7157);
+        // boxed out of line for this handler's stack budget.
+        crate::proxy::boxed_log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            reject_metric_status,
+            start_time,
+            crate::diagnostic_ref::MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
         record_request(&state, reject_metric_status);
         send_h3_plugin_reject_flavor_aware(
             &mut stream,

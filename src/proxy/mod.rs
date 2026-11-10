@@ -16689,7 +16689,18 @@ async fn handle_websocket_request_authenticated(
     ) {
         Ok(url) => url,
         Err(_) => {
-            // Counted like every sibling reject of this handler (issue #7156).
+            // Logged and counted like every sibling reject of this handler
+            // (issue #7156).
+            boxed_log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                start_time,
+                crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+                plugin_execution_ns,
+                Some(&original_request_path),
+            )
+            .await;
             ctx.terminal_record.mark_counted();
             record_request(&state, 500);
             cb_probe.release_neutral();
@@ -16710,7 +16721,18 @@ async fn handle_websocket_request_authenticated(
         Some(on_upgrade) => on_upgrade,
         None => {
             error!("Failed to extract OnUpgrade extension from WebSocket request");
-            // Counted like every sibling reject of this handler (issue #7156).
+            // Logged and counted like every sibling reject of this handler
+            // (issue #7156).
+            boxed_log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                start_time,
+                crate::diagnostic_ref::WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE,
+                plugin_execution_ns,
+                Some(&original_request_path),
+            )
+            .await;
             ctx.terminal_record.mark_counted();
             record_request(&state, 500);
             // The caller's CB check may have claimed a HALF_OPEN probe slot —
@@ -33600,7 +33622,7 @@ type BoxedGrpcWebRejectFuture<'a> =
 
 /// One rejection-logging future, heap-allocated so it is not a frame slot in
 /// the caller. See [`boxed_finalize_reject_response`].
-type BoxedRejectionLogFuture<'a> =
+pub(crate) type BoxedRejectionLogFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
 /// The gRPC-Web reject translation, constructed out of line and returned boxed,
@@ -33649,7 +33671,7 @@ fn boxed_log_rejected_request<'a>(
 /// [`boxed_log_rejected_request`] for the path-overriding variant.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn boxed_log_rejected_request_with_path<'a>(
+pub(crate) fn boxed_log_rejected_request_with_path<'a>(
     plugins: &'a [Arc<dyn Plugin>],
     ctx: &'a RequestContext,
     status_code: u16,
@@ -38947,6 +38969,17 @@ async fn handle_proxy_request_inner(
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
                 );
+                // Logged under its own phase before the count (issue #7156).
+                boxed_log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    response.status().as_u16(),
+                    start_time,
+                    crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
                 ctx.terminal_record.mark_counted();
                 record_request(&state, response.status().as_u16());
                 return Ok(response);
@@ -40553,6 +40586,17 @@ async fn handle_proxy_request_inner(
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
                 );
+                // Logged under its own phase before the count (issue #7156).
+                boxed_log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    response.status().as_u16(),
+                    start_time,
+                    crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
                 ctx.terminal_record.mark_counted();
                 record_request(&state, response.status().as_u16());
                 return Ok(response);
@@ -44367,6 +44411,17 @@ async fn handle_proxy_request_inner(
                 request_uses_grpc_content_type,
                 grpc_web_response_content_type,
             );
+            // Logged under its own phase before the count (issue #7156).
+            boxed_log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                response.status().as_u16(),
+                start_time,
+                crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+                plugin_execution_ns,
+                Some(&original_request_path),
+            )
+            .await;
             ctx.terminal_record.mark_counted();
             record_request(&state, response.status().as_u16());
             return Ok(response);
