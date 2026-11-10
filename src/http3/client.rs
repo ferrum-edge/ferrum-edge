@@ -4508,40 +4508,6 @@ impl Http3ConnectionPool {
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        frontend_body: Incoming,
-        require_h2_end_stream: bool,
-        max_request_body_size: usize,
-        bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
-        auth: H3Authorization<'_>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_streaming_incoming_body_inner(
-            proxy,
-            method,
-            backend_url,
-            headers,
-            frontend_body,
-            require_h2_end_stream,
-            max_request_body_size,
-            bytes_seen,
-            grpc_messages,
-            auth,
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_streaming_incoming_body_inner<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         mut frontend_body: Incoming,
         require_h2_end_stream: bool,
         max_request_body_size: usize,
@@ -4832,51 +4798,6 @@ impl Http3ConnectionPool {
         method: &str,
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        frontend_body: Incoming,
-        require_h2_end_stream: bool,
-        max_request_body_size: usize,
-        bytes_seen: Arc<AtomicU64>,
-        grpc_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
-        auth: H3Authorization<'_>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_with_target_streaming_incoming_body_inner(
-            proxy,
-            target_host,
-            target_port,
-            target_policy_port,
-            method,
-            backend_url,
-            headers,
-            frontend_body,
-            require_h2_end_stream,
-            max_request_body_size,
-            bytes_seen,
-            grpc_messages,
-            auth,
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_with_target_streaming_incoming_body_inner<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        // DestinationRule policy port for this dispatch — the selected target's
-        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
-        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
-        // for `connectionPool.tcp.maxConnections` admission; the dial address,
-        // TLS/SNI and the pool key all stay on `target_host:target_port`.
-        target_policy_port: u16,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         mut frontend_body: Incoming,
         require_h2_end_stream: bool,
         max_request_body_size: usize,
@@ -5008,32 +4929,6 @@ impl Http3ConnectionPool {
     /// buffered `request()` path.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_streaming_under_authorization<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        body: bytes::Bytes,
-        auth: H3Authorization<'_>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
-        self.request_streaming_inner(
-            proxy,
-            method,
-            backend_url,
-            headers,
-            body,
-            auth,
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_streaming_inner<TlsFut>(
         &self,
         proxy: &Proxy,
         method: &str,
@@ -5226,43 +5121,6 @@ impl Http3ConnectionPool {
     where
         TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
     {
-        self.request_with_target_streaming_inner(
-            proxy,
-            target_host,
-            target_port,
-            target_policy_port,
-            method,
-            backend_url,
-            headers,
-            body,
-            auth,
-            tls_config_fn,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn request_with_target_streaming_inner<TlsFut>(
-        &self,
-        proxy: &Proxy,
-        target_host: &str,
-        target_port: u16,
-        // DestinationRule policy port for this dispatch — the selected target's
-        // `dispatch_policy_port()` via `crate::proxy::dispatch_policy_port_for_target`.
-        // Equals `target_port` unless a `targetPort` remap applies. Used ONLY
-        // for `connectionPool.tcp.maxConnections` admission; the dial address,
-        // TLS/SNI and the pool key all stay on `target_host:target_port`.
-        target_policy_port: u16,
-        method: &str,
-        backend_url: &str,
-        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
-        body: bytes::Bytes,
-        auth: H3Authorization<'_>,
-        tls_config_fn: impl FnOnce() -> TlsFut,
-    ) -> H3PoolResult<H3StreamingResponse>
-    where
-        TlsFut: std::future::Future<Output = Result<Arc<rustls::ClientConfig>, anyhow::Error>>,
-    {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
@@ -5432,7 +5290,7 @@ impl Http3ConnectionPool {
 
         [
             measure(|pool, proxy, tls, _, auth, _| {
-                pool.request_streaming_inner(
+                pool.request_streaming_under_authorization(
                     proxy,
                     "POST",
                     "https://127.0.0.1/",
@@ -5443,7 +5301,7 @@ impl Http3ConnectionPool {
                 )
             }),
             measure(|pool, proxy, tls, _, auth, _| {
-                pool.request_with_target_streaming_inner(
+                pool.request_with_target_streaming_under_authorization(
                     proxy,
                     &proxy.backend_host,
                     proxy.backend_port,
