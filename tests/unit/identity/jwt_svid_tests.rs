@@ -2697,6 +2697,35 @@ fn rsa_public_exponents_must_be_odd_and_at_least_three() {
         .expect("exponent 3 is admitted");
 }
 
+/// Under `FERRUM_FIPS_MODE=enforce` a JWT authority is held to the same
+/// `fips::keys` rule as the plugin JWKS path: an RSA public exponent of 3 is
+/// admitted on the default profile but refused once enforced, while 65537 and
+/// an approved EC curve are still admitted.
+#[test]
+fn fips_enforced_authority_admission_follows_the_fips_key_policy() {
+    use ferrum_edge::identity::jwt_svid::{
+        authorities_from_jwks, check_authority_public_key_fips_enforced,
+    };
+
+    let (modulus, _) = rsa_jwk_members();
+    let small_exponent = authorities_from_jwks(&td(), rsa_jwks(&modulus, &[0x03]).as_bytes())
+        .expect("exponent 3 is admitted on the default profile");
+    check_authority_public_key_fips_enforced(&small_exponent[0].public_key_pem)
+        .expect_err("exponent 3 is refused while FIPS mode is enforced");
+
+    let standard_exponent =
+        authorities_from_jwks(&td(), rsa_jwks(&modulus, &[0x01, 0x00, 0x01]).as_bytes())
+            .expect("exponent 65537 is admitted");
+    check_authority_public_key_fips_enforced(&standard_exponent[0].public_key_pem)
+        .expect("exponent 65537 is admitted while FIPS mode is enforced");
+
+    let ec_pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("P-256 key generated")
+        .public_key_pem();
+    check_authority_public_key_fips_enforced(&ec_pem)
+        .expect("a P-256 authority is admitted while FIPS mode is enforced");
+}
+
 #[test]
 fn an_off_curve_ec_point_is_refused_on_both_the_jwk_and_the_spki_path() {
     use ferrum_edge::identity::jwt_svid::{authorities_from_jwks, decoding_key_for_authority};
