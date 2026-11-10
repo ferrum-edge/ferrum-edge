@@ -1213,6 +1213,7 @@ where
     if let Ok(value) = hyper::header::HeaderValue::from_str(default_host) {
         builder = builder.header(hyper::header::HOST, value);
     }
+    let mut host_overridden = false;
     for header in &action.http_headers {
         let (Ok(name), Ok(value)) = (
             hyper::header::HeaderName::from_bytes(header.name.as_bytes()),
@@ -1224,7 +1225,22 @@ where
             );
             continue;
         };
-        // Kubelet lets `httpHeaders` override `Host`; keep that behaviour.
+        if name == hyper::header::HOST {
+            // Kubelet lets `httpHeaders` override `Host`: the first recorded
+            // `Host` entry wins (Go's `Header.Get`), and an empty one leaves the
+            // default. Replace the default rather than append: a request with
+            // two `Host` fields is one RFC 9112 §3.2 requires the server to
+            // reject with 400.
+            if !host_overridden {
+                host_overridden = true;
+                if !value.is_empty()
+                    && let Some(headers) = builder.headers_mut()
+                {
+                    headers.insert(hyper::header::HOST, value);
+                }
+            }
+            continue;
+        }
         builder = builder.header(name, value);
     }
     let request = match builder.body(Empty::<Bytes>::new()) {

@@ -605,6 +605,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no usable TLS server identity and list the remedies (gateway SVID files,
   `FERRUM_MESH_CA_BACKEND`, or the frontend TLS cert and key). The STRICT
   error lists the same three sources instead of only the frontend cert.
+- **Rewritten mesh `httpGet` probes send one `Host` header** (#7242). When a
+  pod's probe set `Host` in `httpHeaders`, the sidecar's app-probe server sent
+  both its default `Host` and the recorded one, a request RFC 9112 servers
+  reject with 400, so the readiness or liveness probe failed after injection.
+  The recorded `Host` now replaces the default (the first one wins, as for
+  kubelet).
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
