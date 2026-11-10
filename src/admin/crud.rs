@@ -4310,7 +4310,7 @@ impl AdminResource for Upstream {
         _state: &AdminState,
         namespace: &str,
         resource: &Self,
-        _existing: Option<&Self>,
+        existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         let subset_names: HashSet<&str> = resource
@@ -4320,6 +4320,19 @@ impl AdminResource for Upstream {
             .iter()
             .map(|subset| subset.name.as_str())
             .collect();
+        // Only a REMOVED subset can strand a proxy reference. An update that
+        // keeps every stored subset skips paging every proxy of the namespace
+        // (issue #7209); creates still scan.
+        if let Some(existing) = existing
+            && existing
+                .subsets
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .all(|subset| subset_names.contains(subset.name.as_str()))
+        {
+            return Ok(());
+        }
         let mut errors = Vec::new();
         let mut offset = 0_i64;
         const PAGE_SIZE: i64 = 1_000;

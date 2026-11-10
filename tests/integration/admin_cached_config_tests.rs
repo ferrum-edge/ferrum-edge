@@ -8501,6 +8501,27 @@ async fn test_upstream_update_rejects_removing_referenced_subset() {
         "Error should identify the referenced subset and proxy: {:?}",
         body
     );
+
+    // An update that keeps every stored subset cannot strand a reference and
+    // skips the proxy scan (issue #7209); it must still succeed.
+    let kept = json!({
+        "id": "subset-u1",
+        "name": "subset-upstream",
+        "targets": [
+            {"host": "10.0.0.1", "port": 8080, "weight": 50, "tags": {"version": "stable"}},
+            {"host": "10.0.0.2", "port": 8080, "weight": 100, "tags": {"version": "canary"}}
+        ],
+        "subsets": [
+            {"name": "stable", "labels": {"version": "stable"}},
+            {"name": "canary", "labels": {"version": "canary"}}
+        ]
+    });
+    let (status, body) = admin_put(&base_url, "/upstreams/subset-u1", &token, &kept).await;
+    assert_eq!(
+        status, 200,
+        "keeping every subset must not be refused: {:?}",
+        body
+    );
 }
 
 // ============================================================================
