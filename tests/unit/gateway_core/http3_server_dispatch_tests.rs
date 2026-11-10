@@ -1610,7 +1610,7 @@ fn h3_send_only_terminal_rejection_write_is_deadline_bounded() {
         .split("async fn write_final_grpc_body_reject_send<S>(")
         .nth(1)
         .expect("send-only terminal gRPC rejection writer")
-        .split("fn reject_body_as_h3_grpc_message(")
+        .split("async fn acquire_cross_protocol_pool_client(")
         .next()
         .expect("bounded send-only terminal gRPC rejection writer");
     assert!(writer.contains("ctx.gateway_deadline_response_selected()"));

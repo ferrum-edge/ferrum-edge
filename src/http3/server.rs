@@ -12653,7 +12653,6 @@ pub(crate) fn finalize_h3_response_gateway_headers(
     owned
 }
 
-/// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
 /// Inject a sticky-session `Set-Cookie` header when the LB strategy is
 /// cookie-based and the response must (re)bind the client to a backend.
 ///
@@ -12745,6 +12744,7 @@ fn h3_connection_error(
         )
 }
 
+/// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
 fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::ErrorClass {
     if e.authorization_expiry().is_some() || e.client_deadline_expired() {
         return crate::retry::ErrorClass::ClientDisconnect;
@@ -19601,8 +19601,6 @@ async fn send_h3_backend_failure_response(
     }
 }
 
-/// Send an HTTP/3 rejection response with custom headers. Same recv-half
-/// halt contract as `send_h3_response`.
 /// Whether an `after_proxy` reject already carries a `Content-Type` header
 /// (case-insensitive). When it does, `send_h3_reject_response` must not add its
 /// own default, because `http::response::Builder::header` *appends* rather than
@@ -19648,6 +19646,8 @@ fn finalize_h3_gateway_error_headers(
     }
 }
 
+/// Send an HTTP/3 rejection response with custom headers. Same recv-half
+/// halt contract as `send_h3_response`.
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
