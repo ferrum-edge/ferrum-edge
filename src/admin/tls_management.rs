@@ -3128,6 +3128,36 @@ mod tests {
         );
     }
 
+    /// Unusable finalization material is one content-free failure with one
+    /// status wherever it surfaces: the store refuses to write it with
+    /// `UnusableFinalizationMaterial`, which the Admin API reports as 400,
+    /// the same status as Admin finalize of a stored order.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn unusable_finalization_material_is_one_content_free_400() {
+        let domains = vec!["example.com".to_string()];
+        let corrupt: AcmeOrderFinalization = serde_json::from_value(serde_json::json!({
+            "key_pem": "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+            "csr_der_base64": "!!!not-base64!!!",
+        }))
+        .expect("deserialize");
+        let mut order = sample_finalize_order(None, domains);
+        order.finalization = Some(corrupt);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::tls::acme::AcmeOrderStore::open(dir.path()).expect("order store");
+        let error = store
+            .upsert_order(order, true)
+            .expect_err("corrupt material must not be storable");
+        assert!(matches!(error, AcmeError::UnusableFinalizationMaterial(_)));
+        let rendered = error.to_string();
+        assert!(rendered.contains("finalization material is missing or unusable"));
+        assert!(
+            !rendered.contains("PRIVATE KEY") && !rendered.contains("not-base64"),
+            "the diagnostic must stay content-free"
+        );
+        assert_eq!(acme_error_response(error).status(), StatusCode::BAD_REQUEST);
+    }
+
     /// Issue #7199: the delete guard matches the referenced record id exactly,
     /// never as a substring of a longer id or of a collection segment.
     #[test]

@@ -229,12 +229,17 @@ pub struct AcmeOrderFinalization {
     csr_der_base64: String,
 }
 
-/// Fixed, redacted diagnostic for unusable finalization material.
+/// Unusable finalization material: the one content-free failure every
+/// [`AcmeOrderFinalization`] check returns.
 ///
-/// Deliberately content-free: the caller knows which order it was driving, and
-/// anything derived from the key or the CSR would be a disclosure.
-const UNUSABLE_FINALIZATION_MATERIAL: &str =
-    "ACME order finalization material is missing or unusable";
+/// Deliberately carries nothing: the caller knows which order it was driving,
+/// and anything derived from the key or the CSR would be a disclosure. Store
+/// and Admin callers that know the order surface it as
+/// [`AcmeError::UnusableFinalizationMaterial`], the single store-level variant
+/// for this failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("ACME order finalization material is missing or unusable")]
+pub struct UnusableFinalization;
 
 impl AcmeOrderFinalization {
     /// Generate a fresh key and a CSR covering exactly `domains`.
@@ -242,15 +247,14 @@ impl AcmeOrderFinalization {
     /// Mirrors what `instant_acme::Order::finalize()` would have generated
     /// internally (SANs from the order identifiers, empty distinguished name),
     /// except that it happens early enough to be persisted first.
-    pub fn generate(domains: &[String]) -> Result<Self, AcmeError> {
-        let mut params = rcgen::CertificateParams::new(domains.to_vec())
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+    pub fn generate(domains: &[String]) -> Result<Self, UnusableFinalization> {
+        let mut params =
+            rcgen::CertificateParams::new(domains.to_vec()).map_err(|_| UnusableFinalization)?;
         params.distinguished_name = rcgen::DistinguishedName::new();
-        let key_pair = rcgen::KeyPair::generate()
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+        let key_pair = rcgen::KeyPair::generate().map_err(|_| UnusableFinalization)?;
         let csr = params
             .serialize_request(&key_pair)
-            .map_err(|_| AcmeError::InvalidConfiguration(UNUSABLE_FINALIZATION_MATERIAL.into()))?;
+            .map_err(|_| UnusableFinalization)?;
         Self::from_parts(key_pair.serialize_pem(), csr.der().as_ref(), domains)
     }
 
@@ -260,7 +264,7 @@ impl AcmeOrderFinalization {
         key_pem: String,
         csr_der: &[u8],
         domains: &[String],
-    ) -> Result<Self, AcmeError> {
+    ) -> Result<Self, UnusableFinalization> {
         let material = Self {
             key_pem,
             csr_der_base64: BASE64_STANDARD.encode(csr_der),
@@ -278,14 +282,14 @@ impl AcmeOrderFinalization {
     ///
     /// Fails closed on corrupt material or a CSR that does not exactly match
     /// `domains`. Never regenerates anything.
-    pub fn csr_der(&self, domains: &[String]) -> Result<Vec<u8>, AcmeError> {
+    pub fn csr_der(&self, domains: &[String]) -> Result<Vec<u8>, UnusableFinalization> {
         validate_persisted_finalization_package(&self.key_pem, &self.csr_der_base64, domains)
     }
 
     /// Reject material that cannot later be used, at the store boundary and
     /// every network entrypoint, so a corrupt package cannot be written or
     /// drive a directory request.
-    pub fn validate(&self, domains: &[String]) -> Result<(), AcmeError> {
+    pub fn validate(&self, domains: &[String]) -> Result<(), UnusableFinalization> {
         self.csr_der(domains).map(|_| ())
     }
 }
@@ -299,13 +303,13 @@ impl AcmeOrderFinalization {
 /// domains (wildcards included). Multiple keys, malformed trailing PEM input,
 /// non-DNS SANs, duplicate DNS SANs, duplicate SAN extensions, and domain
 /// ambiguity fail closed. Errors never carry key, CSR, derived bytes, domains,
-/// or parse detail — only [`UNUSABLE_FINALIZATION_MATERIAL`].
+/// or parse detail — only [`UnusableFinalization`].
 fn validate_persisted_finalization_package(
     key_pem: &str,
     csr_der_base64: &str,
     domains: &[String],
-) -> Result<Vec<u8>, AcmeError> {
-    let unusable = || AcmeError::Parse(UNUSABLE_FINALIZATION_MATERIAL.to_string());
+) -> Result<Vec<u8>, UnusableFinalization> {
+    let unusable = || UnusableFinalization;
     if key_pem.trim().is_empty() || csr_der_base64.trim().is_empty() {
         return Err(unusable());
     }
@@ -1035,7 +1039,9 @@ impl AcmeOrderStore {
         validate_tls_alpn01_challenges(&record.tls_alpn01_challenges)?;
         validate_dns01_challenges(&record.dns01_challenges)?;
         if let Some(finalization) = record.finalization.as_ref() {
-            finalization.validate(&record.domains)?;
+            finalization
+                .validate(&record.domains)
+                .map_err(|_| AcmeError::UnusableFinalizationMaterial(record.id.clone()))?;
         }
         let terminal_history = self.terminal_history;
         let outcome = self.file.mutate(move |document| {
@@ -1441,7 +1447,9 @@ impl AcmeOrderRecord {
         validate_tls_alpn01_challenges(&input.tls_alpn01_challenges)?;
         validate_dns01_challenges(&input.dns01_challenges)?;
         if let Some(finalization) = input.finalization.as_ref() {
-            finalization.validate(&input.domains)?;
+            finalization
+                .validate(&input.domains)
+                .map_err(|_| AcmeError::UnusableFinalizationMaterial(input.id.clone()))?;
         }
         let now = Utc::now();
         Ok(Self {

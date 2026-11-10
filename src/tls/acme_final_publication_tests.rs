@@ -805,14 +805,14 @@ fn corrupt_finalization_material_fails_closed_without_disclosure() {
     let error = orders
         .upsert_order(order, true)
         .expect_err("corrupt material must not be storable");
-    assert!(matches!(error, AcmeError::Parse(_)));
+    assert!(matches!(error, AcmeError::UnusableFinalizationMaterial(_)));
     assert!(
         !error.to_string().contains("not-base64"),
         "the store diagnostic must not describe the material"
     );
 }
 
-fn assert_unusable_without_disclosure(error: &AcmeError) {
+fn assert_unusable_without_disclosure(error: &impl std::fmt::Display) {
     let rendered = error.to_string();
     assert!(
         rendered.contains("missing or unusable"),
