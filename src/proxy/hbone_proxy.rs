@@ -728,8 +728,12 @@ async fn connect_backend(
             Ok(candidates) => candidates,
             Err(denial) => return Err(HboneConnectFailure::RelayDenied(denial.as_str())),
         };
+    // The NodeWaypoint topology, resolved once at startup: the mesh runtime
+    // installs the identity resolver for exactly that topology, so its
+    // presence is the topology bit without a per-CONNECT environment read and
+    // re-parse (issue #7166).
     let socket_mark = (proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
-        && node_waypoint_inbound_relay_mark_enabled())
+        && state.node_waypoint_identity_resolver.is_some())
     .then_some(NODE_WAYPOINT_INBOUND_AUTH_MARK);
     let timeout = Duration::from_millis(effective_connect_timeout_ms);
     let (stream, addr) = match crate::dns::connect_candidates(&candidates, port, timeout, |addr| {
@@ -923,15 +927,6 @@ pub(super) fn inbound_ingress_relay_effective_destination_allowed(
     };
     let (app_host, app_port) = effective_hbone_backend_target(proxy, upstream_target);
     mesh.sidecar_ingress_connect_relay_endpoint_matches(listener_port, app_host, app_port)
-}
-
-fn node_waypoint_inbound_relay_mark_enabled() -> bool {
-    crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").is_some_and(|topology| {
-        matches!(
-            topology.trim().to_ascii_lowercase().as_str(),
-            "node_waypoint" | "node-waypoint"
-        )
-    })
 }
 
 /// What the request path resolved the admitting plugin view with, plus the

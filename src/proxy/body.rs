@@ -5371,12 +5371,12 @@ impl<B> IdleReadTimeoutBody<B> {
     /// `H3FrameSource`: the deadline resets on backend progress and a fired
     /// deadline collapses to a clean EOS while only optional trailers remain.
     /// See the `progress` field.
+    ///
+    /// The deadline starts unarmed: the first inner `Pending` is always a
+    /// `false -> true` edge of `waiting`, which arms it, so a response whose
+    /// frames are all ready never allocates the boxed `Sleep` (issue #7166).
     fn with_progress(inner: B, timeout_ms: u64, progress: Option<Arc<H3ReadProgress>>) -> Self {
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .map(tokio::time::sleep_until)
-            .map(Box::pin);
         let last_progress_epoch = progress
             .as_ref()
             .map(|p| p.epoch.load(Ordering::Acquire))
@@ -5384,7 +5384,7 @@ impl<B> IdleReadTimeoutBody<B> {
         Self {
             inner,
             timeout,
-            deadline,
+            deadline: None,
             done: false,
             waiting: false,
             progress,
@@ -9096,10 +9096,9 @@ mod tests {
 
         let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
         let mut body = IdleReadTimeoutBody::new(inner, u64::MAX);
-        assert_eq!(
+        assert!(
             body.deadline.is_none(),
-            overflows,
-            "deadline must be None exactly when the platform `Instant` range overflows",
+            "the deadline is armed lazily, on the first backend-read wait",
         );
 
         // Polling a pending inner must stay live (Pending) without panicking on
@@ -9128,12 +9127,24 @@ mod tests {
     #[tokio::test]
     async fn idle_read_timeout_representable_deadline_arms_live_timer() {
         // A normal, representable timeout must still arm a live deadline so the
-        // idle-read watchdog continues to bound stalled backends.
+        // idle-read watchdog continues to bound stalled backends. It is armed on
+        // the first backend-read wait, not at construction (issue #7166), so an
+        // all-ready response never allocates the timer.
         let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
-        let body = IdleReadTimeoutBody::new(inner, 1_000);
+        let mut body = IdleReadTimeoutBody::new(inner, 1_000);
+        assert!(
+            body.deadline.is_none(),
+            "construction must not allocate the deadline",
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Pending
+        ));
         assert!(
             body.deadline.is_some(),
-            "a representable timeout must arm a live deadline",
+            "a representable timeout must arm a live deadline on the first wait",
         );
     }
 

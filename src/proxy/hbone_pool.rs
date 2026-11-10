@@ -907,6 +907,32 @@ struct HboneSvidIdentityCache {
     /// rotates out, so `force_drain_svid_generation(old_gen)` can resolve
     /// the passed generation to the fingerprint embedded in pool keys.
     svid_generation: u64,
+    /// The leaf's `notAfter` on the monotonic clock, parsed once when this
+    /// entry was built (issue #7166): see
+    /// [`HboneConnectionPool::source_credential_identity`]. Derived once, so a
+    /// later wall-clock step cannot move it.
+    leaf_deadline: Option<tokio::time::Instant>,
+}
+
+/// The leaf's credential deadline, as [`HboneSvidIdentityCache::leaf_deadline`]
+/// records it. A three-way result: a real `notAfter` bounds the lease; an
+/// unparseable or incoherent leaf (or a bundle with no leaf) yields an
+/// ALREADY-ELAPSED deadline, because a credential whose expiry the gateway
+/// cannot read must never hold a connection open across requests; and a
+/// `notAfter` beyond the representable monotonic range yields `None`
+/// (`CredentialDeadline::Unbounded`, "no representable bound", NOT "expired").
+fn svid_leaf_deadline(bundle: &SvidBundle) -> Option<tokio::time::Instant> {
+    use crate::plugins::utils::auth_flow::CredentialDeadline;
+    match bundle.cert_chain_der.first() {
+        Some(leaf) => {
+            match crate::proxy::hbone_admission_fence::parse_leaf_credential_deadline(leaf) {
+                CredentialDeadline::Bounded(deadline) => Some(deadline),
+                CredentialDeadline::Unbounded => None,
+                CredentialDeadline::Invalid => Some(tokio::time::Instant::now()),
+            }
+        }
+        None => Some(tokio::time::Instant::now()),
+    }
 }
 
 pub(crate) fn effective_connect_timeout_ms_for_policy_port(
@@ -1075,42 +1101,15 @@ impl HboneConnectionPool {
     pub fn source_credential_identity(
         &self,
     ) -> Result<crate::proxy::hbone_inner_pool::HboneSourceCredential, HbonePoolError> {
-        let (identity, fingerprint) = self.current_svid_identity_cached()?;
         // The leaf's own `notAfter`, on the monotonic clock, parsed from the
         // same bundle the dial presents, by the SAME parser the receiver-side
         // fence bounds an inbound tunnel with — so the two halves of issue
-        // #5042 cannot disagree about when a credential ends.
-        //
-        // Its three-way result is preserved exactly: a real `notAfter` bounds
-        // the lease, an unparseable or incoherent leaf yields an ALREADY-ELAPSED
-        // deadline (a credential the gateway cannot read the expiry of must
-        // never be the basis for holding a connection open across requests),
-        // and a `notAfter` beyond the representable monotonic range yields
-        // `None` — `CredentialDeadline::Unbounded`, which is "no representable
-        // bound", NOT "expired". Collapsing that to elapsed would disable reuse
-        // outright for long-dated credentials; the idle timeout and the pool
-        // bounds still apply to it.
-        //
-        // A bundle with no leaf at all cannot dial in the first place
-        // (`current_svid_identity_cached` above already fingerprints it), so
-        // the arm exists only to fail closed rather than to be reached.
-        let leaf_deadline = match self
-            .gateway_svid
-            .load_full()
-            .as_ref()
-            .as_ref()
-            .and_then(|bundle| bundle.cert_chain_der.first().cloned())
-        {
-            Some(leaf) => {
-                use crate::plugins::utils::auth_flow::CredentialDeadline;
-                match crate::proxy::hbone_admission_fence::parse_leaf_credential_deadline(&leaf) {
-                    CredentialDeadline::Bounded(deadline) => Some(deadline),
-                    CredentialDeadline::Unbounded => None,
-                    CredentialDeadline::Invalid => Some(tokio::time::Instant::now()),
-                }
-            }
-            None => Some(tokio::time::Instant::now()),
-        };
+        // #5042 cannot disagree about when a credential ends. It is parsed once
+        // per SVID snapshot with the identity and fingerprint (issue #7166):
+        // no per-request leaf clone, X.509 parse, or wall-clock read. See
+        // `svid_leaf_deadline` for the three-way result; the idle timeout and
+        // the pool bounds still apply to an unbounded credential.
+        let (identity, fingerprint, leaf_deadline) = self.current_svid_credential_cached()?;
         Ok(crate::proxy::hbone_inner_pool::HboneSourceCredential {
             identity,
             fingerprint,
@@ -1274,17 +1273,38 @@ impl HboneConnectionPool {
     fn current_svid_identity_cached(
         &self,
     ) -> Result<(crate::identity::SpiffeId, Arc<str>), HbonePoolError> {
+        self.current_svid_credential_cached()
+            .map(|(identity, fingerprint, _)| (identity, fingerprint))
+    }
+
+    /// [`Self::current_svid_identity_cached`] plus the cached leaf deadline,
+    /// all from ONE identity-cache entry.
+    fn current_svid_credential_cached(
+        &self,
+    ) -> Result<
+        (
+            crate::identity::SpiffeId,
+            Arc<str>,
+            Option<tokio::time::Instant>,
+        ),
+        HbonePoolError,
+    > {
         let snapshot = self.gateway_svid.load_full();
         let cached = self.svid_identity_cache.load_full();
         if let Some(cache) = cached.as_ref()
             && Arc::ptr_eq(&cache.source, &snapshot)
         {
-            return Ok((cache.identity.clone(), cache.fingerprint.clone()));
+            return Ok((
+                cache.identity.clone(),
+                cache.fingerprint.clone(),
+                cache.leaf_deadline,
+            ));
         }
 
         let bundle = snapshot.as_ref().as_ref().ok_or(HbonePoolError::NoSvid)?;
         let identity = bundle.spiffe_id.clone();
         let fingerprint: Arc<str> = Arc::from(svid_fingerprint(bundle)?);
+        let leaf_deadline = svid_leaf_deadline(bundle);
         if let Some(previous) = cached.as_ref() {
             // The SVID slot rotated: file the outgoing fingerprint under the
             // generation it was current for, so the delayed drain task can
@@ -1304,8 +1324,9 @@ impl HboneConnectionPool {
                 identity: identity.clone(),
                 fingerprint: fingerprint.clone(),
                 svid_generation: self.backend_svid_generation.load(Ordering::Acquire),
+                leaf_deadline,
             })));
-        Ok((identity, fingerprint))
+        Ok((identity, fingerprint, leaf_deadline))
     }
 
     fn record_retired_fingerprint(&self, generation: u64, fingerprint: Arc<str>) {

@@ -6255,3 +6255,54 @@ fn websocket_session_listen_port_reports_the_accepting_listener() {
         8443
     );
 }
+
+/// Issue #7166: per-request work the hot paths no longer repeat. The native-H3
+/// backend TLS closures borrow the request's `Proxy` and the pool (a lookup only
+/// on a connection miss) instead of deep-cloning both per request; each mesh
+/// dispatch derives its authorization-lifetime plan once and hands it down;
+/// and the inbound HBONE relay reads the startup-resolved topology instead of
+/// re-reading and re-parsing `FERRUM_MESH_TOPOLOGY` per CONNECT.
+#[test]
+fn hot_path_dispatch_work_is_done_once() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(!proxy.contains("backend_h3_tls_config_owned("));
+    assert_eq!(
+        proxy
+            .matches("|| state.connection_pool.backend_h3_tls_config(proxy)")
+            .count(),
+        10,
+        "every native-H3 dispatch closure borrows"
+    );
+    assert!(!proxy.contains("let proxy_clone = proxy.clone();"));
+
+    for after_ready in [
+        "async fn proxy_to_backend_hbone_after_ready(",
+        "async fn proxy_to_backend_mesh_mtls_after_ready(",
+    ] {
+        let body = proxy
+            .split(after_ready)
+            .nth(1)
+            .expect("mesh dispatch after_ready")
+            .split("\n}\n")
+            .next()
+            .expect("bounded after_ready");
+        assert!(
+            body.contains("upload_auth: Option<RequestAuthLifetimePlan>,")
+                && body.contains("let send_auth_deadline = upload_auth;")
+                && !body.contains("request_upload_auth_deadline("),
+            "{after_ready} must reuse the plan its dispatcher derived"
+        );
+    }
+    let unix = proxy
+        .split("#[cfg(unix)]\nasync fn proxy_to_backend_unix(")
+        .nth(1)
+        .expect("Unix dispatcher")
+        .split("\n}\n")
+        .next()
+        .expect("bounded Unix dispatcher");
+    assert_eq!(unix.matches("request_upload_auth_deadline(").count(), 1);
+
+    let hbone = include_str!("../../../src/proxy/hbone_proxy.rs");
+    assert!(!hbone.contains("FERRUM_MESH_TOPOLOGY"));
+    assert!(hbone.contains("&& state.node_waypoint_identity_resolver.is_some())"));
+}

@@ -61455,6 +61455,12 @@ async fn proxy_to_backend_hbone(
     // the H3 plain bridge that stacks on `handle_h3_request` / `dispatch_plain`,
     // that handshake is the difference between a healthy Sidecar attempt
     // (already boxed) and a healthy Ambient HBONE attempt.
+    // The request's authorization-lifetime plan, derived once for this
+    // dispatch and handed to every phase below (issue #7166).
+    let upload_auth = request_upload_auth_deadline(
+        ctx,
+        state.env_config.authenticated_stream_max_lifetime_seconds,
+    );
     let pooled = inner_plan.as_ref().and_then(|plan| {
         state.hbone_pool.inner_pool().checkout_h1(
             &plan.key_parts(hbone_inner_pool::HboneInnerProtocol::Http1),
@@ -61482,28 +61488,20 @@ async fn proxy_to_backend_hbone(
             asserted_source_identity,
             // The admitted request's absolute authorization deadline
             // (GHSA-xcg4-wj3x-gjj2), the same instant the post-tunnel handoff
-            // gate and response-header wait derive from the same context.
-            request_upload_auth_deadline(
-                ctx,
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            )
-            .map(|(deadline, _, _)| deadline.at),
+            // gate and response-header wait read.
+            upload_auth.as_ref().map(|(deadline, _, _)| deadline.at),
         )
         .await
         {
             Ok(checkout) => checkout,
             Err(HboneInnerOpenError::AuthorizationExpired) => {
-                let auth = request_upload_auth_deadline(
-                    ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                );
                 return (
                     mesh_h1_handoff_bound_expired(
                         proxy,
                         "hbone",
                         BackendHandoffBoundSource::Authorization,
-                        compose_dispatch_phase_auth_bound(None, auth.as_ref()),
-                        auth.as_ref(),
+                        compose_dispatch_phase_auth_bound(None, upload_auth.as_ref()),
+                        upload_auth.as_ref(),
                         resolved_ip,
                     ),
                     None,
@@ -61571,6 +61569,7 @@ async fn proxy_to_backend_hbone(
         checkout,
         inner_plan.as_ref(),
         inbound_version,
+        upload_auth,
     )
     .await
 }
@@ -61607,6 +61606,7 @@ fn boxed_proxy_to_backend_hbone_after_ready<'a>(
     checkout: hbone_inner_pool::HboneInnerH1Checkout,
     inner_plan: Option<&'a HboneInnerDispatchPlan<'a>>,
     inbound_version: hyper::Version,
+    upload_auth: Option<RequestAuthLifetimePlan>,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
     Box::pin(async move {
         proxy_to_backend_hbone_after_ready(
@@ -61632,6 +61632,7 @@ fn boxed_proxy_to_backend_hbone_after_ready<'a>(
             checkout,
             inner_plan,
             inbound_version,
+            upload_auth,
         )
         .await
     })
@@ -61661,6 +61662,8 @@ async fn proxy_to_backend_hbone_after_ready(
     mut checkout: hbone_inner_pool::HboneInnerH1Checkout,
     inner_plan: Option<&HboneInnerDispatchPlan<'_>>,
     inbound_version: hyper::Version,
+    // The plan the outer dispatcher derived once (issue #7166).
+    upload_auth: Option<RequestAuthLifetimePlan>,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -61748,10 +61751,6 @@ async fn proxy_to_backend_hbone_after_ready(
             // wait so `backend_write_timeout_ms` is client-visible even when
             // the transport is parked outside a body poll; after headers, the
             // transport body and `UploadPumpSource` abort guard own teardown.
-            let upload_auth = request_upload_auth_deadline(
-                ctx,
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            );
             // An unpumped adapter reads the client body itself, so it records
             // why that body failed (issue #6776); a pump records it instead.
             let client_fault_latch =
@@ -61939,10 +61938,7 @@ async fn proxy_to_backend_hbone_after_ready(
     // upload adapter installed above has nothing to fire on for a bodyless or
     // already-ended request. Absolute, so the at-most-one idle-race replay
     // below cannot re-arm it.
-    let send_auth_deadline = request_upload_auth_deadline(
-        ctx,
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
+    let send_auth_deadline = upload_auth;
     // ALSO absolute, and hoisted above the loop for exactly that reason: the
     // at-most-one idle-race replay must not hand the retried dispatch a second
     // full `backend_read_timeout_ms` window, which would let one request wait
@@ -62905,21 +62901,19 @@ async fn proxy_to_backend_unix(
             // wait so `backend_write_timeout_ms` is client-visible even when
             // the transport is parked outside a body poll; after headers, the
             // transport body and `UploadPumpSource` abort guard own teardown.
-            let upload_auth = request_upload_auth_deadline(
-                ctx,
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            );
+            // The plan this dispatch already derived (issue #7166).
+            let upload_auth = send_auth_deadline.as_ref();
             // An unpumped adapter reads the client body itself, so it records
             // why that body failed (issue #6776); a pump records it instead.
             let client_fault_latch =
-                unpumped_client_fault_latch(upload_auth.as_ref(), proxy.backend_write_timeout_ms);
+                unpumped_client_fault_latch(upload_auth, proxy.backend_write_timeout_ms);
             let body = match &client_fault_latch {
                 Some(latch) => body.with_client_fault_latch(Arc::clone(latch)),
                 None => body,
             };
             let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
-                upload_auth.as_ref(),
+                upload_auth,
                 proxy.backend_write_timeout_ms,
             );
             let grpc_tap = ctx.and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
@@ -64325,6 +64319,8 @@ async fn proxy_to_backend_mesh_mtls(
         effective_max_response_body_size_bytes,
         client_grpc_deadline_at,
         inbound_version,
+        // The plan derived once for this dispatch (issue #7166).
+        checkout_auth,
     )
     .await
 }
@@ -64387,6 +64383,7 @@ fn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(
     effective_max_response_body_size_bytes: usize,
     client_grpc_deadline_at: Option<tokio::time::Instant>,
     inbound_version: hyper::Version,
+    upload_auth: Option<RequestAuthLifetimePlan>,
 ) -> BoxedMeshTransportDispatchFuture<'a> {
     Box::pin(async move {
         proxy_to_backend_mesh_mtls_after_ready(
@@ -64415,6 +64412,7 @@ fn boxed_proxy_to_backend_mesh_mtls_after_ready<'a>(
             effective_max_response_body_size_bytes,
             client_grpc_deadline_at,
             inbound_version,
+            upload_auth,
         )
         .await
     })
@@ -64447,6 +64445,8 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     effective_max_response_body_size_bytes: usize,
     client_grpc_deadline_at: Option<tokio::time::Instant>,
     inbound_version: hyper::Version,
+    // The plan the outer dispatcher derived once (issue #7166).
+    upload_auth: Option<RequestAuthLifetimePlan>,
 ) -> (
     retry::BackendResponse,
     Option<Bytes>,
@@ -64606,10 +64606,6 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 // transport is parked outside a body poll; after headers, the
                 // transport body and `UploadPumpSource` abort guard own teardown.
                 // Without one, hyper's pipe enforces the write bound (below).
-                let upload_auth = request_upload_auth_deadline(
-                    Some(request_ctx),
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                );
                 // An upload with no authorization lifetime needs no pump: hyper's
                 // HTTP/2 pipe bounds how long a ready chunk may wait to be written
                 // and resets the stream when it fires (vendored hyper patch 004), as
@@ -64812,10 +64808,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     // Composed with the admitted stream's authorization lifetime (#3815): the
     // native-gRPC regime leaves the client deadline UNCAPPED and both regimes
     // allow no bound at all, neither of which may outlive the credential.
-    let send_auth_deadline = request_upload_auth_deadline(
-        Some(request_ctx),
-        state.env_config.authenticated_stream_max_lifetime_seconds,
-    );
+    let send_auth_deadline = upload_auth;
     let send_bound = compose_dispatch_phase_auth_bound(
         if is_grpc_flavored {
             grpc_send_deadline
@@ -66964,21 +66957,18 @@ async fn proxy_to_backend_http3(
                 // so nothing is retained for a replay.
                 backend_attempt_handoff.mark_handed_to_backend(None);
                 let h3_result = if let Some(target) = upstream_target {
-                    let target_host = target.host.clone();
                     let target_port = target.port;
                     // DestinationRule policy port for `maxConnections` admission.
                     // Differs from `target_port` only under a `targetPort` remap;
                     // passing the dial port would resolve no cap at all.
                     let target_policy_port = target.dispatch_policy_port();
-                    let connection_pool = state.connection_pool.clone();
-                    let proxy_clone = proxy.clone();
                     let grpc_messages = response_decision_ctx
                         .and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
                     state
                         .h3_pool
                         .request_with_target_streaming_incoming_body_under_authorization(
                             proxy,
-                            &target_host,
+                            &target.host,
                             target_port,
                             target_policy_port,
                             method,
@@ -66993,12 +66983,10 @@ async fn proxy_to_backend_http3(
                                 grpc_deadline_at,
                                 buffered_upload_auth_deadline.as_ref(),
                             ),
-                            move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                            || state.connection_pool.backend_h3_tls_config(proxy),
                         )
                         .await
                 } else {
-                    let connection_pool = state.connection_pool.clone();
-                    let proxy_clone = proxy.clone();
                     let grpc_messages = response_decision_ctx
                         .and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
                     state
@@ -67017,7 +67005,7 @@ async fn proxy_to_backend_http3(
                                 grpc_deadline_at,
                                 buffered_upload_auth_deadline.as_ref(),
                             ),
-                            move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                            || state.connection_pool.backend_h3_tls_config(proxy),
                         )
                         .await
                 };
@@ -67441,19 +67429,16 @@ async fn proxy_to_backend_http3(
     backend_attempt_handoff.mark_handed_to_backend(retained_body.as_ref());
     if stream_response {
         let h3_result = if let Some(target) = upstream_target {
-            let target_host = target.host.clone();
             let target_port = target.port;
             // DestinationRule policy port for `maxConnections` admission.
             // Differs from `target_port` only under a `targetPort` remap;
             // passing the dial port would resolve no cap at all.
             let target_policy_port = target.dispatch_policy_port();
-            let connection_pool = state.connection_pool.clone();
-            let proxy_clone = proxy.clone();
             state
                 .h3_pool
                 .request_with_target_streaming_under_authorization(
                     proxy,
-                    &target_host,
+                    &target.host,
                     target_port,
                     target_policy_port,
                     method,
@@ -67464,12 +67449,10 @@ async fn proxy_to_backend_http3(
                         grpc_deadline_at,
                         buffered_upload_auth_deadline.as_ref(),
                     ),
-                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                    || state.connection_pool.backend_h3_tls_config(proxy),
                 )
                 .await
         } else {
-            let connection_pool = state.connection_pool.clone();
-            let proxy_clone = proxy.clone();
             state
                 .h3_pool
                 .request_streaming_under_authorization(
@@ -67482,7 +67465,7 @@ async fn proxy_to_backend_http3(
                         grpc_deadline_at,
                         buffered_upload_auth_deadline.as_ref(),
                     ),
-                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                    || state.connection_pool.backend_h3_tls_config(proxy),
                 )
                 .await
         };
@@ -67573,19 +67556,16 @@ async fn proxy_to_backend_http3(
         // drains the body with the same incremental size enforcement the pool's
         // `request()` applied internally.
         let h3_result = if let Some(target) = upstream_target {
-            let target_host = target.host.clone();
             let target_port = target.port;
             // DestinationRule policy port for `maxConnections` admission.
             // Differs from `target_port` only under a `targetPort` remap;
             // passing the dial port would resolve no cap at all.
             let target_policy_port = target.dispatch_policy_port();
-            let connection_pool = state.connection_pool.clone();
-            let proxy_clone = proxy.clone();
             state
                 .h3_pool
                 .request_with_target_streaming_under_authorization(
                     proxy,
-                    &target_host,
+                    &target.host,
                     target_port,
                     target_policy_port,
                     method,
@@ -67596,12 +67576,10 @@ async fn proxy_to_backend_http3(
                         grpc_deadline_at,
                         buffered_upload_auth_deadline.as_ref(),
                     ),
-                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                    || state.connection_pool.backend_h3_tls_config(proxy),
                 )
                 .await
         } else {
-            let connection_pool = state.connection_pool.clone();
-            let proxy_clone = proxy.clone();
             state
                 .h3_pool
                 .request_streaming_under_authorization(
@@ -67614,7 +67592,7 @@ async fn proxy_to_backend_http3(
                         grpc_deadline_at,
                         buffered_upload_auth_deadline.as_ref(),
                     ),
-                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                    || state.connection_pool.backend_h3_tls_config(proxy),
                 )
                 .await
         };
@@ -68246,10 +68224,7 @@ pub(crate) async fn proxy_to_backend_http3_retry(
     let retry_ctx = may_release_after_headers.then(|| retry_response_decision_context(request_ctx));
 
     if stream_response || may_release_after_headers {
-        let connection_pool = state.connection_pool.clone();
-        let proxy_clone = proxy.clone();
         let h3_result = if let Some(target) = upstream_target {
-            let target_host = target.host.clone();
             let target_port = target.port;
             // DestinationRule policy port for `maxConnections` admission.
             // Differs from `target_port` only under a `targetPort` remap;
@@ -68259,7 +68234,7 @@ pub(crate) async fn proxy_to_backend_http3_retry(
                 .h3_pool
                 .request_with_target_streaming_under_authorization(
                     proxy,
-                    &target_host,
+                    &target.host,
                     target_port,
                     target_policy_port,
                     method,
@@ -68267,7 +68242,7 @@ pub(crate) async fn proxy_to_backend_http3_retry(
                     &http3_headers,
                     body_bytes,
                     auth,
-                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                    || state.connection_pool.backend_h3_tls_config(proxy),
                 )
                 .await
         } else {
@@ -68280,7 +68255,7 @@ pub(crate) async fn proxy_to_backend_http3_retry(
                     &http3_headers,
                     body_bytes,
                     auth,
-                    move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                    || state.connection_pool.backend_h3_tls_config(proxy),
                 )
                 .await
         };
@@ -68408,10 +68383,7 @@ pub(crate) async fn proxy_to_backend_http3_retry(
         };
     }
 
-    let connection_pool = state.connection_pool.clone();
-    let proxy_clone = proxy.clone();
     let h3_result = if let Some(target) = upstream_target {
-        let target_host = target.host.clone();
         let target_port = target.port;
         // DestinationRule policy port for `maxConnections` admission. Differs
         // from `target_port` only under a `targetPort` remap; passing the dial
@@ -68421,7 +68393,7 @@ pub(crate) async fn proxy_to_backend_http3_retry(
             .h3_pool
             .request_with_target_streaming_under_authorization(
                 proxy,
-                &target_host,
+                &target.host,
                 target_port,
                 target_policy_port,
                 method,
@@ -68429,7 +68401,7 @@ pub(crate) async fn proxy_to_backend_http3_retry(
                 &http3_headers,
                 body_bytes,
                 auth,
-                move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                || state.connection_pool.backend_h3_tls_config(proxy),
             )
             .await
     } else {
@@ -68442,7 +68414,7 @@ pub(crate) async fn proxy_to_backend_http3_retry(
                 &http3_headers,
                 body_bytes,
                 auth,
-                move || connection_pool.backend_h3_tls_config_owned(proxy_clone),
+                || state.connection_pool.backend_h3_tls_config(proxy),
             )
             .await
     };
