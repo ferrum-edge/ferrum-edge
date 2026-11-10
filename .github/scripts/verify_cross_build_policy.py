@@ -11698,6 +11698,9 @@ def wrapper_option_operand_variants(line: str) -> tuple[str, ...]:
                 ambiguous.append(
                     (words[position].start(), words[position + 1].end())
                 )
+                # Keep reading options past the possible operand, so a later
+                # unknown option on the same wrapper is found too.
+                width = 2
             position += width
     if not ambiguous:
         return ()
