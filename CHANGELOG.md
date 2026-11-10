@@ -635,6 +635,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_OVERLOAD_CHECK_INTERVAL_MS`, and reports at least that budget on
   timeout. A critical threshold above the check interval still cannot be
   reached; the docs now say so.
+- **SQL plugin-config rows with an unknown scope are rejected, not made
+  global** (#7192). The SQL loaders mapped any `plugin_configs.scope` other
+  than `proxy` or `proxy_group` to `global`, so a corrupted or out-of-band
+  value such as `Proxy` widened a proxy-scoped plugin to every proxy in the
+  namespace (MongoDB already rejected it). The scope is now matched exactly
+  and an unknown value fails the row like any other decode error, keeping the
+  last good config. A `proxy_id` or `enabled` value that cannot be decoded
+  also fails the row instead of detaching or enabling the plugin.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

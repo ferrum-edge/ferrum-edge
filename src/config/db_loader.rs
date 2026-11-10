@@ -7312,11 +7312,15 @@ impl DatabaseStore {
                         e,
                     )
                 })?;
-                let scope = match scope_raw.as_str() {
-                    "proxy" => PluginScope::Proxy,
-                    "proxy_group" => PluginScope::ProxyGroup,
-                    _ => PluginScope::Global,
-                };
+                // Strict: an unknown stored scope must not widen a proxy-scoped
+                // plugin to global (issue #7192).
+                let scope = parse_plugin_scope(&scope_raw).map_err(|reason| {
+                    anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
+                        "operation={} resource=proxy_plugins namespace={} \
+                         column=plugin_configs.scope: {}",
+                        operation, namespace, reason
+                    )))
+                })?;
                 let proxy_id = row
                     .try_get::<Option<String>, _>("proxy_id")
                     .map_err(|e| {
@@ -13320,6 +13324,18 @@ pub(crate) fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
     }
 }
 
+/// Parse a stored `plugin_configs.scope` value. Exact match on the values the
+/// writers store; anything else is a row-decode failure, never `Global`
+/// (issue #7192). The raw column is not embedded in the error.
+pub(crate) fn parse_plugin_scope(s: &str) -> Result<PluginScope, String> {
+    match s {
+        "global" => Ok(PluginScope::Global),
+        "proxy" => Ok(PluginScope::Proxy),
+        "proxy_group" => Ok(PluginScope::ProxyGroup),
+        _ => Err("unsupported scope (expected one of: global, proxy, proxy_group)".to_string()),
+    }
+}
+
 pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
     match s.to_lowercase().as_str() {
         "multi" => AuthMode::Multi,
@@ -13850,13 +13866,14 @@ fn row_to_plugin_config_inner(
         namespace: row_namespace_or_default(row),
         plugin_name: row.try_get("plugin_name")?,
         config: config_val,
-        scope: match scope_str.as_str() {
-            "proxy" => PluginScope::Proxy,
-            "proxy_group" => PluginScope::ProxyGroup,
-            _ => PluginScope::Global,
-        },
-        proxy_id: row.try_get("proxy_id").ok(),
-        enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,
+        // Strict (issue #7192): an unknown scope used to become `Global`,
+        // widening a proxy-scoped plugin to every proxy in the namespace; a
+        // `proxy_id` decode failure detached it and an `enabled` decode
+        // failure enabled it. MongoDB rejects the same values through serde.
+        scope: parse_plugin_scope(&scope_str)
+            .map_err(|reason| anyhow::anyhow!("PluginConfig {:?}: {}", id_preview, reason))?,
+        proxy_id: optional_utf8_text_column(row, "proxy_id")?,
+        enabled: row.try_get::<i32, _>("enabled")? != 0,
         priority_override: row
             .try_get::<Option<i32>, _>("priority_override")
             .ok()
