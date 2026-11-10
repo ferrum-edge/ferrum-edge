@@ -1,6 +1,7 @@
 mod admin;
 mod build;
 mod cli;
+mod client_trust_registry_lock;
 mod config;
 mod env_lock;
 mod gateway_trust_observability_lock;

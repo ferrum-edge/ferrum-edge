@@ -2314,7 +2314,7 @@ async fn none_client_auth_refuses_a_named_discovered_token_endpoint() {
             .expect("loopback discovery URL is admitted at construction");
         (server, plugin)
     }
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
     let wait = std::time::Duration::from_secs(10);
 
@@ -3144,7 +3144,7 @@ async fn oidc_discovered_jwks_store_joins_active_trust_health_after_commit() {
         .mount(&server)
         .await;
 
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let mut config = base_config();
@@ -3222,7 +3222,7 @@ async fn oidc_staged_discovery_store_is_not_exposed_before_commit() {
         .mount(&server)
         .await;
 
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let mut config = base_config();
@@ -3397,7 +3397,7 @@ async fn discovery_config_retains_explicit_optional_endpoints() {
         .mount(&server)
         .await;
 
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let mut config = base_config();
