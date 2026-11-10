@@ -6,6 +6,7 @@ use crate::plugins::RequestContext;
 use crate::plugins::utils::auth_flow::constant_time_eq;
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use super::config_values::optional_string_vec_in;
 use super::rules::IpCidr;
 
 /// Fixed-shape global exemption object keys. `header_present` remains an
@@ -71,7 +72,8 @@ impl CompiledExemptions {
             "waf: `config.global_exemptions`: ",
         )?;
 
-        let paths = optional_string_vec(object, "paths")?.unwrap_or_default();
+        let paths =
+            optional_string_vec_in(object, "paths", "global_exemptions.")?.unwrap_or_default();
         // Exemptions are matched against the canonical request path, exactly
         // like rule `conditions.paths`, so a non-canonical exact or `prefix*`
         // value (a percent escape, `//`, a dot segment — easily copied from a
@@ -101,16 +103,16 @@ impl CompiledExemptions {
                 })?
         };
 
-        let methods = optional_string_vec(object, "methods")?
+        let methods = optional_string_vec_in(object, "methods", "global_exemptions.")?
             .unwrap_or_default()
             .into_iter()
             .map(|method| method.to_ascii_uppercase())
             .collect::<Vec<_>>();
-        let consumers = optional_string_vec(object, "consumers")?
+        let consumers = optional_string_vec_in(object, "consumers", "global_exemptions.")?
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let ips = optional_string_vec(object, "ips")?
+        let ips = optional_string_vec_in(object, "ips", "global_exemptions.")?
             .unwrap_or_default()
             .into_iter()
             .map(|raw| {
@@ -128,7 +130,9 @@ impl CompiledExemptions {
             }
         };
         let header_present = parse_header_present(object.get("header_present"))?;
-        let fp_filters = optional_string_vec(object, "fp_capture_filters")?.unwrap_or_default();
+        let fp_filters =
+            optional_string_vec_in(object, "fp_capture_filters", "global_exemptions.")?
+                .unwrap_or_default();
         let fp_capture_filters = if fp_filters.is_empty() {
             None
         } else {
@@ -154,7 +158,9 @@ impl CompiledExemptions {
         // buffering decisions, response phases), so each check is skipped
         // outright when its list is empty and none allocates: methods compare
         // case-insensitively in place instead of uppercasing the request
-        // method, and the client IP is parsed only when an IP exemption exists.
+        // method, and the client IP comes from the context's shared canonical
+        // parse (IPv4-mapped IPv6 already folded to IPv4), read only when an
+        // IP exemption exists.
         let criteria = [
             self.path_set
                 .as_ref()
@@ -165,9 +171,8 @@ impl CompiledExemptions {
                     .any(|method| method.eq_ignore_ascii_case(&ctx.method))
             }),
             (!self.ips.is_empty()).then(|| {
-                ctx.client_ip
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|client_ip| self.ips.iter().any(|cidr| cidr.matches(client_ip)))
+                ctx.canonical_client_ip()
+                    .is_some_and(|client_ip| self.ips.iter().any(|cidr| cidr.matches(client_ip)))
             }),
             (!self.consumers.is_empty()).then(|| {
                 ctx.effective_identity()
@@ -291,36 +296,6 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, String>
         }
         Some(other) => Err(format!(
             "waf: global_exemptions.header_present must be an object, got {other:?}",
-            other = other.to_string()
-        )),
-    }
-}
-
-fn optional_string_vec(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<Option<Vec<String>>, String> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(values)) => {
-            let mut parsed = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(raw) = value.as_str() else {
-                    return Err(format!(
-                        "waf: global_exemptions.{key} entries must be strings"
-                    ));
-                };
-                if raw.is_empty() {
-                    return Err(format!(
-                        "waf: global_exemptions.{key} entries must be non-empty"
-                    ));
-                }
-                parsed.push(raw.to_string());
-            }
-            Ok(Some(parsed))
-        }
-        Some(other) => Err(format!(
-            "waf: global_exemptions.{key} must be an array, got {other:?}",
             other = other.to_string()
         )),
     }

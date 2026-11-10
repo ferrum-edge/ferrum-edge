@@ -1096,9 +1096,9 @@ async fn url_encoding_rules_ignore_valid_multibyte_text_and_score_overlong_once(
 
 #[tokio::test]
 async fn a_method_override_exclusion_covers_the_override_special() {
-    // `FE-HEADER-002` fires on the override header's name and, through its
-    // special, on an override that differs from the request method. A header
-    // exclusion suppresses both, case-insensitively.
+    // `FE-HEADER-002` fires, through its special, on an override that differs
+    // from the request method. A header exclusion suppresses it,
+    // case-insensitively.
     let strict = recommended_with_overrides(json!({}));
     let (result, request) = with_header(&strict, "x-http-method-override", "DELETE").await;
     assert!(
@@ -1124,6 +1124,24 @@ async fn a_method_override_exclusion_covers_the_override_special() {
     }));
     let (result, request) = with_header(&unrelated, "x-http-method-override", "DELETE").await;
     assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(listed(&request, "waf.rule_hits", "FE-HEADER-002"));
+}
+
+#[tokio::test]
+async fn a_method_override_that_restates_the_request_method_is_not_a_hit() {
+    // The rule is special-only: the header's presence alone is not the
+    // signal, an override to a different method is.
+    let strict = recommended_with_overrides(json!({}));
+    for same in ["GET", "get"] {
+        let (result, request) = with_header(&strict, "x-http-method-override", same).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{:?}",
+            meta(&request, "waf.rule_hits")
+        );
+        assert!(!listed(&request, "waf.rule_hits", "FE-HEADER-002"));
+    }
+    let (_, request) = with_header(&strict, "x-http-method-override", "DELETE").await;
     assert!(listed(&request, "waf.rule_hits", "FE-HEADER-002"));
 }
 

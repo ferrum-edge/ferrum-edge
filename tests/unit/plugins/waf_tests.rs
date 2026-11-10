@@ -5435,6 +5435,52 @@ async fn global_exemptions_cover_ips_headers_and_capture_filters() {
     assert!(!capture_ctx.metadata.contains_key("waf.rule_hits"));
 }
 
+/// The IP exemption reads the context's shared canonical client address, in
+/// which an IPv4-mapped spelling is already the IPv4 caller it denotes, so an
+/// IPv6-only `::/0` exemption does not cover `::ffff:10.1.2.3` either.
+#[tokio::test]
+async fn ip_exemption_reads_the_shared_canonical_client_ip() {
+    let plugin = waf(json!({
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "global_exemptions": { "ips": ["::/0"] }
+    }))
+    .unwrap();
+
+    let mut mapped = RequestContext::new("::ffff:10.1.2.3".into(), "GET".into(), "/search".into());
+    mapped.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    assert!(!mapped.canonical_client_ip_is_initialized());
+    match plugin.authorize(&mut mapped).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("a mapped IPv4 caller must still be inspected, got {other:?}"),
+    }
+    assert!(
+        mapped.canonical_client_ip_is_initialized(),
+        "the exemption uses the shared parse rather than its own"
+    );
+}
+
+#[test]
+fn shared_config_readers_report_one_diagnostic_per_mistake() {
+    let err = waf(json!({ "global_exemptions": { "paths": [918273641] } })).unwrap_err();
+    assert!(
+        err.contains("`global_exemptions.paths` entries must be strings"),
+        "{err}"
+    );
+
+    // Root and custom-rule integers share one reader and one wording.
+    let err = waf(json!({ "paranoia_level": 300 })).unwrap_err();
+    assert!(err.contains("`paranoia_level` is too large"), "{err}");
+    let err = waf(json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "WAF_ENTRY_FIRST", "category": "c", "target": "query_values",
+            "pattern": "x", "paranoia_min": 300
+        }]
+    }))
+    .unwrap_err();
+    assert!(err.contains("`paranoia_min` is too large"), "{err}");
+}
+
 /// An IPv6-only exemption (`::/0`) must not exempt native IPv4 callers:
 /// matching an IPv4 caller against an IPv6 network would skip WAF inspection
 /// for every IPv4 client.
