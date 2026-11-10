@@ -1131,7 +1131,7 @@ on a native-gRPC request.
 - SQL plugin migrations are tracked in `_ferrum_plugin_migrations` by `(plugin_name, version)`.
 - `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=false` warns on pending plugin migrations at database/cp startup; it does not mutate schema.
 - `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true` applies pending plugin migrations before `load_full_config`; failure is fatal.
-- Standalone SQL migrate `up` with `FERRUM_MIGRATE_DRY_RUN=false` applies pending plugin migrations independently of the startup auto-apply flag; SQL dry-run only reports pending plugin migrations without applying them, and `status`/config-file migration do not apply SQL plugin migrations. MongoDB custom plugin migration support is constructor-created collections/indexes only.
+- Standalone SQL migrate `up` with `FERRUM_MIGRATE_DRY_RUN=false` applies pending plugin migrations independently of the startup auto-apply flag; SQL dry-run only reports pending plugin migrations without applying them, and `status`/config-file migration do not apply SQL plugin migrations. MongoDB has no custom plugin migrations: a plugin creates its collections/indexes idempotently from its committed background worker (staged in `start_background_tasks()`, released by `commit_background_tasks()`), never in the side-effect-free constructor.
 
 ## Notifications
 

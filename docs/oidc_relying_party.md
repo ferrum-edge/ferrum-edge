@@ -16,15 +16,20 @@ config:
       callback_path: "/oidc/callback"
       client_auth:
         method: client_secret_basic
-        client_secret: "${OIDC_CLIENT_SECRET}"
+        # Literal value: plugin config does not expand environment variables.
+        client_secret: "<client secret issued by the IdP>"
       audiences: ["ferrum-edge"]
       claim_headers:
         email: X-Authenticated-Email
   session:
+    # Replace with a unique random secret of at least 32 bytes. Admission
+    # rejects this placeholder (and any unresolved ${NAME}) as written.
     encryption_secret: "${OIDC_SESSION_SECRET_32_BYTES_MIN}"
   behavior:
     post_login_default_path: "/"
 ```
+
+Plugin config values are literal: neither `client_auth.client_secret` nor `session.encryption_secret` reads an environment variable. Substitute real secrets (for example with your deployment tooling) before applying the config. Admission rejects the session placeholder above, and any unresolved `${NAME}` in a session secret, but a `${NAME}` client secret would be sent to the provider as written.
 
 Exactly one provider is supported. Use `discovery_url` for normal OIDC providers, or set `authorization_endpoint`, `token_endpoint`, and `jwks_uri` explicitly for providers without discovery. Provider endpoints the gateway itself dials (`discovery_url`, `token_endpoint`, `userinfo_endpoint`, `jwks_uri`, and every discovered endpoint) must use HTTPS except for a loopback IP literal (`127.0.0.0/8` or `[::1]`); the name `localhost` does not qualify, because DNS overrides and the resolver decide where a name connects. Browser-followed URLs (`authorization_endpoint`, `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) and the `issuer` identifier keep the `localhost` development case, and a discovered plaintext endpoint must share the loopback IP-literal discovery origin.
 
