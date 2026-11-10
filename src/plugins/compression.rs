@@ -575,7 +575,7 @@ impl CompressionPlugin {
         // unknown-key gate so operators still see an explicit migration hint.
         if config.get("disable_on_etag").is_some() {
             return Err(
-                "compression: `disable_on_etag` has been removed; strong ETag responses are always preserved"
+                "compression: `disable_on_etag` has been removed; strong ETag responses are left uncompressed unless `weaken_strong_etag` is `true`"
                     .to_string(),
             );
         }
