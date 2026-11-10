@@ -2598,8 +2598,7 @@ impl Http3ConnectionPool {
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let create = async {
-            boxed_h3_future(|| self.create_connection(proxy, &tls_config, Some(&h3_config), None))
-                .await
+            boxed_h3_future(|| self.create_connection(proxy, &tls_config, &h3_config, None)).await
         };
         self.create_or_get_sender_as(key, None, PoolCreateCaller::CapabilityProbe, create)
             .await
@@ -2616,10 +2615,8 @@ impl Http3ConnectionPool {
         // H3 is the one pool that needs extra creation context beyond the
         // `Proxy`, so it uses the shared shell's explicit creation closure.
         let create = async {
-            boxed_h3_future(|| {
-                self.create_connection(proxy, &tls_config, Some(&h3_config), connect_at)
-            })
-            .await
+            boxed_h3_future(|| self.create_connection(proxy, &tls_config, &h3_config, connect_at))
+                .await
         };
         self.create_or_get_sender(key, connect_at, create).await
     }
@@ -2660,7 +2657,7 @@ impl Http3ConnectionPool {
                     target.port,
                     target.policy_port,
                     &tls_config,
-                    Some(&h3_config),
+                    &h3_config,
                     connect_at,
                 )
             })
@@ -3155,7 +3152,7 @@ impl Http3ConnectionPool {
         &self,
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
-        h3_config: Option<&super::config::Http3ServerConfig>,
+        h3_config: &super::config::Http3ServerConfig,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
@@ -3165,14 +3162,11 @@ impl Http3ConnectionPool {
             )
         })?;
 
-        let default_cfg = super::config::Http3ServerConfig::default();
-        let cfg = h3_config.unwrap_or(&default_cfg);
-
         // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
         // documented backend flow-control windows and the configured
         // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
         // untrusted-client budgets and never quinn's 30 s idle default.
-        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
+        let transport_config = crate::http3::config::build_backend_transport_config(h3_config)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -3321,7 +3315,7 @@ impl Http3ConnectionPool {
         port: u16,
         policy_port: u16,
         tls_config: &Arc<rustls::ClientConfig>,
-        h3_config: Option<&super::config::Http3ServerConfig>,
+        h3_config: &super::config::Http3ServerConfig,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
@@ -3331,14 +3325,11 @@ impl Http3ConnectionPool {
             )
         })?;
 
-        let default_cfg = super::config::Http3ServerConfig::default();
-        let cfg = h3_config.unwrap_or(&default_cfg);
-
         // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
         // documented backend flow-control windows and the configured
         // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
         // untrusted-client budgets and never quinn's 30 s idle default.
-        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
+        let transport_config = crate::http3::config::build_backend_transport_config(h3_config)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -5489,7 +5480,7 @@ impl Http3ConnectionPool {
                 )
             }),
             measure(|pool, proxy, tls, cfg, _, at| {
-                pool.create_connection(proxy, tls, Some(cfg), Some(at))
+                pool.create_connection(proxy, tls, cfg, Some(at))
             }),
             measure(|pool, proxy, tls, cfg, _, at| {
                 pool.create_connection_to_target(
@@ -5498,7 +5489,7 @@ impl Http3ConnectionPool {
                     proxy.backend_port,
                     proxy.backend_port,
                     tls,
-                    Some(cfg),
+                    cfg,
                     Some(at),
                 )
             }),
