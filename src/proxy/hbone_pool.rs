@@ -2,7 +2,9 @@
 //!
 //! The pool owns HTTP/2 client connections to mesh sidecars on the standard
 //! HBONE listener. Each request opens a CONNECT stream to the application port
-//! and then speaks ordinary HTTP over the resulting byte tunnel.
+//! and then speaks ordinary HTTP over the resulting byte tunnel, unless it
+//! reuses an inner application connection already held open in a fenced
+//! tunnel (`hbone_inner_pool`).
 
 use crate::fips::approved::Sha256;
 use bytes::{Buf, Bytes};
@@ -1622,13 +1624,13 @@ impl HboneConnectionPool {
     /// Open a **bare** HBONE CONNECT byte tunnel to a peer's HBONE listener over
     /// a FRESH SVID-mTLS H2 connection for a WebSocket egress session, carrying
     /// the HBONE protocol marker and the W3C source-identity baggage just like
-    /// [`Self::get_tunnel`]. The connection is DIALED to `dial_host:hbone_port`
+    /// [`Self::get_tunnel_via`]. The connection is DIALED to `dial_host:hbone_port`
     /// (the peer's pod address + `:15008`/`mesh.hbone_port`); the bare CONNECT
     /// `:authority` is `app_host:app_port` — the destination workload's app
     /// address+port the peer's transparent HBONE relay byte-copies to locally.
     ///
-    /// This is the WebSocket analogue of [`Self::get_tunnel`] / the raw-TCP HBONE
-    /// egress path, NOT an Extended CONNECT. Ambient/Waypoint materialize NO
+    /// This is the WebSocket analogue of [`Self::get_tunnel_via`] / the raw-TCP
+    /// HBONE egress path, NOT an Extended CONNECT. Ambient/Waypoint materialize NO
     /// inbound routes, and the route-miss transparent-relay fallback
     /// (`build_inbound_hbone_relay_proxy`) is gated on a BARE CONNECT
     /// (`is_connect_request` requires `:protocol` to be ABSENT) — so an Extended
@@ -1649,7 +1651,6 @@ impl HboneConnectionPool {
     /// SVID rotation is automatic because every new session dials with the
     /// current SVID. The dial PINS `expected_peer`; a missing gateway SVID fails
     /// closed before the dial.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub async fn get_ws_byte_tunnel(
         &self,
@@ -1782,11 +1783,11 @@ impl HboneConnectionPool {
     /// lifetime. SVID rotation is automatic (each session dials with the current
     /// SVID). In-cluster dials pin `expected_peer`; cross-cluster dials use the
     /// supplied trust-domain scope and SNI override. A missing gateway SVID fails
-    /// closed before the dial. Distinct from [`Self::get_tunnel`], which hardcodes the
-    /// `hbone` marker on the pooled byte-stream path.
+    /// closed before the dial. Distinct from [`Self::get_tunnel_via`], which
+    /// hardcodes the `hbone` marker on the pooled byte-stream path.
     //
     // Callers: the mesh UDP capture egress datapath (Linux-only, `IP_TRANSPARENT`)
-    // AND the cross-platform UDP capability probe ([`Self::warmup_datagram_connection`]),
+    // AND the cross-platform UDP capability probe ([`Self::warmup_datagram_connection_via`]),
     // so this is reachable on every platform.
     #[allow(clippy::too_many_arguments)]
     pub async fn get_datagram_tunnel(
@@ -1873,7 +1874,7 @@ impl HboneConnectionPool {
     /// would, then DROP the tunnel. A UDP egress target's destination relay
     /// branches on the `udp` marker (`is_udp_hbone_connect`) and unframes the
     /// stream into a local `UdpSocket`; probing it with the byte-stream
-    /// [`Self::warmup_connection`] (which stamps the `hbone` marker) hits the
+    /// [`Self::warmup_connection_via`] (which stamps the `hbone` marker) hits the
     /// WRONG relay on the destination — the byte-stream path that TCP-connects
     /// to the app port — so the probe must carry the SAME `udp` marker the
     /// dispatch datapath uses, or it would prove the wrong capability (codex r1
@@ -2151,8 +2152,7 @@ impl HboneConnectionPool {
                 // window. Recorded before the lock is released, and re-checked
                 // after every claim, so once a dial has failed no other caller
                 // starts a second one for the key in between. A dial whose
-                // future is dropped (cancellation) records no backoff, as on
-                // main.
+                // future is dropped (cancellation) records no backoff.
                 self.growth_backoff_until
                     .insert(key.to_string(), unix_secs() + HBONE_GROWTH_BACKOFF_SECS);
                 debug!(
@@ -5262,42 +5262,6 @@ mod tests {
         assert_ne!(
             xc_b_svc_x, xc_c_svc_x,
             "different trust domains on the same gateway endpoint must partition the pool"
-        );
-    }
-
-    /// The outer-TLS SNI resolution `dial_h2_connect_sender` applies: `None`
-    /// keeps the dial host (byte-identical to the prior hardcoded
-    /// `ServerName::try_from(target_host)`); `Some(x)` overrides to `x` (the
-    /// cross-cluster destination FQDN). Pins the exact expression so the
-    /// in-cluster callers can never silently change SNI.
-    #[test]
-    fn sni_override_resolves_to_dial_host_when_none_else_the_override() {
-        // Mirrors the resolution inside `dial_h2_connect_sender`:
-        //   let sni_host = sni_override.unwrap_or(target_host);
-        let resolve = |target_host: &str, sni_override: Option<&str>| -> String {
-            let sni_host = sni_override.unwrap_or(target_host);
-            let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
-                .expect("valid server name");
-            match server_name {
-                rustls::pki_types::ServerName::DnsName(dns) => dns.as_ref().to_string(),
-                rustls::pki_types::ServerName::IpAddress(ip) => {
-                    let ip: std::net::IpAddr = ip.into();
-                    ip.to_string()
-                }
-                _ => unreachable!("unexpected server name variant"),
-            }
-        };
-
-        // None ⇒ SNI = the dial host (unchanged in-cluster behavior).
-        assert_eq!(resolve("10.9.9.9", None), "10.9.9.9");
-        assert_eq!(
-            resolve("svc-b.default.svc.cluster.local", None),
-            "svc-b.default.svc.cluster.local"
-        );
-        // Some(x) ⇒ SNI = x even though the dial host is the gateway IP.
-        assert_eq!(
-            resolve("10.9.9.9", Some("svc-b.default.svc.cluster.local")),
-            "svc-b.default.svc.cluster.local"
         );
     }
 

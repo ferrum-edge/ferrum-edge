@@ -2016,9 +2016,3 @@ impl HboneInnerConnectionPool {
         self.record_evictions(HboneInnerProtocol::H2, h2_dropped);
     }
 }
-
-impl Default for HboneInnerConnectionPool {
-    fn default() -> Self {
-        Self::new(8)
-    }
-}

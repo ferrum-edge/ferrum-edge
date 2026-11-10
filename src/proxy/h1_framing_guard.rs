@@ -31,8 +31,9 @@
 //! JSON `400` written directly to the socket only for the connection's first
 //! head, before any response bytes. Later malformed heads stay with Hyper so
 //! earlier responses are preserved. A well-formed head takes the same in-place
-//! observe path and the same vectored writes as on `main`. Other Hyper parse
-//! failures the scanner cannot name stay Hyper's empty-bodied `400`.
+//! observe path and the same vectored writes as an unguarded connection. Other
+//! Hyper parse failures the scanner cannot name stay Hyper's empty-bodied
+//! `400`.
 //!
 //! The envelope carries the same shape as a handler-layer protocol reject
 //! (`Content-Type: application/json`, a fixed `{"error":"..."}` body,
