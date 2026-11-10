@@ -251,7 +251,6 @@ struct TypeSubscription {
     /// sequence counter on restart) is not blocked from delivering the first
     /// response of the new stream.
     last_processed_nonce: Option<String>,
-    has_initial_response: bool,
 }
 
 /// Outcome of recording a received SotW response against the per-type nonce
@@ -342,7 +341,6 @@ impl ClientSubscriptionState {
         }
         subscription.last_received_version = Some(version_info.to_string());
         subscription.last_received_nonce = Some(nonce.to_string());
-        subscription.has_initial_response = true;
         ResponseNonceOutcome::Fresh
     }
 
@@ -420,7 +418,7 @@ impl ClientSubscriptionState {
         REQUIRED_MESH_SLICE_TYPE_URLS.iter().all(|type_url| {
             self.subscriptions
                 .get(*type_url)
-                .is_some_and(|subscription| subscription.has_initial_response)
+                .is_some_and(|subscription| subscription.last_received_version.is_some())
         })
     }
 }
@@ -1627,26 +1625,9 @@ fn reverse_translate(
     let mut destination_rules = Vec::new();
     let mut dr_carrier_seen = false;
     for resource in accumulator.resources(ECDS_TYPE_URL) {
-        let typed_extension = match decode_ecds_typed_extension(resource) {
-            Ok(value) => value,
-            Err(e) => {
-                if reserved_destination_rule_carrier_name(&resource.name)?.is_some() {
-                    return Err(e);
-                }
-                warn!(
-                    resource_name = %crate::startup::sanitize_startup_cause(
-                        format!("{:?}", bounded_xds_log_value(&resource.name).to_string()),
-                        &[]
-                    ),
-                    error = %crate::startup::sanitize_startup_cause(
-                        bounded_xds_log_value(&e),
-                        &[]
-                    ),
-                    "xDS ECDS resource failed TypedExtensionConfig decode; skipping"
-                );
-                continue;
-            }
-        };
+        // Ingestion (`decode_resource_name`) already decoded every accumulated
+        // ECDS resource and refused the response otherwise, so this cannot fail.
+        let typed_extension = decode_ecds_typed_extension(resource)?;
         let Some(carrier) = destination_rule_carrier(resource, &typed_extension)? else {
             continue;
         };
@@ -1759,23 +1740,12 @@ fn reverse_translate(
     // resource that reaches this point has a stable identity.
     let mut runtime_overlay = MeshRuntimeOverlay::default();
     for resource in accumulator.resources(RTDS_TYPE_URL) {
-        match runtime_proto::Runtime::decode(resource.bytes.as_slice()) {
-            Ok(layer) => {
-                let overlay = translate_rtds_layer(&layer);
-                for (key, value) in overlay.fields {
-                    runtime_overlay.fields.insert(key, value);
-                }
-            }
-            Err(_) => {
-                warn!(
-                    resource_name = %crate::startup::sanitize_startup_cause(
-                        format!("{:?}", bounded_xds_log_value(&resource.name).to_string()),
-                        &[]
-                    ),
-                    error = "failed to decode Runtime resource",
-                    "xDS RTDS resource failed Runtime decode; skipping"
-                );
-            }
+        // Ingestion (`decode_resource_name`) already decoded every accumulated
+        // Runtime resource and refused the response otherwise.
+        let layer = runtime_proto::Runtime::decode(resource.bytes.as_slice())
+            .map_err(|_| "xDS RTDS resource failed Runtime decode".to_string())?;
+        for (key, value) in translate_rtds_layer(&layer).fields {
+            runtime_overlay.fields.insert(key, value);
         }
     }
 
@@ -2218,12 +2188,8 @@ fn recover_slice_carriers(
 
     let mut recovered = RecoveredSliceCarriers::default();
     for resource in accumulator.resources(ECDS_TYPE_URL) {
-        let typed_extension = match decode_ecds_typed_extension(resource) {
-            Ok(value) => value,
-            // The DR-carrier loop already warned on this same resource; stay
-            // quiet here to avoid double-logging the same decode failure.
-            Err(_) => continue,
-        };
+        // Decoded once already at ingestion; see `reverse_translate`.
+        let typed_extension = decode_ecds_typed_extension(resource)?;
         let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension)? else {
             continue;
         };
@@ -7014,8 +6980,8 @@ mod tests {
             bytes: vec![0x0a, 0xff],
         };
 
-        // The ECDS decode path embeds the peer-supplied name in its error, and
-        // the warn site renders both the name and the error through
+        // The ECDS decode path embeds the peer-supplied name in its error, so
+        // any log site must render both the name and the error through
         // `bounded_xds_log_value`. A hostile 1 MiB name must therefore never
         // reach a log line at full length.
         let err = match decode_ecds_typed_extension(&resource) {
