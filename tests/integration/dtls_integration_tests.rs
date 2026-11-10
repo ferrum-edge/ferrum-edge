@@ -1014,6 +1014,189 @@ async fn test_dtls_server_accepts_strict_dtls13_client() {
         .expect("run task join");
 }
 
+/// Pump one raw dimpl client until `done` holds or `budget` expires.
+async fn pump_dtls_client_until(
+    client: &mut dimpl::Dtls,
+    socket: &UdpSocket,
+    connected: &mut bool,
+    received: &mut Option<Vec<u8>>,
+    budget: Duration,
+    done: fn(bool, &Option<Vec<u8>>) -> bool,
+) -> Result<(), anyhow::Error> {
+    let mut out_buf = vec![0u8; 4096];
+    let mut udp_buf = vec![0u8; 65536];
+    let mut next_timeout = None;
+    drain_dtls_client_outputs(
+        client,
+        socket,
+        &mut out_buf,
+        &mut next_timeout,
+        connected,
+        received,
+    )
+    .await?;
+    let deadline = Instant::now() + budget;
+    while !done(*connected, received) {
+        if Instant::now() >= deadline {
+            anyhow::bail!("DTLS client did not reach the expected state in time");
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let sleep_dur = next_timeout
+            .map(|t| t.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(100))
+            .min(remaining)
+            .min(Duration::from_millis(100));
+        tokio::select! {
+            result = socket.recv(&mut udp_buf) => {
+                let len = result?;
+                client.handle_packet(&udp_buf[..len])?;
+            }
+            _ = tokio::time::sleep(sleep_dur) => {
+                if let Some(t) = next_timeout
+                    && Instant::now() >= t
+                {
+                    client.handle_timeout(Instant::now())?;
+                    next_timeout = None;
+                }
+            }
+        }
+        drain_dtls_client_outputs(
+            client,
+            socket,
+            &mut out_buf,
+            &mut next_timeout,
+            connected,
+            received,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// GHSA-7464-frfx-85p6: the frontend listener matches datagrams to sessions
+/// by source address only, so a malformed datagram carrying an established
+/// client's address (here: sent from the client's own socket) must be
+/// dropped, not end the session. Covers DTLS 1.2 and DTLS 1.3.
+#[tokio::test]
+async fn test_frontend_dtls_session_survives_malformed_datagrams_from_its_peer() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
+        dimpl_config: Arc::new(
+            dimpl::Config::builder()
+                .use_server_cookie(false)
+                .build()
+                .expect("build frontend config"),
+        ),
+        certificate: dimpl::certificate::generate_self_signed_certificate()
+            .expect("generate server cert")
+            .into(),
+        client_cert_verifier: None,
+        client_trust: None,
+    };
+    let server = Arc::new(
+        bind_dtls("127.0.0.1:0".parse().unwrap(), frontend_config)
+            .await
+            .expect("bind server"),
+    );
+    let server_addr = server.local_addr();
+    let server_runner = server.clone();
+    tokio::spawn(async move {
+        let _ = server_runner.run().await;
+    });
+    let server_acceptor = server.clone();
+    tokio::spawn(async move {
+        while let Ok((conn, _addr)) = server_acceptor.accept().await {
+            tokio::spawn(async move {
+                while let Ok(data) = conn.recv().await {
+                    if data.is_empty() || conn.send(&data).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    // Truncated record headers (plaintext and DTLS 1.3 unified) for both
+    // versions, plus, for DTLS 1.2, a well-formed epoch-1 application-data
+    // record with a fresh sequence number whose body cannot authenticate.
+    let truncated: [&[u8]; 3] = [&[0x00], &[0x2c], &[0x17, 0xfe, 0xfd]];
+    let mut bad_tag = vec![
+        0x17, 0xfe, 0xfd, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x20,
+    ];
+    bad_tag.extend_from_slice(&[0xa5; 32]);
+
+    for dtls13 in [false, true] {
+        let label = if dtls13 { "DTLS 1.3" } else { "DTLS 1.2" };
+        let socket = UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind client");
+        socket.connect(server_addr).await.expect("connect client");
+        let config = Arc::new(
+            dimpl::Config::builder()
+                .use_server_cookie(false)
+                .build()
+                .expect("build client config"),
+        );
+        let certificate =
+            dimpl::certificate::generate_self_signed_certificate().expect("generate client cert");
+        let mut client = if dtls13 {
+            dimpl::Dtls::new_13(config, certificate, Instant::now())
+        } else {
+            dimpl::Dtls::new_12(config, certificate, Instant::now())
+        };
+        client.set_active(true);
+        client
+            .handle_timeout(Instant::now())
+            .expect("prime client handshake");
+
+        let mut connected = false;
+        let mut received = None;
+        pump_dtls_client_until(
+            &mut client,
+            &socket,
+            &mut connected,
+            &mut received,
+            Duration::from_secs(10),
+            |connected, _| connected,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label} handshake: {error}"));
+
+        for (round, payload) in [&b"before junk"[..], &b"after junk"[..]].iter().enumerate() {
+            if round == 1 {
+                for datagram in truncated {
+                    socket.send(datagram).await.expect("send junk datagram");
+                }
+                if !dtls13 {
+                    socket.send(&bad_tag).await.expect("send junk datagram");
+                }
+            }
+            client
+                .send_application_data(payload)
+                .expect("send application data");
+            pump_dtls_client_until(
+                &mut client,
+                &socket,
+                &mut connected,
+                &mut received,
+                Duration::from_secs(5),
+                |_, received| received.is_some(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label} echo {round}: {error}"));
+            assert_eq!(
+                received.take().as_deref(),
+                Some(*payload),
+                "{label}: the session must still echo after malformed datagrams"
+            );
+        }
+    }
+
+    server.close().await;
+}
+
 #[tokio::test]
 async fn test_backend_dtls_verification_rejects_hostname_mismatch() {
     let _ =

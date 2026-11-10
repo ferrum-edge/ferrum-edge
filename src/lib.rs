@@ -16275,6 +16275,10 @@ pub mod _test_support {
         crate::dtls::dtls_datagram_opens_session_for_test(data)
     }
 
+    pub fn dtls_packet_error_is_droppable_for_test(error: &dimpl::Error) -> bool {
+        crate::dtls::dtls_packet_error_is_droppable_for_test(error)
+    }
+
     /// External regression coverage for issue #2959 (DTLS demux identity-aware
     /// session removal). See
     /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].

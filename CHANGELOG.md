@@ -671,6 +671,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intent is now admitted against `FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS` like an
   intent; when the spool is full it is refused and counted as a failed durable
   handoff. Finalizing an admitted intent is unaffected.
+- **One malformed datagram no longer ends a DTLS session**
+  (GHSA-7464-frfx-85p6). Frontend DTLS listeners match datagrams to sessions
+  by UDP source address only, and a session ended on any record-processing
+  error, so an off-path attacker who could forge a client's address ended its
+  established session (or in-progress handshake) with a single 1-byte
+  datagram. Backend DTLS connections, including the `udp_logging` DTLS sink,
+  had the same handling. Truncated or malformed records, DTLS 1.2 records
+  that fail authentication, datagrams over the per-datagram record or
+  receive-queue bounds, and post-handshake renegotiation attempts are now
+  dropped as RFC 6347 §4.1.2.7 and RFC 9147 §4.5.2 require; authenticated
+  fatal alerts and handshake certificate or security failures still end the
+  session, and handshake deadlines still bound a stalled handshake.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
