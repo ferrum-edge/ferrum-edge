@@ -4599,14 +4599,15 @@ impl Plugin for GrpcWebPlugin {
         // mangled form.
         ctx.headers.remove(HEADER_GRPC_WEB_MODE);
 
-        let content_type = match ctx.headers.get("content-type") {
-            Some(ct) => ct.clone(),
-            None => return PluginResult::Continue,
-        };
-
-        let Some(request_media) = grpc_web_media_type(&content_type) else {
+        let Some(content_type) = ctx.headers.get("content-type") else {
             return PluginResult::Continue;
         };
+        let Some(request_media) = grpc_web_media_type(content_type) else {
+            return PluginResult::Continue;
+        };
+        // Owned only once the request is known to be gRPC-Web: the headers
+        // are mutated below while the original value is still logged.
+        let content_type = content_type.clone();
 
         // First effective instance in configured order owns translation. A
         // later instance must not overwrite shared staging or re-claim when the

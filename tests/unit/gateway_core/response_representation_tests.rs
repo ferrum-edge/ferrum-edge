@@ -701,7 +701,7 @@ async fn unprotected_responses_are_never_rejected_by_the_gate() {
 }
 
 /// Regression: the gate must parse exactly the way the enforcer does. A body the
-/// gate accepts but `apply_body_rules` cannot parse would return `None` from the
+/// gate accepts but `apply_body_rules_bounded` cannot parse would return `Unchanged` from the
 /// transform, be read as "no rule matched", and forward the protected bytes —
 /// the same conflation this whole gate exists to close. A UTF-8 BOM is the
 /// concrete case: `serde_json` rejects it, so the gate must too.
@@ -727,7 +727,7 @@ async fn bom_prefixed_json_is_rejected_rather_than_leniently_accepted() {
 // Absent `Content-Type`: the claim predicate must match the enforcer exactly.
 //
 // `transform_response_body` treats `None` as JSON — it only declines on a
-// *present* non-JSON type — and calls `apply_body_rules`. A claim predicate that
+// *present* non-JSON type — and calls `apply_body_rules_bounded`. A claim predicate that
 // declined `None` would leave untyped bodies un-inspected by the gate while the
 // enforcer still tried (and silently failed) to parse them, which is the exact
 // `None`-conflation bypass the gate exists to close.
@@ -756,7 +756,7 @@ async fn untyped_encoded_body_is_claimed_decoded_and_redacted() {
 }
 
 /// An untyped body the enforcer cannot parse must be rejected, not forwarded.
-/// Forwarding is what made this a bypass: `apply_body_rules` returns `None`, the
+/// Forwarding is what made this a bypass: `apply_body_rules_bounded` returns `Unchanged`, the
 /// lifecycle reads "no rule matched", and the protected value ships.
 #[tokio::test]
 async fn untyped_unparseable_body_is_rejected_not_forwarded() {

@@ -231,20 +231,6 @@ macro_rules! emit_ws_frame_log {
                     "WebSocket frame"
                 );
             }
-            (Some(preview), None, None) => {
-                tracing::$level!(
-                    target: "ws_frame_log",
-                    plugin_id,
-                    proxy_id = %$proxy_id,
-                    connection_id = $conn_id,
-                    direction = $dir,
-                    frame_type = obs.frame_type,
-                    size_bytes = obs.size_bytes,
-                    preview = %preview,
-                    outcome = $outcome,
-                    "WebSocket frame"
-                );
-            }
             (None, Some(code), Some(reason_len)) => {
                 tracing::$level!(
                     target: "ws_frame_log",
@@ -260,20 +246,8 @@ macro_rules! emit_ws_frame_log {
                     "WebSocket frame"
                 );
             }
-            (None, None, None) => {
-                tracing::$level!(
-                    target: "ws_frame_log",
-                    plugin_id,
-                    proxy_id = %$proxy_id,
-                    connection_id = $conn_id,
-                    direction = $dir,
-                    frame_type = obs.frame_type,
-                    size_bytes = obs.size_bytes,
-                    outcome = $outcome,
-                    "WebSocket frame"
-                );
-            }
-            // Close(None) or inconsistent close metadata: omit close fields.
+            // No close metadata (a non-Close frame, Close(None), or inconsistent
+            // close metadata): omit the close fields.
             (Some(preview), _, _) => {
                 tracing::$level!(
                     target: "ws_frame_log",

@@ -3945,7 +3945,10 @@ impl Plugin for MeshAuthz {
                         "destination_scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    if self.per_pod_policy_scoping && !asserted_identity_rejected {
+                    if self.per_pod_policy_scoping
+                        && !asserted_identity_rejected
+                        && !live_admission_reevaluation
+                    {
                         crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                             crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
                         );
@@ -4068,7 +4071,7 @@ impl Plugin for MeshAuthz {
                         "scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    if !asserted_identity_rejected {
+                    if !asserted_identity_rejected && !live_admission_reevaluation {
                         crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                             crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::ScopeMissing,
                         );
@@ -4096,7 +4099,7 @@ impl Plugin for MeshAuthz {
                         "destination_scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    if !asserted_identity_rejected {
+                    if !asserted_identity_rejected && !live_admission_reevaluation {
                         crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                             crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
                         );

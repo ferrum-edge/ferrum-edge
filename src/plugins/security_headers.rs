@@ -264,18 +264,15 @@ impl SecurityHeaders {
         // `false`/`null` or customized with an explicit value.
         let mut set: Vec<SetEntry> = Vec::new();
 
-        if let Some(value) = header_value(object, "content_type_options", "nosniff", true)? {
+        if let Some(value) = header_value(object, "content_type_options", "nosniff")? {
             set.push(SetEntry::new("x-content-type-options".to_string(), value));
         }
-        if let Some(value) = header_value(object, "frame_options", "SAMEORIGIN", true)? {
+        if let Some(value) = header_value(object, "frame_options", "SAMEORIGIN")? {
             set.push(SetEntry::new("x-frame-options".to_string(), value));
         }
-        if let Some(value) = header_value(
-            object,
-            "referrer_policy",
-            "strict-origin-when-cross-origin",
-            true,
-        )? {
+        if let Some(value) =
+            header_value(object, "referrer_policy", "strict-origin-when-cross-origin")?
+        {
             set.push(SetEntry::new("referrer-policy".to_string(), value));
         }
         // Opt-in headers: default disabled (no value unless configured).
@@ -542,17 +539,16 @@ fn gateway_owned_destination_reason(name: &str) -> Option<&'static str> {
     None
 }
 
-/// Resolve a built-in security header. `key` is the config field; when present
-/// and `true` (or absent and `default_on`) the `default_value` is used; an
-/// explicit string overrides it; `false`/`null`/`""` disables it.
+/// Resolve a default-on built-in security header. `key` is the config field;
+/// when absent or `true` the `default_value` is used; an explicit string
+/// overrides it; `false`/`null`/`""` disables it.
 fn header_value(
     object: &serde_json::Map<String, Value>,
     key: &str,
     default_value: &str,
-    default_on: bool,
 ) -> Result<Option<String>, String> {
     match object.get(key) {
-        None => Ok(default_on.then(|| default_value.to_string())),
+        None => Ok(Some(default_value.to_string())),
         Some(Value::Null) => Ok(None),
         Some(Value::Bool(true)) => Ok(Some(default_value.to_string())),
         Some(Value::Bool(false)) => Ok(None),

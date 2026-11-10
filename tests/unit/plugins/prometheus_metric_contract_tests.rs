@@ -1559,3 +1559,52 @@ fn database_outage_is_visible_on_metrics_while_poll_freshness_still_advances() {
         "recovery on the shared flag must be observable without a metrics call site"
     );
 }
+
+/// Each mesh freshness family is one group — HELP, TYPE, then every sample —
+/// with no other family's sample between (issue #7145). The federation and
+/// remote-discovery blocks used to interleave a timestamp and an age sample
+/// per key, which strict OpenMetrics parsers reject.
+#[test]
+fn mesh_freshness_families_render_as_contiguous_groups() {
+    let suffix = format!("{}-{}", std::process::id(), line!());
+    for index in 0..2 {
+        prometheus_helpers::record_mesh_federation_poll_success(
+            format!("fed-{index}-{suffix}.example"),
+            1_700_000_000,
+        );
+        prometheus_helpers::record_mesh_remote_discovery_poll_success(
+            format!("remote-{index}-{suffix}"),
+            format!("td-{index}-{suffix}.example"),
+            1_700_000_000,
+        );
+    }
+    let mut output = String::new();
+    prometheus_helpers::render_mesh_observability_metrics(&mut output);
+    let lines: Vec<&str> = output.lines().collect();
+
+    for family in [
+        "ferrum_mesh_federation_last_success_timestamp_seconds",
+        "ferrum_mesh_federation_bundle_age_seconds",
+        "ferrum_mesh_remote_discovery_last_success_timestamp_seconds",
+        "ferrum_mesh_remote_discovery_endpoint_age_seconds",
+    ] {
+        let type_line = format!("# TYPE {family} gauge");
+        let type_index = lines
+            .iter()
+            .position(|line| *line == type_line)
+            .unwrap_or_else(|| panic!("missing {type_line}:\n{output}"));
+        let sample_prefix = format!("{family}{{");
+        let samples: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with(&sample_prefix))
+            .map(|(index, _)| index)
+            .collect();
+        assert!(samples.len() >= 2, "{family} samples missing:\n{output}");
+        let expected: Vec<usize> = (type_index + 1..type_index + 1 + samples.len()).collect();
+        assert_eq!(
+            samples, expected,
+            "{family} samples must directly follow its TYPE line:\n{output}"
+        );
+    }
+}

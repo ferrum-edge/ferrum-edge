@@ -403,6 +403,86 @@ async fn try_send_batch_threshold_triggers_flush() {
     assert_eq!(*flushed.lock().unwrap(), vec![vec![1, 2]]);
 }
 
+/// After a flush that outlasts several flush intervals, the timer resumes at
+/// its period instead of firing the missed ticks back to back (issue #7150),
+/// which would send a recovering collector a run of tiny batches. One record
+/// arrives during each flush, so the buffer is never empty when the timer is
+/// polled again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn flush_timer_does_not_burst_missed_ticks_after_a_slow_flush() {
+    use ferrum_edge::plugins::utils::BatchingLoggerHandle;
+    use std::sync::OnceLock;
+
+    const PERIOD: Duration = Duration::from_millis(100);
+    let flushes = Arc::new(Mutex::new(Vec::<(tokio::time::Instant, Vec<u32>)>::new()));
+    let third_flush = Arc::new(Notify::new());
+    let next_item: Arc<OnceLock<BatchingLoggerHandle<u32>>> = Arc::new(OnceLock::new());
+    let logger = {
+        let flushes = Arc::clone(&flushes);
+        let third_flush = Arc::clone(&third_flush);
+        let next_item = Arc::clone(&next_item);
+        BatchingLogger::spawn(
+            BatchConfig {
+                batch_size: 64,
+                flush_interval: PERIOD,
+                buffer_capacity: 64,
+                retry: RetryPolicy::fixed(1, Duration::ZERO),
+                plugin_name: "batching_logger_missed_ticks",
+            },
+            move |batch: Arc<Vec<u32>>| {
+                let flushes = Arc::clone(&flushes);
+                let third_flush = Arc::clone(&third_flush);
+                let next_item = Arc::clone(&next_item);
+                async move {
+                    let count = flushes.lock().unwrap().len();
+                    if count == 0 {
+                        // A collector slow to answer: ten flush intervals.
+                        tokio::time::sleep(PERIOD * 10).await;
+                    }
+                    flushes
+                        .lock()
+                        .unwrap()
+                        .push((tokio::time::Instant::now(), batch.to_vec()));
+                    if count < 2 {
+                        let next = u32::try_from(count).unwrap() + 2;
+                        let sent = next_item.get().expect("handle installed").try_send(next);
+                        assert!(sent, "the next record must be admitted");
+                    } else {
+                        third_flush.notify_one();
+                    }
+                    Ok(())
+                }
+            },
+        )
+    };
+    assert!(
+        next_item
+            .set(logger.handle().expect("live logger handle"))
+            .is_ok()
+    );
+    logger.commit();
+    assert!(logger.try_send(1));
+
+    timeout(Duration::from_secs(60), third_flush.notified())
+        .await
+        .expect("three flushes");
+    let flushes = flushes.lock().unwrap().clone();
+    assert_eq!(
+        flushes
+            .iter()
+            .map(|(_, batch)| batch.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![1], vec![2], vec![3]]
+    );
+    // The tick missed during the slow flush fires once (record 2); the next
+    // waits a full period instead of firing immediately (record 3).
+    assert!(
+        flushes[2].0 - flushes[1].0 >= PERIOD,
+        "the flush after the missed tick must wait a full interval, got {:?}",
+        flushes[2].0 - flushes[1].0
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn reserved_slot_excludes_concurrent_reservation_until_send() {
     let flushed = Arc::new(Mutex::new(Vec::<Vec<u32>>::new()));

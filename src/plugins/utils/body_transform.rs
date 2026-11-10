@@ -699,23 +699,6 @@ enum BodyRulesPass {
     Skipped(BodyRulesSkipReason),
 }
 
-/// Apply body transformation rules to a JSON body.
-///
-/// Parses `body` as JSON, applies rules in order, and returns the serialized
-/// result. Returns `None` if the body is not valid JSON, is empty, or no rule
-/// actually changed the body.
-///
-/// Number lexemes the client sent are preserved exactly (see
-/// [`apply_request_body_rules`]).
-///
-/// Content-type is checked by the caller — this function assumes JSON input.
-pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
-    match apply_request_body_rules(body, rules) {
-        RequestBodyRulesOutcome::Replaced(bytes) => Some(bytes),
-        RequestBodyRulesOutcome::Skipped(_) | RequestBodyRulesOutcome::Unchanged => None,
-    }
-}
-
 /// Request-side body-rule pass that reports why a body was left unchanged.
 ///
 /// Rewriting a field re-serializes the whole document. `serde_json::Value`
@@ -745,7 +728,14 @@ pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyR
     }
 }
 
-/// [`apply_body_rules`] with an explicit ceiling on the produced document.
+/// Response-side body-rule pass with an explicit ceiling on the produced
+/// document. Content-type is checked by the caller — this function assumes
+/// JSON input; an empty or unparseable body, or one no rule changed, returns
+/// [`crate::plugins::BoundedResponseBodyConstruction::Unchanged`].
+///
+/// Unlike [`apply_request_body_rules`], this pass does not preserve number
+/// lexemes: a rewritten document re-serializes every number from
+/// `serde_json::Value` (issue #7149).
 ///
 /// The response side passes this response's retained ceiling so the rewritten
 /// JSON is serialized THROUGH a bounded sink: a rule set that amplifies a

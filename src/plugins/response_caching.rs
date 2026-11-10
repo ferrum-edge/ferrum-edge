@@ -490,6 +490,19 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
     })
 }
 
+/// Set `name` (a lowercase header name) to `value`, dropping every other
+/// casing of it first so a plugin-written `Vary` and the inserted `vary` never
+/// travel side by side.
+fn replace_header(headers: &mut HashMap<String, String>, name: &str, value: String) {
+    if headers
+        .keys()
+        .any(|header| header != name && header.eq_ignore_ascii_case(name))
+    {
+        headers.retain(|header, _| header == name || !header.eq_ignore_ascii_case(name));
+    }
+    headers.insert(name.to_string(), value);
+}
+
 /// Encode a path for the invalidation path index (`path_index`). Cache keys
 /// themselves are fixed-length digests; this encoding only shapes the index
 /// entries that RFC 9111 unsafe-method invalidation matches against, so a path
@@ -2355,7 +2368,10 @@ impl ResponseCaching {
     ) -> Option<Vec<String>> {
         let mut vary_headers = self.config.vary_by_headers.clone();
 
-        if let Some(vary) = response_headers.get("vary") {
+        // Case-insensitive like the rest of the store path: a plugin-written
+        // response header map is not guaranteed to carry canonical lowercase
+        // keys, and `Vary` decides representation selection.
+        if let Some(vary) = header_value(response_headers, "vary") {
             for header in vary.split(',') {
                 let header = header.trim().to_ascii_lowercase();
                 if header.is_empty() {
@@ -2409,7 +2425,7 @@ impl ResponseCaching {
         // key, then the mandatory credential/session names.
         self.merge_existing_vary_headers(base_key, &mut vary_headers);
         self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
-        response_headers.insert("vary".to_string(), vary_headers.join(", "));
+        replace_header(response_headers, "vary", vary_headers.join(", "));
     }
 
     fn is_fresh_conditional_hit(
@@ -2425,17 +2441,12 @@ impl ResponseCaching {
         }
 
         if let Some(if_none_match) = request_headers.get("if-none-match") {
-            return if_none_match_matches(
-                if_none_match,
-                entry.headers.get("etag").map(String::as_str),
-            );
+            return if_none_match_matches(if_none_match, header_value(&entry.headers, "etag"));
         }
 
         if let Some(if_modified_since) = request_headers.get("if-modified-since") {
-            return entry
-                .headers
-                .get("last-modified")
-                .and_then(|last_modified| parse_http_date(last_modified))
+            return header_value(&entry.headers, "last-modified")
+                .and_then(parse_http_date)
                 .zip(parse_http_date(if_modified_since))
                 .is_some_and(|(last_modified, if_modified_since)| {
                     last_modified <= if_modified_since
@@ -2460,8 +2471,8 @@ impl ResponseCaching {
             "last-modified",
             "vary",
         ] {
-            if let Some(value) = entry.headers.get(key) {
-                headers.insert(key.to_string(), value.clone());
+            if let Some(value) = header_value(&entry.headers, key) {
+                headers.insert(key.to_string(), value.to_string());
             }
         }
 
@@ -4229,7 +4240,11 @@ impl Plugin for ResponseCaching {
             // Mirror the final keyed Vary list onto the cached response so
             // downstream caches and clients observe the same dimensions.
             if !vary_headers.is_empty() {
-                cached_response_headers.insert("vary".to_string(), vary_headers.join(", "));
+                replace_header(
+                    &mut cached_response_headers,
+                    "vary",
+                    vary_headers.join(", "),
+                );
             }
 
             let entry = CacheEntry {
