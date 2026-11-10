@@ -901,4 +901,4 @@ socket/lifetime, CPU-sample and unwind validity. `internal_comparison_eligible`
 requires valid traffic, complete internal profiles and complete runtime pairing;
 `fully_measured_comparison_eligible` remains false with missing dimensions. Review
 the actual hosted compiler, fixture and capture evidence before any
-interpretation; #5588 remains open.
+interpretation; issue #5588 was closed on 2026-10-02.

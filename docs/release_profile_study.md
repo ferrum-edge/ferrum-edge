@@ -1,6 +1,6 @@
 # Release profile study
 
-Issue #4674 remains open. Dispatch **Release Profile Study** to build fat LTO /
+Issue #4674 was closed on 2026-09-09. Dispatch **Release Profile Study** to build fat LTO /
 one codegen unit and thin LTO / sixteen codegen units on one standard Linux
 runner. Both use the same revision, toolchain, native dependencies, other
 release settings and `cloud-secrets` feature. Each compilation starts with an
