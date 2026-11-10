@@ -2606,10 +2606,13 @@ impl MetricsRegistry {
             protocol: protocol.as_str(),
             event: event.as_str(),
         };
-        self.hbone_inner_pool_event_counter
-            .entry(key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
+        let epoch = self.epoch;
+        Self::update_series(
+            &self.hbone_inner_pool_event_counter,
+            key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         self.maybe_invalidate_cache();
     }
@@ -2623,10 +2626,13 @@ impl MetricsRegistry {
             transport,
             result: if success { "success" } else { "failure" },
         };
-        self.mesh_tcp_egress_connection_counter
-            .entry(key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
+        let epoch = self.epoch;
+        Self::update_series(
+            &self.mesh_tcp_egress_connection_counter,
+            key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         self.maybe_invalidate_cache();
     }
