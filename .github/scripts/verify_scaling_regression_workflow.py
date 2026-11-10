@@ -50,6 +50,9 @@ REQUIRED_LATEST_RUN_SELF_TESTS = (
     "exact current run failure",
     "missing head_branch is not on main",
     "dispatched main run closes",
+    # A fork or pull-request run must never open or close the signal.
+    "fork run is not trusted",
+    "pull request run is not trusted",
 )
 PUBLISHER_QUEUE_MODE = "queue: max"
 

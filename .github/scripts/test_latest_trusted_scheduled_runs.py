@@ -25,5 +25,13 @@ class ScheduledRunCLITests(unittest.TestCase):
                 request.assert_not_called()
 
 
+def run_self_test() -> list[str]:
+    """Run these CLI regressions from verify_required_ci.py (issue #7282)."""
+
+    result = unittest.TestResult()
+    unittest.defaultTestLoader.loadTestsFromTestCase(ScheduledRunCLITests).run(result)
+    return [trace for _, trace in result.failures + result.errors]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,9 @@ from pathlib import Path
 
 from test_ci_policy_parallel import run_self_test as ci_policy_parallel_self_test
 from test_release_dispatch import run_self_test as release_dispatch_self_test
+from test_latest_trusted_scheduled_runs import (
+    run_self_test as latest_trusted_scheduled_runs_self_test,
+)
 from test_unit_ci import (
     check_repository as unit_ci_contract_errors,
     self_test as unit_ci_self_test,
@@ -350,6 +353,48 @@ ARTIFACT_GATE_REQUIRED_IDS = {
     "multicluster.federation.trust_restored_recovers",
     "multicluster.eastwest.endpoint_blackhole_when_dest_down",
     "multicluster.eastwest.endpoint_recovers_when_dest_returns",
+}
+
+# Issue #7282: `Multicluster Poller Partition Live` publishes the same kind of
+# emitted-artifact gate, so it gets the same wiring proof. Its ids mirror the
+# `--require` list of its gate (and the DEDICATED_REQUIRED_CHECKS contract).
+POLLER_ARTIFACT_GATE_WORKFLOW = (
+    ".github/workflows/multicluster-poller-partition-live.yml"
+)
+POLLER_ARTIFACT_GATE_REQUIRED_IDS = {
+    "multicluster_poller.initial.polled_trust_endpoints_installed",
+    "multicluster_poller.transient.last_good_retained",
+    "multicluster_poller.transient.cache_age_increased",
+    "multicluster_poller.endpoint.expired_fail_closed",
+    "multicluster_poller.endpoint.remote_target_removed",
+    "multicluster_poller.endpoint.recovered_same_generation",
+    "multicluster_poller.trust.expired_fail_closed",
+    "multicluster_poller.trust.inbound_outbound_recomputed",
+    "multicluster_poller.trust.recovered_same_generation",
+    "multicluster_poller.metrics.failure_backoff_recovery_bounded",
+    "multicluster_poller.metrics.admin_status_parity",
+    "multicluster_poller.withdrawal.inflight_generation_retired",
+    "multicluster_poller.withdrawal.retired_state_not_reinstalled",
+}
+# workflow -> (release-contract ids, artifact steps that must be gated on the
+# summarize step's positive `validate` output).
+ARTIFACT_GATE_CONTRACTS = {
+    ARTIFACT_GATE_WORKFLOW: (
+        ARTIFACT_GATE_REQUIRED_IDS,
+        (
+            "name: Checkout Ferrum Edge",
+            "name: Download live assertion artifact",
+            "name: Validate emitted live assertion artifact",
+        ),
+    ),
+    POLLER_ARTIFACT_GATE_WORKFLOW: (
+        POLLER_ARTIFACT_GATE_REQUIRED_IDS,
+        (
+            "name: Checkout validator",
+            "name: Download emitted evidence",
+            "name: Validate exact poller boundary contract",
+        ),
+    ),
 }
 
 DEDICATED_WORKFLOW_NAMES = {
@@ -1574,12 +1619,67 @@ def validate_artifact_gate_wiring() -> list[str]:
     """
 
     errors: list[str] = []
-    workflow_yml = Path(ARTIFACT_GATE_WORKFLOW).read_text(encoding="utf-8")
-    gate_body = extract_job_body(workflow_yml, "gate")
+    for workflow_path, (required, step_markers) in sorted(
+        ARTIFACT_GATE_CONTRACTS.items()
+    ):
+        workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
+        errors.extend(
+            artifact_gate_wiring_errors(
+                workflow_path,
+                extract_job_body(workflow_yml, "gate"),
+                required,
+                step_markers,
+            )
+        )
+    return errors
+
+
+def artifact_gate_wiring_self_test() -> list[str]:
+    """Each emitted-artifact gate rejects a dropped id and a dropped download."""
+
+    failures: list[str] = []
+    for workflow_path, (required, step_markers) in sorted(
+        ARTIFACT_GATE_CONTRACTS.items()
+    ):
+        gate_body = extract_job_body(
+            Path(workflow_path).read_text(encoding="utf-8"), "gate"
+        )
+        dropped_id = sorted(required)[0]
+        for label, mutated in (
+            ("a dropped release-contract id", gate_body.replace(
+                f"--require {dropped_id}", "", 1
+            )),
+            ("a dropped artifact download", gate_body.replace(
+                "actions/download-artifact@", "actions/download-artifacts@", 1
+            )),
+        ):
+            if mutated == gate_body:
+                failures.append(
+                    f"artifact gate self-test fixture for {workflow_path} "
+                    f"({label}) did not alter the gate"
+                )
+            elif not artifact_gate_wiring_errors(
+                workflow_path, mutated, required, step_markers
+            ):
+                failures.append(
+                    f"{workflow_path} artifact gate accepted {label}"
+                )
+    return failures
+
+
+def artifact_gate_wiring_errors(
+    workflow_path: str,
+    gate_body: str,
+    required_contract_ids: set[str],
+    step_markers: tuple[str, ...],
+) -> list[str]:
+    """Wiring errors for one workflow's emitted-artifact `gate` job."""
+
+    errors: list[str] = []
 
     if ARTIFACT_GATE_DOWNLOAD_ACTION.search(gate_body) is None:
         errors.append(
-            f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must download the published live "
+            f"{workflow_path} jobs.gate must download the published live "
             "artifact with a full-commit-pinned `actions/download-artifact`"
         )
 
@@ -1588,7 +1688,7 @@ def validate_artifact_gate_wiring() -> list[str]:
     for forbidden in ("cargo ", "setup-rust", "rustup", "docker build", "kind "):
         if forbidden in gate_body:
             errors.append(
-                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must not run `{forbidden.strip()}`; "
+                f"{workflow_path} jobs.gate must not run `{forbidden.strip()}`; "
                 "the aggregate gate carries no build or toolchain surface"
             )
 
@@ -1597,11 +1697,11 @@ def validate_artifact_gate_wiring() -> list[str]:
         errors.append(f"{validator} must exist; it is the emitted-artifact gate")
 
     required_ids = extract_required_assertion_ids(gate_body)
-    if required_ids != ARTIFACT_GATE_REQUIRED_IDS:
-        missing = sorted(ARTIFACT_GATE_REQUIRED_IDS - required_ids)
-        unexpected = sorted(required_ids - ARTIFACT_GATE_REQUIRED_IDS)
+    if required_ids != required_contract_ids:
+        missing = sorted(required_contract_ids - required_ids)
+        unexpected = sorted(required_ids - required_contract_ids)
         errors.append(
-            f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must require exactly the "
+            f"{workflow_path} jobs.gate must require exactly the "
             f"release-contract assertion ids (missing: {missing}, "
             f"unexpected: {unexpected})"
         )
@@ -1609,21 +1709,17 @@ def validate_artifact_gate_wiring() -> list[str]:
     # Every artifact step must be reached only through the positively
     # established relevant-and-successful path, so an irrelevant pull request
     # never tries to download an artifact that was never produced.
-    for step_marker in (
-        "name: Checkout Ferrum Edge",
-        "name: Download live assertion artifact",
-        "name: Validate emitted live assertion artifact",
-    ):
+    for step_marker in step_markers:
         index = gate_body.find(step_marker)
         if index < 0:
             errors.append(
-                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate is missing step `{step_marker}`"
+                f"{workflow_path} jobs.gate is missing step `{step_marker}`"
             )
             continue
         following = gate_body[index : index + 400]
         if "if: steps.summarize.outputs.validate == 'true'" not in following:
             errors.append(
-                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate step `{step_marker}` must be "
+                f"{workflow_path} jobs.gate step `{step_marker}` must be "
                 "gated on the summarize step's `validate` output"
             )
 
@@ -1857,6 +1953,7 @@ def main() -> int:
 
     planner_errors.extend(ci_policy_parallel_self_test())
     planner_errors.extend(release_dispatch_self_test())
+    planner_errors.extend(latest_trusted_scheduled_runs_self_test())
     planner_errors.extend(merge_group_self_test())
     planner_errors.extend(optional_live_suite_self_test())
 
@@ -2307,6 +2404,7 @@ def main() -> int:
     else:
         planner_errors.extend(chart_runtime_findings)
     planner_errors.extend(validate_artifact_gate_wiring())
+    planner_errors.extend(artifact_gate_wiring_self_test())
     planner_errors.extend(error.format() for error in check_repository())
     planner_errors.extend(install_docs_contract_self_test())
     planner_errors.extend(check_install_docs_contract())
