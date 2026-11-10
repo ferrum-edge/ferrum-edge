@@ -662,6 +662,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before, and invalid, revoked, expired or deactivated ones fail closed with a
   fixed diagnostic. Preparing a new order still requires the configured
   challenge on every authorization.
+- **The admin audit spool ceiling also bounds finalized records without an
+  intent** (#7200). Under `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_open`, a
+  mutation whose pre-mutation intent was refused because the spool was full
+  still ran, and its finalized record was then written to the spool with no
+  ceiling check, so a long audit-database outage grew the spool by one fsynced
+  file per mutation. A finalized record that does not replace a prepared
+  intent is now admitted against `FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS` like an
+  intent; when the spool is full it is refused and counted as a failed durable
+  handoff. Finalizing an admitted intent is unaffected.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
