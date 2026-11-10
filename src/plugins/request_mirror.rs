@@ -2351,12 +2351,6 @@ impl RequestMirror {
         self.sample_phase.load(Ordering::Relaxed)
     }
 
-    /// Configured mirror timeout override when present.
-    #[allow(dead_code)]
-    pub(crate) fn mirror_timeout_ms_for_test(&self) -> Option<u64> {
-        self.mirror_timeout_ms
-    }
-
     /// Current retained request-body budget usage for external tests.
     #[allow(dead_code)]
     pub(crate) fn retained_request_body_bytes_for_test(&self) -> u64 {

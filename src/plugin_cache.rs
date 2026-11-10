@@ -2805,9 +2805,10 @@ fn validate_tcp_connection_throttle_attachment(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
 ) -> Result<(), String> {
-    let attached = gateway_config.proxies.iter().filter(|proxy| {
-        tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
-    });
+    let attached = gateway_config
+        .proxies
+        .iter()
+        .filter(|proxy| plugin_config_effectively_applies_to_proxy(pc, proxy, gateway_config));
     let mut attached_count = 0usize;
     let mut unsupported = Vec::new();
     for proxy in attached {
@@ -2854,9 +2855,10 @@ fn validate_udp_rate_limiting_attachment(
         // Filter-only by design (a mixed deployment applies it to its UDP/DTLS
         // listeners), but a global policy with no UDP/DTLS proxy at all
         // enforces nothing; say so instead of loading silently.
-        let mut attached = gateway_config.proxies.iter().filter(|proxy| {
-            tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
-        });
+        let mut attached = gateway_config
+            .proxies
+            .iter()
+            .filter(|proxy| plugin_config_effectively_applies_to_proxy(pc, proxy, gateway_config));
         let mut any_attached = false;
         let covers_udp = attached.any(|proxy| {
             any_attached = true;
@@ -3168,38 +3170,6 @@ fn try_create_plugin(
         // mode, Redis key prefix, or failure posture) isolates onto fresh
         // state instead of inheriting.
         create_local_rate_limit_plugin(pc, http_client)
-    } else if matches!(
-        pc.plugin_name.as_str(),
-        "request_mirror"
-            | "api_chargeback_sink"
-            | "soap_ws_security"
-            | "jwks_auth"
-            | "hmac_auth"
-            | "waf"
-    ) {
-        // Pass the stable plugin-config resource id through the production
-        // factory so identity-aware plugins partition or attribute sibling
-        // instances. Do not use the process-local runtime instance id here. It
-        // must be the configured resource id, not a process-local id: replicas
-        // of the same policy on separate data planes must keep sharing one
-        // distributed keyspace.
-        //
-        // `soap_ws_security` uses the same stable identity for its process
-        // replay registry and shared Redis keyspace. Passing `None` here would
-        // leave every production reload generation with private replay state.
-        //
-        // `waf` uses it as the operator-facing anomaly-score identity
-        // (`waf.instances.<id>.score`, `waf.instance_scores`,
-        // `waf.scoring_instance`). Passing `None` here would mint a
-        // process-local `standalone-N` surrogate that is unstable across
-        // reload/rebuild and across replicas consuming the same file, database,
-        // CP, or DP config (issue #3940).
-        create_plugin_with_http_client_and_config_id(
-            &pc.plugin_name,
-            &pc.config,
-            http_client.clone(),
-            Some(&pc.id),
-        )
     } else if pc.plugin_name == "request_deduplication" {
         // Share local idempotency state (active leases, retained completions,
         // execution barriers, and their accounting) across compatible reload
@@ -3240,7 +3210,13 @@ fn try_create_plugin(
         // Configured runtime construction always has a plugin-config resource
         // id. Pass it through so identity-aware plugins (and any future ones
         // that opt into the factory argument) cannot fall back to a
-        // process-local standalone identity on this path.
+        // process-local standalone identity on this path. It must be the
+        // configured resource id, not a process-local runtime instance id:
+        // replicas of the same policy on separate data planes must keep
+        // sharing one distributed keyspace (`request_mirror`,
+        // `api_chargeback_sink`, `jwks_auth`, `hmac_auth`), `soap_ws_security`
+        // keys its replay registry and Redis keyspace on it, and `waf` uses it
+        // as the operator-facing anomaly-score identity (issue #3940).
         create_plugin_with_http_client_and_config_id(
             &pc.plugin_name,
             &pc.config,
@@ -4060,26 +4036,6 @@ fn scoped_plugin_config_applies_to_proxy(
 }
 
 fn plugin_config_effectively_applies_to_proxy(
-    pc: &PluginConfig,
-    proxy: &crate::config::types::Proxy,
-    config: &GatewayConfig,
-) -> bool {
-    if !pc.enabled {
-        return false;
-    }
-    match &pc.scope {
-        PluginScope::Global => !config.plugin_configs.iter().any(|candidate| {
-            candidate.enabled
-                && candidate.plugin_name == pc.plugin_name
-                && scoped_plugin_config_applies_to_proxy(candidate, proxy)
-        }),
-        PluginScope::Proxy | PluginScope::ProxyGroup => {
-            scoped_plugin_config_applies_to_proxy(pc, proxy)
-        }
-    }
-}
-
-fn tcp_connection_throttle_effectively_applies_to_proxy(
     pc: &PluginConfig,
     proxy: &crate::config::types::Proxy,
     config: &GatewayConfig,
@@ -5859,7 +5815,7 @@ impl PluginCapabilities {
     pub const MODIFIES_REQUEST_HEADERS: u32 = 1 << 1;
     pub const MODIFIES_REQUEST_BODY: u32 = 1 << 2;
     pub const HAS_BODY_BEFORE_BEFORE_PROXY: u32 = 1 << 3;
-    pub const NEEDS_REQUEST_BODY_BYTES: u32 = 1 << 4;
+    // `1 << 4` was `NEEDS_REQUEST_BODY_BYTES`; no frontend read it.
     pub const HAS_BODY_BEFORE_AUTHENTICATE: u32 = 1 << 5;
     // `1 << 6` was `NEEDS_DECODED_QUERY_PARAMS`; HTTP/3 now always decodes
     // query params (#6580), so no frontend reads that bit.
@@ -6213,9 +6169,6 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_request_body_before_authorize() {
             caps |= PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE;
-        }
-        if p.needs_request_body_bytes() {
-            caps |= PluginCapabilities::NEEDS_REQUEST_BODY_BYTES;
         }
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
@@ -7254,18 +7207,6 @@ impl PluginCacheInner {
         }
     }
 
-    /// Per-protocol entry for one proxy, falling back to the global entry when
-    /// the proxy has no protocol-scoped override.
-    ///
-    /// `proxy_key` MUST be the composed `namespace|proxy_id` runtime key
-    /// produced by [`write_namespaced_runtime_key`]. The protocol snapshot is
-    /// keyed that way, so a bare proxy ID never matches a proxy entry and
-    /// silently resolves to the GLOBAL entry instead — a cross-tenant policy
-    /// fail-open with no error and no log. Request paths holding a `Proxy`
-    /// should go through [`Self::request_view`],
-    /// [`Self::grpc_web_request_view`], or a namespace-taking accessor such as
-    /// [`Self::initial_response_header_policy_plugins`] instead of passing
-    /// `proxy.id` here.
     /// Whether this generation can enforce NodeWaypoint transparent-capture
     /// destination authorization.
     ///
@@ -7290,6 +7231,18 @@ impl PluginCacheInner {
         self.unrouted_correlation_plugins.clone()
     }
 
+    /// Per-protocol entry for one proxy, falling back to the global entry when
+    /// the proxy has no protocol-scoped override.
+    ///
+    /// `proxy_key` MUST be the composed `namespace|proxy_id` runtime key
+    /// produced by [`write_namespaced_runtime_key`]. The protocol snapshot is
+    /// keyed that way, so a bare proxy ID never matches a proxy entry and
+    /// silently resolves to the GLOBAL entry instead — a cross-tenant policy
+    /// fail-open with no error and no log. Request paths holding a `Proxy`
+    /// should go through [`Self::request_view`],
+    /// [`Self::grpc_web_request_view`], or a namespace-taking accessor such as
+    /// [`Self::initial_response_header_policy_plugins`] instead of passing
+    /// `proxy.id` here.
     fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
         self.protocol_snapshot
             .proxy

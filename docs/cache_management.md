@@ -288,11 +288,11 @@ at construction without disclosing credentials.
 
 **What it stores:** Per-proxy, per-status-code metric counters and a cached rendered output string.
 
-**Default limit:** No hard entry cap -- bounded by proxy count multiplied by observed status codes.
+**Default limit:** Per-proxy families have no hard entry cap -- bounded by proxy count multiplied by observed status codes. Mesh request families are capped at `mesh_series_budget_per_family` (default 10,000 live series per family).
 
-**Config field:** N/A.
+**Config fields:** `render_cache_ttl_seconds` (default `5`), `stale_entry_ttl_seconds` (default `3600`), `mesh_series_budget_per_family` (default `10000`).
 
-**Cleanup mechanism:** Piggyback eviction on cache miss (at most once per `render_cache_ttl_seconds`). Stale proxy entries (for proxies removed from config) are evicted during the render sweep.
+**Cleanup mechanism:** Piggyback eviction on a render-cache miss (at most once per `render_cache_ttl_seconds`): every series not updated within `stale_entry_ttl_seconds` is removed, which is how series for removed proxies age out.
 
 ## Environment Variable Summary
 
@@ -344,5 +344,7 @@ at construction without disclosing credentials.
 | `api_chargeback` | `max_retained_bytes` | `67108864` | Hard ceiling on retained billing-row bytes |
 | `api_chargeback` | `render_cache_ttl_seconds` | `5` | Rendered output cache TTL |
 | `prometheus_metrics` | `render_cache_ttl_seconds` | `5` | Rendered output cache TTL |
+| `prometheus_metrics` | `stale_entry_ttl_seconds` | `3600` | Idle metric-series TTL |
+| `prometheus_metrics` | `mesh_series_budget_per_family` | `10000` | Hard ceiling on live mesh series per family |
 
 Rate limiting plugins (`ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `graphql`, `grpc_method_router`) use hardcoded maximum entry constants (50,000-100,000) and are not configurable via plugin config; `rate_limiting` alone exposes its cap as `max_state_entries` (default 100,000). These limits are intentionally high to avoid false rejections under normal traffic patterns while still preventing unbounded growth from IP/key churn. Counter storage supports only local memory and Redis; there is no database-backed counter policy.

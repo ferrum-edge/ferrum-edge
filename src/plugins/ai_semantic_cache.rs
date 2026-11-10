@@ -2768,12 +2768,6 @@ impl AiSemanticCache {
         self.cleanup_signal.notify_one();
     }
 
-    /// Notify the rebuild worker (test scheduling).
-    #[allow(dead_code)]
-    pub(crate) fn notify_rebuild_for_tests(&self) {
-        self.rebuild_signal.notify_one();
-    }
-
     /// Override the singleflight follower/admission wait used by external
     /// timeout tests. Pass `None` to restore the production default.
     #[allow(dead_code)]

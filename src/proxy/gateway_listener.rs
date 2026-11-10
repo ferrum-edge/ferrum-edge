@@ -1026,8 +1026,8 @@ pub struct GatewayListenerManager {
     /// Config-publication receiver, created in [`Self::new`] — before the
     /// mode's readiness reconcile — and consumed by [`Self::run`]. Subscribing
     /// inside `run` would mark every publication since construction as already
-    /// seen, and the slow retry tick only reconciles when a bind failure is
-    /// outstanding, so a missed publication could stay missed indefinitely.
+    /// seen, and the slow retry tick would only pick a missed publication up
+    /// after `BIND_RETRY_INTERVAL`.
     revisions: Mutex<Option<watch::Receiver<u64>>>,
     /// The stream listener manager's UDP/DTLS port releases (issue #5843),
     /// subscribed in [`Self::new`] and consumed by [`Self::run`] for the same

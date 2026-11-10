@@ -2091,21 +2091,6 @@ pub mod _test_support {
     }
 
     /// Whether an incremental rebuild would reconstruct an active
-    /// `ai_transcript_audit` with a node-local descriptor.
-    pub fn ai_transcript_audit_descriptor_preload_required_for_test(
-        cache: &crate::PluginCache,
-        config: &crate::config::types::GatewayConfig,
-        proxy_ids_to_rebuild: &HashSet<crate::config::db_backend::NamespacedResourceId>,
-        rebuild_globals: bool,
-    ) -> bool {
-        cache.ai_transcript_audit_descriptor_preload_required(
-            config,
-            proxy_ids_to_rebuild,
-            rebuild_globals,
-        )
-    }
-
-    /// Whether an incremental rebuild would reconstruct an active
     /// `body_validator` with a node-local descriptor (parity helper for tests).
     pub fn body_validator_descriptor_preload_required_for_test(
         cache: &crate::PluginCache,
@@ -4171,12 +4156,6 @@ pub mod _test_support {
         plugin.max_mirrored_request_body_bytes_for_test()
     }
 
-    pub fn request_mirror_mirror_timeout_ms_for_test(
-        plugin: &crate::plugins::request_mirror::RequestMirror,
-    ) -> Option<u64> {
-        plugin.mirror_timeout_ms_for_test()
-    }
-
     pub fn request_mirror_metrics_snapshot_for_test(
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> crate::plugins::request_mirror::MirrorMetricsSnapshot {
@@ -5063,10 +5042,6 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::MAX_NONCE_REPLAY_SCOPES_FOR_TESTS;
     pub const NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS: u64 =
         crate::plugins::soap_ws_security::NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS;
-
-    pub fn soap_nonce_replay_registry_len_for_test() -> Result<usize, String> {
-        crate::plugins::soap_ws_security::nonce_replay_registry_len_for_tests()
-    }
 
     pub fn soap_nonce_replay_registry_contains_for_test(scope_key: &str) -> Result<bool, String> {
         crate::plugins::soap_ws_security::nonce_replay_registry_contains_for_tests(scope_key)
@@ -6032,19 +6007,6 @@ pub mod _test_support {
         crate::proxy::EffectiveWsSizeLimits::global_capacity_close_for_error(error)
     }
 
-    /// Resolve the parser incomplete-message bounds from env config.
-    /// Returns `(max_frames, max_duration)`; `None` means that bound is off.
-    pub fn ws_fragment_policy_from_env_for_test(
-        env_config: &crate::config::EnvConfig,
-    ) -> (Option<usize>, Option<std::time::Duration>) {
-        crate::proxy::WsFragmentPolicy::from_env(env_config).bounds()
-    }
-
-    /// Bounded incomplete-message policy Close (RFC 6455 1008).
-    pub fn ws_fragment_policy_close_frame_for_test() -> CloseFrame {
-        crate::proxy::ws_fragment_policy_close_frame()
-    }
-
     /// Policy-Close selection for the parser's incomplete-message bounds.
     pub fn ws_fragment_policy_close_for_error_for_test(
         error: &WsError,
@@ -6127,15 +6089,6 @@ pub mod _test_support {
         )
     }
 
-    /// Apply the shared Ping/Pong control-frame guard used after frame plugins.
-    pub fn guard_ws_control_transform_for_test(
-        original: &Message,
-        transformed: Message,
-        direction: crate::plugins::WebSocketFrameDirection,
-    ) -> Message {
-        crate::proxy::guard_ws_control_transform(original, transformed, direction)
-    }
-
     /// Simulate the shared relay's post-plugin success boundary: run plugins,
     /// apply the control guard, prepare delivery observations from the final
     /// message, then emit them (as if the destination sink accepted the write).
@@ -6166,18 +6119,6 @@ pub mod _test_support {
             prepared,
         );
         outgoing
-    }
-
-    /// Report one gateway policy Close to the decision observers in `plugins`
-    /// exactly as both relay halves do (`on_ws_policy_close`).
-    pub fn observe_ws_policy_close_for_test(
-        plugins: &[Arc<dyn crate::plugins::Plugin>],
-        proxy_id: &str,
-        connection_id: u64,
-        direction: crate::plugins::WebSocketFrameDirection,
-        close: Option<&CloseFrame>,
-    ) {
-        crate::proxy::observe_ws_policy_close(plugins, proxy_id, connection_id, direction, close)
     }
 
     /// Open the production H2 byte transport over an in-memory test connection.
@@ -6556,12 +6497,6 @@ pub mod _test_support {
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
     ) {
         plugin.notify_cleanup_for_tests();
-    }
-
-    pub fn ai_semantic_cache_notify_rebuild_for_test(
-        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
-    ) {
-        plugin.notify_rebuild_for_tests();
     }
 
     pub fn ai_semantic_cache_set_singleflight_wait_override_for_test(
@@ -8312,10 +8247,6 @@ pub mod _test_support {
             db_type,
             configured_seconds,
         )
-    }
-
-    pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
-        known.difference(current).cloned().collect()
     }
 
     pub fn db_code_is_transient(code: &str, is_sqlite: bool) -> bool {
@@ -14465,16 +14396,6 @@ pub mod _test_support {
         let _ = std::future::Future::poll(race.as_mut(), &mut cx);
     }
 
-    /// Whether any upload pump has been handed to a task of its own since
-    /// the process started, and how each was settled (issue #5505). Debug
-    /// builds only; empty in release builds.
-    pub fn upload_pump_driver_diagnostics() -> Vec<(&'static str, u64)> {
-        crate::proxy::backend_send_queue::diagnostics::snapshot()
-            .into_iter()
-            .filter(|(name, _)| name.starts_with("PUMP_"))
-            .collect()
-    }
-
     /// One gateway-owned BUFFERED upload pump under test (issue #4055).
     ///
     /// The buffered reqwest dispatch has no body adapter to hang a deadline
@@ -17914,7 +17835,7 @@ pub mod _test_support {
         crate::proxy::inbound_request_declares_body(ctx)
     }
 
-    /// The exact replay-safety gate `proxy_to_backend_inner` applies at the top
+    /// The exact replay-safety gate `handle_proxy_request_inner` applies at the top
     /// of its retry loop, covering the mesh, native-H3, and reqwest replay
     /// transports. `false` means the loop refuses to replay and surfaces the
     /// original backend failure instead.

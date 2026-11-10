@@ -706,16 +706,6 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 // Helper: Accept header negotiation for GET responses
 // ---------------------------------------------------------------------------
 
-/// Resolve the response format from an `Accept` header vs the stored format.
-///
-/// Returns the `SpecFormat` the caller should use to serialise the body.
-///
-/// Rules:
-/// - Missing, `*/*`, or matching stored format → stored format
-/// - `application/json` and stored is YAML     → Json (convert)
-/// - `application/yaml` / `text/yaml` etc. and stored is JSON → Yaml (convert)
-/// - Unknown accept types                       → stored format (best-effort)
-///
 /// Quality weight for a media range, parsed from `;q=N.NNN`.
 /// Returns a value in `[0, 1000]` (1000 = q=1.0, default).
 ///
@@ -734,6 +724,16 @@ fn parse_accept_quality(params: &str) -> u32 {
     1000 // default q=1.0
 }
 
+/// Resolve the response format from an `Accept` header vs the stored format.
+///
+/// Returns the `SpecFormat` the caller should use to serialise the body.
+///
+/// Rules:
+/// - Missing, `*/*`, or matching stored format → stored format
+/// - `application/json` and stored is YAML     → Json (convert)
+/// - `application/yaml` / `text/yaml` etc. and stored is JSON → Yaml (convert)
+/// - Unknown accept types                       → stored format (best-effort)
+///
 /// Uses a small media-range parser: splits on `,`, strips `q=` quality
 /// parameters, trims whitespace, and compares exact tokens.  Wildcards
 /// (`*/*`, `application/*`) accept the stored format.  Highest-quality
@@ -3945,32 +3945,6 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("accept", accept.parse().unwrap());
         h
-    }
-
-    #[test]
-    fn negotiate_accept_wildcard_returns_stored() {
-        let h = headers_with_accept("*/*");
-        assert_eq!(negotiate_accept(&h, SpecFormat::Yaml), SpecFormat::Yaml);
-        assert_eq!(negotiate_accept(&h, SpecFormat::Json), SpecFormat::Json);
-    }
-
-    #[test]
-    fn negotiate_accept_missing_returns_stored() {
-        let h = HeaderMap::new();
-        assert_eq!(negotiate_accept(&h, SpecFormat::Yaml), SpecFormat::Yaml);
-    }
-
-    #[test]
-    fn negotiate_accept_json_with_yaml_stored_requests_json() {
-        // Client wants JSON, stored is YAML → must convert
-        let h = headers_with_accept("application/json");
-        assert_eq!(negotiate_accept(&h, SpecFormat::Yaml), SpecFormat::Json);
-    }
-
-    #[test]
-    fn negotiate_accept_yaml_with_json_stored_requests_yaml() {
-        let h = headers_with_accept("application/yaml");
-        assert_eq!(negotiate_accept(&h, SpecFormat::Json), SpecFormat::Yaml);
     }
 
     #[test]

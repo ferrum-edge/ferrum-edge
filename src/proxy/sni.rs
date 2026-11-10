@@ -452,10 +452,8 @@ pub async fn peek_client_hello_sni(
                     buffered = have,
                     "TCP passthrough SNI peek timed out before full ClientHello arrived"
                 );
-                // Parse whatever prefix was observed — a complete-but-slow
-                // record already parsed below, so this only salvages the
-                // (unlikely) case where SNI sits inside the partial prefix.
-                // Anything short of a readable hostname is `Timeout`, which an
+                // Classify whatever prefix was observed: a complete hello is
+                // classified normally; anything else is `Timeout`, which an
                 // SNI-routing listener refuses instead of defaulting.
                 return terminal_client_hello(&buf[..have], SniPeekFailure::Timeout);
             }

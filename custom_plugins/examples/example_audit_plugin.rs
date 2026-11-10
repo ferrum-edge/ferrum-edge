@@ -129,7 +129,8 @@ const MAX_METADATA_KEY_CHARS: usize = 128;
 const MAX_METADATA_VALUE_CHARS: usize = 512;
 const MAX_CONTEXT_BYTES: usize = 4096;
 const INSERT_COLUMN_COUNT: usize = 13;
-/// Cap multi-row INSERT binds under SQLite's 999-variable floor (13 × 76 = 988).
+/// Cap multi-row INSERT binds under SQLite's 999-variable floor (13 × 50 = 650;
+/// 76 rows would be the ceiling).
 const INSERT_MAX_ROWS_PER_STATEMENT: usize = 50;
 /// Chunk size for retention DELETE so a multi-million-row backlog cannot hold
 /// the shared configuration-database write lock for one unbounded statement.

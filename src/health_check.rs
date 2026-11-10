@@ -1055,7 +1055,7 @@ fn try_publish_consecutive_ejection(
 /// Health state is split into two independent layers:
 ///
 /// - **Active** (shared per-upstream): Periodic probe results (HTTP/TCP/UDP/gRPC)
-///   keyed by `upstream_id::host:port`. When an active probe marks a target
+///   keyed by `namespace|upstream_id::host:port`. When an active probe marks a target
 ///   unhealthy, ALL proxies using that upstream see it as unavailable — correct
 ///   because the target is genuinely unreachable.
 ///
@@ -1070,12 +1070,12 @@ fn try_publish_consecutive_ejection(
 /// appears in EITHER the active map (upstream-wide) OR the calling proxy's
 /// passive inner map.
 pub struct HealthChecker {
-    /// Active unhealthy targets: "upstream_id::host:port" → epoch_ms.
+    /// Active unhealthy targets: "namespace|upstream_id::host:port" → epoch_ms.
     /// Written by active health check probes, shared across all proxies.
     /// Every mutation publishes a generation bump that invalidates the
     /// per-balancer eligibility snapshots (see [`ActiveUnhealthyTargets`]).
     pub active_unhealthy_targets: Arc<ActiveUnhealthyTargets>,
-    /// Active probe health state, keyed by "upstream_id::host:port".
+    /// Active probe health state, keyed by "namespace|upstream_id::host:port".
     active_target_states: Arc<DashMap<String, Arc<TargetHealth>>>,
     /// Per-proxy passive health state: proxy_id → Arc<ProxyHealthState>.
     /// Two-level index: outer DashMap partitions by proxy_id (one lookup),
@@ -4942,8 +4942,7 @@ mod tests {
     //!
     //! `build_health_check_client` is intentionally private and these tests
     //! sit inline so they can exercise it directly. Promoting it to `pub`
-    //! to enable an external test would widen the public API for no reason —
-    //! per CLAUDE.md private fns belong in inline `#[cfg(test)] mod tests`.
+    //! to enable an external test would widen the public API for no reason.
     use super::*;
     use crate::dns::DnsConfig;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
@@ -5725,7 +5724,7 @@ mod tests {
     #[test]
     fn fallback_client_builds_without_dns_cache() {
         // Verify the helper still succeeds when no DNS cache is available
-        // (this exercises the `from_pool_config` cache-less code path).
+        // (the cache-less code path).
         let _client = build_dns_cached_fallback_client(None, "test")
             .expect("fallback client without DNS cache should build");
     }

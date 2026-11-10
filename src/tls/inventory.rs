@@ -15,9 +15,10 @@
 //! - [`TlsInventory::collect_public_metadata`] — the metrics-safe scope used by
 //!   the bounded background refresh behind
 //!   [`crate::tls::inventory_cache`]. It loads only public
-//!   certificate-family material (certificates, CA bundles, CRLs) and **never**
-//!   materializes private-key, JWKS, or OCSP bytes: those entries report health
-//!   from the owning validated config/reload state instead (issue #2410).
+//!   certificate and revocation material (certificates, CA bundles, CRLs, and
+//!   stapled OCSP responses) and **never** materializes private-key or JWKS
+//!   bytes: those entries report health from the owning validated
+//!   config/reload state instead (issue #2410).
 //!
 //! `/metrics` itself only ever reads the cached snapshot
 //! ([`crate::tls::inventory_cache::TlsInventoryCache::snapshot`]) and performs zero source I/O.

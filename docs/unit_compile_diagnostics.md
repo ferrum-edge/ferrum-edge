@@ -43,16 +43,17 @@ key, commit, runner type, and full job duration recorded. Warm cache is not the
 same as an unchanged workspace target. Preserve test counts and named optional
 feature/live proofs when evaluating a scheduling or harness-layout experiment.
 The instrumentation itself leaves compiler concurrency, debug/codegen profiles,
-production profiles, and test selections unchanged. Issue #4704 remains open
-until measured changes reduce the footprint and complete hosted validation.
+production profiles, and test selections unchanged. Issue #4704 was closed on
+2026-09-06.
 
 The application shard can also report bounded diagnostics for an unexpected
 HTTP/2 preface in a scripted backend (issue #4720). The observer forwards the
 existing I/O operations, stores at most 24 prefix bytes, and reports only a
 protocol category, byte count, loopback peer, backend port, and connection index
 on protocol-handshake errors. It never logs those bytes or relaxes the fixture's
-error assertion. This captures evidence for an unresolved intermittent fixture
-failure; it is not a claim that the sending path has been repaired.
+error assertion. This captures evidence for an intermittent fixture failure
+(issue #4720, closed on 2026-09-09); it is not a claim that the sending path has
+been repaired.
 
 ## Scheduling comparison
 
@@ -125,7 +126,7 @@ one-job lane do not imply more total allocation: competing compiler pages can
 be swapped out in the three-job lane. Keep three jobs in ordinary CI. The next
 footprint investigation should examine compilation-unit boundaries while
 preserving the complete test inventory; execution-only sharding would retain
-the expensive compilation. Issue #4704 remains open.
+the expensive compilation. Issue #4704 was closed on 2026-09-06.
 
 ## Reuse the library in the gateway executable
 

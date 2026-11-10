@@ -1657,8 +1657,7 @@ impl MeshMtlsConnectionPool {
                 // window. Recorded before the lock is released, and re-checked
                 // after every claim, so once a dial has failed no other caller
                 // starts a second one for the key in between. A dial whose
-                // future is dropped (cancellation) records no backoff, as on
-                // main.
+                // future is dropped (cancellation) records no backoff.
                 self.growth_backoff_until
                     .insert(key.to_string(), unix_secs() + MESH_MTLS_GROWTH_BACKOFF_SECS);
                 debug!(

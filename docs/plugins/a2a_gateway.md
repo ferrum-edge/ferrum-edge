@@ -4,7 +4,7 @@ Part of the [Plugin Reference](../plugins.md).
 
 **Priority:** 2993 · **Phases:** `before_proxy`, `on_final_request_body`, `after_proxy`, `normalize_response_body`, `on_response_body`, `transform_response_body`, `on_final_response_body`, `response_stream_inspector`, `on_response_stream_terminated` · **Protocols:** HTTP, gRPC · **Failure policy:** `FailClosed`
 
-Transparent Agent-to-Agent gateway for standardized A2A traffic over HTTP/HTTPS JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs. The plugin detects A2A operations, applies optional method allow/deny policy, rewrites HTTP Agent Card endpoint URLs to the Ferrum gateway, preserves SSE and gRPC streaming pass-through, and emits `a2a.*` metadata for existing Ferrum authz, logging, tracing, chargeback, and alert plugins.
+Transparent Agent-to-Agent gateway for standardized A2A traffic over HTTP/HTTPS JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs. The plugin detects A2A operations, applies optional method allow/deny policy, rewrites HTTP and unary gRPC Agent Card endpoint URLs to the Ferrum gateway, preserves SSE and gRPC streaming pass-through, and emits `a2a.*` metadata for existing Ferrum authz, logging, tracing, chargeback, and alert plugins.
 
 The implemented A2A protocol version is **0.3.x**, whose canonical gRPC service is **`a2a.v1.A2AService`**. A2A 1.0 (`lf.a2a.v1.A2AService`) is a distinct identity with a renumbered `AgentCard`; it can be detected and policed, but its cards are never decoded as 0.3 — see *gRPC service identity and Agent Card schema* below.
 

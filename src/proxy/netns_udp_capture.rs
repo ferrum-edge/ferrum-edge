@@ -31,8 +31,9 @@
 //!
 //! Linux-only (`setns`, `IP_TRANSPARENT`, in-netns iptables). Non-Linux is an
 //! unsupported stub. The reconcile logic is platform-independent and unit-tested
-//! with a mock backend; the `setns`/socket/iptables datapath is verified on a
-//! live multi-pod node (the `netns-capture-live` follow-up).
+//! with a mock backend; the `setns`/socket/iptables datapath is exercised by
+//! `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` in the
+//! privileged `netns-capture-live` CI job.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

@@ -130,9 +130,9 @@ mod inner {
     };
     use regex::escape as regex_escape;
 
-    // MongoDB server error codes used by the index-upgrade logic in
-    // `run_migrations`. Source: src/mongo/db/operation_exit_code.idl (server)
-    // and https://www.mongodb.com/docs/manual/reference/error-codes/.
+    // MongoDB server error codes this module classifies. Source:
+    // src/mongo/db/operation_exit_code.idl (server) and
+    // https://www.mongodb.com/docs/manual/reference/error-codes/.
     const MONGO_ERR_NAMESPACE_NOT_FOUND: i32 = 26;
     const MONGO_ERR_NAMESPACE_EXISTS: i32 = 48;
     const MONGO_ERR_DUPLICATE_KEY: i32 = 11_000;
@@ -1202,22 +1202,6 @@ mod inner {
         "cleanup_orphaned_proxy_group_plugins",
     ];
 
-    /// MongoDB-backed config store.
-    ///
-    /// Implements [`DatabaseBackend`] to provide a NoSQL alternative to the
-    /// sqlx-backed `DatabaseStore`. Uses the official `mongodb` Rust driver.
-    ///
-    /// **Failover & reconnect**: the live `Client`, `Database`, and generated
-    /// TLS PEM guards are one bundle, published atomically together with the
-    /// failover topology (`DbFailoverTopologyState`, issue #7061), so
-    /// [`Self::try_failover_reconnect`] can atomically replace the underlying
-    /// client when the primary URL is unreachable and a configured failover URL
-    /// is healthy. Readers that already loaded the old bundle keep using it
-    /// (commands in flight complete normally), then drop their reference and
-    /// pick up the new one on the next call. The sqlx `DatabaseStore` publishes
-    /// its pool the same way for the same reason — without it, every "failover" attempt would just ping the
-    /// dead client and the gateway would never recover for standalone
-    /// (non-replica-set) MongoDB deployments.
     /// Topology label passed to Mongo reconnect publication test hooks
     /// (issue #3001).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1416,6 +1400,22 @@ mod inner {
         }]
     }
 
+    /// MongoDB-backed config store.
+    ///
+    /// Implements [`DatabaseBackend`] to provide a NoSQL alternative to the
+    /// sqlx-backed `DatabaseStore`. Uses the official `mongodb` Rust driver.
+    ///
+    /// **Failover & reconnect**: the live `Client`, `Database`, and generated
+    /// TLS PEM guards are one bundle, published atomically together with the
+    /// failover topology (`DbFailoverTopologyState`, issue #7061), so
+    /// [`Self::try_failover_reconnect`] can atomically replace the underlying
+    /// client when the primary URL is unreachable and a configured failover URL
+    /// is healthy. Readers that already loaded the old bundle keep using it
+    /// (commands in flight complete normally), then drop their reference and
+    /// pick up the new one on the next call. The sqlx `DatabaseStore` publishes
+    /// its pool the same way for the same reason — without it, every "failover" attempt would just ping the
+    /// dead client and the gateway would never recover for standalone
+    /// (non-replica-set) MongoDB deployments.
     #[derive(Clone)]
     pub struct MongoStore {
         // Admission operations hold the read side from acquisition through
@@ -18460,16 +18460,6 @@ mod inner {
             }
 
             Ok(records)
-        }
-
-        /// Load all `_id` values from a collection for cold-path bulk operations.
-        #[allow(dead_code)]
-        async fn load_collection_ids(
-            &self,
-            collection_name: &str,
-        ) -> Result<HashSet<String>, anyhow::Error> {
-            self.load_collection_ids_filtered(collection_name, doc! {})
-                .await
         }
 
         /// Load plain resource `id` values from a collection matching a

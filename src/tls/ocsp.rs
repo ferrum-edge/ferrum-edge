@@ -89,8 +89,8 @@
 //!    key usage (RFC 6960 §4.2.2.2), and — when it carries a `KeyUsage` at all
 //!    — permits `digitalSignature`. Delegation to anything else is refused.
 //! 8. **Time bounds.** `thisUpdate` must not be in the future and `nextUpdate`
-//!    must not be in the past, each widened by [`OCSP_CLOCK_SKEW`]. A response
-//!    without `nextUpdate` has no defined validity window and is refused: RFC
+//!    must not be in the past, each widened by [`OCSP_CLOCK_SKEW_SECONDS`]. A
+//!    response without `nextUpdate` has no defined validity window and is refused: RFC
 //!    6960 §2.4 makes an absent `nextUpdate` mean "newer information is
 //!    available at all times", which is precisely the property a *stapled*
 //!    (cached, re-served) response cannot have.
@@ -160,7 +160,7 @@
 //!
 //! # Clock-skew policy
 //!
-//! Both time bounds are widened by [`OCSP_CLOCK_SKEW`] (5 minutes) in the
+//! Both time bounds are widened by [`OCSP_CLOCK_SKEW_SECONDS`] (5 minutes) in the
 //! permissive direction only. The window Ferrum accepts is therefore
 //! `thisUpdate - skew <= now <= nextUpdate + skew`. The skew is deliberately
 //! not configurable: it exists to absorb ordinary NTP drift between the

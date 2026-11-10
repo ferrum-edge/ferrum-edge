@@ -919,16 +919,6 @@ pub fn live_peer_still_trusted(
         .is_ok()
 }
 
-/// [`live_peer_still_trusted`] for a chain held as raw DER buffers.
-#[allow(dead_code)]
-pub fn live_peer_der_chain_still_trusted(scope: ClientTrustScope, chain: &[Vec<u8>]) -> bool {
-    let certificates: Vec<CertificateDer<'_>> = chain
-        .iter()
-        .map(|der| CertificateDer::from(der.as_slice()))
-        .collect();
-    live_peer_still_trusted(scope, &certificates)
-}
-
 /// Fail-closed reconnect fence for an armed rustls handshake.
 ///
 /// A missing or empty peer chain is untrusted: TLS session tickets do not

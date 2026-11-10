@@ -555,7 +555,7 @@ static REQUEST_BUFFER_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Which aggregate budget one charge is taken against.
 ///
-/// Production resolves to one of the two process-global budgets, so this costs a
+/// Production resolves to one of the three process-global budgets, so this costs a
 /// discriminant check and nothing else. External tests bind an
 /// [`IsolatedBudget`] instead ([`IsolatedBudget::handle`]), which is what lets a
 /// parallel test binary observe admission and release deterministically without

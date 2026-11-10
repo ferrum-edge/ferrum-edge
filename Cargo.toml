@@ -273,9 +273,11 @@ crc32fast = "1"
 url = "2"
 # Mozilla Public Suffix List for browser-equivalent Set-Cookie Domain handling
 # and CORS credentialed-wildcard classification. A version bump must regenerate
-# `src/plugins/cors_psl_ancestors.rs` from the new bundled list; the
+# `src/plugins/cors_psl_ancestors.rs` from the new bundled list with
+# `python3 scripts/generate_cors_psl_ancestors.py`; the
 # `psl_ancestor_index_is_generated_from_the_locked_psl_version` unit test fails
-# until the index header names the locked version.
+# until the index header names the locked version, and the Dependency Audit CI
+# job fails until every entry matches.
 psl = "2"
 percent-encoding = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
@@ -555,8 +557,9 @@ codegen-units = 256
 
 # Maximum-performance: for production shipping builds and benchmarks.
 # Fat LTO + single codegen unit enables whole-program optimisation across
-# all crates. Compile time is 3-5× slower than `release` but yields 5-10%
-# better runtime throughput.
+# all crates. Since `release` adopted the same settings (#362), this profile
+# builds the same configuration as `release`; it is kept as a named benchmark
+# build input.
 [profile.max-perf]
 inherits = "release"
 lto = "fat"             # full inter-module LTO (cross-crate inlining, DCE)
@@ -572,9 +575,9 @@ tonic-prost-build = "0.14.6"
 # `crate::fips::approved` and must not depend on these RustCrypto crates.
 sha2 = "0.11.0"
 hmac = "0.13.0"
-# `tempfile` is intentionally also declared in `[dependencies]` for
-# `src/config/mongo_store.rs`. Keeping it dev-only would re-introduce the
-# `cargo check --lib` break (see the dependency-section comment).
+# `tempfile` is declared in `[dependencies]` (used by
+# `src/config/mongo_store.rs`), not here: keeping it dev-only would break
+# `cargo check --lib`.
 wiremock = "0.6"
 # Functional secret-backend tests: Vault dev server + LocalStack run in Docker
 # via testcontainers; env-mutating tests serialize via serial_test. Only the
@@ -611,7 +614,6 @@ strict_dimpl = { package = "dimpl", version = "=0.8.0" }
 # with dev-dependency edges excluded for exactly this reason.
 ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
-rstest = "0.28"
 time = "0.3"
 # Phase 6 cross-protocol matrix macro: concatenates idents at macro
 # expansion to generate one #[tokio::test] per (frontend, backend)
@@ -756,7 +758,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when a hyper release can reset an upgraded HTTP/2 stream
 # with a chosen error code, move the HBONE relays to the upstream API and drop
-# only patch 001's hunks. The vendored copy also carries hyper patches 002-005
+# only patch 001's hunks. The vendored copy also carries hyper patches 002-008
 # (`docs/upstream-hyper-patches/series`), so remove the `hyper` line below (and
 # its fuzz and mesh mirrors), update the three lockfiles, and drop
 # `vendor/hyper-1.10.0-ferrum-patched/` only once every one of them has an
@@ -773,10 +775,11 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # tracks the problem as hyperium/h2#902, with a frame-queue fix in PR
 # hyperium/h2#903.
 #
-# Retirement plan: retire both h2 patches before dropping the vendored crate.
-# An adopted h2 release must batch DATA frames into one write
-# (hyperium/h2#903 or an equivalent) AND expose a stream's assigned send window
-# (h2 patch 003, or retire it with Hyper patch 005). Alternatively, Ferrum must
+# Retirement plan: retire all three h2 patches before dropping the vendored
+# crate. An adopted h2 release must batch DATA frames into one write
+# (hyperium/h2#903 or an equivalent), expose a stream's assigned send window
+# (h2 patch 003, or retire it with Hyper patch 005) AND report whether a reset
+# was local or the peer's (h2 patch 004). Alternatively, Ferrum must
 # stop using h2. (h2 0.4.20 retired the runtime-budget and client close-wakeup
 # patches: hyperium/h2#965 and #956.)
 # Then remove the `h2` line below (here, in `tests/performance/mesh/Cargo.toml`

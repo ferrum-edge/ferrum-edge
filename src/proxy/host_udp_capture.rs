@@ -1253,10 +1253,9 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             return;
         }
 
-        // 4. Rebuild the capture chain. An empty interface set renders no rules
-        //    at all (the generator refuses to emit an empty ruleset), so the
-        //    chain contents are removed instead; the `PREROUTING` jump and the
-        //    guard both stay until step 8.
+        // 4. Rebuild the capture chain. An empty interface set needs no
+        //    capture chain, so the capture chain, its `PREROUTING` jump and its
+        //    routing are removed instead; the guard stays until step 8.
         let rebuilt = if ifaces.is_empty() {
             self.backend.teardown_capture_rules()
         } else {
@@ -1945,6 +1944,16 @@ pub(crate) fn reap_stale_host_udp_state(
     run_host_script_owned(&IptablesPlan::host_udp_teardown_script(), deadline)
 }
 
+/// Outcome of one bounded stale-host-state startup pass.
+pub struct HostUdpStaleRecovery {
+    /// Resolves when an incoming UDP producer can publish readiness without the
+    /// recovery retracting it. `None` means that boundary is already safe.
+    pub retraction_ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Retries unfinished retraction and stale-state reaping until success or
+    /// shutdown. `None` means the first pass completed everything.
+    pub retry_task: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Discharge the durable UDP readiness handshake a previous HOST-capture
 /// generation left, then reap its host objects — for a node whose placement is
 /// now the per-pod-netns producer, or which has UDP capture switched off.
@@ -1965,16 +1974,6 @@ pub(crate) fn reap_stale_host_udp_state(
 /// [`HostUdpStaleGenerationRecovery`]), so the two halves of a placement switch
 /// cannot deadlock.
 ///
-/// Outcome of one bounded stale-host-state startup pass.
-pub struct HostUdpStaleRecovery {
-    /// Resolves when an incoming UDP producer can publish readiness without the
-    /// recovery retracting it. `None` means that boundary is already safe.
-    pub retraction_ready: Option<tokio::sync::oneshot::Receiver<()>>,
-    /// Retries unfinished retraction and stale-state reaping until success or
-    /// shutdown. `None` means the first pass completed everything.
-    pub retry_task: Option<tokio::task::JoinHandle<()>>,
-}
-
 /// Returns a bounded startup outcome. If marker discovery or close-request
 /// persistence cannot complete, the caller may continue bringing up unrelated
 /// mesh listeners while delaying only the incoming UDP producer on

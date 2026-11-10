@@ -1764,11 +1764,6 @@ pub fn shutdown_escalation_token() -> &'static CancellationToken {
     SHUTDOWN_ESCALATION.get_or_init(CancellationToken::new)
 }
 
-/// Read the escalation latch without waiting.
-pub fn shutdown_escalated() -> bool {
-    shutdown_escalation_token().is_cancelled()
-}
-
 /// Publish the escalation. Idempotent and one-way; returns `true` when this
 /// call is the one that escalated.
 ///
@@ -1864,19 +1859,6 @@ pub fn begin_drain(state: &Arc<OverloadState>) {
     state.drain_started.cancel();
 }
 
-/// Serving-mode shutdown entry point: [`begin_drain`] plus cancellation of any
-/// deliberately parked work that a drain wait would otherwise block on.
-///
-/// Today that is injected fault delays. Their timers are the one place where a
-/// live request or connection is held open by gateway policy rather than by a
-/// peer, so waiting for them would burn the entire
-/// `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget (or hit the forced-shutdown deadline)
-/// for work that has no reason to finish.
-///
-/// Kept separate from [`begin_drain`] on purpose. The fault-delay token is
-/// process-global and one-shot, so cancelling it from the plain drain-flag
-/// helper — which ordinary tests call directly — would silently disarm every
-/// later fault delay in the same test binary.
 /// Upper bound on how long [`end_shutdown_drain_wait`] waits for the H1/H2
 /// connections it closes to release their requests.
 const DRAIN_WAIT_END_SETTLE: Duration = Duration::from_millis(250);
@@ -1917,6 +1899,19 @@ pub async fn end_shutdown_drain_wait(state: &Arc<OverloadState>) {
     }
 }
 
+/// Serving-mode shutdown entry point: [`begin_drain`] plus cancellation of any
+/// deliberately parked work that a drain wait would otherwise block on.
+///
+/// Today that is injected fault delays. Their timers are the one place where a
+/// live request or connection is held open by gateway policy rather than by a
+/// peer, so waiting for them would burn the entire
+/// `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget (or hit the forced-shutdown deadline)
+/// for work that has no reason to finish.
+///
+/// Kept separate from [`begin_drain`] on purpose. The fault-delay token is
+/// process-global and one-shot, so cancelling it from the plain drain-flag
+/// helper — which ordinary tests call directly — would silently disarm every
+/// later fault delay in the same test binary.
 pub fn begin_shutdown_drain(state: &Arc<OverloadState>) {
     begin_drain(state);
     crate::plugins::utils::fault_delay::cancel_fault_delays_for_shutdown();

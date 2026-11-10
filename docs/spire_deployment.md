@@ -556,7 +556,8 @@ The defaults are conservative and match SPIFFE community guidance:
 | Gateway inline-PEM SVID | matches whatever produced the literal | Config change only | **Not auto-refreshed.** Update the configured literal and reload configuration or restart |
 
 Gateway SVID material and the live-reload carve-out documented under "TLS
-Rotation" in `CLAUDE.md` are the TLS materials Ferrum hot-reloads. Other TLS
+Rotation Model" in `.claude/rules/tls-security.md` are the TLS materials Ferrum
+hot-reloads. Other TLS
 files (frontend cert, frontend key, backend CA bundle outside the gateway SVID
 flow) remain restart-required unless their own opt-in watcher is enabled.
 

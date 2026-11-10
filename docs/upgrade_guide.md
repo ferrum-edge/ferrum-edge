@@ -3671,7 +3671,7 @@ Authenticated `ConfigSync.Subscribe` and `MeshConfigSync.MeshSubscribe` streams 
 
 ### AI gateway authentication `401` bodies use the OpenAI nested envelope (issue [#4408](https://github.com/ferrum-edge/ferrum-edge/issues/4408))
 
-Proxies with an effective `ai_federation` or `ai_stream_router` plugin now return OpenAI-shaped `{"error":{"message","type","param","code"}}` bodies for gateway-authored authentication `401`s (missing or invalid credentials from `key_auth`, JWT/JWKS/Basic/HMAC/LDAP/mTLS/OIDC/introspection plugins). Status codes and `WWW-Authenticate` are unchanged. Authorization-phase rejects (`acl`, `rate_limiting`, and other `authorize` plugins) and non-`401` authentication outcomes keep their existing bodies.
+Proxies with an effective `ai_federation` or `ai_stream_router` plugin now return OpenAI-shaped `{"error":{"message","type","param","code"}}` bodies for gateway-authored authentication `401`s (missing or invalid credentials from `key_auth`, JWT/JWKS/Basic/HMAC/LDAP/mTLS/OIDC/introspection plugins). Status codes and `WWW-Authenticate` are unchanged. Authorization-phase rejects (`access_control`, `rate_limiting`, and other `authorize` plugins) and non-`401` authentication outcomes keep their existing bodies.
 
 **Operator action:** on AI gateway routes, read `error.message` / `error.code` (or use an OpenAI-compatible client) instead of parsing the flat `{"error":"<string>"}` shape for authentication failures.
 
@@ -4288,7 +4288,9 @@ targets; disable or remove a policy that has no TCP listener to protect.
 
 `kafka_logging` is now refused at config admission whenever the backend egress
 policy is able to deny any address — which includes the **default** posture
-(`FERRUM_BACKEND_ALLOW_IPS=both` plus the dangerous-range baseline). librdkafka
+(`FERRUM_BACKEND_ALLOW_IPS=both` plus the dangerous-range baseline) — unless
+the node operator attests the cluster's brokers with
+`FERRUM_KAFKA_ALLOWED_BROKERS`. librdkafka
 resolves bootstrap hostnames itself and dials brokers advertised by cluster
 metadata, and the pinned `rdkafka 0.39` exposes no connect/resolve callback, so
 Ferrum cannot screen the addresses it actually connects to. The gateway refuses
@@ -4305,6 +4307,10 @@ one of:
   policy-aware path (`http_logging`, `tcp_logging`, `ws_logging`,
   `loki_logging`) and bridge to Kafka outside the gateway.
 - Remove or disable the `kafka_logging` rows.
+- List every broker the cluster advertises in `FERRUM_KAFKA_ALLOWED_BROKERS` on
+  every node that admits or runs the plugin, which keeps the backend egress
+  policy on (see [`kafka_logging` and restrictive egress
+  policies](configuration.md#kafka_logging-and-restrictive-egress-policies)).
 - Accept an unrestricted backend egress policy for the whole gateway
   (`FERRUM_BACKEND_ALLOW_IPS=both`, no `FERRUM_BACKEND_DENY_CIDRS`,
   `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false`). This weakens every other

@@ -1188,27 +1188,6 @@ fn build_srv_priorities(upstream_id: &str, targets: &[UpstreamTarget]) -> Vec<u3
     priorities
 }
 
-/// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
-/// targets during the mixed warm-up phase.
-///
-/// Used only when comparing among **unwarmed** candidates (bounded
-/// exploration). Warmed targets are never displaced by an unconditional
-/// biased-best preference for an unsampled peer — see
-/// `LATENCY_WARMUP_EXPLORE_PERMILLE`.
-///
-/// **Behavioral note:** any nonzero bias value (including `1`) produces the
-/// same selection outcome among unwarmed peers because `saturating_sub(N)`
-/// for any `N >= 1` makes the unsampled target strictly less than the
-/// minimum warmed EWMA when `min_known_ewma > 0`, and saturates to `0` (a tie
-/// broken by iteration order) when `min_known_ewma == 0`.
-///
-/// The constant exists as a named policy anchor: 1 ms (1 000 us) documents
-/// the intended preference gap in human-readable latency units and makes the
-/// warm-up strategy greppable and self-documenting, replacing a bare magic
-/// literal.
-#[allow(dead_code)] // policy-anchor constant; mixed warm-up now uses bounded exploration
-const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
-
 /// Permille (‰) of mixed-warm-up selections that explore sub-threshold
 /// (unwarmed) targets via round-robin among them.
 ///
@@ -1241,7 +1220,7 @@ fn unwarmed_explore_slot(ticket: u64, unwarmed_count: usize) -> Option<usize> {
 /// Synthetic EWMA sample (microseconds) recorded for a failed dispatch
 /// attempt. Counts toward the warm-up threshold and penalizes the target so
 /// a target that fails every request exits warm-up with a poor score instead
-/// of remaining biased-best forever. 1 second is deliberately worse than
+/// of staying in warm-up forever. 1 second is deliberately worse than
 /// typical healthy TTFB while still finite for EWMA math.
 const LATENCY_FAILURE_PENALTY_US: u64 = 1_000_000;
 
@@ -1961,19 +1940,6 @@ impl LoadBalancerCache {
             Some(balancer) => balancer.configured_sticky_identity_target(served_target),
             None => served_target,
         }
-    }
-
-    /// Select next target, excluding a previously tried target (for retries).
-    pub fn select_next_target(
-        &self,
-        namespace: &str,
-        upstream_id: &str,
-        ctx_key: &str,
-        exclude: &UpstreamTarget,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        let inner = self.inner.load();
-        Self::select_next_target_from(&inner, namespace, upstream_id, ctx_key, exclude, health)
     }
 
     pub fn select_next_target_from(
@@ -6081,12 +6047,6 @@ impl LoadBalancer {
         })
     }
 
-    /// Return the pre-computed subset indices for a given subset name, if any.
-    #[inline]
-    pub fn subset_indices(&self, subset_name: &str) -> Option<&[usize]> {
-        self.subset_indices.get(subset_name).map(|v| v.as_slice())
-    }
-
     #[inline]
     fn subset_algorithm(&self, subset_name: &str) -> LoadBalancerAlgorithm {
         self.subset_algorithms
@@ -6797,17 +6757,6 @@ impl LoadBalancer {
         self.select_with_bitset(ctx_key, &healthy)
     }
 
-    pub fn select_excluding_for_port(
-        &self,
-        ctx_key: &str,
-        port: u16,
-        exclude: &UpstreamTarget,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        let filter = RetryCandidateFilter::excluding(exclude);
-        self.select_filtered_for_port(ctx_key, port, filter, health)
-    }
-
     /// Retry-only eligibility-aware selection on a live per-port override lane.
     pub fn select_filtered_for_port(
         &self,
@@ -7011,23 +6960,6 @@ impl LoadBalancer {
             self.subset_wrr_state(subset_name),
             self.subset_hash_ring(subset_name),
             self.locality_lb.as_ref(),
-        )
-    }
-
-    pub fn select_excluding_for_port_from_subset(
-        &self,
-        ctx_key: &str,
-        port: u16,
-        subset_name: &str,
-        exclude: &UpstreamTarget,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        self.select_filtered_for_port_from_subset(
-            ctx_key,
-            port,
-            subset_name,
-            RetryCandidateFilter::excluding(exclude),
-            health,
         )
     }
 

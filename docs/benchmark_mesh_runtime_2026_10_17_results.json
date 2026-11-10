@@ -31,7 +31,7 @@
       "1024": {
         "latency_avg_us": 754,
         "median_rps": 132323.8,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_1024.json",
+        "median_run_file": "mesh-results/full/consul/run_1/consul_http1_1024.json",
         "median_run_rps": 132323.8,
         "p50_us": 685,
         "p95_us": 1450,
@@ -77,7 +77,7 @@
               }
             },
             "rps": 132323.8,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_1024.json",
+            "source_file": "mesh-results/full/consul/run_1/consul_http1_1024.json",
             "total_bytes": 1354995712,
             "total_errors": 0,
             "total_requests": 1323238
@@ -88,7 +88,7 @@
       "10240": {
         "latency_avg_us": 1053,
         "median_rps": 94820.7,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_10240.json",
+        "median_run_file": "mesh-results/full/consul/run_1/consul_http1_10240.json",
         "median_run_rps": 94820.7,
         "p50_us": 962,
         "p95_us": 2009,
@@ -134,7 +134,7 @@
               }
             },
             "rps": 94820.7,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_10240.json",
+            "source_file": "mesh-results/full/consul/run_1/consul_http1_10240.json",
             "total_bytes": 9709639680,
             "total_errors": 0,
             "total_requests": 948207
@@ -145,7 +145,7 @@
       "1048576": {
         "latency_avg_us": 28153,
         "median_rps": 1776.6,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_1048576.json",
+        "median_run_file": "mesh-results/full/consul/run_1/consul_http1_1048576.json",
         "median_run_rps": 1776.6,
         "p50_us": 27263,
         "p95_us": 48063,
@@ -191,7 +191,7 @@
               }
             },
             "rps": 1776.6,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_1048576.json",
+            "source_file": "mesh-results/full/consul/run_1/consul_http1_1048576.json",
             "total_bytes": 18629001216,
             "total_errors": 0,
             "total_requests": 17766
@@ -202,7 +202,7 @@
       "512000": {
         "latency_avg_us": 27257,
         "median_rps": 3672.3,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_512000.json",
+        "median_run_file": "mesh-results/full/consul/run_1/consul_http1_512000.json",
         "median_run_rps": 3672.3,
         "p50_us": 26143,
         "p95_us": 46751,
@@ -248,7 +248,7 @@
               }
             },
             "rps": 3672.3,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_512000.json",
+            "source_file": "mesh-results/full/consul/run_1/consul_http1_512000.json",
             "total_bytes": 18802176000,
             "total_errors": 0,
             "total_requests": 36723
@@ -259,7 +259,7 @@
       "5242880": {
         "latency_avg_us": 76349,
         "median_rps": 328.3,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_5242880.json",
+        "median_run_file": "mesh-results/full/consul/run_1/consul_http1_5242880.json",
         "median_run_rps": 328.3,
         "p50_us": 70911,
         "p95_us": 130559,
@@ -305,7 +305,7 @@
               }
             },
             "rps": 328.3,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_5242880.json",
+            "source_file": "mesh-results/full/consul/run_1/consul_http1_5242880.json",
             "total_bytes": 17212375040,
             "total_errors": 0,
             "total_requests": 3283
@@ -316,7 +316,7 @@
       "71680": {
         "latency_avg_us": 4175,
         "median_rps": 23932.3,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_71680.json",
+        "median_run_file": "mesh-results/full/consul/run_1/consul_http1_71680.json",
         "median_run_rps": 23932.3,
         "p50_us": 3893,
         "p95_us": 7695,
@@ -362,7 +362,7 @@
               }
             },
             "rps": 23932.3,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_71680.json",
+            "source_file": "mesh-results/full/consul/run_1/consul_http1_71680.json",
             "total_bytes": 17154672640,
             "total_errors": 0,
             "total_requests": 239323
@@ -375,7 +375,7 @@
       "1024": {
         "latency_avg_us": 238,
         "median_rps": 418179.2,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_1024.json",
+        "median_run_file": "mesh-results/full/direct/run_1/direct_http1_1024.json",
         "median_run_rps": 418179.2,
         "p50_us": 213,
         "p95_us": 442,
@@ -394,7 +394,7 @@
             "publishable": true,
             "resources": null,
             "rps": 418179.2,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_1024.json",
+            "source_file": "mesh-results/full/direct/run_1/direct_http1_1024.json",
             "total_bytes": 4282155008,
             "total_errors": 0,
             "total_requests": 4181792
@@ -405,7 +405,7 @@
       "10240": {
         "latency_avg_us": 302,
         "median_rps": 328821.5,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_10240.json",
+        "median_run_file": "mesh-results/full/direct/run_1/direct_http1_10240.json",
         "median_run_rps": 328821.5,
         "p50_us": 270,
         "p95_us": 578,
@@ -424,7 +424,7 @@
             "publishable": true,
             "resources": null,
             "rps": 328821.5,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_10240.json",
+            "source_file": "mesh-results/full/direct/run_1/direct_http1_10240.json",
             "total_bytes": 33671321600,
             "total_errors": 0,
             "total_requests": 3288215
@@ -435,7 +435,7 @@
       "1048576": {
         "latency_avg_us": 8551,
         "median_rps": 5844.4,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_1048576.json",
+        "median_run_file": "mesh-results/full/direct/run_1/direct_http1_1048576.json",
         "median_run_rps": 5844.4,
         "p50_us": 8271,
         "p95_us": 13703,
@@ -454,7 +454,7 @@
             "publishable": true,
             "resources": null,
             "rps": 5844.4,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_1048576.json",
+            "source_file": "mesh-results/full/direct/run_1/direct_http1_1048576.json",
             "total_bytes": 61282975744,
             "total_errors": 0,
             "total_requests": 58444
@@ -465,7 +465,7 @@
       "512000": {
         "latency_avg_us": 8118,
         "median_rps": 12314.3,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_512000.json",
+        "median_run_file": "mesh-results/full/direct/run_1/direct_http1_512000.json",
         "median_run_rps": 12314.3,
         "p50_us": 7795,
         "p95_us": 13423,
@@ -484,7 +484,7 @@
             "publishable": true,
             "resources": null,
             "rps": 12314.3,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_512000.json",
+            "source_file": "mesh-results/full/direct/run_1/direct_http1_512000.json",
             "total_bytes": 63049216000,
             "total_errors": 0,
             "total_requests": 123143
@@ -495,7 +495,7 @@
       "5242880": {
         "latency_avg_us": 28897,
         "median_rps": 865.2,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_5242880.json",
+        "median_run_file": "mesh-results/full/direct/run_1/direct_http1_5242880.json",
         "median_run_rps": 865.2,
         "p50_us": 28399,
         "p95_us": 42655,
@@ -514,7 +514,7 @@
             "publishable": true,
             "resources": null,
             "rps": 865.2,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_5242880.json",
+            "source_file": "mesh-results/full/direct/run_1/direct_http1_5242880.json",
             "total_bytes": 45361397760,
             "total_errors": 0,
             "total_requests": 8652
@@ -525,7 +525,7 @@
       "71680": {
         "latency_avg_us": 1074,
         "median_rps": 92694.0,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_71680.json",
+        "median_run_file": "mesh-results/full/direct/run_1/direct_http1_71680.json",
         "median_run_rps": 92694.0,
         "p50_us": 993,
         "p95_us": 1945,
@@ -544,7 +544,7 @@
             "publishable": true,
             "resources": null,
             "rps": 92694.0,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/direct/run_1/direct_http1_71680.json",
+            "source_file": "mesh-results/full/direct/run_1/direct_http1_71680.json",
             "total_bytes": 66443059200,
             "total_errors": 0,
             "total_requests": 926940
@@ -557,7 +557,7 @@
       "1024": {
         "latency_avg_us": 1345,
         "median_rps": 74254.3,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_1024.json",
+        "median_run_file": "mesh-results/full/envoy/run_1/envoy_http1_1024.json",
         "median_run_rps": 74254.3,
         "p50_us": 1223,
         "p95_us": 2421,
@@ -603,7 +603,7 @@
               }
             },
             "rps": 74254.3,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_1024.json",
+            "source_file": "mesh-results/full/envoy/run_1/envoy_http1_1024.json",
             "total_bytes": 760364032,
             "total_errors": 0,
             "total_requests": 742543
@@ -614,7 +614,7 @@
       "10240": {
         "latency_avg_us": 2009,
         "median_rps": 49737.3,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_10240.json",
+        "median_run_file": "mesh-results/full/envoy/run_1/envoy_http1_10240.json",
         "median_run_rps": 49737.3,
         "p50_us": 1870,
         "p95_us": 3523,
@@ -660,7 +660,7 @@
               }
             },
             "rps": 49737.3,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_10240.json",
+            "source_file": "mesh-results/full/envoy/run_1/envoy_http1_10240.json",
             "total_bytes": 5093099520,
             "total_errors": 0,
             "total_requests": 497373
@@ -671,7 +671,7 @@
       "1048576": {
         "latency_avg_us": 33544,
         "median_rps": 1491.7,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_1048576.json",
+        "median_run_file": "mesh-results/full/envoy/run_1/envoy_http1_1048576.json",
         "median_run_rps": 1491.7,
         "p50_us": 27327,
         "p95_us": 64095,
@@ -717,7 +717,7 @@
               }
             },
             "rps": 1491.7,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_1048576.json",
+            "source_file": "mesh-results/full/envoy/run_1/envoy_http1_1048576.json",
             "total_bytes": 15641608192,
             "total_errors": 0,
             "total_requests": 14917
@@ -728,7 +728,7 @@
       "512000": {
         "latency_avg_us": 34271,
         "median_rps": 2921.3,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_512000.json",
+        "median_run_file": "mesh-results/full/envoy/run_1/envoy_http1_512000.json",
         "median_run_rps": 2921.3,
         "p50_us": 25471,
         "p95_us": 75263,
@@ -774,7 +774,7 @@
               }
             },
             "rps": 2921.3,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_512000.json",
+            "source_file": "mesh-results/full/envoy/run_1/envoy_http1_512000.json",
             "total_bytes": 14957056000,
             "total_errors": 0,
             "total_requests": 29213
@@ -785,7 +785,7 @@
       "5242880": {
         "latency_avg_us": 85318,
         "median_rps": 294.2,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_5242880.json",
+        "median_run_file": "mesh-results/full/envoy/run_1/envoy_http1_5242880.json",
         "median_run_rps": 294.2,
         "p50_us": 82687,
         "p95_us": 133887,
@@ -831,7 +831,7 @@
               }
             },
             "rps": 294.2,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_5242880.json",
+            "source_file": "mesh-results/full/envoy/run_1/envoy_http1_5242880.json",
             "total_bytes": 15424552960,
             "total_errors": 0,
             "total_requests": 2942
@@ -842,7 +842,7 @@
       "71680": {
         "latency_avg_us": 6224,
         "median_rps": 16059.7,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_71680.json",
+        "median_run_file": "mesh-results/full/envoy/run_1/envoy_http1_71680.json",
         "median_run_rps": 16059.7,
         "p50_us": 5883,
         "p95_us": 10879,
@@ -888,7 +888,7 @@
               }
             },
             "rps": 16059.7,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/envoy/run_1/envoy_http1_71680.json",
+            "source_file": "mesh-results/full/envoy/run_1/envoy_http1_71680.json",
             "total_bytes": 11511592960,
             "total_errors": 0,
             "total_requests": 160597
@@ -901,7 +901,7 @@
       "1024": {
         "latency_avg_us": 2695,
         "median_rps": 37089.2,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_1024.json",
+        "median_run_file": "mesh-results/full/ferrum/run_1/ferrum_http1_1024.json",
         "median_run_rps": 37089.2,
         "p50_us": 2629,
         "p95_us": 4187,
@@ -947,7 +947,7 @@
               }
             },
             "rps": 37089.2,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_1024.json",
+            "source_file": "mesh-results/full/ferrum/run_1/ferrum_http1_1024.json",
             "total_bytes": 379793408,
             "total_errors": 0,
             "total_requests": 370892
@@ -958,7 +958,7 @@
       "10240": {
         "latency_avg_us": 3280,
         "median_rps": 30478.1,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_10240.json",
+        "median_run_file": "mesh-results/full/ferrum/run_1/ferrum_http1_10240.json",
         "median_run_rps": 30478.1,
         "p50_us": 3205,
         "p95_us": 5055,
@@ -1004,7 +1004,7 @@
               }
             },
             "rps": 30478.1,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_10240.json",
+            "source_file": "mesh-results/full/ferrum/run_1/ferrum_http1_10240.json",
             "total_bytes": 3120957440,
             "total_errors": 0,
             "total_requests": 304781
@@ -1015,7 +1015,7 @@
       "1048576": {
         "latency_avg_us": 35161,
         "median_rps": 1423.7,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_1048576.json",
+        "median_run_file": "mesh-results/full/ferrum/run_1/ferrum_http1_1048576.json",
         "median_run_rps": 1423.7,
         "p50_us": 34815,
         "p95_us": 47167,
@@ -1061,7 +1061,7 @@
               }
             },
             "rps": 1423.7,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_1048576.json",
+            "source_file": "mesh-results/full/ferrum/run_1/ferrum_http1_1048576.json",
             "total_bytes": 14928576512,
             "total_errors": 0,
             "total_requests": 14237
@@ -1072,7 +1072,7 @@
       "512000": {
         "latency_avg_us": 36575,
         "median_rps": 2738.7,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_512000.json",
+        "median_run_file": "mesh-results/full/ferrum/run_1/ferrum_http1_512000.json",
         "median_run_rps": 2738.7,
         "p50_us": 35871,
         "p95_us": 52575,
@@ -1118,7 +1118,7 @@
               }
             },
             "rps": 2738.7,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_512000.json",
+            "source_file": "mesh-results/full/ferrum/run_1/ferrum_http1_512000.json",
             "total_bytes": 14022144000,
             "total_errors": 0,
             "total_requests": 27387
@@ -1129,7 +1129,7 @@
       "5242880": {
         "latency_avg_us": 87615,
         "median_rps": 286.2,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_5242880.json",
+        "median_run_file": "mesh-results/full/ferrum/run_1/ferrum_http1_5242880.json",
         "median_run_rps": 286.2,
         "p50_us": 87295,
         "p95_us": 104191,
@@ -1175,7 +1175,7 @@
               }
             },
             "rps": 286.2,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_5242880.json",
+            "source_file": "mesh-results/full/ferrum/run_1/ferrum_http1_5242880.json",
             "total_bytes": 15005122560,
             "total_errors": 0,
             "total_requests": 2862
@@ -1186,7 +1186,7 @@
       "71680": {
         "latency_avg_us": 7591,
         "median_rps": 13169.7,
-        "median_run_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_71680.json",
+        "median_run_file": "mesh-results/full/ferrum/run_1/ferrum_http1_71680.json",
         "median_run_rps": 13169.7,
         "p50_us": 7495,
         "p95_us": 11327,
@@ -1232,7 +1232,7 @@
               }
             },
             "rps": 13169.7,
-            "source_file": "/Users/jeremyjustus/mesh-results/full/ferrum/run_1/ferrum_http1_71680.json",
+            "source_file": "mesh-results/full/ferrum/run_1/ferrum_http1_71680.json",
             "total_bytes": 9440040960,
             "total_errors": 0,
             "total_requests": 131697

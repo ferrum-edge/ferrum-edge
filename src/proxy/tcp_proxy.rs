@@ -5245,7 +5245,6 @@ async fn handle_tcp_connection_inner(
     let mut current_port = params.backend_port;
     let mut current_policy_port = params.backend_policy_port;
     let mut current_cb_info = cb_info;
-    let mut last_connect_err: Option<anyhow::Error> = None;
 
     let mut attempt = 0u32;
     let backend_addr = loop {
@@ -5425,7 +5424,6 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
-                    last_connect_err = Some(setup_err);
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
                     // it is bounded by the same absolute plan — and the same
@@ -5521,14 +5519,6 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
-                    last_connect_err = Some(
-                        StreamSetupError::with_source(
-                            StreamSetupKind::BackendMaxConnectionsExceeded,
-                            format!("for {}", format_backend_target(&current_host, current_port)),
-                            reason,
-                        )
-                        .into(),
-                    );
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
                     // it is bounded by the same absolute plan — and the same
@@ -5721,7 +5711,6 @@ async fn handle_tcp_connection_inner(
                     backend_info.backend_target =
                         format_backend_target(&current_host, current_port);
                     backend_info.backend_resolved_ip = None;
-                    last_connect_err = Some(e);
                     attempt += 1;
                     // The backoff is part of the admitted session's setup, so
                     // it is bounded by the same absolute plan — and the same
@@ -5760,7 +5749,6 @@ async fn handle_tcp_connection_inner(
     let idle_timeout =
         (tcp_idle_timeout_seconds > 0).then(|| Duration::from_secs(tcp_idle_timeout_seconds));
     let (_backend_socket_addr, mut backend_stream, _backend_inflight_guard) = backend_addr;
-    let _ = last_connect_err; // consumed by retry loop logging
     let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
 
     // If first-bytes inspection consumed a decrypted opening prefix from a
@@ -8116,8 +8104,8 @@ async fn connect_backend_plain(
     Ok(stream)
 }
 
-/// Connect to a TLS-enabled backend using the cached TLS config when available.
-/// Falls back to building the config from disk if no cache is provided.
+/// Connect to a TLS-enabled backend using the listener's cached TLS config.
+/// The cache is required: a missing cache fails the attempt.
 ///
 /// `keepalive` carries DestinationRule `connectionPool.tcp.tcpKeepalive`. We
 /// apply it to the underlying `TcpStream` BEFORE the TLS handshake starts so
@@ -10503,8 +10491,8 @@ fn shutdown_write_fd(fd: i32) {
     }
 }
 
-/// Splice-path equivalent of `drain_half_close_copy`. Separate function
-/// because the splice direction future's `Ok` branch returns `anyhow::Error`
+/// Splice-path equivalent of `drain_half_close_direction`. Separate function
+/// because the splice direction future's `Err` branch carries `anyhow::Error`
 /// rather than `std::io::Error`, and the classifier takes the outer anyhow
 /// value directly.
 ///
@@ -11601,6 +11589,20 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
     Ok((fds[0], fds[1]))
 }
 
+#[cfg(target_os = "linux")]
+fn refresh_splice_write_progress(
+    last_activity: Option<&AtomicU64>,
+    write_watermark: Option<&AtomicU64>,
+) {
+    let now = coarse_now_ms();
+    if let Some(la) = last_activity {
+        la.store(now, Ordering::Relaxed);
+    }
+    if let Some(wm) = write_watermark {
+        wm.store(now, Ordering::Relaxed);
+    }
+}
+
 /// Splice data in one direction: src_fd → pipe → dst_fd.
 ///
 /// Bytes transferred are accumulated into `bytes` so the caller can observe
@@ -11618,23 +11620,8 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 /// refreshed on every successful pipe→dst splice, then disarmed when the
 /// pipe drains. The caller fires
 /// `backend_write_timeout_ms` from it for the c2b direction. Both are
-/// `Option<&AtomicU64>` because c2b only carries write_watermark and b2c only
-/// carries read_watermark — they share scope with the watchdog instead of
-/// going through `Arc`.
-#[cfg(target_os = "linux")]
-fn refresh_splice_write_progress(
-    last_activity: Option<&AtomicU64>,
-    write_watermark: Option<&AtomicU64>,
-) {
-    let now = coarse_now_ms();
-    if let Some(la) = last_activity {
-        la.store(now, Ordering::Relaxed);
-    }
-    if let Some(wm) = write_watermark {
-        wm.store(now, Ordering::Relaxed);
-    }
-}
-
+/// `Option<Arc<AtomicU64>>` because c2b only carries write_watermark and b2c
+/// only carries read_watermark.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn splice_one_direction_no_guard(

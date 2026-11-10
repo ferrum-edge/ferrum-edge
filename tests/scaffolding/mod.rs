@@ -20,9 +20,9 @@
 //! - [`clients::Http1Client`] — a `reqwest`-backed client tuned for the
 //!   harness (insecure TLS, short timeout, buffered response).
 //!
-//! Phase 1 acceptance tests live under `tests/functional/scripted_backend/`
-//! (binary mode) and `tests/integration/scripted_backend/` (in-process
-//! smoke tests).
+//! Acceptance tests are the `tests/functional/scripted_backend_*_tests.rs`
+//! files (binary mode) and `tests/integration/scripted_backend_smoke_tests.rs`
+//! (in-process smoke tests).
 //!
 //! # Canonical usage
 //!

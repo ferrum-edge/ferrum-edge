@@ -1199,30 +1199,26 @@ fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig, namespa
         })
 }
 
-fn gateway_hbone_mtls_observed(
-    dispatch_mesh_transport: bool,
-    error_class: Option<retry::ErrorClass>,
-) -> bool {
-    dispatch_mesh_transport
-        && !matches!(
-            error_class,
-            Some(
-                retry::ErrorClass::ConnectionTimeout
-                    | retry::ErrorClass::ConnectionRefused
-                    | retry::ErrorClass::ConnectionReset
-                    | retry::ErrorClass::ConnectionClosed
-                    | retry::ErrorClass::DnsLookupError
-                    | retry::ErrorClass::TlsError
-                    | retry::ErrorClass::ConnectionPoolError
-                    | retry::ErrorClass::PortExhaustion
-                    | retry::ErrorClass::ProtocolError
-                    | retry::ErrorClass::DispatchPolicyRejected
-                    | retry::ErrorClass::BackendConnectionLimit
-                    | retry::ErrorClass::TrustWithdrawn
-                    | retry::ErrorClass::RequestError
-                    | retry::ErrorClass::RequestBodyTooLarge
-            )
+fn gateway_hbone_mtls_observed(error_class: Option<retry::ErrorClass>) -> bool {
+    !matches!(
+        error_class,
+        Some(
+            retry::ErrorClass::ConnectionTimeout
+                | retry::ErrorClass::ConnectionRefused
+                | retry::ErrorClass::ConnectionReset
+                | retry::ErrorClass::ConnectionClosed
+                | retry::ErrorClass::DnsLookupError
+                | retry::ErrorClass::TlsError
+                | retry::ErrorClass::ConnectionPoolError
+                | retry::ErrorClass::PortExhaustion
+                | retry::ErrorClass::ProtocolError
+                | retry::ErrorClass::DispatchPolicyRejected
+                | retry::ErrorClass::BackendConnectionLimit
+                | retry::ErrorClass::TrustWithdrawn
+                | retry::ErrorClass::RequestError
+                | retry::ErrorClass::RequestBodyTooLarge
         )
+    )
 }
 
 /// Stamp mesh transport metadata for an outbound mesh-mTLS-secured dispatch.
@@ -1237,7 +1233,7 @@ pub(crate) fn annotate_gateway_mesh_metadata(
     let Some(transport) = transport else {
         return;
     };
-    if !gateway_hbone_mtls_observed(true, error_class) {
+    if !gateway_hbone_mtls_observed(error_class) {
         return;
     }
 
@@ -2317,7 +2313,7 @@ pub(crate) fn streaming_response_takes_direct_fast_path(
 }
 
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
-/// the `CoalescingH2Body` adapter and stream through hyper's `Incoming`
+/// the `Coalescing<S>` adapter and stream through hyper's `Incoming`
 /// directly.
 ///
 /// Bypass is safe when:
@@ -2327,14 +2323,14 @@ pub(crate) fn streaming_response_takes_direct_fast_path(
 ///   * it is ≥ 512 KiB (backend is already emitting large H2 frames —
 ///     `http2_max_frame_size` is 1 MiB in our build — so coalescing just
 ///     adds a `BytesMut::extend_from_slice` copy that the large-frame
-///     bypass at `body.rs:~1184` would skip anyway), AND
+///     bypass in `body.rs`'s `Coalescing` adapter would skip anyway), AND
 ///   * the size fits within `max_response_body_size_bytes` (or the limit
 ///     is disabled). Outside that window we keep the coalescer so any
 ///     upstream size enforcement still wraps the body.
 ///
-/// Does NOT apply to the gRPC streaming response path — CLAUDE.md
-/// documents a +35 % gRPC large-payload win from coalescing, so that path
-/// deliberately stays on `CoalescingH2Body`.
+/// Does NOT apply to the gRPC streaming response path, which deliberately
+/// stays on the `Coalescing<S>` adapter with its 128 KiB target
+/// (`.claude/rules/proxy-protocols.md`, "HTTP/3 And gRPC").
 ///
 /// Threshold is 512 KiB: below that the coalescer's per-frame amortisation
 /// dominates; above that the backend's own frame size already matches or
@@ -2623,16 +2619,6 @@ fn warn_if_h3_websocket_new_quic_idle_mismatch(
     );
 }
 
-/// Check if the request is a WebSocket upgrade request.
-///
-/// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
-/// String allocations on the hot path.
-///
-/// Validates the `Sec-WebSocket-Key` header format: RFC 6455 §4.1 requires it to
-/// be a base64-encoded 16-byte nonce (exactly 24 base64 characters). A malformed
-/// key causes the handshake to be treated as a non-WebSocket request, which the
-/// backend will handle as a regular HTTP request rather than proceeding with a
-/// broken upgrade.
 /// Check if the request is an HTTP/2 Extended CONNECT WebSocket request (RFC 8441).
 ///
 /// In HTTP/2, WebSocket upgrades use the CONNECT method with a `:protocol = "websocket"`
@@ -3463,28 +3449,6 @@ pub(crate) fn resolve_node_waypoint_capture_destination(
         }),
         mtls_mode,
     })
-}
-
-#[allow(dead_code)]
-fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
-    let headers = req.headers();
-    let connection = headers.get("connection").and_then(|v| v.to_str().ok());
-    let upgrade = headers.get("upgrade").and_then(|v| v.to_str().ok());
-    let sec_key = headers
-        .get("sec-websocket-key")
-        .and_then(|v| v.to_str().ok());
-    let sec_version = headers
-        .get("sec-websocket-version")
-        .and_then(|v| v.to_str().ok());
-
-    connection.is_some_and(|conn| {
-        // The Connection header can contain comma-separated values (e.g., "keep-alive, Upgrade").
-        // Split on commas and check each token case-insensitively without allocating.
-        conn.split(',')
-            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-    }) && upgrade.is_some_and(|up| up.eq_ignore_ascii_case("websocket"))
-        && sec_key.is_some_and(is_valid_websocket_key)
-        && (sec_version == Some("13"))
 }
 
 /// Validate that a `Sec-WebSocket-Key` value is a base64-encoded 16-byte nonce.
@@ -5326,7 +5290,7 @@ fn content_length_field_line_is_zero(value: &[u8]) -> bool {
 ///
 /// A first attempt can fail BEFORE the request body is ever buffered: DNS
 /// resolution and the backend egress screen both run ahead of body preparation
-/// in `proxy_to_backend_inner`, and both return a pre-wire failure with no
+/// in `proxy_to_backend`, and both return a pre-wire failure with no
 /// retained body even though the client's body was already consumed. Replaying
 /// such an attempt would dispatch a body-less request the backend accepts as a
 /// complete one — a silent truncation of a non-idempotent call. This predicate
@@ -9962,9 +9926,11 @@ impl ProxyState {
     /// configured namespace into the live gateway SVID verifier.
     ///
     /// Database serving mode is the only mode that owns this publication. The
-    /// CP→DP side channel (`update_gateway_trust_bundles` /
-    /// `clear_gateway_trust_bundles` from `dp_client`) and the mesh slice apply
-    /// loop already own the same slot for their modes, and a DP's config never
+    /// CP→DP side channel (`dp_client` staging a [`GatewayTrustCommit`] through
+    /// `update_config_off_thread_with_gateway_trust` /
+    /// `apply_incremental_with_gateway_trust`) and the mesh slice apply loop
+    /// (`commit_gateway_trust_generation`) already own the same slot for their
+    /// modes, and a DP's config never
     /// carries `gateway_trust_bundles` at all (the CP strips it), so the mode
     /// gate is what keeps a single writer per deployment shape.
     ///
@@ -13720,17 +13686,7 @@ impl ProxyState {
         }
     }
 
-    /// Apply a new configuration, using incremental (surgical) updates when
-    /// possible to avoid disrupting the hot request path.
-    ///
-    /// The delta between the old and new config is computed first. If nothing
-    /// changed, this is a no-op. For typical admin API edits (1-2 resources),
-    /// only the affected cache entries are updated while the rest of the
-    /// caches — including stateful plugin instances, warm path caches, and
-    /// load balancer counters — remain completely untouched.
-    ///
-    /// Falls back to a full rebuild only on the very first config load (when
-    /// there is no previous config to diff against).
+    /// Whether the route table must be rebuilt for this delta.
     fn delta_routes_changed(
         delta: &crate::config_delta::ConfigDelta,
         old_config: &GatewayConfig,
@@ -20462,8 +20418,6 @@ pub(crate) async fn connect_mesh_websocket_backend(
     }
 }
 
-/// Run bidirectional WebSocket proxying between upgraded client and connected backend.
-///
 /// Session-level metadata captured at WebSocket upgrade time and consumed at
 /// teardown when firing `on_ws_disconnect`. Held as an owned struct (not
 /// references) because the upgrade handler returns before the session ends,
@@ -20794,22 +20748,6 @@ pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
     }
 }
 
-/// `connection_id` — unique per-connection identifier for stateful frame plugins.
-/// `ws_framing_plugins` — plugins that require parsing for a parser-level
-/// policy or post-reassembly hook. Pass an empty `Vec` for zero-overhead
-/// forwarding when no plugin on this proxy needs WebSocket framing.
-/// `ws_frame_plugins` — the subset that opted into post-reassembly hooks.
-/// Parser-policy-only plugins must not enter the per-message loop.
-/// `ws_disconnect_plugins` — plugins that opted into end-of-session hooks by
-/// returning `true` from `requires_ws_disconnect_hooks()`. Pass an empty `Vec`
-/// to skip disconnect bookkeeping entirely.
-/// `session_meta` — captured at upgrade time; used to populate `WsDisconnectContext`
-/// when the session ends. Cost is paid regardless of whether disconnect plugins
-/// are present (one small allocation per upgrade) because the struct is small
-/// and moving it has zero additional cost.
-/// `websocket_tunnel_mode` — when true and no frame plugins are configured, bypass
-/// WebSocket frame parsing and use raw TCP bidirectional copy for maximum throughput.
-///
 /// Polite-close bound used when the cancel branch of each forward loop fires.
 /// The opposite direction has already cancelled, so a plain `.await` on the
 /// polite-Close send could hang indefinitely if the peer socket is dead or
@@ -21943,6 +21881,8 @@ where
     .await
 }
 
+/// Run bidirectional WebSocket proxying between upgraded client and connected backend.
+///
 /// Generic over the client transport type `C`. The H1/H2 frontend passes
 /// `TokioIo::new(upgraded)` (hyper's `Upgraded` adapted to tokio AsyncRead+AsyncWrite);
 /// the H3 frontend (RFC 9220 Extended CONNECT) passes a `tokio::io::DuplexStream`
@@ -21968,6 +21908,22 @@ where
 /// identity [`ws_permessage_deflate::PlainOutbound`] codec for ordinary
 /// sessions, or over inflating transports with per-leg encoders for a
 /// `websocket_permessage_deflate: terminate` session (issue #5769).
+///
+/// `connection_id` — unique per-connection identifier for stateful frame plugins.
+/// `ws_framing_plugins` — plugins that require parsing for a parser-level
+/// policy or post-reassembly hook. Pass an empty `Vec` for zero-overhead
+/// forwarding when no plugin on this proxy needs WebSocket framing.
+/// `ws_frame_plugins` — the subset that opted into post-reassembly hooks.
+/// Parser-policy-only plugins must not enter the per-message loop.
+/// `ws_disconnect_plugins` — plugins that opted into end-of-session hooks by
+/// returning `true` from `requires_ws_disconnect_hooks()`. Pass an empty `Vec`
+/// to skip disconnect bookkeeping entirely.
+/// `session_meta` — captured at upgrade time; used to populate `WsDisconnectContext`
+/// when the session ends. Cost is paid regardless of whether disconnect plugins
+/// are present (one small allocation per upgrade) because the struct is small
+/// and moving it has zero additional cost.
+/// `websocket_tunnel_mode` — when true and no frame plugins are configured, bypass
+/// WebSocket frame parsing and use raw TCP bidirectional copy for maximum throughput.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B, E>(
     client_io: C,
@@ -23369,27 +23325,6 @@ where
     Ok(())
 }
 
-/// Start the proxy HTTP listener with dual-path handling.
-#[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
-pub async fn start_proxy_listener(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), anyhow::Error> {
-    start_proxy_listener_with_tls(addr, state, shutdown, None).await
-}
-
-/// Start the proxy listener with optional TLS and client certificate verification.
-#[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
-pub async fn start_proxy_listener_with_tls(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-) -> Result<(), anyhow::Error> {
-    start_proxy_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
-}
-
 /// Run the proxy accept loop on a pre-bound `TcpListener`.
 ///
 /// This is the in-process entry point used by [`crate::modes::file::serve`]:
@@ -23495,7 +23430,6 @@ async fn run_bound_proxy_listener(
         conn_semaphore,
         shutdown,
         mesh_direction,
-        0,
         SourceIpOverride::none(),
         None,
         frontend_proxy_protocol,
@@ -23952,13 +23886,14 @@ pub(crate) async fn start_mesh_plaintext_listener_with_accept_gate(
     .await
 }
 
-/// Start the mesh UDP TPROXY capture listener (F3 §3.3 Stage 3).
+/// Start the mesh UDP TPROXY capture listener (F3 §3.3 Stages 3–4).
 ///
 /// Binds a transparent UDP socket on `addr` (the Stage-2 capture port,
 /// `FERRUM_MESH_CAPTURE_UDP_PORT`), recovers each captured datagram's original
 /// destination via the `IP(v6)_RECVORIGDSTADDR` cmsg, keys a session by
-/// `(client, orig-dst)`, and DROPS it (egress relay is Stage 4). DoS bounds are
-/// pulled from `EnvConfig` (`FERRUM_UDP_MAX_SESSIONS` /
+/// `(client, orig-dst)`, and relays it over the mesh UDP egress path (Stage 4:
+/// `mesh_udp_egress` route lookup, LB selection, SVID and capability gate).
+/// DoS bounds are pulled from `EnvConfig` (`FERRUM_UDP_MAX_SESSIONS` /
 /// `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` / `FERRUM_UDP_RECVMMSG_BATCH_SIZE` /
 /// `FERRUM_POOL_SHARD_AMOUNT`), matching the plain UDP proxy. `tls_config` is
 /// always `None` for this plaintext listener (the parameter is accepted only so
@@ -24740,8 +24675,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         // (already handled above) cannot leave orphan tasks behind.
         let mut handles = Vec::with_capacity(listeners.len());
 
-        for (offset, listener) in listeners.into_iter().enumerate() {
-            let i = offset + 1;
+        for listener in listeners {
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
@@ -24757,7 +24691,6 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     semaphore,
                     shutdown_rx,
                     mesh_direction,
-                    i,
                     SourceIpOverride::none(),
                     None,
                     frontend_proxy_protocol,
@@ -24771,7 +24704,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             "Proxy listener started on {} (backlog={}, accept_threads={})",
             addr, backlog, accept_threads
         );
-        // Run thread 0 on the current task (avoids an extra spawn)
+        // Run the primary loop on the current task (avoids an extra spawn)
         run_accept_loop(
             first_listener,
             state,
@@ -24779,7 +24712,6 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             conn_semaphore,
             shutdown,
             mesh_direction,
-            0,
             SourceIpOverride::none(),
             None,
             frontend_proxy_protocol,
@@ -24801,7 +24733,6 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             conn_semaphore,
             shutdown,
             mesh_direction,
-            0,
             SourceIpOverride::none(),
             None,
             frontend_proxy_protocol,
@@ -24897,7 +24828,6 @@ async fn run_accept_loop(
     conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
-    _thread_id: usize,
     // Overrides the accepted connection's client IP. Used by the node-waypoint
     // in-netns capture path: `connect4` rewrites a captured pod's egress to
     // loopback, so the accepted peer is 127.0.0.1; this carries the real source
@@ -30481,7 +30411,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
                 ctx.retained_response_body_ceiling() as u128,
             ));
             crate::plugins::invalidate_content_bound_response_headers(response_headers);
-            restore_authoritative_gateway_error_header(response_headers, "overload");
+            restore_authoritative_gateway_error_header(response_headers, X_GATEWAY_ERROR_OVERLOAD);
         } else {
             *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
             *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
@@ -32113,7 +32043,7 @@ pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
         // Case-insensitive, and load-bearing beyond the wire: ordinary
         // Streaming framing removes `Content-Length` from the response the
         // client sees, but the gateway's own declared-length captures
-        // (`preserved_response_content_length`, `content_length_header_value`)
+        // (`preserved_response_content_length`)
         // read this map first, and a length the deadline is about to invalidate
         // must not inform truncation or coalescing decisions either.
         headers_mod::remove_content_length_header(response_headers);
@@ -41985,7 +41915,7 @@ async fn handle_proxy_request_inner(
                 // Re-resolve the effective proxy for the (possibly rotated)
                 // current target so per-port `connect_timeout_ms` overrides
                 // apply to the retried backend. Same per-target-rotation
-                // contract as `proxy_to_backend_inner`.
+                // contract as the generic retry loop in `handle_proxy_request_inner`.
                 let grpc_retry_effective_proxy = resolve_backend_connection_proxy_for_target(
                     &proxy,
                     grpc_current_target.as_deref(),
@@ -44863,7 +44793,7 @@ async fn handle_proxy_request_inner(
             // Never replay a request whose declared body was never retained.
             //
             // DNS resolution and the backend egress screen both run AHEAD of
-            // request-body preparation in `proxy_to_backend_inner`, so a first
+            // request-body preparation in `proxy_to_backend`, so a first
             // attempt that fails there returns a pre-wire `connection_error`
             // (`DnsLookupError`, `DispatchPolicyRejected`) with
             // `retained_body: None` — while the client's body has already been
@@ -47634,7 +47564,7 @@ async fn handle_proxy_request_inner(
             // (>= 512 KiB) the backend frames are already big enough that
             // coalescing them into 128 KiB target chunks just adds a
             // `BytesMut::extend_from_slice` copy before the pre-existing
-            // large-frame bypass at `body.rs:~1184` would skip it anyway.
+            // large-frame bypass in `body.rs`'s `Coalescing` adapter would skip it anyway.
             // That copy was the remaining gap for 5 MB HTTP/2 throughput
             // (81 RPS vs direct 232 RPS).
             //
@@ -47647,9 +47577,10 @@ async fn handle_proxy_request_inner(
             // cannot be sure frames are already 1 MiB when the backend is
             // chunked).
             //
-            // gRPC still uses the coalescing path (see gRPC streaming
-            // response at ~line 5905) because gRPC's +35 % large-payload
-            // win is documented in CLAUDE.md and depends on coalescing.
+            // gRPC still uses the coalescing path (see the native-gRPC
+            // streaming arm of `handle_proxy_request_inner`) and keeps the
+            // 128 KiB coalesce target (`.claude/rules/proxy-protocols.md`,
+            // "HTTP/3 And gRPC").
             let use_passthrough = should_bypass_h2_coalesce_for_large_response(
                 cl,
                 effective_max_response_body_size_bytes,
@@ -47724,9 +47655,9 @@ async fn handle_proxy_request_inner(
             } else if use_passthrough && coalesce_flush.is_none() {
                 // Response too large to benefit from coalescing — stream
                 // direct, let hyper forward 1 MiB frames as-is. Saves the
-                // `BytesMut::extend_from_slice` copy that CoalescingH2Body
-                // would do on every data frame before the large-frame
-                // bypass kicks in at body.rs:~1184.
+                // `BytesMut::extend_from_slice` copy that the `Coalescing`
+                // adapter would do on every data frame before its large-frame
+                // bypass kicks in.
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     crate::proxy::body::observe_h1_backend_input(resp.into_body(), h1_backend, 0),
                     advertised_cl,
@@ -50517,22 +50448,7 @@ pub(crate) fn record_backend_admission_retry_outcome(
     }
 }
 
-/// Proxy the request to the backend.
-///
-/// `dispatch_h3` is captured by the caller and forced through here so the
-/// dispatch decision is made exactly once per attempt — see the
-/// `current_dispatch_h3` capture in `proxy_to_backend_inner` for the
-/// rationale. Without it, a concurrent capability refresh /
-/// `mark_h3_unsupported` between the outer capture and the async DNS resolve
-/// below could flip the inner re-check and split a single attempt's
-/// dispatch decision in half on the same target — the exact
-/// cross-protocol-mid-attempt behavior this contract forbids.
-///
-/// Per-target rotation across retries IS allowed to switch protocols (see the
-/// retry loop's recompute-on-target-change branch). The prohibition is on
-/// switching transports mid-attempt or across same-target retries; cross-
-/// target rotation runs against a different backend, so the new target's
-/// own capability classification is the right answer.
+/// Outcome of one [`proxy_to_backend`] dispatch attempt.
 enum BackendDispatchResult {
     Response {
         response: Box<retry::BackendResponse>,
@@ -50999,11 +50915,6 @@ pub(crate) fn eager_buffer_body_read_error_body(status_code: u16) -> Vec<u8> {
     }
 }
 
-/// Content-Length 413 fast path, hoisted BEFORE backend admission on the HBONE
-/// and native-H3 dispatch branches. Those branches always dispatch (no reqwest
-/// fall-through), and their request-size check lives inside the backend dispatch
-/// function — i.e. after admission. With the adaptive limiter at capacity, an
-/// oversized upload would then be rejected as a concurrency 503 instead of the
 /// The egress-policy enforcement point for **literal-IP** backends.
 ///
 /// reqwest and the H2/gRPC/H3 pools skip the `DnsCacheResolver` for a host that
@@ -51305,6 +51216,11 @@ pub(crate) fn declared_request_content_length_over_limit<H: RequestHeaderLookup 
     }
 }
 
+/// Content-Length 413 fast path, hoisted BEFORE backend admission on the HBONE
+/// and native-H3 dispatch branches. Those branches always dispatch (no reqwest
+/// fall-through), and their request-size check lives inside the backend dispatch
+/// function — i.e. after admission. With the adaptive limiter at capacity, an
+/// oversized upload would then be rejected as a concurrency 503 instead of the
 /// deterministic gateway 413, masking a client/gateway policy violation as
 /// upstream pressure. The reqwest/direct-H2 paths already run their size checks
 /// before admitting; this restores the same ordering. Returns the 413 dispatch
@@ -51479,6 +51395,22 @@ fn boxed_proxy_to_backend_unix_h2c<'a>(
     ))
 }
 
+/// Proxy the request to the backend.
+///
+/// `dispatch_h3` is captured by the caller and forced through here so the
+/// dispatch decision is made exactly once per attempt — see the
+/// `current_dispatch_h3` capture in `handle_proxy_request_inner` for the
+/// rationale. Without it, a concurrent capability refresh /
+/// `mark_h3_unsupported` between the outer capture and the async DNS resolve
+/// below could flip the inner re-check and split a single attempt's
+/// dispatch decision in half on the same target — the exact
+/// cross-protocol-mid-attempt behavior this contract forbids.
+///
+/// Per-target rotation across retries IS allowed to switch protocols (see the
+/// retry loop's recompute-on-target-change branch). The prohibition is on
+/// switching transports mid-attempt or across same-target retries; cross-
+/// target rotation runs against a different backend, so the new target's
+/// own capability classification is the right answer.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
@@ -51567,7 +51499,7 @@ async fn proxy_to_backend(
     // the previous `Option<Vec<u8>>` deep-copied the body on every request
     // with retry enabled, even when no retry actually fired. `Option<Bytes>`
     // still derefs to `Option<&[u8]>` via `as_deref`, so the retry
-    // call sites in `proxy_to_backend_inner` are unchanged.
+    // call sites in `handle_proxy_request_inner` are unchanged.
     let mut retained_body: Option<Bytes> = None;
 
     // Effective client-facing request-body ceiling for this dispatch: the
@@ -56835,6 +56767,12 @@ pub fn check_host_authority_consistency(
 ///    credential after a top-level comma (`Bearer x, Basic <password>`) is the same
 ///    ambiguity and is rejected too; the scan is quote-aware, so `auth-param` lists
 ///    such as `Digest username="a, b", realm="r"` are unaffected.
+///
+/// 7. **One `Content-Type` media type** (all HTTP versions): RFC 9110 §8.3 makes
+///    `Content-Type` a singleton field. Two field lines, or one comma-joined list,
+///    let the gateway (which classifies by the first media type) and a backend
+///    that resolves another member disagree about the body framing. See
+///    [`check_single_content_type`].
 pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
@@ -63487,21 +63425,6 @@ async fn proxy_to_backend_mesh_mtls(
         );
     };
 
-    // Peer-verification mode + SNI depend on whether this is a CROSS-CLUSTER
-    // east-west target:
-    // - Cross-cluster (`mesh.cross_cluster`): the dial host is the REMOTE
-    //   east-west gateway, which SNI-passes the opaque TLS to an LB-picked
-    //   destination workload the client cannot name. So verification is
-    //   TRUST-DOMAIN-ONLY (`expected_peer = None`; the destination SVID must
-    //   still chain to a TRUSTED/federated trust domain — never unverified) and
-    //   the ClientHello SNI is OVERRIDDEN to the destination service FQDN
-    //   (`mesh.eastwest_sni`). A cross-cluster target carries NO `mesh.spiffe_id`
-    //   and MUST carry a usable SNI tag — a missing/empty SNI FAILS CLOSED
-    //   (never fall back to the gateway address as SNI, which would silently
-    //   break passthrough routing and tunnel to whatever the gateway IP's own
-    //   SNI resolves to).
-    // - In-cluster (default): the pinned destination identity is mandatory —
-    //   missing or corrupt fails closed before any dial — and no SNI override.
     // Resolve the peer-verification + SNI plan ONCE, shared with the WebSocket
     // egress path via `MeshMtlsDialPlan` so the in-cluster-pinned vs
     // cross-cluster (east-west) split cannot drift between the two transports:
@@ -67475,9 +67398,9 @@ fn h3_streaming_backend_response(
 ///
 /// Backend response trailers (the second tuple element from
 /// [`drain_h3_response_body`](crate::http3::client::drain_h3_response_body)) are
-/// dropped on this buffered path: `ResponseBody::Buffered` cannot carry them and
-/// the buffered decision is only reached when a response-body plugin needs the
-/// full body (plugins cannot inspect trailers today). The streaming path
+/// dropped on this buffered path by design: see the trailer contract table in
+/// `docs/response_body_streaming.md` (native HTTP/3 backend, buffered). The
+/// streaming path
 /// ([`h3_streaming_backend_response`]) forwards them instead.
 ///
 /// A mid-body `Stream` fault is classified with [`classify_h3_error`] on the raw
@@ -67782,17 +67705,6 @@ pub(crate) fn declared_response_length_exceeds_limit(
     Some(usize::try_from(len).unwrap_or(usize::MAX))
 }
 
-/// Build the 504 `BackendResponse` for an H3 backend read timeout
-/// (`backend_read_timeout_ms` expired waiting for response headers via
-/// `recv_response()` or buffered body frames via `recv_data()`).
-///
-/// Mirrors the direct-H2 / HBONE / sidecar-mTLS read-timeout arms so the
-/// same proxy config produces the same client-visible outcome regardless
-/// of dispatch path: 504 + `{"error":"Backend timeout"}` +
-/// `ErrorClass::ReadWriteTimeout`. `connection_error=false` — the request
-/// reached the backend's application layer (post-wire), so
-/// `retry_on_connect_failure` must not replay it; retries are governed by
-/// `retry_on_methods` / `retryable_status_codes`.
 /// Client-visible response for a failed H1/H2-frontend → native-HTTP/3
 /// backend dispatch. The status follows the shared HTTP-family mapper (504 for
 /// a timeout, 503 for a local `maxConnections` refusal, #6770 / #6771); the
@@ -67820,6 +67732,17 @@ pub(crate) fn h3_pool_failure_backend_response(
     }
 }
 
+/// Build the 504 `BackendResponse` for an H3 backend read timeout
+/// (`backend_read_timeout_ms` expired waiting for response headers via
+/// `recv_response()` or buffered body frames via `recv_data()`).
+///
+/// Mirrors the direct-H2 / HBONE / sidecar-mTLS read-timeout arms so the
+/// same proxy config produces the same client-visible outcome regardless
+/// of dispatch path: 504 + `{"error":"Backend timeout"}` +
+/// `ErrorClass::ReadWriteTimeout`. `connection_error=false` — the request
+/// reached the backend's application layer (post-wire), so
+/// `retry_on_connect_failure` must not replay it; retries are governed by
+/// `retry_on_methods` / `retryable_status_codes`.
 fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
 }
@@ -68166,10 +68089,10 @@ async fn proxy_to_backend_http3_retry(
                     buffered_trailers: None,
                 };
             }
-            // Backend trailers (`response.trailers`) are dropped here for the
-            // same reason as the non-retry H1/H2-frontend → H3-backend path:
-            // emitting them to an H1/H2 client needs chunked-trailer / trailers-
-            // frame machinery that is out of scope for issue #1630.
+            // Backend trailers (`response.trailers`) are dropped here by design,
+            // as on the non-retry H1/H2-frontend → H3-backend buffered path: see
+            // the trailer contract table in `docs/response_body_streaming.md`
+            // (native HTTP/3 backend, buffered).
             retry::BackendResponse {
                 status_code: response.status,
                 body: ResponseBody::buffered(response.body),
@@ -69152,15 +69075,12 @@ mod tests {
         );
     }
 
-    /// Exercises `GrpcStreamingProbeRecorder` against a real breaker. Since
-    /// #1649 item 3 the recorder ONLY settles the HALF_OPEN probe slot — it
-    /// records a NEUTRAL outcome (release, no heal/trip) at the join of header
-    /// arrival + upload termination, or when the post-header upload guard
-    /// expires. The probe's backend-health outcome (heal on a clean stream, trip
-    /// on a `2xx`-then-stall / non-OK grpc-status trailer) is decided at
-    /// response-body completion by the deferred dispatch outcome
-    /// (`record_backend_outcome_inner`), covered by `backend_dispatch` unit
-    /// tests and the functional 2xx-then-stall tests — NOT here.
+    /// Exercises `GrpcStreamingProbeRecorder` against a real breaker. The
+    /// recorder releases the HALF_OPEN probe slot NEUTRALLY at the join of
+    /// header arrival + upload termination (or when the post-header upload
+    /// guard expires), and records the backend-health outcome from
+    /// `on_response_terminal`: a clean response heals the breaker once the
+    /// upload has terminated, and a post-wire failure trips it promptly.
     mod grpc_streaming_probe_slot {
         use crate::circuit_breaker::CircuitBreaker;
         use crate::config::types::CircuitBreakerConfig;
@@ -75729,7 +75649,7 @@ mod tests {
 
     // ── Fix 5: `should_bypass_h2_coalesce_for_large_response` ───────────
     // Validates the per-response decision that steers plain-HTTPS
-    // direct-H2 responses away from `CoalescingH2Body` when the
+    // direct-H2 responses away from `Coalescing<S>` when the
     // backend is already emitting large frames (response >= 512 KiB).
 
     #[test]

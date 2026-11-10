@@ -4,7 +4,8 @@
 //! and delegates to the existing `EnvConfig` / mode dispatch pipeline. No
 //! config resolution logic lives here — that stays in `env_config.rs`.
 //!
-//! **Ordering contract**: `apply_cli_overrides()` must run before any call to
+//! **Ordering contract**: `apply_run_overrides()` / `apply_validate_overrides()`
+//! / `apply_ambient_udp_preflight_overrides()` must run before any call to
 //! `resolve_ferrum_var()` or `ConfFile::load()`, because the `CONF_FILE_CACHE`
 //! `OnceLock` captures `FERRUM_CONF_PATH` on first access and never re-reads it.
 
@@ -269,9 +270,9 @@ fn externally_sourced(base_key: &str) -> bool {
 /// smart discovery would find `./ferrum.conf` and `set_var` over it, and the
 /// operator's invalid value would be gone before anything could complain about
 /// it. That matters because the overwrite happens *first*: these checks run in
-/// `apply_run_overrides`/`apply_validate_overrides` (`main.rs`, before logging
-/// init), while the fail-closed rejection lives in
-/// `secrets::resolve_all_env_secrets` further down `main()`. Overwriting turns
+/// `apply_run_overrides`/`apply_validate_overrides` (`run_gateway_cli()` in
+/// `gateway_entry.rs`, before logging init), while the fail-closed rejection
+/// lives in `secrets::resolve_all_env_secrets` further down that function. Overwriting turns
 /// a command that must fail with `Ferrum configuration values must be valid
 /// Unicode` into one that silently starts on a settings file the operator
 /// never chose — exactly the silent-misconfiguration hazard
@@ -305,8 +306,8 @@ fn resolve_path(p: &Path) -> PathBuf {
 ///
 /// # Safety
 /// Uses `std::env::set_var` which is unsafe in Rust 2024 edition. This is safe
-/// here because it runs in `main()` before any multi-threaded runtime starts,
-/// identical to the existing secret resolution code in `main.rs`.
+/// here because it runs in `run_gateway_cli()` before any multi-threaded
+/// runtime starts, like `resolve_startup_secrets()` in `gateway_entry.rs`.
 pub fn apply_run_overrides(args: &RunArgs) {
     apply_common_overrides(args.settings.as_deref(), args.spec.as_deref());
 
@@ -336,7 +337,8 @@ pub fn apply_run_overrides(args: &RunArgs) {
     }
 }
 
-/// Apply settings/spec/mode/verbose overrides shared between `run` and `validate`.
+/// Apply settings/spec/mode/verbose overrides for `validate` (the twin of
+/// [`apply_run_overrides`]).
 pub fn apply_validate_overrides(args: &ValidateArgs) {
     apply_common_overrides(args.settings.as_deref(), args.spec.as_deref());
 

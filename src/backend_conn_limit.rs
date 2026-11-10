@@ -1,9 +1,10 @@
-//! Per-destination backend connection limiting for HTTP-family transports.
+//! Per-destination backend connection limiting for backend transports.
 //!
 //! Enforces the Istio DestinationRule `connectionPool.tcp.maxConnections`
 //! cap (materialized onto `Upstream.port_overrides[port].max_connections`,
 //! see [`crate::config::types::UpstreamPortOverride`]) for HTTP-family
-//! backend transports whose connection lifecycle Ferrum actually owns.
+//! backend transports whose connection lifecycle Ferrum actually owns (see
+//! Scope below).
 //!
 //! # Scope
 //!
@@ -135,8 +136,9 @@ impl BackendConnKey {
 
 /// Shared per-destination open-connection counter map.
 ///
-/// One instance lives on `ProxyState` and is shared across every HTTP-family
-/// WebSocket dispatch for the gateway lifetime, so the cap bounds concurrent
+/// One instance lives on `ProxyState` and is shared across every backend
+/// transport listed in the module Scope for the gateway lifetime, so the cap
+/// bounds concurrent
 /// open backend connections per `(host, port)` across all proxies that dial
 /// the same destination — matching how the cap is materialized per upstream
 /// destination port rather than per proxy.
@@ -164,9 +166,7 @@ impl BackendConnectionLimiter {
     /// Construct a limiter with `DashMap` sharding sized for the hot path.
     ///
     /// A `0` shard override means "auto" (`max(64, num_cpus * 16)`), matching
-    /// every other hot-path map in the codebase. WebSocket destinations are
-    /// low-cardinality, but going through `pool_shard_amount` keeps the
-    /// sizing contract uniform.
+    /// every other hot-path map in the codebase.
     pub fn new() -> Self {
         Self::with_shard_amount(crate::util::sharding::pool_shard_amount(0))
     }
@@ -187,7 +187,7 @@ impl BackendConnectionLimiter {
     ///   the backend unconditionally.
     /// * `Ok(Some(guard))` — a slot was reserved. The returned guard's `Drop`
     ///   releases it. The caller must hold the guard for the full backend
-    ///   connection lifetime (the WebSocket session).
+    ///   connection lifetime.
     /// * `Err(BackendConnectionLimitExceeded)` — the cap is already reached.
     ///   The caller refuses the new connection (503-class).
     ///
@@ -313,15 +313,15 @@ impl BackendConnectionLimiter {
     /// Number of destinations with a resident counter. Tests/diagnostics —
     /// proves the map drains rather than retaining a zero-count entry per
     /// destination the gateway has ever dialed.
-    #[allow(dead_code)]
-    pub fn resident_counters(&self) -> usize {
+    #[cfg(test)]
+    fn resident_counters(&self) -> usize {
         self.inner.len()
     }
 }
 
 /// RAII guard that holds one open-connection slot for a destination and
 /// releases it on drop. Hold this for the full backend connection lifetime
-/// (the WebSocket session) so the count reflects concurrent *open*
+/// so the count reflects concurrent *open*
 /// connections, not in-flight requests.
 #[derive(Debug)]
 pub struct BackendConnectionGuard {

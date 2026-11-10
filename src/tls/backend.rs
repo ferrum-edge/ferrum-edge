@@ -1257,7 +1257,7 @@ pub fn pool_key_host_port_prefix(key: &str) -> Option<&str> {
 /// certificate-name verification while the TCP/QUIC dial target remains the
 /// selected backend host.
 ///
-/// GAP-1B wires this helper into H2, gRPC, and native H3 backend dispatch.
+/// This helper is used by H2, gRPC, and native H3 backend dispatch.
 /// TCP+TLS, backend WebSocket, DTLS, and active health probes still use their
 /// protocol-specific server-name plumbing and should route through this helper
 /// when those paths grow backend SNI override support.
@@ -1484,7 +1484,8 @@ fn general_name_matches_allowed(name: &GeneralName<'_>, allowed: &SanAllowListEn
     }
 }
 
-/// Build the backend trust store using the CA chain resolution from CLAUDE.md:
+/// Build the backend trust store using the CA chain resolution in
+/// `.claude/rules/tls-security.md` (Backend Trust):
 /// proxy CA, else global CA, else webpki roots. Custom CAs are exclusive.
 pub fn build_root_cert_store(
     proxy_ca: Option<&Path>,

@@ -354,11 +354,10 @@ impl XdsAdsServer {
     /// Verify the stream's bearer and return BOTH the tenant ceiling and the
     /// authenticated principal (JWT `sub`).
     ///
-    /// The audience posture is unchanged from the previous
-    /// `verify_grpc_jwt_metadata_with_claims` call
-    /// ([`GrpcAudiencePolicy::ReservedForbidden`]); the only difference is that
-    /// the subject is no longer discarded — ADS needs it to keep unrelated
-    /// principals off one mutable state key and one quota (issue #3741).
+    /// The audience posture is [`GrpcAudiencePolicy::ReservedForbidden`], as on
+    /// the other non-remote-discovery surfaces. The subject is kept because ADS
+    /// needs it to keep unrelated principals off one mutable state key and one
+    /// quota (issue #3741).
     #[allow(clippy::result_large_err)]
     fn verify_jwt_metadata(
         &self,

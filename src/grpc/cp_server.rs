@@ -12,14 +12,15 @@
 //!   (issue #6163).
 //! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
 //!
-//! Authentication: HS256 JWT in the `authorization` gRPC metadata key.
+//! Authentication: JWT (HS256 shared secret, or a `kid`-selected trust-bundle
+//! credential) in the `authorization` gRPC metadata key.
 //! Required claims: `exp`, `iat`, `sub`, `iss`. The `iss` claim must exactly
 //! match the configured expected issuer (`FERRUM_CP_DP_GRPC_JWT_ISSUER`,
 //! default `"ferrum-edge-cp-dp"`); this prevents a token minted with the same
 //! shared secret for a different audience (e.g. the admin API JWT secret if
 //! it was reused) from authenticating to the gRPC channel. CP and DP must run
-//! the same build; as a safety net the CP rejects a DP whose `major.minor`
-//! version differs.
+//! the same build: the CP refuses any DP whose ConfigSync build identity
+//! (`<crate version>+configsync.r<revision>`) differs.
 //!
 //! Issuer rotation: changing `FERRUM_CP_DP_GRPC_JWT_ISSUER` is a breaking
 //! change. The CP rejects any token whose `iss` does not match its expected
@@ -425,14 +426,6 @@ impl DpNodeRegistry {
     /// the same node id, in any namespace, are left untouched.
     pub fn remove_stream(&self, key: &DpStreamKey) {
         self.streams.remove(key);
-    }
-
-    /// Update `last_update_at` for all live streams (called after broadcast).
-    pub fn touch_all(&self) {
-        let now = Utc::now();
-        for mut entry in self.streams.iter_mut() {
-            entry.last_update_at = now;
-        }
     }
 
     /// Update `last_update_at` for live streams in a specific namespace.
@@ -2106,20 +2099,6 @@ impl CpGrpcServer {
         Self::send_bounded_update(tx, update, namespace)
     }
 
-    /// Broadcast an incremental delta to all connected DPs (with registry update).
-    #[allow(dead_code)]
-    pub fn broadcast_delta_with_registry(
-        tx: &broadcast::Sender<ConfigUpdate>,
-        result: &crate::config::db_loader::IncrementalResult,
-        version: &str,
-        registry: &DpNodeRegistry,
-        trust: GatewayTrustPublication<'_>,
-    ) {
-        if Self::broadcast_delta_with_trust_bundles(tx, result, version, trust) {
-            registry.touch_all();
-        }
-    }
-
     /// Broadcast an incremental delta to all connected DPs.
     ///
     /// Sends only the resources that changed (added/modified/removed) instead
@@ -2989,6 +2968,13 @@ mod tests {
             ..Default::default()
         };
         config.known_namespaces.push("ferrum".to_string());
+        let side_channel = config.trust_bundles.as_deref().expect("trust bundle");
+        let side_channel_authority = side_channel.local.x509_authorities[0].clone();
+        let record_authority = config.gateway_trust_bundles[0]
+            .bundle
+            .local
+            .x509_authorities[0]
+            .clone();
 
         let json = CpGrpcServer::config_json_for_dp(&config).expect("DP config should serialize");
         let value: serde_json::Value =
@@ -2997,8 +2983,8 @@ mod tests {
         assert!(value.get("gateway_trust_bundles").is_none());
         // Neither trust slot's authority material may appear anywhere in the
         // ordinary DP document, nor the record's server-assigned metadata.
-        assert!(!json.contains("AQIDBA=="));
-        assert!(!json.contains("BQYHCA=="));
+        assert!(!json.contains(&side_channel_authority));
+        assert!(!json.contains(&record_authority));
         assert!(!json.contains("cluster.local"));
         assert!(!json.contains("record.internal"));
         assert!(!json.contains("trust-actor@example.test"));
@@ -3020,6 +3006,11 @@ mod tests {
             gateway_trust_bundles: vec![test_gateway_trust_record("ferrum")],
             ..Default::default()
         };
+        let record_authority = config.gateway_trust_bundles[0]
+            .bundle
+            .local
+            .x509_authorities[0]
+            .clone();
         let (tx, mut rx) = broadcast::channel(1);
 
         CpGrpcServer::broadcast_update(&tx, &config);
@@ -3030,7 +3021,7 @@ mod tests {
         assert!(value.get("trust_bundles").is_none());
         assert!(value.get("gateway_trust_bundles").is_none());
         assert!(!update.config_json.contains("record.internal"));
-        assert!(!update.config_json.contains("BQYHCA=="));
+        assert!(!update.config_json.contains(&record_authority));
         assert!(!update.config_json.contains("trust-actor@example.test"));
         // The side channel is unaffected by the wire-boundary strip.
         assert_ne!(update.trust_bundles_json, "null");

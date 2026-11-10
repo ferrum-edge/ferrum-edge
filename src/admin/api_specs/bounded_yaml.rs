@@ -724,12 +724,7 @@ fn scalar_to_json(
         if tag == "tag:yaml.org,2002:float" {
             return float_to_json(value);
         }
-        if tag.starts_with("tag:yaml.org,2002:") || tag.starts_with('!') {
-            // Non-core / local tags are not representable in OpenAPI JSON.
-            return Err(BoundedYamlError::UnsupportedTag {
-                tag: tag.to_owned(),
-            });
-        }
+        // Non-core / local tags are not representable in OpenAPI JSON.
         return Err(BoundedYamlError::UnsupportedTag {
             tag: tag.to_owned(),
         });

@@ -3,11 +3,11 @@
 //! **CA trust chain resolution** (all 8 backend protocol paths follow this):
 //! 1. Proxy-specific CA (`backend_tls_server_ca_cert_path`) → sole trust anchor
 //! 2. Global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) → sole trust anchor
-//! 3. Neither set → webpki/system roots (secure default)
+//! 3. Neither set → bundled webpki roots (secure default)
 //! 4. Explicit opt-out → `backend_tls_verify_server_cert: false` skips verification
 //!
 //! **CA exclusivity**: When a custom CA is configured, it is the **sole** trust
-//! anchor — webpki/system roots are NOT added. This prevents internal backends
+//! anchor — the bundled webpki roots are NOT added. This prevents internal backends
 //! from being MITMed via any public CA.
 //!
 //! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
@@ -16,6 +16,10 @@
 //! outbound backend connections.
 
 pub mod acme;
+#[cfg(test)]
+mod acme_final_publication_tests;
+#[cfg(test)]
+mod acme_renewal_resume_tests;
 pub mod backend;
 pub mod client_trust;
 pub mod crl_policy;
@@ -26,10 +30,6 @@ pub mod inventory_cache;
 // Renewal-lease coordination is consumed by the `acme`-feature renewal
 // scheduler and by external tests; the default (no-`acme`) build compiles it
 // unused, so suppress dead-code warnings for the whole module.
-#[cfg(test)]
-mod acme_final_publication_tests;
-#[cfg(test)]
-mod acme_renewal_resume_tests;
 #[allow(dead_code)]
 pub mod lease;
 pub mod managed;
@@ -44,13 +44,11 @@ pub mod shared_store;
 #[cfg(test)]
 mod shared_store_tests;
 pub mod source;
+#[allow(dead_code)]
+pub mod spiffe;
 #[cfg(test)]
 mod store_atomicity_tests;
 pub(crate) mod store_dir;
-// `spiffe` exposes Phase A scaffolding for Phase C — every public item is
-// dead from the binary's perspective until a later phase wires it in.
-#[allow(dead_code)]
-pub mod spiffe;
 
 pub use client_trust::{
     ClientTrustAdmission, ClientTrustMaterial, ClientTrustScope, ClientTrustSession,
@@ -1112,8 +1110,7 @@ pub fn load_frontend_tls_candidate_from_paths(
 ///
 /// Existing path strings are parsed as [`CertSource::Path`]. Inline PEM is
 /// accepted without writing temporary files, and `file://` URIs share the same
-/// file loader. Other typed URI schemes parse successfully but are rejected here
-/// until their provider loaders are wired in later phases.
+/// file loader.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources(
@@ -1955,8 +1952,9 @@ pub fn svid_rotating_mesh_server_identity(
     }))
 }
 
-/// The process-default rustls crypto provider (startup installs ring before
-/// any TLS work), with a ring fallback for test contexts that skip install.
+/// The process-default rustls crypto provider (startup installs the
+/// build-selected provider before any TLS work), with the same build-selected
+/// base provider as the fallback for test contexts that skip install.
 fn default_crypto_provider() -> Arc<CryptoProvider> {
     CryptoProvider::get_default()
         .cloned()

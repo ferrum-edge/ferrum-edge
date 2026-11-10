@@ -926,7 +926,6 @@ impl AdminState {
     }
 }
 
-static READ_ONLY_REJECTION_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static READ_ONLY_REJECTION_WARN_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Count and emit a bounded structured warning for one admin mutation refused
@@ -936,7 +935,6 @@ fn note_read_only_rejection() {
     let total = crate::plugins::prometheus_metrics::global_registry()
         .record_admin_read_only_rejection()
         .saturating_add(1);
-    READ_ONLY_REJECTION_LOG_COUNT.store(total, Ordering::Relaxed);
 
     let should_sample = total == 1 || total.is_multiple_of(1_024);
     if !should_sample {
@@ -973,7 +971,6 @@ fn note_read_only_rejection() {
 #[allow(dead_code)]
 #[doc(hidden)]
 pub fn reset_read_only_rejection_observability_for_test() {
-    READ_ONLY_REJECTION_LOG_COUNT.store(0, Ordering::Relaxed);
     READ_ONLY_REJECTION_WARN_LAST_MS.store(0, Ordering::Relaxed);
     crate::plugins::prometheus_metrics::global_registry()
         .reset_admin_read_only_rejection_metrics_for_test();
@@ -2637,14 +2634,6 @@ fn unserved_namespace_warned() -> std::sync::MutexGuard<'static, HashSet<(String
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Emit one bounded structured WARN for an **accepted** admin mutation that
-/// targeted a namespace this process's data plane does not route (issue #5447).
-///
-/// Deduplicated per `(namespace, resource kind)` so a provisioning client
-/// looping over one tenant logs once rather than once per resource, and rate
-/// limited to one line per [`UNSERVED_NAMESPACE_WARN_WINDOW_MS`] once the
-/// bounded dedup set is full. Called only after the dispatcher returned `2xx`:
-/// a rejected write is not the silent-success condition being reported.
 /// Outcome of consulting the bounded `(namespace, resource kind)` dedup set in
 /// [`note_unserved_namespace_mutation`].
 enum UnservedWarnAdmission {
@@ -2656,6 +2645,14 @@ enum UnservedWarnAdmission {
     SetFull,
 }
 
+/// Emit one bounded structured WARN for an **accepted** admin mutation that
+/// targeted a namespace this process's data plane does not route (issue #5447).
+///
+/// Deduplicated per `(namespace, resource kind)` so a provisioning client
+/// looping over one tenant logs once rather than once per resource, and rate
+/// limited to one line per [`UNSERVED_NAMESPACE_WARN_WINDOW_MS`] once the
+/// bounded dedup set is full. Called only after the dispatcher returned `2xx`:
+/// a rejected write is not the silent-success condition being reported.
 fn note_unserved_namespace_mutation(marker: &UnservedNamespaceMutation) {
     let total = UNSERVED_NAMESPACE_MUTATION_COUNT
         .fetch_add(1, Ordering::Relaxed)

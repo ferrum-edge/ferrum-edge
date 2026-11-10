@@ -640,7 +640,7 @@ on a native-gRPC request.
   final request-body policy claims the request; a MISSING representation still
   fails closed early. The final
   request-body hook still validates the exact backend-visible bytes. Native
-  gRPC always runs `parse_grpc_frame`. The only exemptions are protocol-defined:
+  gRPC always runs `parse_grpc_frame_charged`. The only exemptions are protocol-defined:
   empty terminal gRPC *error* replies (a single valid non-zero `grpc-status`),
   and responses with no content by status/method semantics (1xx, 204, 205, 304,
   `HEAD`). Representation-gap diagnostics are fixed strings and never echo body
@@ -1110,7 +1110,7 @@ on a native-gRPC request.
   admitting CP does not own.
 - DB mode QUARANTINES existing bad data rather than warning-then-dying: a
   serving-mode (`FullConfigLoadPurpose::Runtime`) full load drops every enabled
-  plugin config the construction gate refuses
+  `OptionalFailOpen` plugin config the construction gate refuses
   (`quarantine_unconstructible_plugin_configs`), records them on
   `GatewayConfig::quarantined_plugin_configs` (`#[serde(skip)]`, never
   persisted, never on the wire), logs one `error!` per row naming the plugin,
@@ -1118,7 +1118,8 @@ on a native-gRPC request.
   process therefore reaches its admin listener and the offending row stays
   readable and deletable in-band (issue #4526, extending the #2158 contract).
   `config_rejected` is NOT cleared by an accepted reload that still had to
-  quarantine. CP loads never quarantine.
+  quarantine. CP loads never quarantine. A refused `FailClosed` /
+  `KeepLastKnownGood` / unknown plugin still rejects the load.
 
 ## File Dependencies And Custom Plugins
 

@@ -974,6 +974,10 @@ DEPENDENCY_AUDIT_PATTERNS = [
         r"^PRODUCTION_READINESS\.md$",
         r"^scripts/(?:check_advisory_expiry\.sh|check_vendored_patch_lifecycle\.py)$",
         r"^scripts/verify_dependency_security_chain\.py$",
+        # The CORS PSL ancestor index parity gate (psl bumps arrive via
+        # Cargo.lock above).
+        r"^scripts/generate_cors_psl_ancestors\.py$",
+        r"^src/plugins/cors_psl_ancestors\.rs$",
         # The lifecycle checker requires the cargo `ignore` list to cover every
         # vendored `[patch.crates-io]` crate.
         r"^\.github/dependabot\.yml$",

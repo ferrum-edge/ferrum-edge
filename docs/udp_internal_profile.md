@@ -243,5 +243,5 @@ traffic/profile validity, with `kong_session_comparability.complete=false`,
 Kong campaign. No inherited effective value, session reuse, native source
 correspondence, or causal performance finding is fabricated.
 
-Final provenance, syscall/CPU tracing, and any decision about optimization or
-closing #5588 remain open.
+Issue #5588 was closed on 2026-10-02 before final provenance, syscall/CPU
+tracing, or an optimization decision were recorded here.

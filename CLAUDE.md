@@ -99,7 +99,7 @@ Run the full local suite only for shared infrastructure, cross-module refactors,
 
 ## Startup And Shutdown
 
-Startup order: jemalloc on non-Windows, CLI parse/env overrides, rustls crypto provider (ring, or AWS-LC FIPS on a `--features fips` build), external secret resolution on a single-threaded runtime, non-blocking tracing stdout, `validate` exit point, `overload::raise_fd_limit()`, `EnvConfig` parse, multi-threaded tokio, mode dispatch, SIGINT/SIGTERM via `watch::channel`.
+Startup order: jemalloc on non-Windows, CLI parse/env overrides, rustls crypto provider (ring, or AWS-LC FIPS on a `--features fips` build), external secret resolution on a single-threaded runtime, non-blocking stdout/stderr tracing, `validate` exit point, `overload::raise_fd_limit()`, `EnvConfig` parse, multi-threaded tokio, mode dispatch, SIGINT/SIGTERM via `overload::ShutdownSender` (a second signal escalates).
 
 Serving modes initialize TLS policy, frontend/admin TLS, DTLS, backend TLS validation, CP/DP gRPC TLS, stream port validation, stream listener binds, DNS warmup, optional pool warmup, and overload monitoring. Stream listener bind is fatal in database/file mode and non-fatal in DP.
 

@@ -8,9 +8,10 @@
 #   cargo install --locked cargo-deny
 #   cargo deny check advisories bans sources licenses   # the blocking gate (see CI)
 #
-# CI runs `cargo deny check advisories bans sources licenses` on every PR that
-# touches a dependency surface (Cargo.toml/Cargo.lock/deny.toml/vendor/**) and on
-# a weekly schedule (.github/workflows/dependency-audit.yml). The advisories and
+# CI runs `cargo deny check advisories bans sources licenses` in the
+# `dependency-audit` job of .github/workflows/ci.yml whenever the PR planner
+# selects the full dependency-audit lane, and on a weekly schedule
+# (.github/workflows/dependency-audit.yml). The advisories and
 # licenses checks are BLOCKING: a new RUSTSEC advisory that is not explicitly
 # ignored below fails CI, and any dependency whose SPDX expression is outside the
 # allowlist (or below the confidence threshold) fails CI.
@@ -23,7 +24,7 @@
 [graph]
 # Evaluate the full dependency graph including all optional features, so
 # feature-gated backends (cloud secret providers, MySQL, MongoDB, GeoIP) are
-# audited even though `default = []`.
+# audited even though they are not default features (`default = ["crypto-ring"]`).
 all-features = true
 
 [advisories]
@@ -143,7 +144,7 @@ ignore = [
 
 [bans]
 # The repo intentionally carries duplicate major versions during build-out
-# (for example tungstenite 0.28+0.29 and the RustCrypto digest 0.10/0.11 lines).
+# (for example tungstenite 0.29+0.30 and the RustCrypto digest 0.10/0.11 lines).
 # Surface them as warnings for visibility without blocking PRs.
 #
 # FIPS profile (issue #3510): `--no-default-features --features fips` adds

@@ -362,8 +362,8 @@ impl CircuitBreaker {
         &self,
         monotonic_now_ms: Option<u64>,
     ) -> Result<(ProbeTicket, u32), CircuitOpenError> {
-        // Acquire pairs with the Release in record_failure() when transitioning
-        // CLOSED → OPEN, ensuring visibility of last_failure_tick_ms and
+        // Acquire pairs with the release half of the AcqRel CAS that
+        // transitions CLOSED → OPEN (`trip_after_closed_failure`), ensuring visibility of last_failure_tick_ms and
         // failure_count. Using Relaxed here would risk stale reads on ARM/weak-
         // memory architectures, allowing requests to leak through after the
         // circuit opens. The ~5-15ns cost of Acquire is acceptable given that

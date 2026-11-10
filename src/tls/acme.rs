@@ -4165,12 +4165,13 @@ fn validate_completed_certificate_pair(cert_pem: &str, key_pem: &str) -> Result<
 
 #[cfg(feature = "acme")]
 pub mod client {
-    //! Optional RFC 8555 ACME client substrate.
+    //! Optional RFC 8555 ACME client substrate: order preparation
+    //! (`prepare_*_order`) and remote-state-aware completion
+    //! (`complete_*_order`) behind the screened ACME egress boundary.
     //!
-    //! This module intentionally prepares orders and challenge material without
-    //! wiring challenge publication to listeners. Runtime surfaces decide how to
-    //! expose HTTP-01, TLS-ALPN-01, or DNS-01 material before calling ACME
-    //! challenge readiness/finalization in follow-on manager work.
+    //! Challenge publication lives in the parent module: the HTTP-01 lookup
+    //! (`http01_key_authorization_for_path`), `AcmeTlsAlpnResolver`
+    //! for TLS-ALPN-01, and the DNS-01 hook (`run_dns01_hook`).
 
     use std::future::{Future, ready};
     use std::io;

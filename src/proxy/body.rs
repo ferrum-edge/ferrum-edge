@@ -134,8 +134,8 @@ pub struct ProxyBody {
     ///
     /// **Counting invariant**: bytes are counted ONCE per outer frame at this
     /// `ProxyBody::poll_frame` site, never on inner adapter frames and never
-    /// on buffer drain. If a future change adds metrics to `CoalescingH2Body`,
-    /// `CoalescingH3Body`, `DirectH2Body`, or `DirectH3Body`, those inner
+    /// on buffer drain. If a future change adds metrics to `Coalescing<S>`,
+    /// `DirectH2Body`, or `DirectH3Body`, those inner
     /// adapters MUST count bytes only on receipt from the backend (never on
     /// the flush side of the coalescing buffer). Double-counting on drain
     /// inflates `bytes_streamed` / `bytes_received` by the
@@ -1790,8 +1790,8 @@ impl ProxyBody {
     ///
     /// Composes with the protocol-agnostic body builders
     /// (`coalescing_body`, `direct_streaming_body`,
-    /// `size_limited_streaming_body`, `coalescing_h2_body`,
-    /// `direct_streaming_h2_body`, `coalescing_h3_body`,
+    /// `size_limited_streaming_body`, `coalescing_h2_body_strip_hop_by_hop_trailers`,
+    /// `direct_streaming_h2_body_strip_hop_by_hop_trailers`, `coalescing_h3_body`,
     /// `direct_streaming_h3_body`) — pick the right base body for the
     /// dispatch path, then call `into_tracked()` so the tracked path inherits
     /// the same coalescing / size-limit / fast-path behaviour as the default
