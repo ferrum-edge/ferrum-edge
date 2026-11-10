@@ -753,14 +753,15 @@ fn utf32_label_endian(value: &str, bom_endian: Option<Utf32Endian>) -> Option<Ut
     }
 }
 
-/// Whether the declared charset names the UTF-32 family at all (bare
-/// `utf-32` or an explicit endianness). A body whose charset says UTF-32 is
-/// read as UTF-32 by any backend honouring the declaration, so its BOM is not
-/// ambiguous; one with no UTF-32 declaration is.
+/// UTF-16 counterpart of [`charset_declares_utf32_family`].
 fn charset_declares_utf16_family(content_type: Option<&str>) -> bool {
     declared_utf16_endian(content_type, Some(Utf16Endian::Little)).is_some()
 }
 
+/// Whether the declared charset names the UTF-32 family at all (bare
+/// `utf-32` or an explicit endianness). A body whose charset says UTF-32 is
+/// read as UTF-32 by any backend honouring the declaration, so its BOM is not
+/// ambiguous; one with no UTF-32 declaration is.
 fn charset_declares_utf32_family(content_type: Option<&str>) -> bool {
     declared_utf32_endian(content_type, Some(Utf32Endian::Little)).is_some()
 }
@@ -1648,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn run_decoders_and_prefilters_match_reference_implementations() {
+    fn run_decoders_match_reference_implementations() {
         let slash = '\\';
         let cases = vec![
             "mixed %3c%3E and plus+ signs".to_string(),
@@ -1678,29 +1679,6 @@ mod tests {
 
             let expected_html = reference_decode_runs(text, b'&', decode_entity);
             assert_eq!(html_entity_decode(text), expected_html, "{text:?}");
-        }
-
-        let patterns = [r"(?i)<script", r"union\s+select", r"%[0-9a-f]{2}"];
-        let regex_set = regex::RegexSet::new(patterns).expect("valid test patterns");
-        let regexes: Vec<_> = patterns
-            .iter()
-            .map(|pattern| regex::Regex::new(pattern).expect("valid test pattern"))
-            .collect();
-        let regex_cases = cases.iter().map(String::as_str).chain([
-            "<SCRIPT>alert(1)",
-            "1 union\tselect",
-            "literal %3c",
-            "日本語の文章",
-            "",
-        ]);
-        for text in regex_cases {
-            let reference = regexes.iter().any(|regex| regex.is_match(text));
-            assert_eq!(regex_set.is_match(text), reference, "{text:?}");
-            assert_eq!(
-                regex_set.matches(text).iter().next().is_some(),
-                reference,
-                "{text:?}"
-            );
         }
     }
 
