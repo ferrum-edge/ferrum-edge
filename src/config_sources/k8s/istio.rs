@@ -11600,7 +11600,7 @@ mod tests {
             filter.expression,
             Some(AccessLogFilterExpr::Or {
                 left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
-                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+                right: Box::new(AccessLogFilterExpr::LatencyAboveMs { value: 1000 }),
             })
         );
         assert_eq!(filter.status_code_min, None);
@@ -11615,7 +11615,7 @@ mod tests {
             filter.expression,
             Some(AccessLogFilterExpr::Or {
                 left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
-                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+                right: Box::new(AccessLogFilterExpr::LatencyAboveMs { value: 1000 }),
             })
         );
     }
@@ -11771,7 +11771,13 @@ mod tests {
             .expect("filter parses")
             .expect("filter is present");
 
-        assert_eq!(filter.min_latency_ms, Some(101));
+        // Latency is fractional milliseconds, so `> 100` is a strict bound,
+        // not `>= 101` (issue #7245): it stays an expression tree.
+        assert_eq!(filter.min_latency_ms, None);
+        assert_eq!(
+            filter.expression,
+            Some(AccessLogFilterExpr::LatencyAboveMs { value: 100 })
+        );
     }
 
     #[test]

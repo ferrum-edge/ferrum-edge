@@ -464,11 +464,11 @@ fn expression_decode_diagnostic(value: &Value, path: &str) -> Option<String> {
             }
             &["op", "left", "right"]
         }
-        "status_code_min" | "status_code_max" | "min_latency_ms" => {
+        "status_code_min" | "status_code_max" | "min_latency_ms" | "latency_above_ms" => {
             let Some(value) = object.get("value") else {
                 return failure(path, "missing field `value`");
             };
-            let max = if operation == "min_latency_ms" {
+            let max = if matches!(operation, "min_latency_ms" | "latency_above_ms") {
                 u64::MAX
             } else {
                 u64::from(MAX_ACCESS_LOG_FILTER_STATUS_CODE)
@@ -485,7 +485,7 @@ fn expression_decode_diagnostic(value: &Value, path: &str) -> Option<String> {
         _ => {
             return failure(
                 &format!("{path}.op"),
-                "unknown operation; expected `and`, `or`, `status_code_min`, `status_code_max`, `min_latency_ms` or `errors_only`",
+                "unknown operation; expected `and`, `or`, `status_code_min`, `status_code_max`, `min_latency_ms`, `latency_above_ms` or `errors_only`",
             );
         }
     };
