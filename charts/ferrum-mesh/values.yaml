@@ -9,8 +9,6 @@ image:
   # Names of imagePullSecrets to attach to the pod.
   pullSecrets: []
 
-namespace: ferrum
-
 # Optional PodDisruptionBudget for mesh Deployments with replicas >= 2. Skipped
 # when a workload runs fewer than two replicas so minAvailable: 1 cannot block
 # node drains. Set minAvailable: null and maxUnavailable: 1 to allow full

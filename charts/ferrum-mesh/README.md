@@ -17,6 +17,9 @@ naming, labelling, secret, and validation conventions.
 
 Example value overlays live under [`examples/`](examples/).
 
+Every namespaced object renders into the Helm release namespace; select it with
+`helm install --namespace <ns>` (the chart has no `namespace` value).
+
 `controlPlane.grpcPort` (default `50051`) sets the control-plane container port,
 its Service port, and the listener itself: the chart renders
 `FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort>` unless `controlPlane.env` sets
