@@ -1313,8 +1313,12 @@ async fn start_proxy_v2_expecting_echo_server_on(
         while let Ok((mut stream, _addr)) = listener.accept().await {
             let observed_tuple = Arc::clone(&observed_tuple);
             tokio::spawn(async move {
-                match ferrum_edge::proxy::proxy_protocol::read_proxy_header(&mut stream, Some(2))
-                    .await
+                match ferrum_edge::proxy::proxy_protocol::read_proxy_header_accepting_tcp(
+                    &mut stream,
+                    Some(2),
+                    ferrum_edge::proxy::proxy_protocol::AcceptedProxyVersions::Any,
+                )
+                .await
                 {
                     Ok(ferrum_edge::proxy::proxy_protocol::ProxyProtocolResult::Forwarded {
                         src,
