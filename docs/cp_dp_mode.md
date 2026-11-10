@@ -304,7 +304,7 @@ Before a full snapshot or a delta can be accepted and broadcast, the CP runs the
 The gate mirrors `plugin_cache::try_create_plugin` exactly:
 
 - `OptionalFailOpen` plugins are **skipped** — a serving mode omits them from the published cache with a warning rather than rejecting the generation.
-- `FailClosed`, `KeepLastKnownGood`, and unknown or retired plugin names **reject** the snapshot/delta, which the CP surfaces as `CP full config rejected: Plugin '<name>' (id=<id>): <error>` and refuses to broadcast. Admin writes stay enabled so the row can be repaired in-band.
+- `FailClosed`, `KeepLastKnownGood`, and unknown or retired plugin names **reject** the snapshot/delta, which the CP surfaces as ``CP full config rejected: Plugin "<name>" (`id`="<id>"): <error>`` and refuses to broadcast. Admin writes stay enabled so the row can be repaired in-band.
 
 Constructors that need node-local resources (the `geo_restriction` MaxMind database, `body_validator` / `ai_response_guard` / `ai_transcript_audit` descriptor sets, `udp_logging` DTLS material, `oidc_relying_party` discovery, the `transaction_log_schema` registry) are validated shape-only, so CP admission never requires a data-plane file to exist on the CP node. Backend egress policy is deliberately **not** applied here: it is node-local environment configuration the admitting CP does not own, and the serving mode still screens it when it builds the cache. Each DP instead reports its own policy to the CP (see [Backend egress policy attestation](#backend-egress-policy-attestation)).
 

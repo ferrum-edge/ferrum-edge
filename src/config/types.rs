@@ -9718,6 +9718,10 @@ impl Consumer {
         for (cred_type, cred_value) in &self.credentials {
             if let Err(e) = validate_credential_type_name(cred_type) {
                 errors.push(e);
+                // The per-entry checks below render the key bare inside a
+                // `credentials.<type>[<n>]` path. Only a path-safe key (ASCII
+                // letters, digits, `_`, `-`) may reach them (issue #7217).
+                continue;
             }
             // Collect array entries to validate. Non-object elements are
             // rejected so operators cannot accidentally configure unusable

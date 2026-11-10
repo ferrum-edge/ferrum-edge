@@ -98,6 +98,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     twice.
   - `/health` no longer builds the FIPS and listener-failure blocks for
     callers that do not get the detailed tier.
+- **Config diagnostics quote stored identifiers** (#7217). Proxy/plugin
+  association load errors, the `expected_proxy_ids` precondition refusal
+  (`412`), the spec-owned upstream decode error and two orphan-cleanup INFO
+  logs now render namespaces and ids Debug-quoted (or sanitized), per the
+  validation-diagnostics rule. Plugin rejection messages use one spelling,
+  ``Plugin "<name>" (`id`="<id>")``, everywhere. A consumer credential
+  type that fails the path-safe name rule is reported once and no longer
+  also appears bare in per-entry `credentials.<type>[<n>]` errors. Update
+  any log matcher keyed on the old `(id=…)` or `proxy_id=<bare>` spellings.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

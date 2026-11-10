@@ -316,7 +316,7 @@ async fn malformed_association_row_rejects_candidate_instead_of_being_skipped() 
     let message = error_text(store.load_full_config("ferrum").await);
     assert_association_error_context(&message, "load_full_config");
     assert!(
-        message.contains("proxy_id=proxy-1") && message.contains("column=plugin_config_id"),
+        message.contains(r#"proxy_id="proxy-1""#) && message.contains("column=plugin_config_id"),
         "decode error should include safe row context, got: {message}"
     );
 }
@@ -1029,7 +1029,7 @@ async fn backend_plugin_update_expected_refuses_stale_set_without_mutation() {
         assert_eq!(refusal.unexpected, ["proxy-2"]);
         assert_eq!(
             refusal.to_string(),
-            "plugin config 'plugin-1' is referenced by proxies outside expected_proxy_ids: proxy-2; re-read the namespace and retry with the current referencing set"
+            r#"plugin config "plugin-1" is referenced by proxies outside expected_proxy_ids: ["proxy-2"]; re-read the namespace and retry with the current referencing set"#
         );
         let after = store.load_full_config("ferrum").await.unwrap();
         assert_eq!(
@@ -1236,7 +1236,7 @@ async fn plugin_delete_expected_repairs_an_undecodable_attached_plugin() {
     );
     assert_eq!(
         body["error"],
-        "plugin config 'pc-attach-1' is referenced by proxies outside expected_proxy_ids: proxy-attach-1; re-read the namespace and retry with the current referencing set"
+        r#"plugin config "pc-attach-1" is referenced by proxies outside expected_proxy_ids: ["proxy-attach-1"]; re-read the namespace and retry with the current referencing set"#
     );
     let (status, body) = admin_call(
         reqwest::Method::DELETE,
