@@ -1108,19 +1108,9 @@ struct StreamSlot {
     revoked: AtomicBool,
     /// True only after the response inspector reaches its drop boundary.
     inspector_dropped: AtomicBool,
-    /// Set after expiry removes the live slot from the global map. A revoked
-    /// fallback handoff may be published only after this transition, otherwise
-    /// a concurrent remove could erase the newly published marker.
-    detached_after_revocation: AtomicBool,
-    /// Single-fire guard for the tiny drop-time fallback handoff.
-    fallback_published: AtomicBool,
-    /// Production inspectors publish into request-owned completion state.
-    /// `false` exists only for external tests that call the plugin factory
-    /// directly without the core response-stream wrapper.
-    uses_request_handoff: bool,
     /// Bounds entries while they are reachable from the process-global live
-    /// map. Production expiry/terminal claim removes the entry before releasing
-    /// this permit; request-owned terminal handoffs need no global capacity.
+    /// map. Expiry and terminal claim remove the entry before releasing this
+    /// permit; the request-owned terminal handoff needs no global capacity.
     pending_permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
@@ -1138,9 +1128,9 @@ impl StreamSlot {
         }
     }
 
-    /// Revoke audit work before reservation accounting is released. Returns
-    /// false when the terminal hook already claimed the slot.
-    fn revoke(&self) -> bool {
+    /// Revoke audit work before reservation accounting is released. No-op when
+    /// the terminal hook already claimed the slot or it was already revoked.
+    fn revoke(&self) {
         let prior = {
             let mut capture = self.lock_capture();
             let hashed_bytes = match &*capture {
@@ -1148,7 +1138,7 @@ impl StreamSlot {
                 StreamCaptureLifecycle::Complete(Some(captured)) => captured.response_hash_bytes,
                 StreamCaptureLifecycle::Complete(None) => 0,
                 StreamCaptureLifecycle::Revoked { .. } | StreamCaptureLifecycle::Claimed => {
-                    return false;
+                    return;
                 }
             };
             std::mem::replace(
@@ -1160,7 +1150,6 @@ impl StreamSlot {
         // caller removes staging and releases any byte/queue reservations.
         drop(prior);
         self.revoked.store(true, Ordering::Release);
-        true
     }
 
     fn finish_abnormally(&self) {
@@ -1180,10 +1169,9 @@ impl StreamSlot {
             if matches!(&*capture, StreamCaptureLifecycle::Active(_))
                 && !self.inspector_dropped.load(Ordering::Acquire)
             {
-                // Production terminal hooks wait for inspector completion.
-                // Preserve that ownership boundary for direct callers too: an
-                // inspector that is still live and never saw on_end has not
-                // produced a terminal result to claim.
+                // Terminal hooks wait for inspector completion: an inspector
+                // that is still live and never saw on_end has not produced a
+                // terminal result to claim.
                 return None;
             }
             if matches!(&*capture, StreamCaptureLifecycle::Claimed) {
@@ -1299,39 +1287,6 @@ impl AuditStreamCaptureProbe {
     }
 }
 
-fn publish_revoked_fallback_if_ready(
-    record_id: &str,
-    slot: &Arc<StreamSlot>,
-    pending_streams: &DashMap<String, Arc<StreamSlot>>,
-) {
-    if slot.uses_request_handoff
-        || !slot.revoked.load(Ordering::Acquire)
-        || !slot.inspector_dropped.load(Ordering::Acquire)
-        || !slot.detached_after_revocation.load(Ordering::Acquire)
-        || slot
-            .fallback_published
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return;
-    }
-    // Serialize publication with `claim_terminal`: without this lifecycle
-    // guard, a direct-factory terminal caller could claim/remove the slot
-    // between the compare-exchange above and this insert, leaving a claimed
-    // tombstone in the bounded global map. Production uses request handoff,
-    // but the compatibility path must retain the same single-consumer rule.
-    let capture = slot.lock_capture();
-    if !matches!(&*capture, StreamCaptureLifecycle::Revoked { .. }) {
-        return;
-    }
-    // This marker owns no transcript bytes, hash state, staging lease, or
-    // commit permit. It is published only at actual inspector drop and is
-    // consumed immediately after the completion signal. This direct-factory
-    // compatibility path retains its live-map permit until terminal claim.
-    pending_streams.insert(record_id.to_string(), Arc::clone(slot));
-    drop(capture);
-}
-
 fn expire_stream_reservation(
     record_id: &str,
     pending_streams: &DashMap<String, Arc<StreamSlot>>,
@@ -1367,21 +1322,16 @@ fn expire_stream_reservation(
         .map(|entry| Arc::clone(entry.value()));
     if let Some(slot) = slot.as_ref() {
         // Synchronously drop the live Vec, completed excerpt/hash, and HMAC
-        // before releasing any staging, queue, or retained-byte owner.
-        let revoked = slot.revoke() || slot.revoked.load(Ordering::Acquire);
+        // before releasing any staging, queue, or retained-byte owner. The
+        // terminal hook still reaches the revoked slot through the
+        // request-owned handoff the inspector publishes when it drops.
+        slot.revoke();
         pending_streams.remove_if(record_id, |_, current| Arc::ptr_eq(current, slot));
-        if slot.uses_request_handoff {
-            slot.release_pending_permit();
-        }
+        slot.release_pending_permit();
         // Fail-open streams own their retained-record reservation in the slot;
         // fail-closed streams release the equivalent staging-owned reservation
         // below. Both happen only after capture/HMAC revocation.
         drop(slot.take_record_lease());
-        if revoked {
-            slot.detached_after_revocation
-                .store(true, Ordering::Release);
-            publish_revoked_fallback_if_ready(record_id, slot, pending_streams);
-        }
     }
 
     // If a normal terminal consumer removed the entry after expiry won the
@@ -5903,13 +5853,17 @@ impl Plugin for AiTranscriptAudit {
                     .map(|owner| Arc::clone(&owner.control)),
             )
         };
+        // The terminal hook reads this stream's capture only through the
+        // request-owned handoff that the core response-stream wrapper attaches
+        // before invoking factories. Without it there is nowhere to publish
+        // the result, so decline before reserving anything.
+        let request_handoff = ctx.response_stream_handoff()?;
         let record_lease = if staging_has_record_lease {
             None
         } else {
             Some(self.reserve_commit_lease()?)
         };
 
-        let request_handoff = ctx.response_stream_handoff();
         let now = Instant::now();
         let max_reservation = self.limits.max_stream_reservation;
         let reservation_deadline = reservation_started
@@ -5935,9 +5889,6 @@ impl Plugin for AiTranscriptAudit {
             downstream_terminated: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
             inspector_dropped: AtomicBool::new(false),
-            detached_after_revocation: AtomicBool::new(false),
-            fallback_published: AtomicBool::new(false),
-            uses_request_handoff: request_handoff.is_some(),
             pending_permit: Mutex::new(Some(pending_permit)),
         });
         // Register before the first chunk. An idle stream can expire without
@@ -6003,23 +5954,17 @@ impl Plugin for AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
-        let slot = ctx
+        let Some(slot) = ctx
             .response_stream_handoff()
             .and_then(|handoff| handoff.take::<StreamSlot>(self.stream_handoff_id))
-            .or_else(|| {
-                self.pending_streams
-                    .get(&record_id)
-                    .map(|slot| Arc::clone(slot.value()))
-            });
-        let Some(slot) = slot else {
+        else {
             return; // not a stream we teed
         };
         let Some(claimed) = slot.claim_terminal() else {
             return;
         };
-        // A sweeper can publish the revoked handoff between the first remove
-        // and the terminal claim. Clear that same-slot marker as part of the
-        // claim so no lost duplicate remains in the bounded handoff map.
+        // The live-map entry stays until this claim so the reservation sweep
+        // can still revoke a completed slot whose terminal hook was lost.
         self.pending_streams
             .remove_if(&record_id, |_, current| Arc::ptr_eq(current, &slot));
         slot.release_pending_permit();
@@ -6265,7 +6210,7 @@ struct AuditStreamInspector {
     /// `Some(limit)` stops keyed hashing after `limit` bytes; `None` hashes the
     /// whole stream (explicit `capture.stream_hash: full` opt-in).
     hash_budget: Option<usize>,
-    request_handoff: Option<ResponseStreamHandoff>,
+    request_handoff: ResponseStreamHandoff,
     stream_handoff_id: u64,
     reservation_deadline: Instant,
     max_reservation: Duration,
@@ -6300,16 +6245,13 @@ impl AuditStreamInspector {
             self.slot.finish_abnormally();
         }
         self.slot.inspector_dropped.store(true, Ordering::Release);
-        if let Some(handoff) = self.request_handoff.as_ref() {
-            // Keep the live-map reference until the terminal hook consumes it.
-            // If that hook is lost, the reservation sweep can still find and
-            // revoke this completed/abnormal slot before releasing accounting.
-            // An already-expired slot was detached by its deadline owner or the
-            // repair sweep and exists only in this request-owned handoff.
-            handoff.publish(self.stream_handoff_id, Arc::clone(&self.slot));
-        } else {
-            publish_revoked_fallback_if_ready(&self.record_id, &self.slot, &self.pending_streams);
-        }
+        // Keep the live-map reference until the terminal hook consumes it. If
+        // that hook is lost, the reservation sweep can still find and revoke
+        // this completed/abnormal slot before releasing accounting. An
+        // already-expired slot was detached by its deadline owner or the repair
+        // sweep and exists only in this request-owned handoff.
+        self.request_handoff
+            .publish(self.stream_handoff_id, Arc::clone(&self.slot));
     }
 }
 

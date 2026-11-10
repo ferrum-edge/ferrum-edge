@@ -98,6 +98,21 @@ fn make_ctx() -> RequestContext {
     ctx
 }
 
+/// Build this instance's response-stream inspector through the core wrapper the
+/// proxy uses: stream selection runs first, then the factory with the
+/// request-owned terminal handoff attached. The inspector publishes its capture
+/// into that handoff when it drops, so a test drops it before calling
+/// `on_response_stream_terminated`.
+fn audit_stream_inspector(
+    plugin: &Arc<AiTranscriptAudit>,
+    ctx: &mut RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    create_response_stream_inspector(&plugins, ctx, response_status, content_type)
+}
+
 fn ai_request_body() -> &'static [u8] {
     br#"{"model":"gpt-4o","messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#
 }
@@ -969,6 +984,7 @@ async fn final_request_body_drops_stale_candidate_after_ai_is_transformed_away()
             loopback_http_client(),
         )
         .unwrap();
+        let plugin = Arc::new(plugin);
         let mut ctx = make_ctx();
         ctx.metadata.insert(
             "request_body".to_string(),
@@ -994,9 +1010,7 @@ async fn final_request_body_drops_stale_candidate_after_ai_is_transformed_away()
         );
         assert!(!plugin.forces_reqwest_dispatch(&ctx));
         assert!(
-            plugin
-                .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-                .is_none()
+            audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream")).is_none()
         );
     }
 }
@@ -1034,6 +1048,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let headers = json_headers();
@@ -1096,6 +1111,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         loopback_http_client(),
     )
     .unwrap();
+    let peer = Arc::new(peer);
     peer.start_background_tasks().expect("live start");
     peer.commit_background_tasks();
     let mut peer_overflow = make_ctx();
@@ -1134,8 +1150,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "a saturated instance must not force reqwest dispatch for a peer's stream candidate"
     );
     assert!(
-        plugin
-            .response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+        audit_stream_inspector(&plugin, &mut peer_overflow, 200, Some("text/event-stream"))
             .is_none(),
         "a saturated instance must not tee a peer's stream"
     );
@@ -1146,8 +1161,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "true".to_string(),
     );
     assert!(
-        plugin
-            .response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+        audit_stream_inspector(&plugin, &mut peer_overflow, 200, Some("text/event-stream"))
             .is_none(),
         "shared sample_hit must not authorize a saturated instance to tee"
     );
@@ -1167,8 +1181,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "peer must retain its staging commit capability after saturated response hooks"
     );
     assert!(
-        peer.response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
-            .is_some(),
+        audit_stream_inspector(&peer, &mut peer_overflow, 200, Some("text/event-stream")).is_some(),
         "peer must still be able to tee its own staged stream"
     );
     let mut still_saturated = make_ctx();
@@ -2425,6 +2438,7 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     let headers = json_headers();
 
     // rate 0, no guardrail: instance-local staging exists, but the tee gate
@@ -2439,9 +2453,7 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
         "sampled mode must honor sampling.rate for the dispatch decision"
     );
     assert!(
-        plugin
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .is_none(),
+        audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream")).is_none(),
         "sampled mode must honor sampling.rate for the tee decision"
     );
 
@@ -2456,8 +2468,7 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
         .await;
     assert!(plugin.forces_reqwest_dispatch(&guardrail_ctx));
     assert!(
-        plugin
-            .response_stream_inspector(&guardrail_ctx, 200, Some("text/event-stream"))
+        audit_stream_inspector(&plugin, &mut guardrail_ctx, 200, Some("text/event-stream"))
             .is_some()
     );
 }
@@ -2472,28 +2483,17 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    assert!(
-        plugin
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .is_some()
-    );
+    assert!(audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream")).is_some());
     // always_capture_on_error (default true) wants response evidence for
     // error transactions — error SSE must be teed too.
-    assert!(
-        plugin
-            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
-            .is_some()
-    );
+    assert!(audit_stream_inspector(&plugin, &mut ctx, 500, Some("text/event-stream")).is_some());
     // Redirects are neither successes nor error captures.
-    assert!(
-        plugin
-            .response_stream_inspector(&ctx, 304, Some("text/event-stream"))
-            .is_none()
-    );
+    assert!(audit_stream_inspector(&plugin, &mut ctx, 304, Some("text/event-stream")).is_none());
 
     // With error capture disabled AND the request un-sampled (rate 0), a non-2xx
     // SSE stays un-teed: the record would not emit, so there is no body to
@@ -2510,13 +2510,13 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
         loopback_http_client(),
     )
     .unwrap();
+    let no_error_capture = Arc::new(no_error_capture);
     let mut ctx2 = make_ctx();
     no_error_capture
         .on_final_request_body_with_context(&mut ctx2, &json_headers(), ai_request_body())
         .await;
     assert!(
-        no_error_capture
-            .response_stream_inspector(&ctx2, 500, Some("text/event-stream"))
+        audit_stream_inspector(&no_error_capture, &mut ctx2, 500, Some("text/event-stream"))
             .is_none()
     );
 }
@@ -3007,12 +3007,12 @@ async fn stream_inspector_without_body_drive_does_not_emit_pending_record() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let _inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let _inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
 
     plugin
@@ -3041,18 +3041,19 @@ async fn unsampled_completed_stream_writes_hash_before_deferring_emit() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream =
         b"data: {\"choices\":[{\"delta\":{\"content\":\"complete\"}}]}\n\ndata: [DONE]\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
 
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -3106,14 +3107,14 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let audit = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let audit = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("audit inspector");
     let mut chain = chain_response_stream_inspectors(vec![audit, Box::new(TerminateOnEnd)])
         .expect("chained inspector");
@@ -3127,6 +3128,7 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
         ResponseStreamAction::Terminate(_)
     ));
 
+    drop(chain);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -3209,14 +3211,14 @@ async fn stream_capture_tail_guard_prevents_boundary_leak() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     // The SSN starts just before the 300-byte capture cap, so the accumulator
     // holds only its raw prefix — the tail guard must drop it before redaction.
@@ -3224,6 +3226,7 @@ async fn stream_capture_tail_guard_prevents_boundary_leak() {
     stream.push_str("123-45-6789 and more trailing data beyond the cap");
     let _ = inspector.on_chunk(stream.as_bytes()).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -3263,14 +3266,14 @@ async fn stream_capture_redacts_decoded_sse_json_frames() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream = br#"data: {"choices":[{"delta":{"content":"ssn 123\u002d45\u002d6789"}}]}
 
@@ -3281,6 +3284,7 @@ data: [DONE]
 "#;
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -3749,19 +3753,20 @@ async fn sampled_error_sse_is_teed_and_captures_body() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let inspector = plugin
-        .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
+    let inspector = audit_stream_inspector(&plugin, &mut ctx, 500, Some("text/event-stream"))
         .expect("sampled error SSE must be teed");
     let mut chain = chain_response_stream_inspectors(vec![inspector]).expect("inspector");
     let body = b"data: {\"error\":{\"message\":\"upstream boom\"}}\n\ndata: [DONE]\n\n";
     let _ = chain.on_chunk(body).await;
     let _ = chain.on_end().await;
+    drop(chain);
     plugin
         .on_response_stream_terminated(&mut ctx, 500, &BodyOutcome::success(body.len() as u64))
         .await;
@@ -4258,14 +4263,14 @@ async fn stream_end_without_on_end_omits_body() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let _ = inspector
         .on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
@@ -4461,7 +4466,9 @@ async fn stream_sampling_reads_instance_staging_not_shared_metadata() {
         )
     };
     let instance_a = AiTranscriptAudit::new(&cfg(1.0), loopback_http_client()).unwrap();
+    let instance_a = Arc::new(instance_a);
     let instance_b = AiTranscriptAudit::new(&cfg(0.0), loopback_http_client()).unwrap();
+    let instance_b = Arc::new(instance_b);
     let mut ctx = make_ctx();
     let body_str = std::str::from_utf8(ai_request_body()).unwrap();
     let mut headers = ctx.headers.clone();
@@ -4485,16 +4492,12 @@ async fn stream_sampling_reads_instance_staging_not_shared_metadata() {
     );
     // A must still tee its sampled 5xx SSE, reading its own staged roll.
     assert!(
-        instance_a
-            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
-            .is_some(),
+        audit_stream_inspector(&instance_a, &mut ctx, 500, Some("text/event-stream")).is_some(),
         "instance A must tee its sampled error stream despite B overwriting shared sample_hit"
     );
     // B (un-sampled, error capture off) does not tee.
     assert!(
-        instance_b
-            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
-            .is_none()
+        audit_stream_inspector(&instance_b, &mut ctx, 500, Some("text/event-stream")).is_none()
     );
 }
 
@@ -4519,6 +4522,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         loopback_http_client(),
     )
     .unwrap();
+    let saturated = Arc::new(saturated);
     let headers = json_headers();
     for _ in 0..4096 {
         let mut filler = make_ctx();
@@ -4539,6 +4543,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         loopback_http_client(),
     )
     .unwrap();
+    let peer = Arc::new(peer);
     let mut ctx = make_ctx();
     assert!(matches!(
         peer.on_final_request_body_with_context(&mut ctx, &headers, stream_request_body())
@@ -4582,9 +4587,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         "peer sample_hit must not authorize stream dispatch without local staging"
     );
     assert!(
-        saturated
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .is_none(),
+        audit_stream_inspector(&saturated, &mut ctx, 200, Some("text/event-stream")).is_none(),
         "peer marker must not tee on a saturated instance"
     );
     let saturated_after_peer_stream = saturated.status_snapshot();
@@ -4607,6 +4610,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         loopback_http_client(),
     )
     .unwrap();
+    let off = Arc::new(off);
     let mut off_ctx = make_ctx();
     off.on_final_request_body_with_context(&mut off_ctx, &headers, ai_request_body())
         .await;
@@ -4615,8 +4619,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         "streaming off must not force reqwest dispatch"
     );
     assert!(
-        off.response_stream_inspector(&off_ctx, 200, Some("text/event-stream"))
-            .is_none(),
+        audit_stream_inspector(&off, &mut off_ctx, 200, Some("text/event-stream")).is_none(),
         "streaming off must not tee SSE"
     );
 
@@ -4629,9 +4632,9 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
     );
     let peer_before_reservation = peer.status_snapshot();
     peer.on_response_stream_selected(&ctx, 200, Some("text/event-stream"));
-    let mut peer_inspector = peer
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-        .expect("locally staged sampled winner must install a stream inspector");
+    let mut peer_inspector =
+        audit_stream_inspector(&peer, &mut ctx, 200, Some("text/event-stream"))
+            .expect("locally staged sampled winner must install a stream inspector");
     let peer_probe = peer
         .stream_capture_probe(&ctx)
         .expect("owned stream must publish a local lifecycle slot");
@@ -4943,20 +4946,21 @@ async fn stream_hash_is_incremental_keyed_hmac_over_teed_bytes() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let chunk_a: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n";
     let chunk_b: &[u8] = b"data: [DONE]\n\n";
     let _ = inspector.on_chunk(chunk_a).await;
     let _ = inspector.on_chunk(chunk_b).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(
             &mut ctx,
@@ -5237,15 +5241,16 @@ async fn tool_governor_buffered_and_terminal_stream_decisions_force_capture_but_
     streaming
         .on_final_request_body_with_context(&mut stream_ctx, &headers, ai_request_body())
         .await;
-    let mut inspector = streaming
-        .response_stream_inspector(&stream_ctx, 200, Some("text/event-stream"))
-        .expect("streaming capture is enabled");
+    let mut inspector =
+        audit_stream_inspector(&streaming, &mut stream_ctx, 200, Some("text/event-stream"))
+            .expect("streaming capture is enabled");
     let stream =
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
     let termination_plugins: Vec<Arc<dyn Plugin>> =
         vec![streaming.clone(), Arc::new(TerminalToolGovernorDecision)];
+    drop(inspector);
     run_response_stream_termination_hooks(
         &termination_plugins,
         &mut stream_ctx,
@@ -5453,6 +5458,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
@@ -5469,12 +5475,12 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         plugin.forces_reqwest_dispatch(&ctx),
         "request-side guardrail hit must tee the un-sampled stream"
     );
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("guardrail-flagged un-sampled stream must get an inspector");
     let stream: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"evidence\"}}]}\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -5504,6 +5510,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         loopback_http_client(),
     )
     .unwrap();
+    let no_override = Arc::new(no_override);
     let mut ctx2 = make_ctx();
     no_override
         .on_final_request_body_with_context(&mut ctx2, &headers, ai_request_body())
@@ -5512,9 +5519,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         .insert("ai_shield_redacted".to_string(), "true".to_string());
     assert!(!no_override.forces_reqwest_dispatch(&ctx2));
     assert!(
-        no_override
-            .response_stream_inspector(&ctx2, 200, Some("text/event-stream"))
-            .is_none()
+        audit_stream_inspector(&no_override, &mut ctx2, 200, Some("text/event-stream")).is_none()
     );
 }
 
@@ -6118,14 +6123,14 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     // The SSN 123-45-6789 is split so no single frame matches the regex.
     let chunks: [&[u8]; 4] = [
@@ -6140,6 +6145,7 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -6176,14 +6182,14 @@ async fn malformed_optional_sse_fields_do_not_bypass_split_pii_redaction() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let chunks: [&[u8]; 3] = [
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"alice@\"}}]}\n\n",
@@ -6196,6 +6202,7 @@ async fn malformed_optional_sse_fields_do_not_bypass_split_pii_redaction() {
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -6239,14 +6246,14 @@ async fn reassembled_sse_excerpt(frames: &[&str]) -> String {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut total = 0u64;
     for frame in frames {
@@ -6255,6 +6262,7 @@ async fn reassembled_sse_excerpt(frames: &[&str]) -> String {
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -7133,14 +7141,14 @@ async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted(
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let chunks: [&[u8]; 6] = [
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will look that up.\"}}]}\n\n",
@@ -7156,6 +7164,7 @@ async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted(
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -7213,18 +7222,19 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":2,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_only\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":42}\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":2,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -7254,18 +7264,19 @@ async fn repeated_indexless_tool_call_frames_stay_reassembled_with_withheld_argu
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"42}\"}}]}}]}\n\ndata: [DONE]\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
@@ -7311,20 +7322,21 @@ async fn non_openai_sse_capture_keeps_per_frame_redacted_fallback() {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     // Anthropic-style event frames: no object=chat.completion.chunk.
     let chunk: &[u8] =
         b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"ssn 123-45-6789\"}}\n\n";
     let _ = inspector.on_chunk(chunk).await;
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(chunk.len() as u64))
         .await;
@@ -7355,14 +7367,14 @@ async fn streamed_sse_excerpt(chunks: &[&[u8]]) -> String {
         loopback_http_client(),
     )
     .unwrap();
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut total = 0u64;
     for chunk in chunks {
@@ -7370,6 +7382,7 @@ async fn streamed_sse_excerpt(chunks: &[&[u8]]) -> String {
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
+    drop(inspector);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
@@ -9129,6 +9142,7 @@ async fn retained_budget_staging_refusal_leaves_no_stale_or_peer_erasing_metadat
         loopback_http_client(),
     )
     .expect("valid peer");
+    let peer = Arc::new(peer);
     peer.start_background_tasks().expect("peer live start");
     peer.commit_background_tasks();
     let mut peer_ctx = make_ctx();
@@ -9212,8 +9226,7 @@ async fn retained_budget_staging_refusal_leaves_no_stale_or_peer_erasing_metadat
         "peer must retain stream dispatch after a sibling's refused admission"
     );
     assert!(
-        peer.response_stream_inspector(&peer_ctx, 200, Some("text/event-stream"))
-            .is_some(),
+        audit_stream_inspector(&peer, &mut peer_ctx, 200, Some("text/event-stream")).is_some(),
         "peer must still tee its owned stream after a sibling refusal"
     );
     assert!(
@@ -9997,6 +10010,7 @@ async fn redacted_stream_accumulation_stops_at_scan_bound() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
@@ -10005,8 +10019,7 @@ async fn redacted_stream_accumulation_stops_at_scan_bound() {
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
     plugin.on_response_stream_selected(&ctx, 200, Some("text/event-stream"));
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+    let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let probe = plugin.stream_capture_probe(&ctx).expect("capture probe");
     let chunk = vec![b'r'; 6000];
@@ -10067,15 +10080,16 @@ async fn streaming_hash_is_capped_by_default_and_marked_partial() {
             loopback_http_client(),
         )
         .expect("valid config");
+        let plugin = Arc::new(plugin);
         plugin.start_background_tasks().expect("live start");
         plugin.commit_background_tasks();
         let mut ctx = make_ctx();
         plugin
             .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
             .await;
-        let mut inspector = plugin
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .expect("inspector");
+        let mut inspector =
+            audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
+                .expect("inspector");
         let _ = inspector.on_chunk(chunk).await;
         let _ = inspector.on_end().await;
         drop(inspector);
@@ -10428,6 +10442,7 @@ async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let plugin = Arc::new(plugin);
     let mut ctx = make_ctx();
     set_prebuffered_body(&mut ctx, ai_request_body());
     let mut headers = ctx.headers.clone();
@@ -10435,7 +10450,7 @@ async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
     assert_eq!(audit_meta(&ctx, CANDIDATE_KEY).as_deref(), Some("true"));
     assert!(!plugin.forces_reqwest_dispatch(&ctx));
     let sse = Some("text/event-stream");
-    assert!(plugin.response_stream_inspector(&ctx, 200, sse).is_none());
+    assert!(audit_stream_inspector(&plugin, &mut ctx, 200, sse).is_none());
 
     // A sampled candidate under the same streaming policy still tees.
     let sampled = AiTranscriptAudit::new(
@@ -10446,12 +10461,13 @@ async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let sampled = Arc::new(sampled);
     let mut hit = make_ctx();
     set_prebuffered_body(&mut hit, ai_request_body());
     let mut hit_headers = hit.headers.clone();
     sampled.before_proxy(&mut hit, &mut hit_headers).await;
     assert!(sampled.forces_reqwest_dispatch(&hit));
-    assert!(sampled.response_stream_inspector(&hit, 200, sse).is_some());
+    assert!(audit_stream_inspector(&sampled, &mut hit, 200, sse).is_some());
 }
 
 /// Two candidates may reach capture admission before either enqueues. With
@@ -10478,6 +10494,7 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let headers = json_headers();
@@ -10506,9 +10523,7 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         "rate-limited candidate must not pin reqwest dispatch"
     );
     assert!(
-        plugin
-            .response_stream_inspector(&limited, 200, sse)
-            .is_none(),
+        audit_stream_inspector(&plugin, &mut limited, 200, sse).is_none(),
         "rate-limited candidate must not install an SSE inspector"
     );
 
@@ -10533,6 +10548,7 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let admissible = Arc::new(admissible);
     let mut hit = make_ctx();
     set_prebuffered_body(&mut hit, stream_body);
     let mut hit_headers = hit.headers.clone();
@@ -10541,11 +10557,7 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         .on_final_request_body_with_context(&mut hit, &headers, stream_body)
         .await;
     assert!(admissible.forces_reqwest_dispatch(&hit));
-    assert!(
-        admissible
-            .response_stream_inspector(&hit, 200, sse)
-            .is_some()
-    );
+    assert!(audit_stream_inspector(&admissible, &mut hit, 200, sse).is_some());
 }
 
 /// A sampling loser that may emit only through `always_capture_on_error` must
@@ -10627,6 +10639,7 @@ async fn streamed_transaction_pays_one_request_capture() {
         loopback_http_client(),
     )
     .expect("valid config");
+    let plugin = Arc::new(plugin);
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
@@ -10644,14 +10657,14 @@ async fn streamed_transaction_pays_one_request_capture() {
     assert_eq!(plugin.capture_counters(), (1, 0));
 
     let sse = Some("text/event-stream");
-    let inspector = plugin
-        .response_stream_inspector(&ctx, 200, sse)
-        .expect("sampled SSE must be teed");
+    let inspector =
+        audit_stream_inspector(&plugin, &mut ctx, 200, sse).expect("sampled SSE must be teed");
     let mut chain = chain_response_stream_inspectors(vec![inspector]).expect("chain");
     let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
     let _ = chain.on_chunk(body).await;
     let _ = chain.on_end().await;
     let outcome = BodyOutcome::success(body.len() as u64);
+    drop(chain);
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &outcome)
         .await;
