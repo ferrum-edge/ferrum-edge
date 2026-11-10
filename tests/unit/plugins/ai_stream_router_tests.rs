@@ -9257,19 +9257,31 @@ async fn test_gemini_legacy_function_call_and_tool_result_shapes() {
             .is_some()
     );
 
-    // Empty tools array and empty/non-array stop remain representable.
+    // An empty tools array and a null stop remain representable (both absent).
     let empty_tools = json!({
         "model": "gemini-1.5-flash",
         "stream": true,
         "tools": [],
-        "stop": 7,
+        "stop": null,
         "messages": [{"role": "user", "content": "hi"}]
     });
     let parsed = translate_gemini_body(&plugin, &empty_tools)
         .await
-        .expect("empty tools + odd stop");
+        .expect("empty tools + null stop");
     assert!(parsed.get("tools").is_none());
-    assert_eq!(parsed["generationConfig"]["stopSequences"], json!([]));
+    assert!(parsed["generationConfig"].get("stopSequences").is_none());
+
+    // A mistyped stop is refused, never silently dropped (issue #7124).
+    let odd_stop = json!({
+        "model": "gemini-1.5-flash",
+        "stream": true,
+        "stop": 7,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let error = translate_gemini_body(&plugin, &odd_stop)
+        .await
+        .expect_err("a numeric stop must be rejected");
+    assert!(error.contains("stop must be"), "{error}");
 }
 
 #[tokio::test]

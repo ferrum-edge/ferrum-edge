@@ -238,9 +238,10 @@ use super::utils::ai_model_glob::{
     MAX_MODEL_PATTERNS_PER_PROVIDER, is_valid_model_pattern, matches_model_glob,
 };
 use super::utils::ai_translation::{
-    MAX_TOOL_ARGUMENTS_BYTES, ParsedToolCall, ToolArgumentsField, parse_openai_tool_calls,
-    parse_tool_arguments_object, present_tool_calls, screen_gemini_strict_schema_document,
-    tool_result_text, valid_tool_call_id, valid_tool_name,
+    MAX_TOOL_ARGUMENTS_BYTES, ParsedToolCall, ToolArgumentsField, openai_max_output_tokens,
+    openai_sampling_number, parse_openai_tool_calls, parse_tool_arguments_object,
+    present_tool_calls, screen_gemini_strict_schema_document, tool_result_text, valid_tool_call_id,
+    valid_tool_name,
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::content_encoding::{
@@ -2236,27 +2237,6 @@ fn openai_declared_tool_names(openai_body: &Value) -> Result<Option<Vec<&str>>, 
     Ok(Some(names))
 }
 
-/// The client's OpenAI output bound (`max_tokens`, else
-/// `max_completion_tokens`). A present non-null value of either field must be a
-/// positive integer; a string, float, negative, or zero is rejected rather than
-/// silently treated as omission.
-fn openai_max_output_tokens(openai_body: &Value) -> Result<Option<u64>, String> {
-    let mut resolved = None;
-    for field in ["max_tokens", "max_completion_tokens"] {
-        match openai_body.get(field) {
-            None | Some(Value::Null) => {}
-            Some(value) => {
-                let tokens = value
-                    .as_u64()
-                    .filter(|tokens| *tokens > 0)
-                    .ok_or_else(|| format!("{field} must be a positive integer"))?;
-                resolved = resolved.or(Some(tokens));
-            }
-        }
-    }
-    Ok(resolved)
-}
-
 /// Effective Anthropic `max_tokens` this route forwards (OpenAI `max_tokens`,
 /// else `max_completion_tokens`, else the provider's `default_max_tokens`).
 fn anthropic_effective_max_tokens(
@@ -2297,13 +2277,20 @@ fn present<'a>(openai_body: &'a Value, field: &str) -> Option<&'a Value> {
 
 /// Shared closed-shape checks for OpenAI parameters neither translated provider
 /// can represent in a streamed generation (`logit_bias`, `logprobs`,
-/// `top_logprobs`) plus the output bound and `parallel_tool_calls` typing.
+/// `top_logprobs`) plus the output bound, sampling-number, `stop`, and
+/// `parallel_tool_calls` typing.
 fn validate_common_request_params(
     openai_body: &Value,
     provider_label: &str,
 ) -> Result<(), ParamRejection> {
     openai_max_output_tokens(openai_body)
         .map_err(|message| ParamRejection::invalid("max_tokens", message))?;
+    for field in ["temperature", "top_p"] {
+        openai_sampling_number(openai_body, field)
+            .map_err(|message| ParamRejection::invalid(field, message))?;
+    }
+    normalize_stop_sequences(openai_body)
+        .map_err(|message| ParamRejection::invalid("stop", message))?;
     if let Some(bias) = present(openai_body, "logit_bias") {
         let Some(bias) = bias.as_object() else {
             return Err(ParamRejection::invalid(
@@ -2880,14 +2867,14 @@ fn translate_to_anthropic(
     if !system_parts.is_empty() {
         body["system"] = Value::String(system_parts.join("\n\n"));
     }
-    if let Some(temp) = openai_body.get("temperature") {
+    if let Some(temp) = openai_sampling_number(openai_body, "temperature")? {
         body["temperature"] = temp.clone();
     }
-    if let Some(top_p) = openai_body.get("top_p") {
+    if let Some(top_p) = openai_sampling_number(openai_body, "top_p")? {
         body["top_p"] = top_p.clone();
     }
-    if let Some(stop) = openai_body.get("stop") {
-        body["stop_sequences"] = normalize_stop_sequences(stop);
+    if let Some(stop) = normalize_stop_sequences(openai_body)? {
+        body["stop_sequences"] = stop;
     }
     if let Some(tools) = translate_tools(openai_body.get("tools")) {
         body["tools"] = tools;
@@ -3403,14 +3390,14 @@ fn translate_to_gemini(openai_body: &Value, prevalidated: bool) -> Result<Vec<u8
             gen_config.insert("responseJsonSchema".to_string(), schema.clone());
         }
     }
-    if let Some(temp) = openai_body.get("temperature") {
+    if let Some(temp) = openai_sampling_number(openai_body, "temperature")? {
         gen_config.insert("temperature".to_string(), temp.clone());
     }
-    if let Some(top_p) = openai_body.get("top_p") {
+    if let Some(top_p) = openai_sampling_number(openai_body, "top_p")? {
         gen_config.insert("topP".to_string(), top_p.clone());
     }
-    if let Some(stop) = openai_body.get("stop") {
-        gen_config.insert("stopSequences".to_string(), normalize_stop_sequences(stop));
+    if let Some(stop) = normalize_stop_sequences(openai_body)? {
+        gen_config.insert("stopSequences".to_string(), stop);
     }
     if !gen_config.is_empty() {
         body["generationConfig"] = Value::Object(gen_config);
@@ -3460,12 +3447,18 @@ fn translate_to_gemini(openai_body: &Value, prevalidated: bool) -> Result<Vec<u8
     serde_json::to_vec(&body).map_err(|error| format!("failed to serialize Gemini body: {error}"))
 }
 
-/// Anthropic `stop_sequences` is always an array of strings.
-fn normalize_stop_sequences(stop: &Value) -> Value {
-    match stop {
-        Value::String(s) => json!([s]),
-        Value::Array(_) => stop.clone(),
-        _ => Value::Array(Vec::new()),
+/// OpenAI `stop` as the array of strings Anthropic `stop_sequences` and Gemini
+/// `stopSequences` take. Absent or JSON `null` is omission; a string becomes a
+/// one-element array; any other shape (a number, an object, an array with a
+/// non-string member) is rejected rather than silently dropped.
+fn normalize_stop_sequences(openai_body: &Value) -> Result<Option<Value>, String> {
+    match openai_body.get("stop") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(stop)) => Ok(Some(json!([stop]))),
+        Some(Value::Array(values)) if values.iter().all(Value::is_string) => {
+            Ok(Some(Value::Array(values.clone())))
+        }
+        Some(_) => Err("stop must be a string, an array of strings, or null".to_string()),
     }
 }
 

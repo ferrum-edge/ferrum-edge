@@ -12,7 +12,12 @@
 //!   ([`valid_tool_name`]) may be;
 //! - how an assistant `tool_calls` array is read, with `"tool_calls": null`
 //!   treated as absent ([`present_tool_calls`], [`parse_openai_tool_calls`]);
-//! - how a tool-result `content` is flattened ([`tool_result_text`]).
+//! - how a tool-result `content` is flattened ([`tool_result_text`]);
+//! - how the output bound (`max_tokens` / `max_completion_tokens`,
+//!   [`openai_max_output_tokens`]) and the sampling numbers (`temperature`,
+//!   `top_p`, [`openai_sampling_number`]) are read, with JSON `null` treated
+//!   as absent and any other mistyped value rejected rather than forwarded,
+//!   dropped, or replaced by a default.
 //!
 //! Buffered vs streaming protocol handling, error envelopes, and each plugin's
 //! own error prefix stay in the plugins. Diagnostics here name the offending
@@ -356,6 +361,49 @@ fn screen_gemini_strict_schema<'a>(
         }
     }
     Ok(())
+}
+
+// ── Output bound and sampling parameters ──────────────────────────────────
+
+/// The client's OpenAI output bound: `max_tokens`, else
+/// `max_completion_tokens`.
+///
+/// An absent or JSON `null` field is omission, so a serializer that emits
+/// unset optionals as `null` does not cancel the other field. A present
+/// non-null value of either field must be a positive integer; a string, float,
+/// negative, or zero is rejected rather than treated as omission or replaced by
+/// a default. Errors name the field and carry no plugin prefix.
+pub(crate) fn openai_max_output_tokens(openai_body: &Value) -> Result<Option<u64>, String> {
+    let mut resolved = None;
+    for field in ["max_tokens", "max_completion_tokens"] {
+        match openai_body.get(field) {
+            None | Some(Value::Null) => {}
+            Some(value) => {
+                let tokens = value
+                    .as_u64()
+                    .filter(|tokens| *tokens > 0)
+                    .ok_or_else(|| format!("{field} must be a positive integer"))?;
+                resolved = resolved.or(Some(tokens));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// An OpenAI sampling number (`temperature`, `top_p`). An absent or JSON
+/// `null` field is omission; any other non-number is rejected rather than
+/// forwarded for the provider to refuse. The range is the provider's to
+/// enforce: clamping would substitute a value the client never chose. Errors
+/// name the field and carry no plugin prefix.
+pub(crate) fn openai_sampling_number<'a>(
+    openai_body: &'a Value,
+    field: &str,
+) -> Result<Option<&'a Value>, String> {
+    match openai_body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) if value.is_number() => Ok(Some(value)),
+        Some(_) => Err(format!("{field} must be a number")),
+    }
 }
 
 // ── Tool calls and tool results ───────────────────────────────────────────

@@ -59,6 +59,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **AI translators no longer forward `null` sampling values or drop the
+  client's output bound** (#7124). `ai_federation`'s Gemini, Bedrock, and
+  Cohere adapters read `max_tokens` with a plain field lookup, so
+  `{"max_tokens": null, "max_completion_tokens": 256}` forwarded a `null`
+  bound and lost the 256; the Anthropic adapter replaced a string, float,
+  zero, or negative bound with 4096. Both AI translation plugins now share one
+  rule: a `null` `max_tokens`, `max_completion_tokens`, `temperature`, or
+  `top_p` is absent, a present output bound must be a positive integer, and a
+  present `temperature` / `top_p` must be a number; anything else is an
+  OpenAI-shaped `400` on buffered and streaming routes alike. On
+  `ai_stream_router`, a `stop` that is not a string or an array of strings is
+  now a `400` instead of being forwarded as an empty list. Anthropic's 4096
+  default for an unbounded `ai_federation` request is now documented.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then
