@@ -89,10 +89,10 @@ All gRPC calls are authenticated with bearer JWTs:
   (multiple keys, asymmetric algorithms, per-key namespace ceilings — see
   [cp_namespace_tenancy.md](cp_namespace_tenancy.md#trust-binding-ghsa-3f2j-wwqw-grmg)),
   and a node can present an externally issued token from
-  `FERRUM_DP_CP_GRPC_TOKEN_FILE` instead of minting one. **Stock DPs cannot
-  use this yet.** The DP sends a random per-process `node_id`, and the CP
-  requires `sub == node_id` (below), so an issuer-minted token is refused with
-  `PERMISSION_DENIED`. Give each DP its own per-tenant secret plus
+  `FERRUM_DP_CP_GRPC_TOKEN_FILE` instead of minting one. **That is a mesh-node
+  option; `dp` mode refuses it at startup.** The DP sends a random per-process
+  `node_id`, and the CP requires `sub == node_id` (below), so an issuer-minted
+  token would be refused with `PERMISSION_DENIED`. Give each DP its own per-tenant secret plus
   `FERRUM_CP_DP_GRPC_JWT_KEY_ID` instead (see
   [cp_namespace_tenancy.md](cp_namespace_tenancy.md#data-plane-side))
 
@@ -200,8 +200,9 @@ the aggregate path-backed material retained for one candidate are limited to 1
 MiB. See
 [cp_namespace_tenancy.md](cp_namespace_tenancy.md#rotation-is-atomic-per-source-generation).
 
-DPs and mesh/xDS clients use their existing bounded reconnect backoff and reread
-`FERRUM_DP_CP_GRPC_TOKEN_FILE` (or mint a new short-lived token) on each attempt.
+DPs and mesh/xDS clients use their existing bounded reconnect backoff and mint a
+new short-lived token (mesh nodes: reread `FERRUM_DP_CP_GRPC_TOKEN_FILE`) on
+each attempt.
 The fixed-cardinality
 `ferrum_grpc_config_stream_terminations_total{surface,reason}` metric and
 structured `grpc_config_stream_*` audit events distinguish `expired`,
@@ -1085,8 +1086,8 @@ in a failover set must use the same value.
 | `FERRUM_DP_CP_GRPC_URLS` | Yes | Comma-separated priority-ordered CP URLs (`http://` or `https://`). A non-loopback `http://` (plaintext) URL is refused at startup unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` |
 | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT` | No | Permit a non-loopback `http://` (plaintext) CP URL (default `false`). Loopback URLs are always allowed; even when permitted, plaintext logs a high-severity warning |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | Retry primary CP interval when on fallback (default: 300) |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | Unless token file set | Shared JWT secret for CP/DP gRPC auth (same value as CP) |
-| `FERRUM_DP_CP_GRPC_TOKEN_FILE` | No | Path to an externally issued bearer token, re-read on each connect attempt, used instead of minting one. Not usable by stock DPs today: their random per-process `node_id` cannot match the token's `sub`, so `ConfigSync.Subscribe` is refused. Use a per-tenant secret plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID` for DPs |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | Yes | Shared JWT secret for CP/DP gRPC auth (same value as CP, or this DP's per-tenant secret against a trust-bundle CP) |
+| `FERRUM_DP_CP_GRPC_TOKEN_FILE` | Refused | Mesh-only (externally issued bearer token). `dp` mode refuses it at startup: the DP's random per-process `node_id` cannot match the token's `sub`, so `ConfigSync.Subscribe` would be refused. Use a per-tenant secret plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID` for DPs |
 | `FERRUM_NAMESPACE` | No | Namespace this DP subscribes to; the CP must serve it (default `ferrum`) |
 | `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` | No | Maximum age of the last applied CP snapshot while no CP is authoritative (default `3600`; `0` = unbounded, unsafe). See [Bounded last-known-good configuration age](#bounded-last-known-good-configuration-age) |
 | `FERRUM_DP_CONFIG_STALE_ACTION` | No | `fail_closed` (default) or `readiness_only` at the staleness bound |

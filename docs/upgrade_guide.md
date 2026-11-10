@@ -54,6 +54,19 @@ silently to `RS256` / no `kid`; it now fails config load with
 value with the intended string (for example `"ES384"` instead of `["ES384"]`)
 or remove it before upgrading.
 
+### `dp` mode refuses `FERRUM_DP_CP_GRPC_TOKEN_FILE` (#7273)
+
+A stock DP (`FERRUM_MODE=dp`) now fails `ferrum-edge validate` and startup when
+`FERRUM_DP_CP_GRPC_TOKEN_FILE` is set, with or without
+`FERRUM_CP_DP_GRPC_JWT_SECRET`, and always requires the secret. The DP sends a
+random per-process `node_id`, and `ConfigSync.Subscribe` requires the token's
+`sub` to equal it, so such a DP started cleanly and then looped on
+`PERMISSION_DENIED` without ever receiving config. The `ferrum-gateway` chart
+no longer has `dp.cpGrpcTokenFile`, and `grpc.jwtSecret` is always required in
+`dp` mode. Before upgrading, remove the token file from DP deployments and give
+each DP its own per-tenant secret plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID`
+(`grpc.jwtKeyId` in the chart). Mesh nodes keep the token-file option.
+
 ### Repeated `Content-Type` and gateway-asserted request headers (#7064)
 
 - **Repeated or list-valued `Content-Type` is refused.** `Content-Type` is a
