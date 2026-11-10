@@ -636,6 +636,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any other provider was silently inert. A non-null value there now fails
   admission (and the OpenAPI schema), like `default_max_tokens`. Remove it
   from such providers before upgrading.
+- **`ai_semantic_cache` rebuild throttle and Redis envelope** (issue #7131).
+  The HNSW vector-index rebuild throttle measured its 30-second interval on
+  the wall clock, so after a backward clock step of N seconds no new entry
+  became semantically searchable for N + 30 seconds. It now uses the same
+  monotonic clock as the expired-entry cleanup throttle. The Redis envelope
+  drops its `semantic_scope_key` and `embedding` fields, which were never
+  written (Redis holds exact entries only) and were only fed back into the
+  MAC on read; the envelope version is now 5. Entries written by an earlier
+  build fail the version check and are quarantined like any other
+  cross-version envelope, so a Redis-backed cache starts cold after upgrade.
 
 ### Performance
 - **`ai_tool_governor` drains its live SSE buffer once per chunk**

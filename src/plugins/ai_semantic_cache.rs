@@ -221,6 +221,9 @@ pub const AI_SEMANTIC_CACHE_CONFIG_KEYS: &[&str] = &[
     "redis_integrity_key",
 ];
 
+/// Minimum interval between HNSW vector-index rebuilds, measured, like the
+/// cleanup throttle, against the monotonic `created_at` clock so a wall-clock
+/// step cannot stall rebuilds (issue #7131).
 const VECTOR_REBUILD_INTERVAL_SECONDS: u64 = 30;
 
 /// Embedding-provider responses are small JSON documents in normal operation.
@@ -294,9 +297,10 @@ const MIN_REDIS_INTEGRITY_KEY_BYTES: usize = 32;
 /// v2 requires an HMAC authenticity tag; v3 length-frames every authenticated
 /// header name/value so embedded NUL bytes cannot repartition header fields;
 /// v4 authenticates the seal timestamp so Redis retention cannot extend replay
-/// beyond the configured cache TTL. There is no legacy unauthenticated read
-/// path during build-out.
-const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 4;
+/// beyond the configured cache TTL; v5 drops the never-written semantic scope
+/// and embedding fields (Redis holds exact entries only). There is no legacy
+/// unauthenticated read path during build-out.
+const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 5;
 
 /// Wall-clock skew tolerated between the replica that sealed an authenticated
 /// Redis envelope and the replica reading it. An envelope sealed up to this far
@@ -1178,7 +1182,9 @@ pub struct AiSemanticCache {
     /// Guards the lifecycle-owned cleanup worker so the full-map `retain` +
     /// oldest-entry eviction never overlaps itself.
     cleanup_running: Arc<AtomicBool>,
-    /// Last time the semantic vector snapshot was rebuilt.
+    /// Seconds elapsed (against `created_at`) at the last semantic vector
+    /// snapshot rebuild; `u64::MAX` until the first one. Monotonic for the same
+    /// reason as `last_cleanup`.
     last_vector_rebuild: Arc<AtomicU64>,
     /// Whether local semantic entries changed since the latest vector rebuild.
     vector_index_dirty: Arc<AtomicBool>,
@@ -1234,10 +1240,6 @@ struct SerializableCacheEntry {
     status_code: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    semantic_scope_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    embedding: Option<Vec<f32>>,
     /// Hex-encoded HMAC-SHA256 over the authenticated envelope fields and the
     /// Redis key context. Absent on foreign/legacy writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1420,7 +1422,8 @@ impl AiSemanticCache {
             // Sentinel: never cleaned, so the first cleanup pass always runs.
             last_cleanup: AtomicU64::new(u64::MAX),
             cleanup_running: Arc::new(AtomicBool::new(false)),
-            last_vector_rebuild: Arc::new(AtomicU64::new(0)),
+            // Sentinel: never rebuilt, so the first rebuild is never throttled.
+            last_vector_rebuild: Arc::new(AtomicU64::new(u64::MAX)),
             vector_index_dirty: Arc::new(AtomicBool::new(false)),
             vector_index_rebuild_running: Arc::new(AtomicBool::new(false)),
             cleanup_signal: Arc::new(Notify::new()),
@@ -2000,8 +2003,6 @@ impl AiSemanticCache {
                 status_code: entry.status_code,
                 headers: &entry.headers,
                 body: &entry.body,
-                semantic_scope_key: entry.semantic_scope_key.as_deref(),
-                embedding: entry.embedding.as_deref(),
             },
         ) else {
             return RedisHitVerdict::Invalid;
@@ -2319,7 +2320,7 @@ impl AiSemanticCache {
         );
         drop(previous);
         self.last_vector_rebuild
-            .store(current_epoch_seconds(), Ordering::Release);
+            .store(monotonic_elapsed_secs(self.created_at), Ordering::Release);
         self.vector_index_rebuild_running
             .store(false, Ordering::Release);
         peak_used
@@ -2475,10 +2476,10 @@ impl AiSemanticCache {
         if !self.vector_index_dirty.load(Ordering::Acquire) {
             return;
         }
-        let now_epoch = current_epoch_seconds();
+        let now_secs = monotonic_elapsed_secs(self.created_at);
         let has_snapshot = self.vector_index.load().is_some();
         let last = self.last_vector_rebuild.load(Ordering::Relaxed);
-        if has_snapshot && now_epoch.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS {
+        if has_snapshot && vector_rebuild_throttled(last, now_secs) {
             return;
         }
         self.rebuild_signal.notify_one();
@@ -2721,8 +2722,6 @@ impl AiSemanticCache {
                 status_code,
                 headers,
                 body,
-                semantic_scope_key: None,
-                embedding: None,
             },
         )?;
         Some(SerializableCacheEntry {
@@ -2731,8 +2730,6 @@ impl AiSemanticCache {
             status_code,
             headers: headers.clone(),
             body: body.to_vec(),
-            semantic_scope_key: None,
-            embedding: None,
             integrity: Some(hex::encode(mac)),
         })
     }
@@ -4240,6 +4237,17 @@ fn request_forbids_cache(headers: &HashMap<String, String>) -> bool {
     cache_control_has_directive(headers, &["no-store", "no-cache"])
 }
 
+/// Whole seconds elapsed on the monotonic clock since `origin`.
+fn monotonic_elapsed_secs(origin: Instant) -> u64 {
+    Instant::now().saturating_duration_since(origin).as_secs()
+}
+
+/// Whether a vector-index rebuild at monotonic second `now_secs` falls inside
+/// the interval after the last one (`u64::MAX`: never rebuilt).
+fn vector_rebuild_throttled(last: u64, now_secs: u64) -> bool {
+    last != u64::MAX && now_secs.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS
+}
+
 fn current_epoch_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5224,6 +5232,7 @@ impl Plugin for AiSemanticCache {
             let cache_budget = Arc::clone(&self.cache_budget);
             let rebuild_reserved_bytes = Arc::clone(&self.rebuild_reserved_bytes);
             let last_vector_rebuild = Arc::clone(&self.last_vector_rebuild);
+            let created_at = self.created_at;
             let ttl = self.ttl;
             let max_candidates = self
                 .semantic
@@ -5253,12 +5262,10 @@ impl Plugin for AiSemanticCache {
                     if !dirty.load(Ordering::Acquire) {
                         continue;
                     }
-                    let now_epoch = current_epoch_seconds();
+                    let now_secs = monotonic_elapsed_secs(created_at);
                     let has_snapshot = vector_index.load().is_some();
                     let last = last_vector_rebuild.load(Ordering::Relaxed);
-                    if has_snapshot
-                        && now_epoch.saturating_sub(last) < VECTOR_REBUILD_INTERVAL_SECONDS
-                    {
+                    if has_snapshot && vector_rebuild_throttled(last, now_secs) {
                         continue;
                     }
                     if rebuild_running
@@ -5271,7 +5278,7 @@ impl Plugin for AiSemanticCache {
                         rebuild_running.store(false, Ordering::Release);
                         continue;
                     }
-                    last_vector_rebuild.store(now_epoch, Ordering::Release);
+                    last_vector_rebuild.store(now_secs, Ordering::Release);
                     let _state_guard = RebuildStateGuard {
                         running: Arc::clone(&rebuild_running),
                         reserved: Arc::clone(&rebuild_reserved_bytes),
@@ -6102,19 +6109,17 @@ struct RedisEnvelopeMacInput<'a> {
     status_code: u16,
     headers: &'a HashMap<String, String>,
     body: &'a [u8],
-    semantic_scope_key: Option<&'a str>,
-    embedding: Option<&'a [f32]>,
 }
 
 /// HMAC-SHA256 authenticity tag over the Redis envelope and key context.
 ///
-/// Binds status/headers/body (and optional semantic fields) to the Redis
+/// Binds status/headers/body and the seal time to the Redis
 /// namespace/key so a valid-looking foreign JSON document under another key
 /// cannot be replayed. Returns `None` only when the HMAC implementation fails
 /// to initialize (fail closed).
 fn compute_redis_envelope_mac(key: &[u8], envelope: &RedisEnvelopeMacInput<'_>) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).ok()?;
-    mac.update(b"ai_semantic_cache.v4\0");
+    mac.update(b"ai_semantic_cache.v5\0");
     mac.update((envelope.redis_key.len() as u64).to_le_bytes());
     mac.update(envelope.redis_key.as_bytes());
     mac.update([envelope.version]);
@@ -6135,22 +6140,6 @@ fn compute_redis_envelope_mac(key: &[u8], envelope: &RedisEnvelopeMacInput<'_>) 
     }
     mac.update((envelope.body.len() as u64).to_le_bytes());
     mac.update(envelope.body);
-    if let Some(scope) = envelope.semantic_scope_key {
-        mac.update([1]);
-        mac.update((scope.len() as u64).to_le_bytes());
-        mac.update(scope.as_bytes());
-    } else {
-        mac.update([0]);
-    }
-    if let Some(values) = envelope.embedding {
-        mac.update([1]);
-        mac.update((values.len() as u64).to_le_bytes());
-        for value in values {
-            mac.update(value.to_le_bytes());
-        }
-    } else {
-        mac.update([0]);
-    }
     Some(mac.finalize().into_bytes().to_vec())
 }
 
@@ -7002,15 +6991,13 @@ mod tests {
     }
 
     #[test]
-    fn redis_serialized_cache_entry_omits_semantic_vector_fields_when_empty() {
+    fn redis_serialized_cache_entry_carries_no_semantic_vector_fields() {
         let entry = SerializableCacheEntry {
             version: SEMANTIC_CACHE_ENTRY_VERSION,
             sealed_at_epoch_seconds: current_epoch_seconds(),
             status_code: 200,
             headers: HashMap::new(),
             body: b"cached".to_vec(),
-            semantic_scope_key: None,
-            embedding: None,
             integrity: None,
         };
 
@@ -7049,8 +7036,6 @@ mod tests {
                     status_code,
                     headers: &headers,
                     body,
-                    semantic_scope_key: None,
-                    embedding: None,
                 },
             )
             .expect("test HMAC");
@@ -7064,8 +7049,6 @@ mod tests {
             status_code,
             headers,
             body: body.to_vec(),
-            semantic_scope_key: None,
-            embedding: None,
             integrity,
         }
     }
@@ -7131,8 +7114,6 @@ mod tests {
                 status_code: 200,
                 headers: &split_headers,
                 body: b"body",
-                semantic_scope_key: None,
-                embedding: None,
             },
         )
         .expect("test HMAC");
@@ -7145,8 +7126,6 @@ mod tests {
                 status_code: 200,
                 headers: &fused_headers,
                 body: b"body",
-                semantic_scope_key: None,
-                embedding: None,
             },
         )
         .expect("test HMAC");
@@ -7187,8 +7166,6 @@ mod tests {
                 status_code: valid.status_code,
                 headers: &valid.headers,
                 body: &valid.body,
-                semantic_scope_key: None,
-                embedding: None,
             },
         )
         .expect("test HMAC");
@@ -7224,8 +7201,6 @@ mod tests {
                 status_code: stale.status_code,
                 headers: &stale.headers,
                 body: &stale.body,
-                semantic_scope_key: None,
-                embedding: None,
             },
         )
         .expect("test HMAC");
