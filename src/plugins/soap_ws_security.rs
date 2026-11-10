@@ -1637,15 +1637,6 @@ fn process_replay_state(scope_key: Option<&str>) -> Result<Arc<Mutex<NonceReplay
     Ok(state)
 }
 
-/// Current process-global replay-scope registry cardinality (test support).
-#[allow(dead_code)]
-pub(crate) fn nonce_replay_registry_len_for_tests() -> Result<usize, String> {
-    let Ok(registry) = NONCE_REPLAY_REGISTRY.lock() else {
-        return Err("soap_ws_security: replay-scope registry is unavailable".to_string());
-    };
-    Ok(registry.len())
-}
-
 /// Whether `scope_key` is still present in the process-global registry.
 #[allow(dead_code)]
 pub(crate) fn nonce_replay_registry_contains_for_tests(scope_key: &str) -> Result<bool, String> {
