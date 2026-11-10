@@ -2362,6 +2362,43 @@ fn admin_tls_store_backed_operations_document_internal_server_error() {
     }
 }
 
+/// Every TLS/ACME DELETE handler in `src/admin/tls_management.rs` answers
+/// `200` with `{"deleted": true, "record": <summary>}`; the spec must document
+/// that body with the same record schema the matching GET returns.
+#[test]
+fn admin_tls_delete_operations_document_deleted_record_body() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    const DELETES: &[(&str, &str)] = &[
+        ("deleteAcmeCertificate", "AcmeCertificateRecord"),
+        ("deleteAcmeOrder", "AcmeOrder"),
+        ("deleteManagedTlsCertificate", "ManagedTlsRecord"),
+        ("deleteManagedTlsCaBundle", "ManagedTlsRecord"),
+        ("deleteManagedTlsCrl", "ManagedTlsRecord"),
+        ("deleteManagedTlsOcspResponse", "ManagedTlsRecord"),
+        ("deleteManagedTlsJwks", "ManagedTlsRecord"),
+    ];
+    for (operation_id, record_schema) in DELETES {
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        let schema = &operation["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            schema["required"],
+            json!(["deleted", "record"]),
+            "{method} {path} ({operation_id}) must require deleted and record"
+        );
+        assert_eq!(
+            schema["properties"]["deleted"]["type"], "boolean",
+            "{method} {path} ({operation_id}) must document a boolean deleted flag"
+        );
+        assert_eq!(
+            schema["properties"]["record"]["$ref"],
+            format!("#/components/schemas/{record_schema}"),
+            "{method} {path} ({operation_id}) must document the deleted record"
+        );
+    }
+}
+
 fn collect_openapi_inventory(
     value: &serde_json::Value,
     refs: &mut BTreeSet<String>,
