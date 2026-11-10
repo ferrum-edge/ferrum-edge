@@ -14,7 +14,9 @@ policy freezes the per-job digest of every Cross-sensitive `ci.yml` job, and
 `ci-plan` is one of them.
 
 The scanner checks both chart sources (after stripping comments) and manifests
-rendered by Helm, so helpers and expressions cannot conceal dangerous output.
+Helm renders for every chart under `charts/` (defaults, example values, and the
+mesh node-agent/ambient switches), so helpers and expressions cannot conceal
+dangerous output in either chart.
 Rendered checks prefer `FERRUM_TRUSTED_HELM` when CI pins the installer output.
 
 Usage:
@@ -26,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -266,16 +269,95 @@ def resolve_helm_binary() -> str:
     return str(path)
 
 
-def iter_mesh_example_value_files(root: Path) -> list[Path]:
-    """Discover ferrum-mesh example inputs in parity with GOVERNED_GLOBS."""
+# Extra renders beyond the defaults and the example values files. The mesh
+# node-agent and ambient workloads are off by default, so they are also rendered
+# switched on.
+CHART_EXTRA_RENDERS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "ferrum-mesh": (
+        (
+            "node-agent-and-ambient",
+            ("--set", "nodeAgent.enabled=true", "--set", "ambient.enabled=true"),
+        ),
+    ),
+}
+
+TOP_LEVEL_YAML_KEY_RE = re.compile(
+    r"(?m)^[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[\"']?[ \t]*:(?:[ \t]|$)"
+)
+
+
+def iter_chart_directories(root: Path) -> list[Path]:
+    """Return every chart directory directly under `charts/`.
+
+    The rendered pass covers every chart, not one named chart, so a chart
+    added beside `ferrum-mesh` and `ferrum-gateway` is rendered too. A
+    symlinked `charts/` or chart directory fails closed.
+    """
 
     charts_dir = root / "charts"
-    chart_path = charts_dir / "ferrum-mesh"
+    if charts_dir.is_symlink():
+        raise OSError(f"charts directory must not be a symlink: {charts_dir}")
+    if not charts_dir.is_dir():
+        return []
+    directories: list[Path] = []
+    for child in sorted(charts_dir.iterdir()):
+        if child.is_symlink():
+            raise OSError(f"chart directory must not be a symlink: {child}")
+        if child.is_dir():
+            directories.append(child)
+    return directories
+
+
+def example_is_values_input(chart: Path, path: Path) -> bool:
+    """Whether Helm could accept this example file as a values input.
+
+    Chart examples also hold plain Kubernetes manifests (for example the
+    gateway chart's migrate Jobs). They carry no template expressions and are
+    already source-scanned, and Helm refuses them as values when the chart's
+    `values.schema.json` forbids unknown top-level keys. Only that provable
+    case is skipped; any file whose keys cannot be read, or a chart without
+    such a schema, is rendered, so an unreadable input fails closed in Helm.
+    """
+
+    schema_path = chart / "values.schema.json"
+    if schema_path.is_symlink() or not schema_path.is_file():
+        return True
+    try:
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(schema, dict) or schema.get("additionalProperties") is not False:
+        return True
+    properties = schema.get("properties")
+    allowed = set(properties) if isinstance(properties, dict) else set()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    if path.suffix == ".json":
+        try:
+            document = json.loads(text)
+        except ValueError:
+            return True
+        keys = set(document) if isinstance(document, dict) else set()
+    else:
+        keys = {
+            match.group("key")
+            for match in TOP_LEVEL_YAML_KEY_RE.finditer(strip_chart_comments(text))
+        }
+    return not keys or keys <= allowed
+
+
+def iter_chart_example_value_files(root: Path, chart_name: str) -> list[Path]:
+    """Discover one chart's example values inputs in parity with GOVERNED_GLOBS."""
+
+    charts_dir = root / "charts"
+    chart_path = charts_dir / chart_name
     examples_path = chart_path / "examples"
     for label, directory in (
         ("charts", charts_dir),
-        ("ferrum-mesh chart", chart_path),
-        ("ferrum-mesh examples", examples_path),
+        (f"{chart_name} chart", chart_path),
+        (f"{chart_name} examples", examples_path),
     ):
         if directory.is_symlink():
             raise OSError(f"{label} directory must not be a symlink: {directory}")
@@ -293,7 +375,7 @@ def iter_mesh_example_value_files(root: Path) -> list[Path]:
         examples_root.relative_to(chart)
     except ValueError as exc:
         raise ValueError(
-            "ferrum-mesh examples directory escapes chart boundary"
+            f"{chart_name} examples directory escapes chart boundary"
         ) from exc
     discovered: set[Path] = set()
     for pattern in EXAMPLE_VALUE_GLOBS:
@@ -313,35 +395,41 @@ def iter_mesh_example_value_files(root: Path) -> list[Path]:
                 raise ValueError(
                     f"chart example values escape repository/chart boundary: {path}"
                 ) from exc
-            discovered.add(resolved)
+            if example_is_values_input(chart, resolved):
+                discovered.add(resolved)
     return sorted(discovered)
 
 
-def render_mesh_manifests(
+def render_chart_manifests(
     root: Path,
     *,
     helm_bin: str | None = None,
     timeout_seconds: float = DEFAULT_HELM_RENDER_TIMEOUT_SECONDS,
 ) -> list[tuple[str, str]]:
-    """Render the security-sensitive workloads with their supported inputs."""
+    """Render every chart with its defaults, extra switches, and example values.
+
+    GHSA-4xcp-8c2m-g84j: rendering only `charts/ferrum-mesh` let a socket path
+    that a `charts/ferrum-gateway` template builds at render time (for example
+    with `printf`) pass both layers, although that chart is deployed into the
+    same clusters.
+    """
 
     helm = helm_bin if helm_bin is not None else resolve_helm_binary()
-    chart = root / "charts/ferrum-mesh"
-    if chart.is_symlink() or not chart.is_dir():
+    mesh = root / "charts/ferrum-mesh"
+    if mesh.is_symlink() or not mesh.is_dir():
         raise OSError("charts/ferrum-mesh must be a regular directory")
-    renders: list[tuple[str, list[str]]] = [
-        ("defaults", []),
-        (
-            "node-agent-and-ambient",
-            ["--set", "nodeAgent.enabled=true", "--set", "ambient.enabled=true"],
-        ),
-    ]
-    for values in iter_mesh_example_value_files(root):
-        label = values.relative_to((root / "charts/ferrum-mesh").resolve()).as_posix()
-        renders.append((f"values:{label}", ["--values", str(values)]))
+    renders: list[tuple[str, Path, list[str]]] = []
+    for chart in iter_chart_directories(root):
+        name = chart.name
+        renders.append((f"{name}:defaults", chart, []))
+        for label, extra_args in CHART_EXTRA_RENDERS.get(name, ()):
+            renders.append((f"{name}:{label}", chart, list(extra_args)))
+        for values in iter_chart_example_value_files(root, name):
+            label = values.relative_to(chart.resolve()).as_posix()
+            renders.append((f"{name}:values:{label}", chart, ["--values", str(values)]))
 
     manifests: list[tuple[str, str]] = []
-    for label, extra_args in renders:
+    for label, chart, extra_args in renders:
         command = [helm, "template", "ferrum-runtime-lint", str(chart), *extra_args]
         try:
             result = subprocess.run(
@@ -377,7 +465,7 @@ def check_repository(
     for path in iter_scan_paths(base):
         findings.extend(scan_file(base, path))
     if render:
-        for label, manifest in render_mesh_manifests(
+        for label, manifest in render_chart_manifests(
             base, helm_bin=helm_bin, timeout_seconds=timeout_seconds
         ):
             findings.extend(scan_text(f"helm-render:{label}", manifest))
@@ -730,7 +818,7 @@ spec:
                 path.relative_to(
                     (example_root / "charts/ferrum-mesh").resolve()
                 ).as_posix()
-                for path in iter_mesh_example_value_files(example_root)
+                for path in iter_chart_example_value_files(example_root, "ferrum-mesh")
             }
         except Exception as exc:  # noqa: BLE001
             failures.append(f"example discovery raised: {exc}")
@@ -774,7 +862,7 @@ spec:
             pass
         else:
             try:
-                iter_mesh_example_value_files(symlink_dir_root)
+                iter_chart_example_value_files(symlink_dir_root, "ferrum-mesh")
             except OSError:
                 pass
             else:
@@ -797,7 +885,7 @@ spec:
             pass
         else:
             try:
-                iter_mesh_example_value_files(symlink_file_root)
+                iter_chart_example_value_files(symlink_file_root, "ferrum-mesh")
             except OSError:
                 pass
             else:
@@ -948,6 +1036,98 @@ spec:
                 failures.append(
                     "hostile rendered docker.sock mount was not rejected"
                 )
+
+        # GHSA-4xcp-8c2m-g84j: the rendered pass covers every chart. A
+        # gateway-chart template that builds a runtime socket path with
+        # `printf` passes the source scan and must be caught once rendered;
+        # the chart's values examples are rendered and its plain manifest
+        # examples (refused by its closed values schema) are not.
+        gateway_root = Path(tmp) / "gateway-render"
+        _required_tree(
+            gateway_root,
+            node_agent=_CLEAN_NODE_AGENT,
+            ambient=_CLEAN_AMBIENT,
+            values=_CLEAN_VALUES,
+        )
+        gateway_chart = gateway_root / "charts/ferrum-gateway"
+        _write(
+            gateway_chart / "templates/runtime-access.yaml",
+            "apiVersion: apps/v1\n"
+            "kind: DaemonSet\n"
+            "spec:\n"
+            "  template:\n"
+            "    spec:\n"
+            "      volumes:\n"
+            "        - hostPath:\n"
+            '            path: {{ printf "/%s/%s/%s.%s" "var" "run" "docker" "sock" }}\n',
+        )
+        _write(
+            gateway_chart / "values.schema.json",
+            '{"type": "object", "additionalProperties": false, '
+            '"properties": {"mode": {"type": "string"}}}\n',
+        )
+        _write(gateway_chart / "values.yaml", "mode: file\n")
+        _write(gateway_chart / "examples/file-values.yaml", "mode: file\n")
+        _write(
+            gateway_chart / "examples/migrate-job.yaml",
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: migrate\n",
+        )
+        try:
+            source_only = check_repository(gateway_root)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"gateway source-scan fixture raised: {exc}")
+        else:
+            if source_only:
+                failures.append(
+                    "constructed gateway socket path unexpectedly matched the "
+                    f"source scan: {source_only}"
+                )
+        gateway_record = Path(tmp) / "gateway-helm-args.txt"
+        gateway_helm = bin_dir / "gateway-render-helm"
+        _write(
+            gateway_helm,
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" >> "{gateway_record}"\n'
+            'case "$*" in\n'
+            "  *charts/ferrum-gateway*)\n"
+            "    printf 'kind: DaemonSet\\nspec:\\n  path: /var/run/docker.sock\\n'\n"
+            "    ;;\n"
+            "  *)\n"
+            "    printf 'kind: ConfigMap\\nmetadata:\\n  name: ok\\n'\n"
+            "    ;;\n"
+            "esac\n",
+        )
+        gateway_helm.chmod(0o755)
+        try:
+            findings = check_repository(
+                gateway_root, render=True, helm_bin=str(gateway_helm)
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"gateway render fixture raised: {exc}")
+        else:
+            if not any(
+                finding.startswith("helm-render:ferrum-gateway:")
+                and "docker.sock" in finding
+                for finding in findings
+            ):
+                failures.append(
+                    "a printf-built socket path in a ferrum-gateway template "
+                    "was not rejected by the rendered pass"
+                )
+            recorded = (
+                gateway_record.read_text(encoding="utf-8")
+                if gateway_record.is_file()
+                else ""
+            )
+            if "examples/file-values.yaml" not in recorded:
+                failures.append("gateway example values were not rendered")
+            if "migrate-job.yaml" in recorded:
+                failures.append(
+                    "a gateway manifest example refused by the closed values "
+                    "schema was rendered as values"
+                )
+            if "charts/ferrum-mesh" not in recorded:
+                failures.append("the mesh chart dropped out of the rendered pass")
 
         oversized = "x" * (MAX_HELM_ERROR_CHARS + 50)
         bounded = _bound_helm_detail(oversized)
