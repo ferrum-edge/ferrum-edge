@@ -17116,8 +17116,6 @@ fn response_caching_schema_matches_strict_runtime_contract() {
             "respect_cache_control": true,
             "respect_no_cache": false,
             "vary_by_headers": ["x-tenant"],
-            "cache_key_include_query": true,
-            "cache_key_include_consumer": true,
             "add_cache_status_header": true,
             "invalidate_on_unsafe_methods": false
         }),
@@ -17132,8 +17130,8 @@ fn response_caching_schema_matches_strict_runtime_contract() {
 
     for invalid in [
         json!({"vary_by_header": ["x-tenant"]}),
-        json!({"cache_key_include_consumr": true}),
-        json!({"cache_key_include_quer": false}),
+        json!({"cache_key_include_consumer": true}),
+        json!({"cache_key_include_query": false}),
         json!({"respect_cache_contro": true}),
         json!({"respect_no_cach": true}),
         json!({"cacheable_status_code": [200]}),
@@ -17234,8 +17232,6 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         "max_total_size_bytes",
         "respect_cache_control",
         "respect_no_cache",
-        "cache_key_include_query",
-        "cache_key_include_consumer",
         "add_cache_status_header",
         "invalidate_on_unsafe_methods",
     ] {
