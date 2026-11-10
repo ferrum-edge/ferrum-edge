@@ -1615,7 +1615,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     "",
                     "",
                     "failure",
-                    status.message(),
+                    crate::grpc::cp_server::tenant_authentication_rejection_reason(&status),
                 );
                 return Err(status);
             }
@@ -1634,7 +1634,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     "",
                     "",
                     "failure",
-                    status.message(),
+                    crate::grpc::cp_server::tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
                 );
                 return Err(status);
             }
@@ -2001,7 +2001,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     "",
                     "",
                     "failure",
-                    status.message(),
+                    crate::grpc::cp_server::tenant_authentication_rejection_reason(&status),
                 );
                 return Err(status);
             }
@@ -2020,7 +2020,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     "",
                     "",
                     "failure",
-                    status.message(),
+                    crate::grpc::cp_server::tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
                 );
                 return Err(status);
             }

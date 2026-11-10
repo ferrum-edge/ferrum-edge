@@ -1467,6 +1467,26 @@ impl HealthChecker {
         self.active_probe_upstreams.clear();
         self.upstream_probe_target_keys.clear();
         self.active_probe_specs.clear();
+        // Keep a generation cell only for upstreams that still have an active
+        // check; every other key would otherwise stay for the process lifetime
+        // (issue #7206). Retired probes hold their own `Arc` of the cell and
+        // are fenced by `task_generation`, so dropping the map entry cannot
+        // un-fence them, and a re-added upstream starts from a fresh cell.
+        let active_check_upstreams: std::collections::HashSet<String> = config
+            .upstreams
+            .iter()
+            .filter(|upstream| {
+                upstream
+                    .health_checks
+                    .as_ref()
+                    .is_some_and(|hc| hc.active.is_some())
+            })
+            .map(|upstream| {
+                crate::config::db_backend::namespaced_runtime_key(&upstream.namespace, &upstream.id)
+            })
+            .collect();
+        self.upstream_probe_generation
+            .retain(|key, _| active_check_upstreams.contains(key));
 
         {
             let mut slot = match self.probe_shutdown_rx.lock() {
@@ -1520,13 +1540,18 @@ impl HealthChecker {
             new_handles.push(handle);
         }
 
+        // Extend, never replace: both lists were drained under the lifecycle
+        // guard above, so anything in them now was added by a concurrent
+        // `restart_upstream_probes` for this generation. Replacing would drop
+        // those tasks from every abort list while they keep probing
+        // (issue #7206).
         match self.active_check_handles.lock() {
-            Ok(mut guard) => *guard = new_handles,
-            Err(poisoned) => *poisoned.into_inner() = new_handles,
+            Ok(mut guard) => guard.extend(new_handles),
+            Err(poisoned) => poisoned.into_inner().extend(new_handles),
         }
         match self.active_check_aborts.lock() {
-            Ok(mut guard) => *guard = new_aborts,
-            Err(poisoned) => *poisoned.into_inner() = new_aborts,
+            Ok(mut guard) => guard.extend(new_aborts),
+            Err(poisoned) => poisoned.into_inner().extend(new_aborts),
         }
     }
 
@@ -1795,30 +1820,33 @@ impl HealthChecker {
             new_handles.push(handle);
         }
 
+        // Both callers retire this upstream's previous probes before
+        // spawning, so any set still registered here was published by a
+        // concurrent spawn (a full reload racing a service-discovery restart).
+        // Exactly one set may run per upstream: abort the one being replaced
+        // instead of orphaning it (issue #7206).
         let new_keys = probe_target_identity_keys(targets);
         if new_aborts.is_empty() {
-            match self.upstream_probe_aborts.lock() {
-                Ok(mut map) => {
-                    map.remove(&spec_key);
-                }
-                Err(poisoned) => {
-                    poisoned.into_inner().remove(&spec_key);
-                }
+            let replaced = match self.upstream_probe_aborts.lock() {
+                Ok(mut map) => map.remove(&spec_key),
+                Err(poisoned) => poisoned.into_inner().remove(&spec_key),
+            };
+            for abort in replaced.into_iter().flatten() {
+                abort.abort();
             }
             self.active_probe_upstreams.remove(&spec_key);
             self.upstream_probe_target_keys.remove(&spec_key);
             return (new_handles, new_aborts);
         }
 
-        match self.upstream_probe_aborts.lock() {
-            Ok(mut map) => {
-                map.insert(spec_key.clone(), new_aborts.clone());
-            }
-            Err(poisoned) => {
-                poisoned
-                    .into_inner()
-                    .insert(spec_key.clone(), new_aborts.clone());
-            }
+        let replaced = match self.upstream_probe_aborts.lock() {
+            Ok(mut map) => map.insert(spec_key.clone(), new_aborts.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .insert(spec_key.clone(), new_aborts.clone()),
+        };
+        for abort in replaced.into_iter().flatten() {
+            abort.abort();
         }
         self.active_probe_upstreams.insert(spec_key.clone(), ());
         self.upstream_probe_target_keys.insert(spec_key, new_keys);
@@ -2462,6 +2490,13 @@ impl HealthChecker {
             Ok(g) => g.iter().filter(|a| !a.is_finished()).count(),
             Err(p) => p.into_inner().iter().filter(|a| !a.is_finished()).count(),
         }
+    }
+
+    /// Test-only count of per-upstream probe generation cells.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn upstream_probe_generation_len_for_test(&self) -> usize {
+        self.upstream_probe_generation.len()
     }
 
     /// Test-only view of whether one active-probe state key is present.
@@ -3965,9 +4000,15 @@ enum HealthCheckClientError {
     /// off the egress-screened candidate set for the target being probed.
     DialPinUnavailable,
     /// `backend_tls_san_allow_list` could not be installed on the probe
-    /// verifier (invalid entries or the inner webpki verifier failed to build).
+    /// verifier (for example an invalid entry).
     /// Fail closed: a probe that cannot pin identity must not dial unpinned.
     SanPinningUnavailable(String),
+    /// The probe's TLS verifier or client could not be built for a reason
+    /// unrelated to a SAN allow-list (webpki/CRL verifier construction, the
+    /// shared rustls config builder, or the reqwest builder). Fail closed like
+    /// the other variants, but without pointing operators at a setting they
+    /// may not have configured (issue #7206).
+    VerifierUnavailable(String),
     /// This node refused the upstream's backend TLS material
     /// ([`BackendTlsConfig::tls_refused`]). Checked before anything else, so
     /// neither no-verify nor the global CA / client pair builds a probe that
@@ -3999,6 +4040,10 @@ impl std::fmt::Display for HealthCheckClientError {
             Self::SanPinningUnavailable(details) => write!(
                 f,
                 "backend TLS SAN allow-list could not be applied ({details})"
+            ),
+            Self::VerifierUnavailable(details) => write!(
+                f,
+                "backend TLS health-check client could not be built ({details})"
             ),
             Self::BackendTlsRefused => {
                 f.write_str("backend TLS for this upstream was refused on this node")
@@ -4164,7 +4209,7 @@ fn build_probe_server_verifier(
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
     let inner = build_server_verifier_with_crls(root_store, crls).map_err(|e| {
-        HealthCheckClientError::SanPinningUnavailable(format!(
+        HealthCheckClientError::VerifierUnavailable(format!(
             "failed to build probe server verifier: {e}"
         ))
     })?;
@@ -4215,7 +4260,7 @@ fn probe_rustls_client_config(
     client_auth: ProbeRustlsClientAuth,
 ) -> Result<rustls::ClientConfig, HealthCheckClientError> {
     let builder = backend_client_config_builder(None)
-        .map_err(|e| HealthCheckClientError::SanPinningUnavailable(e.to_string()))?;
+        .map_err(|e| HealthCheckClientError::VerifierUnavailable(e.to_string()))?;
     match verifier {
         ProbeServerVerifier::WebPki(verifier) => {
             finish_probe_client_auth(builder.with_webpki_verifier(verifier), client_auth)
@@ -4323,7 +4368,7 @@ fn build_health_check_client_with_rustls_verifier(
             ));
     }
     builder.build().map_err(|e| {
-        HealthCheckClientError::SanPinningUnavailable(format!(
+        HealthCheckClientError::VerifierUnavailable(format!(
             "verified health-check HTTP client could not be built: {e}"
         ))
     })

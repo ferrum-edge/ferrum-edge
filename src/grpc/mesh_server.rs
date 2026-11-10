@@ -666,12 +666,16 @@ impl MeshConfigSync for MeshGrpcServer {
                         "Refused MeshSubscribe: JWT audience does not match subscription purpose"
                     );
                 }
+                let audit_reason = match audience_reason {
+                    Some(reason) => reason.as_metric_label(),
+                    None => super::cp_server::tenant_authentication_rejection_reason(&status),
+                };
                 CpGrpcServer::audit_tenant_subscription(
                     "MeshConfigSync.MeshSubscribe",
                     &req.node_id,
                     &req.namespace,
                     "failure",
-                    status.message(),
+                    audit_reason,
                 );
                 return Err(status);
             }
@@ -686,7 +690,7 @@ impl MeshConfigSync for MeshGrpcServer {
                 &inner.node_id,
                 &inner.namespace,
                 "failure",
-                status.message(),
+                super::cp_server::tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
             );
             return Err(status);
         }
@@ -704,7 +708,7 @@ impl MeshConfigSync for MeshGrpcServer {
                 &identity.subject,
                 &inner.namespace,
                 "failure",
-                "node_id does not match authenticated subject",
+                super::cp_server::tenant_rejection_reason::NODE_ID_MISMATCH,
             );
             return Err(Status::permission_denied(
                 "MeshSubscribe node_id must match the authenticated JWT subject",
@@ -727,7 +731,7 @@ impl MeshConfigSync for MeshGrpcServer {
                     "",
                     &inner.namespace,
                     "failure",
-                    status.message(),
+                    rejection.metric_reason(),
                 );
                 return Err(status);
             }

@@ -3084,14 +3084,26 @@ fn build_resolver_with_cache_mode(
     *builder.options_mut() = resolver_opts;
     let mut resolver = builder.build().expect("failed to build DNS resolver");
 
-    // Load custom hosts file if specified
+    // Load custom hosts file if specified. A read error (for example a
+    // directory or a non-UTF-8 line) leaves a partial table, so it is
+    // reported and the resolver keeps its default hosts instead of a
+    // silently truncated replacement (issue #7204).
     if let Some(ref hosts_path) = config.hosts_file_path {
         match File::open(hosts_path) {
             Ok(file) => {
                 let mut hosts = hickory_resolver::Hosts::default();
-                let _ = hosts.read_hosts_conf(BufReader::new(file));
-                resolver.set_hosts(Arc::new(hosts));
-                info!("DNS: loaded custom hosts file from {}", hosts_path);
+                match hosts.read_hosts_conf(BufReader::new(file)) {
+                    Ok(()) => {
+                        resolver.set_hosts(Arc::new(hosts));
+                        info!("DNS: loaded custom hosts file from {}", hosts_path);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "DNS: failed to read custom hosts file '{}', not applied: {}",
+                            hosts_path, e
+                        );
+                    }
+                }
             }
             Err(e) => {
                 warn!(

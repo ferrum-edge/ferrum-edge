@@ -1517,6 +1517,42 @@ async fn test_restart_when_all_upstreams_removed() {
     );
 }
 
+/// Issue #7206: the per-upstream probe generation map keeps a cell only for
+/// upstreams that still have an active check, so generated upstream ids do
+/// not accumulate for the process lifetime.
+#[tokio::test]
+async fn test_restart_prunes_probe_generation_for_removed_upstreams() {
+    let checker = HealthChecker::new();
+
+    let initial = config_with_upstreams(vec![
+        make_upstream_with_active_probe("gen-keep", vec![make_target("gen-keep-host", 9401)], 60),
+        make_upstream_with_active_probe(
+            "gen-remove",
+            vec![make_target("gen-remove-host", 9402)],
+            60,
+        ),
+    ]);
+    checker.start(&initial);
+    assert_eq!(checker.upstream_probe_generation_len_for_test(), 2);
+
+    let after_remove = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "gen-keep",
+        vec![make_target("gen-keep-host", 9401)],
+        60,
+    )]);
+    checker.restart_with_shutdown(&after_remove, None);
+    assert_eq!(
+        checker.upstream_probe_generation_len_for_test(),
+        1,
+        "the removed upstream's generation cell must be pruned on reload"
+    );
+    assert_eq!(checker.active_task_count(), 1);
+
+    checker.restart_with_shutdown(&config_with_upstreams(vec![]), None);
+    assert_eq!(checker.upstream_probe_generation_len_for_test(), 0);
+    assert_eq!(checker.active_task_count(), 0);
+}
+
 // ─── Production start → take → restart ownership (issue #2383) ───────────────
 
 /// TCP accept counter used to observe whether a drained startup generation

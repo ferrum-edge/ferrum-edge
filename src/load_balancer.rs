@@ -7935,8 +7935,10 @@ impl LoadBalancer {
         Some(Arc::clone(best.1))
     }
 
-    /// Consistent hash — Vec fallback. Uses bitset for O(1) candidate
-    /// membership check instead of the previous O(candidates) linear scan.
+    /// Consistent hash — Vec fallback (more than 128 targets). Candidate
+    /// membership during the ring walk is a binary search on the
+    /// ascending-original-index candidate slice (see
+    /// [`resolve_wrr_vec_candidate`]), so selection allocates nothing.
     #[cfg(test)]
     fn select_consistent_hash_vec(
         &self,
@@ -7958,11 +7960,9 @@ impl LoadBalancer {
 
         let hash = fx_hash_str(ctx_key);
 
-        // Build a membership set for O(1) candidate check during ring walk.
-        // For the >128-target Vec fallback, use a HashSet.
-        let candidate_set: std::collections::HashSet<usize> =
-            candidates.iter().map(|(i, _)| *i).collect();
-
+        // Vec candidates keep ascending original-index order, so membership is
+        // an allocation-free binary search instead of a per-selection HashSet
+        // (issue #7207). A hit always names a real candidate.
         let pos = match hash_ring.binary_search_by_key(&hash, |&(h, _)| h) {
             Ok(p) => p,
             Err(p) => p % hash_ring.len(),
@@ -7971,8 +7971,8 @@ impl LoadBalancer {
         for i in 0..hash_ring.len() {
             let ring_idx = (pos + i) % hash_ring.len();
             let target_idx = hash_ring[ring_idx].1;
-            if candidate_set.contains(&target_idx) {
-                return Some(Arc::clone(&self.targets[target_idx]));
+            if let Some(target) = resolve_wrr_vec_candidate(candidates, target_idx) {
+                return Some(Arc::clone(target));
             }
         }
 
@@ -8353,6 +8353,47 @@ mod tests {
         let empty_candidates: Vec<(usize, &Arc<UpstreamTarget>)> = vec![];
         let result = lb.select_consistent_hash_vec("key", &empty_candidates);
         assert!(result.is_none());
+    }
+
+    /// Issue #7207: the Vec fallback's binary-search membership walk selects
+    /// exactly the first ring entry that is a candidate, as the previous
+    /// HashSet walk did.
+    #[test]
+    fn consistent_hash_vec_selects_first_candidate_on_ring() {
+        let targets: Vec<UpstreamTarget> = (0..200)
+            .map(|i| make_target(&format!("10.0.{}.{}", i / 250, i % 250), 8080))
+            .collect();
+        let lb = LoadBalancer::new(
+            "upstream-ch-vec",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        // Every third target, ascending original indices.
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = lb
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| idx % 3 == 0)
+            .collect();
+        for key in ["a", "client-1", "client-2", "198.51.100.7", "session-xyz"] {
+            let selected = lb
+                .select_consistent_hash_vec(key, &candidates)
+                .expect("candidates are non-empty");
+            let hash = fx_hash_str(key);
+            let pos = match lb.hash_ring.binary_search_by_key(&hash, |&(h, _)| h) {
+                Ok(p) => p,
+                Err(p) => p % lb.hash_ring.len(),
+            };
+            let expected = (0..lb.hash_ring.len())
+                .map(|i| lb.hash_ring[(pos + i) % lb.hash_ring.len()].1)
+                .find(|target_idx| target_idx % 3 == 0)
+                .expect("ring contains candidate targets");
+            assert!(
+                Arc::ptr_eq(&selected, &lb.targets[expected]),
+                "key {key} must select the first candidate clockwise on the ring"
+            );
+        }
     }
 
     /// Non-consistent-hash algorithms have an empty hash_ring by construction.

@@ -46,7 +46,7 @@ If a caller past its own stale window attempts a synchronous refresh and DNS fai
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `FERRUM_DNS_RESOLVER_ADDRESS` | `String` | System resolv.conf | Comma-separated nameserver addresses (`ip[:port]`). Supports IPv4 and IPv6. Port defaults to 53 if omitted. |
-| `FERRUM_DNS_RESOLVER_HOSTS_FILE` | `String` | `/etc/hosts` | Path to a custom hosts file. Entries in this file take priority over DNS queries. |
+| `FERRUM_DNS_RESOLVER_HOSTS_FILE` | `String` | `/etc/hosts` | Path to a custom hosts file. Entries in this file take priority over DNS queries. A file that cannot be opened or read (for example a non-UTF-8 line) is logged as a warning and not applied; the resolver keeps its default hosts table. |
 | `FERRUM_DNS_ORDER` | `String` | `CACHE,SRV,A,CNAME` | Comma-separated, case-insensitive list of DNS record types to query, in order. See [DNS Order](#dns-order) below. |
 | `FERRUM_DNS_TRY_TCP_ON_ERROR` | `bool` | `true` | Retry over TCP when a UDP DNS response is truncated (`TC` bit) or errors. |
 | `FERRUM_DNS_NUM_CONCURRENT_REQS` | `usize` | `3` | Number of nameservers queried concurrently per lookup (the fastest answer wins). Range: 1-10. |
