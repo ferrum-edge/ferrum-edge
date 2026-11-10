@@ -711,9 +711,9 @@ pub(crate) fn effective_response_media_type<'a>(
 ///
 /// This parses **exactly** the way the enforcer does — `serde_json::from_slice`
 /// over the same bytes, with no normalization. That symmetry is load-bearing: if
-/// the gate were more lenient than [`crate::plugins::utils::body_transform::apply_body_rules`]
+/// the gate were more lenient than `body_transform::apply_body_rules_bounded`
 /// (say, by stripping a UTF-8 BOM the enforcer chokes on), a body could pass the
-/// gate, fail to parse inside the transform, return `None`, and be forwarded
+/// gate, fail to parse inside the transform, return `Unchanged`, and be forwarded
 /// unredacted — which is precisely the `None`-conflation bypass this module
 /// exists to close. A BOM-prefixed body is therefore rejected rather than
 /// accommodated; RFC 8259 forbids emitting one, and fail-closed is the posture.

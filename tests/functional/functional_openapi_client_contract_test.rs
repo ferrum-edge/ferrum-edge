@@ -181,8 +181,8 @@ async fn openapi_client_contract_rejects_empty_bodyless_methods_on_h1_h2_h3() {
             // The client did not send `x-post-client-contract-bypass`. If H1/H2
             // skipped the client phase, `before_proxy` would add that header and
             // the later backend-final decision would bypass and forward 200. The
-            // empty body itself is not transformed (`apply_body_rules` returns
-            // `None` for an empty body), so the asserted 400 plus no backend
+            // empty body itself is not transformed (`apply_body_rules_bounded`
+            // returns `Unchanged` for an empty body), so the asserted 400 plus no backend
             // request proves the client contract ran before `before_proxy` and,
             // transitively, before any final body transform.
             harness
