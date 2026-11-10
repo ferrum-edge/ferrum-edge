@@ -212,7 +212,6 @@ fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2466,13 +2465,17 @@ fn unmatched_sni_route_classifies_as_dispatch_policy_rejected() {
 #[test]
 fn untyped_refused_substring_still_classifies_as_connection_refused() {
     // Defence: a bare anyhow whose Display contains "refused" is still a
-    // backend connect refusal. The typed SNI kind is what escapes that trap.
+    // backend connect refusal during setup. The typed SNI kind is what
+    // escapes that trap.
     let untyped =
         anyhow::anyhow!("SNI-routed stream listener on port 21582 refused connection (not_tls)");
     assert_eq!(
-        classify_stream_error(&untyped),
+        classify_stream_setup_error(&untyped),
         ErrorClass::ConnectionRefused
     );
+    // Issue #7213: the same text from the copy loop is not phase evidence and
+    // keeps the post-wire twin.
+    assert_eq!(classify_stream_error(&untyped), ErrorClass::ConnectionReset);
 }
 
 /// rustls accepts a trailing root dot in a received SNI and reports it from

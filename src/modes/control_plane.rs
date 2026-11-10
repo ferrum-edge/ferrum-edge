@@ -2668,6 +2668,13 @@ pub async fn run(
     // for a later mutation to lazily spawn the worker. A process that receives
     // no new mutations still has to drain the backlog it inherited.
     crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
+    // Age retention must also reach namespaces that stop receiving audit
+    // events; insert-path pruning alone never revisits them.
+    let audit_retention_sweep_handle = crate::admin::audit::start_retention_sweep(
+        env_config.audit_retention_days,
+        db.clone(),
+        shutdown_tx.subscribe(),
+    );
 
     let admin_state = AdminState {
         db: Some(db.clone()),
@@ -2707,7 +2714,6 @@ pub async fn run(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,
@@ -4284,6 +4290,9 @@ pub async fn run(
     if let Some(handle) = db_tls_reload_handle {
         background_handles.push(handle);
     }
+    if let Some(handle) = audit_retention_sweep_handle {
+        background_handles.push(handle);
+    }
     if let Some(handle) = trust_bundle_reload_handle {
         background_handles.push(handle);
     }
@@ -4667,7 +4676,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

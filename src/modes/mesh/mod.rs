@@ -667,7 +667,7 @@ impl MeshRuntimeConfig {
 
     pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let config_protocol = MeshConfigProtocol::parse(&env_config.mesh_config_protocol)?;
-        let cp_urls = env_config.resolved_dp_cp_grpc_urls();
+        let cp_urls = env_config.dp_cp_grpc_urls.clone();
         if config_protocol.requires_control_plane() && cp_urls.is_empty() {
             return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
         }
@@ -2918,7 +2918,6 @@ fn node_waypoint_udp_listener_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
@@ -4680,7 +4679,6 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -5270,7 +5268,6 @@ fn east_west_service_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -7429,7 +7426,6 @@ fn mesh_inbound_loopback_proxy_to(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -7526,7 +7522,6 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -7658,7 +7653,6 @@ fn mesh_inbound_connect_relay_proxy(id: &str, host: &str, port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -8880,7 +8874,6 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -10261,7 +10254,6 @@ fn mesh_outbound_route_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -13373,7 +13365,6 @@ fn egress_gateway_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -13475,7 +13466,6 @@ fn stream_egress_gateway_proxy(
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         // Derived-only: projected from DestinationRule port overrides at
         // dispatch time via `resolve_effective_proxy_for_target`; a
         // freshly-materialized mesh proxy starts at `None`.
@@ -17580,7 +17570,6 @@ fn start_mesh_admin_listeners(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,
@@ -31226,13 +31215,15 @@ mod tests {
             .expect("port 8080 override");
         assert_eq!(port_8080.connect_timeout_ms, Some(2222));
         assert_eq!(port_8080.algorithm, Some(LoadBalancerAlgorithm::Random));
-
-        // Proof that the override is actually consulted at dispatch time via
-        // the helper the hot path uses — port 8080 wins, other ports fall
-        // back to the proxy default.
-        let upstream = &config.upstreams[0];
-        assert_eq!(upstream.effective_connect_timeout_ms(8080, 1111), 2222);
-        assert_eq!(upstream.effective_connect_timeout_ms(9090, 1111), 1111);
+        // Other ports carry no connect-timeout override, so dispatch keeps the
+        // proxy default.
+        assert!(
+            config.upstreams[0]
+                .port_overrides
+                .get(&9090)
+                .and_then(|ovr| ovr.connect_timeout_ms)
+                .is_none()
+        );
     }
 
     #[test]
@@ -31316,14 +31307,14 @@ mod tests {
             Some(LoadBalancerAlgorithm::ConsistentHashing)
         );
         assert_eq!(p9090.hash_on.as_deref(), Some("header:x-user"));
-
-        // Effective-timeout helper is what the dispatch hot path consults.
-        // Each port's own override wins; an unrelated port falls back to the
-        // proxy default (here passed in as 5000ms).
-        let upstream = &config.upstreams[0];
-        assert_eq!(upstream.effective_connect_timeout_ms(8080, 5000), 750);
-        assert_eq!(upstream.effective_connect_timeout_ms(9090, 5000), 3000);
-        assert_eq!(upstream.effective_connect_timeout_ms(7777, 5000), 5000);
+        // An unrelated port carries no connect-timeout override.
+        assert!(
+            config.upstreams[0]
+                .port_overrides
+                .get(&7777)
+                .and_then(|ovr| ovr.connect_timeout_ms)
+                .is_none()
+        );
     }
 
     #[test]

@@ -961,14 +961,12 @@ pub(crate) fn check_circuit_breaker(
         // concurrent open racing this admission can only make the outcome look
         // stale, never too-new (#1649 R6 finding 3), and a probe guard bound to it
         // cannot release a later cycle's slot (#6177).
-        match state
-            .circuit_breaker_cache
-            .can_execute_with_admission_epoch(
-                &proxy.namespace,
-                &proxy.id,
-                cb_target_key.as_deref(),
-                cb_config,
-            ) {
+        match state.circuit_breaker_cache.can_execute(
+            &proxy.namespace,
+            &proxy.id,
+            cb_target_key.as_deref(),
+            cb_config,
+        ) {
             // Keep the admitting breaker: the attempt's outcome and probe slot
             // settle on exactly this instance (issue #6799), never on one
             // re-resolved later from the request's captured config.

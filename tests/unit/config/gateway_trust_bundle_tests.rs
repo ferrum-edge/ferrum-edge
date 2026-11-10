@@ -19,6 +19,7 @@
 //!    deterministic simulator that reproduces the interleaving exactly.
 
 use crate::unit::gateway_trust_observability_lock::lock_gateway_trust_observability;
+use ferrum_edge::config::db_backend::IncrementalResult;
 use ferrum_edge::config::gateway_trust::{
     AMBIGUOUS_TRUST_AUTHORITY_MESSAGE, GatewayTrustBundleIdentity, GatewayTrustBundleRecord,
     GatewayTrustDriftSource, GatewayTrustFailureReason, GatewayTrustPublication,
@@ -32,6 +33,7 @@ use ferrum_edge::config::gateway_trust::{
     trust_generation_fingerprint,
 };
 use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::identity::ca::PublishedJwtAuthority;
 use ferrum_edge::identity::jwt_svid::jwks_document;
@@ -659,90 +661,53 @@ fn the_summary_carries_counts_and_never_material() {
 
 // ── Publication semantics ───────────────────────────────────────────────────
 
-#[test]
-fn a_snapshot_always_states_the_complete_current_state() {
-    let record = valid_record();
-
-    // Present → Replace, so a reconnecting data plane reconstructs trust from
-    // the snapshot alone.
-    let replace = GatewayTrustPublication::for_snapshot(Some(&record));
-    assert!(matches!(replace, GatewayTrustPublication::Replace(_)));
-    let json = replace
-        .to_side_channel_json()
-        .expect("a valid bundle serializes");
-    assert!(json.contains("cluster.local"));
-
-    // Absent → Clear, NOT Unchanged: a namespace with no record must actively
-    // withdraw anything a subscriber applied earlier.
-    let clear = GatewayTrustPublication::for_snapshot(None);
-    assert_eq!(clear, GatewayTrustPublication::Clear);
-    assert_eq!(
-        clear.to_side_channel_json().expect("clear serializes"),
-        "null"
+/// Encode one delta publication through the production CP broadcast path and
+/// return the side-channel value a subscriber would receive.
+fn delta_side_channel(trust: GatewayTrustPublication<'_>) -> String {
+    let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 0,
+        poll_timestamp: chrono::Utc::now(),
+    };
+    let version = delta.poll_timestamp.to_rfc3339();
+    assert!(
+        CpGrpcServer::broadcast_delta_with_trust_bundles(&tx, &delta, &version, trust),
+        "a valid delta publication must be delivered"
     );
+    rx.try_recv()
+        .expect("the delta reaches the subscriber channel")
+        .trust_bundles_json
 }
 
 #[test]
-fn unchanged_and_clear_are_distinguishable_on_the_wire() {
+fn unchanged_clear_and_replace_are_distinguishable_on_the_wire() {
     // This is the regression the resource exists to prevent: before issue
     // #3727 the delta path encoded "no trust to say" as JSON `null`, which the
     // data plane reads as an explicit revocation.
     assert_eq!(
-        GatewayTrustPublication::Unchanged
-            .to_side_channel_json()
-            .expect("unchanged serializes"),
+        delta_side_channel(GatewayTrustPublication::Unchanged),
         "",
         "'nothing to say' must be an EMPTY side channel"
     );
     assert_eq!(
-        GatewayTrustPublication::Clear
-            .to_side_channel_json()
-            .expect("clear serializes"),
+        delta_side_channel(GatewayTrustPublication::Clear),
         "null",
         "'revoke' must be JSON null"
     );
-}
-
-#[test]
-fn a_delta_publication_distinguishes_no_change_rotation_and_revocation() {
-    let previous = valid_record();
-
-    // Untouched namespace: say nothing.
-    assert_eq!(
-        GatewayTrustPublication::for_delta(Some(&previous), Some(&previous)),
-        GatewayTrustPublication::Unchanged
+    let record = valid_record();
+    let replace = delta_side_channel(GatewayTrustPublication::Replace(&record.bundle));
+    assert!(
+        replace.contains("cluster.local"),
+        "'install' must carry the serialized bundle set"
     );
-
-    // Never had one, still does not: say nothing (NOT a clear — an absent
-    // record must not repeatedly revoke).
-    assert_eq!(
-        GatewayTrustPublication::for_delta(None, None),
-        GatewayTrustPublication::Unchanged
-    );
-
-    // Rotation: same identity, new revision and material.
-    let mut rotated = previous.clone();
-    rotated.revision = previous.revision + 1;
-    rotated.bundle.local.x509_authorities = vec![
-        previous.bundle.local.x509_authorities[0].clone(),
-        root_ca_der_base64("rotated-root"),
-    ];
-    assert!(matches!(
-        GatewayTrustPublication::for_delta(Some(&previous), Some(&rotated)),
-        GatewayTrustPublication::Replace(_)
-    ));
-
-    // Revocation: the record went away.
-    assert_eq!(
-        GatewayTrustPublication::for_delta(Some(&previous), None),
-        GatewayTrustPublication::Clear
-    );
-
-    // First publication for a namespace that had none.
-    assert!(matches!(
-        GatewayTrustPublication::for_delta(None, Some(&previous)),
-        GatewayTrustPublication::Replace(_)
-    ));
 }
 
 // ── Authority precedence ────────────────────────────────────────────────────

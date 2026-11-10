@@ -17,7 +17,7 @@
 //! - An unsupported escape (e.g. `$x` where `x` is not `$` or `{`) is left
 //!   as-is — `$` followed by a non-special character is common in templates.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 /// Render `template` by substituting `${var}` placeholders from `vars`.
@@ -224,44 +224,8 @@ fn truncate_string_to_budget(out: &mut String, budget: usize) {
     }
 }
 
-/// Inspect `template` and return the set of variable names it references
-/// (excluding any in `known`). Useful for warning the operator about typos
-/// at plugin construction time without aborting startup.
-///
-/// Returns `Err` on unbalanced `${`.
-#[allow(dead_code)] // Public helper for callers that want a one-shot
-// "did the operator typo a placeholder?" check at construction.
-pub fn unknown_variables(template: &str, known: &HashSet<&str>) -> Result<Vec<String>, String> {
-    let mut unknown = Vec::new();
-    let mut i = 0;
-    while i < template.len() {
-        let rest = &template[i..];
-        if rest.starts_with("$$") {
-            i += 2;
-            continue;
-        }
-        if let Some(after_open) = rest.strip_prefix("${") {
-            let close = after_open.find('}').ok_or_else(|| {
-                format!("template: unbalanced '${{' starting at byte offset {}", i)
-            })?;
-            let name = &after_open[..close];
-            if !known.contains(name) && !unknown.iter().any(|n: &String| n == name) {
-                unknown.push(name.to_string());
-            }
-            i += 2 + close + 1;
-            continue;
-        }
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        i += ch.len_utf8();
-    }
-    Ok(unknown)
-}
-
 /// Dry-run `template`: returns `Ok(())` when it is well-formed (balanced
-/// braces). Unknown variables are NOT errors and are not reported;
-/// [`unknown_variables`] can list them, but no production caller uses it.
+/// braces). Unknown variables are NOT errors and are not reported.
 pub fn validate_template(template: &str) -> Result<(), String> {
     let mut i = 0;
     while i < template.len() {

@@ -1094,3 +1094,71 @@ fn admin_namespace_claim_derivation_matches_cp_scope() {
         "a cluster-wide CP engages enforcement without the env flag"
     );
 }
+
+/// Headers of every block enclosing byte offset `at` in `source`, innermost
+/// first. A header is the text between the previous statement boundary
+/// (`;`, `{` or `}`) and the block's opening brace.
+fn enclosing_block_headers(source: &str, at: usize) -> Vec<&str> {
+    let bytes = source.as_bytes();
+    let mut headers = Vec::new();
+    let mut depth = 0usize;
+    let mut index = at;
+    while index > 0 {
+        index -= 1;
+        match bytes[index] {
+            b'}' => depth += 1,
+            b'{' if depth > 0 => depth -= 1,
+            b'{' => {
+                let header_start = source[..index]
+                    .rfind([';', '{', '}'])
+                    .map_or(0, |boundary| boundary + 1);
+                headers.push(&source[header_start..index]);
+            }
+            _ => {}
+        }
+    }
+    headers
+}
+
+/// Issue #7216: `/health` builds its detail-only blocks (pool stats, failover
+/// topology, admission fences, cached config, polling detail, mesh state) only
+/// for the authenticated detailed tier. Unauthenticated probes receive just
+/// `status` + `ready`, so they must not pay for work whose result is
+/// discarded. These blocks have no observable effect on the minimal body, so
+/// the gate is pinned structurally: each call sits inside a block whose header
+/// tests `detailed`.
+#[test]
+fn health_detail_blocks_are_built_only_for_the_detailed_tier() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    let health = admin_source_section(
+        source,
+        "if path == \"/health\" || path == \"/status\" {",
+        "// Overload status.",
+    );
+    for call in [
+        "db.pool_stats()",
+        "db.failover_topology_status()",
+        "db.mtls_dns_admission_fence_status()",
+        "state.cached_gateway_config()",
+        "\"database_polling\"",
+        "egress_scope_state()",
+        "crate::fips::status_metadata()",
+        "failures.snapshot()",
+    ] {
+        let at = health
+            .find(call)
+            .unwrap_or_else(|| panic!("/health no longer calls {call}"));
+        // The call may sit in its own block's condition
+        // (`if detailed && let Some(..) = call {`) or inside a gated block.
+        let statement_start = health[..at]
+            .rfind([';', '{', '}'])
+            .map_or(0, |boundary| boundary + 1);
+        let statement = &health[statement_start..at];
+        let headers = enclosing_block_headers(health, at);
+        assert!(
+            statement.contains("detailed")
+                || headers.iter().any(|header| header.contains("detailed")),
+            "{call} must be built only inside a `detailed` gate; enclosing headers: {headers:?}"
+        );
+    }
+}

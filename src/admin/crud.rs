@@ -276,9 +276,6 @@ pub(crate) struct LeaseRenewalCounters {
     /// Attempts abandoned on a datastore error or the per-attempt timeout and
     /// re-issued inside the same window.
     pub(crate) retries: u32,
-    /// Always zero: a keeper must never re-acquire a released or absent row.
-    /// Retained for the external renewal test observation.
-    pub(crate) reclaims: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -412,7 +409,6 @@ where
                     namespace = %namespace,
                     renewals = counters.renewals,
                     retries = counters.retries,
-                    reclaims = counters.reclaims,
                     detail_withheld = true,
                     "Namespace config admission lease expired before any renewal attempt could complete; failing closed"
                 );

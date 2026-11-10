@@ -807,13 +807,22 @@ fn test_grpc_response_too_large_classified_as_backend_failure() {
 
 // --- classify_boxed_error tests (WebSocket / generic errors) ---
 
+// The substring fallback is phase-gated like the typed walk (issues #4536,
+// #7213): the error TEXT is not phase evidence, so the pre-wire verdicts are
+// issued only through the setup-phase entry point and the post-connect entry
+// point maps them to their post-wire twins.
+
 #[test]
 fn test_boxed_error_connect_timeout() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "WebSocket backend connect timeout (5000ms) for proxy ws-1".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::ConnectionTimeout
+    );
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ReadWriteTimeout
     );
 }
 
@@ -821,25 +830,43 @@ fn test_boxed_error_connect_timeout() {
 fn test_boxed_error_timed_out() {
     let err: Box<dyn std::error::Error + Send + Sync> = "operation timed out".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::ConnectionTimeout
     );
+    let post = classify_boxed_error(err.as_ref());
+    assert_eq!(post, ErrorClass::ReadWriteTimeout);
+    assert!(ferrum_edge::retry::request_reached_wire(post));
 }
 
 #[test]
 fn test_boxed_error_connection_refused() {
     let err: Box<dyn std::error::Error + Send + Sync> = "Connection refused (os error 111)".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::ConnectionRefused
     );
+    let post = classify_boxed_error(err.as_ref());
+    assert_eq!(
+        post,
+        ErrorClass::ConnectionReset,
+        "a stringified ECONNREFUSED after the connect phase (an ICMP port-unreachable \
+         on a connected UDP socket) must not read as a pre-wire refusal"
+    );
+    assert!(ferrum_edge::retry::request_reached_wire(post));
 }
 
 #[test]
 fn test_boxed_error_tls() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "TLS handshake failed: certificate verify failed".into();
-    assert_eq!(classify_boxed_error(err.as_ref()), ErrorClass::TlsError);
+    assert_eq!(
+        classify_boxed_setup_error(err.as_ref()),
+        ErrorClass::TlsError
+    );
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionReset
+    );
 }
 
 #[test]
@@ -967,9 +994,14 @@ fn test_boxed_error_port_exhaustion_linux() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "Backend connect failed: Can't assign requested address (os error 99)".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::PortExhaustion
     );
+    // Only a dial can exhaust ephemeral ports: the same text after the
+    // connect phase is not claimed as the pre-wire class.
+    let post = classify_boxed_error(err.as_ref());
+    assert_ne!(post, ErrorClass::PortExhaustion);
+    assert!(ferrum_edge::retry::request_reached_wire(post));
 }
 
 #[test]
@@ -977,9 +1009,12 @@ fn test_boxed_error_port_exhaustion_macos() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "Backend connect failed: Can't assign requested address (os error 49)".into();
     assert_eq!(
-        classify_boxed_error(err.as_ref()),
+        classify_boxed_setup_error(err.as_ref()),
         ErrorClass::PortExhaustion
     );
+    let post = classify_boxed_error(err.as_ref());
+    assert_ne!(post, ErrorClass::PortExhaustion);
+    assert!(ferrum_edge::retry::request_reached_wire(post));
 }
 
 #[test]
@@ -1867,6 +1902,51 @@ fn test_classify_boxed_setup_error_ws_io_econnrefused_stays_pre_wire() {
 }
 
 #[test]
+fn test_classify_boxed_error_ws_session_io_errno_stays_post_wire() {
+    // Issue #7213: the `WsError::Io` ECONNREFUSED / EADDRNOTAVAIL exceptions
+    // are pre-wire only when the CALLER is dialing. On an established
+    // WebSocket session (`classify_boxed_error`) the same errno proves
+    // nothing about the request and must keep the post-wire twin.
+    let refused: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+        ));
+    let post = classify_boxed_error(&*refused);
+    assert_eq!(post, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(post));
+
+    for raw in [99, 49, 10049] {
+        let exhausted: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            tokio_tungstenite::tungstenite::Error::Io(std::io::Error::from_raw_os_error(raw)),
+        );
+        assert_eq!(
+            classify_boxed_setup_error(&*exhausted),
+            ErrorClass::PortExhaustion,
+            "raw_os_error({raw}) during the WebSocket dial is port exhaustion"
+        );
+        let post = classify_boxed_error(&*exhausted);
+        assert_ne!(post, ErrorClass::PortExhaustion);
+        assert!(
+            ferrum_edge::retry::request_reached_wire(post),
+            "raw_os_error({raw}) on a live WebSocket session must be post-wire (got {post:?})"
+        );
+    }
+}
+
+#[test]
+fn test_classify_body_error_eaddrnotavail_is_post_wire_backend_failure() {
+    // Issue #7213: a body error is post-headers, so EADDRNOTAVAIL there is
+    // never a dial's port exhaustion; it is charged as a post-wire reset.
+    for raw in [99, 49, 10049] {
+        let io_err = std::io::Error::from_raw_os_error(raw);
+        let (class, disconnected) = classify_body_error(&io_err);
+        assert_eq!(class, ErrorClass::ConnectionReset, "raw_os_error({raw})");
+        assert!(!disconnected);
+        assert!(ferrum_edge::retry::request_reached_wire(class));
+    }
+}
+
+#[test]
 fn h3_mesh_websocket_invalid_request_target_is_policy_rejection() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         WS_MESH_BACKEND_REQUEST_TARGET_INVALID.into();
@@ -2365,8 +2445,8 @@ fn test_classify_body_error_unexpected_eof_is_connection_closed() {
 
 #[test]
 fn test_substring_fallback_matches_capitalized_os_wording() {
-    // Several stream paths stringify io::Error before classifying (TCP
-    // fast-path copy errors, UDP backend recv/send errors). The OS wording
+    // Some stream paths stringify io::Error before classifying (TCP
+    // fast-path copy errors). The OS wording
     // from `io::Error::Display` is capitalized — `Connection reset by peer`,
     // `Broken pipe`, `Connection aborted`. The substring fallback must
     // recognize both lowercase application wording AND the capitalized
@@ -2491,7 +2571,9 @@ fn test_substring_fallback_anchored_tls_handshake() {
     // bare `"tls"` was the false-positive risk, not full phrases.
     let err: Box<dyn std::error::Error + Send + Sync> =
         "outbound request failed: tls handshake aborted by peer".into();
-    assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
+    assert_eq!(classify_boxed_setup_error(&*err), ErrorClass::TlsError);
+    // Post-connect, the TLS token is not phase evidence (issue #7213).
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::ConnectionReset);
 }
 
 #[test]

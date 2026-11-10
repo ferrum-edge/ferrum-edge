@@ -1378,7 +1378,13 @@ async fn shared_secret_quarantine_blocks_cross_consumer_impersonation() {
     let mut ctx = bearer_ctx(&forged);
     assert_continue(plugin.authenticate(&mut ctx, &unquarantined).await);
 
-    assert_eq!(config.quarantine_invalid_jwt_credentials().len(), 2);
+    assert_eq!(
+        config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages
+            .len(),
+        2
+    );
     let index = ConsumerIndex::new(&config.consumers);
     for sub in ["alice", "eve"] {
         let mut ctx = bearer_ctx(&create_jwt_token(&json!({ "sub": sub }), shared));

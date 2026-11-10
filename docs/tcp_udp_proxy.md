@@ -400,7 +400,7 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
 ### DTLS and the TLS policy
 
 `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`, `FERRUM_TLS_CIPHER_SUITES` and
-`FERRUM_TLS_KEY_EXCHANGE_GROUPS` (alias `FERRUM_TLS_CURVES`) are documented as applying
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS` are documented as applying
 "inbound + outbound", and that includes every DTLS surface (issue #4507): the frontend
 DTLS listener, the DTLS live-reload rebuild, the generated NodeWaypoint DTLS listeners,
 and the backend DTLS client. The policy is resolved once at startup (and again on each

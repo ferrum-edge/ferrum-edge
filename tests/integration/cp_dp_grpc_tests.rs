@@ -162,7 +162,6 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -8351,10 +8350,11 @@ mod configsync_size_bounds {
     /// so a failed wait says what happened instead of timing out bare
     /// (issue #5730).
     ///
-    /// `connect_and_subscribe_with_startup_ready` runs exactly one subscription
-    /// and returns on ANY stream end, a refused snapshot included, so a
-    /// finished DP task is terminal and is reported at once rather than after
-    /// the rest of the budget. The report names the generation the DP serves,
+    /// The DP runs the production reconnect loop
+    /// (`start_dp_client_with_shutdown_and_startup_ready`), which never returns
+    /// on its own, so a finished DP task (a panic) is terminal and is reported
+    /// at once rather than after the rest of the budget. The report names the
+    /// generation the DP serves,
     /// the task outcome, the connection state, whether the CP still holds the
     /// subscription, and the DP's own ConfigSync log, which records every
     /// update it received and why a refused one ended the stream.
@@ -8463,16 +8463,17 @@ mod configsync_size_bounds {
         let dp_subscriber = logs.subscriber();
         let mut dp_task = tokio::spawn(
             async move {
-                dp_client::connect_and_subscribe_with_startup_ready(
-                    &format!("http://{cp_addr}"),
-                    &test_secret(),
-                    "size-bound-dp",
-                    &dp_state,
+                dp_client::start_dp_client_with_shutdown_and_startup_ready(
+                    vec![format!("http://{cp_addr}")],
+                    test_secret(),
+                    dp_state,
+                    None,
+                    None,
                     None,
                     Some(dp_ready),
-                    "ferrum",
-                    Some(&dp_connection),
-                    true,
+                    "ferrum".to_string(),
+                    0,
+                    Some(dp_connection),
                     None,
                 )
                 .await

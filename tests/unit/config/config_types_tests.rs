@@ -54,7 +54,6 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
@@ -425,11 +424,7 @@ fn upstream_port_override_connection_pool_http_fields_round_trip_through_serde()
     let default_override = UpstreamPortOverride::default();
     let default_json = serde_json::to_value(&default_override).expect("serialize default");
     let object = default_json.as_object().expect("object");
-    for field in [
-        "http_max_requests_per_connection",
-        "http_idle_timeout_ms",
-        "h2_max_concurrent_streams",
-    ] {
+    for field in ["http_idle_timeout_ms", "h2_max_concurrent_streams"] {
         assert!(
             !object.contains_key(field),
             "UpstreamPortOverride.{field} must be omitted when None (wire compatibility)"
@@ -439,17 +434,12 @@ fn upstream_port_override_connection_pool_http_fields_round_trip_through_serde()
     // Round-trip with each field set independently — verifies that partial
     // overlays don't auto-fill the other fields.
     let override_with_http = UpstreamPortOverride {
-        http_max_requests_per_connection: Some(100),
         http_idle_timeout_ms: Some(90_000),
         h2_max_concurrent_streams: Some(500),
         ..UpstreamPortOverride::default()
     };
     let json = serde_json::to_value(&override_with_http).expect("serialize override");
     let object = json.as_object().expect("object");
-    assert_eq!(
-        object.get("http_max_requests_per_connection"),
-        Some(&serde_json::json!(100))
-    );
     assert_eq!(
         object.get("http_idle_timeout_ms"),
         Some(&serde_json::json!(90_000))
@@ -461,7 +451,6 @@ fn upstream_port_override_connection_pool_http_fields_round_trip_through_serde()
 
     let round_tripped: UpstreamPortOverride =
         serde_json::from_value(json).expect("round-trip override");
-    assert_eq!(round_tripped.http_max_requests_per_connection, Some(100));
     assert_eq!(round_tripped.http_idle_timeout_ms, Some(90_000));
     assert_eq!(round_tripped.h2_max_concurrent_streams, Some(500));
 }
@@ -516,7 +505,6 @@ fn resolved_port_override_from_upstream_override_projects_http_fields() {
     use ferrum_edge::config::types::{ResolvedPortOverride, UpstreamPortOverride};
 
     let port_override = UpstreamPortOverride {
-        http_max_requests_per_connection: Some(40),
         http_idle_timeout_ms: Some(60_000),
         h2_max_concurrent_streams: Some(250),
         ..UpstreamPortOverride::default()
@@ -524,7 +512,6 @@ fn resolved_port_override_from_upstream_override_projects_http_fields() {
 
     let resolved = ResolvedPortOverride::from_upstream_override(&port_override)
         .expect("non-empty overlay produces Some");
-    assert_eq!(resolved.http_max_requests_per_connection, Some(40));
     assert_eq!(resolved.http_idle_timeout_ms, Some(60_000));
     assert_eq!(resolved.h2_max_concurrent_streams, Some(250));
 
@@ -535,40 +522,6 @@ fn resolved_port_override_from_upstream_override_projects_http_fields() {
         ResolvedPortOverride::from_upstream_override(&empty).is_none(),
         "empty overlay must collapse to None"
     );
-}
-
-#[test]
-fn seed_connection_pool_http_from_fallback_merges_field_by_field() {
-    use ferrum_edge::config::types::ResolvedPortOverride;
-
-    // Per-port entry sets connectTimeout + one connectionPool.http field; the
-    // remaining http fields must be inherited from the SD top-level fallback and
-    // the per-port-set field must win. Non-http fields are untouched. This is the
-    // exact field-level merge `resolve_effective_proxy_for_target` performs for
-    // an SD upstream under Ferrum's documented connectionPool semantics.
-    let mut per_port = ResolvedPortOverride {
-        connect_timeout_ms: Some(750),
-        h2_max_concurrent_streams: Some(10),
-        ..ResolvedPortOverride::default()
-    };
-    let fallback = ResolvedPortOverride {
-        h2_max_concurrent_streams: Some(64),
-        http_idle_timeout_ms: Some(120_000),
-        max_retries: Some(2),
-        http1_max_pending_requests: Some(32),
-        ..ResolvedPortOverride::default()
-    };
-
-    per_port.seed_connection_pool_http_from_fallback(&fallback);
-
-    // Per-port field wins.
-    assert_eq!(per_port.h2_max_concurrent_streams, Some(10));
-    // Unset http fields inherited from the fallback.
-    assert_eq!(per_port.http_idle_timeout_ms, Some(120_000));
-    assert_eq!(per_port.max_retries, Some(2));
-    assert_eq!(per_port.http1_max_pending_requests, Some(32));
-    // Non-connectionPool.http field untouched (fallback never carries it).
-    assert_eq!(per_port.connect_timeout_ms, Some(750));
 }
 
 #[test]
@@ -1474,7 +1427,6 @@ fn test_unique_listen_paths_valid() {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -1543,7 +1495,6 @@ fn test_unique_listen_paths_valid() {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -1628,7 +1579,6 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -1697,7 +1647,6 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -1995,7 +1944,11 @@ fn test_unique_consumer_credentials_rejects_jwt_secret_shared_across_consumers()
         !errors[0].contains(secret),
         "the secret must never be echoed"
     );
-    assert!(config.validate_unique_jwt_credentials().is_err());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "eve"])
+            .is_err()
+    );
 }
 
 #[test]
@@ -2011,7 +1964,11 @@ fn test_unique_jwt_credentials_rejects_collision_introduced_by_a_rotation_entry(
         ),
     ];
 
-    assert!(config.validate_unique_jwt_credentials().is_err());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "eve"])
+            .is_err()
+    );
     assert!(config.validate_unique_consumer_credentials().is_err());
 }
 
@@ -2025,9 +1982,18 @@ fn test_unique_jwt_credentials_allow_same_consumer_rotation_and_other_namespaces
     let mut config = empty_config();
     config.consumers = vec![tenant_a, tenant_b];
 
-    assert!(config.validate_unique_jwt_credentials().is_ok());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "bob"])
+            .is_ok()
+    );
     assert!(config.validate_unique_consumer_credentials().is_ok());
-    assert!(config.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages
+            .is_empty()
+    );
     assert!(
         config
             .consumers
@@ -2081,7 +2047,9 @@ fn test_quarantine_jwt_strips_shared_secret_from_every_holder() {
         jwt_consumer("mallory", "mallory", &[secret]),
     ];
 
-    let messages = config.quarantine_invalid_jwt_credentials();
+    let messages = config
+        .quarantine_invalid_jwt_credentials_against(&Default::default())
+        .messages;
     assert_eq!(messages.len(), 3, "{messages:?}");
     assert!(messages.iter().all(|message| !message.contains(secret)));
     let holders: Vec<(&str, bool)> = config
@@ -2100,7 +2068,11 @@ fn test_quarantine_jwt_strips_shared_secret_from_every_holder() {
             ("mallory", false)
         ]
     );
-    assert!(config.validate_unique_jwt_credentials().is_ok());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "bob", "eve", "mallory"])
+            .is_ok()
+    );
 }
 
 #[test]
@@ -2126,7 +2098,9 @@ fn test_quarantine_jwt_strips_weak_or_malformed_credentials() {
         let mut config = empty_config();
         config.consumers = vec![consumer];
 
-        let messages = config.quarantine_invalid_jwt_credentials();
+        let messages = config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages;
         assert_eq!(messages.len(), 1, "shape not quarantined: {shape}");
         assert!(!messages[0].contains("test-jwt-secret"));
         assert!(!config.consumers[0].credentials.contains_key("jwt"));
@@ -2158,7 +2132,9 @@ fn test_quarantine_jwt_counts_holders_whose_own_credential_is_malformed() {
             jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
         ];
 
-        let messages = config.quarantine_invalid_jwt_credentials();
+        let messages = config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages;
         assert_eq!(messages.len(), 2, "eve shape {eve_shape}: {messages:?}");
         assert!(messages.iter().all(|message| !message.contains(shared)));
         assert!(
@@ -2197,7 +2173,11 @@ fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
     // Generation 2: a point delta re-delivers Alice with the same secret on
     // top of the stripped snapshot (Eve's stripped credential is gone).
     config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
-    assert!(config.validate_unique_jwt_credentials().is_ok());
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice", "eve"])
+            .is_ok()
+    );
     let messages = config
         .quarantine_invalid_jwt_credentials_against(&history)
         .messages;
@@ -2209,7 +2189,12 @@ fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
     // Without history (a fresh authoritative load) the same snapshot passes.
     config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
     let mut fresh = config.clone();
-    assert!(fresh.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        fresh
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages
+            .is_empty()
+    );
 
     // A new distinct secret restores Alice, and the history is namespace
     // bound: another namespace may still use the once-shared value.
@@ -2489,7 +2474,12 @@ fn test_quarantine_jwt_keeps_strong_secrets_and_legacy_selector_fields() {
         jwt_consumer("strong", "strong", &[strong_secret.as_str()]),
     ];
 
-    assert!(config.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        config
+            .quarantine_invalid_jwt_credentials_against(&Default::default())
+            .messages
+            .is_empty()
+    );
     assert!(
         config
             .consumers

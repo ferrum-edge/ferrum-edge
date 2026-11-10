@@ -3363,7 +3363,7 @@ pub struct UdpListenerConfig {
     pub backend_tls_reload_epoch: Arc<AtomicU64>,
     /// Gateway TLS hardening policy (`FERRUM_TLS_MIN_VERSION` /
     /// `FERRUM_TLS_MAX_VERSION` / `FERRUM_TLS_CIPHER_SUITES` /
-    /// `FERRUM_TLS_CURVES`) applied to backend DTLS configs built by this
+    /// `FERRUM_TLS_KEY_EXCHANGE_GROUPS`) applied to backend DTLS configs built by this
     /// listener (issue #4507). `None` keeps the DTLS stack's own defaults;
     /// every serving mode supplies `Some`.
     pub tls_policy: Option<Arc<crate::tls::TlsPolicy>>,
@@ -9362,9 +9362,7 @@ async fn create_session(
                         let error_message = e.to_string();
                         disconnect_error = Some((
                             error_message.clone(),
-                            crate::retry::classify_boxed_error(
-                                anyhow::anyhow!(error_message).as_ref(),
-                            ),
+                            crate::retry::classify_boxed_error(e.as_ref()),
                             crate::plugins::DisconnectCause::BackendError,
                             crate::plugins::Direction::BackendToClient,
                         ));
@@ -9411,9 +9409,7 @@ async fn create_session(
                         let error_message = e.to_string();
                         disconnect_error = Some((
                             error_message.clone(),
-                            crate::retry::classify_boxed_error(
-                                anyhow::anyhow!(error_message).as_ref(),
-                            ),
+                            crate::retry::classify_boxed_error(&e),
                             crate::plugins::DisconnectCause::BackendError,
                             crate::plugins::Direction::BackendToClient,
                         ));
@@ -9670,9 +9666,7 @@ async fn create_session(
                         // attribute the session teardown to the client recv path.
                         disconnect_error = Some((
                             error_message.clone(),
-                            crate::retry::classify_boxed_error(
-                                anyhow::anyhow!(error_message).as_ref(),
-                            ),
+                            crate::retry::classify_boxed_error(&e),
                             crate::plugins::DisconnectCause::RecvError,
                             crate::plugins::Direction::BackendToClient,
                         ));
@@ -9944,9 +9938,7 @@ async fn create_session(
                                                     disconnected_wall_at: chrono::Utc::now(),
                                                     connection_error: Some(error_message.clone()),
                                                     error_class: Some(
-                                                        crate::retry::classify_boxed_error(
-                                                            anyhow::anyhow!(error_message).as_ref(),
-                                                        ),
+                                                        crate::retry::classify_boxed_error(&e),
                                                     ),
                                                     disconnect_direction: Some(
                                                         crate::plugins::Direction::BackendToClient,
@@ -10066,9 +10058,7 @@ async fn create_session(
                                 // (client), not the backend — client-side.
                                 disconnect_error = Some((
                                     error_message.clone(),
-                                    crate::retry::classify_boxed_error(
-                                        anyhow::anyhow!(error_message).as_ref(),
-                                    ),
+                                    crate::retry::classify_boxed_error(&e),
                                     crate::plugins::DisconnectCause::RecvError,
                                     crate::plugins::Direction::BackendToClient,
                                 ));

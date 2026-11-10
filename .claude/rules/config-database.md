@@ -121,6 +121,13 @@ paths:
 - MongoDB supports only `disable`, `require`, and `verify-full`.
 - SQLite accepts only `disable` and rejects cert paths and other TLS modes.
 - Keep `docs/database_tls.md`, `docs/configuration.md`, and env parsing synchronized.
+- Deliberate exception to the no-legacy-shims policy: `validate_db_tls_config`
+  refuses startup when any retired DB TLS variable (`FERRUM_DB_TLS_ENABLED`,
+  `FERRUM_DB_TLS_INSECURE`, `FERRUM_DB_SSL_MODE`, `FERRUM_DB_SSL_ROOT_CERT`,
+  `FERRUM_DB_SSL_CLIENT_CERT`, `FERRUM_DB_SSL_CLIENT_KEY`) is set. It accepts
+  nothing old; it fails closed so a stale TLS setting cannot be silently
+  ignored and leave the config-database connection without the TLS the
+  operator asked for (issue #7218). Keep it.
 
 ## File Mode And Validation
 

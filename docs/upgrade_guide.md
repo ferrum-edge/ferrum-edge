@@ -83,6 +83,46 @@ They no longer fall back to a `correlation_id` metadata key. **Operator
 action:** a custom plugin that publishes a request ID for these consumers must
 write it to `request_id` (`ferrum_edge::plugins::REQUEST_ID_METADATA_KEY`).
 
+### `pool_max_requests_per_connection` is removed (#7218)
+
+The proxy field `pool_max_requests_per_connection` and the upstream
+`port_overrides[].http_max_requests_per_connection` carrier were accepted and
+persisted but never applied (Ferrum has no close-after-N-requests runtime).
+Both are removed: a proxy or upstream document that still sets them is refused
+as an unknown field by the Admin API, `POST /batch`, `POST /restore` and file
+mode, and the `proxies.pool_max_requests_per_connection` column is gone from
+the `V001` baseline (a database that already applied the old baseline is
+refused at startup; rebuild it as described in
+[Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)).
+Delete the field from configs and backups before upgrading. The ConfigSync
+build identity revision is bumped, so CP and DP must be upgraded together.
+
+### Restore refuses `api_specs` section version `"1"` and empty `resource_hash` (#7218)
+
+`POST /restore` now accepts only `api_specs.section_version: "2"` (what every
+current `GET /backup` writes) and requires each item's `resource_hash` to be
+64 lowercase hex characters (every spec writer records it). A backup taken
+with an older build that carries section version `"1"` or an empty
+`resource_hash` is refused with `400`; take a fresh `GET /backup` from the
+running deployment before upgrading.
+
+### Undocumented TLS source option spellings are no longer read (#7218)
+
+A TLS material source URI sets its refresh cadence only with the documented
+`?poll=` option; the undocumented `poll_interval` and `poll_interval_seconds`
+spellings are now ignored, so such a source uses the default cadence. A
+`pkcs11://` key source selects its key type only with `key_type`; a `type`
+option is now ignored. Rename those options before upgrading.
+
+### `FERRUM_TLS_CURVES` is no longer read (#7218)
+
+`FERRUM_TLS_CURVES` was a compatibility alias of
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS`. The alias is removed under the build-out
+policy, so a value set only through `FERRUM_TLS_CURVES` (including its
+`_FILE` / secret-manager suffixes) is now ignored and the default groups
+(`X25519,secp256r1`) apply. Rename the variable to
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS` before upgrading.
+
 ### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`

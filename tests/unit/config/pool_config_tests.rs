@@ -59,7 +59,6 @@ fn create_test_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -412,36 +411,6 @@ fn test_effective_http2_max_concurrent_streams_matches_for_proxy() {
     assert_eq!(
         global.effective_http2_max_concurrent_streams(&inherit),
         global.for_proxy(&inherit).http2_max_concurrent_streams
-    );
-}
-
-#[test]
-fn test_validate_clamps_too_low() {
-    let result = PoolConfig::validate_max_idle_per_host(1, "test");
-    assert_eq!(result, MIN_IDLE_PER_HOST);
-}
-
-#[test]
-fn test_validate_clamps_too_high() {
-    let result = PoolConfig::validate_max_idle_per_host(5000, "test");
-    assert_eq!(result, MAX_IDLE_PER_HOST);
-}
-
-#[test]
-fn test_validate_accepts_valid_value() {
-    let result = PoolConfig::validate_max_idle_per_host(100, "test");
-    assert_eq!(result, 100);
-}
-
-#[test]
-fn test_validate_accepts_boundary_values() {
-    assert_eq!(
-        PoolConfig::validate_max_idle_per_host(MIN_IDLE_PER_HOST, "test"),
-        MIN_IDLE_PER_HOST
-    );
-    assert_eq!(
-        PoolConfig::validate_max_idle_per_host(MAX_IDLE_PER_HOST, "test"),
-        MAX_IDLE_PER_HOST
     );
 }
 

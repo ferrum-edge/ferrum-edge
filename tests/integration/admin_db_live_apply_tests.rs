@@ -539,7 +539,7 @@ async fn tests_without_a_poll_loop_do_not_wait() {
     let mut state = live_admin_state(
         store,
         proxy_state.clone(),
-        Arc::new(RuntimeConfigApply::new(default_namespace(), 0)),
+        Arc::new(RuntimeConfigApply::at_epoch(default_namespace(), 0, 0)),
     );
     state.runtime_config_apply = None;
     let (base, _shutdown) = start_admin(state).await;
@@ -940,7 +940,7 @@ async fn deferred_without_poll_loop_stays_plain_success_and_status_is_absent() {
     let mut state = live_admin_state(
         store,
         proxy_state.clone(),
-        Arc::new(RuntimeConfigApply::new(default_namespace(), 0)),
+        Arc::new(RuntimeConfigApply::at_epoch(default_namespace(), 0, 0)),
     );
     state.runtime_config_apply = None;
     let (base, _shutdown) = start_admin(state).await;

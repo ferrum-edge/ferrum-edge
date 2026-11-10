@@ -1318,27 +1318,6 @@ impl CircuitBreakerCache {
         Ok((cb, ticket, admission_generation))
     }
 
-    /// Like [`can_execute`](Self::can_execute); the third element is the open
-    /// generation the request is admitted under.
-    ///
-    /// The generation is the one the admitting atomic operation observed or
-    /// published, so it is exactly the admission's own cycle: a concurrent open
-    /// racing this admission can only make a later deferred streaming outcome
-    /// look *stale* (neutralized — recovered by the next probe), never *too new*
-    /// (which would let a request heal/reopen a HALF_OPEN cycle it never probed).
-    /// Used by the #1649 streaming-deferral admission sites — the initial
-    /// admission and every retry-target rotation — where the backend-health
-    /// outcome is recorded at response-body completion. (#1649 R6 finding 3)
-    pub fn can_execute_with_admission_epoch(
-        &self,
-        namespace: &str,
-        proxy_id: &str,
-        target_key: Option<&str>,
-        config: &CircuitBreakerConfig,
-    ) -> Result<(Arc<CircuitBreaker>, ProbeTicket, u64), CircuitOpenError> {
-        self.can_execute(namespace, proxy_id, target_key, config)
-    }
-
     /// Snapshot of all circuit breaker states for metrics.
     pub fn snapshot(&self) -> Vec<(String, &'static str, u32, u32)> {
         self.breakers

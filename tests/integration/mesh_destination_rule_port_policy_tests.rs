@@ -1075,10 +1075,6 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
         .dispatch_port_override_fallback
         .as_ref()
         .expect("top-level HTTP fields project as a fallback");
-    assert!(
-        inherited.http_max_requests_per_connection.is_none(),
-        "maxRequestsPerConnection is deferred and must not project into the fallback"
-    );
     assert_eq!(inherited.http_idle_timeout_ms, Some(45_000));
     assert_eq!(inherited.http2_max_requests, Some(250));
     assert_eq!(
@@ -1325,11 +1321,8 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
     // Per-port wins for the field it sets:
     assert_eq!(port_override.http2_max_requests, Some(999));
     // Supported fields not respecified by per-port stay on the fallback, not
-    // the port override slot; maxRequestsPerConnection is deferred.
-    assert!(
-        port_override.http_max_requests_per_connection.is_none(),
-        "unsupported maxRequestsPerConnection must not survive as effective policy"
-    );
+    // the port override slot; maxRequestsPerConnection is deferred and has no
+    // carrier field.
     assert!(
         port_override.http_idle_timeout_ms.is_none(),
         "top-level idleTimeout stays on the fallback, not the partial per-port slot"
@@ -1388,10 +1381,6 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
         .port_overrides
         .get(&8080)
         .expect("per-port overlay present");
-    assert!(
-        port_override.http_max_requests_per_connection.is_none(),
-        "unsupported maxRequestsPerConnection must not project at port level"
-    );
     assert_eq!(port_override.http_idle_timeout_ms, Some(30_000));
     assert_eq!(port_override.http2_max_requests, Some(20));
 

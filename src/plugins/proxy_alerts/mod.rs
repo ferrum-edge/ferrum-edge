@@ -85,7 +85,6 @@
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -141,8 +140,6 @@ pub const UNARMED_PROXY_LIFECYCLE_GENERATION: u64 = 0;
 /// Policy identity used for `${incident_key}` by instances constructed without
 /// a plugin-config resource id (config validation, direct/test construction).
 pub const STANDALONE_POLICY_ID: &str = "standalone";
-
-static NEXT_DISPATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub struct ProxyAlerts {
     core: Arc<AlertCore>,
@@ -286,8 +283,7 @@ impl ProxyAlerts {
             .collect();
         let lifecycle_keep_ms = lifecycle_keep_ms(parsed.rules.as_ref());
         let dispatch_sem = Arc::new(Semaphore::new(parsed.max_concurrent_dispatches));
-        let dispatch_generation =
-            DispatchGeneration::new(NEXT_DISPATCH_GENERATION.fetch_add(1, Ordering::Relaxed));
+        let dispatch_generation = DispatchGeneration::new();
 
         let core = Arc::new(AlertCore {
             rules: parsed.rules,

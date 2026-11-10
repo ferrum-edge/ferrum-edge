@@ -569,7 +569,10 @@ pub struct LoadedExternalDocument {
     pub content_digest: String,
     pub format: &'static str,
     pub root: Value,
-    pub raw_bytes: Vec<u8>,
+    /// Byte length of the fetched document, charged against the aggregate
+    /// external-document budget. Only the length is kept; the parsed `root`
+    /// is the document.
+    pub raw_len: usize,
 }
 
 /// Sync loader used by unit tests and the file path.
@@ -587,8 +590,6 @@ pub trait ExternalDocumentLoader: Send + Sync {
 pub struct DefaultExternalDocumentLoader {
     pub egress: crate::config::BackendEgressPolicy,
     pub dns_cache: Option<std::sync::Arc<crate::dns::DnsCache>>,
-    /// Optional in-memory fixtures keyed by canonical URI (tests only).
-    pub fixtures: HashMap<String, Vec<u8>>,
 }
 
 impl Default for DefaultExternalDocumentLoader {
@@ -598,7 +599,6 @@ impl Default for DefaultExternalDocumentLoader {
                 crate::config::BackendAllowIps::Public,
             ),
             dns_cache: None,
-            fixtures: HashMap::new(),
         }
     }
 }
@@ -614,10 +614,6 @@ impl ExternalDocumentLoader for DefaultExternalDocumentLoader {
             return Err(external_ref_error(
                 "external $ref fetch exceeded the total timeout budget",
             ));
-        }
-        let key = resource_uri_key(uri);
-        if let Some(bytes) = self.fixtures.get(&key) {
-            return parse_loaded_document(uri, bytes, policy);
         }
         match uri.scheme() {
             "file" => load_file_document(uri, policy),
@@ -762,7 +758,7 @@ pub fn load_external_documents(
         }
         validate_candidate_uri(&uri, policy)?;
         let doc = loader.load(&uri, policy, deadline)?;
-        aggregate_bytes = aggregate_bytes.saturating_add(doc.raw_bytes.len());
+        aggregate_bytes = aggregate_bytes.saturating_add(doc.raw_len);
         if aggregate_bytes > policy.max_aggregate_bytes {
             return Err(ExtractError::SchemaTooLarge {
                 location: "x-ferrum-external-refs".to_string(),
@@ -1425,7 +1421,7 @@ fn parse_loaded_document(
         content_digest: digest,
         format,
         root,
-        raw_bytes: bytes.to_vec(),
+        raw_len: bytes.len(),
     })
 }
 

@@ -73,7 +73,6 @@ fn proxy_for_backend(port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -142,29 +141,6 @@ async fn start_counting_h1_backend(
     });
 
     (addr, accepted, handle)
-}
-
-#[tokio::test]
-async fn max_requests_per_connection_does_not_close_h1_backend_after_n_requests() {
-    let (backend, accepted, _backend_task) = start_counting_h1_backend(Duration::ZERO).await;
-    let mut proxy = proxy_for_backend(backend.port());
-    proxy.pool_max_requests_per_connection = Some(2);
-
-    let pool = reqwest_pool();
-    let client = pool.get_client(&proxy).await.expect("reqwest client");
-    let url = format!("http://{}:{}/audit", backend.ip(), backend.port());
-
-    for _ in 0..5 {
-        let response = client.get(&url).send().await.expect("backend response");
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        let _ = response.bytes().await.expect("body");
-    }
-
-    assert_eq!(
-        accepted.load(Ordering::SeqCst),
-        1,
-        "five sequential requests with pool_max_requests_per_connection=2 stayed on one reusable backend socket; close-after-N is not implemented"
-    );
 }
 
 /// A reqwest client built WITHOUT the admission hook is socket-unbounded. This

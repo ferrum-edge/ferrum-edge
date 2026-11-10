@@ -182,8 +182,9 @@ fn should_race_primary_blocked_until_startup_ready() {
 // x86 provides acquire semantics on all loads by default, and thread::spawn +
 // join provides a happens-before edge that masks ordering bugs. A cross-thread
 // test would pass even with Relaxed and therefore proves nothing. The correct
-// ordering is enforced by review: Release in connect_and_subscribe_with_startup_ready,
-// Acquire in the should_race_primary guard and the admin /health endpoint.
+// ordering is enforced by review: Release in
+// connect_and_subscribe_with_startup_ready_inner, Acquire in the
+// should_race_primary guard and the admin /health endpoint.
 
 #[test]
 fn grpc_jwt_external_token_reads_bounded_regular_file() {

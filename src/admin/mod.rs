@@ -476,7 +476,9 @@ pub struct AdminState {
     /// Process-level OpenAPI external `$ref` gate and budgets (from EnvConfig).
     pub external_ref_policy: std::sync::Arc<crate::admin::api_specs::ExternalRefProcessPolicy>,
     /// Loader used when external `$ref` resolution is effectively enabled.
-    pub external_ref_loader: std::sync::Arc<crate::admin::api_specs::DefaultExternalDocumentLoader>,
+    /// Serving modes install [`crate::admin::api_specs::DefaultExternalDocumentLoader`];
+    /// tests substitute their own in-memory loader through the trait.
+    pub external_ref_loader: std::sync::Arc<dyn crate::admin::api_specs::ExternalDocumentLoader>,
     /// Database-mode coordinator that waits for the poll-loop reload to publish
     /// a covering `config_changes` watermark before admin mutations return 2xx
     /// (issue #3926). `None` in every other mode and in tests that do not run
@@ -3304,7 +3306,9 @@ async fn handle_admin_request_inner(
                     "status": "connected",
                     "type": db.db_type()
                 });
-                if let Some(stats) = db.pool_stats() {
+                // Pool stats are authenticated detail (issue #7216): built
+                // only for the detailed tier, never for an anonymous probe.
+                if detailed && let Some(stats) = db.pool_stats() {
                     db_info["pool"] = serde_json::to_value(&stats).unwrap_or_else(|_| json!(null));
                 }
                 health_status["database"] = db_info;
@@ -3326,7 +3330,10 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        if let Some(db) = &state.db {
+        // Failover topology and admission fences are authenticated detail and
+        // change neither `status` nor `ready`, so they are built only for the
+        // detailed tier (issue #7216).
+        if detailed && let Some(db) = &state.db {
             let topology = db.failover_topology_status();
             if !topology.primary_active {
                 let mut failover = json!({
@@ -3356,31 +3363,29 @@ async fn handle_admin_request_inner(
 
             // Process-local mTLS DNS admission fences (issue #7031). Present
             // only while at least one namespace is fenced; authenticated
-            // detail tier only, like `failover_topology`. Built only for the
-            // detailed tier: the snapshot walks the store's fence registry, so
-            // unauthenticated (minimal) and tenant probes must never pay for
-            // it. Does not change `status`/`ready`: reconnect/failover stay
-            // available and only the fenced namespaces' admissions fail closed.
-            if detailed {
-                let fence = db.mtls_dns_admission_fence_status();
-                if fence.fenced() {
-                    let mut fence_info = json!({
-                        "fenced": true,
-                        "retained_fences": fence.retained_fences,
-                        "namespaces": fence.namespaces,
-                    });
-                    if let Some(since) = fence.oldest_retained_since_unix_ms {
-                        fence_info["oldest_retained_since_unix_ms"] = json!(since);
+            // detail tier only, like `failover_topology`. The snapshot walks
+            // the store's fence registry, so unauthenticated (minimal) and
+            // tenant probes must never pay for it. Does not change
+            // `status`/`ready`: reconnect/failover stay available and only the
+            // fenced namespaces' admissions fail closed.
+            let fence = db.mtls_dns_admission_fence_status();
+            if fence.fenced() {
+                let mut fence_info = json!({
+                    "fenced": true,
+                    "retained_fences": fence.retained_fences,
+                    "namespaces": fence.namespaces,
+                });
+                if let Some(since) = fence.oldest_retained_since_unix_ms {
+                    fence_info["oldest_retained_since_unix_ms"] = json!(since);
+                }
+                match health_status.get_mut("database") {
+                    Some(serde_json::Value::Object(map)) => {
+                        map.insert("mtls_dns_admission_fence".to_string(), fence_info);
                     }
-                    match health_status.get_mut("database") {
-                        Some(serde_json::Value::Object(map)) => {
-                            map.insert("mtls_dns_admission_fence".to_string(), fence_info);
-                        }
-                        _ => {
-                            health_status["database"] = json!({
-                                "mtls_dns_admission_fence": fence_info
-                            });
-                        }
+                    _ => {
+                        health_status["database"] = json!({
+                            "mtls_dns_admission_fence": fence_info
+                        });
                     }
                 }
             }
@@ -3618,18 +3623,21 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        // Report cached config availability for resilience visibility
-        if let Some(config) = state.cached_gateway_config() {
-            health_status["cached_config"] = json!({
-                "available": true,
-                "loaded_at": config.loaded_at.to_rfc3339(),
-                "proxy_count": config.proxies.len(),
-                "consumer_count": config.consumers.len(),
-            });
-        } else {
-            health_status["cached_config"] = json!({
-                "available": false
-            });
+        // Report cached config availability for resilience visibility.
+        // Authenticated detail only (issue #7216): it never changes `status`.
+        if detailed {
+            if let Some(config) = state.cached_gateway_config() {
+                health_status["cached_config"] = json!({
+                    "available": true,
+                    "loaded_at": config.loaded_at.to_rfc3339(),
+                    "proxy_count": config.proxies.len(),
+                    "consumer_count": config.consumers.len(),
+                });
+            } else {
+                health_status["cached_config"] = json!({
+                    "available": false
+                });
+            }
         }
 
         if (state.mode == "database" || state.mode == "cp")
@@ -3640,40 +3648,48 @@ async fn handle_admin_request_inner(
             // reload-latency signal only: a disconnected or degraded watcher
             // never forces `status: degraded`, because periodic polling remains
             // authoritative and keeps applying committed changes.
-            let change_stream = snapshot.change_stream.clone();
-            if let Some(degraded) = snapshot.degraded {
+            //
+            // A degraded poll loop degrades the coarse `status` for every
+            // tier; the `database_polling` object itself is authenticated
+            // detail and is built only for the detailed tier (issue #7216).
+            if snapshot.degraded.is_some() {
                 health_status["status"] = json!("degraded");
-                let mut polling = json!({
-                    "status": "degraded",
-                    "reason": degraded.reason,
-                    "resource_category": degraded.resource_category,
-                    "validation_category": degraded.validation_category,
-                    "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
-                    "current_backoff_bucket": degraded.current_backoff_bucket,
-                    "current_backoff_seconds": degraded.current_backoff_seconds,
-                    "escalated": degraded.escalated,
-                });
-                if let Some(at) = snapshot.last_poll_completed_at {
-                    polling["last_poll_completed_at"] = json!(at);
-                }
-                health_status["database_polling"] = polling;
-            } else {
-                let mut polling = json!({
-                    "status": "ok",
-                    "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
-                    "current_backoff_bucket": snapshot.current_backoff_bucket,
-                    "current_backoff_seconds": snapshot.current_backoff_seconds,
-                });
-                if let Some(at) = snapshot.last_poll_completed_at {
-                    polling["last_poll_completed_at"] = json!(at);
-                }
-                health_status["database_polling"] = polling;
             }
-            if let Some(change_stream) = change_stream
-                && let Ok(value) = serde_json::to_value(&change_stream)
-                && let Some(polling) = health_status.get_mut("database_polling")
-            {
-                polling["change_stream"] = value;
+            if detailed {
+                let change_stream = snapshot.change_stream.clone();
+                if let Some(degraded) = snapshot.degraded {
+                    let mut polling = json!({
+                        "status": "degraded",
+                        "reason": degraded.reason,
+                        "resource_category": degraded.resource_category,
+                        "validation_category": degraded.validation_category,
+                        "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
+                        "current_backoff_bucket": degraded.current_backoff_bucket,
+                        "current_backoff_seconds": degraded.current_backoff_seconds,
+                        "escalated": degraded.escalated,
+                    });
+                    if let Some(at) = snapshot.last_poll_completed_at {
+                        polling["last_poll_completed_at"] = json!(at);
+                    }
+                    health_status["database_polling"] = polling;
+                } else {
+                    let mut polling = json!({
+                        "status": "ok",
+                        "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
+                        "current_backoff_bucket": snapshot.current_backoff_bucket,
+                        "current_backoff_seconds": snapshot.current_backoff_seconds,
+                    });
+                    if let Some(at) = snapshot.last_poll_completed_at {
+                        polling["last_poll_completed_at"] = json!(at);
+                    }
+                    health_status["database_polling"] = polling;
+                }
+                if let Some(change_stream) = change_stream
+                    && let Ok(value) = serde_json::to_value(&change_stream)
+                    && let Some(polling) = health_status.get_mut("database_polling")
+                {
+                    polling["change_stream"] = value;
+                }
             }
         }
 
@@ -3712,11 +3728,14 @@ async fn handle_admin_request_inner(
             health_status["config_rejected"] = json!(true);
         }
 
-        if state
-            .proxy_state
-            .as_ref()
-            .is_some_and(|ps| ps.config.load_full().mesh.is_some())
-            || state.mode == "mesh"
+        // Mesh egress-scope / config-stream detail never changes `status`, so
+        // it is built only for the detailed tier (issue #7216).
+        if detailed
+            && (state
+                .proxy_state
+                .as_ref()
+                .is_some_and(|ps| ps.config.load().mesh.is_some())
+                || state.mode == "mesh")
         {
             let egress_health = state
                 .mesh_runtime_state
@@ -5548,10 +5567,13 @@ async fn handle_admin_request_inner(
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
-        // Live-apply cursor status (issue #4139). Operator-gated like the
-        // other convergence/status surfaces: it discloses only change-log
-        // sequence numbers and topology epochs — no resource data — and is
-        // how a `?apply=async` bulk client proves its writes are live. Not
+        // Live-apply cursor status (issue #4139). Operator-gated, as the role
+        // table in `docs/admin_api.md` lists it, unlike the read-only viewer
+        // introspection routes (`/cluster`, `/mesh/config-drift`,
+        // `/mesh/slice-drift`, `/mesh/federation`; issue #7216). It discloses
+        // only change-log sequence numbers and topology epochs — no resource
+        // data — and is how a `?apply=async` bulk client proves its writes are
+        // live. Not
         // namespace-scoped: cursors are process-topology values, not
         // tenant-addressed resources (writes to non-served namespaces never
         // mint one).
@@ -5982,7 +6004,7 @@ async fn handle_mesh_config_drift_get(
             let proto = ps.env_config.mesh_config_protocol.as_str();
             let cp_url = ps
                 .env_config
-                .resolved_dp_cp_grpc_urls()
+                .dp_cp_grpc_urls
                 .first()
                 .cloned()
                 .unwrap_or_default();
@@ -9953,49 +9975,60 @@ async fn handle_batch_create(
         .collect();
 
     for proxy in &batch.proxies {
-        if let Some(upstream_id) = proxy.upstream_id.as_deref()
-            && !batch_upstream_ids.contains(upstream_id)
-        {
-            match batch_reference_lookup(
-                namespace,
-                db.check_upstream_exists(upstream_id, namespace).await,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Upstream reads are namespace-predicated (issue #2122
-                    // DB-M1): an upstream in another namespace reports as
-                    // missing, so cross-namespace references are rejected
-                    // without disclosing other tenants' resources.
-                    validation_errors.push(format!(
-                        "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
-                        proxy.id, upstream_id, namespace
-                    ));
+        // One namespace-predicated read of a persisted upstream serves the
+        // existence, API-spec ownership and subset checks below.
+        let persisted_upstream = match proxy.upstream_id.as_deref() {
+            Some(upstream_id) if !batch_upstream_ids.contains(upstream_id) => {
+                match batch_reference_lookup(
+                    namespace,
+                    db.get_upstream(namespace, upstream_id).await,
+                ) {
+                    Ok(Some(upstream)) => Some(upstream),
+                    Ok(None) => {
+                        // Upstream reads are namespace-predicated (issue #2122
+                        // DB-M1): an upstream in another namespace reports as
+                        // missing, so cross-namespace references are rejected
+                        // without disclosing other tenants' resources.
+                        validation_errors.push(format!(
+                            "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
+                            proxy.id, upstream_id, namespace
+                        ));
+                        None
+                    }
+                    Err(response) => return Ok(response),
                 }
-                Err(response) => return Ok(response),
             }
+            _ => None,
+        };
+        // Same ownership rule as single-resource proxy admission (issue
+        // #7214): a spec-owned upstream may only back a proxy of the same
+        // spec. Batch strips `api_spec_id` from every submitted resource, so
+        // a batch proxy is never spec-owned and batch upstreams never are.
+        if let (Some(upstream_id), Some(owner_spec_id)) = (
+            proxy.upstream_id.as_deref(),
+            persisted_upstream
+                .as_ref()
+                .and_then(|upstream| upstream.api_spec_id.as_deref()),
+        ) {
+            validation_errors.push(format!(
+                "Proxy '{}' references upstream_id '{}' that is owned by api_spec '{}'; create a hand-managed upstream or update the owning API spec",
+                proxy.id, upstream_id, owner_spec_id
+            ));
         }
         if let (Some(upstream_id), Some(subset_name)) = (
             proxy.upstream_id.as_deref(),
             proxy.upstream_subset.as_deref(),
         ) {
-            let subset_exists = if let Some(upstream) = batch_upstreams.get(upstream_id) {
-                upstream
-                    .subsets
-                    .as_ref()
-                    .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
-            } else {
-                match batch_reference_lookup(
-                    namespace,
-                    db.get_upstream(namespace, upstream_id).await,
-                ) {
-                    Ok(Some(upstream)) => upstream
+            let subset_exists = batch_upstreams
+                .get(upstream_id)
+                .copied()
+                .or(persisted_upstream.as_ref())
+                .is_some_and(|upstream| {
+                    upstream
                         .subsets
                         .as_ref()
-                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name)),
-                    Ok(None) => false,
-                    Err(response) => return Ok(response),
-                }
-            };
+                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
+                });
             if !subset_exists {
                 validation_errors.push(format!(
                     "Proxy '{}' references upstream_subset '{}' that is not defined on upstream_id '{}'",
@@ -10073,6 +10106,48 @@ async fn handle_batch_create(
                     ));
                 }
                 Err(response) => return Ok(response),
+            }
+        }
+
+        // Single-resource `openapi_validator` precondition (issue #7214): the
+        // target proxy must carry an attached API spec. A proxy created by
+        // this batch never can (batch strips `api_spec_id`), so only a
+        // persisted target can satisfy it.
+        if plugin_config.plugin_name == "openapi_validator" {
+            if plugin_config.scope != PluginScope::Proxy {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': openapi_validator requires scope 'proxy'",
+                    plugin_config.id
+                ));
+            } else {
+                match plugin_config.proxy_id.as_deref() {
+                    None => validation_errors.push(format!(
+                        "PluginConfig '{}': openapi_validator requires proxy_id",
+                        plugin_config.id
+                    )),
+                    Some(proxy_id) if batch_proxy_ids.contains(proxy_id) => {
+                        validation_errors.push(format!(
+                            "PluginConfig '{}': openapi_validator requires a proxy with an attached api_spec; proxy '{}' is created by this batch and cannot carry one",
+                            plugin_config.id, proxy_id
+                        ));
+                    }
+                    Some(proxy_id) => {
+                        match batch_reference_lookup(
+                            namespace,
+                            db.get_proxy(namespace, proxy_id).await,
+                        ) {
+                            Ok(Some(proxy)) if proxy.api_spec_id.is_none() => {
+                                validation_errors.push(format!(
+                                    "PluginConfig '{}': openapi_validator requires a proxy with an attached api_spec",
+                                    plugin_config.id
+                                ));
+                            }
+                            // A missing proxy is already reported above.
+                            Ok(_) => {}
+                            Err(response) => return Ok(response),
+                        }
+                    }
+                }
             }
         }
 

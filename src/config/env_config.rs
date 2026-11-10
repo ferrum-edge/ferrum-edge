@@ -1931,24 +1931,6 @@ fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Optio
     }
 }
 
-fn resolve_tls_key_exchange_groups(
-    configured: Option<String>,
-    legacy_curves: Option<String>,
-) -> Option<String> {
-    match (configured, legacy_curves) {
-        (Some(value), Some(legacy)) => {
-            if value != legacy {
-                tracing::warn!(
-                    "FERRUM_TLS_KEY_EXCHANGE_GROUPS is set; it overrides FERRUM_TLS_CURVES"
-                );
-            }
-            Some(value)
-        }
-        (Some(value), None) => Some(value),
-        (None, legacy) => legacy,
-    }
-}
-
 /// Detect whether this process is running inside a Kubernetes pod.
 ///
 /// The Kubernetes API server injects `KUBERNETES_SERVICE_HOST` and
@@ -5458,7 +5440,6 @@ impl EnvConfig {
             tls_cipher_suites: Option<String> = "FERRUM_TLS_CIPHER_SUITES";
             tls_prefer_server_cipher_order: bool = "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER" => true;
             tls_key_exchange_groups: Option<String> = "FERRUM_TLS_KEY_EXCHANGE_GROUPS";
-            tls_curves_legacy: Option<String> = "FERRUM_TLS_CURVES";
             tls_session_cache_size: usize = "FERRUM_TLS_SESSION_CACHE_SIZE" => 4096usize;
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
             tls_crl_expiry_warning_days: u64 = "FERRUM_TLS_CRL_EXPIRY_WARNING_DAYS" => 30u64;
@@ -5559,8 +5540,7 @@ impl EnvConfig {
             }
             None => None,
         };
-        let tls_curves =
-            resolve_tls_key_exchange_groups(tls_key_exchange_groups, tls_curves_legacy);
+        let tls_curves = tls_key_exchange_groups;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -6783,11 +6763,6 @@ impl EnvConfig {
                 &self.admin_bind_address
             ),
         ))
-    }
-
-    /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
-    pub fn resolved_dp_cp_grpc_urls(&self) -> Vec<String> {
-        self.dp_cp_grpc_urls.clone()
     }
 
     /// Seconds the shutdown signal handler holds the accept loops open after
@@ -9751,25 +9726,6 @@ pub(crate) fn resolve_real_ip_header() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tls_key_exchange_groups_prefer_canonical_env_name() {
-        assert_eq!(
-            resolve_tls_key_exchange_groups(
-                Some("X25519,secp384r1".to_string()),
-                Some("secp256r1".to_string()),
-            ),
-            Some("X25519,secp384r1".to_string())
-        );
-    }
-
-    #[test]
-    fn tls_key_exchange_groups_accept_legacy_curves_alias() {
-        assert_eq!(
-            resolve_tls_key_exchange_groups(None, Some("X25519,secp256r1".to_string())),
-            Some("X25519,secp256r1".to_string())
-        );
-    }
 
     #[test]
     fn existing_db_tls_url_params_detects_sql_tls_options_case_insensitively() {
