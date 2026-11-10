@@ -380,15 +380,17 @@ fn flatten_overwrite_value<'v, T: SchemaSerializable>(
     })
 }
 
-fn flatten_key(key: &str, prefix: Option<&str>) -> String {
+/// The flattened output key; borrows `key` when there is no prefix, so an
+/// unprefixed flatten allocates nothing per metadata entry.
+fn flatten_key<'k>(key: &'k str, prefix: Option<&str>) -> std::borrow::Cow<'k, str> {
     match prefix {
         Some(p) => {
             let mut out = String::with_capacity(p.len() + key.len());
             out.push_str(p);
             out.push_str(key);
-            out
+            std::borrow::Cow::Owned(out)
         }
-        None => key.to_string(),
+        None => std::borrow::Cow::Borrowed(key),
     }
 }
 
