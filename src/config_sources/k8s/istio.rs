@@ -25,9 +25,9 @@ use crate::modes::mesh::metric_tag_cel::{
 
 use super::{
     K8sAccumulator, K8sObject, K8sTranslateError, K8sTranslationOptions,
-    MeshRouteDispatchDestination, MeshRouteDispatchPolicy, RouteBackend, RouteProxySpec,
-    SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
-    is_vs_authority_header, mesh_route_dispatch_can_emit_rule,
+    MeshRouteDispatchDestination, MeshRouteDispatchPolicy, ProxyUpsert, RouteBackend,
+    RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, is_vs_authority_header, mesh_route_dispatch_can_emit_rule,
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
     mesh_route_dispatch_rules_for_proxy, optional_port_field, optional_target_weight_field,
     parse_istio_duration_ms, port_from_u64, proxy_for_route, request_termination_plugin_for_proxy,
@@ -89,11 +89,40 @@ pub(super) fn translate(
             for upstream in upstreams {
                 acc.upsert_upstream(upstream);
             }
+            // Proxy-scoped plugins follow their proxy (GHSA-qw5p-g8jx-pmv8).
+            // Plugin ids are derived from the proxy id, so pushing the plugins
+            // of a proxy `upsert_proxy` refused (another VirtualService already
+            // produced the same lossy id) would publish two plugin configs with
+            // one `(namespace, id)`, and the publish-time duplicate check would
+            // then reject every later Kubernetes reconcile cluster-wide. A
+            // replaced proxy's previous plugins are withdrawn for the same
+            // reason before this VirtualService's plugins are added.
+            let mut accepted_proxy_keys: Vec<(String, String)> = Vec::new();
+            let mut refused_proxy_keys: Vec<(String, String)> = Vec::new();
             for proxy in proxies {
-                acc.upsert_proxy(proxy, SourceKind::Istio);
+                let key = (proxy.namespace.clone(), proxy.id.clone());
+                match acc.upsert_proxy(proxy, SourceKind::Istio) {
+                    ProxyUpsert::Inserted => accepted_proxy_keys.push(key),
+                    ProxyUpsert::Replaced => {
+                        acc.config.plugin_configs.retain(|plugin| {
+                            !(plugin.namespace == key.0
+                                && plugin.proxy_id.as_deref() == Some(key.1.as_str()))
+                        });
+                        accepted_proxy_keys.push(key);
+                    }
+                    ProxyUpsert::Ignored => refused_proxy_keys.push(key),
+                }
             }
             for plugin in plugins {
-                acc.config.plugin_configs.push(plugin);
+                let follows_refused_proxy = plugin.proxy_id.as_deref().is_some_and(|proxy_id| {
+                    let is_key = |(namespace, id): &(String, String)| {
+                        *namespace == plugin.namespace && id == proxy_id
+                    };
+                    refused_proxy_keys.iter().any(is_key) && !accepted_proxy_keys.iter().any(is_key)
+                });
+                if !follows_refused_proxy {
+                    acc.config.plugin_configs.push(plugin);
+                }
             }
             Ok(true)
         }
