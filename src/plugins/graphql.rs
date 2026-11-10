@@ -1860,31 +1860,52 @@ impl<'de> serde::de::Visitor<'de> for GraphqlEnvelopeVisitor {
         Ok(GraphqlEnvelope::NotAnObject)
     }
 
-    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         Ok(GraphqlEnvelope::NotAnObject)
     }
 
-    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         Ok(GraphqlEnvelope::NotAnObject)
     }
 
-    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         Ok(GraphqlEnvelope::NotAnObject)
     }
 
-    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         Ok(GraphqlEnvelope::NotAnObject)
     }
 
-    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         Ok(GraphqlEnvelope::NotAnObject)
     }
 
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         Ok(GraphqlEnvelope::NotAnObject)
     }
 
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         Ok(GraphqlEnvelope::NotAnObject)
     }
 }
