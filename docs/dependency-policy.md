@@ -346,8 +346,9 @@ permanent by default.
 
 The token lives in a **comment**, not in the entry value, because cargo-deny's
 two schemas differ: an `[advisories.ignore]` table accepts a free-text `reason`
-field, while a `[licenses.exceptions]` entry does not — cargo-deny 0.19.9 rejects
-every key other than the crate spec plus `allow`
+field, while a `[licenses.exceptions]` entry does not — cargo-deny 0.19.9 (the
+pinned gate) and 0.20.2 both reject every key other than the crate spec plus
+`allow`
 (`error[unexpected-keys]: found 1 unexpected keys, expected: ["allow"]`). The
 convention is a `#` comment on the line immediately preceding the entry (a
 trailing comment on the entry line is also accepted), and it binds to exactly one
