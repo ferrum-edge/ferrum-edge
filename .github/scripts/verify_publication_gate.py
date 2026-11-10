@@ -943,7 +943,11 @@ def _transient_http_delay(
         return None
     if status == 403 and not rate_signature:
         return None
-    if reset is not None:
+    # `X-RateLimit-Reset` is the start of the next hourly quota window, sent on
+    # every response. Only an exhausted quota waits for it: a 5xx or secondary
+    # limit that still has quota falls through to `Retry-After`, then one poll
+    # interval, instead of sleeping until the window resets (issue #7283).
+    if reset is not None and remaining == "0":
         try:
             return max(1.0, float(reset) - now)
         except ValueError:
@@ -2512,6 +2516,31 @@ def self_test() -> list[str]:
         _transient_http_delay(503, {}, "", now=1000)
         == POLL_SECONDS,
         "a 5xx without reset headers must remain pending for one poll interval",
+    )
+    expect(
+        _transient_http_delay(
+            502,
+            {"X-RateLimit-Remaining": "4999", "X-RateLimit-Reset": "4000"},
+            "",
+            now=1000,
+        )
+        == POLL_SECONDS,
+        "a 5xx with quota remaining must not sleep until X-RateLimit-Reset",
+    )
+    expect(
+        _transient_http_delay(
+            403,
+            {
+                "X-RateLimit-Remaining": "12",
+                "X-RateLimit-Reset": "4000",
+                "Retry-After": "60",
+            },
+            "secondary rate limit",
+            now=1000,
+        )
+        == 60,
+        "a secondary limit with quota remaining must honor Retry-After, not the "
+        "hourly reset",
     )
     expect(
         _transient_http_delay(404, {}, "", now=1000) is None,
