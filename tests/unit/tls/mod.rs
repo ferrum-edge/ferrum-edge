@@ -2,6 +2,7 @@ mod acme_http01_challenge_path_tests;
 mod acme_order_lifecycle_tests;
 mod acme_store_ha_tests;
 mod backend_tls_refusal_tests;
+mod client_session_resumption_tests;
 mod client_trust_dtls_session_tests;
 mod client_trust_retirement_bounds_tests;
 mod client_trust_stream_setup_tests;
