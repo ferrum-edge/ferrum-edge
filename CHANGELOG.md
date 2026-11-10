@@ -17,6 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Changed
+- **ferrum-mesh chart: values now reach the workload they name, once**
+  (#7297, #7299).
+  - `controlPlane.grpcPort` now renders
+    `FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort>` (unless `controlPlane.env`
+    sets it). Before, a non-default port changed only the container and
+    Service ports while the control plane kept listening on 50051.
+  - Node-agent and CNI-uninstall images keep an `image.tag` that already ends
+    in `-ebpf-tools` instead of rendering the unpublished `<tag>-ebpf-tools-ebpf`.
+  - `helm template` / `helm upgrade` now fail when a workload env map sets a
+    name the chart renders from a first-class value:
+    `injector.env.FERRUM_INJECTOR_{LISTEN_ADDR,REQUIRE_ANNOTATION,TLS_CERT_PATH,TLS_KEY_PATH}`,
+    `ambient.env.FERRUM_MESH_CAPTURE_MODE` (use `ambient.captureMode`), and
+    `<component>.env.FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` /
+    `FERRUM_TLS_CRL_FILE_PATH` together with `admin.tls.clientCaKey` /
+    `crlKey`. These previously rendered the name twice.
+  - The unused top-level `namespace` value is removed; `--set namespace=...`
+    now fails schema validation. Install with `helm install --namespace`.
+- **Compose `ferrum-mongodb` publishes host ports 8004/8447/9446** (#7296),
+  so the `mongodb` and `cp-dp` profiles can run together. It previously
+  reused 8002/8445 (ferrum-dp-1) and 9445 (ferrum-cp).
 - **Mesh HTTP/2 backend connections use the same builder settings as the
   direct-H2 and gRPC pools** (issue #7071).
   - Sidecar mesh-mTLS connections and the nested HTTP/2 connection a native
