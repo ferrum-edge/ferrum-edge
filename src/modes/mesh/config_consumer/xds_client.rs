@@ -491,16 +491,33 @@ struct ResourceAccumulator {
     versions_by_type: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct AccumulatedResource {
     name: String,
-    /// Raw protobuf bytes of the resource. Captured only for type URLs whose
-    /// reverse-translation needs the full payload (currently ECDS, where the
-    /// inner `TypedExtensionConfig.typed_config.value` carries the
-    /// operator's opaque DR JSON). The other type URLs only need the name
-    /// for service-port reconstruction, so storing bytes there would be
+    /// The decoded resource, kept only for type URLs whose reverse
+    /// translation reads more than the name. Decoded ONCE, at ingestion: the
+    /// ACK-time carrier checks and every later slice rebuild read this value
+    /// instead of re-decoding the wire bytes.
+    payload: AccumulatedPayload,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AccumulatedPayload {
+    /// CDS/EDS/LDS/RDS/SDS only carry routing names; storing more would be
     /// wasted memory under high resource cardinality.
-    bytes: Vec<u8>,
+    NameOnly,
+    /// ECDS: the inner `typed_config` carries the Ferrum carrier payloads.
+    Ecds(proto::TypedExtensionConfig),
+    /// RTDS: the runtime layer merged into the slice's overlay.
+    Rtds(runtime_proto::Runtime),
+}
+
+/// The previous contents of one type URL's accumulator slots, returned by
+/// [`ResourceAccumulator::replace_sotw_type`] so a NACK can put them back
+/// without the accumulator ever being cloned.
+struct ReplacedSotwType {
+    resources: Option<Vec<AccumulatedResource>>,
+    version: Option<String>,
 }
 
 impl ResourceAccumulator {
@@ -508,12 +525,27 @@ impl ResourceAccumulator {
         Self::default()
     }
 
+    /// Test convenience: [`Self::replace_sotw_type`] without the undo record.
+    #[cfg(test)]
     fn apply_sotw_response(
         &mut self,
         type_url: &str,
         resources: &[proto::Any],
         version: &str,
     ) -> Result<(), String> {
+        self.replace_sotw_type(type_url, resources, version)
+            .map(drop)
+    }
+
+    /// Validate and install one SotW response for `type_url`, returning what
+    /// it replaced. Every check runs before the accumulator is touched, so an
+    /// `Err` leaves it unchanged; only this type's two slots change on `Ok`.
+    fn replace_sotw_type(
+        &mut self,
+        type_url: &str,
+        resources: &[proto::Any],
+        version: &str,
+    ) -> Result<ReplacedSotwType, String> {
         if !is_known_type_url(type_url) {
             return Err("unknown xDS type_url <redacted scalar>".to_string());
         }
@@ -534,7 +566,7 @@ impl ResourceAccumulator {
                      type_url {type_url:?}"
                 ));
             }
-            let name = decode_resource_name(type_url, &resource.value)?;
+            let (name, payload) = decode_accumulated_resource(type_url, &resource.value)?;
             if name.is_empty() {
                 return Err(format!(
                     "xDS resource for type_url {type_url:?} has an empty name"
@@ -547,16 +579,7 @@ impl ResourceAccumulator {
                         .to_string(),
                 );
             }
-            // ECDS reverse-translation reads the full bytes back to decode
-            // its inner TypedExtensionConfig. RTDS reverse-translation does
-            // the same to decode the layer struct. Other resource types
-            // only carry routing names, so skip the allocation.
-            let bytes = if type_url == ECDS_TYPE_URL || type_url == RTDS_TYPE_URL {
-                resource.value.clone()
-            } else {
-                Vec::new()
-            };
-            let accumulated_resource = AccumulatedResource { name, bytes };
+            let accumulated_resource = AccumulatedResource { name, payload };
             if type_url == ECDS_TYPE_URL {
                 validate_ecds_mesh_slice_carrier(&accumulated_resource)?;
                 validate_ecds_destination_rule_carrier(&accumulated_resource)?;
@@ -573,11 +596,34 @@ impl ResourceAccumulator {
             accumulated.sort_by(|left, right| left.name.cmp(&right.name));
         }
 
-        self.resources_by_type
+        let resources = self
+            .resources_by_type
             .insert(type_url.to_string(), accumulated);
-        self.versions_by_type
+        let version = self
+            .versions_by_type
             .insert(type_url.to_string(), version.to_string());
-        Ok(())
+        Ok(ReplacedSotwType { resources, version })
+    }
+
+    /// Undo a [`Self::replace_sotw_type`] for `type_url`.
+    fn restore_sotw_type(&mut self, type_url: &str, replaced: ReplacedSotwType) {
+        match replaced.resources {
+            Some(resources) => {
+                self.resources_by_type
+                    .insert(type_url.to_string(), resources);
+            }
+            None => {
+                self.resources_by_type.remove(type_url);
+            }
+        }
+        match replaced.version {
+            Some(version) => {
+                self.versions_by_type.insert(type_url.to_string(), version);
+            }
+            None => {
+                self.versions_by_type.remove(type_url);
+            }
+        }
     }
 
     fn resources(&self, type_url: &str) -> &[AccumulatedResource] {
@@ -1340,10 +1386,15 @@ async fn handle_ads_response(
         );
         return Ok(None);
     }
-    let snapshot = accumulator.clone();
-    let apply_result =
-        accumulator.apply_sotw_response(&type_url, &response.resources, &response.version_info);
-    let slice_result = apply_result.and_then(|_| accumulator.try_build_mesh_slice(config));
+    // Only this type's slots change, so a NACK restores exactly what the
+    // response replaced instead of deep-cloning every type's resources first.
+    let mut replaced = None;
+    let slice_result = accumulator
+        .replace_sotw_type(&type_url, &response.resources, &response.version_info)
+        .and_then(|previous| {
+            replaced = Some(previous);
+            accumulator.try_build_mesh_slice(config)
+        });
 
     match slice_result {
         Ok(Some(slice)) => {
@@ -1366,7 +1417,9 @@ async fn handle_ads_response(
             Ok(None)
         }
         Err(e) => {
-            *accumulator = snapshot;
+            if let Some(previous) = replaced {
+                accumulator.restore_sotw_type(&type_url, previous);
+            }
             let nack = subscriptions.build_nack(&type_url, e.clone());
             // First-slice NACK visibility: if a REQUIRED type is being NACKed
             // while the slice has not yet converged (the DP is still inside
@@ -1625,10 +1678,8 @@ fn reverse_translate(
     let mut destination_rules = Vec::new();
     let mut dr_carrier_seen = false;
     for resource in accumulator.resources(ECDS_TYPE_URL) {
-        // Ingestion (`decode_resource_name`) already decoded every accumulated
-        // ECDS resource and refused the response otherwise, so this cannot fail.
-        let typed_extension = decode_ecds_typed_extension(resource)?;
-        let Some(carrier) = destination_rule_carrier(resource, &typed_extension)? else {
+        let typed_extension = ecds_typed_extension(resource)?;
+        let Some(carrier) = destination_rule_carrier(resource, typed_extension)? else {
             continue;
         };
         dr_carrier_seen = true;
@@ -1740,11 +1791,11 @@ fn reverse_translate(
     // resource that reaches this point has a stable identity.
     let mut runtime_overlay = MeshRuntimeOverlay::default();
     for resource in accumulator.resources(RTDS_TYPE_URL) {
-        // Ingestion (`decode_resource_name`) already decoded every accumulated
-        // Runtime resource and refused the response otherwise.
-        let layer = runtime_proto::Runtime::decode(resource.bytes.as_slice())
-            .map_err(|_| "xDS RTDS resource failed Runtime decode".to_string())?;
-        for (key, value) in translate_rtds_layer(&layer).fields {
+        // Decoded once, at ingestion.
+        let AccumulatedPayload::Rtds(layer) = &resource.payload else {
+            return Err("xDS RTDS resource carries no decoded Runtime layer".to_string());
+        };
+        for (key, value) in translate_rtds_layer(layer).fields {
             runtime_overlay.fields.insert(key, value);
         }
     }
@@ -2188,9 +2239,8 @@ fn recover_slice_carriers(
 
     let mut recovered = RecoveredSliceCarriers::default();
     for resource in accumulator.resources(ECDS_TYPE_URL) {
-        // Decoded once already at ingestion; see `reverse_translate`.
-        let typed_extension = decode_ecds_typed_extension(resource)?;
-        let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension)? else {
+        let typed_extension = ecds_typed_extension(resource)?;
+        let Some(inner) = mesh_slice_carrier_inner(resource, typed_extension)? else {
             continue;
         };
         match MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
@@ -2269,8 +2319,8 @@ fn join_bounded_carrier_errors(errors: Vec<String>) -> String {
 }
 
 fn validate_ecds_mesh_slice_carrier(resource: &AccumulatedResource) -> Result<(), String> {
-    let typed_extension = decode_ecds_typed_extension(resource)?;
-    let Some(inner) = mesh_slice_carrier_inner(resource, &typed_extension)? else {
+    let typed_extension = ecds_typed_extension(resource)?;
+    let Some(inner) = mesh_slice_carrier_inner(resource, typed_extension)? else {
         return Ok(());
     };
     match crate::xds::carrier::MeshSliceCarrier::decode(&inner.type_url, &inner.value) {
@@ -2360,8 +2410,8 @@ fn validate_recognized_mesh_slice_carrier(
 /// Diagnostics are fixed-shape and never echo the carrier-supplied `export_to`
 /// value.
 fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Result<(), String> {
-    let typed_extension = decode_ecds_typed_extension(resource)?;
-    let Some(carrier) = destination_rule_carrier(resource, &typed_extension)? else {
+    let typed_extension = ecds_typed_extension(resource)?;
+    let Some(carrier) = destination_rule_carrier(resource, typed_extension)? else {
         return Ok(());
     };
     let dr =
@@ -2392,15 +2442,19 @@ fn validate_ecds_destination_rule_carrier(resource: &AccumulatedResource) -> Res
     }
 }
 
-fn decode_ecds_typed_extension(
+/// The `TypedExtensionConfig` an ECDS resource was decoded into at ingestion.
+/// Every accumulated ECDS resource carries one, so the `Err` arm is only a
+/// fail-closed guard against a misfiled resource.
+fn ecds_typed_extension(
     resource: &AccumulatedResource,
-) -> Result<proto::TypedExtensionConfig, String> {
-    proto::TypedExtensionConfig::decode(resource.bytes.as_slice()).map_err(|_| {
-        format!(
-            "xDS ECDS resource {:?} failed TypedExtensionConfig decode",
+) -> Result<&proto::TypedExtensionConfig, String> {
+    match &resource.payload {
+        AccumulatedPayload::Ecds(typed_extension) => Ok(typed_extension),
+        _ => Err(format!(
+            "xDS ECDS resource {:?} carries no decoded TypedExtensionConfig",
             resource.name
-        )
-    })
+        )),
+    }
 }
 
 fn reserved_destination_rule_carrier_name(name: &str) -> Result<Option<(&str, &str)>, String> {
@@ -2637,28 +2691,34 @@ fn apply_recovered_carrier(
     Ok(())
 }
 
-fn decode_resource_name(type_url: &str, value: &[u8]) -> Result<String, String> {
+/// Decode one wire resource into its name and the payload the accumulator
+/// keeps. A resource that does not decode as its type refuses the response.
+fn decode_accumulated_resource(
+    type_url: &str,
+    value: &[u8],
+) -> Result<(String, AccumulatedPayload), String> {
+    let name_only = |name: String| (name, AccumulatedPayload::NameOnly);
     match type_url {
         CDS_TYPE_URL => proto::Cluster::decode(value)
-            .map(|resource| resource.name)
+            .map(|resource| name_only(resource.name))
             .map_err(|_| "failed to decode Cluster resource".to_string()),
         EDS_TYPE_URL => proto::ClusterLoadAssignment::decode(value)
-            .map(|resource| resource.cluster_name)
+            .map(|resource| name_only(resource.cluster_name))
             .map_err(|_| "failed to decode ClusterLoadAssignment resource".to_string()),
         LDS_TYPE_URL => proto::Listener::decode(value)
-            .map(|resource| resource.name)
+            .map(|resource| name_only(resource.name))
             .map_err(|_| "failed to decode Listener resource".to_string()),
         RDS_TYPE_URL => proto::RouteConfiguration::decode(value)
-            .map(|resource| resource.name)
+            .map(|resource| name_only(resource.name))
             .map_err(|_| "failed to decode RouteConfiguration resource".to_string()),
         SDS_TYPE_URL => proto::Secret::decode(value)
-            .map(|resource| resource.name)
+            .map(|resource| name_only(resource.name))
             .map_err(|_| "failed to decode Secret resource".to_string()),
         ECDS_TYPE_URL => proto::TypedExtensionConfig::decode(value)
-            .map(|resource| resource.name)
+            .map(|resource| (resource.name.clone(), AccumulatedPayload::Ecds(resource)))
             .map_err(|_| "failed to decode TypedExtensionConfig resource".to_string()),
         RTDS_TYPE_URL => runtime_proto::Runtime::decode(value)
-            .map(|resource| resource.name)
+            .map(|resource| (resource.name.clone(), AccumulatedPayload::Rtds(resource)))
             .map_err(|_| "failed to decode Runtime resource".to_string()),
         _ => Err("unknown xDS type_url <redacted scalar>".to_string()),
     }
@@ -2873,7 +2933,7 @@ mod tests {
 
         let resource = AccumulatedResource {
             name: "'UNREGISTERED_CARRIER5591\"\\\n".to_string(),
-            bytes: Vec::new(),
+            payload: AccumulatedPayload::NameOnly,
         };
         let extension = proto::TypedExtensionConfig {
             name: resource.name.clone(),
@@ -4713,6 +4773,64 @@ mod tests {
         accumulator
             .apply_sotw_response(SDS_TYPE_URL, &[], "")
             .expect("empty optional response can omit version");
+    }
+
+    /// A NACK puts back exactly the type the rejected response replaced — the
+    /// previous resources and version, or nothing when the type was new —
+    /// and never touches another type's slots.
+    #[test]
+    fn replaced_sotw_type_restores_exactly_the_previous_slots() {
+        let mut accumulator = ResourceAccumulator::new();
+        accumulator
+            .apply_sotw_response(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                "v1",
+            )
+            .expect("CDS v1 applies");
+        let cds_before = accumulator.resources(CDS_TYPE_URL).to_vec();
+
+        let replaced = accumulator
+            .replace_sotw_type(
+                CDS_TYPE_URL,
+                &[any_resource(CDS_TYPE_URL, "cluster/default/web/9090")],
+                "v2",
+            )
+            .expect("CDS v2 applies");
+        let eds = accumulator
+            .replace_sotw_type(
+                EDS_TYPE_URL,
+                &[any_resource(EDS_TYPE_URL, "cluster/default/api/8080")],
+                "v2",
+            )
+            .expect("EDS v2 applies");
+        assert_ne!(accumulator.resources(CDS_TYPE_URL), cds_before.as_slice());
+
+        accumulator.restore_sotw_type(EDS_TYPE_URL, eds);
+        assert!(accumulator.resources(EDS_TYPE_URL).is_empty());
+        assert!(!accumulator.versions_by_type.contains_key(EDS_TYPE_URL));
+
+        accumulator.restore_sotw_type(CDS_TYPE_URL, replaced);
+        assert_eq!(accumulator.resources(CDS_TYPE_URL), cds_before.as_slice());
+        assert_eq!(
+            accumulator
+                .versions_by_type
+                .get(CDS_TYPE_URL)
+                .map(String::as_str),
+            Some("v1")
+        );
+
+        // A response refused during ingestion leaves the accumulator as it was.
+        assert!(
+            accumulator
+                .replace_sotw_type(
+                    CDS_TYPE_URL,
+                    &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
+                    "",
+                )
+                .is_err()
+        );
+        assert_eq!(accumulator.resources(CDS_TYPE_URL), cds_before.as_slice());
     }
 
     #[test]
@@ -6975,18 +7093,16 @@ mod tests {
         let hostile_name = "a".repeat(1024 * 1024);
         let resource = AccumulatedResource {
             name: hostile_name,
-            // A length-delimited field (name, field 1) that declares 127 bytes
-            // but carries none: prost reliably fails this decode.
-            bytes: vec![0x0a, 0xff],
+            payload: AccumulatedPayload::NameOnly,
         };
 
-        // The ECDS decode path embeds the peer-supplied name in its error, so
-        // any log site must render both the name and the error through
+        // The ECDS payload lookup embeds the peer-supplied name in its error,
+        // so any log site must render both the name and the error through
         // `bounded_xds_log_value`. A hostile 1 MiB name must therefore never
         // reach a log line at full length.
-        let err = match decode_ecds_typed_extension(&resource) {
+        let err = match ecds_typed_extension(&resource) {
             Err(e) => e,
-            Ok(_) => panic!("truncated wire bytes must not decode"),
+            Ok(_) => panic!("a name-only resource has no ECDS payload"),
         };
         assert!(bounded_xds_log_value(&resource.name).len() <= 1024);
         assert!(bounded_xds_log_value(&err).len() <= 1024);
