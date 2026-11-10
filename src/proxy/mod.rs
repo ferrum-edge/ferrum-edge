@@ -17519,6 +17519,7 @@ async fn handle_websocket_request_authenticated(
                             mismatch,
                             is_tls,
                             false,
+                            None,
                             start_time,
                             plugin_execution_ns,
                             "mesh_inbound_peer_auth_retry_target_mismatch",
@@ -24469,6 +24470,7 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
     mismatch: MeshInboundPeerAuthTransportMismatch,
     is_tls: bool,
     is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
     start_time: Instant,
     plugin_execution_ns: u64,
     log_reason: &'static str,
@@ -24484,18 +24486,24 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
         client_ip = %ctx.client_ip,
         "Rejecting mesh inbound request because its transport does not satisfy the effective target app-port PeerAuthentication mode"
     );
-    let reject = finalize_reject_response_with_after_proxy_hooks(
+    // gRPC-Web carries its status in a body trailer frame, so the committed
+    // observers run on the translated response instead (issue #7155).
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
         StatusCode::FORBIDDEN,
         Bytes::from_static(br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#),
         HashMap::new(),
         is_grpc_request,
+        grpc_web_response_content_type.is_none(),
     )
     .await;
     if is_grpc_request {
         apply_grpc_reject_metadata(ctx, &reject);
     }
+    let grpc_web_response =
+        boxed_build_grpc_web_reject_response(plugins, ctx, grpc_web_response_content_type, &reject)
+            .await;
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -24507,6 +24515,9 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
     )
     .await;
     record_request(state, reject.http_status.as_u16());
+    if let Some(response) = grpc_web_response {
+        return response;
+    }
     build_response_from_normalized_reject(reject)
 }
 
@@ -30022,6 +30033,44 @@ fn build_translated_grpc_web_error_response(
     ))
 }
 
+/// A gateway-generated error from the native-gRPC branch in the framing the
+/// client negotiated (issue #7155): a gRPC-Web trailer frame for a gRPC-Web
+/// client (negotiated by the frontend or translated by the `grpc_web` plugin),
+/// otherwise the native Trailers-Only response. gRPC-Web carries terminal
+/// metadata in a body trailer frame, never as response header fields.
+fn build_native_grpc_branch_error_response(
+    ctx: &RequestContext,
+    grpc_web_response_content_type: Option<&str>,
+    grpc_request_is_web_translated: bool,
+    status: u32,
+    message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    if let Some(content_type) = grpc_web_response_content_type {
+        return build_grpc_web_error_response(
+            content_type,
+            status,
+            message,
+            initial_response_header_policy_plugins,
+        );
+    }
+    if grpc_request_is_web_translated
+        && let Some(response) = build_translated_grpc_web_error_response(
+            ctx,
+            status,
+            message,
+            initial_response_header_policy_plugins,
+        )
+    {
+        return response;
+    }
+    grpc_proxy::build_grpc_error_response_with_policy(
+        status,
+        message,
+        initial_response_header_policy_plugins,
+    )
+}
+
 /// Build a gateway-generated gRPC-Web error at the client-visible boundary.
 /// These early/backend-exchange failure paths bypass normal response hooks, so
 /// enforce the precomputed initial-header policy chain directly without a
@@ -32890,6 +32939,7 @@ async fn finalize_terminal_request_body_read_rejection(
     body: &[u8],
     headers: HashMap<String, String>,
     is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
     start_time: Instant,
     plugin_execution_ns: u64,
     request_path: &str,
@@ -32898,16 +32948,26 @@ async fn finalize_terminal_request_body_read_rejection(
         RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
         "true".to_string(),
     );
-    let normalized = finalize_reject_response_with_after_proxy_hooks(
+    // gRPC-Web carries its status in a body trailer frame, so the committed
+    // observers run on the translated response instead (issue #7155).
+    let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
         status,
         Bytes::copy_from_slice(body),
         headers,
         is_grpc_request,
+        grpc_web_response_content_type.is_none(),
     )
     .await;
     apply_grpc_reject_metadata(ctx, &normalized);
+    let grpc_web_response = boxed_build_grpc_web_reject_response(
+        plugins,
+        ctx,
+        grpc_web_response_content_type,
+        &normalized,
+    )
+    .await;
     if status.as_u16() == client_abort::CLIENT_CLOSED_REQUEST_STATUS {
         log_client_disconnect_rejection_with_path(
             plugins,
@@ -32932,6 +32992,9 @@ async fn finalize_terminal_request_body_read_rejection(
         .await;
     }
     record_request(state, normalized.http_status.as_u16());
+    if let Some(response) = grpc_web_response {
+        return response;
+    }
     build_response_from_normalized_reject(normalized)
 }
 
@@ -37422,6 +37485,7 @@ async fn handle_proxy_request_inner(
             mismatch,
             is_tls,
             is_grpc_request,
+            grpc_web_response_content_type,
             start_time,
             0,
             "mesh_inbound_peer_auth_initial_route_mismatch",
@@ -39311,6 +39375,7 @@ async fn handle_proxy_request_inner(
             mismatch,
             is_tls,
             is_grpc_request,
+            grpc_web_response_content_type,
             start_time,
             plugin_execution_ns,
             "mesh_inbound_peer_auth_transport_mismatch",
@@ -39377,6 +39442,7 @@ async fn handle_proxy_request_inner(
                             br#"{"error":"Request body exceeds maximum size"}"#,
                             HashMap::new(),
                             is_grpc_request,
+                            grpc_web_response_content_type,
                             start_time,
                             plugin_execution_ns,
                             &original_request_path,
@@ -39400,6 +39466,7 @@ async fn handle_proxy_request_inner(
                             client_abort::CLIENT_ABORT_HTTP_BODY.as_bytes(),
                             HashMap::new(),
                             is_grpc_request,
+                            grpc_web_response_content_type,
                             start_time,
                             plugin_execution_ns,
                             &original_request_path,
@@ -39422,6 +39489,7 @@ async fn handle_proxy_request_inner(
                             response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY.as_bytes(),
                             request_buffer_capacity_reject_headers(is_grpc_request),
                             is_grpc_request,
+                            grpc_web_response_content_type,
                             start_time,
                             plugin_execution_ns,
                             &original_request_path,
@@ -39437,6 +39505,7 @@ async fn handle_proxy_request_inner(
                             br#"{"error":"Request body read timed out"}"#,
                             HashMap::new(),
                             is_grpc_request,
+                            grpc_web_response_content_type,
                             start_time,
                             plugin_execution_ns,
                             &original_request_path,
@@ -39506,6 +39575,7 @@ async fn handle_proxy_request_inner(
                         response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY.as_bytes(),
                         request_buffer_capacity_reject_headers(is_grpc_request),
                         is_grpc_request,
+                        grpc_web_response_content_type,
                         start_time,
                         plugin_execution_ns,
                         &original_request_path,
@@ -40490,7 +40560,10 @@ async fn handle_proxy_request_inner(
             cb_probe.release_neutral();
             ctx.terminal_record.mark_counted();
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+            return Ok(build_native_grpc_branch_error_response(
+                &ctx,
+                grpc_web_response_content_type,
+                grpc_request_is_web_translated,
                 14,
                 "backend address blocked by egress policy",
                 initial_response_header_policy_plugins.as_ref(),
@@ -40785,7 +40858,10 @@ async fn handle_proxy_request_inner(
                         )) => {
                             ctx.terminal_record.mark_counted();
                             record_request(&state, StatusCode::OK.as_u16());
-                            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                            return Ok(build_native_grpc_branch_error_response(
+                                &ctx,
+                                grpc_web_response_content_type,
+                                grpc_request_is_web_translated,
                                 grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                                 &message,
                                 initial_response_header_policy_plugins.as_ref(),
@@ -40838,7 +40914,10 @@ async fn handle_proxy_request_inner(
                     {
                         ctx.terminal_record.mark_counted();
                         record_request(&state, StatusCode::OK.as_u16());
-                        return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                        return Ok(build_native_grpc_branch_error_response(
+                            &ctx,
+                            grpc_web_response_content_type,
+                            grpc_request_is_web_translated,
                             grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                             &format!(
                                 "gRPC request payload size exceeds maximum of {} bytes",
@@ -41146,7 +41225,10 @@ async fn handle_proxy_request_inner(
                 {
                     ctx.terminal_record.mark_counted();
                     record_request(&state, 200);
-                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                    return Ok(build_native_grpc_branch_error_response(
+                        &ctx,
+                        grpc_web_response_content_type,
+                        grpc_request_is_web_translated,
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         &format!(
                             "gRPC request payload size exceeds maximum of {} bytes",
@@ -41814,6 +41896,7 @@ async fn handle_proxy_request_inner(
                         mismatch,
                         is_tls,
                         true,
+                        grpc_web_response_content_type,
                         start_time,
                         plugin_execution_ns,
                         "mesh_inbound_peer_auth_retry_target_mismatch",
@@ -41898,7 +41981,10 @@ async fn handle_proxy_request_inner(
                     );
                     ctx.terminal_record.mark_counted();
                     record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                    return Ok(build_native_grpc_branch_error_response(
+                        &ctx,
+                        grpc_web_response_content_type,
+                        grpc_request_is_web_translated,
                         14,
                         "backend address blocked by egress policy",
                         initial_response_header_policy_plugins.as_ref(),
@@ -42844,7 +42930,10 @@ async fn handle_proxy_request_inner(
                     drop(grpc_lb_connection_guard.take());
                     ctx.terminal_record.mark_counted();
                     record_request(&state, 200);
-                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                    return Ok(build_native_grpc_branch_error_response(
+                        &ctx,
+                        grpc_web_response_content_type,
+                        grpc_request_is_web_translated,
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         "gRPC request payload size exceeds maximum",
                         initial_response_header_policy_plugins.as_ref(),
@@ -43226,7 +43315,10 @@ async fn handle_proxy_request_inner(
                                 .with_grpc_status(Some(grpc_proxy::grpc_status::UNAVAILABLE)),
                             );
                         }
-                        return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                        return Ok(build_native_grpc_branch_error_response(
+                            &ctx,
+                            grpc_web_response_content_type,
+                            grpc_request_is_web_translated,
                             grpc_proxy::grpc_status::UNAVAILABLE,
                             "Internal gateway error",
                             initial_response_header_policy_plugins.as_ref(),
@@ -44083,7 +44175,10 @@ async fn handle_proxy_request_inner(
                 };
 
                 return Ok(resp_builder.body(body).unwrap_or_else(|_| {
-                    grpc_proxy::build_grpc_error_response_with_policy(
+                    build_native_grpc_branch_error_response(
+                        &ctx,
+                        grpc_web_response_content_type,
+                        grpc_request_is_web_translated,
                         grpc_proxy::grpc_status::UNAVAILABLE,
                         "Internal gateway error",
                         initial_response_header_policy_plugins.as_ref(),
@@ -44308,12 +44403,13 @@ async fn handle_proxy_request_inner(
                 // for a gateway-generated backend error: the terminal status has
                 // to ride in a gRPC-Web trailer frame under the gRPC-Web
                 // content-type, never a raw `application/grpc` trailers-only
-                // response the browser client cannot read. The mesh-retry-refusal
-                // (above) and backend-admission-rejection paths are already
-                // gRPC-Web aware; this backend-exchange-error arm was the last one
-                // that fell through to raw `application/grpc`, which is exactly the
+                // response the browser client cannot read. Every gateway-authored
+                // terminal of this branch follows the same rule (the size,
+                // egress, and mesh refusals go through
+                // `build_native_grpc_branch_error_response`, issue #7155); before
+                // #2041 this arm fell through to raw `application/grpc`, the
                 // intermittent `200 + application/grpc` a gRPC-Web caller saw when
-                // a backend read/connect blipped under load (issue #2041).
+                // a backend read/connect blipped under load.
                 //
                 // Every terminal this arm writes is gateway-generated: backend
                 // unavailable, the gateway's own deadline (an uncharged attempt
@@ -45120,6 +45216,7 @@ async fn handle_proxy_request_inner(
                     mismatch,
                     is_tls,
                     is_grpc_request,
+                    grpc_web_response_content_type,
                     start_time,
                     plugin_execution_ns,
                     "mesh_inbound_peer_auth_retry_target_mismatch",
