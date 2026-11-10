@@ -382,7 +382,6 @@ impl NodeLocalEnrolledDestinationsHandle {
     }
 
     /// Whether a node-local registry bounds this proxy's relay inventory.
-    #[allow(dead_code)] // Diagnostics + external test assertions; unread by the binary target.
     pub fn is_authoritative(&self) -> bool {
         self.0.is_some()
     }

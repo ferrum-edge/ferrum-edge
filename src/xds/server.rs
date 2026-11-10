@@ -347,6 +347,7 @@ impl XdsAdsServer {
     /// Reserve an aggregate permit for the existing inline guard tests, which
     /// exercise node-scoped cleanup rather than the aggregate budget.
     #[cfg(test)]
+    #[cfg(test)]
     fn test_permit(&self) -> XdsStreamPermit {
         self.admission
             .reserve_stream(&self.namespace, "test-principal")
@@ -528,11 +529,13 @@ impl XdsAdsServer {
         self.namespace.clone()
     }
 
+    #[cfg(test)]
     fn rebuild_snapshot(&self, node_id: &str) -> XdsSnapshot {
         let config = self.config.load_full();
         self.rebuild_snapshot_from_config(node_id, config.as_ref())
     }
 
+    #[cfg(test)]
     fn rebuild_snapshot_from_config(&self, node_id: &str, config: &GatewayConfig) -> XdsSnapshot {
         self.rebuild_snapshot_from_config_for_node(node_id, node_id, config)
     }
@@ -572,6 +575,7 @@ impl XdsAdsServer {
         translate_mesh_slice_to_snapshot(&slice)
     }
 
+    #[cfg(test)]
     fn snapshot_for_config(&self, node_id: &str, config: &GatewayConfig) -> Arc<XdsSnapshot> {
         // Non-stream helper for tests and one-off callers. ADS streams carry
         // XdsStreamConfig so request/ACK cache hits do not rehash config.
@@ -579,6 +583,7 @@ impl XdsAdsServer {
         self.snapshot_for_config_with_fingerprint(node_id, node_id, config, &fingerprint)
     }
 
+    #[cfg(test)]
     fn snapshot_for_stream_config(
         &self,
         node_id: &str,
@@ -767,6 +772,7 @@ impl XdsAdsServer {
         }
     }
 
+    #[cfg(test)]
     fn delta_response(
         &self,
         snapshot: &XdsSnapshot,
@@ -920,6 +926,7 @@ impl XdsAdsServer {
         }
     }
 
+    #[cfg(test)]
     fn sotw_responses_for_subscriptions(
         &self,
         node_id: &str,
@@ -929,6 +936,7 @@ impl XdsAdsServer {
         self.sotw_responses_for_subscriptions_from_config(node_id, subscriptions, config.as_ref())
     }
 
+    #[cfg(test)]
     fn sotw_responses_for_subscriptions_from_config(
         &self,
         node_id: &str,
@@ -945,6 +953,7 @@ impl XdsAdsServer {
         .1
     }
 
+    #[cfg(test)]
     fn sotw_responses_for_subscriptions_from_config_with_previous(
         &self,
         node_id: &str,
@@ -1007,6 +1016,7 @@ impl XdsAdsServer {
         (snapshot, responses)
     }
 
+    #[cfg(test)]
     fn sotw_response_for_request(
         &self,
         node_id: &str,
@@ -1025,6 +1035,7 @@ impl XdsAdsServer {
         )
     }
 
+    #[cfg(test)]
     fn sotw_response_for_stream_request(
         &self,
         node_id: &str,
@@ -1124,6 +1135,7 @@ impl XdsAdsServer {
         }
     }
 
+    #[cfg(test)]
     fn delta_response_for_stream_request(
         &self,
         node_id: &str,
@@ -1142,6 +1154,7 @@ impl XdsAdsServer {
         )
     }
 
+    #[cfg(test)]
     fn delta_response_for_stream_request_without_ack(
         &self,
         node_id: &str,
@@ -1258,49 +1271,6 @@ impl XdsAdsServer {
         Some(outcome)
     }
 
-    fn delta_responses_for_subscriptions(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-    ) -> Vec<DeltaDiscoveryResponse> {
-        let config = self.config.load_full();
-        self.delta_responses_for_subscriptions_from_config(node_id, subscriptions, config.as_ref())
-    }
-
-    fn delta_responses_for_subscriptions_from_config(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        config: &GatewayConfig,
-    ) -> Vec<DeltaDiscoveryResponse> {
-        let previous = self.snapshot_cache.get(node_id);
-        self.delta_responses_for_subscriptions_from_config_with_previous(
-            node_id,
-            subscriptions,
-            config,
-            previous.as_deref(),
-        )
-        .1
-    }
-
-    fn delta_responses_for_subscriptions_from_config_with_previous(
-        &self,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        config: &GatewayConfig,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        let fingerprint = config_fingerprint(config);
-        self.delta_responses_for_subscriptions_from_config_with_fingerprint(
-            node_id,
-            node_id,
-            subscriptions,
-            config,
-            &fingerprint,
-            previous,
-        )
-    }
-
     fn delta_responses_for_stream_config_with_previous_by_type_key(
         &self,
         cache_key: &str,
@@ -1328,37 +1298,6 @@ impl XdsAdsServer {
                         cache_key,
                     )
                 })
-            })
-            .collect();
-        (snapshot, responses)
-    }
-
-    fn delta_responses_for_subscriptions_from_config_with_fingerprint(
-        &self,
-        cache_key: &str,
-        node_id: &str,
-        subscriptions: &HashMap<String, XdsSubscription>,
-        config: &GatewayConfig,
-        fingerprint: &XdsConfigFingerprint,
-        previous: Option<&XdsSnapshot>,
-    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
-        let snapshot =
-            self.snapshot_for_config_with_fingerprint(cache_key, node_id, config, fingerprint);
-        let responses = subscriptions
-            .values()
-            .filter(|subscription| {
-                subscription_resources_changed(previous, &snapshot, subscription)
-            })
-            .map(|subscription| {
-                self.delta_response_with_nonce_key(
-                    &snapshot,
-                    previous,
-                    subscription,
-                    &HashMap::new(),
-                    &[],
-                    &[],
-                    cache_key,
-                )
             })
             .collect();
         (snapshot, responses)
@@ -4311,20 +4250,58 @@ mod tests {
         assert_ne!(old_snapshot.version, new_snapshot.version);
     }
 
+    /// Resend a Delta generation exactly as the live stream does after a config
+    /// update or broadcast lag: each subscribed type is diffed against the
+    /// snapshot that type last had ACKed (`last_accepted_snapshot_by_type`).
+    fn delta_resend(
+        server: &XdsAdsServer,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        config: GatewayConfig,
+        accepted_by_type: &HashMap<String, Arc<XdsSnapshot>>,
+    ) -> (Arc<XdsSnapshot>, Vec<DeltaDiscoveryResponse>) {
+        let stream_config = XdsStreamConfig::new(config);
+        server.invalidate_snapshot_for_config_update("node-a");
+        server.delta_responses_for_stream_config_with_previous_by_type_key(
+            "node-a",
+            "node-a",
+            subscriptions,
+            &stream_config,
+            accepted_by_type,
+        )
+    }
+
+    /// Record `snapshot` as ACKed for every subscribed type.
+    fn accepted_for_all(
+        subscriptions: &HashMap<String, XdsSubscription>,
+        snapshot: &Arc<XdsSnapshot>,
+    ) -> HashMap<String, Arc<XdsSnapshot>> {
+        subscriptions
+            .keys()
+            .map(|type_url| (type_url.clone(), Arc::clone(snapshot)))
+            .collect()
+    }
+
     #[test]
     fn delta_lag_recovery_reports_removed_resources() {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
-        let initial = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        let (initial_snapshot, initial) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 0),
+            &HashMap::new(),
+        );
         assert_eq!(initial.len(), 1);
         assert_eq!(initial[0].resources.len(), 1);
         assert!(initial[0].removed_resources.is_empty());
 
-        server
-            .config
-            .store(Arc::new(gateway_config_with_service(false, 1)));
-        let recovered = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        let (_, recovered) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(false, 1),
+            &accepted_for_all(&subscriptions, &initial_snapshot),
+        );
 
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].resources.len(), 0);
@@ -4339,15 +4316,62 @@ mod tests {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
 
-        let initial = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        let (initial_snapshot, initial) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 0),
+            &HashMap::new(),
+        );
         assert_eq!(initial.len(), 1);
 
-        server
-            .config
-            .store(Arc::new(gateway_config_with_service(true, 1)));
-        let unchanged = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        let (_, unchanged) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 1),
+            &accepted_for_all(&subscriptions, &initial_snapshot),
+        );
 
         assert!(unchanged.is_empty());
+    }
+
+    /// The resend diffs each type against ITS OWN last-accepted snapshot, not
+    /// one shared previous: a type whose earlier response was never ACKed is
+    /// re-sent in full even though a sibling type is already current.
+    #[test]
+    fn delta_resend_diffs_each_type_against_its_own_accepted_snapshot() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let cds = super::super::translator::CDS_TYPE_URL;
+        let eds = super::super::translator::EDS_TYPE_URL;
+        let mut subscriptions = wildcard_subscription(cds);
+        subscriptions.extend(wildcard_subscription(eds));
+
+        let (current, _) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 0),
+            &HashMap::new(),
+        );
+        // CDS ACKed the current generation; EDS has nothing accepted yet.
+        let accepted = HashMap::from([(cds.to_string(), Arc::clone(&current))]);
+
+        let (_, responses) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(true, 1),
+            &accepted,
+        );
+
+        let resent: Vec<&str> = responses
+            .iter()
+            .map(|response| response.type_url.as_str())
+            .collect();
+        assert_eq!(
+            resent,
+            vec![eds],
+            "only the type without an accepted snapshot is re-sent"
+        );
+        assert!(!responses[0].resources.is_empty());
+        assert!(responses[0].removed_resources.is_empty());
     }
 
     #[test]
@@ -4355,24 +4379,21 @@ mod tests {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
         let previous = server.snapshot_for_config("node-a", &gateway_config_with_service(true, 0));
-        let first_previous = Some(previous.clone());
-        let second_previous = Some(previous);
-        let next_config = gateway_config_with_service(false, 1);
+        let first_accepted = accepted_for_all(&subscriptions, &previous);
+        let second_accepted = accepted_for_all(&subscriptions, &previous);
 
-        let (_, first_responses) = server
-            .delta_responses_for_subscriptions_from_config_with_previous(
-                "node-a",
-                &subscriptions,
-                &next_config,
-                first_previous.as_deref(),
-            );
-        let (_, second_responses) = server
-            .delta_responses_for_subscriptions_from_config_with_previous(
-                "node-a",
-                &subscriptions,
-                &next_config,
-                second_previous.as_deref(),
-            );
+        let (_, first_responses) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(false, 1),
+            &first_accepted,
+        );
+        let (_, second_responses) = delta_resend(
+            &server,
+            &subscriptions,
+            gateway_config_with_service(false, 1),
+            &second_accepted,
+        );
 
         assert_eq!(first_responses.len(), 1);
         assert_eq!(second_responses.len(), 1);

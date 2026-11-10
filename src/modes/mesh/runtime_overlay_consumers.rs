@@ -39,8 +39,6 @@
 //! single `apply_*` call from [`apply_overlay`] plus its own module-global
 //! `ArcSwap` (or equivalent reload handle).
 
-#![allow(dead_code)]
-
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;

@@ -1007,83 +1007,6 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     carriers
 }
 
-/// Apply a decoded carrier onto the in-progress reverse-translated slice.
-///
-/// The DP collects every carrier it decodes off the ECDS stream, then applies
-/// them onto the slice it is rebuilding from CDS/EDS/LDS/RDS. Each variant
-/// overwrites the corresponding slice field; a slice never sees a partially
-/// applied carrier because apply happens after the whole ECDS resource list is
-/// decoded.
-pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
-    match carrier {
-        MeshSliceCarrier::Services(value) => slice.services = value,
-        MeshSliceCarrier::LocalInboundServices(value) => slice.local_inbound_services = value,
-        MeshSliceCarrier::LocalInboundWorkloads(value) => {
-            slice.local_inbound_workloads = Some(value)
-        }
-        MeshSliceCarrier::LocalIngressListeners(value) => slice.local_ingress_listeners = value,
-        MeshSliceCarrier::SidecarIngressDeclared(value) => slice.sidecar_ingress_declared = value,
-        MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => {
-            slice.declared_ingress_http_ports = value
-        }
-        MeshSliceCarrier::ConfigRevision(value) => slice.revision = Some(value),
-        MeshSliceCarrier::Workloads(value) => slice.workloads = value,
-        MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => {
-            slice.ambient_udp_source_workloads = value
-        }
-        MeshSliceCarrier::NodeWaypointAssertors(value) => slice.node_waypoint_assertors = value,
-        MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => {
-            slice.node_waypoint_capture_destinations = value
-        }
-        MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => {
-            slice.node_waypoint_capture_peer_authentications = value
-        }
-        MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value) => {
-            slice.node_waypoint_capture_mesh_policies = value;
-            slice.node_waypoint_capture_mesh_policies_resolved = true;
-        }
-        MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
-        MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
-        MeshSliceCarrier::VirtualServiceL4Proxies(value) => {
-            slice.virtual_service_l4_proxies = value
-        }
-        MeshSliceCarrier::VirtualServiceL4Upstreams(value) => {
-            slice.virtual_service_l4_upstreams = value
-        }
-        MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
-        MeshSliceCarrier::ExtAuthzProviders(value) => slice.ext_authz_providers = value,
-        MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
-            slice.virtual_service_cors_policies = value
-        }
-        MeshSliceCarrier::PeerAuthentications(value) => slice.peer_authentications = value,
-        MeshSliceCarrier::RequestAuthentications(value) => slice.request_authentications = value,
-        MeshSliceCarrier::ServiceEntries(value) => slice.service_entries = value,
-        MeshSliceCarrier::TelemetryResources(value) => slice.telemetry_resources = value,
-        MeshSliceCarrier::ProxyConfigs(value) => slice.proxy_configs = value,
-        MeshSliceCarrier::TrustBundles(value) => slice.trust_bundles = Some(value),
-        MeshSliceCarrier::OutboundTrafficPolicy(value) => {
-            slice.outbound_traffic_policy = Some(value)
-        }
-        MeshSliceCarrier::SidecarOutboundTrafficPolicy(value) => {
-            slice.sidecar_outbound_traffic_policy = Some(value)
-        }
-        MeshSliceCarrier::MultiCluster(value) => slice.multi_cluster = Some(value),
-        MeshSliceCarrier::SidecarEgressScope(value) => slice.sidecar_egress_scope = Some(value),
-        MeshSliceCarrier::WaypointGatewayClass(value) => slice.waypoint_gateway_class = Some(value),
-        MeshSliceCarrier::ServiceWaypointBoundServices(value) => {
-            slice.service_waypoint_bound_services = value
-        }
-        // Decode already rejects blank values; defend in depth so an empty
-        // variant constructed in-process cannot clear trustworthy provenance.
-        MeshSliceCarrier::IstioRootNamespace(value) => {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                slice.istio_root_namespace = trimmed.to_string();
-            }
-        }
-    }
-}
-
 /// Workload identity a Ferrum DP communicates to the CP via the xDS
 /// `Node.metadata` bytes shim (the minimal proto carries `bytes`, a placeholder
 /// for Envoy's `google.protobuf.Struct`). JSON-encoded so it stays
@@ -1503,8 +1426,8 @@ mod tests {
     }
 
     /// Blank / whitespace-only root-namespace carriers are not trustworthy
-    /// provenance: decode ignores them, apply cannot clear a prior value, and
-    /// emission omits empty/whitespace slice fields (issue #2469).
+    /// provenance: decode ignores them and emission omits empty/whitespace
+    /// slice fields (issue #2469).
     #[test]
     fn blank_istio_root_namespace_carrier_is_ignored() {
         for blank in ["", "   ", "\t\n"] {
@@ -1517,19 +1440,6 @@ mod tests {
                 "blank root carrier {blank:?} must be ignored at decode"
             );
         }
-
-        let mut slice = MeshSlice {
-            istio_root_namespace: "istio-system".to_string(),
-            ..MeshSlice::default()
-        };
-        apply_carrier(
-            &mut slice,
-            MeshSliceCarrier::IstioRootNamespace("   ".to_string()),
-        );
-        assert_eq!(
-            slice.istio_root_namespace, "istio-system",
-            "blank apply must not clear trustworthy root provenance"
-        );
 
         for blank in ["", "  \t "] {
             let carriers = build_slice_carriers(&MeshSlice {

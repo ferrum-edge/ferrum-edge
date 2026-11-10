@@ -1284,7 +1284,7 @@ async fn functional_cli_validate_redacts_resolved_value_in_startup_warning() {
 /// `FERRUM_CP_NAMESPACES` is parsed as `Vec<String>`, which splits on `,` and
 /// trims each entry, and `EnvConfig::validate()` then interpolates the trimmed
 /// **entry** into a hand-written error. The staged value carries leading
-/// whitespace that `read_secret` (which only trims the *trailing* end) leaves
+/// whitespace that the `_FILE` reader (which only trims the *trailing* end) leaves
 /// intact, so the resolved environment value and the echoed entry are different
 /// strings and only a derived candidate can match.
 #[ignore]
@@ -1296,7 +1296,7 @@ async fn functional_cli_validate_redacts_transformed_list_entry() {
     let jwt_path = temp_dir.path().join("jwt-secret");
     std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
     let namespaces_path = temp_dir.path().join("cp-namespaces");
-    // Leading whitespace survives `read_secret`'s trailing-only trim.
+    // Leading whitespace survives the `_FILE` reader's trailing-only trim.
     std::fs::write(&namespaces_path, format!("   {ENTRY}")).unwrap();
 
     let output = validate_database_mode_command(&temp_dir)

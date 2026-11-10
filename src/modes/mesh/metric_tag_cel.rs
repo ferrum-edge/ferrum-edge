@@ -504,10 +504,8 @@ fn expr_uses_http_only(expr: &MetricTagCelExpr) -> bool {
 /// Missing attributes yield an empty string (Istio/Envoy empty-dimension
 /// behavior) rather than inventing placeholder traffic data. Output is
 /// truncated and sanitized to printable ASCII suitable for Prometheus labels.
-// This is a public library helper exercised by the external unit-test target.
-// The binary target compiles the same module independently, where the helper is
-// intentionally unused because the live hot path evaluates the compact plan.
-#[allow(dead_code)]
+// A public library helper exercised by the external unit-test target; the live
+// hot path evaluates the compact plan instead.
 pub fn evaluate_metric_tag_cel(expr: &MetricTagCelExpr, ctx: MetricTagCelContext<'_>) -> String {
     let raw = match expr {
         MetricTagCelExpr::Literal { value } => value.clone(),

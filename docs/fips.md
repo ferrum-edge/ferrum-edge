@@ -405,6 +405,11 @@ the entry and discloses nothing.
   nothing. They are computed through the provider seam, and the inventory
   records them as `outside-boundary` for exactly the same reason as the RFC 6455
   handshake value. Do not read them as SHA-1 signature verification.
+- JWT-SVID authorities (local and federated) follow the same key policy as the
+  plugin JWKS path while `FERRUM_FIPS_MODE=enforce` is in effect: an RSA
+  authority's public exponent must be odd and greater than 65536, and an EC
+  authority must use P-256 or P-384 (`fips::keys`). On the default profile the
+  RFC 8017 floor (odd, at least 3) still applies.
 - JWT-SVID trust material admits an EC authority only after proving
   the published point actually lies on its named curve. That proof is a bounded
   ephemeral ECDH agreement at the provider seam (`fips::ec_point_on_named_curve`

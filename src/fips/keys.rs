@@ -290,20 +290,12 @@ pub fn check_jwt_rsa_verification_pkcs1_der(der: &[u8], surface_label: &str) -> 
     }
 }
 
-/// Admit a JWK RSA modulus, when FIPS mode is enforced.
+/// Admit a JWK RSA modulus under the FIPS key policy.
 ///
 /// `modulus` is the decoded, unsigned big-endian `n` member of an RFC 7518 RSA
 /// JWK — public material only. JWKs are fetched from an operator-configured
 /// issuer, so a weak signing key admitted here would let that issuer's
 /// compromise become Ferrum's authentication failure.
-pub fn check_jwk_rsa_modulus(modulus: &[u8]) -> Result<(), String> {
-    if !super::is_enforcing() {
-        return Ok(());
-    }
-    check_jwk_rsa_modulus_enforced(modulus)
-}
-
-/// The enforced half of [`check_jwk_rsa_modulus`].
 pub fn check_jwk_rsa_modulus_enforced(modulus: &[u8]) -> Result<(), String> {
     check_rsa_modulus_bits(unsigned_be_bit_length(modulus), "JWKS RSA signing key")
 }
@@ -351,15 +343,7 @@ fn check_rsa_public_exponent_enforced(exponent: &[u8], surface_label: &str) -> R
 /// would just move the failure later.
 pub const APPROVED_JWK_EC_CURVES: &[&str] = &["P-256", "P-384"];
 
-/// Admit a JWK elliptic curve, when FIPS mode is enforced.
-pub fn check_jwk_ec_curve(curve: &str) -> Result<(), String> {
-    if !super::is_enforcing() {
-        return Ok(());
-    }
-    check_jwk_ec_curve_enforced(curve)
-}
-
-/// The enforced half of [`check_jwk_ec_curve`].
+/// Admit a JWK elliptic curve under the FIPS key policy.
 pub fn check_jwk_ec_curve_enforced(curve: &str) -> Result<(), String> {
     // RFC 7518 registry values are case-sensitive. Requiring the exact token
     // keeps this admission decision identical to the downstream algorithm

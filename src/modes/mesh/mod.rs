@@ -327,7 +327,6 @@ impl MeshTopology {
     /// derives the HBONE listener from `listener_plan()`. Only the topology
     /// conformance matrix and integration tests read it.
     #[inline]
-    #[allow(dead_code)]
     pub fn terminates_hbone(self) -> bool {
         matches!(
             self,
@@ -1583,7 +1582,6 @@ impl MeshRuntimeConfig {
 /// This entry point takes a whole `GatewayConfig` and is used by tests and the
 /// `startup_rollback_test_seams` seam. The mutation is cold-path: it runs
 /// before `ProxyState` builds router/plugin caches.
-#[allow(dead_code)] // Used by tests and test seams.
 pub fn prepare_gateway_config_for_mesh(
     mut config: GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -1614,7 +1612,6 @@ pub fn prepare_gateway_config_for_mesh(
 /// [`MeshSlice::from_gateway_config`] before this step, which is why a
 /// document that names Services in other namespaces never reaches the
 /// NodeWaypoint UDP materializer on that path.
-#[allow(dead_code)] // Used by tests.
 pub fn prepare_gateway_config_from_mesh_slice(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
@@ -20838,9 +20835,7 @@ fn stage_gateway_active_trust_bundles(
 /// the staging contract (a deep-invalid bundle rejects the whole generation and
 /// mutates no live state) against the PRODUCTION helper rather than a copy.
 ///
-/// Reached only from `tests/`; the `ferrum-edge` bin target compiles this module
-/// without any such caller.
-#[allow(dead_code)]
+/// Reached only from `tests/`.
 pub fn stage_gateway_active_trust_bundles_unfederated_for_test(
     proxy_state: &ProxyState,
     slice: &MeshSlice,
@@ -21867,11 +21862,6 @@ async fn shutdown_and_join_mesh(
 }
 
 /// External coverage seams for issue #2372 mesh startup rollback.
-///
-/// `src/main.rs` re-declares modules without the `_test_support` bridge, so this
-/// module is unused in the binary target — hence the module-scoped
-/// `allow(dead_code)`. Production code is not suppressed.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub mod startup_rollback_test_seams {
     use super::*;
@@ -22097,11 +22087,6 @@ pub mod startup_rollback_test_seams {
 /// private, so external coverage of the config-revision watermark lifecycle
 /// ACROSS that stage reaches it through this seam rather than through an
 /// in-source test.
-///
-/// `src/main.rs` re-declares modules without the `_test_support` bridge, so
-/// this module is unused in the binary target — hence the module-scoped
-/// `allow(dead_code)`. Production code is not suppressed.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub mod initial_config_wait_test_seams {
     use super::*;

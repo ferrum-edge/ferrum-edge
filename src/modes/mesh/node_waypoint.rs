@@ -79,7 +79,6 @@
 //! best-effort garbage collection, not security invariants. The fail-closed
 //! invariant on the accept path is unchanged: an unknown cookie or pod is
 //! still rejected before traffic enters the plugin chain.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;

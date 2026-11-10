@@ -5,7 +5,6 @@
 //! It evaluates the Layer 2 `MeshPolicy` model.
 //! Path matching is intentionally literal; callers must pass already-normalized
 //! request paths when they want dot-segment, slash, or percent-decoding policy.
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
 

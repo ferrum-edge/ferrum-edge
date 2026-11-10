@@ -11,8 +11,6 @@
 //! mesh subsystem will share the same `FERRUM_NAMESPACE` mechanism so a
 //! single gateway instance only loads its own namespace's mesh resources.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};

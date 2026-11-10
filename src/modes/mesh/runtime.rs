@@ -2,7 +2,6 @@
 //!
 //! Phase C keeps the live per-node [`MeshSlice`] in an `ArcSwap` slot so
 //! listener and plugin paths can read the latest mesh view without locks.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

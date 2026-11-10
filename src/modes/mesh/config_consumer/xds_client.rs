@@ -1562,6 +1562,32 @@ impl XdsConfigConsumer {
     }
 }
 
+/// Rebuild a mesh slice from a CP-built xDS snapshot through the DP's
+/// production path: one SotW response per type URL into a
+/// [`ResourceAccumulator`] (with its ACK-boundary carrier validation), then
+/// [`reverse_translate`] (carrier recovery, cross-carrier coherence checks and
+/// the capture-inventory completeness gate).
+///
+/// This is the parity seam for tests that assert an xDS-carried slice behaves
+/// like a native one. It runs the code the live ADS stream runs, so a test
+/// cannot pass against a parallel decoder the data plane never uses.
+#[doc(hidden)]
+pub fn reverse_translate_xds_snapshot(
+    snapshot: &crate::xds::XdsSnapshot,
+    config: &XdsClientConfig,
+) -> Result<MeshSlice, String> {
+    let mut accumulator = ResourceAccumulator::new();
+    for type_url in XDS_TYPE_URLS {
+        let resources: Vec<proto::Any> = snapshot
+            .resources(type_url)
+            .iter()
+            .map(crate::xds::XdsResource::to_any)
+            .collect();
+        accumulator.apply_sotw_response(type_url, &resources, &snapshot.version)?;
+    }
+    reverse_translate(&accumulator, config)
+}
+
 fn reverse_translate(
     accumulator: &ResourceAccumulator,
     config: &XdsClientConfig,

@@ -9,7 +9,7 @@ use crate::common::containers::{VaultContainer, fail_in_ci_else_skip, start_vaul
 use crate::common::env::{EnvGuard, assert_resolved_var};
 #[cfg(feature = "secrets-azure")]
 use crate::common::fakes::AzureKeyVaultFake;
-use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference, resolve_secret};
+use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference};
 use serial_test::serial;
 use std::time::Duration;
 use wiremock::matchers::{header, method, path};
@@ -58,16 +58,17 @@ async fn vault_address_validation_precedes_reference_parsing_without_panicking()
 
 #[tokio::test]
 #[serial]
-async fn vault_invalid_address_fails_single_and_batch_resolution() {
+async fn vault_invalid_address_fails_direct_reference_and_batch_resolution() {
     let guard = EnvGuard::new();
     guard.set("VAULT_TOKEN", "address-token-sentinel");
     guard.set("FERRUM_ADMIN_JWT_SECRET_VAULT", "secret/data/app#field");
     for &(address, reason) in INVALID_ADDRESSES {
         guard.set("VAULT_ADDR", address);
-        let single = resolve_secret("FERRUM_ADMIN_JWT_SECRET")
-            .await
-            .err()
-            .expect("single-key resolution must reject the address");
+        let single =
+            resolve_external_reference("vault", "secret/data/app#field", "FERRUM_ADMIN_JWT_SECRET")
+                .await
+                .err()
+                .expect("direct-reference resolution must reject the address");
         let batch = resolve_all_env_secrets()
             .await
             .err()
