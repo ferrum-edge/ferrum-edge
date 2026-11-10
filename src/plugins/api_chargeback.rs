@@ -3806,8 +3806,6 @@ impl ApiChargeback {
             "api_chargeback: `config`: ",
         )?;
 
-        let registry = global_registry_with_shard_amount(shard_amount);
-
         let currency = instance_currency(config)?;
 
         // Resolve shared tunables before mutating the registry so a bad value
@@ -3828,6 +3826,12 @@ impl ApiChargeback {
                     .to_string(),
             );
         }
+
+        // Resolve (and, on first use, create) the process-global registry only
+        // once every currency, tunable, and pricing check has passed, so a
+        // config that fails validation never claims the singleton (issue
+        // #7109).
+        let registry = global_registry_with_shard_amount(shard_amount);
 
         // Construction stays side-effect free on the process-global registry.
         // Admin validation and a staged plugin-cache generation both build an
