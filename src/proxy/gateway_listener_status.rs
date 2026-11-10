@@ -505,9 +505,6 @@ impl GatewayListenerStatus {
     /// Release store that happens after the snapshot it describes is visible.
     /// Generation `0` and `u64::MAX` are exact values; the initialized flag
     /// exists only so those are not sentinels.
-    // The binary target re-declares these modules, so a `pub` item consumed
-    // only by `tests/` reads as dead code there.
-    #[allow(dead_code)]
     pub fn published_generation(&self) -> Option<u64> {
         if self
             .published_generation_initialized
@@ -573,9 +570,6 @@ impl GatewayListenerStatus {
     /// `observations` is consumed inside that critical section, so a rejected
     /// publication leaves the snapshot, the active ledger, the cumulative
     /// counters, and every timestamp exactly as they were.
-    // The binary target re-declares these modules, so a `pub` item consumed
-    // only by `tests/` reads as dead code there.
-    #[allow(dead_code)]
     pub fn publish(
         &self,
         config_generation: u64,

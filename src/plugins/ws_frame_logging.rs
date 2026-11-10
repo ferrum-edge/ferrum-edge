@@ -95,7 +95,6 @@ pub const MAX_PAYLOAD_PREVIEW_BYTES: u64 = 65_536;
 /// Default `log_level` when omitted. Healthy per-frame records remain
 /// informational; construction emits an actionable warning when the active
 /// filter (including the gateway default `warn`) suppresses them.
-#[allow(dead_code)] // Used by external unit tests that verify OpenAPI/default parity.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Accepted `direction` values, in documentation order.
@@ -544,19 +543,16 @@ impl WsFrameLogging {
     }
 
     /// Configured tracing level label (`trace`/`debug`/`info`/`warn`).
-    #[allow(dead_code)] // Used by external unit tests; the binary uses the parsed enum directly.
     pub fn configured_log_level(&self) -> &'static str {
         self.config.log_level.as_str()
     }
 
     /// Leading payload bytes folded into fingerprints when previews are enabled.
-    #[allow(dead_code)] // Used by external unit tests; runtime reads the field directly.
     pub fn payload_preview_bytes(&self) -> usize {
         self.config.payload_preview_bytes
     }
 
     /// Plugin-config resource id stamped on every record as `plugin_id`.
-    #[allow(dead_code)] // Used by external unit tests; runtime reads the field directly.
     pub fn plugin_id(&self) -> &str {
         &self.config.plugin_id
     }

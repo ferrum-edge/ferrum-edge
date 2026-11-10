@@ -4036,7 +4036,7 @@ fn scoped_plugin_config_applies_to_proxy(
     }
 }
 
-fn plugin_config_effectively_applies_to_proxy(
+pub(crate) fn plugin_config_effectively_applies_to_proxy(
     pc: &PluginConfig,
     proxy: &crate::config::types::Proxy,
     config: &GatewayConfig,
@@ -4342,7 +4342,6 @@ thread_local! {
 /// Number of `ai_federation` streaming route plans resolved on the calling
 /// thread since it started.
 #[doc(hidden)]
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call through its wrapper.
 pub fn ai_federation_route_plan_resolutions_for_test() -> u64 {
     AI_FEDERATION_ROUTE_PLAN_RESOLUTIONS.with(Cell::get)
 }
@@ -6322,8 +6321,7 @@ fn mesh_authz_global_config_state(config: &GatewayConfig) -> (bool, usize) {
 ///
 /// `pub(crate)` so `_test_support` can pin the "managed row configured but its
 /// runtime policy never reached the prebuilt TCP chain" arm directly, without
-/// forging a plugin construction failure. A dedicated `_for_test` wrapper would
-/// be dead code in the binary target, which does not compile `lib.rs`.
+/// forging a plugin construction failure.
 pub(crate) fn node_waypoint_destination_authz_ready_from_counts(
     managed_config_present: bool,
     enabled_global_mesh_authz_configs: usize,
@@ -6744,7 +6742,6 @@ thread_local! {
 /// Arm a single post-JWKS-startup rejection for the next staged PluginCache
 /// build. Consumed once by [`reject_after_jwks_startup_if_requested_for_test`].
 #[doc(hidden)]
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call through its wrapper.
 pub fn request_reject_after_jwks_startup_for_test() {
     REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.set(true));
 }
@@ -7878,7 +7875,6 @@ fn validate_mesh_bpf_metrics_ownership(config: &GatewayConfig) -> Result<(), Str
 
 impl PluginCache {
     /// Build a new plugin cache from the given config with a default HTTP client.
-    #[allow(dead_code)]
     pub fn new(config: &GatewayConfig) -> Result<Self, String> {
         let http_client = PluginHttpClient::default();
         Self::with_http_client(config, http_client)
@@ -8064,7 +8060,6 @@ impl PluginCache {
 
     /// Every target tracked by the live adaptive-concurrency policies.
     /// Inspection only, for in-process fixtures that settle real requests.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
     pub(crate) fn adaptive_concurrency_snapshots(&self) -> Vec<AdaptiveConcurrencySnapshot> {
         self.inner
             .load()
@@ -8086,7 +8081,6 @@ impl PluginCache {
     /// so the injected plugin is actually visible to
     /// [`Self::get_plugins_for_protocol`] and friends. A bare-id key would land
     /// in the map unreachable and the seam would silently no-op.
-    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
     pub(crate) fn prepend_proxy_plugin_for_test(
         &self,
         namespace: &str,
@@ -8287,7 +8281,6 @@ impl PluginCache {
     /// Global access logs a request that matched no proxy is delivered to
     /// (route-miss `404`), in configured order; empty when the published
     /// generation has none.
-    #[allow(dead_code)] // Inspection API for external tests; the proxy reads the epoch's inner cache.
     pub fn unrouted_transaction_log_plugins(&self) -> Vec<Arc<dyn Plugin>> {
         self.inner
             .load()
@@ -8298,7 +8291,6 @@ impl PluginCache {
 
     /// Global correlation policies applied to route-miss responses, in
     /// lifecycle order; empty when this generation has none.
-    #[allow(dead_code)] // Inspection API for external tests; dispatch reads the epoch.
     pub fn unrouted_correlation_plugins(&self) -> Vec<Arc<dyn Plugin>> {
         self.inner
             .load()
@@ -9382,7 +9374,6 @@ impl PluginCache {
     ///
     /// Returns an Arc to the cached plugin Vec — zero allocation per request.
     /// Callers iterate by reference; no Vec clone needed.
-    #[allow(dead_code)] // Used by tests for protocol-agnostic plugin inspection
     pub fn get_plugins(&self, namespace: &str, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
@@ -9417,7 +9408,6 @@ impl PluginCache {
     /// Standalone accessor: each call loads the cache independently. Request
     /// paths that need multiple plugin-cache values should use
     /// `request_view()` for cross-accessor generation consistency.
-    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn get_auth_plugins(
         &self,
         namespace: &str,
@@ -9437,7 +9427,6 @@ impl PluginCache {
     /// Standalone accessor: each call loads the cache independently. Request
     /// paths that need multiple plugin-cache values should use
     /// `request_view()` for cross-accessor generation consistency.
-    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn get_capabilities(
         &self,
         namespace: &str,
@@ -9457,7 +9446,6 @@ impl PluginCache {
     /// Standalone accessor: each call loads the cache independently. Request
     /// paths that need multiple plugin-cache values should use
     /// `request_view()` for cross-accessor generation consistency.
-    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn requires_response_body_buffering(&self, namespace: &str, proxy_id: &str) -> bool {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
@@ -9489,7 +9477,6 @@ impl PluginCache {
     /// Standalone accessor: each call loads the cache independently. Request
     /// paths that need multiple plugin-cache values should use
     /// `request_view()` for cross-accessor generation consistency.
-    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn requires_ws_frame_hooks(&self, namespace: &str, proxy_id: &str) -> bool {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
@@ -9616,7 +9603,6 @@ impl PluginCache {
     }
 
     /// Number of proxy entries in the cache (for testing).
-    #[allow(dead_code)]
     pub fn proxy_count(&self) -> usize {
         self.inner.load().proxy_plugins.len()
     }

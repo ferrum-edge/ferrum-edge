@@ -2965,33 +2965,22 @@ mod live_netns_tests {
             .ok()
     }
 
-    /// Build the transparent capture socket EXACTLY as the production listener's
-    /// `build_bound_socket` does (`SO_REUSEADDR` + `IP_TRANSPARENT` +
-    /// `IP_RECVORIGDSTADDR`, options before bind), bound to the v4 wildcard on
-    /// `CAPTURE_PORT`. Returns the bound std socket so the test can drain it with
-    /// the listener's own `RecvMmsgBatch` primitive.
+    /// Bind the production transparent capture socket
+    /// ([`super::bind_mesh_udp_capture_socket`]) to the v4 wildcard on
+    /// `CAPTURE_PORT`, so a regression in the production recipe surfaces here.
+    /// Returns the bound std socket so the test can drain it with the
+    /// listener's own `RecvMmsgBatch` primitive.
     fn build_capture_socket() -> Result<std::net::UdpSocket, String> {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .map_err(|e| format!("socket: {e}"))?;
-        socket
-            .set_reuse_address(true)
-            .map_err(|e| format!("SO_REUSEADDR: {e}"))?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| format!("set_nonblocking: {e}"))?;
-        let fd = socket.as_raw_fd();
-        crate::socket_opts::set_ip_transparent(fd).map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
-        crate::socket_opts::set_ip_recvorigdstaddr(fd)
-            .map_err(|e| format!("IP_RECVORIGDSTADDR: {e}"))?;
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), CAPTURE_PORT);
-        socket
-            .bind(&bind_addr.into())
-            .map_err(|e| format!("bind {bind_addr}: {e}"))?;
-        Ok(socket.into())
+        let (socket, bound, v4_origdst, _) = super::bind_mesh_udp_capture_socket(bind_addr)
+            .map_err(|e| format!("bind production capture socket {bind_addr}: {e:#}"))?;
+        if bound != bind_addr || !v4_origdst {
+            return Err(format!(
+                "production capture socket bound {bound} (v4 orig-dst: {v4_origdst}), \
+                 expected {bind_addr} with v4 orig-dst recovery"
+            ));
+        }
+        Ok(socket)
     }
 
     #[test]
@@ -3289,10 +3278,9 @@ mod live_netns_tests {
         // The return-path primitive: a reply to the captured client must be
         // SOURCED from the captured original destination (the VIP:port the pod
         // dialed), which requires an IP_TRANSPARENT socket bound NON-LOCALLY to
-        // that address. This exercises `build_transparent_reply_socket`'s exact
-        // recipe (SO_REUSEADDR + IP_TRANSPARENT + non-local bind) against a real
-        // kernel inside the netns — proving the bind the egress return path
-        // depends on actually succeeds with CAP_NET_ADMIN.
+        // that address. This calls the production `build_transparent_reply_socket`
+        // against a real kernel inside the netns — proving the bind the egress
+        // return path depends on actually succeeds with CAP_NET_ADMIN.
         if !is_root() {
             skip_or_fail("not root; IP_TRANSPARENT non-local bind needs CAP_NET_ADMIN");
             return;
@@ -3329,28 +3317,12 @@ mod live_netns_tests {
             if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
                 return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
             }
-            // Mirror `build_transparent_reply_socket` for a NON-LOCAL captured
-            // destination (TEST-NET-1 — never assigned to `lo`, so the bind only
-            // succeeds because IP_TRANSPARENT permits binding a non-local addr).
+            // The production reply socket for a NON-LOCAL captured destination
+            // (TEST-NET-1 — never assigned to `lo`, so the bind only succeeds
+            // because IP_TRANSPARENT permits binding a non-local addr).
             let orig_dst = SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT);
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )
-            .map_err(|e| format!("socket: {e}"))?;
-            socket
-                .set_reuse_address(true)
-                .map_err(|e| format!("SO_REUSEADDR: {e}"))?;
-            socket
-                .set_nonblocking(true)
-                .map_err(|e| format!("set_nonblocking: {e}"))?;
-            crate::socket_opts::set_ip_transparent(socket.as_raw_fd())
-                .map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
-            socket
-                .bind(&orig_dst.into())
+            let std_sock = super::build_transparent_reply_socket(orig_dst)
                 .map_err(|e| format!("non-local transparent bind {orig_dst}: {e}"))?;
-            let std_sock: std::net::UdpSocket = socket.into();
             std_sock
                 .local_addr()
                 .map_err(|e| format!("local_addr: {e}"))

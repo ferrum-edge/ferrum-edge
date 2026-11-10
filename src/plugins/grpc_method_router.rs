@@ -160,7 +160,6 @@ pub struct GrpcMethodRouter {
 }
 
 impl GrpcMethodRouter {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -360,7 +359,6 @@ impl GrpcMethodRouter {
 
     /// Give external metric tests their own registry instead of racing other
     /// plugins' process-wide counter updates. Production uses the global registry.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn with_metrics_registry_for_test(mut self, registry: Arc<MetricsRegistry>) -> Self {
         self.metrics = registry;
         self

@@ -2088,7 +2088,6 @@ pub struct RequestMirror {
 }
 
 impl RequestMirror {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
     }
@@ -2331,7 +2330,6 @@ impl RequestMirror {
     /// Effective sampling threshold in tenths of a percent (`0..=1000`).
     // This accessor exists for the external sampling contract tests. The
     // production request path reads the field directly in `should_mirror`.
-    #[allow(dead_code)]
     pub(crate) fn sample_threshold_for_test(&self) -> u64 {
         self.sample_threshold
     }
@@ -2339,25 +2337,21 @@ impl RequestMirror {
     /// Current Bresenham phase in `0..SAMPLE_PERIOD`.
     // This accessor exists for the external sampling contract tests. The
     // production request path updates the atomic directly in `should_mirror`.
-    #[allow(dead_code)]
     pub(crate) fn sample_phase_for_test(&self) -> u64 {
         self.sample_phase.load(Ordering::Relaxed)
     }
 
     /// Current retained request-body budget usage for external tests.
-    #[allow(dead_code)]
     pub(crate) fn retained_request_body_bytes_for_test(&self) -> u64 {
         self.body_budget.used_for_test()
     }
 
     /// Configured retained-body ceiling for external tests.
-    #[allow(dead_code)]
     pub(crate) fn max_retained_request_body_bytes_for_test(&self) -> u64 {
         self.body_budget.max_bytes
     }
 
     /// Configured plugin-local per-request body ceiling for external tests.
-    #[allow(dead_code)]
     pub(crate) fn max_mirrored_request_body_bytes_for_test(&self) -> u64 {
         self.max_mirrored_request_body_bytes
     }
@@ -2405,7 +2399,6 @@ impl RequestMirror {
     /// tests. Process-wide authenticated `/metrics` also exports the same
     /// aggregate tallies as `ferrum_request_mirror_*_total` (monotonic across
     /// reloads); this hook asserts the per-instance, reload-reset view.
-    #[allow(dead_code)]
     pub(crate) fn mirror_metrics_snapshot_for_test(&self) -> MirrorMetricsSnapshot {
         self.metrics.snapshot()
     }
@@ -2550,7 +2543,6 @@ impl RequestMirror {
 
     /// External-test probe for the real state-advancing sampler without
     /// widening the production API surface.
-    #[allow(dead_code)]
     pub(crate) fn should_mirror_for_test(&self) -> bool {
         self.should_mirror()
     }

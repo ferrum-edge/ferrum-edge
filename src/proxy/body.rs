@@ -2456,16 +2456,12 @@ impl Drop for ProxyBody {
 // -- SyncBody wrapper ---------------------------------------------------------
 
 pin_project! {
-    /// Wraps a body that already implements `Send + Sync` so that the
-    /// `Sync` bound is preserved through `pin_project!`'s synthesized
-    /// generics, enabling use with `reqwest::Body::wrap()` (which requires
-    /// `Send + Sync + 'static`).
+    /// Wraps a request body handed to `reqwest::Body::wrap()` (which requires
+    /// `Send + Sync + 'static`) and drops inbound request trailer frames.
     ///
-    /// The wrapper itself adds no extra concurrency capability beyond what
-    /// `B` already provides — it is a thin `#[pin]`-projected newtype. The
-    /// `unsafe impl Sync` below delegates the `Sync` claim to `B` at
-    /// compile time via the `B: Send + Sync` bound; there is no runtime
-    /// invariant required.
+    /// The wrapper is a thin `#[pin]`-projected newtype, so `Send`/`Sync` are
+    /// the compiler's auto-trait derivation from `B`: no `unsafe impl` is
+    /// needed or wanted.
     ///
     /// Use [`reqwest::Body::wrap_stream`] instead if `B` is `Send` but
     /// `!Sync`. That path loses the `size_hint()` from the underlying body
@@ -2477,14 +2473,6 @@ pin_project! {
         inner: B,
     }
 }
-
-// SAFETY: The bound `B: Send + Sync` makes this `Sync` claim a compile-time
-// delegation to the inner body. `SyncBody<B>` is a transparent newtype over
-// `B` (one `#[pin]`-projected field, no interior mutability of its own), so
-// `&SyncBody<B>` exposes only `&B`'s API surface, which is `Sync`-safe by
-// the bound. No runtime invariant (such as "polled from a single task") is
-// required for soundness.
-unsafe impl<B: Send + Sync> Sync for SyncBody<B> {}
 
 /// How a [`ReplayableRequestBody`] reaches the backend transport.
 enum ReplayableUploadSource {
@@ -3828,7 +3816,6 @@ impl http_body::Body for DirectH1RequestBody {
 ///
 /// Reached only through `crate::_test_support`, which the binary target does
 /// not compile, so it is dead code there.
-#[allow(dead_code)]
 pub(crate) fn poll_upload_cancel_once(
     cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> UploadCancelSignal {
@@ -5114,7 +5101,6 @@ impl<S: FrameSource> Coalescing<S> {
     ///
     /// Reached only through `crate::_test_support`, so the issue #5040
     /// laziness contract is asserted on the production adapter.
-    #[allow(dead_code)]
     pub(crate) fn buffer_state_name(&self) -> &'static str {
         self.buffer.state_name()
     }
@@ -8872,18 +8858,10 @@ mod tests {
 
     // --- SyncBody trait-bound assertions -------------------------------------
     //
-    // The `unsafe impl<B: Send + Sync> Sync for SyncBody<B>` claim below is
-    // future-proofed by these compile-time assertions. They will fail to
-    // build if either:
-    //   1. The bound on `SyncBody`'s `Sync` impl is loosened back to just
-    //      `B: Send` AND a future caller wraps a `!Sync` body (latent UB).
-    //   2. A current call-site type (`SizeLimitedIncoming`, `CountingIncoming`)
-    //      gains a `!Sync` field, breaking the assumption that all current
-    //      callers happen to satisfy the tighter bound.
-    //
-    // The negative case is enforced by a `must_be_sync<T: Sync>` helper that
-    // would refuse to monomorphize over a `!Sync` body. See `phantom_not_sync`
-    // below for the local witness type used by the tests.
+    // `SyncBody` is `Sync` only through auto-trait derivation from its inner
+    // body. This compile-time assertion fails to build if a current call-site
+    // type (`SizeLimitedIncoming`, `CountingIncoming`) gains a `!Sync` field,
+    // which `reqwest::Body::wrap()` would then refuse.
     fn must_be_sync<T: Sync>() {}
     fn must_be_send<T: Send>() {}
 
@@ -8931,28 +8909,6 @@ mod tests {
             0,
             "dropping the body must release the per-IP slot exactly once"
         );
-    }
-
-    /// A `Send`-but-`!Sync` witness body. Used purely for compile-time
-    /// negative tests below — the inclusion of a `Cell<()>` field makes
-    /// the type `!Sync` while leaving it `Send`.
-    ///
-    /// If the `Sync` bound on `SyncBody` is ever loosened to `B: Send`,
-    /// `must_be_sync::<SyncBody<NotSyncBody>>()` would compile, signaling
-    /// the latent unsoundness has returned.
-    struct NotSyncBody {
-        _marker: std::cell::Cell<()>,
-    }
-
-    impl http_body::Body for NotSyncBody {
-        type Data = Bytes;
-        type Error = BoxError;
-        fn poll_frame(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-            Poll::Ready(None)
-        }
     }
 
     #[test]
@@ -9473,34 +9429,5 @@ mod tests {
             Pin::new(&mut body).poll_frame(&mut cx),
             Poll::Ready(None)
         ));
-    }
-
-    #[test]
-    fn not_sync_body_is_indeed_send_but_not_sync() {
-        // Sanity: confirm the witness type has the expected trait shape.
-        // (`NotSyncBody` is `Send` because `Cell<()>` is `Send`, but `!Sync`.)
-        must_be_send::<NotSyncBody>();
-        // The next line would refuse to compile — it is the negative test:
-        //
-        //     must_be_sync::<NotSyncBody>();
-        //     must_be_sync::<SyncBody<NotSyncBody>>();
-        //
-        // Both are commented out. Uncommenting them will produce
-        // `the trait bound `std::cell::Cell<()>: Sync` is not satisfied`,
-        // which is the desired guarantee: the tightened bound on the
-        // `unsafe impl Sync for SyncBody<B>` block correctly refuses to
-        // synthesize `Sync` for a `!Sync` inner body.
-    }
-
-    /// Compile-fail witness: forcibly attempting `SyncBody<NotSyncBody>: Sync`
-    /// must NOT compile. Gated under `#[cfg(any())]` so it is parsed for
-    /// syntactic correctness but never actually monomorphized — the gate
-    /// keeps the test in source as documentation of the bound's intent
-    /// without breaking `cargo test`. Flip the gate to `#[cfg(test)]` (or
-    /// remove it) to manually verify the bound's negative case: it should
-    /// produce `the trait bound `std::cell::Cell<()>: Sync` is not satisfied`.
-    #[cfg(any())]
-    fn _compile_fail_sync_body_over_not_sync() {
-        must_be_sync::<SyncBody<NotSyncBody>>();
     }
 }

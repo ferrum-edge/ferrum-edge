@@ -4,7 +4,7 @@
 //! `request_timeout_ms`, Gateway API `HTTPRoute.rules[].timeouts.request`) and
 //! a per-attempt total bound (`attempt_timeout_ms`, `timeouts.backendRequest`).
 //! Proxy core enforces both for HTTP/1.1 and HTTP/2 around every backend
-//! attempt ([`crate::proxy::await_route_request_deadline`]) and on the committed
+//! attempt ([`crate::proxy::await_backend_attempt_route_deadline`]) and on the committed
 //! response body (`ProxyBody::with_route_request_deadline`). The native HTTP/3
 //! relays write the response head and body from inside their own dispatch, so
 //! they apply the same bounds at the same phases with the helpers here:
@@ -125,24 +125,11 @@ impl H3RouteDeadlines {
         self.total.is_some_and(|deadline| deadline <= now)
     }
 
-    /// Whether an attempt's own budget, and not the total deadline, has
-    /// expired: the ordinary backend timeout, which the rule's retry policy
-    /// may retry. The total deadline wins a tie, as in proxy core.
-    #[inline]
-    pub(crate) fn attempt_budget_expired(
-        self,
-        attempt_deadline: Option<tokio::time::Instant>,
-    ) -> bool {
-        let now = tokio::time::Instant::now();
-        self.total.is_none_or(|total| now < total)
-            && attempt_deadline.is_some_and(|attempt| attempt <= now)
-    }
-
     /// Whether the attempt budget owns an elapsed response-header bound that
     /// folds it with `operator_at` and the total deadline, from the captured
     /// instants rather than the clock at observation (issue #6976): it must be
-    /// the earliest of the three. The total deadline wins a tie, as in
-    /// [`Self::attempt_budget_expired`], and so does the operator bound.
+    /// the earliest of the three. The total deadline wins a tie, as in proxy
+    /// core, and so does the operator bound.
     #[inline]
     pub(crate) fn attempt_budget_owns(
         self,

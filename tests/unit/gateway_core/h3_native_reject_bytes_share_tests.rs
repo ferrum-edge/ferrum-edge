@@ -218,7 +218,7 @@ fn native_h3_committed_hook_runner_clones_bytes_instead_of_copying() {
     let server = include_str!("../../../src/http3/server.rs");
     let runner = bounded_fn(
         server,
-        "async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(",
+        "async fn run_h3_deadline_bounded_reject_committed_hooks(",
         "async fn finalize_h3_upload_deadline_rejection(",
     );
     assert!(

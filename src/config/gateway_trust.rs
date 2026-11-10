@@ -203,11 +203,6 @@ impl GatewayTrustBundleRecord {
     /// persisted: the store stamps the backend-assigned value inside the write
     /// transaction, so no construction site can seed a value that a later
     /// incarnation could repeat.
-    // Reached only from external and inline test suites: production records are
-    // deserialized by the stores or built through the CRUD admission path, so
-    // this constructor reads as dead code in the `ferrum-edge` bin target,
-    // which recompiles this module without any test caller.
-    #[allow(dead_code)]
     pub fn new(namespace: &str, id: &str, bundle: TrustBundleSet) -> Self {
         let now = Utc::now();
         Self {
@@ -879,17 +874,14 @@ pub async fn detect_gateway_trust_drift<S: GatewayTrustDriftSource + ?Sized>(
 /// reason the side channel can express a rotation, a revocation, and "nothing
 /// to say" without any of the three being inferable from the other two.
 ///
-/// `Clear` and `Replace` are public library and integration-test seams. The
-/// `ferrum-edge` bin target recompiles this module privately and only
-/// constructs [`Self::Unchanged`] on the ordinary resource-delta path;
-/// production full-snapshot encoding stays in
+/// `Clear` and `Replace` are public library and integration-test seams.
+/// Production only constructs [`Self::Unchanged`] on the ordinary
+/// resource-delta path; full-snapshot encoding stays in
 /// `CpGrpcServer::filter_config_and_trust_for_scope` / `trust_bundles_json` so
 /// deep validation, ambiguity refusal, and fail-closed skip behavior are not
 /// duplicated here, and `CpGrpcServer::trust_publication_json` is the only
-/// delta encoder. `#[allow(dead_code)]` is therefore scoped to this enum, not
-/// the module.
+/// delta encoder.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum GatewayTrustPublication<'a> {
     /// Emit nothing: the subscriber keeps whatever it already applied. Encoded
     /// as an empty `trust_bundles_json`.
@@ -1339,8 +1331,6 @@ pub fn observability_snapshot() -> GatewayTrustObservabilitySnapshot {
 
 /// Reset every counter. Test-support only — the production paths are monotonic
 /// within a process.
-// Test-support by definition; the bin target has no caller.
-#[allow(dead_code)]
 pub fn reset_observability_for_tests() {
     PUBLISHED_GENERATIONS_TOTAL.store(0, Ordering::Relaxed);
     LOAD_REJECTIONS_TOTAL.store(0, Ordering::Relaxed);

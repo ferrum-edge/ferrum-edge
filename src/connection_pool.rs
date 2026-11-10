@@ -410,7 +410,6 @@ impl std::error::Error for BackendTlsConfigUnavailable {}
 
 impl ConnectionPool {
     /// Create a new connection pool manager with global configuration.
-    #[allow(dead_code)] // Used by focused tests and by callers that do not share SVID rotation state.
     pub fn new(
         global_config: PoolConfig,
         mtls_config: crate::config::EnvConfig,
@@ -516,7 +515,6 @@ impl ConnectionPool {
 
     /// TLS-config cache key (no host/port / rcfg suffix). Used by unit tests
     /// to prove two endpoints sharing trust material reuse one `ClientConfig`.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn tls_config_cache_key_for_warmup(&self, proxy: &Proxy) -> String {
         self.pool.manager().tls_config_cache_key_owned(proxy)
     }
@@ -631,13 +629,11 @@ impl ConnectionPool {
             .await;
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().backend_h3_tls_configs
     }
 
     /// Reqwest-side counterpart of [`Self::backend_tls_config_cache`].
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_reqwest_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().backend_reqwest_tls_configs
     }
@@ -734,7 +730,6 @@ impl ConnectionPool {
     }
 
     /// WebSocket-side counterpart of [`Self::backend_tls_config_cache`].
-    #[allow(dead_code)] // exercised from unit tests
     pub fn backend_websocket_tls_config_cache(&self) -> &BackendTlsConfigCache {
         &self.pool.manager().backend_ws_tls_configs
     }

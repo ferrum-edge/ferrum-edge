@@ -649,7 +649,6 @@ impl Oauth2Introspection {
     /// Per provider, how many discovery attempts the background worker has
     /// fully processed (`0` for a provider without `discovery_url`). Lets
     /// external tests wait for a refresh outcome instead of sleeping.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn completed_discovery_attempts(&self) -> Vec<u64> {
         self.providers
             .iter()

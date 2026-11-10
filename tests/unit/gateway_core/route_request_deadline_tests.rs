@@ -315,30 +315,26 @@ async fn native_http3_bounds_the_committed_body_by_the_earlier_deadline() {
 
     // A fresh attempt budget starts now, and the committed body is cut at the
     // earlier of it and the total deadline.
-    let (fresh, body, budget_expired, _) =
-        bounds(Some(total), Some(budget), Some(attempt_deadline));
+    let (fresh, body, _) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(fresh, Some(attempt_deadline));
     assert_eq!(body, Some(attempt_deadline));
-    assert!(!budget_expired);
-    let (_, body, _, _) = bounds(Some(total), None, None);
+    let (_, body, _) = bounds(Some(total), None, None);
     assert_eq!(body, Some(total));
 
     // The attempt budget alone has expired: the retryable backend timeout.
     tokio::time::advance(budget).await;
-    let (_, _, budget_expired, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
-    assert!(budget_expired);
+    let (_, _, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(expiry, "attempt_budget");
 
     // Once the total deadline has elapsed it wins, so the spent transaction
     // is never retried.
     tokio::time::advance(Duration::from_millis(700)).await;
-    let (_, _, budget_expired, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
-    assert!(!budget_expired);
+    let (_, _, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(expiry, "in_flight");
 
     // A rule without timeouts arms nothing.
-    let (fresh, body, budget_expired, _) = bounds(None, None, None);
-    assert_eq!((fresh, body, budget_expired), (None, None, false));
+    let (fresh, body, _) = bounds(None, None, None);
+    assert_eq!((fresh, body), (None, None));
 }
 
 #[test]
@@ -1366,6 +1362,46 @@ fn config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConf
 }
 
 #[tokio::test]
+async fn global_alt_svc_waits_for_a_started_quic_listener() {
+    use ferrum_edge::config::env_config::EnvConfig;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::proxy::ProxyState;
+
+    // `FERRUM_ENABLE_HTTP3=true` alone: no frontend TLS material, so no serving
+    // mode starts the QUIC listener and nothing may advertise it (issue #7168).
+    let env_config = EnvConfig {
+        enable_http3: true,
+        ..Default::default()
+    };
+    let https_port = env_config.proxy_https_port;
+    let http_port = env_config.proxy_http_port;
+    let (state, _) = ProxyState::new(
+        config(vec![proxy("api", None)], Vec::new()),
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+
+    for port in [None, Some(https_port), Some(http_port)] {
+        assert!(
+            state.alt_svc_for_frontend_port(port).is_none(),
+            "Alt-Svc must stay off until the QUIC listener has started"
+        );
+    }
+
+    state.set_h3_listener_started(true);
+    assert_eq!(
+        state.alt_svc_for_frontend_port(Some(https_port)).as_deref(),
+        Some(format!("h3=\":{https_port}\"; ma=86400").as_str())
+    );
+
+    state.set_h3_listener_started(false);
+    assert!(state.alt_svc_for_frontend_port(None).is_none());
+}
+
+#[tokio::test]
 async fn the_gateway_advertises_http3_where_a_timed_rule_is_served() {
     use ferrum_edge::config::env_config::EnvConfig;
     use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -1388,6 +1424,8 @@ async fn the_gateway_advertises_http3_where_a_timed_rule_is_served() {
         None,
     )
     .expect("test proxy state should build");
+    // The serving mode reports its process-global QUIC listener as started.
+    state.set_h3_listener_started(true);
 
     // Native HTTP/3 enforces both route timeouts, so a timed rule no longer
     // costs the origin its HTTP/3 advertisement.

@@ -2949,9 +2949,6 @@ impl OidcRelyingParty {
         Ok(value)
     }
 
-    // Reached only through the lib target's `_test_support` shim by external
-    // unit tests; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
     pub(crate) fn sealed_refresh_session_cookie_for_tests(
         &self,
         claims: Value,
@@ -2968,7 +2965,6 @@ impl OidcRelyingParty {
         self.seal_session_cookie(&payload)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn sealed_session_cookie_for_tests(
         &self,
         claims: Value,
@@ -2979,7 +2975,6 @@ impl OidcRelyingParty {
         self.seal_session_cookie(&payload)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn sealed_due_refresh_session_cookie_for_tests(
         &self,
         claims: Value,
@@ -3024,7 +3019,6 @@ impl OidcRelyingParty {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn open_session_cookie_for_tests(&self, cookie: &str) -> Option<Value> {
         let cookie_pair = cookie.split(';').next()?;
         let (_, value) = cookie_pair.split_once('=')?;
@@ -3032,7 +3026,6 @@ impl OidcRelyingParty {
         serde_json::to_value(payload).ok()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn session_state_from_set_cookie_for_tests(
         &self,
         set_cookie: &str,
@@ -3053,9 +3046,6 @@ impl OidcRelyingParty {
     /// Whether the discovery task published a document within `wait`, without
     /// consuming the plugin. A refused document is retried with backoff, so
     /// the task itself never ends on refusal.
-    // Reached only through the lib target's `_test_support` shim by external
-    // unit tests; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
     pub(crate) async fn discovery_published_within_for_tests(&self, wait: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
@@ -3069,9 +3059,6 @@ impl OidcRelyingParty {
         }
     }
 
-    // Reached only through the lib target's `_test_support` shim by external
-    // unit tests; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
     pub(crate) async fn resolved_discovery_endpoints_for_tests(
         mut self,
     ) -> Option<(Option<String>, Option<String>)> {
@@ -5514,8 +5501,8 @@ fn apply_discovery_endpoint_overrides(
 /// External coverage seams for the issue #4761 discovery endpoint overrides.
 ///
 /// Reached only through the lib target's `_test_support` shim by external unit
-/// tests; `src/main.rs` re-declares modules without that bridge, so the module
-/// is unused in the binary target — hence the module-scoped `allow(dead_code)`.
+/// tests; the module-scoped `allow(dead_code)` covers seams that shim does not
+/// re-export.
 /// Nothing here is on a request path.
 #[allow(dead_code)]
 #[doc(hidden)]
@@ -5564,8 +5551,8 @@ pub(crate) mod discovery_test_seams {
 /// External coverage seams for the issue #4640 refresh single-flight registry.
 ///
 /// Reached only through the lib target's `_test_support` shims by external unit
-/// tests; `src/main.rs` re-declares modules without that bridge, so the module
-/// is unused in the binary target — hence the module-scoped `allow(dead_code)`.
+/// tests; the module-scoped `allow(dead_code)` covers seams those shims do not
+/// re-export.
 /// Nothing here is on a request path.
 #[allow(dead_code)]
 #[doc(hidden)]

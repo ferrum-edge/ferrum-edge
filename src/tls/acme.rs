@@ -816,7 +816,6 @@ impl AcmeCertificateStore {
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
-    #[allow(dead_code)]
     pub fn store_version(&self) -> Result<u64, AcmeError> {
         Ok(self.file.version()?)
     }
@@ -980,7 +979,6 @@ impl AcmeOrderStore {
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
-    #[allow(dead_code)]
     pub fn store_version(&self) -> Result<u64, AcmeError> {
         Ok(self.file.version()?)
     }
@@ -1279,7 +1277,6 @@ impl AcmeAccountStore {
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
-    #[allow(dead_code)]
     pub fn store_version(&self) -> Result<u64, AcmeError> {
         Ok(self.file.version()?)
     }
@@ -4153,7 +4150,6 @@ async fn run_dns01_hook(
 /// production surface with anything callers could mistake for an API.
 #[cfg(feature = "acme")]
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn run_dns01_hook_for_tests(
     command: &str,
     action: &str,

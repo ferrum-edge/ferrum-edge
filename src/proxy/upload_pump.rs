@@ -1137,7 +1137,6 @@ impl UploadPumpJoin {
     /// Which task is driving this pump right now: `Some(false)` inline on the
     /// dispatcher's, `Some(true)` on one of its own, `None` once it has
     /// reached its terminal. Reached through `crate::_test_support`.
-    #[allow(dead_code)]
     pub(crate) fn runs_on_own_task(&self) -> Option<bool> {
         match self.driver {
             PumpDriver::Inline(_) => Some(false),

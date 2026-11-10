@@ -370,12 +370,10 @@ impl AuditSpool {
         self.max_record_bytes
     }
 
-    #[allow(dead_code)] // External audit pipeline tests inspect the owned generation; the bin does not.
     pub fn generation(&self) -> &str {
         &self.generation
     }
 
-    #[allow(dead_code)] // External audit pipeline tests inspect destination isolation; the bin does not.
     pub fn destination(&self) -> &str {
         &self.destination
     }

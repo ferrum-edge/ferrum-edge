@@ -2350,7 +2350,7 @@ pub async fn run(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
-        proxy_state.set_h3_websocket_listener_started(h3_listener_started);
+        proxy_state.set_h3_listener_started(h3_listener_started);
         Ok(())
     }
     .await;

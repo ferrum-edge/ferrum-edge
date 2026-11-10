@@ -268,7 +268,6 @@ const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "upgrade",
 ];
 /// Plugin-specific root config keys, excluding the shared Redis fields.
-#[allow(dead_code)] // Used by external unit tests that verify OpenAPI/allowlist parity.
 pub const REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS: &[&str] = &[
     "header_name",
     "ttl_seconds",
@@ -931,7 +930,6 @@ fn owns_request_state(ctx: &RequestContext, instance_id: u64) -> bool {
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn set_request_state_for_test(
     plugin: &RequestDeduplication,
     ctx: &mut RequestContext,
@@ -955,7 +953,6 @@ pub(crate) fn set_request_state_for_test(
 /// Sorted logical keys acquired during `before_proxy` for external tests that
 /// construct plugins through `PluginCache` / the production factory (trait
 /// objects) rather than the concrete test helper.
-#[allow(dead_code)]
 pub(crate) fn logical_keys_from_request_context_for_test(ctx: &RequestContext) -> Vec<String> {
     let mut keys: Vec<String> = ctx
         .plugin_state()
@@ -1210,7 +1207,6 @@ impl RequestDeduplication {
     ///
     /// A compatible reload generation for the same policy identity must share;
     /// an unrelated policy, tenant, or semantically changed policy must not.
-    #[allow(dead_code)] // used only by tests/; dead code in the bin target
     pub fn shares_local_state_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.local, &other.local)
     }
@@ -1538,7 +1534,6 @@ impl RequestDeduplication {
             .sum()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn completed_size_snapshot_for_tests(&self) -> (usize, usize) {
         let _guard = self.accounting_guard();
         (
@@ -1547,12 +1542,10 @@ impl RequestDeduplication {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn inflight_count_snapshot_for_tests(&self) -> usize {
         self.local.inflight_count.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn live_inflight_count_snapshot_for_tests(&self) -> usize {
         self.local.live_inflight_count.load(Ordering::Relaxed)
     }
@@ -1561,14 +1554,12 @@ impl RequestDeduplication {
     /// proof, or `None` in local mode. Test support for `GHSA-26gf-943w-w5x8`:
     /// the screen itself needs a live server, so coverage pins the requirement
     /// the constructor asked for.
-    #[allow(dead_code)]
     pub(crate) fn redis_requires_no_eviction_for_tests(&self) -> Option<bool> {
         self.redis_client
             .as_ref()
             .map(|client| client.requires_no_eviction_screen_for_test())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn request_identity_for_tests(
         &self,
         ctx: &RequestContext,
@@ -1578,7 +1569,6 @@ impl RequestDeduplication {
             .map(|state| (state.key.clone(), state.fingerprint.clone()))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn expire_completed_entries_for_tests(&self) {
         let _guard = self.accounting_guard();
         let now = Instant::now();
@@ -1596,7 +1586,6 @@ impl RequestDeduplication {
             .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn expire_inflight_entries_for_tests(&self) {
         let _guard = self.accounting_guard();
         let now = Instant::now();
@@ -1617,7 +1606,6 @@ impl RequestDeduplication {
             .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn backdate_inflight_entries_for_tests(&self, age: Duration) {
         let _guard = self.accounting_guard();
         let now = Instant::now();
@@ -1633,7 +1621,6 @@ impl RequestDeduplication {
 
     /// Age every completion whose Redis publication is still pending, as if
     /// its publisher had stopped awaiting the verdict `age` ago.
-    #[allow(dead_code)]
     pub(crate) fn backdate_pending_publication_completions_for_tests(&self, age: Duration) {
         let _guard = self.accounting_guard();
         let now = Instant::now();
@@ -1652,7 +1639,6 @@ impl RequestDeduplication {
             .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn expire_execution_barriers_for_tests(&self) {
         let _guard = self.accounting_guard();
         let now = Instant::now();
@@ -2148,7 +2134,6 @@ impl RequestDeduplication {
 
     /// Classify the Redis record stored under logical `key`. Test support for
     /// the bounded-read contract; production reads go through admission.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) async fn redis_record_state_for_test(&self, key: &str) -> &'static str {
         let Some(redis) = self.redis_client.as_ref() else {
             return "no_redis";
@@ -2672,7 +2657,6 @@ impl RequestDeduplication {
     /// policy digest a real request would have copied from its plugin-cache
     /// view; `None` reproduces a request that never observed one, which must
     /// refuse to persist.
-    #[allow(dead_code)]
     pub(crate) fn redis_payload_for_tests(
         &self,
         status_code: u16,
@@ -2704,7 +2688,6 @@ impl RequestDeduplication {
     /// the store-side header sanitization, modelling an entry persisted under
     /// an older header policy. The stored provenance is taken from `ctx`, so
     /// the replay is admitted and only the header handling is under test.
-    #[allow(dead_code)]
     pub(crate) fn replay_stored_response_for_tests(
         &self,
         ctx: &mut RequestContext,
@@ -3844,9 +3827,6 @@ fn request_body_digest(
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
-// External tests reach this through `crate::_test_support`; the binary target
-// still sees the crate-private helper itself as unused.
-#[allow(dead_code)]
 pub(crate) fn redis_cached_response_payload_is_valid_for_test(data: &[u8]) -> bool {
     // Mirrors the admission `redis_get` performs: a payload counts as valid
     // only when it both deserializes and carries decodable replay provenance.
@@ -3856,9 +3836,6 @@ pub(crate) fn redis_cached_response_payload_is_valid_for_test(data: &[u8]) -> bo
         .is_some()
 }
 
-// External tests reach this through `crate::_test_support`; the binary target
-// still sees the crate-private helper itself as unused.
-#[allow(dead_code)]
 pub(crate) fn redis_record_payload_is_valid_for_test(data: &[u8]) -> bool {
     let Ok(record) = serde_json::from_slice::<SerializableDedupRecord>(data) else {
         return false;

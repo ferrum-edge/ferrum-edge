@@ -1586,7 +1586,6 @@ impl RouterCache {
     /// Without this,
     /// the tiny-cache eviction short-circuit would leave the cache unbounded
     /// under load.
-    #[allow(dead_code)]
     pub fn new(config: &GatewayConfig, max_cache_entries: usize) -> Self {
         Self::with_shard_amount(config, max_cache_entries, 0)
     }
@@ -1686,7 +1685,6 @@ impl RouterCache {
     /// Standalone-router admission publisher for external regression tests.
     /// Production admission is published only through `RequestEpochStore`.
     #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn publish_listener_admission_for_test(&self, pending: bool, refused_ports: BTreeSet<u16>) {
         let current = self.route_snapshot.load_full();
         let listener_admission = if pending {
@@ -1842,14 +1840,12 @@ impl RouterCache {
     /// Results are cached (including misses) for O(1) repeated lookups.
     /// Prefix and regex matches use separate cache partitions.
     /// Library/test API; request hot paths use find_proxy_in_epoch().
-    #[allow(dead_code)]
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
         self.find_proxy_on_frontend(host, path, None, false)
     }
 
     /// Port-aware library/test lookup. Production request paths pass the
     /// frontend accept port and TLS class into [`Self::find_proxy_in_epoch`].
-    #[allow(dead_code)]
     pub fn find_proxy_on_frontend(
         &self,
         host: Option<&str>,
@@ -2300,7 +2296,6 @@ impl RouterCache {
     /// resolve through [`Self::resolve_mesh_scoped_route_in_epoch`]. It is
     /// public only so the library's external tests can reach it.
     #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn resolve_mesh_scoped_route_for_test(
         &self,
         host: Option<&str>,
@@ -2383,13 +2378,11 @@ impl RouterCache {
     }
 
     /// Number of entries currently in the prefix cache (for testing).
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn cache_len(&self) -> usize {
         self.prefix_cache_entries.load(Ordering::Relaxed)
     }
 
     /// Number of entries currently in the regex cache (for testing).
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn regex_cache_len(&self) -> usize {
         self.regex_cache_entries.load(Ordering::Relaxed)
     }
@@ -2441,7 +2434,6 @@ impl RouterCache {
     }
 
     /// Number of routes in the pre-sorted route table (for testing).
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn route_count(&self) -> usize {
         let snapshot = self.route_snapshot.load();
         let table = &snapshot.table;
@@ -3725,7 +3717,6 @@ pub struct MeshScopedRoute(RouteMatch);
 
 impl MeshScopedRoute {
     /// The resolved route.
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn route_match(&self) -> &RouteMatch {
         &self.0
     }
@@ -3837,7 +3828,6 @@ fn complete_mesh_scoped_resolution(
 ///
 /// Anything this cannot place, such as a proxy whose hosts do not match the
 /// request host, is refused.
-#[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
 pub fn path_parameter_route_admitted(
     matched: &Proxy,
     stripped_route: &RouteMatch,

@@ -1722,7 +1722,6 @@ fn write_node_attestation(
 /// idempotent retirement itself: a Helm rollback, re-applied historical
 /// manifest, or restored ConfigMap can recreate an earlier era's generation
 /// token, and a mutable monotonic counter cannot prove that did not happen.
-#[allow(dead_code)] // External integration-test seam is unused by the bin test target.
 pub fn node_cleanup_proof_is_current(
     registry_dir: &Path,
     target: UdpPlacement,

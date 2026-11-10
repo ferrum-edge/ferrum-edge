@@ -224,7 +224,6 @@ fn clamp_poll_interval(interval: Duration) -> Duration {
 }
 
 /// Fingerprint all configured sources using their material bytes.
-#[allow(dead_code)] // External unit tests; reload paths use material_set_fingerprint_with.
 pub fn material_set_fingerprint(
     sources: &[WatchedMaterialSource],
 ) -> Result<MaterialSetFingerprint, MaterialError> {

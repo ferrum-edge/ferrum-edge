@@ -402,9 +402,6 @@ impl BackendPendingLimiter {
 
     /// Current in-flight count for a logical scope + policy port.
     /// Test/metrics only — the hot path uses `try_acquire` directly.
-    // The binary target re-declares library modules, so this public inspection
-    // seam is used by external tests but appears dead in that compilation.
-    #[allow(dead_code)]
     pub fn current(&self, scope: &BackendPendingScopeBase, port: u16) -> u64 {
         PENDING_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();

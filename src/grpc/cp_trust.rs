@@ -892,7 +892,6 @@ async fn load_trust_bundle_reload_candidate_with_timeout(
 }
 
 #[doc(hidden)]
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) async fn load_trust_bundle_reload_candidate_for_test(
     path: String,
     timeout: std::time::Duration,
@@ -954,7 +953,6 @@ impl TenantAuthRejectReason {
     /// Kept available (and pinned by tests) even where no metric consumes it
     /// yet: the point of the closed set is that any future audit/metric sink
     /// has a bounded label to reach for instead of interpolating token data.
-    #[allow(dead_code)]
     pub const fn as_metric_label(self) -> &'static str {
         match self {
             Self::MalformedHeader => "malformed_header",
@@ -1049,9 +1047,7 @@ pub struct CpGrpcConnectInfo {
     /// Preserved from tonic's `TcpConnectInfo`, which this type replaces, so
     /// swapping the connect-info type does not silently drop addresses a
     /// future handler or access log needs.
-    #[allow(dead_code)]
     pub local_addr: Option<SocketAddr>,
-    #[allow(dead_code)]
     pub remote_addr: Option<SocketAddr>,
     pub peer_namespace_scope: Option<PeerNamespaceScope>,
 }
@@ -1235,7 +1231,6 @@ impl CpDpTrustBundle {
     ///
     /// The document carries no pinned generation here, so every `secret_path` /
     /// `public_key_path` it names must be bound by `material_sha256`.
-    #[allow(dead_code)] // Public library API exercised by the external integration-test crate.
     pub fn from_document_str(
         raw: &str,
         origin: &str,

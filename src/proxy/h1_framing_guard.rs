@@ -1805,6 +1805,26 @@ mod tests {
                 "parse-reject envelope must not carry X-Gateway-Error: {head_text}"
             );
         }
+
+        // The parse-layer bodies are the same messages the handler-layer
+        // `check_protocol_headers` returns for the same request shapes.
+        let uri: hyper::Uri = "/".parse().expect("uri");
+        let mut duplicate_cl = hyper::HeaderMap::new();
+        duplicate_cl.append(hyper::header::CONTENT_LENGTH, "5".parse().expect("value"));
+        duplicate_cl.append(hyper::header::CONTENT_LENGTH, "6".parse().expect("value"));
+        assert_eq!(
+            crate::proxy::check_protocol_headers(&duplicate_cl, hyper::Version::HTTP_11, &uri),
+            Some(JSON_CONFLICTING_CONTENT_LENGTH)
+        );
+        let mut http10_chunked = hyper::HeaderMap::new();
+        http10_chunked.insert(
+            hyper::header::TRANSFER_ENCODING,
+            "chunked".parse().expect("value"),
+        );
+        assert_eq!(
+            crate::proxy::check_protocol_headers(&http10_chunked, hyper::Version::HTTP_10, &uri),
+            Some(JSON_HTTP10_TRANSFER_ENCODING)
+        );
     }
 
     /// Minimal duplex used to drive `H1FramingGuardIo` directly: `reads` are

@@ -323,13 +323,11 @@ impl H3RetainedUpload {
     }
 
     /// Bytes collected so far. External-test seam.
-    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn collected_len(&self) -> usize {
         self.collector.len()
     }
 
     /// Capacity the charge currently covers. External-test seam.
-    #[allow(dead_code)] // external-test seam; dead in the separately compiled binary unit
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.collector.reserved_bytes()
     }
@@ -625,7 +623,6 @@ fn boxed_finalize_h3_dispatch_body_refusal<'a>(
         .await;
         send_h3_plugin_reject_flavor_aware(
             stream,
-            plugins,
             ctx,
             http_flavor,
             grpc_web_response_content_type,
@@ -4216,14 +4213,11 @@ async fn handle_h3_request(
     // duplicate plugin instances/hooks. Method-filtered Extended CONNECT
     // requests still require WebSocket-scoped initial response policy and
     // transport-managed header stripping.
-    let request_protocol = h3_plugin_protocol_for_request(
-        if is_connect_udp_request {
-            HttpFlavor::Plain
-        } else {
-            detected_http_flavor
-        },
-        grpc_web_response_content_type.is_some(),
-    );
+    let request_protocol = h3_plugin_protocol_for_request(if is_connect_udp_request {
+        HttpFlavor::Plain
+    } else {
+        detected_http_flavor
+    });
     // Fault shaping must retain the immutable wire flavor: recognized
     // gRPC-Web is promoted only for gRPC policy selection above and must not
     // become native gRPC merely because its policy chain is gRPC-scoped.
@@ -4266,7 +4260,6 @@ async fn handle_h3_request(
         if let Some(content_type) = grpc_web_response_content_type {
             send_h3_grpc_web_reject(
                 &mut stream,
-                &[],
                 &mut ctx,
                 content_type,
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -4457,7 +4450,6 @@ async fn handle_h3_request(
         if let Some(content_type) = grpc_web_response_content_type {
             send_h3_grpc_web_reject(
                 &mut stream,
-                &[],
                 &mut ctx,
                 content_type,
                 StatusCode::BAD_REQUEST,
@@ -4564,7 +4556,6 @@ async fn handle_h3_request(
                 record_request(&state, log_status_code);
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -4645,7 +4636,6 @@ async fn handle_h3_request(
             } else {
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -4710,7 +4700,6 @@ async fn handle_h3_request(
                     record_request(&state, log_status_code);
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -4777,7 +4766,6 @@ async fn handle_h3_request(
                 .await;
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -5083,7 +5071,6 @@ async fn handle_h3_request(
         .await;
         send_h3_plugin_reject_flavor_aware(
             &mut stream,
-            &plugins,
             &mut ctx,
             http_flavor,
             grpc_web_response_content_type,
@@ -5298,7 +5285,6 @@ async fn handle_h3_request(
                         record_request(&state, log_status_code);
                         send_h3_plugin_reject_flavor_aware(
                             &mut stream,
-                            &plugins,
                             &mut ctx,
                             http_flavor,
                             grpc_web_response_content_type,
@@ -5362,7 +5348,6 @@ async fn handle_h3_request(
                     .await;
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -5643,7 +5628,6 @@ async fn handle_h3_request(
                 record_request(&state, log_status_code);
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -5699,7 +5683,6 @@ async fn handle_h3_request(
             .await;
             send_h3_plugin_reject_flavor_aware(
                 &mut stream,
-                &plugins,
                 &mut ctx,
                 http_flavor,
                 grpc_web_response_content_type,
@@ -5763,7 +5746,6 @@ async fn handle_h3_request(
                     record_request(&state, log_status_code);
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -5827,7 +5809,6 @@ async fn handle_h3_request(
                 .await;
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -5880,7 +5861,6 @@ async fn handle_h3_request(
                     record_request(&state, log_status_code);
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -5945,7 +5925,6 @@ async fn handle_h3_request(
                 .await;
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -6103,7 +6082,6 @@ async fn handle_h3_request(
                 .await;
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -6232,7 +6210,6 @@ async fn handle_h3_request(
             .await;
             send_h3_plugin_reject_flavor_aware(
                 &mut stream,
-                &plugins,
                 &mut ctx,
                 http_flavor,
                 grpc_web_response_content_type,
@@ -6519,7 +6496,6 @@ async fn handle_h3_request(
                     record_request(&state, log_status_code);
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -6575,7 +6551,6 @@ async fn handle_h3_request(
                 .await;
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -6763,7 +6738,6 @@ async fn handle_h3_request(
                     .await;
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -6807,7 +6781,6 @@ async fn handle_h3_request(
                     .await;
                     send_h3_plugin_reject_flavor_aware_with_recv_halt(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -6983,7 +6956,6 @@ async fn handle_h3_request(
                 // into an empty trailers-only success (issue #5174).
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -7110,7 +7082,6 @@ async fn handle_h3_request(
                 // into an empty trailers-only success (issue #5174).
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -7233,7 +7204,6 @@ async fn handle_h3_request(
                 } else {
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -7513,7 +7483,6 @@ async fn handle_h3_request(
                     record_request(&state, log_status_code);
                     send_h3_plugin_reject_flavor_aware(
                         &mut stream,
-                        &plugins,
                         &mut ctx,
                         http_flavor,
                         grpc_web_response_content_type,
@@ -7567,7 +7536,6 @@ async fn handle_h3_request(
                 .await;
                 send_h3_plugin_reject_flavor_aware(
                     &mut stream,
-                    &plugins,
                     &mut ctx,
                     http_flavor,
                     grpc_web_response_content_type,
@@ -7872,7 +7840,6 @@ async fn handle_h3_request(
         record_request(&state, reject_metric_status);
         send_h3_plugin_reject_flavor_aware(
             &mut stream,
-            &plugins,
             &mut ctx,
             http_flavor,
             grpc_web_response_content_type,
@@ -10400,7 +10367,6 @@ async fn handle_h3_request(
             .await;
             send_h3_plugin_reject_flavor_aware(
                 &mut stream,
-                &plugins,
                 &mut ctx,
                 http_flavor,
                 grpc_web_response_content_type,
@@ -12262,14 +12228,10 @@ fn boxed_h3_request_stream_ends_without_data(
     })
 }
 
-pub(crate) fn h3_plugin_protocol_for_request(
-    flavor: HttpFlavor,
-    _grpc_web_request: bool,
-) -> ProxyProtocol {
-    h3_plugin_protocol_for_flavor(flavor)
-}
-
-fn h3_plugin_protocol_for_flavor(flavor: HttpFlavor) -> ProxyProtocol {
+/// The plugin protocol key for an H3 request's wire flavor. Recognized
+/// gRPC-Web arrives as `Plain` and keeps the HTTP key; its request view
+/// composes the gRPC-only plugins separately.
+pub(crate) fn h3_plugin_protocol_for_request(flavor: HttpFlavor) -> ProxyProtocol {
     match flavor {
         HttpFlavor::Plain => ProxyProtocol::Http,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
@@ -12328,7 +12290,6 @@ async fn run_h3_backend_path_plugins_or_send_reject(
                     record_request(state, log_status_code);
                     send_h3_plugin_reject_flavor_aware(
                         stream,
-                        plugins,
                         ctx,
                         flavor,
                         grpc_web_response_content_type,
@@ -12385,7 +12346,6 @@ async fn run_h3_backend_path_plugins_or_send_reject(
                 .await;
                 send_h3_plugin_reject_flavor_aware(
                     stream,
-                    plugins,
                     ctx,
                     flavor,
                     grpc_web_response_content_type,
@@ -12427,7 +12387,7 @@ async fn run_h3_backend_admission_or_send_reject(
         ctx,
         proxy,
         upstream_target,
-        h3_plugin_protocol_for_flavor(flavor),
+        h3_plugin_protocol_for_request(flavor),
     ) {
         Ok(permits) => Ok(Ok(permits)),
         Err(rejection) => {
@@ -12510,7 +12470,6 @@ async fn run_h3_backend_admission_or_send_reject(
             } else {
                 send_h3_plugin_reject_flavor_aware(
                     stream,
-                    plugins,
                     ctx,
                     flavor,
                     grpc_web_response_content_type,
@@ -15401,13 +15360,12 @@ where
     let gateway_closed = h3_pool_error_is_gateway_closed_upload(&e);
     let is_malformed_request = malformed_request_message.is_some();
     // Deadline expiries the dispatch attributed to the CLIENT (a grpc-timeout
-    // too tight to even connect, or a stalled client upload) are neutral for
-    // backend health: the backend is not at fault. Both arrive as
-    // `read_timeout` (DEADLINE_EXCEEDED on the wire) but must NOT poison
-    // CB / passive health / adaptive concurrency.
-    let is_client_side_neutral_timeout = e.client_deadline_expired()
-        || err_msg.contains("client grpc-timeout deadline exceeded before")
-        || err_msg.contains("client request upload stalled");
+    // too tight to even connect, typed on the pool error, or a stalled client
+    // upload) are neutral for backend health: the backend is not at fault.
+    // Both arrive as `read_timeout` (DEADLINE_EXCEEDED on the wire) but must
+    // NOT poison CB / passive health / adaptive concurrency.
+    let is_client_side_neutral_timeout =
+        e.client_deadline_expired() || err_msg.contains("client request upload stalled");
     // The gateway could not build the backend TLS client configuration: an
     // internal gateway fault, not an unavailable backend (#6773). INTERNAL on
     // the wire, as on the HTTP/1.1-HTTP/2 and cross-protocol builders, and
@@ -19093,7 +19051,6 @@ async fn send_h3_protocol_method_not_allowed(
     if let Some(content_type) = grpc_web_response_content_type {
         send_h3_grpc_web_reject(
             stream,
-            &[],
             ctx,
             content_type,
             StatusCode::METHOD_NOT_ALLOWED,
@@ -19352,8 +19309,7 @@ async fn send_h3_pre_sanitized_reject_response_with_recv_halt(
 #[allow(clippy::too_many_arguments)]
 async fn send_h3_grpc_web_reject(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    _plugins: &[Arc<dyn Plugin>],
-    _ctx: &mut RequestContext,
+    ctx: &mut RequestContext,
     response_content_type: &str,
     http_status: StatusCode,
     body: Bytes,
@@ -19361,8 +19317,7 @@ async fn send_h3_grpc_web_reject(
 ) -> Result<(), anyhow::Error> {
     send_h3_grpc_web_reject_with_recv_halt(
         stream,
-        _plugins,
-        _ctx,
+        ctx,
         response_content_type,
         http_status,
         body,
@@ -19375,7 +19330,6 @@ async fn send_h3_grpc_web_reject(
 #[allow(clippy::too_many_arguments)]
 async fn send_h3_grpc_web_reject_with_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    _plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     response_content_type: &str,
     http_status: StatusCode,
@@ -19432,7 +19386,7 @@ pub(crate) async fn run_h3_reject_response_committed_hooks(
     body: Bytes,
     headers: &HashMap<String, String>,
 ) -> bool {
-    run_h3_deadline_bounded_reject_committed_hooks_with_policy(
+    run_h3_deadline_bounded_reject_committed_hooks(
         plugins,
         ctx,
         flavor,
@@ -19447,30 +19401,6 @@ pub(crate) async fn run_h3_reject_response_committed_hooks(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_h3_deadline_bounded_reject_committed_hooks(
-    plugins: &[Arc<dyn Plugin>],
-    ctx: &mut RequestContext,
-    flavor: HttpFlavor,
-    grpc_web_response_content_type: Option<&str>,
-    http_status: StatusCode,
-    body: Bytes,
-    headers: &HashMap<String, String>,
-    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
-) -> bool {
-    run_h3_deadline_bounded_reject_committed_hooks_with_policy(
-        plugins,
-        ctx,
-        flavor,
-        grpc_web_response_content_type,
-        http_status,
-        body,
-        headers,
-        initial_response_header_policy_plugins,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     flavor: HttpFlavor,
@@ -19770,7 +19700,6 @@ async fn finalize_h3_upload_deadline_rejection(
     // flow-control-blocked client cannot retain the task indefinitely.
     send_h3_plugin_reject_flavor_aware_with_recv_halt(
         stream,
-        plugins,
         ctx,
         flavor,
         grpc_web_response_content_type,
@@ -19809,7 +19738,6 @@ fn h3_route_upload_timeout_plugin_result() -> PluginResult {
 #[allow(clippy::too_many_arguments)]
 async fn send_h3_plugin_reject_flavor_aware(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,
@@ -19819,7 +19747,6 @@ async fn send_h3_plugin_reject_flavor_aware(
 ) -> Result<(), anyhow::Error> {
     send_h3_plugin_reject_flavor_aware_with_recv_halt(
         stream,
-        plugins,
         ctx,
         flavor,
         grpc_web_response_content_type,
@@ -19834,7 +19761,6 @@ async fn send_h3_plugin_reject_flavor_aware(
 #[allow(clippy::too_many_arguments)]
 async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,
@@ -19942,7 +19868,6 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
         if let Some(content_type) = grpc_web_response_content_type {
             return send_h3_grpc_web_reject_with_recv_halt(
                 stream,
-                plugins,
                 ctx,
                 content_type,
                 http_status,
@@ -22234,7 +22159,7 @@ mod h3_streaming_outcome_tests {
 #[cfg(test)]
 mod h3_plugin_protocol_tests {
     use super::{
-        h3_grpc_reject_signal, h3_plugin_protocol_for_flavor, h3_reject_log_status_and_metadata,
+        h3_grpc_reject_signal, h3_plugin_protocol_for_request, h3_reject_log_status_and_metadata,
     };
     use crate::config::types::HttpFlavor;
     use crate::plugins::ProxyProtocol;
@@ -22245,7 +22170,7 @@ mod h3_plugin_protocol_tests {
     #[test]
     fn maps_websocket_flavor_to_websocket_plugin_protocol() {
         assert_eq!(
-            h3_plugin_protocol_for_flavor(HttpFlavor::WebSocket),
+            h3_plugin_protocol_for_request(HttpFlavor::WebSocket),
             ProxyProtocol::WebSocket
         );
     }
@@ -22253,7 +22178,7 @@ mod h3_plugin_protocol_tests {
     #[test]
     fn maps_grpc_flavor_to_grpc_plugin_protocol() {
         assert_eq!(
-            h3_plugin_protocol_for_flavor(HttpFlavor::Grpc),
+            h3_plugin_protocol_for_request(HttpFlavor::Grpc),
             ProxyProtocol::Grpc
         );
     }
@@ -22261,7 +22186,7 @@ mod h3_plugin_protocol_tests {
     #[test]
     fn maps_plain_flavor_to_http_plugin_protocol() {
         assert_eq!(
-            h3_plugin_protocol_for_flavor(HttpFlavor::Plain),
+            h3_plugin_protocol_for_request(HttpFlavor::Plain),
             ProxyProtocol::Http
         );
     }

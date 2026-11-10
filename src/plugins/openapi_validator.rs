@@ -1004,7 +1004,6 @@ impl OpenapiValidator {
     /// External-test seam: `(cached schema-type nodes, request-time fallback computes)`.
     /// Cached nodes are populated once per registered schema during compile;
     /// fallback computes must stay zero for registered form/multipart conversion.
-    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn schema_type_cache_stats_for_test(&self) -> (usize, usize) {
         let mut cached_nodes = 0usize;
         let mut fallback_computes = 0usize;
@@ -3617,7 +3616,6 @@ fn charged_decode_failure(error: ChargedDecodeError) -> MediaFailure {
 /// and call `inspect` while the decoded body (and its charge) is still alive,
 /// as validation does. `Err(None)` is the capacity refusal;
 /// `Err(Some(detail))` a violation.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn decode_body_for_test<R>(
     content_encoding: Option<&str>,
     body: &[u8],

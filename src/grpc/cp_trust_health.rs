@@ -562,7 +562,6 @@ impl CpDpTrustReloadStatus {
     }
 
     /// Configured stall window: three poll intervals, floored at 60s.
-    #[allow(dead_code)] // Public library API exercised by the external integration-test crate.
     pub fn stall_after(&self) -> Duration {
         self.stall_after
     }
@@ -936,7 +935,6 @@ impl TrustStaleWatch {
 /// as 64 lowercase hex characters. Returns `None` when `status_hmac_key` is
 /// shorter than [`STATUS_HMAC_KEY_MIN_BYTES`]; an unkeyed digest is never
 /// substituted.
-#[allow(dead_code)] // Public library API exercised by the external integration-test crate.
 pub fn keyed_generation_id(status_hmac_key: &[u8], fingerprint: &[u8; 32]) -> Option<String> {
     let key = parse_status_hmac_key(status_hmac_key)?;
     Some(hmac_generation_id(&key, fingerprint))

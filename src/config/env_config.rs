@@ -1011,8 +1011,6 @@ fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), Str
 /// TLS values are unresolved source references; use [`Self::connect_lazy`]
 /// rather than passing this URL directly to SQLx.
 #[derive(Clone, PartialEq, Eq)]
-// Public custom-plugin API; the binary test target may compile without opt-in plugins.
-#[allow(dead_code)]
 pub struct EffectiveSqlBackend {
     pub db_type: String,
     pub effective_url: String,
@@ -1022,7 +1020,6 @@ impl EffectiveSqlBackend {
     /// Build a lazy SQL pool with pool-owned TLS material, without dialing.
     /// Source reads use the shared detached-reader fence and the supplied
     /// timeout (seconds; zero disables the bound). Errors fail closed.
-    #[allow(dead_code)] // Public custom-plugin API; examples are opt-in.
     pub async fn connect_lazy(
         &self,
         options: sqlx::any::AnyPoolOptions,
@@ -1065,7 +1062,6 @@ pub enum OperatingMode {
 }
 
 impl OperatingMode {
-    #[allow(dead_code)] // Used by integration/unit tests via the lib crate
     pub fn from_env() -> Result<Self, String> {
         Self::resolve(&ConfFile::default())
     }
@@ -1913,7 +1909,6 @@ fn resolve_tls_source_override(
 /// conf-aware resolver for consumers that do not hold the `ConfFile` used by
 /// `EnvConfig::from_env_with_conf`.
 // Used by the public SQL-backend resolver when an opt-in plugin is compiled.
-#[allow(dead_code)]
 fn resolve_cached_tls_source_override(source_key: &str, path_key: &str) -> Option<String> {
     let path_value = crate::config::conf_file::resolve_ferrum_var(path_key);
     match crate::config::conf_file::resolve_ferrum_var(source_key) {
@@ -2118,7 +2113,6 @@ impl CompressionAdmissionPolicy {
 
 /// All environment-driven configuration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Some fields are used only in specific modes or feature paths.
 pub struct EnvConfig {
     pub mode: OperatingMode,
     /// Namespace this gateway instance loads and manages. Resources from other
@@ -2133,13 +2127,10 @@ pub struct EnvConfig {
     /// share one sink and stderr owns another. Default: 4096.
     /// Note: consumed in main() before EnvConfig is constructed (tracing must init
     /// first), but stored here for completeness alongside other FERRUM_* vars.
-    #[allow(dead_code)]
     pub log_buffer_capacity: usize,
     /// Per-sink aggregate reserved-byte budget. Default: 32 MiB.
-    #[allow(dead_code)]
     pub log_buffer_bytes: usize,
     /// Maximum serialized bytes in one process log record. Default: 64 KiB.
-    #[allow(dead_code)]
     pub log_max_record_bytes: usize,
     /// Shared observability lifecycle and per-process-sink drain timeout.
     /// Default: 2000 ms.
@@ -2315,7 +2306,6 @@ pub struct EnvConfig {
     /// are rejected during verification. Default: "ferrum-edge".
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs` for use sites
     /// that don't have `EnvConfig` in scope (e.g., `create_jwt_manager_from_env()`).
-    #[allow(dead_code)]
     pub admin_jwt_issuer: String,
     /// Maximum accepted TTL in seconds for externally minted Admin API JWT tokens.
     ///
@@ -2329,14 +2319,12 @@ pub struct EnvConfig {
     /// lifetime cap entirely; a value above `i64::MAX` is rejected as invalid
     /// rather than treated as unlimited. Default: 3600.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
-    #[allow(dead_code)]
     pub admin_jwt_max_ttl: u64,
     /// Optional required `aud` (audience) claim for externally minted Admin API
     /// JWT tokens. When set, verification requires the token to carry an `aud`
     /// claim matching this value; when unset (default), tokens that carry an
     /// `aud` claim are rejected.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
-    #[allow(dead_code)]
     pub admin_jwt_audience: Option<String>,
 
     // Database
@@ -7194,8 +7182,6 @@ impl EnvConfig {
     ///
     /// MongoDB is rejected because callers need a SQL pool. Errors never include
     /// the raw database URL or credentials.
-    // Public custom-plugin API; not every binary artifact opts a SQL consumer in.
-    #[allow(dead_code)]
     pub fn resolve_effective_sql_backend() -> Result<EffectiveSqlBackend, String> {
         use env_config_macro::EnvValue;
 
@@ -7232,7 +7218,6 @@ impl EnvConfig {
     /// process environment / `ferrum.conf`. This method is useful for tests that
     /// construct a partial [`EnvConfig`] without opening a network connection.
     // Public custom-plugin API and external-test helper.
-    #[allow(dead_code)]
     pub fn effective_sql_backend(&self) -> Result<EffectiveSqlBackend, String> {
         let db_type = self
             .db_type

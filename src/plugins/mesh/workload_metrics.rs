@@ -449,7 +449,6 @@ impl Default for WorkloadMetrics {
 }
 
 impl WorkloadMetrics {
-    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::new_with_http_client(config, PluginHttpClient::default())
     }
@@ -466,7 +465,6 @@ impl WorkloadMetrics {
     /// Test seam: inject environment lookup outcomes without mutating the
     /// process environment (Rust 2024 forbids unsynchronized `set_var` under
     /// the parallel test harness).
-    #[allow(dead_code)]
     pub(crate) fn new_with_env_lookup_for_test<F>(
         config: &Value,
         env_lookup: F,

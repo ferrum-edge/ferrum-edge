@@ -1279,7 +1279,6 @@ pub(crate) fn lookup_namespaced_upstream<'a>(
 
 impl LoadBalancerCacheInner {
     /// Access the upstream index for custom code that needs direct lookup.
-    #[allow(dead_code)] // Public API used by custom plugins
     #[inline]
     pub fn upstreams(&self) -> &HashMap<String, Arc<Upstream>> {
         &self.upstreams
@@ -4138,10 +4137,7 @@ impl LoadBalancer {
     ///
     /// Crate-private test seam (routed through `_test_support`): lets coverage
     /// assert distinct construction-time phases without depending on OS thread →
-    /// shard assignment. The library target exposes this through `_test_support`;
-    /// the binary target compiles this module without that bridge, so the helper
-    /// is intentionally unused there.
-    #[allow(dead_code)]
+    /// shard assignment.
     pub(crate) fn selection_counter_phases_for_test(&self) -> [u64; 16] {
         std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
     }

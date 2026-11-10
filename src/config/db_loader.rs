@@ -8613,7 +8613,6 @@ impl DatabaseStore {
         self.failover_topology.handle()
     }
 
-    #[allow(dead_code)]
     pub fn db_type_str(&self) -> &str {
         &self.db_type
     }
@@ -8671,7 +8670,6 @@ impl DatabaseStore {
 
     /// Install (or clear) async test hooks around the reconnect transition
     /// write lock. Production leaves this unset.
-    #[allow(dead_code)] // exercised via external unit tests through the lib target
     pub fn set_reconnect_transition_hooks_for_test(
         &self,
         hooks: Option<SqlReconnectTransitionTestHooks>,
@@ -8684,7 +8682,6 @@ impl DatabaseStore {
     }
 
     /// Fail the next [`Self::latest_change_sequence`] reads (issue #3926 tests).
-    #[allow(dead_code)] // exercised via external unit tests through the lib target
     pub fn set_latest_change_sequence_fault_for_test(&self, fail: bool) {
         self.latest_change_sequence_test_fault
             .store(fail, Ordering::Release);
@@ -8911,7 +8908,6 @@ impl DatabaseStore {
     /// Extract the hostname from a database URL, if it contains one.
     ///
     /// Delegates to [`crate::config::db_backend::extract_db_hostname`].
-    #[allow(dead_code)]
     pub fn extract_db_hostname(db_url: &str) -> Option<String> {
         crate::config::db_backend::extract_db_hostname(db_url)
     }
@@ -9305,7 +9301,6 @@ impl DatabaseStore {
     }
 
     /// Returns true if a read replica URL is configured.
-    #[allow(dead_code)] // Public API for tests and future consumers
     pub fn has_read_replica_pool(&self) -> bool {
         self.read_replica_url.is_some()
     }

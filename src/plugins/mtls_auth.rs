@@ -60,7 +60,6 @@ const ALLOWED_ISSUER_MISMATCH: &str = "Certificate issuer does not match any all
 /// (issue #4359). `None` is the fail-closed inverted-interval case used by
 /// `CertValidityWindow::from_certificate`. Reached through `_test_support`;
 /// the binary target has no consumer.
-#[allow(dead_code)]
 pub(crate) fn cert_is_valid_at_unix(
     not_before_unix: i64,
     not_after_unix: i64,
@@ -72,7 +71,6 @@ pub(crate) fn cert_is_valid_at_unix(
 
 /// Parse a leaf DER into the same Unix bounds `evaluate_client_cert` retains.
 /// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
 pub(crate) fn cert_validity_unix_bounds_from_der(der: &[u8]) -> Option<(i64, i64)> {
     let (_, cert) = X509Certificate::from_der(der).ok()?;
     let window = CertValidityWindow::from_certificate(&cert)?;

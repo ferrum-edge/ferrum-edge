@@ -1304,7 +1304,11 @@ fn two_plain_udp_services_sharing_one_port_both_materialize_exact_routes() {
         config
             .node_waypoint_udp_destination_routes
             .iter()
-            .all(|route| route.listen_port == 5353 && !route.terminates_dtls)
+            .all(|route| route.listen_port == 5353)
+    );
+    assert!(
+        listeners.iter().all(|proxy| !proxy.frontend_tls),
+        "plain `udp` claimants materialize non-terminating listeners"
     );
 
     // Backend isolation: each generated upstream carries only its own Service's

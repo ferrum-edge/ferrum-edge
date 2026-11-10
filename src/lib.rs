@@ -9454,7 +9454,9 @@ pub mod _test_support {
     pub fn permessage_deflate_answer_for_test(
         headers: &hyper::HeaderMap,
     ) -> Option<hyper::header::HeaderValue> {
-        crate::proxy::permessage_deflate_answer(headers)
+        crate::proxy::backend_extensions_answer(headers)
+            .as_ref()
+            .and_then(crate::proxy::permessage_deflate_answer_from)
     }
 
     /// Finish a `websocket_permessage_deflate: terminate` negotiation against
@@ -15358,7 +15360,7 @@ pub mod _test_support {
         deadline: Option<tokio::time::Instant>,
         attempt: F,
     ) -> Result<F::Output, &'static str> {
-        crate::proxy::await_route_request_deadline(deadline, None, attempt)
+        crate::proxy::await_backend_attempt_route_deadline(deadline, None, None, attempt)
             .await
             .map_err(route_deadline_expiry_label)
     }
@@ -15391,9 +15393,10 @@ pub mod _test_support {
                 &mut armed_deadline,
             ),
         };
-        let outcome = crate::proxy::await_route_request_deadline(deadline, budget, attempt)
-            .await
-            .map_err(route_deadline_expiry_label);
+        let outcome =
+            crate::proxy::await_backend_attempt_route_deadline(deadline, budget, None, attempt)
+                .await
+                .map_err(route_deadline_expiry_label);
         (outcome, armed_deadline)
     }
 
@@ -15515,8 +15518,7 @@ pub mod _test_support {
     /// rule's deadlines (#5646), for a total deadline `total`, an attempt
     /// budget `attempt_timeout`, and the committed attempt's budget instant
     /// `attempt_deadline`: `(a fresh attempt's budget instant, the committed
-    /// body's deadline, whether the attempt budget alone has expired, how the
-    /// body deadline ended the attempt)`.
+    /// body's deadline, how the body deadline ended the attempt)`.
     pub fn h3_route_attempt_bounds_for_test(
         total: Option<tokio::time::Instant>,
         attempt_timeout: Option<std::time::Duration>,
@@ -15524,14 +15526,12 @@ pub mod _test_support {
     ) -> (
         Option<tokio::time::Instant>,
         Option<tokio::time::Instant>,
-        bool,
         &'static str,
     ) {
         let route = crate::http3::route_deadline::H3RouteDeadlines::new(total, attempt_timeout);
         (
             route.start_attempt(),
             route.body_deadline(attempt_deadline),
-            route.attempt_budget_expired(attempt_deadline),
             route_deadline_expiry_label(route.body_expiry()),
         )
     }
@@ -16044,9 +16044,8 @@ pub mod _test_support {
 
     pub fn h3_plugin_protocol_for_request_for_test(
         flavor: crate::config::types::HttpFlavor,
-        grpc_web_request: bool,
     ) -> crate::plugins::ProxyProtocol {
-        crate::http3::server::h3_plugin_protocol_for_request(flavor, grpc_web_request)
+        crate::http3::server::h3_plugin_protocol_for_request(flavor)
     }
 
     pub fn udp_logging_should_replace_sender_on_resolve_for_test(

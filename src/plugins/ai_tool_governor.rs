@@ -4784,7 +4784,7 @@ impl Plugin for AiToolGovernor {
 /// Test-only observability — exposed for unit tests (the approval cache is
 /// otherwise unobservable from outside the plugin).
 #[doc(hidden)]
-#[allow(dead_code)] // used only by tests/, dead code in the bin target
+#[allow(dead_code)] // used only by tests/
 impl AiToolGovernor {
     pub fn approval_cache_len(&self) -> usize {
         self.engine.approval_cache.len()

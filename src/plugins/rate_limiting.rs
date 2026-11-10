@@ -355,7 +355,6 @@ pub struct RateLimiting {
 }
 
 impl RateLimiting {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -551,7 +550,6 @@ impl RateLimiting {
     /// Lets composition tests drive a real `503` through `on_request_received`
     /// with a live `RequestContext`, instead of only through the key-level
     /// helper below. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn mark_redis_unavailable_for_test(&self) -> bool {
         match self.limiter.redis_client_arc_for_test() {
             Some(client) => {
@@ -568,7 +566,6 @@ impl RateLimiting {
     ///
     /// Exercises the production [`Self::reject`] mapping so the fail-closed
     /// status/body cannot drift from the outage path. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) async fn refusal_under_redis_outage_for_test(
         &self,
         key: &str,
@@ -648,7 +645,6 @@ impl RateLimiting {
     }
 
     /// Invoke the production cleanup wrapper at `now`. Test-only.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn maybe_evict_stale_entries_at_for_test(&self, now: Instant) {
         self.maybe_evict_stale_entries_at(now);
     }

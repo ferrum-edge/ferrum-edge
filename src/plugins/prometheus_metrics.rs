@@ -1615,14 +1615,12 @@ impl MetricsRegistry {
 
     /// Live request-scoped duration bucket layout (milliseconds).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn request_duration_buckets_ms_for_test(&self) -> Vec<f64> {
         self.duration_bucket_layouts.load().request.to_vec()
     }
 
     /// Live session-scoped duration bucket layout (milliseconds).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn session_duration_buckets_ms_for_test(&self) -> Vec<f64> {
         self.duration_bucket_layouts.load().session.to_vec()
     }
@@ -1630,7 +1628,6 @@ impl MetricsRegistry {
     /// Capture the currently published duration layouts, as a recorder does
     /// at the start of `record`.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn duration_layout_snapshot_for_test(&self) -> DurationLayoutSnapshotForTest {
         DurationLayoutSnapshotForTest(self.duration_bucket_layouts.load_full())
     }
@@ -1638,7 +1635,6 @@ impl MetricsRegistry {
     /// Record an HTTP-family summary as a recorder that captured `snapshot`
     /// before a later reload (the late-recorder interleaving).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn record_with_layout_snapshot_for_test(
         &self,
         summary: &TransactionSummary,
@@ -1650,7 +1646,6 @@ impl MetricsRegistry {
 
     /// Stream-summary counterpart of [`Self::record_with_layout_snapshot_for_test`].
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn record_stream_with_layout_snapshot_for_test(
         &self,
         summary: &StreamTransactionSummary,
@@ -1661,7 +1656,6 @@ impl MetricsRegistry {
 
     /// WebSocket counterpart of [`Self::record_with_layout_snapshot_for_test`].
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn record_ws_session_with_layout_snapshot_for_test(
         &self,
         ctx: &WsDisconnectContext,
@@ -2131,7 +2125,6 @@ impl MetricsRegistry {
 
     /// Current `ferrum_ws_message_size_limit_rejected_total` value for one
     /// direction (test-crate reader).
-    #[allow(dead_code)]
     pub fn ws_message_size_limit_rejections_total(
         &self,
         direction: super::WebSocketFrameDirection,
@@ -2159,9 +2152,7 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    // Test-crate-only; dead code in the BIN target.
     /// Current `adaptive_concurrency` decision count for one proxy.
-    #[allow(dead_code)]
     pub fn adaptive_concurrency_decision_total(
         &self,
         proxy_id: &str,
@@ -2182,8 +2173,6 @@ impl MetricsRegistry {
         previous
     }
 
-    // Test-crate-only; dead code in the BIN target (see `src/admin/mod.rs`).
-    #[allow(dead_code)]
     #[doc(hidden)]
     pub fn reset_admin_read_only_rejection_metrics_for_test(&self) {
         self.admin_read_only_rejected_mutations
@@ -2210,15 +2199,11 @@ impl MetricsRegistry {
     }
 
     /// Current retained mTLS DNS admission fence count.
-    // Test-crate-only; dead code in the BIN target.
-    #[allow(dead_code)]
     pub fn mtls_dns_admission_fences_retained(&self) -> u64 {
         self.mtls_dns_admission_fences_retained
             .load(Ordering::Relaxed)
     }
 
-    // Test-crate-only; dead code in the BIN target.
-    #[allow(dead_code)]
     pub fn admin_read_only_rejected_mutations_total(&self) -> u64 {
         self.admin_read_only_rejected_mutations
             .load(Ordering::Relaxed)
@@ -2402,66 +2387,55 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_task_panics_total(&self) -> u64 {
         self.service_discovery_task_panics.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_task_restarts_total(&self) -> u64 {
         self.service_discovery_task_restarts.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_stale_expiries_total(&self) -> u64 {
         self.service_discovery_stale_expiries
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_stale_withdrawals_total(&self) -> u64 {
         self.service_discovery_stale_withdrawals
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_stale_recoveries_total(&self) -> u64 {
         self.service_discovery_stale_recoveries
             .load(Ordering::Relaxed)
     }
 
     // Test-crate observation seams for issue #3719 / #3718 / #3720 counters.
-    #[allow(dead_code)]
     pub fn service_discovery_provider_normalization_rejected_total(&self) -> u64 {
         self.service_discovery_provider_normalization_rejected
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_shared_admission_rejected_total(&self) -> u64 {
         self.service_discovery_shared_admission_rejected
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_cursor_rollback_total(&self) -> u64 {
         self.service_discovery_cursor_rollback
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_cursor_advance_total(&self) -> u64 {
         self.service_discovery_cursor_advance
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_response_oversized_total(&self) -> u64 {
         self.service_discovery_response_oversized
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn service_discovery_malformed_envelope_total(&self) -> u64 {
         self.service_discovery_malformed_envelope
             .load(Ordering::Relaxed)
@@ -2886,7 +2860,6 @@ impl MetricsRegistry {
 
     /// Fixed-cardinality test/operator seam for the current logical record
     /// count gauge of one persistent TLS store.
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn current_tls_store_record_count(
         &self,
         kind: crate::tls::shared_store::TlsPersistentStoreKind,
@@ -3276,7 +3249,6 @@ impl MetricsRegistry {
     /// Lower the per-family mesh series budget for focused cardinality tests.
     /// Clamps into the same nonzero bounded range as production config.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn set_mesh_series_budget_per_family_for_test(&self, budget: usize) {
         self.mesh_series_budget_per_family.store(
             budget.clamp(
@@ -3289,28 +3261,24 @@ impl MetricsRegistry {
 
     /// Current per-family mesh series budget (exact admission ceiling).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn mesh_series_budget_per_family_for_test(&self) -> usize {
         self.mesh_series_budget_per_family.load(Ordering::Acquire)
     }
 
     /// Live render-cache TTL in seconds (process-wide tunable).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn render_cache_ttl_secs_for_test(&self) -> u64 {
         self.render_cache_ttl_secs.load(Ordering::Relaxed)
     }
 
     /// Live stale-entry TTL in seconds (process-wide tunable).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn stale_entry_ttl_secs_for_test(&self) -> u64 {
         self.stale_entry_ttl_nanos.load(Ordering::Relaxed) / 1_000_000_000
     }
 
     /// Live cache-invalidation minimum age in milliseconds.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn cache_invalidation_min_age_ms_for_test(&self) -> u64 {
         self.cache_invalidation_min_age_nanos
             .load(Ordering::Relaxed)
@@ -3319,7 +3287,6 @@ impl MetricsRegistry {
 
     /// Live admitted series for one mesh family (exact reservation count).
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn mesh_series_live_for_test(&self, family: &str) -> Option<usize> {
         prometheus_helpers::MeshMetricFamily::from_config_name(family).map(|family| {
             self.mesh_series_budgets[family.index()]
@@ -3330,7 +3297,6 @@ impl MetricsRegistry {
 
     /// Overflow drops for one mesh family.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn mesh_series_overflow_for_test(&self, family: &str) -> Option<u64> {
         prometheus_helpers::MeshMetricFamily::from_config_name(family).map(|family| {
             self.mesh_series_budgets[family.index()]
@@ -5104,11 +5070,6 @@ impl MetricsRegistry {
     /// complete rendering of everything the registry owns plus everything it
     /// composes. `render()` reaches the same families through a live append
     /// rather than through the cached body.
-    // Now that `render()` memoizes `render_cacheable_body()` instead, this is
-    // reached only from the test suites, which compile against the library
-    // crate. The binary target compiles this module without them, so `-D
-    // warnings` sees it as dead there.
-    #[allow(dead_code)]
     pub fn render_uncached(&self) -> String {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
@@ -7472,7 +7433,6 @@ impl PrometheusMetrics {
     /// process-global registry when the test harness runs constructors in
     /// parallel.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit tests call this through the lib target; the bin target does not.
     pub fn new_with_registry_for_test(
         config: &Value,
         namespace: &str,

@@ -60,29 +60,6 @@ mod h1_framing_guard;
 /// requests while one was being queued (issue #5720).
 pub mod h1_send_release;
 
-// `tests/` is a separate crate, so these are unreachable from the
-// `ferrum-edge` binary target and would otherwise be reported as dead code
-// there. They exist only so external tests can drive the production
-// envelope mapping instead of restating its bytes.
-#[doc(hidden)]
-#[allow(dead_code)]
-pub fn envelope_for_hint_for_test(hint: u8) -> &'static [u8] {
-    h1_framing_guard::envelope_for_hint(hint)
-}
-
-#[doc(hidden)]
-#[allow(dead_code)]
-pub const PARSE_HINT_CONFLICTING_CONTENT_LENGTH_FOR_TEST: u8 =
-    h1_framing_guard::PARSE_HINT_CONFLICTING_CONTENT_LENGTH;
-#[doc(hidden)]
-#[allow(dead_code)]
-pub const PARSE_HINT_HTTP10_TRANSFER_ENCODING_FOR_TEST: u8 =
-    h1_framing_guard::PARSE_HINT_HTTP10_TRANSFER_ENCODING;
-#[doc(hidden)]
-#[allow(dead_code)]
-pub const PARSE_HINT_INVALID_REQUEST_TARGET_UTF8_FOR_TEST: u8 =
-    h1_framing_guard::PARSE_HINT_INVALID_REQUEST_TARGET_UTF8;
-
 /// Shared h2c (cleartext, prior-knowledge HTTP/2) peer-preface observation.
 /// Hyper's client handshake proves only the client half, so both h2c transports
 /// — the pooled gRPC path and the Unix-socket path — establish through here.
@@ -95,7 +72,7 @@ pub mod hbone_inner_pool;
 pub mod hbone_pool;
 mod hbone_proxy;
 #[allow(unused_imports)]
-// Used by external tests; unused in the separately compiled bin target.
+// Re-exported for `_test_support`.
 pub(crate) use hbone_proxy::settle_hbone_backend_connect_circuit_breaker_outcome;
 pub mod headers;
 pub mod hop_limit;
@@ -145,7 +122,7 @@ pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
 pub(crate) mod request_headers;
 #[allow(unused_imports)]
-// Used by external tests; unused in the separately compiled bin target.
+// Re-exported for `_test_support`.
 pub(crate) use mesh_tcp_egress::connection_balancer as mesh_tcp_egress_connection_balancer;
 mod mesh_tcp_inbound;
 pub mod mesh_trust_registry;
@@ -7861,8 +7838,15 @@ pub struct ProxyState {
     pub service_discovery_manager: Arc<ServiceDiscoveryManager>,
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement on the
     /// process-global proxy ports. `None` when HTTP/3 is disabled; avoids a
-    /// `format!()` allocation per response.
+    /// `format!()` allocation per response. Advertised only while
+    /// [`Self::h3_listener_live`] is set.
     pub alt_svc_header: Option<Arc<str>>,
+    /// True only after the serving mode actually started the process-global
+    /// QUIC listener (see [`Self::set_h3_listener_started`]).
+    /// `FERRUM_ENABLE_HTTP3` alone is not enough: the listener also needs
+    /// frontend TLS material and a non-zero HTTPS port, and `Alt-Svc` must
+    /// never advertise a QUIC endpoint that does not exist (issue #7168).
+    pub h3_listener_live: Arc<AtomicBool>,
     /// Pre-computed Alt-Svc values for dynamically bound Gateway API listener
     /// ports that really have a QUIC socket, published by
     /// [`crate::proxy::gateway_listener::GatewayListenerManager`] on each
@@ -8198,7 +8182,6 @@ pub struct ProxyState {
     /// reload that rebuilds `PluginHttpClient` — the plugin factory
     /// reads the live Arc via the http_client; the field itself is
     /// retained as a lifetime anchor and observability surface.
-    #[allow(dead_code)]
     pub bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     /// Per-destination open-connection limiter enforcing DestinationRule
     /// `connectionPool.tcp.maxConnections` across EVERY backend transport
@@ -11726,6 +11709,7 @@ impl ProxyState {
             },
             http3_connect_udp_max_sessions_per_ip,
             h3_websocket_reachable: Arc::new(AtomicBool::new(false)),
+            h3_listener_live: Arc::new(AtomicBool::new(false)),
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
                 Some(Arc::new(dashmap::DashMap::with_shard_amount(
                     pool_shard_amount,
@@ -11950,7 +11934,6 @@ impl ProxyState {
     /// Production route lookup exposed narrowly for external generation-race
     /// regression tests. Both HTTP and HTTP/3 use the same epoch-bound helper.
     #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn find_proxy_on_frontend_for_test(
         &self,
         host: Option<&str>,
@@ -11973,7 +11956,6 @@ impl ProxyState {
     /// connection that `listener` accepted, exactly as the H1/H2 and H3
     /// request paths route it (issue #5921).
     #[doc(hidden)]
-    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn find_proxy_on_gateway_listener_for_test(
         &self,
         host: Option<&str>,
@@ -12006,6 +11988,9 @@ impl ProxyState {
     /// small-map lookup; no allocation and no lock.
     pub fn alt_svc_for_frontend_port(&self, frontend_port: Option<u16>) -> Option<Arc<str>> {
         let global = self.alt_svc_header.as_ref()?;
+        if !self.h3_listener_live.load(Ordering::Acquire) {
+            return None;
+        }
         match frontend_port {
             Some(port)
                 if port != self.env_config.proxy_https_port
@@ -12188,11 +12173,7 @@ impl ProxyState {
                     &upstream_id,
                 );
                 relay_proxy.dispatch_port_overrides =
-                    Self::projected_dispatch_overrides_for_upstream(
-                        config,
-                        &service.namespace,
-                        &upstream_id,
-                    );
+                    Self::projected_dispatch_overrides_for_upstream(upstream);
                 for target in &upstream.targets {
                     // Only Ambient `mesh.hbone` targets use the HBONE capability
                     // registry. Sidecar `mesh.mtls` raw-TCP targets dispatch over
@@ -12242,11 +12223,8 @@ impl ProxyState {
                 spec.canonical_ip,
                 &spec.upstream_id,
             );
-            relay_proxy.dispatch_port_overrides = Self::projected_dispatch_overrides_for_upstream(
-                config,
-                &spec.service.namespace,
-                &spec.upstream_id,
-            );
+            relay_proxy.dispatch_port_overrides =
+                Self::projected_dispatch_overrides_for_upstream(upstream);
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
@@ -12296,11 +12274,7 @@ impl ProxyState {
                     &upstream_id,
                 );
                 relay_proxy.dispatch_port_overrides =
-                    Self::projected_dispatch_overrides_for_upstream(
-                        config,
-                        &service.namespace,
-                        &upstream_id,
-                    );
+                    Self::projected_dispatch_overrides_for_upstream(upstream);
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
@@ -12333,13 +12307,38 @@ impl ProxyState {
             if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
                 continue;
             }
-            let Some(proxy_id) = plugin.proxy_id.as_deref() else {
-                continue;
+            // A Proxy-scoped instance names its proxy. Global and ProxyGroup
+            // instances reach every proxy they effectively attach to, resolved
+            // exactly as the plugin cache resolves them at runtime; skipping
+            // them left their rule destinations without a capability record,
+            // so native H3 / direct H2 never engaged for those routes
+            // (issue #7168).
+            let base_proxies: Vec<&Proxy> = match plugin.scope {
+                PluginScope::Proxy => plugin
+                    .proxy_id
+                    .as_deref()
+                    .and_then(|proxy_id| {
+                        proxy_map
+                            .get(&(plugin.namespace.as_str(), proxy_id))
+                            .copied()
+                    })
+                    .into_iter()
+                    .collect(),
+                PluginScope::Global | PluginScope::ProxyGroup => config
+                    .proxies
+                    .iter()
+                    .filter(|proxy| {
+                        crate::plugin_cache::plugin_config_effectively_applies_to_proxy(
+                            plugin, proxy, config,
+                        )
+                    })
+                    .collect(),
             };
-            let Some(base_proxy) = proxy_map.get(&(plugin.namespace.as_str(), proxy_id)) else {
-                continue;
-            };
-            if !base_proxy.dispatch_kind.is_http_family() {
+            let base_proxies: Vec<&Proxy> = base_proxies
+                .into_iter()
+                .filter(|proxy| proxy.dispatch_kind.is_http_family())
+                .collect();
+            if base_proxies.is_empty() {
                 continue;
             }
             let Ok(dispatch_config) =
@@ -12347,67 +12346,80 @@ impl ProxyState {
             else {
                 warn!(
                     plugin_id = %plugin.id,
-                    proxy_id = %proxy_id,
                     "Skipping mesh_route_dispatch capability targets: config failed to parse"
                 );
                 continue;
             };
 
-            for rule in dispatch_config.rules {
-                let destination = rule.destination;
-                let direct_backend_override = destination.upstream_id.is_none()
-                    && (destination.backend_host.is_some() || destination.backend_port.is_some());
-                let mut effective_proxy = (*base_proxy).clone();
-                if let Some(upstream_id) = destination.upstream_id {
-                    effective_proxy.upstream_id = Some(upstream_id.clone());
-                    let Some(upstream) =
-                        upstream_map.get(&(base_proxy.namespace.as_str(), upstream_id.as_str()))
-                    else {
-                        continue;
-                    };
-                    effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
-                    for target in &upstream.targets {
-                        // SKIP cross-cluster east-west HBONE targets — a
-                        // mesh_route_dispatch rule could point at the same mesh
-                        // egress upstream; same rationale as the proxy-driven
-                        // walk above (dispatch bypasses the registry for them,
-                        // probing dials the gateway with the wrong SNI).
-                        if crate::proxy::hbone_pool::target_hbone_cross_cluster(target) {
-                            continue;
-                        }
-                        let probe_target = BackendCapabilityProbeTarget::from_proxy(
-                            &effective_proxy,
-                            Some(target),
-                        );
-                        if seen.insert(probe_target.key.clone()) {
-                            targets.push(probe_target);
-                        }
-                    }
+            for base_proxy in base_proxies {
+                for rule in &dispatch_config.rules {
+                    Self::collect_mesh_route_dispatch_rule_targets(
+                        base_proxy,
+                        &rule.destination,
+                        upstream_map,
+                        seen,
+                        targets,
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_mesh_route_dispatch_rule_targets(
+        base_proxy: &Proxy,
+        destination: &crate::plugins::mesh_route_dispatch::RouteDestination,
+        upstream_map: &HashMap<(&str, &str), &Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        targets: &mut Vec<BackendCapabilityProbeTarget>,
+    ) {
+        let direct_backend_override = destination.upstream_id.is_none()
+            && (destination.backend_host.is_some() || destination.backend_port.is_some());
+        let mut effective_proxy = base_proxy.clone();
+        if let Some(upstream_id) = destination.upstream_id.as_deref() {
+            effective_proxy.upstream_id = Some(upstream_id.to_string());
+            let Some(upstream) = upstream_map.get(&(base_proxy.namespace.as_str(), upstream_id))
+            else {
+                return;
+            };
+            effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
+            for target in &upstream.targets {
+                // SKIP cross-cluster east-west HBONE targets — a
+                // mesh_route_dispatch rule could point at the same mesh
+                // egress upstream; same rationale as the proxy-driven
+                // walk above (dispatch bypasses the registry for them,
+                // probing dials the gateway with the wrong SNI).
+                if crate::proxy::hbone_pool::target_hbone_cross_cluster(target) {
                     continue;
                 }
-
-                if let Some(host) = destination.backend_host {
-                    effective_proxy.backend_host = host;
-                }
-                if let Some(port) = destination.backend_port {
-                    effective_proxy.backend_port = port;
-                }
-                if direct_backend_override {
-                    let reset_direct_tls = effective_proxy.upstream_id.is_some();
-                    effective_proxy.upstream_id = None;
-                    if reset_direct_tls {
-                        effective_proxy.resolved_tls = BackendTlsConfig::from_proxy(base_proxy);
-                    }
-                }
-                if let Some(tls) = destination.backend_tls {
-                    effective_proxy.resolved_tls = tls;
-                }
-
-                let probe_target = BackendCapabilityProbeTarget::from_proxy(&effective_proxy, None);
+                let probe_target =
+                    BackendCapabilityProbeTarget::from_proxy(&effective_proxy, Some(target));
                 if seen.insert(probe_target.key.clone()) {
                     targets.push(probe_target);
                 }
             }
+            return;
+        }
+
+        if let Some(host) = destination.backend_host.as_ref() {
+            effective_proxy.backend_host = host.clone();
+        }
+        if let Some(port) = destination.backend_port {
+            effective_proxy.backend_port = port;
+        }
+        if direct_backend_override {
+            let reset_direct_tls = effective_proxy.upstream_id.is_some();
+            effective_proxy.upstream_id = None;
+            if reset_direct_tls {
+                effective_proxy.resolved_tls = BackendTlsConfig::from_proxy(base_proxy);
+            }
+        }
+        if let Some(tls) = destination.backend_tls.as_ref() {
+            effective_proxy.resolved_tls = tls.clone();
+        }
+
+        let probe_target = BackendCapabilityProbeTarget::from_proxy(&effective_proxy, None);
+        if seen.insert(probe_target.key.clone()) {
+            targets.push(probe_target);
         }
     }
 
@@ -14007,13 +14019,16 @@ impl ProxyState {
             return false;
         }
 
+        // Serialize in place and drop the volatile timestamps from the value,
+        // rather than deep-cloning the proxy to overwrite them first (issue
+        // #7168). The normalized-JSON comparison itself is the same contract
+        // `projected_dr_dispatch_changed_upstreams` uses for upstreams.
         fn content_value(proxy: &Proxy) -> Option<serde_json::Value> {
-            let mut normalized = proxy.clone();
-            let epoch = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                .unwrap_or_else(chrono::Utc::now);
-            normalized.created_at = epoch;
-            normalized.updated_at = epoch;
-            serde_json::to_value(&normalized).ok()
+            let mut value = serde_json::to_value(proxy).ok()?;
+            let fields = value.as_object_mut()?;
+            fields.remove("created_at");
+            fields.remove("updated_at");
+            Some(value)
         }
 
         match (content_value(a), content_value(b)) {
@@ -14040,10 +14055,12 @@ impl ProxyState {
         let Some(mesh) = config.mesh.as_deref() else {
             return HashMap::new();
         };
-        let upstream_keys: std::collections::HashSet<(&str, &str)> = config
+        // One `(namespace, id)` index per projection instead of a linear scan
+        // of every upstream per mesh relay upstream (issue #7168).
+        let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|u| (u.namespace.as_str(), u.id.as_str()))
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
         let mut projection = HashMap::new();
 
@@ -14057,14 +14074,12 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
+                if let Some(upstream) =
+                    upstream_map.get(&(service.namespace.as_str(), upstream_id.as_str()))
+                {
                     projection.insert(
                         NamespacedResourceId::new(&service.namespace, &upstream_id),
-                        Self::projected_dispatch_overrides_for_upstream(
-                            config,
-                            &service.namespace,
-                            &upstream_id,
-                        ),
+                        Self::projected_dispatch_overrides_for_upstream(upstream),
                     );
                 }
             }
@@ -14074,14 +14089,12 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
+                if let Some(upstream) =
+                    upstream_map.get(&(service.namespace.as_str(), upstream_id.as_str()))
+                {
                     projection.insert(
                         NamespacedResourceId::new(&service.namespace, &upstream_id),
-                        Self::projected_dispatch_overrides_for_upstream(
-                            config,
-                            &service.namespace,
-                            &upstream_id,
-                        ),
+                        Self::projected_dispatch_overrides_for_upstream(upstream),
                     );
                 }
             }
@@ -14092,15 +14105,12 @@ impl ProxyState {
             &mesh.workloads,
             mesh.multi_cluster.as_ref(),
         ) {
-            if upstream_keys.contains(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
+            if let Some(upstream) =
+                upstream_map.get(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
             {
                 projection.insert(
                     NamespacedResourceId::new(&spec.service.namespace, &spec.upstream_id),
-                    Self::projected_dispatch_overrides_for_upstream(
-                        config,
-                        &spec.service.namespace,
-                        &spec.upstream_id,
-                    ),
+                    Self::projected_dispatch_overrides_for_upstream(upstream),
                 );
             }
         }
@@ -14109,14 +14119,8 @@ impl ProxyState {
     }
 
     fn projected_dispatch_overrides_for_upstream(
-        config: &GatewayConfig,
-        namespace: &str,
-        upstream_id: &str,
+        upstream: &Upstream,
     ) -> Option<HashMap<u16, crate::config::types::ResolvedPortOverride>> {
-        let upstream = config
-            .upstreams
-            .iter()
-            .find(|u| u.namespace == namespace && u.id == upstream_id)?;
         if upstream.port_overrides.is_empty() {
             return None;
         }
@@ -14421,14 +14425,19 @@ impl ProxyState {
         self.tls_inventory_cache.mark_stale();
     }
 
-    /// Record whether the serving mode actually started an H3 listener.
+    /// Record whether the serving mode actually started the process-global H3
+    /// listener.
     ///
     /// This must be set by mode startup after it evaluates the same gates used
     /// to spawn the listener: H3 enabled, HTTPS port available, and frontend
     /// TLS material or a dynamic TLS slot. Keeping this as a listener-start
     /// signal avoids warning about H3 WebSocket behavior in HTTP-only
-    /// deployments where env flags are enabled but no QUIC listener exists.
-    pub(crate) fn set_h3_websocket_listener_started(&self, h3_listener_started: bool) {
+    /// deployments where env flags are enabled but no QUIC listener exists,
+    /// and keeps `Alt-Svc` off the process-global ports until a QUIC listener
+    /// really serves them.
+    pub fn set_h3_listener_started(&self, h3_listener_started: bool) {
+        self.h3_listener_live
+            .store(h3_listener_started, Ordering::Release);
         let reachable = h3_websocket_reachable_from_listener(&self.env_config, h3_listener_started);
         let was_reachable = self
             .h3_websocket_reachable
@@ -14795,6 +14804,13 @@ impl ProxyState {
                         && !projected_lb_changed
                         && country_mmdb_plugin_cache.is_none()
                     {
+                        // Unchanged: still advance the stored snapshot (its
+                        // `loaded_at` is the DP's committed-version
+                        // watermark), but here, under the publication lock,
+                        // like every other `ProxyState.config` write — never
+                        // after the lock is released, where an older candidate
+                        // could overwrite a newer writer's (issue #7168).
+                        self.config.store(Arc::clone(&staged_config));
                         return Ok(None);
                     }
 
@@ -14878,9 +14894,9 @@ impl ProxyState {
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
+                // The staging closure already stored the unchanged candidate
+                // (and its `loaded_at`) under the publication lock.
                 debug!("Config poll: candidate valid but unchanged, skipping update");
-                // Still update loaded_at timestamp
-                self.config.store(Arc::clone(&staged_config));
                 return ConfigApplyOutcome::Unchanged;
             }
             Err(e) => {
@@ -15134,7 +15150,6 @@ impl ProxyState {
     /// no-op candidates (`Unchanged`) from validation/build rejections
     /// (`Rejected`). The DB poller relies on this to avoid advancing
     /// `last_poll_at` on rejection — see `src/modes/database.rs`.
-    #[allow(dead_code)] // Integration-test seam; DB mode uses the topology-fenced entry point.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
@@ -16237,23 +16252,14 @@ pub fn try_acquire_websocket_connection_permit(
 }
 
 /// Try to admit one upgraded WebSocket session for `ip` against the per-source
-/// session budget.
+/// session budget, grouping IPv6 sources by the configured
+/// `FERRUM_PER_IP_IPV6_PREFIX`.
 ///
 /// `counts == None` or `max == 0` means the dimension is disabled (`Ok(None)`).
 /// The returned guard must be moved into the session task so the slot is
 /// released on every disconnect path. Source identity is the caller's
 /// resolved `client_ip` — forwarding headers must already have been accepted
 /// only from a trusted peer.
-pub fn try_acquire_per_ip_websocket_session(
-    counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
-    ip: &str,
-    max: u64,
-) -> Result<Option<PerIpConnectionGuard>, PerIpLimitExceeded> {
-    try_acquire_per_ip_slot(counts, ip, max)
-}
-
-/// Same as [`try_acquire_per_ip_websocket_session`], but groups IPv6 sources by
-/// the configured `FERRUM_PER_IP_IPV6_PREFIX` instead of the fixed /64.
 pub fn try_acquire_per_ip_websocket_session_with_prefix(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     ip: &str,
@@ -18663,13 +18669,6 @@ pub(crate) fn permessage_deflate_answer_from(
 ) -> Option<hyper::header::HeaderValue> {
     let answer = retain_permessage_deflate_extensions(answer.to_str().ok()?)?;
     hyper::header::HeaderValue::from_str(&answer).ok()
-}
-
-/// The `permessage-deflate` part of a backend handshake answer, or `None`.
-pub(crate) fn permessage_deflate_answer(
-    headers: &hyper::HeaderMap,
-) -> Option<hyper::header::HeaderValue> {
-    permessage_deflate_answer_from(&backend_extensions_answer(headers)?)
 }
 
 fn push_forwardable_header_override(
@@ -21648,7 +21647,6 @@ impl<S> WsActivityIo<S> {
     }
 
     /// Access the wrapped transport (socket-option tweaks, tests).
-    #[allow(dead_code)] // Used by library consumers and external unit tests; the binary tree has no caller.
     pub fn get_ref(&self) -> &S {
         &self.inner
     }
@@ -23468,10 +23466,7 @@ async fn run_bound_proxy_listener(
     run_accept_loop(
         listener,
         state,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Static { tls_config },
         conn_semaphore,
         shutdown,
         mesh_direction,
@@ -23827,10 +23822,7 @@ pub(crate) async fn start_proxy_listener_with_tls_and_accept_gate(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Static { tls_config },
         None,
         false,
         None,
@@ -23857,10 +23849,7 @@ pub async fn start_global_proxy_listener_with_tls_and_signal(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Static { tls_config },
         None,
         false,
         frontend_proxy_protocol,
@@ -23918,10 +23907,7 @@ pub(crate) async fn start_mesh_plaintext_listener_with_accept_gate(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Static { tls_config },
         mesh_direction,
         dual_stack,
         None,
@@ -24016,10 +24002,7 @@ pub(crate) async fn start_proxy_listener_with_dynamic_tls_and_accept_gate(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Dynamic {
-            slot: tls_slot,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Dynamic { slot: tls_slot },
         None,
         false,
         None,
@@ -24046,10 +24029,7 @@ pub async fn start_global_proxy_listener_with_dynamic_tls_and_signal(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::Dynamic {
-            slot: tls_slot,
-            record_mesh_mtls_metric: false,
-        },
+        ListenerTlsSource::Dynamic { slot: tls_slot },
         None,
         false,
         frontend_proxy_protocol,
@@ -24100,7 +24080,6 @@ enum ListenerTlsSource {
     /// `Option<Arc<_>>` and performs no atomic read.
     Static {
         tls_config: Option<Arc<rustls::ServerConfig>>,
-        record_mesh_mtls_metric: bool,
     },
     /// Dynamic mesh inbound TLS loaded from the authoritative
     /// `ProxyState::mesh_inbound_tls_policy` on every accept so
@@ -24112,10 +24091,7 @@ enum ListenerTlsSource {
     /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) takes effect on the next
     /// handshake without restarting the listener. Existing in-flight TLS
     /// sessions keep their old `ServerConfig`.
-    Dynamic {
-        slot: crate::tls::SharedFrontendTls,
-        record_mesh_mtls_metric: bool,
-    },
+    Dynamic { slot: crate::tls::SharedFrontendTls },
 }
 
 impl ListenerTlsSource {
@@ -24146,18 +24122,10 @@ impl ListenerTlsSource {
         }
     }
 
+    /// Only mesh inbound listeners count mesh mTLS handshakes; the static
+    /// and dynamic HTTPS listeners never do.
     fn record_mesh_mtls_metric(&self) -> bool {
-        match self {
-            Self::Static {
-                record_mesh_mtls_metric,
-                ..
-            } => *record_mesh_mtls_metric,
-            Self::MeshInbound { .. } => true,
-            Self::Dynamic {
-                record_mesh_mtls_metric,
-                ..
-            } => *record_mesh_mtls_metric,
-        }
+        matches!(self, Self::MeshInbound { .. })
     }
 
     /// Whether this source REQUIRES a TLS config to serve a connection.
@@ -34964,7 +34932,6 @@ fn attach_auth_rejection_set_cookie(
 /// per-proxy OpenAI-envelope flag. `tests/` is a separate crate, so this is
 /// unreachable from the `ferrum-edge` binary target and would otherwise be
 /// reported as dead code there.
-#[allow(dead_code)]
 pub async fn run_authentication_phase(
     auth_mode: AuthMode,
     auth_plugins: &[Arc<dyn Plugin>],
@@ -35189,7 +35156,6 @@ pub fn apply_trusted_forwarded_request_scheme(
 }
 
 /// Handle a single proxy request.
-#[allow(dead_code)] // Public test/library entry point; listeners use the port-aware wrapper below.
 pub async fn handle_proxy_request(
     req: Request<Incoming>,
     state: ProxyState,
@@ -41377,7 +41343,6 @@ async fn handle_proxy_request_inner(
                         // and defensively refused by the screen above (issues #2003,
                         // #3284, #3728).
                         &grpc_transport,
-                        &state.dns_cache,
                         attempt_span.headers(headers_view),
                         grpc_should_stream,
                         effective_max_response_body_size_bytes,
@@ -41558,7 +41523,6 @@ async fn handle_proxy_request_inner(
                             // the Ambient HBONE tunnel's nested HTTP/2 connection with
                             // frames committed incrementally and no retry (issue #3728).
                             &grpc_transport,
-                            &state.dns_cache,
                             attempt_span.headers(headers_view),
                             effective_max_grpc_recv_size_bytes,
                             body_size_exceeded,
@@ -41720,7 +41684,6 @@ async fn handle_proxy_request_inner(
                                     // The same materialized transport as the split-path
                                     // call above (issues #2003, #3284, #3728).
                                     &grpc_transport,
-                                    &state.dns_cache,
                                     attempt_span.headers(headers_view),
                                     grpc_should_stream,
                                     effective_max_response_body_size_bytes,
@@ -42374,7 +42337,6 @@ async fn handle_proxy_request_inner(
                             // any class this pipeline cannot carry before reaching here
                             // (issues #2003, #3728).
                             &grpc_retry_transport,
-                            &state.dns_cache,
                             attempt_span.headers(headers_view),
                             grpc_should_stream,
                             effective_max_response_body_size_bytes,
@@ -50703,33 +50665,30 @@ pub(crate) async fn proxy_h3_plain_http_mesh_buffered(
         replay_headers.append(header_name, header_value);
     }
 
-    let (response, request_body_exceeded, streaming_h2_read_timeout_ms) =
-        boxed_proxy_to_backend_mesh_retry(
-            state,
-            proxy,
-            backend_url,
-            method,
-            headers,
-            Some(upstream_target),
-            Some(&body),
-            Some(&replay_headers),
-            dispatch_hbone,
-            plugins,
-            request_ctx,
-            false, // buffered response for the H3 plain writer
-            client_ip,
-            xff_append_ip,
-            request_is_secure,
-            &request_ctx.bytes_sent_observed,
-            // The client spoke HTTP/3, as on every other H3 bridge (issue #7165).
-            hyper::Version::HTTP_3,
-        )
-        .await;
-    h3_mesh_buffered_retry_response(
-        response,
-        request_body_exceeded,
-        streaming_h2_read_timeout_ms,
+    // The third element is the StreamingH2 relay read budget; a buffered H3
+    // response has no streaming follow-on to apply it to.
+    let (response, request_body_exceeded, _) = boxed_proxy_to_backend_mesh_retry(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        Some(upstream_target),
+        Some(&body),
+        Some(&replay_headers),
+        dispatch_hbone,
+        plugins,
+        request_ctx,
+        false, // buffered response for the H3 plain writer
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        &request_ctx.bytes_sent_observed,
+        // The client spoke HTTP/3, as on every other H3 bridge (issue #7165).
+        hyper::Version::HTTP_3,
     )
+    .await;
+    h3_mesh_buffered_retry_response(response, request_body_exceeded)
 }
 
 /// One H3 plain mesh helper future, heap-allocated so it is not a frame slot
@@ -50797,11 +50756,7 @@ pub(crate) fn boxed_proxy_h3_plain_http_mesh_buffered<'a>(
 fn h3_mesh_buffered_retry_response(
     response: retry::BackendResponse,
     request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
-    streaming_h2_read_timeout_ms: u64,
 ) -> retry::BackendResponse {
-    // Copy so the target-effective deadline stays on this seam; buffered H3
-    // has no StreamingH2 follow-on that would consume it as a relay budget.
-    let _applied_read_timeout_ms = streaming_h2_read_timeout_ms;
     if !request_body_exceeded
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -51876,7 +51831,7 @@ async fn proxy_to_backend(
     // BACKEND — every gateway- and client-side step (buffered client-body
     // collection, request-body hooks, DNS, backend admission) is complete and
     // the backend dial / stream open / send begins. A route request deadline
-    // (`await_route_request_deadline`) that cancels the attempt before this
+    // (`await_backend_attempt_route_deadline`) that cancels the attempt before this
     // point is health-neutral; one that cancels it afterwards is charged to
     // the backend. The route's per-attempt budget (`RouteAttemptBudget`)
     // starts here, which is why the wrapper observes this marker while the
@@ -55969,7 +55924,6 @@ fn reqwest_response_can_carry_trailers(response: &reqwest::Response) -> bool {
 /// Test seam (issue #5760): whether the reqwest relay would treat `response`
 /// as able to carry a trailer section, and therefore capture response-policy
 /// evidence for it. Reached only through `crate::_test_support`.
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
 pub(crate) fn reqwest_response_can_carry_trailers_for_test(response: &reqwest::Response) -> bool {
     reqwest_response_can_carry_trailers(response)
 }
@@ -56026,7 +55980,6 @@ fn buffered_response_body(
 /// names a late gateway terminal: `"deadline"`, `"capacity"`, or
 /// `"representation"`), and the body the builder then emits. Reached only
 /// through `crate::_test_support`.
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn buffered_response_body_for_test(
     inbound_carries_response_trailers: bool,
@@ -56076,7 +56029,6 @@ fn buffered_response_carries_backend_trailers(
 /// (`eager = false`) or the eager small-body collector (`eager = true`) over
 /// `response` and report the retained body and trailer section. Reached only
 /// through `crate::_test_support`.
-#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
 pub(crate) async fn collect_reqwest_buffered_response_for_test(
     response: reqwest::Response,
     eager: bool,
@@ -58884,7 +58836,10 @@ pub(crate) fn earliest_deadline(
 }
 
 /// Await one backend attempt under a route rule's total request deadline and
-/// its per-attempt budget.
+/// its per-attempt budget. Every poll of the attempt runs in the attempt's
+/// `otel_tracing` scope when the attempt was begun with
+/// `RequestContext::begin_backend_attempt_span` (issue #5864); with `trace`
+/// `None` no span is entered.
 ///
 /// With neither (`None`, `None`) this is the unbounded fast path: the attempt
 /// is polled directly and no timer exists. A total deadline that has already
@@ -58895,21 +58850,6 @@ pub(crate) fn earliest_deadline(
 /// upload, and pooled stream exactly as a client disconnect would. When both
 /// have elapsed the total deadline wins, so a spent transaction is never
 /// retried.
-pub(crate) fn await_route_request_deadline<F>(
-    deadline: Option<tokio::time::Instant>,
-    attempt_budget: Option<RouteAttemptBudget<'_>>,
-    attempt: F,
-) -> RouteDeadlineAttempt<'_, F>
-where
-    F: std::future::Future,
-{
-    await_backend_attempt_route_deadline(deadline, attempt_budget, None, attempt)
-}
-
-/// [`await_route_request_deadline`] for a backend attempt begun with
-/// `RequestContext::begin_backend_attempt_span`: every poll of the attempt runs
-/// in the attempt's `otel_tracing` scope (issue #5864). With `trace` `None`
-/// this is exactly [`await_route_request_deadline`].
 pub(crate) fn await_backend_attempt_route_deadline<F>(
     deadline: Option<tokio::time::Instant>,
     attempt_budget: Option<RouteAttemptBudget<'_>>,
@@ -58930,7 +58870,7 @@ where
 }
 
 pin_project_lite::pin_project! {
-    /// Future returned by [`await_route_request_deadline`].
+    /// Future returned by [`await_backend_attempt_route_deadline`].
     ///
     /// Hand-written rather than an `async fn` so the (large) backend attempt
     /// future is stored exactly once (production dispatch passes a boxed child).
@@ -74358,6 +74298,35 @@ mod tests {
     }
 
     #[test]
+    fn proxy_content_eq_ignores_timestamps_but_not_same_timestamp_edits() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let original = route_delta_proxy("content", DispatchKind::HttpPool, t0);
+
+        let mut touched = original.clone();
+        touched.created_at = t1;
+        touched.updated_at = t1;
+        assert!(
+            ProxyState::proxy_content_eq(&original, &touched),
+            "a timestamp-only rewrite must not count as a route-content change"
+        );
+
+        let mut edited = original.clone();
+        edited.backend_port = original.backend_port.wrapping_add(1);
+        assert!(
+            !ProxyState::proxy_content_eq(&original, &edited),
+            "a same-timestamp content edit must be detected"
+        );
+
+        let old_config = route_delta_config(vec![original]);
+        let new_config = route_delta_config(vec![edited]);
+        assert!(ProxyState::projected_route_proxy_content_changed(
+            &old_config,
+            &new_config
+        ));
+    }
+
+    #[test]
     fn delta_routes_changed_ignores_stream_only_proxy_changes() {
         let t0 = chrono::Utc::now();
         let t1 = t0 + chrono::Duration::seconds(1);
@@ -75717,131 +75686,6 @@ mod tests {
 
     // ── Connection-error classification boundary tests ─────────────────
     //
-    // These exercise the unified contract: every protocol classifier funnels
-    // through `retry::request_reached_wire`, and the H3 thin wrapper
-    // (`classify_h3_error`) inherits the corrected ordering from
-    // `classify_http3_error` so stream-level RESET_STREAM is no longer
-    // mislabeled `ConnectionReset` and load-balancer "upstream" messages no
-    // longer false-match the bare "stream" substring.
-
-    /// Small helper to invoke the proxy/mod.rs `classify_h3_error` against
-    /// a synthesized `anyhow::Error` carrying a particular message. Mirrors
-    /// the runtime path where the H3 pool wraps quinn / h3 errors in
-    /// anyhow before bubbling them up.
-    fn classify_h3_message(msg: &str) -> retry::ErrorClass {
-        let err: anyhow::Error = anyhow::anyhow!("{}", msg);
-        let (_, class) = super::classify_h3_error(err.as_ref());
-        class
-    }
-
-    #[test]
-    fn classify_h3_error_orders_protocol_tokens_before_bare_reset() {
-        // Pre-fix: `lower.contains("reset")` matched RESET_STREAM (an h3
-        // stream-level abort, not a connection reset) BEFORE the protocol
-        // ordering had a chance to fire. Fixed by aligning with
-        // `classify_http3_error` — these stream-level tokens land as
-        // `ProtocolError`, not `ConnectionReset`.
-        assert_eq!(
-            classify_h3_message("h3 stream RESET_STREAM (code=H3_REQUEST_REJECTED)"),
-            retry::ErrorClass::ProtocolError,
-            "RESET_STREAM is a stream-level abort — must classify as ProtocolError"
-        );
-        assert_eq!(
-            classify_h3_message("stream reset by backend"),
-            retry::ErrorClass::ProtocolError
-        );
-        assert_eq!(
-            classify_h3_message("reset_stream"),
-            retry::ErrorClass::ProtocolError
-        );
-    }
-
-    #[test]
-    fn classify_h3_error_does_not_false_match_upstream_substring() {
-        // Pre-fix: the bare `lower.contains("stream")` substring matched
-        // "upstream", so any load-balancer error mentioning "upstream
-        // target" landed as ProtocolError. The shared classifier removed
-        // the bare "stream" check; "upstream" no longer false-matches.
-        let class = classify_h3_message("upstream target unreachable: connection refused");
-        assert_eq!(
-            class,
-            retry::ErrorClass::ConnectionRefused,
-            "the literal 'upstream' must not steer classification toward ProtocolError"
-        );
-    }
-
-    #[test]
-    fn classify_h3_error_recognizes_application_close() {
-        // h3 0.0.8 renders quinn::ConnectionError::ApplicationClose as the
-        // bare token "ApplicationClose" — without the explicit substring
-        // match in the shared classifier this would have landed as
-        // RequestError (since the bare "closed" substring requires
-        // trailing 'd'). Confirm we now classify it as ConnectionClosed.
-        assert_eq!(
-            classify_h3_message("h3 connection closed: ApplicationClose code=0x100"),
-            retry::ErrorClass::ConnectionClosed
-        );
-    }
-
-    #[test]
-    fn classify_h3_error_recognizes_h3_protocol_codes() {
-        // Any token starting with `H3_` is an h3 protocol error code
-        // (H3_FRAME_UNEXPECTED, H3_FRAME_ERROR, etc.). Must classify as
-        // ProtocolError so the capability registry downgrade fires.
-        assert_eq!(
-            classify_h3_message("LocalError::Application { code: H3_FRAME_UNEXPECTED }"),
-            retry::ErrorClass::ProtocolError
-        );
-        assert_eq!(
-            classify_h3_message("h3::Error: GoAway received"),
-            retry::ErrorClass::ProtocolError
-        );
-    }
-
-    #[test]
-    fn classify_h3_error_distinguishes_connect_vs_read_timeout() {
-        assert_eq!(
-            classify_h3_message("QUIC connect timeout after 5s"),
-            retry::ErrorClass::ConnectionTimeout
-        );
-        assert_eq!(
-            classify_h3_message("recv_data timed out"),
-            retry::ErrorClass::ReadWriteTimeout
-        );
-    }
-
-    #[test]
-    fn classify_h3_error_dns_and_tls_remain_pre_wire() {
-        // DNS / TLS classifications gate `connection_error=true` in the
-        // gateway because the request never went on the wire. Verify the
-        // boundary stays consistent.
-        let dns = classify_h3_message("DNS resolution failed: no record found");
-        assert_eq!(dns, retry::ErrorClass::DnsLookupError);
-        assert!(!retry::request_reached_wire(dns));
-
-        let tls = classify_h3_message("TLS handshake failed: certificate invalid");
-        assert_eq!(tls, retry::ErrorClass::TlsError);
-        assert!(!retry::request_reached_wire(tls));
-    }
-
-    #[test]
-    fn classify_h3_error_protocol_class_reaches_wire() {
-        // Protocol errors happen AFTER the request has been sent, so they
-        // must `request_reached_wire=true` (`connection_error=false`)
-        // — the backend may have processed the request, retries must
-        // respect `retry_on_methods`.
-        let protocol = classify_h3_message("h3_frame_error: GOAWAY");
-        assert_eq!(protocol, retry::ErrorClass::ProtocolError);
-        assert!(retry::request_reached_wire(protocol));
-    }
-
-    #[test]
-    fn classify_h3_error_connect_refused_is_pre_wire() {
-        let class = classify_h3_message("Connection refused: ECONNREFUSED");
-        assert_eq!(class, retry::ErrorClass::ConnectionRefused);
-        assert!(!retry::request_reached_wire(class));
-    }
-
     #[test]
     fn classify_h3_pool_error_short_circuits_on_graceful_close_flag() {
         // Regression: when an `H3PoolError` carries `is_graceful_close=true`
@@ -76522,6 +76366,101 @@ mod tests {
     /// the dedup-contract tests only need a stable stand-in that ignores it.
     fn const_pool_key(key: &str) -> impl Fn(&Proxy) -> String + '_ {
         move |_: &Proxy| key.to_string()
+    }
+
+    fn mesh_route_dispatch_plugin_to_upstream(
+        id: &str,
+        scope: PluginScope,
+        proxy_id: Option<&str>,
+        upstream_id: &str,
+    ) -> PluginConfig {
+        let now = chrono::Utc::now();
+        PluginConfig {
+            labels: Default::default(),
+            id: id.to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": upstream_id}
+                }]
+            }),
+            scope,
+            proxy_id: proxy_id.map(str::to_string),
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_targets_expand_global_and_proxy_group_mesh_route_dispatch() {
+        // `grouped` carries the ProxyGroup instance, so the Global instance is
+        // overridden there and applies only to `plain`.
+        let mut grouped = warmup_test_proxy("grouped", BackendScheme::Https, "a.test", 443);
+        grouped.plugins = vec![PluginAssociation {
+            plugin_config_id: "mrd-group".to_string(),
+        }];
+        let plain = warmup_test_proxy("plain", BackendScheme::Https, "b.test", 443);
+        let config = GatewayConfig {
+            proxies: vec![grouped, plain],
+            upstreams: vec![
+                upstream_with_targets("group-canary", &[("group.test", 8443)]),
+                upstream_with_targets("global-canary", &[("global.test", 9443)]),
+                upstream_with_targets("orphan-canary", &[("orphan.test", 7443)]),
+            ],
+            plugin_configs: vec![
+                mesh_route_dispatch_plugin_to_upstream(
+                    "mrd-group",
+                    PluginScope::ProxyGroup,
+                    None,
+                    "group-canary",
+                ),
+                mesh_route_dispatch_plugin_to_upstream(
+                    "mrd-global",
+                    PluginScope::Global,
+                    None,
+                    "global-canary",
+                ),
+                // A ProxyGroup instance no proxy is associated with never runs.
+                mesh_route_dispatch_plugin_to_upstream(
+                    "mrd-orphan",
+                    PluginScope::ProxyGroup,
+                    None,
+                    "orphan-canary",
+                ),
+            ],
+            ..GatewayConfig::default()
+        };
+        let state = make_test_proxy_state(config);
+        let loaded = state.config.load_full();
+
+        let targets = state.collect_backend_capability_targets(&loaded);
+        let probed_for = |host: &str| -> Vec<String> {
+            targets
+                .iter()
+                .filter(|target| target.host() == host)
+                .map(|target| target.proxy.id.clone())
+                .collect()
+        };
+        assert_eq!(
+            probed_for("group.test"),
+            vec!["grouped".to_string()],
+            "a ProxyGroup mesh_route_dispatch destination must be probed for its attached proxy"
+        );
+        assert_eq!(
+            probed_for("global.test"),
+            vec!["plain".to_string()],
+            "a Global mesh_route_dispatch destination must be probed for every proxy it applies to"
+        );
+        assert!(
+            probed_for("orphan.test").is_empty(),
+            "an unattached ProxyGroup instance must not enroll capability targets"
+        );
     }
 
     #[tokio::test]
@@ -81787,10 +81726,7 @@ mod tests {
     /// TLS, so the accept loop can correctly route to the plaintext handler.
     #[test]
     fn listener_tls_source_static_plaintext_does_not_require_tls() {
-        let source = ListenerTlsSource::Static {
-            tls_config: None,
-            record_mesh_mtls_metric: false,
-        };
+        let source = ListenerTlsSource::Static { tls_config: None };
         assert!(
             !source.requires_tls(),
             "Static listener with no TLS configured is the legitimate plaintext path"
@@ -81804,10 +81740,7 @@ mod tests {
     #[test]
     fn listener_tls_source_respects_mesh_plaintext_capability() {
         let slot = crate::tls::empty_frontend_tls_slot();
-        let dynamic = ListenerTlsSource::Dynamic {
-            slot,
-            record_mesh_mtls_metric: false,
-        };
+        let dynamic = ListenerTlsSource::Dynamic { slot };
         assert!(dynamic.requires_tls());
 
         let sidecar_dev = ListenerTlsSource::MeshInbound {

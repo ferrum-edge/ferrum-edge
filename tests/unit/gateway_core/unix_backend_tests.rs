@@ -18,12 +18,32 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::config::types::UpstreamTarget;
+use ferrum_edge::proxy::mesh_mtls_pool::MeshMtlsSender;
 use ferrum_edge::proxy::unix_backend::{
     DEFAULT_UNIX_CONNECT_TIMEOUT_MS, MESH_UNIX_SOCKET_H2C_TAG, MESH_UNIX_SOCKET_TAG,
-    UnixBackendError, connect_admitted, dial_unix_h2c_sender, effective_connect_timeout_ms,
+    UnixBackendError, connect_admitted, effective_connect_timeout_ms, handshake_unix_h2c_sender,
     resolve_unix_socket_target, target_is_unix_backend,
 };
 use ferrum_edge::util::unix_socket::{UnixSocketPathRejection, admit_socket_for_connect};
+
+/// Admit `path`, connect, and complete the h2c handshake under ONE connect
+/// budget, composing the same public primitives the Unix backend pool's cold
+/// path uses. The test owns the connection driver for its own lifetime.
+async fn dial_unix_h2c_sender(
+    path: &str,
+    connect_timeout_ms: u64,
+    allowed_roots: &[String],
+    allowed_uids: &[u32],
+) -> Result<MeshMtlsSender, UnixBackendError> {
+    let timeout_ms = effective_connect_timeout_ms(connect_timeout_ms);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let admitted = admit_socket_for_connect(path, allowed_roots, allowed_uids)
+        .map_err(UnixBackendError::InadmissiblePath)?;
+    let stream = connect_admitted(&admitted, deadline, timeout_ms).await?;
+    let (sender, driver) = handshake_unix_h2c_sender(stream, deadline, timeout_ms).await?;
+    tokio::spawn(driver);
+    Ok(sender)
+}
 
 /// `connect_admitted` takes the caller's ONE establishment deadline rather than
 /// deriving its own, so a dial and the admission that preceded it cannot each

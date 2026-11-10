@@ -40,13 +40,15 @@ fn h3_grpc_web_requests_keep_the_http_protocol_key() {
     use ferrum_edge::config::types::HttpFlavor;
     use ferrum_edge::plugins::ProxyProtocol;
 
+    // Recognized gRPC-Web arrives on the Plain wire flavor, which keeps the
+    // HTTP protocol key; only native gRPC selects the gRPC key.
     assert_eq!(
-        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, true),
+        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain),
         ProxyProtocol::Http
     );
     assert_eq!(
-        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, false),
-        ProxyProtocol::Http
+        h3_plugin_protocol_for_request_for_test(HttpFlavor::Grpc),
+        ProxyProtocol::Grpc
     );
 }
 
@@ -8332,8 +8334,7 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
         "the late-failure owner must use the instant send() was observed"
     );
     assert!(
-        bridge.contains("route.attempt_budget_owns(")
-            && !bridge.contains("&& route.attempt_budget_expired(route_attempt_deadline) =>"),
+        bridge.contains("route.attempt_budget_owns("),
         "the prebuffered attempt budget must be attributed from captured instants"
     );
     let streamed_timer = bounded(

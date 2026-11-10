@@ -367,13 +367,11 @@ impl NamespaceBroadcasts {
 
     /// Total namespaces with active or previously-active broadcast channels.
     /// Exposed for observability and tests.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.channels.len()
     }
 
     /// Whether any broadcast channels exist.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }
@@ -475,13 +473,11 @@ impl DpNodeRegistry {
     }
 
     /// Number of live DP streams.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.streams.len()
     }
 
     /// Whether the registry has no live DP streams.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.streams.is_empty()
     }
@@ -635,8 +631,7 @@ impl CpGrpcServer {
     /// Shared stream-admission controller. Production wires one controller
     /// through the BUILDER (`.admission(...)`) into ConfigSync, MeshSubscribe,
     /// and ADS; this getter exists so external tests can reach the same
-    /// controller, which is why the binary target sees it as dead code.
-    #[allow(dead_code)]
+    /// controller.
     pub fn admission(&self) -> CpGrpcAdmissionController {
         self.admission.clone()
     }
@@ -872,7 +867,6 @@ impl CpGrpcServer {
 
     /// Access the scope this CP was configured with. Used by the CP polling
     /// loop to decide which namespaces to load from the database.
-    #[allow(dead_code)]
     pub fn scope(&self) -> &CpScope {
         &self.scope
     }
@@ -1544,7 +1538,6 @@ impl CpGrpcServer {
     /// `pub` so external integration tests can assert the namespace
     /// projection directly; this is the primary tenant boundary for every
     /// full-snapshot publication path.
-    #[allow(dead_code)] // Public integration-test seam is unused in the binary target.
     pub fn filter_config_to_namespace_for_scope(
         config: &GatewayConfig,
         namespace: &str,
@@ -2204,7 +2197,6 @@ impl CpGrpcServer {
     ///
     /// Sends only the resources that changed (added/modified/removed) instead
     /// of the full config. DPs apply the delta via `ProxyState::apply_incremental`.
-    #[allow(dead_code)] // Used by integration tests and external callers without trust-bundle side-channel needs.
     pub fn broadcast_delta(
         tx: &broadcast::Sender<ConfigUpdate>,
         result: &crate::config::db_loader::IncrementalResult,
@@ -2452,7 +2444,6 @@ impl CpGrpcServerBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub fn require_ns_claim(mut self, require: bool) -> Self {
         self.require_ns_claim = require;
         self

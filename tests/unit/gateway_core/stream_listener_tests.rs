@@ -3409,7 +3409,6 @@ fn nw_udp_destination_route(ip: &str, port: u16, service: &str) -> NodeWaypointU
             ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(&namespace, service, port)
                 .expect("test service names are admitted Kubernetes identities"),
         ),
-        false,
     )
 }
 

@@ -694,12 +694,7 @@ impl AiRequestGuard {
     ///
     /// Only the external test crate (`tests/unit/plugins/ai_request_guard_tests.rs`)
     /// calls this — production code reads `self.final_inspection_marker`
-    /// directly in `before_proxy` / `on_final_request_body`. The binary crate
-    /// only ever uses `AiRequestGuard` as a `dyn Plugin`, so its dead-code pass
-    /// (which can't see the separate test crate) would otherwise flag this
-    /// accessor. `#[allow(dead_code)]` mirrors the established pattern for
-    /// test-only `pub(crate)` accessors elsewhere in `src/plugins/`.
-    #[allow(dead_code)]
+    /// directly in `before_proxy` / `on_final_request_body`.
     pub fn final_inspection_marker_key(&self) -> &str {
         &self.final_inspection_marker
     }

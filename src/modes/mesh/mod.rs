@@ -2795,7 +2795,6 @@ fn materialize_node_waypoint_udp_listeners(
                             candidate.proxy.namespace.clone(),
                             candidate.proxy.id.clone(),
                         ),
-                        candidate.terminates_dtls,
                     ),
                 );
             }

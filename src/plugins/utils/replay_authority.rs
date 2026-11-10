@@ -443,7 +443,6 @@ pub enum ReplayAdmission {
 }
 
 impl ReplayAdmission {
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn is_admitted(self) -> bool {
         matches!(self, Self::Admitted)
     }
@@ -926,20 +925,17 @@ impl ProcessReplayLane {
 
     /// Retained entry count, including entries whose expiry has passed but
     /// which lazy reclamation has not yet removed (test support).
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn retained_entries(&self) -> usize {
         self.entry_count.load(Ordering::Acquire)
     }
 
     /// How many times the capacity path ran a reclamation pass (test support).
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn prune_scans(&self) -> u64 {
         self.prune_scans.load(Ordering::Acquire)
     }
 
     /// Markers currently held by the expiry index (test support). Equals
     /// [`Self::retained_entries`] whenever no admission or prune is in flight.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn indexed_markers_for_tests(&self) -> usize {
         self.expiry_index
             .iter()
@@ -953,20 +949,17 @@ impl ProcessReplayLane {
     }
 
     /// Total indexed markers reclamation passes have examined (test support).
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn prune_entries_examined_for_tests(&self) -> u64 {
         self.prune_entries_examined.load(Ordering::Acquire)
     }
 
     /// Conservative earliest-expiry bound currently published (test support).
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn earliest_expiry_millis_for_tests(&self) -> u64 {
         self.earliest_expiry_millis.load(Ordering::Acquire)
     }
 
     /// Retained markers charged to `marker`'s principal, including expired
     /// ones lazy reclamation has not yet removed (test support).
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn principal_entries_for_tests(&self, marker: &ReplayMarker) -> usize {
         self.principal_count(&marker.principal_digest)
     }
@@ -978,7 +971,6 @@ impl ProcessReplayLane {
     /// Does not take `prune_lock` and does not scan. A full lane, or a
     /// presenting principal at its share, returns
     /// [`ReplayAdmission::CapacityRefused`] rather than pruning.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn admit_at_holding_expiry_write_for_tests(
         &self,
         marker: &ReplayMarker,
@@ -1038,7 +1030,6 @@ impl ProcessReplayLane {
     ///
     /// `after_scan` runs under [`Self::prune_lock`] and must not re-enter prune.
     /// Ordinary admission from the callback is safe: it never takes that lock.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn prune_expired_with_after_scan_for_tests(
         &self,
         now_millis: u64,
@@ -1061,7 +1052,6 @@ pub struct HeldExpiryWrite<'a> {
 
 impl HeldExpiryWrite<'_> {
     /// Publish the completed revision and release the writer.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn finish(mut self) {
         self.release();
     }
@@ -1132,7 +1122,6 @@ fn resolve_process_lane(
 }
 
 /// Whether a domain currently owns a registered process lane (test support).
-#[allow(dead_code)] // exercised by external unit tests
 pub fn process_lane_registered_for_tests(domain: &ReplayDomain) -> bool {
     PROCESS_REPLAY_LANES
         .lock()
@@ -1204,7 +1193,6 @@ fn shared_authority_health() -> (u64, u64) {
 /// readiness-relevant condition rather than a per-request error. Test
 /// support: the admin `/health` + `/status` readiness decision reads
 /// [`shared_health_snapshot`] directly.
-#[allow(dead_code)] // exercised by external unit tests
 pub fn shared_authority_degraded() -> bool {
     shared_health_snapshot().unavailable()
 }
@@ -1292,7 +1280,6 @@ impl ReplayAuthority {
 
     /// Whether this shared authority's Redis recovery checker has been armed
     /// (test support). Process-scoped authorities never start one.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn recovery_checker_started_for_test(&self) -> bool {
         match self {
             Self::Shared { client, .. } => client.health_checker_started_for_test(),
@@ -1309,7 +1296,6 @@ impl ReplayAuthority {
     }
 
     /// Retention horizon written with every marker in this authority.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn retention(&self) -> Duration {
         match self {
             Self::Process { retention, .. } | Self::Shared { retention, .. } => *retention,
@@ -1465,7 +1451,6 @@ pub fn validate_scope_backend(
 
 /// Test-support admission against an explicit monotonic instant, so external
 /// tests can pin exact TTL boundaries without sleeping.
-#[allow(dead_code)] // exercised by external unit tests
 pub fn admit_process_at(
     authority: &ReplayAuthority,
     marker: &ReplayMarker,
@@ -1494,7 +1479,6 @@ pub fn process_max_entries(authority: &ReplayAuthority) -> Option<usize> {
 }
 
 /// The process lane behind a process-scoped authority (test support).
-#[allow(dead_code)] // exercised by external unit tests
 pub fn process_lane(authority: &ReplayAuthority) -> Option<&Arc<ProcessReplayLane>> {
     match authority {
         ReplayAuthority::Process { lane, .. } => Some(lane),

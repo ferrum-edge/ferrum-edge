@@ -190,7 +190,6 @@ impl GrpcJwtSecret {
     /// Used by tests and library callers; production binary code path uses
     /// [`GrpcJwtSecret::with_issuer`] so the operator-configured
     /// `FERRUM_CP_DP_GRPC_JWT_ISSUER` is honored.
-    #[allow(dead_code)]
     pub fn new(secret: String) -> Self {
         Self::with_issuer(
             secret,
@@ -711,7 +710,6 @@ impl DpFrontendH3Pairing {
     /// with its own single atomic load, which is the property
     /// `frontend_trust_binding_tests` pins. The bin target re-declares the
     /// module tree without `tests/`, so it is dead there.
-    #[allow(dead_code)]
     pub fn h3_accepted(&self) -> Option<Arc<crate::tls::AcceptedFrontendTls>> {
         self.h3_accepted_slot.load_full().as_ref().clone()
     }
@@ -856,7 +854,6 @@ const DP_JWT_TTL_SECONDS: i64 = 3540;
 /// the operator-configured `FERRUM_CP_DP_GRPC_JWT_ISSUER` is honored. This
 /// helper is kept for tests and library callers that want the default behavior
 /// without threading the issuer through.
-#[allow(dead_code)]
 pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Error> {
     generate_dp_jwt_with_issuer(
         secret,
@@ -1791,9 +1788,7 @@ fn parse_gateway_trust_bundle_update(
 /// `"unchanged"` / `"clear"` / `"replace"` label and forwards the error
 /// verbatim. Nothing here relaxes a bound — it is the production parser.
 ///
-/// Reached only from `tests/`; the `ferrum-edge` bin target compiles this
-/// module without any such caller.
-#[allow(dead_code)]
+/// Reached only from `tests/`.
 pub fn classify_gateway_trust_side_channel_for_test(
     trust_bundles_json: &str,
 ) -> Result<&'static str, String> {
@@ -2151,7 +2146,6 @@ fn bump_frontend_tls_revision(frontend_tls_runtime: Option<&DpFrontendTlsRuntime
     }
 }
 
-#[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn connect_and_subscribe(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,

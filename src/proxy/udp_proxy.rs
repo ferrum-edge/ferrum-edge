@@ -1103,7 +1103,50 @@ impl BackendDtlsConfigCacheState {
     }
 }
 
-type PendingSessionMap = Arc<DashMap<UdpSessionKey, PendingDatagramQueue, ahash::RandomState>>;
+/// Pending-session gates plus an exact gate count.
+///
+/// The pending-gate cap is checked once per datagram from a source with no
+/// session, which is exactly the spoofed-flood case the cap exists for, and
+/// `DashMap::len()` read-locks every shard. The count therefore lives beside the
+/// map (issue #7167). Membership changes only through [`Self::remove`],
+/// [`try_insert_pending_session_gate`] and [`take_pending_datagrams`], which
+/// adjust `len` while holding the entry's shard lock (increment before the
+/// insert becomes visible, decrement after the removal), so the count never
+/// under-reports a live gate.
+struct PendingSessionTable {
+    map: DashMap<UdpSessionKey, PendingDatagramQueue, ahash::RandomState>,
+    len: AtomicUsize,
+}
+
+impl PendingSessionTable {
+    fn with_shard_amount(shard_amount: usize) -> Self {
+        Self {
+            map: DashMap::with_hasher_and_shard_amount(ahash::RandomState::default(), shard_amount),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    fn get_mut(
+        &self,
+        key: &UdpSessionKey,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, UdpSessionKey, PendingDatagramQueue>> {
+        self.map.get_mut(key)
+    }
+
+    fn remove(&self, key: &UdpSessionKey) -> Option<(UdpSessionKey, PendingDatagramQueue)> {
+        let removed = self.map.remove(key);
+        if removed.is_some() {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
+    }
+}
+
+type PendingSessionMap = Arc<PendingSessionTable>;
 
 /// Maximum number of follow-up datagrams queued per pending (setup-in-progress)
 /// session. Sized for real opening flights — a QUIC Initial + 0-RTT coalesced
@@ -2016,7 +2059,7 @@ fn try_insert_pending_session_gate(
             max_sessions
         ));
     }
-    match pending_sessions.entry(session_key.clone()) {
+    match pending_sessions.map.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
             #[cfg(feature = "bench-udp-profile")]
             crate::udp_profile::lookup_outcome(
@@ -2031,6 +2074,9 @@ fn try_insert_pending_session_gate(
                 crate::udp_profile::Operation::PendingRaceGate,
                 false,
             );
+            // Counted while the vacant entry still holds the shard lock, so a
+            // concurrent removal can never decrement before this increment.
+            pending_sessions.len.fetch_add(1, Ordering::Relaxed);
             vacant.insert(PendingDatagramQueue {
                 forwarded_client,
                 ..Default::default()
@@ -2090,11 +2136,12 @@ fn take_pending_datagrams(
     pending_sessions: &PendingSessionMap,
     session_key: &UdpSessionKey,
 ) -> Option<Vec<PendingDatagram>> {
-    match pending_sessions.entry(session_key.clone()) {
+    match pending_sessions.map.entry(session_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
             if occupied.get().datagrams.is_empty() {
                 udp_count!(PendingEmptyRemove, 1);
                 occupied.remove();
+                pending_sessions.len.fetch_sub(1, Ordering::Relaxed);
                 None
             } else {
                 let queue = occupied.get_mut();
@@ -2260,22 +2307,25 @@ fn udp_session_shard_amount(override_value: usize) -> usize {
     crate::util::sharding::pool_shard_amount(override_value)
 }
 
-struct UdpSessionEpochView {
-    proxy: Proxy,
+/// Per-session view of the pinned epoch. `proxy` borrows from that epoch
+/// (which the setup task holds for the whole setup) instead of cloning the
+/// whole `Proxy` per new session (issue #7167).
+struct UdpSessionEpochView<'e> {
+    proxy: &'e Proxy,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
     consumer_index: Arc<ConsumerIndex>,
     sni_hostname: Option<String>,
 }
 
-fn resolve_udp_session_epoch_view(
+fn resolve_udp_session_epoch_view<'e>(
     listener_proxy_id: &str,
     listener_proxy_namespace: &str,
-    epoch: &RequestEpoch,
+    epoch: &'e RequestEpoch,
     initial_data: &[u8],
     sni_proxy_ids: Option<&[NamespacedResourceId]>,
     listen_port: u16,
-) -> Result<UdpSessionEpochView, anyhow::Error> {
+) -> Result<UdpSessionEpochView<'e>, anyhow::Error> {
     let base_proxy = epoch
         .proxy_by_namespaced_id(listener_proxy_namespace, listener_proxy_id)
         .ok_or_else(|| {
@@ -2326,8 +2376,9 @@ fn resolve_udp_session_epoch_view(
 
     let proxy = epoch
         .proxy_by_namespaced_id(resolved_namespace, resolved_proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found"))?
-        .clone();
+        .ok_or_else(|| {
+            anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found")
+        })?;
     let plugins =
         epoch
             .plugin_cache
@@ -3997,10 +4048,8 @@ pub async fn start_udp_listener_holding_port(
         ahash::RandomState::default(),
         session_shard_amount,
     ));
-    let pending_sessions: PendingSessionMap = Arc::new(DashMap::with_hasher_and_shard_amount(
-        ahash::RandomState::default(),
-        session_shard_amount,
-    ));
+    let pending_sessions: PendingSessionMap =
+        Arc::new(PendingSessionTable::with_shard_amount(session_shard_amount));
 
     // Spawn session cleanup task
     spawn_session_cleanup(
@@ -5757,34 +5806,16 @@ fn spawn_session_cleanup(
                     }
 
                     for (session_key, expired_session) in &expired {
-                        if let Some((_, session)) =
-                            sessions.remove_if(session_key, |_, v| Arc::ptr_eq(v, expired_session))
+                        if let Some(session) =
+                            remove_idle_udp_session(&sessions, session_key, expired_session)
                         {
-                            // Mark the session expired BEFORE we let go of
-                            // any reference. The recv-loop fast path may
-                            // hold a `last_client` Arc to this session
-                            // that survives the map removal; the flag is
-                            // how that path notices it must re-create.
-                            session
-                                .expired
-                                .store(true, std::sync::atomic::Ordering::Release);
                             // Close DTLS connection if active
                             if let Some(ref dtls) = session.dtls_conn {
                                 let _ = dtls.close().await;
                             }
-                            // Signal plain-UDP backend reply tasks to stop even
-                            // when no backend datagram arrives to wake recv().
-                            // notify_one stores a permit so the wakeup cannot be
-                            // lost if the reply task has not registered yet.
-                            signal_udp_reply_task_stop(
-                                &session.stop_reply_task,
-                                session.stop_notify.as_ref(),
-                            );
-                            session.close_hook_ingress();
+                            release_idle_udp_session(&session, &metrics);
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
-                            session.release_session_guards();
-                            metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                             debug!(
                                 proxy_id = %proxy_id,
                                 client = %udp_client_log_addr(session_key.client),
@@ -5875,7 +5906,6 @@ pub(crate) fn fail_dtls_listener_on_recv_loop_exit(
 /// [`start_dtls_frontend_listener`]. This seam lets external tests drive
 /// panic/error/shutdown classification with synthetic tasks without a
 /// production panic or socket fault injector.
-#[allow(dead_code)] // Intentionally exposed via library `_test_support`; unused by the binary target.
 pub(crate) async fn supervise_dtls_recv_loop_task(
     mut server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -7245,6 +7275,119 @@ pub(crate) fn udp_authorization_disconnect_classification() -> (
     )
 }
 
+/// Settled disconnect attribution for a UDP session teardown:
+/// `(message, error class, cause, direction)`.
+type UdpDisconnectError = (
+    String,
+    crate::retry::ErrorClass,
+    crate::plugins::DisconnectCause,
+    Direction,
+);
+
+/// The disconnect-summary fields a reply-task exit settles:
+/// `(connection_error, error_class, disconnect_cause, disconnect_direction)`.
+type UdpReplyExitSummaryFields = (
+    Option<String>,
+    Option<crate::retry::ErrorClass>,
+    Option<crate::plugins::DisconnectCause>,
+    Option<Direction>,
+);
+
+/// Authorization attribution for a backend reply task's exit.
+///
+/// Taken from the session's own settlement LATCH rather than from which select
+/// arm broke the loop (issue #3816): the client→backend direction and the
+/// hook-ingress worker can both observe the expiry first and then wake the
+/// reply task through the ordinary stop signal, which is indistinguishable
+/// from an idle-cleanup stop at that point. The latch IS the record of the
+/// decision, so the summary reports it whichever direction saw it. A genuine
+/// backend or client-write failure that already broke the loop keeps its own
+/// attribution — that failure really is what ended the session.
+fn attribute_udp_reply_task_exit(
+    session: &UdpSession,
+    disconnect_error: Option<UdpDisconnectError>,
+) -> Option<UdpDisconnectError> {
+    if disconnect_error.is_none() && session.observed_authorization_termination().is_some() {
+        return Some(udp_authorization_disconnect_classification());
+    }
+    disconnect_error
+}
+
+/// The backend reply task's exit teardown, after its DTLS close: mark this
+/// generation expired, close its hook ingress, remove ONLY this generation
+/// from the session map, and release its guards and the active-session gauge
+/// exactly once. Returns the disconnect-summary fields when this call owned
+/// the removal, `None` when the idle cleanup (or a newer generation's
+/// teardown) already did. Shared by production and
+/// [`UdpAuthorizationSessionProbe`] so the probe cannot drift from it.
+fn settle_udp_reply_task_exit(
+    sessions: &SessionMap,
+    session_key: &UdpSessionKey,
+    session: &Arc<UdpSession>,
+    metrics: &UdpProxyMetrics,
+    disconnect_error: Option<UdpDisconnectError>,
+) -> Option<UdpReplyExitSummaryFields> {
+    // Mark expired BEFORE removal so the recv-loop's `last_client`
+    // fast-path cache (which checks only this flag) stops forwarding
+    // through the dead session and re-creates one. The flag is on THIS
+    // generation's Arc, so a newer session re-created at the same client
+    // address is unaffected.
+    session
+        .expired
+        .store(true, std::sync::atomic::Ordering::Release);
+    session.close_hook_ingress();
+    // Only decrement active_sessions if we actually removed THIS session
+    // (the cleanup task may have already removed and decremented it, or a
+    // newer session may have been re-created at the same client address —
+    // identity-aware removal must not evict that newer generation).
+    sessions.remove_if(session_key, |_, v| Arc::ptr_eq(v, session))?;
+    session.release_session_guards();
+    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    Some(match disconnect_error {
+        Some((message, error_class, cause, direction)) => (
+            Some(message),
+            Some(error_class),
+            Some(cause),
+            Some(direction),
+        ),
+        None => (
+            None,
+            None,
+            Some(crate::plugins::DisconnectCause::GracefulShutdown),
+            None,
+        ),
+    })
+}
+
+/// Identity-aware idle removal shared by the cleanup task and
+/// [`UdpAuthorizationSessionProbe`]: removes ONLY `expected` (a session
+/// re-created at the same client address after the scan is a newer, still-live
+/// generation) and marks it expired before any reference is released, so the
+/// recv-loop's `last_client` fast path notices it must re-create.
+fn remove_idle_udp_session(
+    sessions: &SessionMap,
+    session_key: &UdpSessionKey,
+    expected: &Arc<UdpSession>,
+) -> Option<Arc<UdpSession>> {
+    let (_, session) = sessions.remove_if(session_key, |_, v| Arc::ptr_eq(v, expected))?;
+    session
+        .expired
+        .store(true, std::sync::atomic::Ordering::Release);
+    Some(session)
+}
+
+/// The rest of an idle removal, after the DTLS close: stop the plain-UDP
+/// backend reply task even when no backend datagram arrives to wake `recv()`
+/// (`notify_one` stores a permit, so the wakeup cannot be lost if the task has
+/// not registered yet), close hook ingress, and release the session's guards
+/// and the active-session gauge.
+fn release_idle_udp_session(session: &UdpSession, metrics: &UdpProxyMetrics) {
+    signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
+    session.close_hook_ingress();
+    session.release_session_guards();
+    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+}
+
 /// Outcome of one authorization-bounded backend-reply receive.
 #[derive(Debug)]
 pub(crate) enum UdpReplyRecvOutcome<T> {
@@ -7790,11 +7933,11 @@ async fn handle_dtls_client_inner(
     if client_trust.is_retired() {
         return Err(client_trust.settle_withdrawal());
     }
-    // Look up proxy config
+    // Look up proxy config. Borrowed from the pinned epoch, which outlives this
+    // handler, rather than cloned per DTLS session (issue #7167).
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?
-        .clone();
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?;
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
     if crate::udp_amplification::factor_is_unlimited(proxy.udp_max_response_amplification_factor) {
         crate::udp_amplification::record_policy_unlimited();
@@ -7828,7 +7971,7 @@ async fn handle_dtls_client_inner(
     // balancer's socket address.
     let lb_hash_key = udp_lb_hash_key_for_client_ip(identity.resolved().ip());
     let (backend_host, backend_port) = resolve_backend_target(
-        &proxy,
+        proxy,
         &epoch.load_balancer,
         health_checker,
         &lb_hash_key,
@@ -7996,7 +8139,7 @@ async fn handle_dtls_client_inner(
         .then(|| {
             cached_backend_dtls_config(
                 backend_dtls_config_cache,
-                &proxy,
+                proxy,
                 &backend_host,
                 tls_no_verify,
                 crls,
@@ -8629,7 +8772,7 @@ async fn handle_dtls_client_inner(
 /// re-authorization.
 async fn admit_plain_udp_stream(
     epoch: &RequestEpoch,
-    view: &UdpSessionEpochView,
+    view: &UdpSessionEpochView<'_>,
     identity: DatagramClientIdentity,
     listen_port: u16,
     node_waypoint_udp_source: Option<
@@ -8764,7 +8907,7 @@ async fn admit_plain_udp_stream(
 async fn create_session(
     request_epoch: &Arc<RequestEpochStore>,
     epoch: &RequestEpoch,
-    view: UdpSessionEpochView,
+    view: UdpSessionEpochView<'_>,
     dns_cache: &DnsCache,
     frontend_socket: &Arc<FrontendUdpSocket>,
     identity: DatagramClientIdentity,
@@ -8825,7 +8968,7 @@ async fn create_session(
     let lb_hash_key = udp_session_lb_hash_key(identity.resolved().ip(), session_key.destination);
     let (backend_host, backend_port) = resolve_or_reuse_backend_target(
         preselected_backend_target,
-        &proxy,
+        proxy,
         &epoch.load_balancer,
         health_checker,
         &lb_hash_key,
@@ -8988,7 +9131,7 @@ async fn create_session(
         .then(|| {
             cached_backend_dtls_config(
                 backend_dtls_config_cache,
-                &proxy,
+                proxy,
                 &backend_host,
                 tls_no_verify,
                 crls,
@@ -10091,63 +10234,22 @@ async fn create_session(
                 .fetch_add(batch_bytes, Ordering::Relaxed);
         }
         // Session's backend receiver exited — remove session.
-        //
-        // Authorization attribution is taken from the session's own settlement
-        // LATCH rather than from which select arm broke the loop (issue
-        // #3816): the client→backend direction and the hook-ingress worker can
-        // both observe the expiry first and then wake this task through the
-        // ordinary stop signal, which is indistinguishable from an idle-cleanup
-        // stop at this point. The latch IS the record of the decision, so the
-        // summary reports it whichever direction saw it. A genuine backend or
-        // client-write failure that already broke the loop keeps its own
-        // attribution — that failure really is what ended the session.
-        if disconnect_error.is_none()
-            && reply_session.observed_authorization_termination().is_some()
-        {
-            disconnect_error = Some(udp_authorization_disconnect_classification());
-        }
+        let disconnect_error = attribute_udp_reply_task_exit(&reply_session, disconnect_error);
         // Close DTLS connection if active
         if let Some(ref dtls) = reply_dtls {
             dtls.close().await;
         }
-        // Mark expired BEFORE removal so the recv-loop's `last_client`
-        // fast-path cache (which checks only this flag) stops forwarding
-        // through the dead session and re-creates one. The flag is on THIS
-        // generation's Arc, so a newer session re-created at the same client
-        // address is unaffected.
-        reply_session
-            .expired
-            .store(true, std::sync::atomic::Ordering::Release);
-        reply_session.close_hook_ingress();
-        // Only decrement active_sessions if we actually removed THIS session
-        // (the cleanup task may have already removed and decremented it, or a
-        // newer session may have been re-created at the same client address —
-        // identity-aware removal must not evict that newer generation).
-        if reply_sessions
-            .remove_if(&session_key, |_, v| Arc::ptr_eq(v, &reply_session))
-            .is_some()
+        if let Some((connection_error, error_class, disconnect_cause, disconnect_direction)) =
+            settle_udp_reply_task_exit(
+                &reply_sessions,
+                &session_key,
+                &reply_session,
+                &reply_metrics,
+                disconnect_error,
+            )
         {
-            reply_session.release_session_guards();
-            reply_metrics
-                .active_sessions
-                .fetch_sub(1, Ordering::Relaxed);
             let disconnected_ms = coarse_epoch_millis();
             let disconnected_wall_at = chrono::Utc::now();
-            let (connection_error, error_class, disconnect_cause, disconnect_direction) =
-                match disconnect_error {
-                    Some((message, error_class, cause, direction)) => (
-                        Some(message),
-                        Some(error_class),
-                        Some(cause),
-                        Some(direction),
-                    ),
-                    None => (
-                        None,
-                        None,
-                        Some(crate::plugins::DisconnectCause::GracefulShutdown),
-                        None,
-                    ),
-                };
             emit_udp_stream_disconnect(
                 &reply_plugins,
                 UdpDisconnectContext {
@@ -10440,7 +10542,7 @@ fn mono_millis_precise() -> u64 {
 /// (`forward_client_datagram_to_backend`, `enqueue_session_hook_datagram`,
 /// `spawn_session_hook_ingress_worker`) rather than a restatement of them. It
 /// exists so the coverage under `tests/` can be external instead of inline.
-#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+#[allow(dead_code)] // Library test seam
 pub struct UdpAuthorizationSessionProbe {
     session: Arc<UdpSession>,
     metrics: Arc<UdpProxyMetrics>,
@@ -10710,37 +10812,20 @@ impl UdpAuthorizationSessionProbe {
         (live, cache.is_some())
     }
 
-    /// Run the production teardown the backend reply task performs at exit:
-    /// authorization attribution from the latch, mark expired, close the
-    /// hook-ingress channel, identity-aware removal of ONLY this generation,
-    /// and a single overload / active-session release. Returns the disconnect
-    /// summary when this call owned the removal.
+    /// Run the production teardown the backend reply task performs at exit
+    /// ([`attribute_udp_reply_task_exit`] + [`settle_udp_reply_task_exit`]; a
+    /// probe session has no DTLS connection to close in between). Returns the
+    /// disconnect summary when this call owned the removal.
     pub fn run_reply_task_exit_teardown(&self) -> Option<crate::plugins::StreamTransactionSummary> {
-        let terminated = self.session.observed_authorization_termination().is_some();
-        self.session
-            .expired
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.session.close_hook_ingress();
-        let removed = self
-            .sessions
-            .remove_if(&self.session_key, |_, v| Arc::ptr_eq(v, &self.session))
-            .is_some();
-        if !removed {
-            return None;
-        }
-        self.session.release_session_guards();
-        self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-        let mut connection_error = None;
-        let mut error_class = None;
-        let mut disconnect_cause = None;
-        let mut disconnect_direction = None;
-        if terminated {
-            let (message, class, cause, direction) = udp_authorization_disconnect_classification();
-            connection_error = Some(message);
-            error_class = Some(class);
-            disconnect_cause = Some(cause);
-            disconnect_direction = Some(direction);
-        }
+        let disconnect_error = attribute_udp_reply_task_exit(&self.session, None);
+        let (connection_error, error_class, disconnect_cause, disconnect_direction) =
+            settle_udp_reply_task_exit(
+                &self.sessions,
+                &self.session_key,
+                &self.session,
+                &self.metrics,
+                disconnect_error,
+            )?;
         Some(build_udp_stream_summary(UdpDisconnectContext {
             namespace: &self.session.proxy_namespace,
             proxy_id: &self.session.proxy_id,
@@ -10757,22 +10842,16 @@ impl UdpAuthorizationSessionProbe {
         }))
     }
 
-    /// Remove this generation the way the idle-cleanup task does, so a
+    /// Remove this generation the way the idle-cleanup task does
+    /// ([`remove_idle_udp_session`] + [`release_idle_udp_session`]), so a
     /// simultaneous idle expiry and authorization expiry can be raced.
     pub fn run_idle_cleanup_removal(&self) -> bool {
-        let Some((_, session)) = self
-            .sessions
-            .remove_if(&self.session_key, |_, v| Arc::ptr_eq(v, &self.session))
+        let Some(session) =
+            remove_idle_udp_session(&self.sessions, &self.session_key, &self.session)
         else {
             return false;
         };
-        session
-            .expired
-            .store(true, std::sync::atomic::Ordering::Release);
-        signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
-        session.close_hook_ingress();
-        session.release_session_guards();
-        self.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+        release_idle_udp_session(&session, &self.metrics);
         true
     }
 
@@ -10806,7 +10885,6 @@ impl UdpAuthorizationSessionProbe {
 
 /// The verdict [`UdpEgressWriterProbe`] observed for one client→backend
 /// datagram, mirroring the private [`UdpEgressAdmission`].
-#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UdpEgressAdmissionForTest {
     /// Written straight from the borrowed receive buffer.
@@ -10824,7 +10902,7 @@ pub enum UdpEgressAdmissionForTest {
 /// Parking is a flag plus a `Notify`, never a sleep, so "the healthy session
 /// progressed while the other was blocked" is a scheduling fact the test
 /// decides rather than a timing race.
-#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+#[allow(dead_code)] // Library test seam
 struct UdpEgressSendGate {
     /// Payloads the writer actually committed, in the order it sent them.
     committed: std::sync::Mutex<Vec<Vec<u8>>>,
@@ -10881,7 +10959,7 @@ impl UdpEgressSendGate {
 /// writer ([`spawn_session_egress_writer`]) — never a restatement of them. Only
 /// the backend send itself is injectable, so a parked send stands in for a
 /// socket waiting on writability or a DTLS driver round trip without a sleep.
-#[allow(dead_code)] // Library test seam; the separately compiled binary never builds one.
+#[allow(dead_code)] // Library test seam
 pub struct UdpEgressWriterProbe {
     session: Arc<UdpSession>,
     metrics: Arc<UdpProxyMetrics>,
@@ -12017,7 +12095,16 @@ backend_tls_verify_server_cert: false
     }
 
     fn test_pending_map() -> super::PendingSessionMap {
-        Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default()))
+        Arc::new(super::PendingSessionTable::with_shard_amount(4))
+    }
+
+    /// Open a pending gate through the production insert path.
+    fn open_test_gate(pending: &super::PendingSessionMap, key: &super::UdpSessionKey) {
+        assert!(
+            super::try_insert_pending_session_gate(pending, key, usize::MAX, None)
+                .expect("gate below cap"),
+            "gate must be newly inserted"
+        );
     }
 
     fn test_client_addr() -> std::net::SocketAddr {
@@ -12372,9 +12459,9 @@ backend_tls_verify_server_cert: false
 
         // Absent entry: nothing to drain, nothing inserted.
         assert!(super::take_pending_datagrams(&pending, &addr).is_none());
-        assert!(!pending.contains_key(&addr));
+        assert!(!pending.map.contains_key(&addr));
 
-        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
+        open_test_gate(&pending, &addr);
         {
             let mut entry = pending.get_mut(&addr).expect("gate present");
             assert!(entry.push_bounded(&[1], Some(7)));
@@ -12398,7 +12485,7 @@ backend_tls_verify_server_cert: false
             ]
         );
         assert!(
-            pending.contains_key(&addr),
+            pending.map.contains_key(&addr),
             "gate must survive a non-empty take"
         );
 
@@ -12421,7 +12508,7 @@ backend_tls_verify_server_cert: false
         // Empty queue: the gate is removed atomically and the drain ends.
         assert!(super::take_pending_datagrams(&pending, &addr).is_none());
         assert!(
-            !pending.contains_key(&addr),
+            !pending.map.contains_key(&addr),
             "empty take must remove the pending gate"
         );
     }
@@ -12432,7 +12519,7 @@ backend_tls_verify_server_cert: false
         let addr = test_session_key();
 
         // Armed gate (setup failure path): entry and queued datagrams removed.
-        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
+        open_test_gate(&pending, &addr);
         {
             let _gate = super::PendingSessionGate {
                 pending_sessions: Arc::clone(&pending),
@@ -12441,12 +12528,12 @@ backend_tls_verify_server_cert: false
             };
         }
         assert!(
-            !pending.contains_key(&addr),
+            !pending.map.contains_key(&addr),
             "armed gate must remove the pending entry on drop"
         );
 
         // Disarmed gate (successful handoff): entry left alone.
-        pending.insert(addr.clone(), super::PendingDatagramQueue::default());
+        open_test_gate(&pending, &addr);
         {
             let mut gate = super::PendingSessionGate {
                 pending_sessions: Arc::clone(&pending),
@@ -12456,9 +12543,104 @@ backend_tls_verify_server_cert: false
             gate.disarm();
         }
         assert!(
-            pending.contains_key(&addr),
+            pending.map.contains_key(&addr),
             "disarmed gate must not touch the map"
         );
+    }
+
+    #[test]
+    fn pending_gate_count_tracks_every_insert_and_removal_path() {
+        let pending = test_pending_map();
+        let max = 8;
+        let keys: Vec<super::UdpSessionKey> = (0..32u16)
+            .map(|i| {
+                super::UdpSessionKey::undestined(SocketAddr::from(([127, 0, 0, 1], 41_000 + i)), 1)
+            })
+            .collect();
+
+        // Flood: only `max` distinct sources get a gate, the rest hit the cap.
+        let mut admitted = Vec::new();
+        for key in &keys {
+            match super::try_insert_pending_session_gate(&pending, key, max, None) {
+                Ok(true) => admitted.push(key.clone()),
+                Ok(false) => panic!("a fresh source must not be reported as an existing gate"),
+                Err(err) => assert!(
+                    err.to_string()
+                        .contains("UDP pending session limit reached"),
+                    "unexpected error: {err}"
+                ),
+            }
+        }
+        assert_eq!(admitted.len(), max);
+        assert_eq!(pending.len(), max);
+        assert_eq!(pending.len(), pending.map.len());
+
+        // A datagram for an existing gate does not count it twice.
+        assert!(
+            !super::try_insert_pending_session_gate(&pending, &admitted[0], usize::MAX, None)
+                .expect("existing gate below cap")
+        );
+        assert_eq!(pending.len(), max);
+
+        // Drain through both production removal paths.
+        let (by_take, by_abort) = admitted.split_at(max / 2);
+        for key in by_take {
+            assert!(super::take_pending_datagrams(&pending, key).is_none());
+        }
+        for key in by_abort {
+            drop(super::PendingSessionGate {
+                pending_sessions: Arc::clone(&pending),
+                session_key: key.clone(),
+                armed: true,
+            });
+        }
+        assert_eq!(
+            pending.len(),
+            0,
+            "every removal path must release its count"
+        );
+        assert_eq!(pending.map.len(), 0);
+
+        // Removing an absent gate must not underflow the count.
+        assert!(pending.remove(&keys[0]).is_none());
+        assert!(super::take_pending_datagrams(&pending, &keys[0]).is_none());
+        assert_eq!(pending.len(), 0);
+
+        // Capacity is available again once the flood drained.
+        assert!(
+            super::try_insert_pending_session_gate(&pending, &keys[max], max, None)
+                .expect("cap released")
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_gate_count_stays_exact_under_concurrent_churn() {
+        let pending = test_pending_map();
+        std::thread::scope(|scope| {
+            // Workers share one key space, so inserts and removals of the
+            // same gate race across threads.
+            for worker in 0..4u16 {
+                let pending = &pending;
+                scope.spawn(move || {
+                    for round in 0..200u16 {
+                        let key = super::UdpSessionKey::undestined(
+                            SocketAddr::from(([127, 0, 0, 1], 20_000 + (round + worker) % 50)),
+                            1,
+                        );
+                        let _ =
+                            super::try_insert_pending_session_gate(pending, &key, usize::MAX, None);
+                        if round % 2 == 0 {
+                            let _ = super::take_pending_datagrams(pending, &key);
+                        } else {
+                            let _ = pending.remove(&key);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(pending.len(), pending.map.len());
+        assert_eq!(pending.len(), 0);
     }
 
     #[test]
@@ -12656,26 +12838,6 @@ backend_tls_verify_server_cert: false
     }
 
     #[test]
-    fn udp_session_increments_overload_active_connections_on_create() {
-        let state = Arc::new(crate::overload::OverloadState::new());
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
-
-        let session = make_udp_session_with_overload(&state);
-        assert_eq!(
-            state.active_connections.load(Ordering::Relaxed),
-            1,
-            "creating a UDP session must increment OverloadState.active_connections (parity with TCP/H3)"
-        );
-
-        drop(session);
-        assert_eq!(
-            state.active_connections.load(Ordering::Relaxed),
-            0,
-            "dropping the UDP session must release the global connection slot"
-        );
-    }
-
-    #[test]
     fn udp_session_overload_guard_can_release_before_last_arc_drop() {
         let state = Arc::new(crate::overload::OverloadState::new());
         let session = Arc::new(make_udp_session_with_overload(&state));
@@ -12696,21 +12858,6 @@ backend_tls_verify_server_cert: false
             state.active_connections.load(Ordering::Relaxed),
             0,
             "early release must be idempotent and not double-decrement on drop"
-        );
-    }
-
-    #[test]
-    fn udp_session_caches_datagram_plugin_context_strings() {
-        let session = make_udp_session();
-
-        assert_eq!(session.datagram_client_ip.as_ref(), "127.0.0.1");
-        assert_eq!(session.datagram_proxy_id.as_ref(), "udp-proxy");
-        assert_eq!(
-            session
-                .datagram_proxy_name
-                .as_ref()
-                .map(|name| name.as_ref()),
-            Some("UDP Proxy")
         );
     }
 
@@ -13101,55 +13248,5 @@ listen_port: 5300
             "error should make the inherited unsupported hash key explicit: {}",
             setup.message
         );
-    }
-
-    #[test]
-    fn multiple_udp_sessions_track_concurrent_load() {
-        let state = Arc::new(crate::overload::OverloadState::new());
-
-        let s1 = make_udp_session_with_overload(&state);
-        let s2 = make_udp_session_with_overload(&state);
-        let s3 = make_udp_session_with_overload(&state);
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 3);
-
-        // Drop in non-LIFO order to exercise per-session ownership.
-        drop(s2);
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 2);
-
-        drop(s1);
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
-
-        drop(s3);
-        assert_eq!(
-            state.active_connections.load(Ordering::Relaxed),
-            0,
-            "all UDP sessions released — global counter must return to 0"
-        );
-    }
-
-    #[test]
-    fn udp_session_decrement_via_arc_unwrap_lifecycle() {
-        // The production code stores sessions as `Arc<UdpSession>` in the
-        // session map and clones them into the recv-loop fast-path cache and
-        // the spawned reply task. The guard must only fire when the LAST Arc
-        // is dropped. Verify Arc ref-counting interacts correctly.
-        let state = Arc::new(crate::overload::OverloadState::new());
-
-        let session = Arc::new(make_udp_session_with_overload(&state));
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
-
-        let cloned = session.clone();
-        let cloned2 = session.clone();
-        // Cloning the Arc must not double-count.
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
-
-        drop(cloned);
-        drop(cloned2);
-        // Dropping clones leaves one Arc — guard still alive.
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
-
-        drop(session);
-        // Last Arc dropped → UdpSession dropped → guard dropped → counter 0.
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
     }
 }

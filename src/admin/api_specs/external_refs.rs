@@ -657,9 +657,6 @@ impl ExternalDocumentLoader for DefaultExternalDocumentLoader {
 }
 
 /// In-memory map loader for deterministic unit tests (no filesystem / network).
-// The binary target compiles this public library module privately and therefore
-// cannot observe its integration-test consumers.
-#[allow(dead_code)]
 #[derive(Default)]
 pub struct MapExternalDocumentLoader {
     pub docs: HashMap<String, Vec<u8>>,

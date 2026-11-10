@@ -1732,7 +1732,7 @@ pub async fn serve(
         if env_config.pool_warmup_enabled {
             proxy_state.warmup_connection_pools().await;
         }
-        proxy_state.set_h3_websocket_listener_started(h3_listener_started);
+        proxy_state.set_h3_listener_started(h3_listener_started);
         startup_ready.store(true, Ordering::Release);
         info!("Gateway startup complete; /health now reports ready");
         Ok(())

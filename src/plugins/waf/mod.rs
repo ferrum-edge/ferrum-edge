@@ -391,7 +391,6 @@ impl Waf {
 
     // Kept for direct construction by the external integration-test suites;
     // the production plugin cache always supplies the stable config id below.
-    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::new_with_config_id(config, None)
     }
@@ -1152,7 +1151,6 @@ impl Waf {
     /// scan takes. Not a production API: external tests use it to pin the
     /// `on_scan_timeout` disposition deterministically.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests
     pub fn finish_clean_timed_out_body_scan_for_test(
         &self,
         ctx: &mut RequestContext,

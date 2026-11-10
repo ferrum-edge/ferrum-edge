@@ -477,7 +477,6 @@ impl ClientTrustMaterial {
     /// and why it is drawn there.
     #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
-    #[allow(dead_code)] // External test seam only.
     pub fn from_test_digest(digest: [u8; 32]) -> Self {
         let mut anchors = BTreeSet::new();
         anchors.insert(digest);
@@ -888,9 +887,6 @@ fn publish_locked(
 /// CRLs and anchors that endpoint was not yet enforcing — a revoked client
 /// could be retired and then reconnect successfully. It now publishes the
 /// identity carried by the exact candidate it adopted.
-// Introspection surface for external tests; the bin target re-declares the
-// module tree, so an item used only from `tests/` is dead there.
-#[allow(dead_code)]
 pub fn current_material(scope: ClientTrustScope) -> Option<ClientTrustMaterial> {
     domain(scope).material.load_full().as_ref().clone()
 }
@@ -902,8 +898,6 @@ pub fn current_material(scope: ClientTrustScope) -> Option<ClientTrustMaterial> 
 /// no rustls verifier (DTLS, material-only tests). Returns `false` when the
 /// published verifier refuses the peer. Armed rustls admission uses
 /// [`armed_handshake_still_trusted`], which fails closed on a missing chain.
-// Introspection / test seam; production admission uses `armed_handshake_*`.
-#[allow(dead_code)]
 pub fn live_peer_still_trusted(
     scope: ClientTrustScope,
     certificates: &[CertificateDer<'_>],
@@ -1111,7 +1105,6 @@ impl ClientTrustAdmission {
     }
 
     /// The captured generation.
-    #[allow(dead_code)]
     pub fn generation(self) -> u64 {
         self.generation
     }
@@ -1201,7 +1194,6 @@ impl std::fmt::Debug for ClientTrustSession {
 
 impl ClientTrustSession {
     /// The scope this transport was admitted under.
-    #[allow(dead_code)] // External test / introspection surface.
     pub fn scope(&self) -> ClientTrustScope {
         self.inner.scope
     }
@@ -1311,7 +1303,6 @@ impl<S> TrustFencedStream<S> {
     }
 
     /// Whether this wrapper is actually fencing anything.
-    #[allow(dead_code)] // External test / introspection surface.
     pub fn is_fencing(&self) -> bool {
         self.retired.is_some()
     }
@@ -1590,7 +1581,6 @@ pub fn render_prometheus(output: &mut String, ns_label: &str) {
 /// [`arm_at_generation_for_test`], which carry the same gate.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
-#[allow(dead_code)] // External test seam only.
 pub fn reset_for_test() {
     for domain in domains().iter() {
         let _guard = domain
@@ -1626,7 +1616,6 @@ pub fn reset_for_test() {
 /// and why it is drawn there.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
-#[allow(dead_code)] // External test seam only.
 pub fn force_withdrawal_fence_for_test(
     scope: ClientTrustScope,
     generation: u64,
@@ -1648,7 +1637,6 @@ pub fn force_withdrawal_fence_for_test(
 /// and why it is drawn there.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
-#[allow(dead_code)] // External test seam only.
 pub fn arm_at_generation_for_test(scope: ClientTrustScope, generation: u64) {
     let domain = domain(scope);
     domain.generation.store(generation, Ordering::Release);

@@ -1618,9 +1618,6 @@ pub fn is_mtls_dns_admission_unavailable(error: &anyhow::Error) -> bool {
     error.is::<MtlsDnsAdmissionUnavailable>()
 }
 
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
 pub(crate) fn mark_mtls_dns_admission_unavailable(error: anyhow::Error) -> anyhow::Error {
     error.context(MtlsDnsAdmissionUnavailable)
 }
@@ -2064,7 +2061,6 @@ impl IncrementalFullReloadRequired {
 
     /// Read by external integration tests (which link the lib target); the bin
     /// target never inspects the reason, so it is dead code there.
-    #[allow(dead_code)]
     pub fn reason(&self) -> IncrementalFullReloadReason {
         self.reason
     }
@@ -2435,7 +2431,6 @@ impl std::error::Error for DbTlsReconnectError {}
 /// Connection lifecycle (connect, reconnect, failover) is NOT in the trait
 /// because construction is inherently backend-specific. The trait covers only
 /// operations on an already-connected store.
-#[allow(dead_code)] // Some methods are only used through dyn dispatch or by MongoDB backend
 #[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
@@ -3679,8 +3674,6 @@ impl crate::config::gateway_trust::GatewayTrustDriftSource for dyn DatabaseBacke
 /// Extract resource IDs from a full config.
 ///
 /// This is a pure function on `GatewayConfig`, independent of any backend.
-// Used by external test crates; the binary target otherwise flags it as dead code.
-#[allow(dead_code)]
 pub fn extract_known_ids(
     config: &GatewayConfig,
 ) -> (

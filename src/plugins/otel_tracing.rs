@@ -1934,7 +1934,6 @@ pub(crate) struct TraceMaterializationProbe {
 /// queue does, then materializes one export body while those reservations are
 /// still held, so an external test can pin that the body is charged, released on
 /// drop, and refused rather than materialized when the ceiling is exhausted.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_trace_batch_materialization_for_test(
     ceiling: &'static RetainedByteCeiling,
     span_count: usize,
@@ -2000,7 +1999,6 @@ pub(crate) fn probe_trace_batch_materialization_for_test(
     }
 }
 
-#[allow(dead_code)] // reached only from the probe above
 fn probe_span_for_test(index: usize, attribute_bytes: usize) -> SpanData {
     SpanData {
         trace_id: format!("{index:032x}"),

@@ -1893,7 +1893,6 @@ impl DnsCache {
     }
 
     /// Check if a cached entry exists and is a cached error.
-    #[allow(dead_code)]
     pub fn is_cached_error(&self, hostname: &str) -> bool {
         let cache_key = dns_hostname_key(hostname);
         self.cache

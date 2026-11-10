@@ -2780,7 +2780,6 @@ impl BackendScheme {
     /// True when this uses HTTP-family transport (HTTP/1.1, HTTP/2, HTTP/3,
     /// gRPC, WebSocket — determined per-request from `HttpFlavor`).
     #[inline]
-    #[allow(dead_code)]
     pub fn is_http_family(&self) -> bool {
         matches!(self, Self::Http | Self::Https)
     }
@@ -2892,7 +2891,6 @@ impl DispatchKind {
     }
 
     #[inline]
-    #[allow(dead_code)] // part of public API, exercised via re-export + tests
     pub fn is_tls_backend(&self) -> bool {
         matches!(self, Self::HttpsPool | Self::TcpTls | Self::UdpDtls)
     }

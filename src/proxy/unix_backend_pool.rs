@@ -584,14 +584,12 @@ mod imp {
         /// Whether this lease may re-enter the idle set at all. `false` when
         /// the effective `pool_enable_http_keep_alive` is off.
         #[inline]
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn keep_alive(&self) -> bool {
             self.keep_alive
         }
 
         /// The publication generation this lease is bound to.
         #[inline]
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn generation(&self) -> u64 {
             self.generation
         }
@@ -948,7 +946,6 @@ mod imp {
         }
 
         /// Slots currently held for one target. Diagnostics and tests only.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn current(&self, key: &UnixPoolKey) -> u64 {
             self.counters
                 .get(key)
@@ -959,7 +956,6 @@ mod imp {
         /// Targets with a resident lane. Tests/diagnostics: proves the map
         /// drains rather than retaining a zero-count lane per socket ever
         /// dialed.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn resident_lanes(&self) -> usize {
             self.counters.len()
         }
@@ -1074,7 +1070,6 @@ mod imp {
 
         /// Drivers currently tracked. Diagnostics/tests only; never on the
         /// request path.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn entries(&self) -> usize {
             self.lock().len()
         }
@@ -1493,7 +1488,6 @@ mod imp {
 
         /// Physical connections currently held for one target identity.
         /// Diagnostics and external tests only; never on the request path.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn open_connections_for_target(
             &self,
             proxy: &Proxy,
@@ -1508,7 +1502,6 @@ mod imp {
         /// Targets with a resident connection lane. Diagnostics and external
         /// tests: proves the bound's map drains instead of retaining a
         /// zero-count lane per socket the gateway has ever dialed.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn resident_connection_lanes(&self) -> usize {
             self.conn_bound.resident_lanes()
         }
@@ -1516,7 +1509,6 @@ mod imp {
         /// Resident H1 + h2c key slots. Diagnostics and external tests: proves
         /// config churn cannot retain one empty structured key per withdrawn
         /// logical identity while a shared application socket stays alive.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn resident_key_slots(&self) -> (usize, usize) {
             (self.h1_idle.len(), self.h2c_carriers.len())
         }
@@ -1524,7 +1516,6 @@ mod imp {
         /// Entries currently held by the driver tracker. Diagnostics and
         /// external tests: proves a drain leaves no registration sentinel and
         /// no orphaned handle behind.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn tracked_drivers(&self) -> usize {
             self.drivers.entries()
         }
@@ -1533,7 +1524,6 @@ mod imp {
         /// Diagnostics and external tests: the ordering regression test reads it
         /// from inside the inter-latch interval to prove the tracker's
         /// registration latch was closed strictly first.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn shutdown_latch_published(&self) -> bool {
             self.is_shutting_down()
         }
@@ -1586,7 +1576,6 @@ mod imp {
         /// The current publication generation. Exposed for diagnostics and for
         /// the external fence regression tests.
         #[inline]
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn publication_generation(&self) -> u64 {
             self.publication_generation.load(Ordering::Acquire)
         }
@@ -1729,7 +1718,6 @@ mod imp {
         /// shutdown-path tests use this to exercise the forced-cancellation
         /// branch deterministically instead of waiting out the production
         /// budget; production goes through [`Self::shutdown_drain`].
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub async fn shutdown_drain_with_budgets(
             &self,
             driver_budget: std::time::Duration,
@@ -2801,7 +2789,6 @@ mod imp {
         /// seam: an async hook awaited after the handshake and BEFORE the driver
         /// is registered, so the shutdown latch/registration race is reproducible
         /// on this wire protocol too (issue #3764).
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests reach it there.
         pub(crate) async fn checkout_h2c_with_registration_seam<F, Fut>(
             &self,
             proxy: &Proxy,
@@ -2963,7 +2950,6 @@ mod imp {
         /// re-entering `checkout_h2c` (which would block on the creation lock
         /// its caller still holds). It re-admits the path exactly as a checkout
         /// does and never dials.
-        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests reach it there.
         pub(crate) fn shared_h2c_selector_yields_carrier(
             &self,
             proxy: &Proxy,

@@ -112,7 +112,6 @@ impl ConsulDiscoverer {
     ///
     /// External unit tests observe cursor advancement through
     /// `ferrum_edge::_test_support::consul_blocking_query_index_for_test`.
-    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     #[doc(hidden)]
     pub(crate) fn blocking_query_index(&self) -> u64 {
         self.last_index.load(Ordering::Relaxed)

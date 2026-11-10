@@ -462,7 +462,6 @@ impl JwksAuth {
     /// a process readiness dependency or arms a Redis recovery task. Live
     /// readiness is published from
     /// [`crate::plugins::Plugin::commit_background_tasks`].
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
     }
@@ -1170,7 +1169,6 @@ impl JwksAuth {
 
     /// Eagerly fetch JWKS keys for all providers that have stores ready.
     /// Called by tests to pre-populate key stores before assertions.
-    #[allow(dead_code)]
     pub async fn warmup_jwks(&self) {
         for prov in &self.providers {
             let guard = prov.jwks_store.load();
@@ -1195,7 +1193,6 @@ impl JwksAuth {
     /// Live remote JWKS stores backing this plugin's providers. Test-only
     /// visibility for the unknown-`kid` on-demand refetch contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn remote_jwks_stores_for_test(&self) -> Vec<Arc<JwksKeyStore>> {
         self.providers
             .iter()
@@ -1216,7 +1213,6 @@ impl JwksAuth {
     /// Test-only visibility for default-contract regressions and for proving
     /// a reloaded generation enforces its own admitted cap.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_lane_capacities(&self) -> Vec<Option<usize>> {
         self.providers
             .iter()
@@ -1231,7 +1227,6 @@ impl JwksAuth {
     /// Per-provider replay-authority modes (`None` when DPoP is not required).
     /// Test-only visibility for scope/reload contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_modes(&self) -> Vec<Option<&'static str>> {
         self.providers
             .iter()
@@ -1242,7 +1237,6 @@ impl JwksAuth {
     /// Whether any provider's shared Redis recovery checker has been armed.
     /// Test support for proving construction stays detached until commit.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn shared_replay_recovery_started_for_test(&self) -> bool {
         self.providers.iter().any(|provider| {
             provider
@@ -1256,7 +1250,6 @@ impl JwksAuth {
     /// "equivalent reload / equivalent replica converge, distinct policies
     /// isolate" contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_domain_markers(&self, jkt: &str, jti: &str) -> Vec<Option<[u8; 32]>> {
         self.providers
             .iter()

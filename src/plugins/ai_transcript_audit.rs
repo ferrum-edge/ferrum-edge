@@ -1222,7 +1222,6 @@ impl StreamSlot {
         lease.take()
     }
 
-    #[allow(dead_code)] // used only by external tests; dead in binary target
     fn capture_snapshot(&self) -> AuditStreamCaptureSnapshot {
         let capture = self.lock_capture();
         match &*capture {
@@ -1264,14 +1263,13 @@ impl StreamSlot {
 /// Read-only test probe for one inspector-owned capture lifecycle. It holds a
 /// weak reference so tests cannot extend the production state lifetime.
 #[doc(hidden)]
-#[allow(dead_code)] // constructed only by external tests; dead in binary target
+#[allow(dead_code)] // constructed only by external tests
 pub struct AuditStreamCaptureProbe {
     slot: Weak<StreamSlot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
-#[allow(dead_code)] // constructed only by external tests; dead in binary target
 pub struct AuditStreamCaptureSnapshot {
     pub retained_capture_bytes: u64,
     pub hashed_bytes: u64,
@@ -1281,7 +1279,6 @@ pub struct AuditStreamCaptureSnapshot {
 
 impl AuditStreamCaptureProbe {
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary target
     pub fn snapshot(&self) -> Option<AuditStreamCaptureSnapshot> {
         self.slot.upgrade().map(|slot| slot.capture_snapshot())
     }
@@ -2419,7 +2416,6 @@ impl AiTranscriptAudit {
     }
 
     /// `(captures_performed, captures_skipped)` — see [`Self::request_captures`].
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn capture_counters(&self) -> (u64, u64) {
         (
             self.request_captures.load(Ordering::Relaxed),
@@ -2428,7 +2424,6 @@ impl AiTranscriptAudit {
     }
 
     /// Effective admitted capture ceilings for authenticated status / tests.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn status_snapshot(&self) -> AiTranscriptAuditSnapshot {
         self.status_snapshot_for_id(self.status_id.get().copied().unwrap_or(0))
     }
@@ -2436,7 +2431,6 @@ impl AiTranscriptAudit {
     /// Obtain a weak, read-only probe for focused external lifecycle tests.
     /// Production code never calls this and the probe cannot retain the slot.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary target
     pub fn stream_capture_probe(&self, ctx: &RequestContext) -> Option<AuditStreamCaptureProbe> {
         let record_id = ctx.metadata.get(MD_RECORD_ID)?;
         self.pending_streams

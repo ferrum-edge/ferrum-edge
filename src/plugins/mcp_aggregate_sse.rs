@@ -475,7 +475,6 @@ impl StreamIdentity {
 
     /// Canonical text form. Internal/equality use only — callers must not log
     /// it, because it is a verbatim client-controlled JSON-RPC id.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn canonical(&self) -> &str {
         match self {
             Self::Text(value) | Self::Number(value) => value,
@@ -1064,22 +1063,18 @@ impl AggregateSseBroker {
         }
     }
 
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn bounds(&self) -> &AggregateSseBounds {
         &self.bounds
     }
 
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn is_retired(&self) -> bool {
         self.retired.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
@@ -1246,7 +1241,6 @@ impl AggregateSseBroker {
 
     /// POST-attached publications staged on a session but not yet committed
     /// or aborted.
-    #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn outstanding_reservations(&self, session_id: &str) -> Option<usize> {
         let state = self.session_state(session_id)?;
         let inner = state.lock();
@@ -1888,7 +1882,6 @@ impl AggregateSseBody {
     /// Retained payload bytes still owned by this body's session. External
     /// regressions use this to prove teardown releases history even when the
     /// body itself deliberately remains alive like a stalled transport.
-    #[allow(dead_code)]
     pub fn retained_session_bytes_for_test(&self) -> usize {
         self.session.lock().history_bytes
     }

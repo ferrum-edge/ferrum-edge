@@ -31,9 +31,7 @@ pub type GateSnapshot = runtime_bool_gate::BoolGateSnapshot;
 /// The live published gate map. Provenance/observability only: no plugin
 /// phase consults it, since the gate that governs rule application is bound
 /// into the instance config and resolved at construction
-/// (GHSA-83rc-23c9-3g9x). Reachable from `tests/` but not consumed by the
-/// binary build path, hence the `#[allow(dead_code)]`.
-#[allow(dead_code)]
+/// (GHSA-83rc-23c9-3g9x). Reachable from `tests/`.
 pub fn current_gates() -> GateSnapshot {
     runtime_bool_gate::current_snapshot(&GATES)
 }
@@ -58,10 +56,8 @@ pub fn scope_gates(overlay: &MeshRuntimeOverlay) -> HashMap<String, bool> {
 }
 
 /// Reset state for tests in external crates. `pub` + `#[doc(hidden)]` so the
-/// symbol is reachable from `tests/` without ad-hoc visibility hacks; the
-/// binary build path does not consume it, hence the `#[allow(dead_code)]`.
+/// symbol is reachable from `tests/` without ad-hoc visibility hacks.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn reset_for_test() {
     runtime_bool_gate::reset(&GATES);
 }

@@ -603,43 +603,12 @@ pub async fn connect_admitted(
     Ok(stream)
 }
 
-/// Admit `path` at the TOCTOU boundary and dial the resulting checked identity,
-/// bounded by `connect_timeout_ms`.
-///
-/// This is the dial-time half of the containment contract:
-/// the value reached this process over a CP/DP, file, or xDS boundary, and only
-/// this data plane has the local containment policy and filesystem facts. It
-/// checks containment, symlink-resolved containment, the full parent-to-root
-/// directory chain, socket file type, owner uid, and mode — see
-/// [`crate::util::unix_socket::admit_socket_for_connect`] — and hands
-/// [`connect_admitted`] the identity to bind the connection to.
-///
-/// Returns the admitted identity alongside the connected stream so a pool can
-/// key and re-verify the connection against the exact `(dev, ino, owner)` that
-/// was checked.
-#[cfg(unix)]
-pub async fn admit_and_connect(
-    path: &str,
-    deadline: tokio::time::Instant,
-    timeout_ms: u64,
-    allowed_roots: &[String],
-    allowed_uids: &[u32],
-) -> Result<(AdmittedUnixSocket, tokio::net::UnixStream), UnixBackendError> {
-    let admitted =
-        crate::util::unix_socket::admit_socket_for_connect(path, allowed_roots, allowed_uids)
-            .map_err(UnixBackendError::InadmissiblePath)?;
-    let stream = connect_admitted(&admitted, deadline, timeout_ms).await?;
-    Ok((admitted, stream))
-}
-
 /// Complete an h2c prior-knowledge HTTP/2 client handshake on an already
 /// admitted + connected Unix stream, waiting for the peer's SETTINGS preface
 /// inside `deadline`.
 ///
 /// The Unix backend pool's cold path calls this after [`connect_admitted`] so
-/// the pooled entry can retain the admitted `(dev, ino, owner)` identity; the
-/// 1:1 [`dial_unix_h2c_sender`] helper composes admission + this handshake for
-/// focused external tests.
+/// the pooled entry can retain the admitted `(dev, ino, owner)` identity.
 ///
 /// Returns the driver as a [`UnixConnectionDriver`] instead of spawning it: the
 /// caller owns it, so the pool can track, close, and reap every physical
@@ -699,44 +668,4 @@ pub async fn handshake_unix_h2c_sender(
         crate::proxy::mesh_mtls_pool::MeshMtlsSender::ungoverned(sender),
         driver,
     ))
-}
-
-/// Dial a co-located Unix-domain STREAM socket and complete an **h2c
-/// prior-knowledge HTTP/2** client handshake on it, returning a sender of the
-/// same type the sidecar mesh-mTLS pool produces.
-///
-/// Sharing that sender type is deliberate: it lets the Unix h2c transport reuse
-/// `proxy_to_backend_mesh_mtls`'s dispatch body verbatim, so request/response
-/// streaming, gRPC deadlines and cancellation, `te: trailers` regeneration, and
-/// terminal-trailer forwarding are the SAME code on both transports and cannot
-/// drift apart.
-///
-/// Production dispatch never calls this: it uses the pooled carrier in
-/// [`crate::proxy::unix_backend_pool`], whose cold path admits the socket,
-/// calls [`connect_admitted`] + [`handshake_unix_h2c_sender`] directly so it
-/// can retain the admitted identity on the pooled entry, and owns the driver.
-/// This unpooled 1:1 helper exists only for external unit tests that prove the
-/// connect-budget and SETTINGS-preface contracts without constructing a pool.
-#[cfg(unix)]
-#[allow(dead_code)] // External unit tests call this; the binary/pool cold path uses the split primitives.
-pub async fn dial_unix_h2c_sender(
-    path: &str,
-    connect_timeout_ms: u64,
-    allowed_roots: &[String],
-    allowed_uids: &[u32],
-) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
-    let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
-
-    let connect = admit_and_connect(path, deadline, timeout_ms, allowed_roots, allowed_uids);
-    let (_admitted, stream) = match tokio::time::timeout_at(deadline, connect).await {
-        Ok(result) => result?,
-        Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
-    };
-    // Unpooled compatibility helper: nothing here owns a driver registry, so
-    // the driver is tied to the returned sender's lifetime exactly as it was
-    // before the pool existed. Production dispatch goes through the pool, which
-    // takes structured ownership instead.
-    let (sender, driver) = handshake_unix_h2c_sender(stream, deadline, timeout_ms).await?;
-    tokio::spawn(driver);
-    Ok(sender)
 }

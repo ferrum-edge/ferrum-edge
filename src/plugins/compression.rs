@@ -186,7 +186,6 @@ tokio::task_local! {
 }
 
 /// Run `f` with an isolated response-buffer admission budget of `permits` slots.
-#[allow(dead_code)]
 pub async fn with_test_response_buffer_budget<F, Fut, T>(permits: usize, f: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -361,7 +360,6 @@ pub fn compression_codec_metrics() -> CompressionCodecMetrics {
 /// Saturation tests must use this seam instead of draining the process-global
 /// semaphore, which would nondeterministically force unrelated parallel codec
 /// work onto 503/identity paths.
-#[allow(dead_code)]
 pub async fn with_test_codec_budget<F, Fut, T>(permits: usize, f: F) -> T
 where
     F: FnOnce() -> Fut,
@@ -533,9 +531,6 @@ pub struct CompressionPlugin {
 }
 
 impl CompressionPlugin {
-    // Public for the library and external integration tests; the binary target
-    // compiles this module independently and does not construct it directly.
-    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::new_with_algorithm_support_and_body_limit(config, true, true, 0)
     }
@@ -545,7 +540,6 @@ impl CompressionPlugin {
     /// The configured `algorithms` order remains the per-instance response
     /// preference, while disabled codecs are removed before the instance is
     /// published. Request decompression observes the same gates.
-    #[allow(dead_code)]
     pub fn new_with_algorithm_support(
         config: &Value,
         gzip_enabled: bool,

@@ -683,25 +683,21 @@ impl StatsdLogging {
     }
 
     /// Test-only: aggregate retained-byte usage for the sink instance.
-    #[allow(dead_code)]
     pub fn byte_budget_used_for_test(&self) -> usize {
         self.byte_budget.used()
     }
 
     /// Test-only: cumulative byte-budget / queue saturation drops.
-    #[allow(dead_code)]
     pub fn byte_budget_drops_for_test(&self) -> u64 {
         self.byte_budget.drops_total()
     }
 
     /// Test-only: configured per-entry retained-byte ceiling.
-    #[allow(dead_code)]
     pub fn max_entry_bytes_for_test(&self) -> usize {
         self.max_entry_bytes
     }
 
     /// Test-only: hold `bytes` against the aggregate budget until the guard drops.
-    #[allow(dead_code)]
     pub fn hold_byte_budget_for_test(&self, bytes: usize) -> Option<StatsdByteLeaseGuardForTest> {
         self.byte_budget
             .try_acquire(bytes)
@@ -751,7 +747,6 @@ impl StatsdAdmittedPayloadForTest {
 }
 
 /// Test-only: render HTTP metrics under a budget without enqueueing.
-#[allow(dead_code)]
 pub fn render_http_under_budget_for_test(
     budget: &ByteBudget,
     max_entry_bytes: usize,

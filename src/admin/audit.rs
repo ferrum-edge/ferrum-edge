@@ -1250,19 +1250,16 @@ impl AuditPipeline {
 
     /// Raw counters. Used by external tests; the binary target otherwise flags
     /// it as dead code.
-    #[allow(dead_code)]
     pub fn metrics(&self) -> &Arc<AuditPipelineMetrics> {
         &self.metrics
     }
 
     /// This process generation's spool ownership identity.
-    #[allow(dead_code)]
     pub fn generation(&self) -> &str {
         &self.generation
     }
 
     /// Non-secret audit destination identity bound to every durable record.
-    #[allow(dead_code)]
     pub fn destination(&self) -> &str {
         &self.config.destination
     }
@@ -1272,7 +1269,6 @@ impl AuditPipeline {
     /// Callers must not perform filesystem work through it on an admin request
     /// path: the observability surfaces read [`Self::status`] instead, which is
     /// O(1). Used by the delivery worker and by external tests.
-    #[allow(dead_code)]
     pub fn spool(&self) -> Option<&Arc<AuditSpool>> {
         self.spool.as_ref()
     }
@@ -2441,7 +2437,6 @@ impl AuditWorker {
     /// External tests drive queue saturation, backend failure/recovery, replay,
     /// idempotency, and shutdown through this entry point; the binary target
     /// otherwise flags it as dead code.
-    #[allow(dead_code)]
     pub fn spawn_for_delivery(
         pipeline: Arc<AuditPipeline>,
         delivery: Arc<dyn AuditEventDelivery>,
@@ -3461,9 +3456,6 @@ pub fn append_local_fallback_event(dir: &Path, event: &AuditEvent) -> Result<(),
 /// Uses the same bounded process and cross-process lock acquisition as
 /// [`append_local_fallback_event`]; contention past the shared deadline fails
 /// closed.
-// This public library surface is exercised by integration tests but is unused
-// when the same module is compiled directly into the `ferrum-edge` binary.
-#[allow(dead_code)]
 pub fn list_local_fallback_events(dir: &Path) -> Result<Vec<AuditEvent>, anyhow::Error> {
     let deadline = local_fallback_lock_deadline();
     let _process_guard = acquire_local_fallback_process_lock(deadline)?;
@@ -3513,9 +3505,6 @@ fn acquire_local_fallback_process_lock(
 }
 
 /// Test seam: hold the in-process fallback mutex without waiting.
-// The library test harness calls this through `src/lib.rs`; the binary target
-// compiles the shared module without that harness.
-#[allow(dead_code)]
 pub(crate) fn hold_local_fallback_process_lock_for_test()
 -> Result<MutexGuard<'static, ()>, anyhow::Error> {
     match LOCAL_FALLBACK_LOCK.try_lock() {

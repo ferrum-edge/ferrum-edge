@@ -348,7 +348,6 @@ impl CircuitBreaker {
 
     /// Deterministic-clock variant used by external unit tests.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn can_execute_at_for_test(&self, monotonic_now_ms: u64) -> Result<bool, CircuitOpenError> {
         self.can_execute_inner(Some(monotonic_now_ms))
             .map(|(ticket, _)| ticket.is_probe())
@@ -908,7 +907,6 @@ impl CircuitBreaker {
     /// Deterministic-clock variant used by external unit tests. Wall time is
     /// injected separately to prove it remains diagnostic-only.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn record_failure_at_for_test(
         &self,
         status_code: u16,
@@ -958,7 +956,6 @@ impl CircuitBreaker {
     /// counter already belongs to a newer cycle. Lets a test stage the
     /// check-then-reopen-then-increment interleaving deterministically.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn count_success_in_cycle_for_test(&self, generation: u64) -> bool {
         self.success_count.increment(generation as u32).is_some()
     }
@@ -969,7 +966,6 @@ impl CircuitBreaker {
     /// [`settle`](Self::settle) does once the count reached
     /// `failure_threshold`. Returns whether the breaker opened.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn trip_after_closed_failure_for_test(&self, entry_generation: u64) -> bool {
         self.trip_after_closed_failure(entry_generation as u32)
     }
@@ -979,7 +975,6 @@ impl CircuitBreaker {
     /// leave for an instant (for example a recovery between its close CAS and
     /// its counter clear). Never used by production code.
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn stage_failure_count_for_test(&self, generation: u64, count: u32) {
         self.failure_count
             .0
@@ -989,28 +984,24 @@ impl CircuitBreaker {
     /// Test seam for the counter half of a CLOSED-state failure settlement
     /// (#7030). See [`count_success_in_cycle_for_test`](Self::count_success_in_cycle_for_test).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn count_failure_in_cycle_for_test(&self, generation: u64) -> bool {
         self.failure_count.increment(generation as u32).is_some()
     }
 
     /// Current half-open in-flight counter (for testing).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn half_open_in_flight(&self) -> u32 {
         packed_count(self.packed.load(Ordering::Acquire))
     }
 
     /// Last failure timestamp in epoch milliseconds (for testing).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn last_failure_epoch_ms(&self) -> u64 {
         self.last_failure_epoch_ms.load(Ordering::Relaxed)
     }
 
     /// Last state-machine failure tick (for deterministic tests).
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub fn last_failure_tick_ms_for_test(&self) -> u64 {
         self.last_failure_tick_ms.load(Ordering::Relaxed)
     }
@@ -1111,7 +1102,6 @@ impl Default for CircuitBreakerCache {
 }
 
 impl CircuitBreakerCache {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::with_max_entries(10_000)
     }
@@ -1446,13 +1436,11 @@ impl CircuitBreakerCache {
     }
 
     /// Current number of entries in the cache.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entry_count.load(Ordering::Acquire)
     }
 
     /// Whether the cache is empty.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

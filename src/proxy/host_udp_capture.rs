@@ -432,7 +432,6 @@ impl HostUdpIdentityIndex {
         self.by_ifindex.store(Arc::new(HashMap::new()));
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.by_ifindex.load().len()
     }
@@ -446,14 +445,12 @@ impl HostUdpIdentityIndex {
             .all(|binding| allowed.contains(binding))
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Per-datagram admission check: one lock-free snapshot load, one hash lookup,
     /// one address comparison, and one `Arc` retain for the authorized binding.
-    #[allow(dead_code)] // Library test seam; the binary uses `authorized_binding` directly.
     pub fn authorize(
         &self,
         ingress_ifindex: Option<u32>,
@@ -488,7 +485,6 @@ impl HostUdpIdentityIndex {
     }
 
     /// Resolve attested evidence from one authorization snapshot.
-    #[allow(dead_code)] // Library test seam; the binary retains the authorized binding instead.
     pub fn identity_for(
         &self,
         ingress_ifindex: Option<u32>,
@@ -544,7 +540,6 @@ impl HostUdpListenerHandle {
     }
 
     /// A handle with no task, for backends (and tests) that do not spawn one.
-    #[allow(dead_code)]
     pub fn detached(stop: watch::Sender<bool>) -> Self {
         Self { stop, task: None }
     }
@@ -918,7 +913,9 @@ fn read_handshake_marker_uids(dir: &Path) -> Result<(Vec<String>, bool), std::io
 /// Reconciles host-network UDP capture against the enrolled-pod registry.
 pub struct HostUdpCaptureManager<B: HostUdpCaptureBackend> {
     source: Arc<dyn PodCaptureSource>,
-    backend: B,
+    /// Shared so each blocking effect can run on tokio's blocking pool
+    /// ([`Self::backend_effect`]).
+    backend: Arc<B>,
     poll_interval: Duration,
     index: Arc<HostUdpIdentityIndex>,
     /// Producer-to-node-agent readiness handshake directory
@@ -984,7 +981,7 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
     pub fn new(source: Arc<dyn PodCaptureSource>, backend: B, poll_interval: Duration) -> Self {
         Self {
             source,
-            backend,
+            backend: Arc::new(backend),
             poll_interval,
             index: Arc::new(HostUdpIdentityIndex::new()),
             ready_dir: None,
@@ -1002,6 +999,23 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         }
     }
 
+    /// Run one blocking backend effect — an iptables / routing script that
+    /// waits for its child, possibly for seconds behind the xtables lock — on
+    /// tokio's blocking pool instead of a runtime worker that serves proxy
+    /// traffic (issue #7170). Effects still run strictly one after another:
+    /// each is awaited before the next starts, so the fail-closed ordering of
+    /// the reconcile, recovery and shutdown paths is unchanged, and a caller's
+    /// shutdown budget can now cancel the wait at this await point.
+    async fn backend_effect<F>(&self, effect: F) -> Result<(), String>
+    where
+        F: FnOnce(&B) -> Result<(), String> + Send + 'static,
+    {
+        let backend = Arc::clone(&self.backend);
+        tokio::task::spawn_blocking(move || effect(&backend))
+            .await
+            .unwrap_or_else(|error| Err(format!("host UDP capture backend effect failed: {error}")))
+    }
+
     pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.recovery = HostUdpStaleGenerationRecovery::new(dir.clone());
         self.ready_dir = dir;
@@ -1010,7 +1024,6 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
 
     /// Override the bounded wait for the node-agent's gate-close acknowledgement
     /// (tests use a short window; production uses [`GATE_CLOSE_ACK_TIMEOUT`]).
-    #[allow(dead_code)]
     pub fn with_gate_close_timeout(mut self, timeout: Duration) -> Self {
         self.gate_close_timeout = timeout;
         self
@@ -1067,7 +1080,7 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         if !self.recovery.poll_once(budget).await {
             return false;
         }
-        if let Err(error) = self.backend.teardown_all() {
+        if let Err(error) = self.backend_effect(|backend| backend.teardown_all()).await {
             if self.recovery.should_warn_reap_failure() {
                 warn!(
                     %error,
@@ -1218,7 +1231,11 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         //    exists to close.
         let guard_ifaces = self.guard_scope_for(&ifaces);
         if !guard_ifaces.is_empty() {
-            if let Err(error) = self.backend.install_guard(&guard_ifaces) {
+            let scope = guard_ifaces.clone();
+            if let Err(error) = self
+                .backend_effect(move |backend| backend.install_guard(&scope))
+                .await
+            {
                 warn!(
                     %error,
                     interfaces = guard_ifaces.len(),
@@ -1268,9 +1285,12 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         //    capture chain, so the capture chain, its `PREROUTING` jump and its
         //    routing are removed instead; the guard stays until step 8.
         let rebuilt = if ifaces.is_empty() {
-            self.backend.teardown_capture_rules()
+            self.backend_effect(|backend| backend.teardown_capture_rules())
+                .await
         } else {
-            self.backend.install_capture(&ifaces)
+            let scope = ifaces.clone();
+            self.backend_effect(move |backend| backend.install_capture(&scope))
+                .await
         };
         if let Err(error) = rebuilt {
             warn!(
@@ -1279,7 +1299,10 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
                 "Host UDP capture: capture rule install failed; removing partial capture state \
                  and retaining the fail-closed guard"
             );
-            if let Err(cleanup_error) = self.backend.teardown_capture_rules() {
+            if let Err(cleanup_error) = self
+                .backend_effect(|backend| backend.teardown_capture_rules())
+                .await
+            {
                 warn!(
                     error = %cleanup_error,
                     "Host UDP capture: partial capture cleanup failed; guard retained"
@@ -1315,7 +1338,10 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
                         "Host UDP capture: transparent socket bind failed; retaining the \
                          fail-closed guard and retrying"
                     );
-                    if let Err(cleanup_error) = self.backend.teardown_capture_rules() {
+                    if let Err(cleanup_error) = self
+                        .backend_effect(|backend| backend.teardown_capture_rules())
+                        .await
+                    {
                         warn!(
                             error = %cleanup_error,
                             "Host UDP capture: capture cleanup after bind failure did not complete"
@@ -1344,13 +1370,16 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         // has since emptied), and that retained DROP must not outlive the rebuild
         // that fixed it. The release script tolerates absent chains and stays
         // strict about resource errors.
-        if let Err(error) = self.backend.release_guard() {
+        if let Err(error) = self.backend_effect(|backend| backend.release_guard()).await {
             warn!(
                 %error,
                 "Host UDP capture: could not release the fail-closed guard; removing capture \
                  rules and retrying with enrolled egress still closed"
             );
-            if let Err(cleanup_error) = self.backend.teardown_capture_rules() {
+            if let Err(cleanup_error) = self
+                .backend_effect(|backend| backend.teardown_capture_rules())
+                .await
+            {
                 warn!(
                     error = %cleanup_error,
                     "Host UDP capture: capture cleanup after guard-release failure did not complete"
@@ -1740,7 +1769,7 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
                 listener.stop().await;
             }
             self.index.clear();
-            if let Err(error) = self.backend.teardown_all() {
+            if let Err(error) = self.backend_effect(|backend| backend.teardown_all()).await {
                 warn!(%error, "Host UDP capture: shutdown teardown did not complete");
             }
             self.published_ready.clear();
@@ -1753,7 +1782,11 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             let guard_installed = if ifaces.is_empty() {
                 true
             } else {
-                match self.backend.install_guard(&ifaces) {
+                let scope = ifaces.clone();
+                match self
+                    .backend_effect(move |backend| backend.install_guard(&scope))
+                    .await
+                {
                     Ok(()) => true,
                     Err(error) => {
                         warn!(
@@ -1770,7 +1803,11 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
                 listener.stop().await;
             }
             self.index.clear();
-            if guard_installed && let Err(error) = self.backend.teardown_capture_rules() {
+            if guard_installed
+                && let Err(error) = self
+                    .backend_effect(|backend| backend.teardown_capture_rules())
+                    .await
+            {
                 warn!(%error, "Host UDP capture: shutdown capture cleanup did not complete");
             }
         }
@@ -1852,7 +1889,6 @@ impl ProxyHostUdpBackend {
     }
 
     /// Override the sysfs root used for interface-index lookups (tests).
-    #[allow(dead_code)]
     pub fn with_sysfs_net(mut self, path: PathBuf) -> Self {
         self.sysfs_net = path;
         self

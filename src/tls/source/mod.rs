@@ -563,7 +563,6 @@ impl CertSource {
         Self::Path(PathBuf::from(raw))
     }
 
-    #[allow(dead_code)]
     pub fn from_path(path: impl Into<PathBuf>) -> Self {
         Self::Path(path.into())
     }

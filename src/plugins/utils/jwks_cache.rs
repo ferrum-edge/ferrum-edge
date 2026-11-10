@@ -303,7 +303,6 @@ impl LateActiveRequirement {
     /// reconciliation finds the reconciliation gate already held, immediately
     /// before it blocks on it. Lets external tests observe contention.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn register_with_gate_contended_hook_for_test(
         jwks_uri: &str,
         requirement: JwksRefreshRequirement,
@@ -574,7 +573,6 @@ fn schedule_trust_health_watch(next_watch: Option<Instant>) {
 
 /// Current watcher generation for external regression tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn trust_health_watch_generation_for_test() -> u64 {
     TRUST_HEALTH_WATCH_GENERATION.load(Ordering::Acquire)
 }
@@ -713,7 +711,6 @@ pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefr
 /// computed the active union and before it applies it, while the
 /// reconciliation gate is held. Lets external tests force an interleaving.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn retain_active_requirements_with_after_snapshot_hook_for_test(
     active_requirements: &HashMap<String, JwksRefreshRequirement>,
     hook: &dyn Fn(),
@@ -962,7 +959,6 @@ pub fn retire_jwks_store_if_unreferenced(jwks_uri: &str) {
 
 /// Return the current interval and task generation for diagnostics and tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_refresh_state(jwks_uri: &str) -> Option<(Duration, u64)> {
     global_cache().get(jwks_uri).map(|entry| {
         (
@@ -974,7 +970,6 @@ pub fn cached_refresh_state(jwks_uri: &str) -> Option<(Duration, u64)> {
 
 /// Return the shared store for a URI without creating or reviving an entry.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_store(jwks_uri: &str) -> Option<Arc<JwksKeyStore>> {
     global_cache()
         .get(jwks_uri)
@@ -983,7 +978,6 @@ pub fn cached_store(jwks_uri: &str) -> Option<Arc<JwksKeyStore>> {
 
 /// Return whether the entry is in the active set, for lifecycle tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_active(jwks_uri: &str) -> Option<bool> {
     global_cache()
         .get(jwks_uri)
@@ -992,7 +986,6 @@ pub fn cached_active(jwks_uri: &str) -> Option<bool> {
 
 /// Return the current strict shared-store policy for diagnostics and tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_requirement(jwks_uri: &str) -> Option<JwksRefreshRequirement> {
     global_cache()
         .get(jwks_uri)
@@ -1075,7 +1068,6 @@ pub fn render_prometheus() -> String {
 
 /// Return reaper-scheduling state for lifecycle tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_reaper_generation(jwks_uri: &str) -> Option<u64> {
     global_cache()
         .get(jwks_uri)
@@ -1083,7 +1075,6 @@ pub fn cached_reaper_generation(jwks_uri: &str) -> Option<u64> {
 }
 
 /// Clear the global JWKS cache. Used in tests to isolate state between runs.
-#[allow(dead_code)]
 pub fn clear_jwks_cache() {
     if let Some(cache) = JWKS_CACHE.get() {
         // Abort all background refresh tasks before clearing
