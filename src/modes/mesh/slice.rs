@@ -4443,6 +4443,11 @@ fn narrow_service_ports(
 /// Returns the per-host narrowed `ServiceEntry` projections that satisfy the
 /// resolved Sidecar egress scope.
 ///
+/// Every host is judged on its own: a host the Sidecar does not admit is
+/// never carried into the slice because a sibling host of the same entry
+/// matched. A port-less entry keeps only its admitted hosts (and is dropped
+/// when none is admitted).
+///
 /// Hosts that share the same admitted port-set are grouped into a single
 /// returned entry; hosts that admit different port-sets produce separate
 /// entries that all carry the original entry's `name`. As a result the
@@ -4453,18 +4458,30 @@ fn narrow_service_entry_ports(
     entry: &ServiceEntry,
     sidecar: ResolvedSidecarEgress<'_>,
 ) -> Vec<ServiceEntry> {
-    let host_refs: Vec<&str> = entry.hosts.iter().map(String::as_str).collect();
     let resource_ports: Vec<u16> = entry.ports.iter().map(|port| port.port).collect();
     if resource_ports.is_empty() {
-        return sidecar_egress_port_admission(
-            sidecar.namespace,
-            sidecar.egress,
-            entry.namespace.as_str(),
-            &host_refs,
-            Some(&resource_ports),
-        )
-        .map(|_| vec![entry.clone()])
-        .unwrap_or_default();
+        let hosts = entry
+            .hosts
+            .iter()
+            .filter(|host| {
+                sidecar_egress_port_admission(
+                    sidecar.namespace,
+                    sidecar.egress,
+                    entry.namespace.as_str(),
+                    &[host.as_str()],
+                    Some(&resource_ports),
+                )
+                .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if hosts.is_empty() {
+            return Vec::new();
+        }
+        return vec![ServiceEntry {
+            hosts,
+            ..entry.clone()
+        }];
     }
 
     let resource_port_set: BTreeSet<u16> = resource_ports.iter().copied().collect();
@@ -10723,10 +10740,10 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_narrowing_multi_host_service_entry_any_match_admits() {
-        // A ServiceEntry with multiple hosts: as long as ONE host matches the
-        // egress pattern, the whole entry is admitted. Documented at the
-        // sidecar_egress_includes_service rustdoc.
+    fn sidecar_narrowing_multi_host_service_entry_keeps_only_admitted_hosts() {
+        // A ServiceEntry with multiple hosts is narrowed per host: the entry
+        // survives because one host matches the egress pattern, but only that
+        // host is carried into the slice (see `narrow_service_entry_ports`).
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
                 "wildcard-sc",
@@ -10755,6 +10772,10 @@ mod tests {
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(
+            slice.service_entries[0].hosts,
+            vec!["api.example.com".to_string()]
+        );
     }
 
     #[test]
