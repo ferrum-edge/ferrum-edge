@@ -631,9 +631,9 @@ pub(crate) fn sse_inspector_retained_semantic_bytes(
 
 #[async_trait]
 impl ResponseStreamInspector for A2aSseStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         self.ingest(chunk);
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {

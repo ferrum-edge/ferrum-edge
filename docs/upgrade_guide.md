@@ -93,6 +93,16 @@ A non-null `anthropic_version` on an `openai`, `openai_compatible`,
 the value never had an effect. Remove it from those providers (or set it to
 `null`) before upgrading.
 
+### Custom plugins: `ResponseStreamInspector::on_chunk` takes `&Bytes` (#7117)
+
+`ResponseStreamInspector::on_chunk` now receives the chunk as a shared buffer,
+`chunk: &bytes::Bytes`, instead of `&[u8]`. A custom inspector that implements
+it no longer compiles until its signature is updated. The body usually needs
+no other change, because `&Bytes` dereferences to `&[u8]`. An inspector that
+forwards the chunk unchanged should return `Forward(chunk.clone())`, which
+shares the buffer, rather than `Forward(Bytes::copy_from_slice(chunk))`. See
+[Inspect while streaming](../CUSTOM_PLUGINS.md#inspect-while-streaming).
+
 Per-release sections below are written when a release is cut. Changes already
 on `main` but not yet released, including breaking ones, are listed under
 `[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before

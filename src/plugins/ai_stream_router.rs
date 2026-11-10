@@ -6242,7 +6242,7 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
@@ -7374,7 +7374,7 @@ impl ResponseStreamInspector for GeminiStreamNormalizer {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
@@ -7789,7 +7789,7 @@ impl NormalizeEngine {
         }
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         match self {
             Self::Anthropic(inner) => inner.on_chunk(chunk).await,
             Self::Gemini(inner) => inner.on_chunk(chunk).await,
@@ -7829,7 +7829,7 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.inner.done_emitted() {
             return ResponseStreamAction::Terminate(None);
         }
@@ -7872,7 +7872,7 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         drop(std::mem::take(&mut self.encoded));
         let mut out = Vec::new();
         if !decoded.is_empty() {
-            match self.inner.on_chunk(&decoded).await {
+            match self.inner.on_chunk(&Bytes::from(decoded)).await {
                 ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
                 ResponseStreamAction::Terminate(bytes) => {
                     if let Some(bytes) = bytes {
@@ -7923,7 +7923,7 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &Bytes) -> ResponseStreamAction {
         if self.emitted {
             return ResponseStreamAction::Terminate(None);
         }

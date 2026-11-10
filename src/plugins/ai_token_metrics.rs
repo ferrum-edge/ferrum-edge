@@ -1149,9 +1149,9 @@ impl UsageObserver {
 
 #[async_trait]
 impl ResponseStreamInspector for UsageObserver {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         self.extractor.push(chunk);
-        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {

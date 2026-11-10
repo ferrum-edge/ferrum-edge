@@ -103,8 +103,8 @@ struct OrderedLogPlugin {
 
 #[async_trait]
 impl ResponseStreamInspector for PassthroughInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(chunk.clone())
     }
 }
 
@@ -1475,7 +1475,7 @@ struct HoldingResponseInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for HoldingResponseInspector {
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &Bytes) -> ResponseStreamAction {
         self.saw_backend_chunk.notify_one();
         std::future::pending::<ResponseStreamAction>().await
     }
@@ -2642,7 +2642,7 @@ async fn terminal_hook_ai_usage_export_reaches_the_logged_summary() {
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("ai_token_metrics observes a 2xx SSE stream");
-    match inspector.on_chunk(body).await {
+    match inspector.on_chunk(&Bytes::copy_from_slice(body)).await {
         ResponseStreamAction::Forward(bytes) => assert_eq!(&bytes[..], body),
         ResponseStreamAction::Terminate(_) => panic!("observer must not truncate"),
     }

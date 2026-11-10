@@ -6263,9 +6263,9 @@ impl Drop for AuditStreamInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for AuditStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.revoke_if_expired() {
-            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+            return ResponseStreamAction::Forward(chunk.clone());
         }
         let mut capture = self.slot.lock_capture();
         if let StreamCaptureLifecycle::Active(work) = &mut *capture {
@@ -6320,7 +6320,7 @@ impl ResponseStreamInspector for AuditStreamInspector {
         }
         drop(capture);
         // Tee: forward the bytes exactly as received, never altering the stream.
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {

@@ -3050,7 +3050,7 @@ async fn unsampled_completed_stream_writes_hash_before_deferring_emit() {
         .expect("inspector");
     let stream =
         b"data: {\"choices\":[{\"delta\":{\"content\":\"complete\"}}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
 
     drop(inspector);
@@ -3083,8 +3083,8 @@ struct TerminateOnEnd;
 
 #[async_trait]
 impl ResponseStreamInspector for TerminateOnEnd {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
@@ -3120,7 +3120,7 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
         .expect("chained inspector");
     let stream = b"data: {\"choices\":[{\"delta\":{\"content\":\"secret backend bytes\"}}]}\n\n";
     assert!(matches!(
-        chain.on_chunk(stream).await,
+        chain.on_chunk(&Bytes::copy_from_slice(stream)).await,
         ResponseStreamAction::Forward(_)
     ));
     assert!(matches!(
@@ -3224,7 +3224,9 @@ async fn stream_capture_tail_guard_prevents_boundary_leak() {
     // holds only its raw prefix — the tail guard must drop it before redaction.
     let mut stream = format!("data: {}", "y".repeat(288));
     stream.push_str("123-45-6789 and more trailing data beyond the cap");
-    let _ = inspector.on_chunk(stream.as_bytes()).await;
+    let _ = inspector
+        .on_chunk(&Bytes::copy_from_slice(stream.as_bytes()))
+        .await;
     let _ = inspector.on_end().await;
     drop(inspector);
     plugin
@@ -3282,7 +3284,7 @@ data: provider-error jane.doe@example.com
 data: [DONE]
 
 "#;
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
     drop(inspector);
     plugin
@@ -3764,7 +3766,7 @@ async fn sampled_error_sse_is_teed_and_captures_body() {
         .expect("sampled error SSE must be teed");
     let mut chain = chain_response_stream_inspectors(vec![inspector]).expect("inspector");
     let body = b"data: {\"error\":{\"message\":\"upstream boom\"}}\n\ndata: [DONE]\n\n";
-    let _ = chain.on_chunk(body).await;
+    let _ = chain.on_chunk(&Bytes::copy_from_slice(body)).await;
     let _ = chain.on_end().await;
     drop(chain);
     plugin
@@ -4273,7 +4275,9 @@ async fn stream_end_without_on_end_omits_body() {
     let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let _ = inspector
-        .on_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+        .on_chunk(&Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ))
         .await;
     drop(inspector); // on_end never ran
     plugin
@@ -4639,7 +4643,9 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         .stream_capture_probe(&ctx)
         .expect("owned stream must publish a local lifecycle slot");
     let peer_chunk = vec![b'p'; 4096];
-    let _ = peer_inspector.on_chunk(&peer_chunk).await;
+    let _ = peer_inspector
+        .on_chunk(&Bytes::copy_from_slice(&peer_chunk))
+        .await;
     let peer_during_reservation = peer.status_snapshot();
     assert!(
         peer_during_reservation
@@ -4957,8 +4963,8 @@ async fn stream_hash_is_incremental_keyed_hmac_over_teed_bytes() {
         .expect("inspector");
     let chunk_a: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n";
     let chunk_b: &[u8] = b"data: [DONE]\n\n";
-    let _ = inspector.on_chunk(chunk_a).await;
-    let _ = inspector.on_chunk(chunk_b).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk_a)).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk_b)).await;
     let _ = inspector.on_end().await;
     drop(inspector);
     plugin
@@ -5246,7 +5252,7 @@ async fn tool_governor_buffered_and_terminal_stream_decisions_force_capture_but_
             .expect("streaming capture is enabled");
     let stream =
         b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
     let termination_plugins: Vec<Arc<dyn Plugin>> =
         vec![streaming.clone(), Arc::new(TerminalToolGovernorDecision)];
@@ -5478,7 +5484,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
     let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("guardrail-flagged un-sampled stream must get an inspector");
     let stream: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"evidence\"}}]}\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
     drop(inspector);
     plugin
@@ -6141,7 +6147,7 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
     ];
     let mut total = 0u64;
     for chunk in chunks {
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
@@ -6198,7 +6204,7 @@ async fn malformed_optional_sse_fields_do_not_bypass_split_pii_redaction() {
     ];
     let mut total = 0u64;
     for chunk in chunks {
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
@@ -6258,7 +6264,9 @@ async fn reassembled_sse_excerpt(frames: &[&str]) -> String {
     let mut total = 0u64;
     for frame in frames {
         let chunk = format!("data: {frame}\n\n");
-        let _ = inspector.on_chunk(chunk.as_bytes()).await;
+        let _ = inspector
+            .on_chunk(&Bytes::copy_from_slice(chunk.as_bytes()))
+            .await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
@@ -7160,7 +7168,7 @@ async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted(
     ];
     let mut total = 0u64;
     for chunk in chunks {
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
@@ -7232,7 +7240,7 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
     let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":2,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_only\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":42}\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":2,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
     drop(inspector);
     plugin
@@ -7274,7 +7282,7 @@ async fn repeated_indexless_tool_call_frames_stay_reassembled_with_withheld_argu
     let mut inspector = audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"42}\"}}]}}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(stream)).await;
     let _ = inspector.on_end().await;
     drop(inspector);
     plugin
@@ -7334,7 +7342,7 @@ async fn non_openai_sse_capture_keeps_per_frame_redacted_fallback() {
     // Anthropic-style event frames: no object=chat.completion.chunk.
     let chunk: &[u8] =
         b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"ssn 123-45-6789\"}}\n\n";
-    let _ = inspector.on_chunk(chunk).await;
+    let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
     let _ = inspector.on_end().await;
     drop(inspector);
     plugin
@@ -7378,7 +7386,7 @@ async fn streamed_sse_excerpt(chunks: &[&[u8]]) -> String {
         .expect("inspector");
     let mut total = 0u64;
     for chunk in chunks {
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         total += chunk.len() as u64;
     }
     let _ = inspector.on_end().await;
@@ -9575,7 +9583,7 @@ async fn expired_stream_revokes_capture_and_hash_work_while_forwarding() {
         .stream_capture_probe(&stuck)
         .expect("registered capture probe");
     let first = vec![b'a'; 4096];
-    match inspector.on_chunk(&first).await {
+    match inspector.on_chunk(&Bytes::copy_from_slice(&first)).await {
         ResponseStreamAction::Forward(forwarded) => {
             assert_eq!(forwarded.as_ref(), first.as_slice())
         }
@@ -9598,7 +9606,10 @@ async fn expired_stream_revokes_capture_and_hash_work_while_forwarding() {
     assert_eq!(plugin.status_snapshot().stream_reservations_expired, 1);
 
     let after_expiry = vec![b'b'; 4096];
-    match inspector.on_chunk(&after_expiry).await {
+    match inspector
+        .on_chunk(&Bytes::copy_from_slice(&after_expiry))
+        .await
+    {
         ResponseStreamAction::Forward(forwarded) => {
             assert_eq!(forwarded.as_ref(), after_expiry.as_slice())
         }
@@ -9662,7 +9673,9 @@ async fn repeated_expired_stream_cohorts_cannot_bypass_retained_capacity() {
             create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
                 .expect("cohort inspector");
         let cohort_chunk = vec![b'c'; 8192];
-        let _ = inspector.on_chunk(&cohort_chunk).await;
+        let _ = inspector
+            .on_chunk(&Bytes::copy_from_slice(&cohort_chunk))
+            .await;
         probes.push(
             plugin
                 .stream_capture_probe(&ctx)
@@ -9708,10 +9721,15 @@ async fn repeated_expired_stream_cohorts_cannot_bypass_retained_capacity() {
         .stream_capture_probe(&second_cohort)
         .expect("second cohort probe");
     let second_chunk = vec![b'd'; 8192];
-    let _ = second_inspector.on_chunk(&second_chunk).await;
+    let _ = second_inspector
+        .on_chunk(&Bytes::copy_from_slice(&second_chunk))
+        .await;
     for inspector in &mut inspectors {
         let forwarded = vec![b'e'; 8192];
-        match inspector.on_chunk(&forwarded).await {
+        match inspector
+            .on_chunk(&Bytes::copy_from_slice(&forwarded))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => {
                 assert_eq!(bytes.as_ref(), forwarded.as_slice())
             }
@@ -9781,7 +9799,9 @@ async fn late_normal_termination_emits_exactly_one_safe_expiry_fallback() {
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("inspector");
-    let _ = inspector.on_chunk(response.as_bytes()).await;
+    let _ = inspector
+        .on_chunk(&Bytes::copy_from_slice(response.as_bytes()))
+        .await;
 
     tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
     let _ = inspector.on_end().await;
@@ -9847,7 +9867,9 @@ async fn abnormal_post_expiry_drop_cannot_leak_or_double_emit() {
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("inspector");
-    let _ = inspector.on_chunk(b"abnormal-secret").await;
+    let _ = inspector
+        .on_chunk(&Bytes::from_static(b"abnormal-secret"))
+        .await;
     let probe = plugin.stream_capture_probe(&ctx).expect("capture probe");
 
     tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
@@ -10023,7 +10045,7 @@ async fn redacted_stream_accumulation_stops_at_scan_bound() {
         .expect("inspector");
     let probe = plugin.stream_capture_probe(&ctx).expect("capture probe");
     let chunk = vec![b'r'; 6000];
-    match inspector.on_chunk(&chunk).await {
+    match inspector.on_chunk(&Bytes::copy_from_slice(&chunk)).await {
         ResponseStreamAction::Forward(forwarded) => {
             assert_eq!(forwarded.as_ref(), chunk.as_slice())
         }
@@ -10090,7 +10112,7 @@ async fn streaming_hash_is_capped_by_default_and_marked_partial() {
         let mut inspector =
             audit_stream_inspector(&plugin, &mut ctx, 200, Some("text/event-stream"))
                 .expect("inspector");
-        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         let _ = inspector.on_end().await;
         drop(inspector);
         plugin
@@ -10661,7 +10683,7 @@ async fn streamed_transaction_pays_one_request_capture() {
         audit_stream_inspector(&plugin, &mut ctx, 200, sse).expect("sampled SSE must be teed");
     let mut chain = chain_response_stream_inspectors(vec![inspector]).expect("chain");
     let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
-    let _ = chain.on_chunk(body).await;
+    let _ = chain.on_chunk(&Bytes::copy_from_slice(body)).await;
     let _ = chain.on_end().await;
     let outcome = BodyOutcome::success(body.len() as u64);
     drop(chain);

@@ -7573,7 +7573,7 @@ async fn drive_stream(
     {
         inspected = true;
         for chunk in chunks {
-            match inspector.on_chunk(chunk).await {
+            match inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await {
                 ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
                 ResponseStreamAction::Terminate(_) => {
                     panic!("ai_rate_limiter must never truncate a committed response stream")
@@ -7931,7 +7931,7 @@ async fn a_never_ending_stream_forwards_incrementally_without_retaining_the_body
     let chunk = sse_frame(json!({"choices": [{"delta": {"content": "x".repeat(512)}}]}));
     let mut forwarded_total = 0usize;
     for _ in 0..(4 * 1024 * 1024 / chunk.len()) {
-        match inspector.on_chunk(&chunk).await {
+        match inspector.on_chunk(&Bytes::copy_from_slice(&chunk)).await {
             ResponseStreamAction::Forward(bytes) => {
                 assert_eq!(
                     bytes.len(),
@@ -9193,9 +9193,9 @@ struct DeferCutAtBang {
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for DeferCutAtBang {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         let Some(at) = chunk.iter().position(|&byte| byte == b'!') else {
-            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+            return ResponseStreamAction::Forward(chunk.clone());
         };
         self.deferred = Some(Some(Bytes::from_static(b"CUT")));
         ResponseStreamAction::Forward(Bytes::copy_from_slice(&chunk[..at]))
@@ -9235,7 +9235,9 @@ async fn a_deferred_cut_ahead_of_the_limiter_charges_the_cleared_usage_once() {
     let cutter: Box<dyn ResponseStreamInspector> = Box::new(DeferCutAtBang { deferred: None });
     let inspectors = vec![cutter, limiter_inspector];
     let mut chain = chain_response_stream_inspectors(inspectors).expect("chain");
-    let ResponseStreamAction::Terminate(Some(sent)) = chain.on_chunk(&chunk).await else {
+    let ResponseStreamAction::Terminate(Some(sent)) =
+        chain.on_chunk(&Bytes::copy_from_slice(&chunk)).await
+    else {
         panic!("the deferred cut ends the stream");
     };
     let expected = [usage.as_slice(), &b"CUT"[..]].concat();

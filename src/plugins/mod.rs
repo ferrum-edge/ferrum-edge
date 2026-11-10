@@ -8565,7 +8565,10 @@ pub trait ResponseStreamInspector: Send {
     }
 
     /// Inspect the next decoded chunk of the response body.
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction;
+    ///
+    /// The chunk is a shared buffer: an inspector that forwards it unchanged
+    /// returns `Forward(chunk.clone())`, a reference-count bump, not a copy.
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction;
 
     /// Flush / inspect the trailing partial window at end of stream. The default
     /// forwards nothing.
@@ -8767,7 +8770,7 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
         self.inner.stage()
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         self.inner.on_chunk(chunk).await
     }
 
@@ -9242,7 +9245,7 @@ impl ChainFlushEnd {
 
 #[async_trait]
 impl ResponseStreamInspector for ChainedResponseStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         let action = self.chunk_through(chunk).await;
         self.note_sent(&action);
         action
@@ -9266,12 +9269,13 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
 }
 
 impl ChainedResponseStreamInspector {
-    async fn chunk_through(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        // The first inspector reads the caller's chunk in place; each later one
-        // reads what the previous inspector released. Nothing is copied here.
+    async fn chunk_through(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+        // The first inspector reads the caller's chunk; each later one reads
+        // what the previous inspector released. Both are shared buffers, so
+        // handing them on never copies bytes.
         let mut released: Option<bytes::Bytes> = None;
         for index in 0..self.inspectors.len() {
-            let input: &[u8] = released.as_deref().unwrap_or(chunk);
+            let input: &bytes::Bytes = released.as_ref().unwrap_or(chunk);
             if input.is_empty() {
                 // An upstream inspector is holding this window; nothing yet for
                 // the rest of the chain to see.
@@ -9304,9 +9308,7 @@ impl ChainedResponseStreamInspector {
             }
         }
         // A chain always holds at least one inspector, so `released` is set.
-        ResponseStreamAction::Forward(
-            released.unwrap_or_else(|| bytes::Bytes::copy_from_slice(chunk)),
-        )
+        ResponseStreamAction::Forward(released.unwrap_or_else(|| chunk.clone()))
     }
 
     /// Flush inspectors `from..` as the end of the stream: each receives
@@ -9475,8 +9477,8 @@ mod chained_inspector_tests {
     }
     #[async_trait]
     impl ResponseStreamInspector for TagAtEnd {
-        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(chunk.clone())
         }
         async fn on_end(&mut self) -> ResponseStreamAction {
             ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(self.tag.as_bytes()))
@@ -9487,7 +9489,7 @@ mod chained_inspector_tests {
     struct CutNow;
     #[async_trait]
     impl ResponseStreamInspector for CutNow {
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"CUT")))
         }
     }
@@ -9500,7 +9502,7 @@ mod chained_inspector_tests {
             ResponseStreamInspectorStage::Normalize
         }
 
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(b"FINAL")))
         }
     }
@@ -9511,8 +9513,8 @@ mod chained_inspector_tests {
     }
     #[async_trait]
     impl ResponseStreamInspector for CutAtEnd {
-        async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
+            ResponseStreamAction::Forward(chunk.clone())
         }
         async fn on_end(&mut self) -> ResponseStreamAction {
             ResponseStreamAction::Terminate(self.payload.map(bytes::Bytes::from_static))
@@ -9523,7 +9525,7 @@ mod chained_inspector_tests {
     struct HoldAll;
     #[async_trait]
     impl ResponseStreamInspector for HoldAll {
-        async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
             ResponseStreamAction::Forward(bytes::Bytes::new())
         }
     }
@@ -9551,7 +9553,10 @@ mod chained_inspector_tests {
         ])
         .expect("two inspectors chain");
         // A chunk passes through both unchanged.
-        assert_eq!(&forwarded(chain.on_chunk(b"hi").await)[..], b"hi");
+        assert_eq!(
+            &forwarded(chain.on_chunk(&bytes::Bytes::from_static(b"hi")).await)[..],
+            b"hi"
+        );
         // on_end: A flushes "A" -> fed through B.on_chunk ("A") -> then B flushes
         // "B"; result is "A" ++ "B".
         assert_eq!(&forwarded(chain.on_end().await)[..], b"AB");
@@ -9565,7 +9570,7 @@ mod chained_inspector_tests {
         ])
         .expect("chain");
         assert!(matches!(
-            chain.on_chunk(b"x").await,
+            chain.on_chunk(&bytes::Bytes::from_static(b"x")).await,
             ResponseStreamAction::Terminate(Some(_))
         ));
     }
@@ -9577,7 +9582,10 @@ mod chained_inspector_tests {
             Box::new(NormalizeAndCut),
         ])
         .expect("chain");
-        match chain.on_chunk(b"provider-native").await {
+        match chain
+            .on_chunk(&bytes::Bytes::from_static(b"provider-native"))
+            .await
+        {
             ResponseStreamAction::Terminate(Some(bytes)) => {
                 assert_eq!(bytes.as_ref(), b"FINALB");
             }
@@ -9634,7 +9642,7 @@ mod chained_inspector_tests {
         ])
         .expect("chain");
         // First inspector holds → nothing reaches the second this chunk.
-        assert!(forwarded(chain.on_chunk(b"x").await).is_empty());
+        assert!(forwarded(chain.on_chunk(&bytes::Bytes::from_static(b"x")).await).is_empty());
     }
 }
 

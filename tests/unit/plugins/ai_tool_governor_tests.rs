@@ -116,7 +116,10 @@ async fn drive_stream(
     let mut out = Vec::new();
     let mut terminated = false;
     for chunk in chunks {
-        match inspector.on_chunk(chunk).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
             ResponseStreamAction::Terminate(bytes) => {
                 if let Some(bytes) = bytes {
@@ -2101,9 +2104,9 @@ struct RecordingInspector {
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for RecordingInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         self.seen.lock().unwrap().extend_from_slice(chunk);
-        ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
@@ -2119,7 +2122,7 @@ const CUT_BY_LATER: &[u8] = b"event: error\ndata: later\n\n";
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for CutEveryChunk {
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &bytes::Bytes) -> ResponseStreamAction {
         ResponseStreamAction::Terminate(Some(bytes::Bytes::from_static(CUT_BY_LATER)))
     }
 }
@@ -2166,7 +2169,9 @@ async fn chained_governor_cut_sends_its_same_chunk_release_through_later_inspect
         let mut inspector = plugin
             .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
             .expect("inspector");
-        let action = inspector.on_chunk(chunk.as_bytes()).await;
+        let action = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+            .await;
         let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
             panic!("a lone governor sends the cleared frame before the cut");
         };
@@ -2180,7 +2185,9 @@ async fn chained_governor_cut_sends_its_same_chunk_release_through_later_inspect
             seen: Arc::clone(&seen),
         });
         let mut chain = chain_response_stream_inspectors(vec![inspector, recorder]).expect("chain");
-        let action = chain.on_chunk(chunk.as_bytes()).await;
+        let action = chain
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+            .await;
         let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
             panic!("a chained governor sends the cleared frame before the cut");
         };
@@ -2201,7 +2208,9 @@ async fn chained_governor_cut_sends_its_same_chunk_release_through_later_inspect
             .expect("inspector");
         let cutter: Box<dyn ResponseStreamInspector> = Box::new(CutEveryChunk);
         let mut chain = chain_response_stream_inspectors(vec![inspector, cutter]).expect("chain");
-        let action = chain.on_chunk(chunk.as_bytes()).await;
+        let action = chain
+            .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+            .await;
         let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
             panic!("the later inspector cuts the forwarded frame");
         };
@@ -2219,9 +2228,9 @@ const CUT_BY_EARLIER: &[u8] = b"event: error\ndata: earlier\n\n";
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for DeferCutAtBang {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         let Some(at) = chunk.iter().position(|&byte| byte == b'!') else {
-            return ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk));
+            return ResponseStreamAction::Forward(chunk.clone());
         };
         self.deferred = Some(Some(bytes::Bytes::from_static(CUT_BY_EARLIER)));
         ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(&chunk[..at]))
@@ -2268,7 +2277,9 @@ async fn governor_after_a_deferred_cut_drops_its_pending_batch_ungoverned() {
     let call_end = DENIED_TOOL_CALL.find("\n\n").expect("frame end") + 2;
     let (pending_call, finish) = DENIED_TOOL_CALL.split_at(call_end);
     let chunk = format!("{CONTENT_FRAME}{pending_call}!{finish}");
-    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let action = chain
+        .on_chunk(&bytes::Bytes::copy_from_slice(chunk.as_bytes()))
+        .await;
     let ResponseStreamAction::Terminate(Some(final_bytes)) = action else {
         panic!("the deferred cut ends the stream");
     };
@@ -2917,7 +2928,10 @@ async fn streaming_hold_cap_terminates_in_enforce_mode() {
     let mut out = Vec::new();
     let mut terminated = false;
     for _ in 0..6 {
-        match inspector.on_chunk(&frame).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&frame))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
             ResponseStreamAction::Terminate(bytes) => {
                 if let Some(bytes) = bytes {
@@ -2954,7 +2968,10 @@ async fn streaming_hold_cap_releases_uninspected_in_dry_run() {
     let mut out = Vec::new();
     let mut terminated = false;
     for _ in 0..6 {
-        match inspector.on_chunk(&frame).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&frame))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
             ResponseStreamAction::Terminate(bytes) => {
                 if let Some(bytes) = bytes {
@@ -5607,7 +5624,10 @@ async fn streaming_holds_non_tool_frames_behind_pending_batch_and_releases_in_or
     // First chunk: tool frame + trailing content frame. Nothing may be
     // forwarded yet — the content frame arrived while the batch was pending.
     let first = format!("{tool_frame}{content_after}");
-    let forwarded = match inspector.on_chunk(first.as_bytes()).await {
+    let forwarded = match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(first.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => bytes,
         ResponseStreamAction::Terminate(_) => panic!("allowed batch must not terminate"),
     };

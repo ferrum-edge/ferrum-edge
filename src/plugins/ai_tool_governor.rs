@@ -6094,12 +6094,12 @@ impl ToolCallStreamInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for ToolCallStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
         if self.bypassed {
-            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+            return ResponseStreamAction::Forward(chunk.clone());
         }
         self.carry.extend_from_slice(chunk);
         // Sniff the body shape once, from the leading bytes: a JSON-shaped
