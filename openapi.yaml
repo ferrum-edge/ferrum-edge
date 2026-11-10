@@ -11277,18 +11277,6 @@ components:
             Number of QUIC connections per HTTP/3 backend (overrides global
             FERRUM_HTTP3_CONNECTIONS_PER_BACKEND). Multiple connections distribute
             QUIC frame processing across driver tasks. Range: 1–256. Default: 4.
-        pool_max_requests_per_connection:
-          type: [integer, "null"]
-          format: uint64
-          minimum: 0
-          maximum: 2147483647
-          description: |
-            Reserved for Istio DestinationRule
-            `connectionPool.http.maxRequestsPerConnection`. The field is
-            validated and persisted for schema compatibility, but currently has
-            no runtime effect because reqwest/hyper do not expose a stable
-            per-connection request cap for the shared client pool. Range:
-            0–2147483647, where 0 preserves Istio's explicit unlimited value.
         upstream_id:
           type: [string, "null"]
           description: |
@@ -15835,11 +15823,6 @@ components:
             `connectionPool.tcp.idleTimeout`) for this port. `0` disables the
             idle watchdog. Distinct from `http_idle_timeout_ms` (HTTP pool
             idle).
-        http_max_requests_per_connection:
-          type: [integer, "null"]
-          format: uint32
-          deprecated: true
-          description: Legacy mesh carrier; not applied by runtime dispatch.
         http_idle_timeout_ms:
           type: [integer, "null"]
           format: uint64

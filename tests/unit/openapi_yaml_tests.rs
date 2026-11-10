@@ -11190,7 +11190,6 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
                 "max_connections": 100,
                 "tcp_keepalive": {"time_seconds": 30, "interval_seconds": 10, "probes": 3},
                 "tcp_idle_timeout_seconds": 3600,
-                "http_max_requests_per_connection": 1000,
                 "http_idle_timeout_ms": 30000,
                 "http2_max_requests": 256,
                 "h2_max_concurrent_streams": 128,

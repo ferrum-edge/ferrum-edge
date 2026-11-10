@@ -3761,7 +3761,7 @@ impl DatabaseStore {
     //
     // ── Drift-prevention contract for proxy write call sites ─────────────────
     //
-    // The 54-column proxy column list is canonical. When you add a new column
+    // The 53-column proxy column list is canonical. When you add a new column
     // to the `proxies` table, it must be added — in the same position — to ALL
     // of:
     //
@@ -3788,20 +3788,20 @@ impl DatabaseStore {
     // such helpers verbose without meaningful runtime benefit.
 
     /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
-    /// 54 resource columns + `created_at` + `updated_at` = 56.
+    /// 53 resource columns + `created_at` + `updated_at` = 55.
     ///
     /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 56;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 55;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
     /// `stream_match` and `created_at`).
-    /// 56 base + 1 (api_spec_id) = 57.
+    /// 55 base + 1 (api_spec_id) = 56.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 57;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 56;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -3822,7 +3822,7 @@ impl DatabaseStore {
          pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
          pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
          pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-         pool_http3_connections_per_backend, pool_max_requests_per_connection, \
+         pool_http3_connections_per_backend, \
          listen_port, frontend_tls, passthrough, \
          udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
          websocket_permessage_deflate, allow_path_parameters, \
@@ -3832,7 +3832,7 @@ impl DatabaseStore {
          created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     /// Spec-owned proxy INSERT used by `restore_api_spec_bundle_inner`: the
     /// `PROXY_INSERT_SQL` columns plus `api_spec_id` before `created_at`.
@@ -3851,7 +3851,7 @@ impl DatabaseStore {
         pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
         pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
         pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-        pool_http3_connections_per_backend, pool_max_requests_per_connection, \
+        pool_http3_connections_per_backend, \
         listen_port, frontend_tls, passthrough, \
         udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
         websocket_permessage_deflate, allow_path_parameters, \
@@ -3860,7 +3860,7 @@ impl DatabaseStore {
         api_spec_id, created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -3960,7 +3960,6 @@ impl DatabaseStore {
             .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-            .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(proxy.listen_port.map(|v| v as i32))
             .bind(if proxy.frontend_tls { 1i32 } else { 0 })
             .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -4072,7 +4071,7 @@ impl DatabaseStore {
         let stream_match_json = serialize_stream_match(proxy)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, websocket_permessage_deflate=?, allow_path_parameters=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE proxies SET labels=?, name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, websocket_permessage_deflate=?, allow_path_parameters=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, backend_proxy_protocol=?, stream_match=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(serde_json::to_string(&proxy.labels)?)
         .bind(&proxy.name)
@@ -4111,7 +4110,6 @@ impl DatabaseStore {
         .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
         .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
         .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-        .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
         .bind(proxy.listen_port.map(|v| v as i32))
         .bind(if proxy.frontend_tls { 1i32 } else { 0 })
         .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -7586,7 +7584,6 @@ impl DatabaseStore {
                 .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
                 .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
                 .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-                .bind(proxy.pool_max_requests_per_connection.map(|v| v as i64))
                 .bind(proxy.listen_port.map(|v| v as i32))
                 .bind(if proxy.frontend_tls { 1i32 } else { 0 })
                 .bind(if proxy.passthrough { 1i32 } else { 0 })
@@ -10408,7 +10405,6 @@ impl DatabaseStore {
                 .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
                 .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
                 .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
-                .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
                 .bind(p.listen_port.map(|v| v as i32))
                 .bind(if p.frontend_tls { 1i32 } else { 0 })
                 .bind(if p.passthrough { 1i32 } else { 0 })
@@ -10929,7 +10925,6 @@ impl DatabaseStore {
                  pool_http2_adaptive_window = ?, pool_http2_max_frame_size = ?, \
                  pool_http2_max_concurrent_streams = ?, \
                  pool_http3_connections_per_backend = ?, \
-                 pool_max_requests_per_connection = ?, \
                  listen_port = ?, frontend_tls = ?, passthrough = ?, \
                  udp_idle_timeout_seconds = ?, tcp_idle_timeout_seconds = ?, \
                  websocket_idle_timeout_seconds = ?, websocket_permessage_deflate = ?, \
@@ -10993,7 +10988,6 @@ impl DatabaseStore {
             .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
             .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
             .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
-            .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
             .bind(p.listen_port.map(|v| v as i32))
             .bind(if p.frontend_tls { 1i32 } else { 0 })
             .bind(if p.passthrough { 1i32 } else { 0 })
@@ -13560,10 +13554,6 @@ fn row_to_proxy_inner(
         // DestinationRule port overrides at dispatch time, never persisted as a
         // proxy column, so a DB-loaded proxy always starts at `None`.
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: row
-            .try_get::<i64, _>("pool_max_requests_per_connection")
-            .ok()
-            .map(|v| v.max(0) as u64),
         // Derived-only: `pool_http1_max_pending_requests` is projected from the
         // mesh DestinationRule port overrides at dispatch time, never persisted
         // as a proxy column, so a DB-loaded proxy always starts at `None`.

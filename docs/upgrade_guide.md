@@ -28,6 +28,20 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `pool_max_requests_per_connection` is removed (#7218)
+
+The proxy field `pool_max_requests_per_connection` and the upstream
+`port_overrides[].http_max_requests_per_connection` carrier were accepted and
+persisted but never applied (Ferrum has no close-after-N-requests runtime).
+Both are removed: a proxy or upstream document that still sets them is refused
+as an unknown field by the Admin API, `POST /batch`, `POST /restore` and file
+mode, and the `proxies.pool_max_requests_per_connection` column is gone from
+the `V001` baseline (a database that already applied the old baseline is
+refused at startup; rebuild it as described in
+[Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)).
+Delete the field from configs and backups before upgrading. The ConfigSync
+build identity revision is bumped, so CP and DP must be upgraded together.
+
 ### Restore refuses `api_specs` section version `"1"` and empty `resource_hash` (#7218)
 
 `POST /restore` now accepts only `api_specs.section_version: "2"` (what every

@@ -14172,7 +14172,6 @@ impl ProxyState {
             && a.max_connections == b.max_connections
             && a.tcp_keepalive == b.tcp_keepalive
             && a.tcp_idle_timeout_seconds == b.tcp_idle_timeout_seconds
-            && a.http_max_requests_per_connection == b.http_max_requests_per_connection
             && a.http_idle_timeout_ms == b.http_idle_timeout_ms
             && a.h2_max_concurrent_streams == b.h2_max_concurrent_streams
             && a.tls == b.tls
@@ -79816,14 +79815,12 @@ mod tests {
     // ── T1-C: HTTP connection-pool projection onto effective proxy ───────
 
     /// Helper: clone the standard test proxy and add a per-port override
-    /// carrying the supported HTTP fields plus a legacy
-    /// maxRequestsPerConnection carrier and the existing connect timeout so
+    /// carrying the supported HTTP fields and the existing connect timeout so
     /// each test can dial in only the field it cares about.
     fn proxy_with_http_overrides_for_test(
         connect_ms: u64,
         h2_streams: Option<u32>,
         http_idle_ms: Option<u64>,
-        max_reqs: Option<u32>,
     ) -> Proxy {
         let mut proxy = proxy_with_port_overrides_for_test(connect_ms, &[]);
         proxy.dispatch_port_overrides = Some(HashMap::from([(
@@ -79832,7 +79829,6 @@ mod tests {
                 connect_timeout_ms: Some(connect_ms),
                 h2_max_concurrent_streams: h2_streams,
                 http_idle_timeout_ms: http_idle_ms,
-                http_max_requests_per_connection: max_reqs,
                 ..Default::default()
             },
         )]));
@@ -79841,7 +79837,7 @@ mod tests {
 
     #[test]
     fn resolve_effective_proxy_projects_h2_max_concurrent_streams_per_port() {
-        let proxy = proxy_with_http_overrides_for_test(5000, Some(250), None, None);
+        let proxy = proxy_with_http_overrides_for_test(5000, Some(250), None);
         let target = target_for_test(8080);
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         assert!(
@@ -79860,25 +79856,11 @@ mod tests {
         // Per-port idle_timeout_ms is whole-second-granular (translator
         // rejects sub-second). Conversion to `Option<u64>` seconds on the
         // proxy schema is lossless.
-        let proxy = proxy_with_http_overrides_for_test(5000, None, Some(120_000), None);
+        let proxy = proxy_with_http_overrides_for_test(5000, None, Some(120_000));
         let target = target_for_test(8080);
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         assert!(matches!(effective, std::borrow::Cow::Owned(_)));
         assert_eq!(effective.pool_idle_timeout_seconds, Some(120));
-    }
-
-    #[test]
-    fn resolve_effective_proxy_ignores_legacy_max_requests_per_connection() {
-        // The field has no close-after-N runtime behavior. A legacy carried
-        // override must not make the effective proxy look programmed.
-        let proxy = proxy_with_http_overrides_for_test(5000, None, None, Some(40));
-        let target = target_for_test(8080);
-        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
-        assert!(
-            matches!(effective, std::borrow::Cow::Borrowed(_)),
-            "a legacy-only maxRequestsPerConnection override must be ignored"
-        );
-        assert_eq!(effective.pool_max_requests_per_connection, None);
     }
 
     #[test]
@@ -79904,8 +79886,7 @@ mod tests {
     fn resolve_effective_proxy_borrows_when_all_http_overrides_match_proxy() {
         // Set the proxy's fields to the same values the override carries so
         // every comparison is a no-op. The helper must avoid the clone.
-        let mut proxy =
-            proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
+        let mut proxy = proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000));
         proxy.pool_http2_max_concurrent_streams = Some(250);
         proxy.pool_idle_timeout_seconds = Some(120);
         let target = target_for_test(8080);
@@ -79922,8 +79903,7 @@ mod tests {
         // differ; the others match the proxy's existing values. The owned
         // clone must carry both diffs without resetting unrelated proxy
         // fields.
-        let mut proxy =
-            proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000), Some(40));
+        let mut proxy = proxy_with_http_overrides_for_test(5000, Some(250), Some(120_000));
         proxy.backend_connect_timeout_ms = 5000; // override = 5000 too, no diff
         proxy.pool_idle_timeout_seconds = Some(120); // matches override
         // h2 streams currently None → override Some(250) differs.
@@ -79944,7 +79924,6 @@ mod tests {
         assert_eq!(owned.pool_http2_max_concurrent_streams, Some(250));
         // Unchanged fields preserved from proxy:
         assert_eq!(owned.pool_idle_timeout_seconds, Some(120));
-        assert_eq!(owned.pool_max_requests_per_connection, None);
     }
 
     // ── F5.1: h2UpgradePolicy projection + dispatch decision ─────────────

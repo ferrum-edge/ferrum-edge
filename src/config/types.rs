@@ -1025,16 +1025,6 @@ pub struct UpstreamPortOverride {
     /// `http_idle_timeout_ms` (HTTP pool idle; 0 is rejected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_idle_timeout_seconds: Option<u64>,
-    /// Legacy carrier for DestinationRule
-    /// `connectionPool.http.maxRequestsPerConnection`.
-    ///
-    /// New translation does not populate this field, and
-    /// `resolve_effective_proxy_for_target` intentionally ignores any legacy
-    /// carried value because Ferrum has no backend close-after-N-requests
-    /// runtime behavior. K8s status reports the DR field as deferred instead of
-    /// presenting this as effective policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_max_requests_per_connection: Option<u32>,
     /// Per-port HTTP idle-timeout mapped from DestinationRule
     /// `connectionPool.http.idleTimeout` (milliseconds). Projected onto the
     /// per-target effective proxy's `pool_idle_timeout_seconds` (whole
@@ -1175,7 +1165,6 @@ pub struct ResolvedPortOverride {
     pub max_connections: Option<u32>,
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
     pub tcp_idle_timeout_seconds: Option<u64>,
-    pub http_max_requests_per_connection: Option<u32>,
     pub http_idle_timeout_ms: Option<u64>,
     /// Destination-wide active-request cap (`http2MaxRequests`).
     pub http2_max_requests: Option<u32>,
@@ -1217,7 +1206,6 @@ impl ResolvedPortOverride {
             max_connections: value.max_connections,
             tcp_keepalive: value.tcp_keepalive.clone(),
             tcp_idle_timeout_seconds: value.tcp_idle_timeout_seconds,
-            http_max_requests_per_connection: value.http_max_requests_per_connection,
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             http2_max_requests: value.http2_max_requests,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
@@ -1241,7 +1229,6 @@ impl ResolvedPortOverride {
             && self.max_connections.is_none()
             && self.tcp_keepalive.is_none()
             && self.tcp_idle_timeout_seconds.is_none()
-            && self.http_max_requests_per_connection.is_none()
             && self.http_idle_timeout_ms.is_none()
             && self.http2_max_requests.is_none()
             && self.h2_max_concurrent_streams.is_none()
@@ -1269,9 +1256,6 @@ impl ResolvedPortOverride {
     /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
     /// this per-port entry already has them.
     pub fn seed_connection_pool_http_from_fallback(&mut self, fallback: &ResolvedPortOverride) {
-        self.http_max_requests_per_connection = self
-            .http_max_requests_per_connection
-            .or(fallback.http_max_requests_per_connection);
         self.http_idle_timeout_ms = self.http_idle_timeout_ms.or(fallback.http_idle_timeout_ms);
         self.http2_max_requests = self.http2_max_requests.or(fallback.http2_max_requests);
         self.h2_max_concurrent_streams = self
@@ -3305,16 +3289,6 @@ pub struct Proxy {
     /// (always H2) or HBONE/mesh-mTLS transport selection.
     #[serde(skip)]
     pub h2_upgrade_policy: Option<H2UpgradePolicy>,
-    /// Deprecated proxy-level `maxRequestsPerConnection` carrier.
-    /// Reqwest/hyper do not expose a stable close-after-N-requests builder knob
-    /// for the shared backend client pool, so this direct proxy field is
-    /// admitted for backward compatibility but has no live runtime effect.
-    /// DestinationRule translation no longer projects into this field; K8s
-    /// status reports DR `connectionPool.http.maxRequestsPerConnection` as
-    /// deferred instead.
-    /// `None` (default) = no configured cap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pool_max_requests_per_connection: Option<u64>,
     /// Istio DestinationRule `connectionPool.http.http1MaxPendingRequests`. The
     /// honestly reinterpreted cap on concurrent in-flight requests on the
     /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
@@ -9216,14 +9190,6 @@ impl Proxy {
         {
             errors.push(format!(
                 "`pool_http2_max_concurrent_streams` must be between 1 and {} (got \"{}\")",
-                MAX_POOL_SQL_INTEGER_VALUE, v
-            ));
-        }
-        if let Some(v) = self.pool_max_requests_per_connection
-            && v > MAX_POOL_SQL_INTEGER_VALUE
-        {
-            errors.push(format!(
-                "`pool_max_requests_per_connection` must be between 0 and {} (got \"{}\")",
                 MAX_POOL_SQL_INTEGER_VALUE, v
             ));
         }

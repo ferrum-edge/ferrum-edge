@@ -54,7 +54,6 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
@@ -425,11 +424,7 @@ fn upstream_port_override_connection_pool_http_fields_round_trip_through_serde()
     let default_override = UpstreamPortOverride::default();
     let default_json = serde_json::to_value(&default_override).expect("serialize default");
     let object = default_json.as_object().expect("object");
-    for field in [
-        "http_max_requests_per_connection",
-        "http_idle_timeout_ms",
-        "h2_max_concurrent_streams",
-    ] {
+    for field in ["http_idle_timeout_ms", "h2_max_concurrent_streams"] {
         assert!(
             !object.contains_key(field),
             "UpstreamPortOverride.{field} must be omitted when None (wire compatibility)"
@@ -439,17 +434,12 @@ fn upstream_port_override_connection_pool_http_fields_round_trip_through_serde()
     // Round-trip with each field set independently — verifies that partial
     // overlays don't auto-fill the other fields.
     let override_with_http = UpstreamPortOverride {
-        http_max_requests_per_connection: Some(100),
         http_idle_timeout_ms: Some(90_000),
         h2_max_concurrent_streams: Some(500),
         ..UpstreamPortOverride::default()
     };
     let json = serde_json::to_value(&override_with_http).expect("serialize override");
     let object = json.as_object().expect("object");
-    assert_eq!(
-        object.get("http_max_requests_per_connection"),
-        Some(&serde_json::json!(100))
-    );
     assert_eq!(
         object.get("http_idle_timeout_ms"),
         Some(&serde_json::json!(90_000))
@@ -461,7 +451,6 @@ fn upstream_port_override_connection_pool_http_fields_round_trip_through_serde()
 
     let round_tripped: UpstreamPortOverride =
         serde_json::from_value(json).expect("round-trip override");
-    assert_eq!(round_tripped.http_max_requests_per_connection, Some(100));
     assert_eq!(round_tripped.http_idle_timeout_ms, Some(90_000));
     assert_eq!(round_tripped.h2_max_concurrent_streams, Some(500));
 }
@@ -516,7 +505,6 @@ fn resolved_port_override_from_upstream_override_projects_http_fields() {
     use ferrum_edge::config::types::{ResolvedPortOverride, UpstreamPortOverride};
 
     let port_override = UpstreamPortOverride {
-        http_max_requests_per_connection: Some(40),
         http_idle_timeout_ms: Some(60_000),
         h2_max_concurrent_streams: Some(250),
         ..UpstreamPortOverride::default()
@@ -524,7 +512,6 @@ fn resolved_port_override_from_upstream_override_projects_http_fields() {
 
     let resolved = ResolvedPortOverride::from_upstream_override(&port_override)
         .expect("non-empty overlay produces Some");
-    assert_eq!(resolved.http_max_requests_per_connection, Some(40));
     assert_eq!(resolved.http_idle_timeout_ms, Some(60_000));
     assert_eq!(resolved.h2_max_concurrent_streams, Some(250));
 
@@ -1474,7 +1461,6 @@ fn test_unique_listen_paths_valid() {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -1543,7 +1529,6 @@ fn test_unique_listen_paths_valid() {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -1628,7 +1613,6 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
@@ -1697,7 +1681,6 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,

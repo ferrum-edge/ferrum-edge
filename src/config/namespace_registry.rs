@@ -373,7 +373,6 @@ pub const NAMESPACE_RENAME_COPY_TABLES: &[(&str, &[&str])] = &[
             "pool_http2_max_frame_size",
             "pool_http2_max_concurrent_streams",
             "pool_http3_connections_per_backend",
-            "pool_max_requests_per_connection",
             "listen_port",
             "frontend_tls",
             "passthrough",
