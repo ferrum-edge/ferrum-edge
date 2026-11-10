@@ -119,4 +119,3 @@ WebSocket backend URLs are built using the same path logic as HTTP proxying:
 | `src/http3/websocket.rs` | H3 Extended CONNECT (RFC 9220) frontend and bridge to the shared relay |
 | `tests/functional/functional_websocket_test.rs` | Functional tests |
 | `tests/unit/gateway_core/websocket_auth_tests.rs` | Auth integration tests |
-| `tests/helpers/bin/websocket_echo_server.rs` | Echo server for testing |
