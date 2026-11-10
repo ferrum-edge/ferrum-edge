@@ -58,12 +58,6 @@ pub struct DatagramMatcher {
     pub payload_equals: Option<Vec<u8>>,
     /// Substring match on the datagram bytes.
     pub payload_contains: Option<Vec<u8>>,
-    /// Exact datagram length in bytes.
-    pub len_equals: Option<usize>,
-    /// Minimum datagram length in bytes.
-    pub min_len: Option<usize>,
-    /// Maximum datagram length in bytes.
-    pub max_len: Option<usize>,
 }
 
 impl DatagramMatcher {
@@ -88,12 +82,6 @@ impl DatagramMatcher {
         }
     }
 
-    /// Builder: add a length constraint.
-    pub fn with_len(mut self, n: usize) -> Self {
-        self.len_equals = Some(n);
-        self
-    }
-
     /// Check the matcher against an incoming payload. Returns `Ok(())` on
     /// match or a human-readable error string.
     pub fn check(&self, payload: &[u8]) -> Result<(), String> {
@@ -112,30 +100,6 @@ impl DatagramMatcher {
             return Err(format!(
                 "payload does not contain {} bytes of expected subsequence",
                 needle.len()
-            ));
-        }
-        if let Some(n) = self.len_equals
-            && payload.len() != n
-        {
-            return Err(format!(
-                "length mismatch: expected {n}, got {}",
-                payload.len()
-            ));
-        }
-        if let Some(n) = self.min_len
-            && payload.len() < n
-        {
-            return Err(format!(
-                "length below floor: expected ≥ {n}, got {}",
-                payload.len()
-            ));
-        }
-        if let Some(n) = self.max_len
-            && payload.len() > n
-        {
-            return Err(format!(
-                "length above ceiling: expected ≤ {n}, got {}",
-                payload.len()
             ));
         }
         Ok(())

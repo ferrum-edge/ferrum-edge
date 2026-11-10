@@ -64,12 +64,11 @@ pub mod ports;
 
 // Curated re-exports so a test's imports fit on one line.
 pub use backends::{
-    ConnectionSettings, DatagramMatcher, DtlsConfig, ExecutionMode, GrpcStep, H2Step,
-    H3RecordedRequest, H3Step, H3TlsConfig, Http1Request, HttpStep, MatchHeaders, MatchRpc,
-    QuicRefuser, ReceivedStream, RecordedDatagram, RequestMatcher, ScriptedDtlsBackend,
-    ScriptedGrpcBackend, ScriptedH2Backend, ScriptedH3Backend, ScriptedHttp1Backend,
-    ScriptedTcpBackend, ScriptedTlsBackend, ScriptedUdpBackend, TcpStep, TlsConfig, UdpStep,
-    tls_backend_without_quic, tls_backend_without_quic_with_ok_response,
+    ConnectionSettings, DatagramMatcher, ExecutionMode, GrpcStep, H2Step, H3RecordedRequest,
+    H3Step, H3TlsConfig, Http1Request, HttpStep, MatchHeaders, MatchRpc, QuicRefuser,
+    ReceivedStream, RecordedDatagram, RequestMatcher, ScriptedGrpcBackend, ScriptedH2Backend,
+    ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend,
+    ScriptedUdpBackend, TcpStep, TlsConfig, UdpStep, tls_backend_without_quic_with_ok_response,
 };
 pub use certs::TestCa;
 pub use clients::{
@@ -80,7 +79,6 @@ pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
 pub use matrix::{BackendKind, FrontendKind, MatrixBackend, MatrixResponse};
 pub use network::{
     BandwidthLimitedStream, DelayedStream, NetworkProfile, NetworkSimProxy, NetworkSimProxyBuilder,
-    TruncatedStream,
 };
 pub use ports::{
     BIND_DROP_SPAWN_ATTEMPTS, PortReservation, RefusedTcpPort, UdpPortReservation,

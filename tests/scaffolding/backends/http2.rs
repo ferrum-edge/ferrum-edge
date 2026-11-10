@@ -297,29 +297,6 @@ impl ScriptedH2BackendBuilder {
         })
     }
 
-    /// Like [`Self::tls`] but advertises both `h2` and `http/1.1` in ALPN.
-    /// Useful for tests that want the scripted backend to also respond on
-    /// the fallback path (rare — usually we'd use `ScriptedTlsBackend` for
-    /// that). Kept here for API symmetry.
-    pub fn tls_with_alpn(
-        listener: TcpListener,
-        cert_pem: &str,
-        key_pem: &str,
-        alpn: Vec<Vec<u8>>,
-    ) -> io::Result<Self> {
-        let tls_config = build_server_config_with_alpn(cert_pem, key_pem, alpn)?;
-        Ok(Self {
-            listener,
-            tls: Some(TlsParams {
-                server_config: Arc::new(tls_config),
-            }),
-            steps: Vec::new(),
-            connection_scripts: Vec::new(),
-            settings: ConnectionSettings::default(),
-            repeat_script: false,
-        })
-    }
-
     /// Append a step.
     pub fn step(mut self, step: H2Step) -> Self {
         self.steps.push(step);
@@ -379,12 +356,6 @@ impl ScriptedH2BackendBuilder {
     /// 65,535 when unset.
     pub fn with_initial_window_size(mut self, n: u32) -> Self {
         self.settings.initial_window_size = Some(n);
-        self
-    }
-
-    /// Convenience: set initial connection window to `n` octets.
-    pub fn with_initial_connection_window_size(mut self, n: u32) -> Self {
-        self.settings.initial_connection_window_size = Some(n);
         self
     }
 
@@ -506,8 +477,8 @@ impl ScriptedH2Backend {
         ScriptedH2BackendBuilder::plain(listener)
     }
 
-    /// Builder for an h2-over-TLS listener. Advertises ALPN `h2` only; see
-    /// [`ScriptedH2BackendBuilder::tls_with_alpn`] for multi-protocol ALPN.
+    /// Builder for an h2-over-TLS listener. Advertises ALPN `h2` only; use
+    /// `ScriptedTlsBackend` for multi-protocol ALPN scripting.
     pub fn builder_tls(
         listener: TcpListener,
         cert_pem: &str,

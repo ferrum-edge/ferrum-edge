@@ -516,7 +516,9 @@ async fn correlation_id_composition_reaches_generated_and_preserved_disconnect_l
 }
 
 #[tokio::test]
-async fn disconnect_log_falls_back_to_legacy_custom_correlation_metadata() {
+async fn disconnect_log_ignores_custom_correlation_id_metadata() {
+    // Only the canonical `request_id` metadata key is read; the pre-rename
+    // `correlation_id` metadata spelling is not a fallback (#7303).
     let capture = WsLogCapture::default();
     let _guard = install_ws_log_capture(&capture);
     let logger = WsFrameLogging::new(&json!({})).expect("valid WebSocket logger config");
@@ -524,7 +526,7 @@ async fn disconnect_log_falls_back_to_legacy_custom_correlation_metadata() {
     logger
         .on_ws_disconnect(&disconnect_context(HashMap::from([(
             "correlation_id".to_string(),
-            "legacy-custom-id".to_string(),
+            "custom-correlation-id".to_string(),
         )])))
         .await;
 
@@ -533,12 +535,15 @@ async fn disconnect_log_falls_back_to_legacy_custom_correlation_metadata() {
         .into_iter()
         .find(|event| event.event.as_deref() == Some("disconnect"))
         .expect("disconnect log event");
-    assert_eq!(event.correlation_id.as_deref(), Some("legacy-custom-id"));
+    assert_eq!(event.correlation_id.as_deref(), Some("-"));
 
     logger
         .on_ws_disconnect(&disconnect_context(HashMap::from([
             ("request_id".to_string(), "canonical-request-id".to_string()),
-            ("correlation_id".to_string(), "legacy-custom-id".to_string()),
+            (
+                "correlation_id".to_string(),
+                "custom-correlation-id".to_string(),
+            ),
         ])))
         .await;
     let event = capture

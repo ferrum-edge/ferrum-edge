@@ -1001,7 +1001,6 @@ impl Plugin for WsFrameLogging {
         let correlation_id = ctx
             .metadata
             .get(super::REQUEST_ID_METADATA_KEY)
-            .or_else(|| ctx.metadata.get("correlation_id"))
             .map(String::as_str)
             .unwrap_or("-");
         let plugin_id: &str = &self.config.plugin_id;

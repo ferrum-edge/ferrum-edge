@@ -341,6 +341,14 @@ independent `ferrum-mesh` release in the same cluster must set a unique
 intentional, and a later release must not force-import or skip-create to share
 another release's class.
 
+The mesh CA Deployment (`ca.enabled=true`) runs `FERRUM_MODE=cp` from `ca.env`,
+so it is held to the CP gRPC transport check at render time: a non-loopback,
+non-zero `FERRUM_CP_GRPC_LISTEN_ADDR` (default `0.0.0.0:50051`) fails `helm
+template` unless `ca.env` sets both `FERRUM_CP_GRPC_TLS_CERT_PATH` and
+`FERRUM_CP_GRPC_TLS_KEY_PATH` or `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"`
+(the development example sets the opt-in). The binary refuses the same
+configuration at startup.
+
 ### Gateway API CRDs (required)
 
 Ferrum does **not** ship upstream Gateway API CRDs in the Helm chart. Upstream
@@ -377,12 +385,13 @@ helm template <release> ./charts/ferrum-mesh -n <namespace> \
 `helm upgrade`.
 
 Existing clusters that installed this CRD from the former
-`charts/ferrum-mesh/crds/` directory must adopt it once so Helm can update it.
+`charts/ferrum-mesh/crds/` directory must let Helm take ownership of it once so
+Helm can update it; a plain `helm upgrade` fails on Helm's own ownership check.
 **Operator action** (`--take-ownership` needs a Helm 3.17+ client):
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
-  --take-ownership --set crds.adoptExisting=true
+  --take-ownership
 ```
 
 Independent `ferrum-mesh` releases in one cluster share this cluster-scoped CRD.

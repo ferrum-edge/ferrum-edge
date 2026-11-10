@@ -12,6 +12,7 @@
 {{- include "ferrum-mesh.validateResources" (dict "component" "ca" "resources" .Values.ca.resources) -}}
 {{- include "ferrum-mesh.validatePlaintextAdmin" (dict "component" "ca" "resolved" (include "ferrum-mesh.resolveComponentAdmin" (dict "component" "ca" "env" (.Values.ca.env | default dict) "admin" (.Values.ca.admin | default dict)) | fromYaml) "hardFail" true "probes" .Values.ca.probes) -}}
 {{- include "ferrum-mesh.failReservedEnv" (dict "label" "ca.env" "env" .Values.ca.env "names" (list "FERRUM_SHUTDOWN_DRAIN_SECONDS" "FERRUM_SHUTDOWN_PREDRAIN_SECONDS" "FERRUM_METRICS_BEARER_TOKEN" "FERRUM_METRICS_ALLOWED_CIDRS")) -}}
+{{- include "ferrum-mesh.validateCpGrpcTransport" (dict "label" "ca.env" "env" .Values.ca.env) -}}
 {{- end -}}
 {{- if .Values.eastWest.enabled -}}
 {{- include "ferrum-mesh.validateResources" (dict "component" "eastWest" "resources" .Values.eastWest.resources) -}}

@@ -330,7 +330,6 @@ impl GatewayHarnessBuilder {
     ) -> Result<GatewayHarness, Box<dyn std::error::Error + Send + Sync>> {
         let gw = self.inner.spawn().await?;
         Ok(GatewayHarness {
-            mode: HarnessMode::Binary,
             backend: Backend::Binary {
                 gateway: Box::new(gw),
             },
@@ -509,7 +508,6 @@ async fn try_spawn_in_process(
     });
 
     Ok(GatewayHarness {
-        mode: HarnessMode::InProcess,
         backend: Backend::InProcess(Box::new(InProcessBackend {
             proxy_base_url,
             admin_base_url,
@@ -635,8 +633,6 @@ where
 /// gateway (subprocess or in-process task) on `Drop`.
 pub struct GatewayHarness {
     backend: Backend,
-    #[allow(dead_code)] // Used only by debug_summary().
-    mode: HarnessMode,
 }
 
 // Both variants are boxed: TestGateway carries TempDir + Child + many
@@ -1039,16 +1035,6 @@ impl GatewayHarness {
             .get(&url)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-    }
-
-    /// Dump a small debug summary — useful in `panic!` messages.
-    pub fn debug_summary(&self) -> String {
-        format!(
-            "GatewayHarness{{mode={:?}, proxy={}, admin={}}}",
-            self.mode,
-            self.proxy_base_url(),
-            self.admin_base_url()
-        )
     }
 }
 

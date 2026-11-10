@@ -151,9 +151,12 @@ fn udp_policy_crd_lives_in_templates_not_install_once_crds() {
         template.contains("lookup \"apiextensions.k8s.io/v1\" \"CustomResourceDefinition\""),
         "co-resident releases must skip a CRD owned by another release"
     );
+    // Helm's own ownership check refuses an unmanaged CRD and
+    // `helm upgrade --take-ownership` adopts it; the chart keeps no separate
+    // adoption flag (build-out policy, issue #7299).
     assert!(
-        template.contains("crds.adoptExisting=true"),
-        "unmanaged CRDs from the former crds/ directory must fail with an adoption action"
+        !template.contains("adoptExisting"),
+        "the CRD template must not carry the removed crds.adoptExisting shim"
     );
 }
 
@@ -163,12 +166,12 @@ fn crd_values_and_schema_expose_install_and_schema_version() {
     assert!(values.contains("crds:"));
     assert!(values.contains("install: true"));
     assert!(values.contains("skipInstallAcknowledged: false"));
-    assert!(values.contains("adoptExisting: false"));
+    assert!(!values.contains("adoptExisting"));
     assert!(values.contains("schemaVersion: v1alpha1-1"));
     let schema = read_chart("values.schema.json");
     assert!(schema.contains("\"crds\""));
     assert!(schema.contains("\"skipInstallAcknowledged\""));
-    assert!(schema.contains("\"adoptExisting\""));
+    assert!(!schema.contains("\"adoptExisting\""));
     assert!(schema.contains("\"udpResponseAmplificationPolicy\""));
     assert!(schema.contains("\"const\": \"v1alpha1-1\""));
     let helpers = read_chart("templates/_helpers.tpl");
@@ -228,8 +231,8 @@ fn docs_name_operator_action_for_crd_adoption_and_injector_ca() {
         "upgrade guide must tell operators how to adopt the CRD"
     );
     assert!(
-        upgrade.contains("--take-ownership") && upgrade.contains("crds.adoptExisting=true"),
-        "upgrade guide must name helm --take-ownership and crds.adoptExisting"
+        upgrade.contains("--take-ownership") && !upgrade.contains("crds.adoptExisting=true"),
+        "upgrade guide must name helm --take-ownership and not the removed crds.adoptExisting"
     );
     assert!(
         upgrade.contains("#4433") && upgrade.contains("injector.caBundle"),

@@ -51,3 +51,8 @@ injector:
 
 ca:
   enabled: false
+  env:
+    # The CA Deployment runs FERRUM_MODE=cp from ca.env, which refuses a
+    # non-loopback plaintext CP gRPC bind at startup; the chart fails the render
+    # unless TLS paths or this development opt-in are set.
+    FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
