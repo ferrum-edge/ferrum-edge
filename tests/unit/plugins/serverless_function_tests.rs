@@ -10,8 +10,8 @@ use super::plugin_utils::{create_test_context, normalize_compressed_request_for_
 ///
 /// This is the single process-wide lock, not a file-private one. These tests
 /// write `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION`, which
-/// the AWS secret-backend tests in `unit::secrets::aws_tests` read through the
-/// SDK's credential chain, so the two suites must serialize against each other.
+/// any other env-reading test in the binary could observe, so every suite that
+/// touches the process environment must serialize against this one.
 /// The guard also restores every variable it saved, so a fixture value — or a
 /// panicking assertion — cannot leak into a later test in the binary.
 use crate::unit::env_lock::EnvGuard;

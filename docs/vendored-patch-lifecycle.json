@@ -716,7 +716,8 @@
         }
       },
       "regression_tests": [
-        "vendor/tokio-tungstenite-0.29.0-ferrum-patched (fragment accounting delegator)"
+        "tests/unit/gateway_core/websocket_fragment_metering_tests.rs::async_delegator_meters_fragments_through_split_stream",
+        "tests/unit/gateway_core/websocket_fragment_metering_tests.rs::async_delegator_forwards_incomplete_message_frame_bound"
       ]
     },
     {

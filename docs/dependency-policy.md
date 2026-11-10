@@ -500,7 +500,9 @@ of the vendor copy and must keep passing after retirement:
 - The tungstenite / tokio-tungstenite fragment-accounting regressions live in
   the vendored crate (`protocol::tests::fragment_*`,
   `protocol::tests::incomplete_message_*`) and in
-  `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`.
+  `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`, which repeats
+  every vendored case through the public API and covers the
+  `tokio-tungstenite` delegator (`async_delegator_*`).
 - The dimpl credential regressions live in
   `vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs`. They
   cover DTLS 1.2 and 1.3 chain transmission plus deterministic clone,

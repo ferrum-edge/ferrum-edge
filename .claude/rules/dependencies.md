@@ -249,8 +249,10 @@ sections:
   `tests/unit/gateway_core/websocket_auto_pong_tests.rs`, and functional
   H1/H2/H3 Ping transparency tests in `functional_websocket_test.rs`.
 - Tungstenite/tokio-tungstenite fragment accounting + incomplete-message bounds
-  (GHSA-qq94-2gv2-phh6): vendored `--lib fragment` / `--lib incomplete_message`
-  and `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`.
+  (GHSA-qq94-2gv2-phh6): `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`
+  (every vendored `--lib fragment` / `--lib incomplete_message` case through the
+  public API, plus the `async_delegator_*` tests for
+  `WebSocketStream::set_fragment_accounting` through `split()`).
 - h3-quinn `stop_sending` during an in-flight read (issue #3283): the vendored
   shape contract in `tests/unit/gateway_core/http3_server_dispatch_tests.rs`
   (`h3_quinn_vendored_recv_stream_can_stop_sending_during_an_in_flight_read`)
