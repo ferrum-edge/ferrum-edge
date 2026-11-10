@@ -2421,23 +2421,10 @@ pub async fn run(
             })?;
             // Warn (not fail) on a served namespace no credential can reach:
             // it is a real rollout gap, but refusing to start would make adding
-            // a tenant a two-step outage.
+            // a tenant a two-step outage. The reload worker repeats the same
+            // check on every accepted change.
             if let Some(namespaces) = cp_scope.explicit_namespaces() {
-                let bound = bundle.bound_namespaces();
-                let unreachable: Vec<&str> = namespaces
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|namespace| !bound.contains(namespace))
-                    .collect();
-                if !unreachable.is_empty() {
-                    warn!(
-                        "CP/DP trust bundle binds no verification credential to {} served \
-                         namespace(s): [{}]. Data planes in those namespaces cannot subscribe \
-                         until a credential is bound to them.",
-                        unreachable.len(),
-                        sanitize_startup_scalar(unreachable.join(", "))
-                    );
-                }
+                crate::grpc::cp_trust::warn_unbound_served_namespaces(&bundle, &namespaces);
             }
             // The legacy secret stays optional here: with a trust bundle
             // configured it is no longer an authorization input, and CP mode
@@ -2531,7 +2518,7 @@ pub async fn run(
             path,
             env_config.cp_dp_grpc_jwt_secret.clone(),
             cp_dp_verifier.clone(),
-            cp_scope.requires_namespace_claim_by_default(),
+            cp_scope.explicit_namespaces(),
             trust_reload_interval,
             trust_status,
             shutdown_tx.subscribe(),

@@ -17434,7 +17434,6 @@ components:
               reader_unavailable,
               reload_reader_failed,
               reload_read_timed_out,
-              scope_validation_failed,
               worker_exited,
             ]
           description: Closed-set reason currently blocking rotation.
