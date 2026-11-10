@@ -30,7 +30,7 @@ pub struct StartupSecurityScope {
     pub tls_policy_and_crls: bool,
     /// Strict `FERRUM_ADMIN_ALLOWED_CIDRS` + `MetricsAuthPolicy::from_env`.
     pub admin_cidrs_and_metrics: bool,
-    /// Frontend cert/key pair via `load_tls_config_with_client_auth_and_ocsp`
+    /// Frontend cert/key pair via `tls::load_frontend_tls_candidate_from_paths`
     /// when both paths are set (proxy-serving modes).
     pub frontend_tls: bool,
     /// Admin HTTPS cert/key pair when `admin_https_listener_enabled()`.
@@ -113,8 +113,9 @@ impl StartupSecurityScope {
 
 /// Materials produced by the shared env-security loaders.
 ///
-/// Serving modes reuse these so validate and run cannot diverge on the same
-/// inputs. Optional fields are `None` when the active scope skips that surface
+/// Built by [`load_startup_security`] for `validate`; serving modes call the
+/// same underlying loaders individually rather than reusing this struct.
+/// Optional fields are `None` when the active scope skips that surface
 /// or when the corresponding env pair is unset.
 pub struct StartupSecurityMaterials {
     pub tls_policy: Option<TlsPolicy>,
@@ -390,9 +391,9 @@ pub fn try_load_admin_tls(
 
 /// Load admin TLS material whenever both cert and key paths are set.
 ///
-/// Used by serving modes that may also adopt a pre-bound admin HTTPS socket
-/// when `FERRUM_ADMIN_HTTPS_PORT=0`. `validate` uses [`try_load_admin_tls`],
-/// which additionally requires a nonzero HTTPS port.
+/// Called by [`try_load_admin_tls`], which additionally requires a nonzero
+/// HTTPS port. Serving modes call [`load_admin_tls_candidate`] directly so
+/// they also get the client-trust identity.
 pub fn load_admin_tls_material(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,

@@ -6,7 +6,7 @@
 //! [`prepare_admin_frontend_tls`] return only the loaded config and no
 //! watcher.  When the operator opts in, the helpers additionally build a
 //! `SharedFrontendTls` slot pre-populated with the loaded config and spawn a
-//! poll task that re-runs the same load (`load_tls_config_with_client_auth`
+//! poll task that re-runs the same load (`tls::load_frontend_tls_candidate`
 //! plus the surface-specific post-load options) on watched source changes,
 //! atomically swapping the slot on success and warning-and-keeping the old
 //! slot on validation failure.
@@ -67,8 +67,9 @@ pub struct ProxyFrontendTlsReloadHandles {
 /// secret-extraction opt-in).
 ///
 /// The rebuild closure mirrors the startup path:
-/// `load_tls_config_with_client_auth(cert, key, client_ca, no_verify, policy,
-/// warning_days, crls)` followed by the same `enable_early_data` /
+/// `tls::load_frontend_tls_candidate(cert, key, client_ca, ocsp, no_verify,
+/// policy, warning_days, crl_warning_days, crls, scope)` followed by the same
+/// `enable_early_data` /
 /// `enable_secret_extraction_for_ktls` opt-ins.  Validation failures (parse,
 /// expired, not-yet-valid, key mismatch) flow out as the closure's `Err` and
 /// keep the previous config — never serving a known-bad TLS config.
