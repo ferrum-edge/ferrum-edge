@@ -41052,7 +41052,6 @@ async fn handle_proxy_request_inner(
                         // and defensively refused by the screen above (issues #2003,
                         // #3284, #3728).
                         &grpc_transport,
-                        &state.dns_cache,
                         attempt_span.headers(headers_view),
                         grpc_should_stream,
                         effective_max_response_body_size_bytes,
@@ -41230,7 +41229,6 @@ async fn handle_proxy_request_inner(
                             // the Ambient HBONE tunnel's nested HTTP/2 connection with
                             // frames committed incrementally and no retry (issue #3728).
                             &grpc_transport,
-                            &state.dns_cache,
                             attempt_span.headers(headers_view),
                             effective_max_grpc_recv_size_bytes,
                             body_size_exceeded,
@@ -41392,7 +41390,6 @@ async fn handle_proxy_request_inner(
                                     // The same materialized transport as the split-path
                                     // call above (issues #2003, #3284, #3728).
                                     &grpc_transport,
-                                    &state.dns_cache,
                                     attempt_span.headers(headers_view),
                                     grpc_should_stream,
                                     effective_max_response_body_size_bytes,
@@ -42044,7 +42041,6 @@ async fn handle_proxy_request_inner(
                             // any class this pipeline cannot carry before reaching here
                             // (issues #2003, #3728).
                             &grpc_retry_transport,
-                            &state.dns_cache,
                             attempt_span.headers(headers_view),
                             grpc_should_stream,
                             effective_max_response_body_size_bytes,

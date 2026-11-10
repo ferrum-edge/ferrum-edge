@@ -1048,7 +1048,6 @@ async fn grpc_dispatches_over_sidecar_mesh_mtls_and_relays_status_trailers() {
     );
 
     let (headers, proxy_headers) = grpc_request_headers();
-    let dns = DnsCache::new(DnsConfig::default());
     let result = proxy_grpc_request_from_bytes(
         hyper::Method::POST,
         headers,
@@ -1057,7 +1056,6 @@ async fn grpc_dispatches_over_sidecar_mesh_mtls_and_relays_status_trailers() {
         &proxy,
         &format!("http://127.0.0.1:{APP_PORT}/reviews.Reviews/Get"),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1132,7 +1130,6 @@ async fn grpc_over_mesh_mtls_fails_closed_when_the_pinned_peer_does_not_match() 
             .expect("a well-formed mesh.mtls target still resolves the transport");
 
     let (headers, proxy_headers) = grpc_request_headers();
-    let dns = DnsCache::new(DnsConfig::default());
     let result = proxy_grpc_request_from_bytes(
         hyper::Method::POST,
         headers,
@@ -1141,7 +1138,6 @@ async fn grpc_over_mesh_mtls_fails_closed_when_the_pinned_peer_does_not_match() 
         &proxy,
         &format!("http://127.0.0.1:{APP_PORT}/reviews.Reviews/Get"),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1188,7 +1184,6 @@ async fn grpc_dispatches_over_same_cluster_ambient_hbone_and_relays_status_trail
     );
 
     let (headers, proxy_headers) = grpc_request_headers();
-    let dns = DnsCache::new(DnsConfig::default());
     let result = proxy_grpc_request_from_bytes(
         hyper::Method::POST,
         headers,
@@ -1197,7 +1192,6 @@ async fn grpc_dispatches_over_same_cluster_ambient_hbone_and_relays_status_trail
         &proxy,
         &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1277,7 +1271,6 @@ async fn grpc_over_ambient_hbone_fails_closed_when_the_pinned_peer_does_not_matc
             .expect("a well-formed mesh.hbone target still resolves the transport");
 
     let (headers, proxy_headers) = grpc_request_headers();
-    let dns = DnsCache::new(DnsConfig::default());
     let result = proxy_grpc_request_from_bytes(
         hyper::Method::POST,
         headers,
@@ -1286,7 +1279,6 @@ async fn grpc_over_ambient_hbone_fails_closed_when_the_pinned_peer_does_not_matc
         &proxy,
         &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1331,7 +1323,6 @@ async fn grpc_over_ambient_hbone_bounds_the_nested_h2_handshake_by_connect_timeo
             .expect("mesh.hbone target must resolve the Ambient HBONE transport");
 
     let (headers, proxy_headers) = grpc_request_headers();
-    let dns = DnsCache::new(DnsConfig::default());
     let started = tokio::time::Instant::now();
     let result = proxy_grpc_request_from_bytes(
         hyper::Method::POST,
@@ -1341,7 +1332,6 @@ async fn grpc_over_ambient_hbone_bounds_the_nested_h2_handshake_by_connect_timeo
         &proxy,
         &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1400,7 +1390,6 @@ async fn grpc_over_ambient_hbone_classifies_a_rejected_inner_handshake_as_h2c() 
             .expect("mesh.hbone target must resolve the Ambient HBONE transport");
 
     let (headers, proxy_headers) = grpc_request_headers();
-    let dns = DnsCache::new(DnsConfig::default());
     let result = proxy_grpc_request_from_bytes(
         hyper::Method::POST,
         headers,
@@ -1409,7 +1398,6 @@ async fn grpc_over_ambient_hbone_classifies_a_rejected_inner_handshake_as_h2c() 
         &proxy,
         &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1452,7 +1440,6 @@ async fn grpc_dispatches_over_cross_cluster_ambient_hbone_through_the_east_west_
     assert_eq!(transport.label(), "hbone");
 
     let (headers, proxy_headers) = grpc_request_headers();
-    let dns = DnsCache::new(DnsConfig::default());
     // The gateway builds this URL from the target, whose host is a SCOPED
     // SYNTHETIC identity with `|` separators — not a parseable URI authority.
     // The transport must still recover the path and rebuild the request line.
@@ -1467,7 +1454,6 @@ async fn grpc_dispatches_over_cross_cluster_ambient_hbone_through_the_east_west_
             app_addr.port()
         ),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1633,7 +1619,6 @@ async fn grpc_over_ambient_hbone_honors_the_client_deadline() {
     proxy_headers.insert("grpc-timeout".to_string(), "2S".to_string());
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1_500);
 
-    let dns = DnsCache::new(DnsConfig::default());
     let result = proxy_grpc_request_from_bytes(
         hyper::Method::POST,
         headers,
@@ -1642,7 +1627,6 @@ async fn grpc_over_ambient_hbone_honors_the_client_deadline() {
         &proxy,
         &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
@@ -1691,7 +1675,6 @@ async fn grpc_over_ambient_hbone_relays_a_non_zero_status_and_custom_trailers() 
     assert_eq!(transport.label(), "hbone");
 
     let (headers, proxy_headers) = grpc_request_headers();
-    let dns = DnsCache::new(DnsConfig::default());
     let result = proxy_grpc_request_from_bytes(
         hyper::Method::POST,
         headers,
@@ -1700,7 +1683,6 @@ async fn grpc_over_ambient_hbone_relays_a_non_zero_status_and_custom_trailers() 
         &proxy,
         &format!("http://127.0.0.1:{}/reviews.Reviews/Get", app_addr.port()),
         &transport,
-        &dns,
         &proxy_headers,
         false,
         0,
