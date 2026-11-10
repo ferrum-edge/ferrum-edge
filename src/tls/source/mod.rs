@@ -551,14 +551,6 @@ impl CertSource {
         matches!(self, Self::Uri(uri) if uri.scheme == SourceScheme::System)
     }
 
-    #[allow(dead_code)]
-    pub fn kind(&self) -> MaterialKind {
-        match self {
-            Self::Path(_) | Self::InlinePem(_) => MaterialKind::Unknown,
-            Self::Uri(uri) => uri.kind,
-        }
-    }
-
     pub fn source_id(&self) -> String {
         match self {
             Self::Path(path) => path.display().to_string(),

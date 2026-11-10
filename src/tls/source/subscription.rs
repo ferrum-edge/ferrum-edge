@@ -81,11 +81,6 @@ impl WatchedMaterialSource {
             kind,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn source_id(&self) -> String {
-        self.source.source_id()
-    }
 }
 
 /// A non-secret byte fingerprint for one material source.
@@ -103,18 +98,6 @@ pub struct MaterialFingerprintEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterialSetFingerprint {
     pub entries: Vec<MaterialFingerprintEntry>,
-}
-
-impl MaterialSetFingerprint {
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 /// Return true when the source can change underneath the running process.
@@ -307,7 +290,7 @@ pub fn material_fingerprint_with(
             registry.record_tls_source_fetch_failure(
                 configured_scheme.as_str(),
                 watched.kind.as_str(),
-                material_error_reason(&error),
+                error.failure_class(),
             );
             return Err(error);
         }
@@ -419,10 +402,6 @@ fn opaque_key_fingerprint_entry(
         source_kind: SourceScheme::Pkcs11,
         kind: watched.kind,
     })
-}
-
-fn material_error_reason(error: &MaterialError) -> &'static str {
-    error.failure_class()
 }
 
 /// Fixed-size transition latch for one configured watcher. It retains only a

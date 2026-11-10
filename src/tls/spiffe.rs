@@ -1210,9 +1210,10 @@ fn verify_peer_chain_result(
 /// Validate `end_entity + intermediates` against `bundle.trust_bundles`,
 /// extract the SPIFFE ID, and (optionally) match it against `expected_peer`.
 ///
-/// This uncached helper is retained for direct validation tests. Runtime
-/// verifiers use [`verify_peer_against_cached_snapshot`] so live handshakes
-/// rebuild chain verifiers only when the bundle slot rotates.
+/// Test-only: this uncached helper backs the direct validation tests below.
+/// Runtime verifiers use [`verify_peer_against_cached_snapshot`] so live
+/// handshakes rebuild chain verifiers only when the bundle slot rotates.
+#[cfg(test)]
 fn verify_peer_against_bundle(
     trust_bundles: &TrustBundleSet,
     end_entity: &CertificateDer<'_>,
