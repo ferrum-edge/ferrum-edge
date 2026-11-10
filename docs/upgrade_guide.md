@@ -288,11 +288,6 @@ forwards the chunk unchanged should return `Forward(chunk.clone())`, which
 shares the buffer, rather than `Forward(Bytes::copy_from_slice(chunk))`. See
 [Inspect while streaming](../CUSTOM_PLUGINS.md#inspect-while-streaming).
 
-Per-release sections below are written when a release is cut. Changes already
-on `main` but not yet released, including breaking ones, are listed under
-`[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
-deploying a build from `main`.
-
 ### ACME auto-renew is refused outside database, file and dp modes (#7251)
 
 `FERRUM_ACME_AUTO_RENEW_ENABLED=true` is now refused at startup and by
@@ -302,6 +297,28 @@ accepted and certificates silently stopped renewing. Remove the flag from those
 processes' configuration (a configuration shared with a dp or file process
 must set it per process) and renew their `acme://` material out of band, or
 serve it from a database, file or dp process that runs the scheduler.
+
+### PeerAuthentication requires `scope` (#7243)
+
+A native, file-source or xDS-carried `PeerAuthentication` must now carry
+`scope`, like every other mesh policy resource (`kind: namespace` with
+`namespace`, `kind: workload_selector` with `selector`, or `kind: mesh_wide`).
+The earlier scope-less form is refused: a policy without `scope` fails as
+missing a required field, and the legacy `selector` member fails as an unknown
+field, with or without a `scope` beside it. Rewrite each policy before
+upgrading:
+
+- no `selector`, or one with no labels: `scope: {kind: namespace, namespace: <policy namespace>}`;
+- a labelled `selector`: `scope: {kind: workload_selector, selector: {labels: ..., namespace: <policy namespace>}}`.
+
+Policies translated from Istio `PeerAuthentication` objects need no change. The
+ConfigSync protocol revision is 4, so a CP and DP from different builds refuse
+each other at `Subscribe` and never exchange the earlier form.
+
+Per-release sections below are written when a release is cut. Changes already
+on `main` but not yet released, including breaking ones, are listed under
+`[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
+deploying a build from `main`.
 
 ## Upgrading to 0.9.20
 

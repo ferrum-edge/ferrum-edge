@@ -353,13 +353,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   materializes in the Gateway's namespace (source-bound ids, weighted upstream
   included), as `TCPRoute`/`TLSRoute` already did. Previously it was refused
   (#7305).
-- **PeerAuthentication applicability is `scope` only** (#7243). Native, file
-  and xDS PeerAuthentication now carries the same `scope` as every other mesh
-  policy resource and is always written with `scope`. A policy without `scope`
-  is still read: no `selector` is the namespace default, and a labelled
-  `selector` selects in the policy's own namespace. A `selector` beside a
-  `scope` that differs from it, or a scope-less `selector.namespace` naming
-  another namespace, is now refused. **Operator action:** write `scope` (`kind:
+- **BREAKING — PeerAuthentication applicability is `scope` only** (issue
+  #7243). Native, file and xDS PeerAuthentication now carries the same `scope`
+  as every other mesh policy resource and is always written with `scope`. A
+  policy without `scope`, or one carrying the earlier `selector` member, is
+  refused (missing `scope`, unknown field `selector`); ConfigSync protocol
+  revision 4 carries the new shape. **Operator action:** write `scope` (`kind:
   namespace` / `workload_selector` / `mesh_wide`) in native mesh documents.
 - **BREAKING — `FERRUM_ACME_AUTO_RENEW_ENABLED=true` is refused outside
   `database`, `file` and `dp` modes** (issue #7251). Only those modes run the

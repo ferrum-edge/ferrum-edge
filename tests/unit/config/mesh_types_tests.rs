@@ -342,123 +342,47 @@ fn peer_authentication_serializes_scope_and_no_selector() {
     assert_eq!(decode_peer_authentication(encoded).unwrap(), pa);
 }
 
-/// The scope-less form earlier builds wrote (and still on the ConfigSync and
-/// mesh-carrier wire until a protocol revision bump) decodes straight to the
-/// canonical `scope`: no selector is the namespace default, a labelled
-/// selector selects in the policy's own namespace.
+/// The scope-less form earlier builds wrote is refused (issue #7243): a
+/// document without `scope` is missing a required field, and the legacy
+/// `selector` member is refused like any other unknown member, with or
+/// without a `scope` beside it. ConfigSync protocol revision 4 carries this
+/// shape, so no earlier build's snapshot reaches this decoder.
 #[test]
-fn peer_authentication_scope_less_input_decodes_to_canonical_scope() {
-    let namespace_default = decode_peer_authentication(serde_json::json!({
+fn peer_authentication_legacy_scope_less_forms_are_refused() {
+    let missing_scope = decode_peer_authentication(serde_json::json!({
         "name": "ns-strict",
         "namespace": "default",
         "mtls_mode": "strict"
     }))
-    .unwrap();
-    assert_eq!(
-        namespace_default.scope,
-        PolicyScope::Namespace {
-            namespace: "default".into()
-        }
+    .unwrap_err();
+    assert!(
+        missing_scope.contains("missing field `scope`"),
+        "unexpected error: {missing_scope}"
     );
 
-    let empty_selector = decode_peer_authentication(serde_json::json!({
-        "name": "ns-strict",
-        "namespace": "default",
-        "selector": {"labels": {}}
-    }))
-    .unwrap();
-    assert_eq!(empty_selector.scope, namespace_default.scope);
-    assert!(!empty_selector.has_workload_selector());
-
-    for selector in [
-        serde_json::json!({"labels": {"app": "api"}}),
-        serde_json::json!({"labels": {"app": "api"}, "namespace": "default"}),
-    ] {
-        let selected = decode_peer_authentication(serde_json::json!({
+    for document in [
+        serde_json::json!({
             "name": "api-strict",
             "namespace": "default",
-            "selector": selector,
-            "mtls_mode": "strict",
-            "port_overrides": {"8080": "permissive"}
-        }))
-        .unwrap();
-        assert_eq!(
-            selected.scope,
-            PolicyScope::WorkloadSelector {
-                selector: api_selector(Some("default"))
-            }
-        );
-        assert!(selected.has_workload_selector());
-        assert_eq!(
-            selected.port_overrides.get(&8080).copied(),
-            Some(MtlsMode::Permissive)
-        );
-        let encoded = serde_json::to_value(&selected).unwrap();
-        assert!(encoded.get("selector").is_none(), "{encoded}");
-    }
-}
-
-/// Earlier translators wrote the selector a second time beside a
-/// workload-selector `scope`. Only that identical copy is accepted; a
-/// `selector` that disagrees with `scope` is refused rather than ignored.
-#[test]
-fn peer_authentication_selector_beside_scope_must_repeat_it() {
-    let scope = serde_json::json!({
-        "kind": "workload_selector",
-        "selector": {"labels": {"app": "api"}, "namespace": "default"}
-    });
-    let duplicate = decode_peer_authentication(serde_json::json!({
-        "name": "api-strict",
-        "namespace": "default",
-        "scope": scope,
-        "selector": {"labels": {"app": "api"}, "namespace": "default"}
-    }))
-    .unwrap();
-    assert_eq!(
-        duplicate.scope,
-        PolicyScope::WorkloadSelector {
-            selector: api_selector(Some("default"))
-        }
-    );
-
-    for (scope, selector) in [
-        (
-            scope.clone(),
-            serde_json::json!({"labels": {"app": "web"}, "namespace": "default"}),
-        ),
-        (
-            serde_json::json!({"kind": "namespace", "namespace": "default"}),
-            serde_json::json!({"labels": {"app": "api"}}),
-        ),
-    ] {
-        let error = decode_peer_authentication(serde_json::json!({
+            "selector": {"labels": {"app": "api"}},
+            "mtls_mode": "strict"
+        }),
+        serde_json::json!({
             "name": "api-strict",
             "namespace": "default",
-            "scope": scope,
-            "selector": selector
-        }))
-        .unwrap_err();
+            "scope": {
+                "kind": "workload_selector",
+                "selector": {"labels": {"app": "api"}, "namespace": "default"}
+            },
+            "selector": {"labels": {"app": "api"}, "namespace": "default"}
+        }),
+    ] {
+        let error = decode_peer_authentication(document).unwrap_err();
         assert!(
-            error.contains("`selector` differs from `scope`"),
+            error.contains("unknown field `selector`"),
             "unexpected error: {error}"
         );
     }
-}
-
-/// A scope-less selector naming another namespace never applied to any
-/// workload, and no scope expresses that, so it is refused.
-#[test]
-fn peer_authentication_scope_less_selector_in_another_namespace_is_refused() {
-    let error = decode_peer_authentication(serde_json::json!({
-        "name": "api-strict",
-        "namespace": "default",
-        "selector": {"labels": {"app": "api"}, "namespace": "other"}
-    }))
-    .unwrap_err();
-    assert!(
-        error.contains("selector.namespace differs from the policy namespace"),
-        "unexpected error: {error}"
-    );
 }
 
 /// The decode shape stays closed (issue #6616): an unknown member is refused.

@@ -1200,7 +1200,7 @@ port_overrides:
   8080: permissive
 ```
 
-Write `scope` in new configuration. Until a ConfigSync protocol revision removes it, a policy without `scope` is still read: no `selector` (or one with no labels) is a namespace default, and a labelled `selector` selects those workloads in the policy's own namespace. It is converted to `scope` when the document is read and is never written back. A `selector` beside a `scope` must repeat the scope's selector exactly, and a scope-less `selector.namespace` naming another namespace is refused.
+`scope` is required. A policy without `scope`, or one that carries the earlier `selector` member (with or without a `scope` beside it), is refused: `selector` is an unknown member like any other. The ConfigSync build identity carries this shape at protocol revision 4, so a CP and DP of different builds never exchange the earlier form. See the [upgrade guide](upgrade_guide.md#peerauthentication-requires-scope-7243).
 
 ### MeshRequestAuthentication
 

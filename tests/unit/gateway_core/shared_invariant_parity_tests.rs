@@ -2857,7 +2857,6 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/modes/mesh/config.rs:MeshTrafficPolicy.tcp_keepalive",
     "src/modes/mesh/config.rs:MeshTrafficPolicy.tls",
     "src/modes/mesh/config.rs:MeshVirtualServiceCorsPolicy.cors",
-    "src/modes/mesh/config.rs:PeerAuthenticationWire.selector",
     "src/modes/mesh/config.rs:PolicyScope.selector",
     "src/modes/mesh/config.rs:ServiceEntry.workload_selector",
     "src/modes/mesh/config.rs:TrustBundleSet.local",
