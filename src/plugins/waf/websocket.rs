@@ -221,8 +221,8 @@ fn body_direction(direction: WebSocketFrameDirection) -> BodyDirection {
 
 pub(super) fn direction_label(direction: WebSocketFrameDirection) -> &'static str {
     match direction {
-        WebSocketFrameDirection::ClientToBackend => "client->backend",
-        WebSocketFrameDirection::BackendToClient => "backend->client",
+        WebSocketFrameDirection::ClientToBackend => "client_to_backend",
+        WebSocketFrameDirection::BackendToClient => "backend_to_client",
     }
 }
 

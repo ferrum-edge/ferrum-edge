@@ -422,7 +422,7 @@ async fn logger_before_rejecting_plugin_records_policy_close_client_to_backend()
     run_relay_with_client_bytes(&plugins, 101, masked_client_frame(0x81, b"oversized!")).await;
 
     assert_eq!(size.invocations.load(Ordering::SeqCst), 1);
-    assert_one_policy_close(&capture, 1009, "client->backend");
+    assert_one_policy_close(&capture, 1009, "client_to_backend");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -437,7 +437,7 @@ async fn logger_before_rejecting_plugin_records_policy_close_backend_to_client()
     run_relay_with_backend_message(&plugins, 102, Message::Text("oversized!".into())).await;
 
     assert_eq!(size.invocations.load(Ordering::SeqCst), 1);
-    assert_one_policy_close(&capture, 1009, "backend->client");
+    assert_one_policy_close(&capture, 1009, "backend_to_client");
 }
 
 /// Parser-level `ws_message_size_limiting` rejections never enter the
@@ -453,7 +453,7 @@ async fn parser_size_limit_rejection_records_policy_close() {
 
     run_relay_with_client_bytes(&plugins, 103, masked_client_frame(0x81, &[b'a'; 64])).await;
 
-    assert_one_policy_close(&capture, 1009, "client->backend");
+    assert_one_policy_close(&capture, 1009, "client_to_backend");
 }
 
 /// Fragment-budget Closes come from `on_ws_reassembly_frames`, which skips
@@ -469,7 +469,7 @@ async fn fragment_budget_rejection_records_policy_close() {
     wire.extend(masked_client_frame(0x80, b"cd"));
     run_relay_with_client_bytes(&plugins, 104, wire).await;
 
-    assert_one_policy_close(&capture, 1008, "client->backend");
+    assert_one_policy_close(&capture, 1008, "client_to_backend");
 }
 
 // ── H3 bridge transport verdict (SOL-2) ──────────────────────────────────

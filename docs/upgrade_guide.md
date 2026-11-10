@@ -28,6 +28,15 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### WebSocket frame records spell `direction` like every other record (#7144)
+
+`ws_frame_logging` frame records (the `ws_frame_log` tracing target) and the
+`ws_rate_limiting` and `waf` WebSocket warnings now write `direction` as
+`client_to_backend` / `backend_to_client`, the spelling the `ws_frame_logging`
+`direction` filter, its disconnect records, stream summaries, metrics and
+traces already used. They wrote `client->backend` / `backend->client` before.
+Update any log query, alert or parser that matches the arrow spelling.
+
 ### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`

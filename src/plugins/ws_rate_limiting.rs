@@ -475,8 +475,8 @@ impl WsRateLimiting {
         super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
         let dir_label = match direction {
-            WebSocketFrameDirection::ClientToBackend => "client->backend",
-            WebSocketFrameDirection::BackendToClient => "backend->client",
+            WebSocketFrameDirection::ClientToBackend => "client_to_backend",
+            WebSocketFrameDirection::BackendToClient => "backend_to_client",
         };
         // One bounded, low-cardinality warning per closed connection: this is
         // the terminal decision, not a per-frame event.
