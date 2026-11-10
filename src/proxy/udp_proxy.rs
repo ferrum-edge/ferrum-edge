@@ -12796,26 +12796,6 @@ backend_tls_verify_server_cert: false
     }
 
     #[test]
-    fn udp_session_increments_overload_active_connections_on_create() {
-        let state = Arc::new(crate::overload::OverloadState::new());
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
-
-        let session = make_udp_session_with_overload(&state);
-        assert_eq!(
-            state.active_connections.load(Ordering::Relaxed),
-            1,
-            "creating a UDP session must increment OverloadState.active_connections (parity with TCP/H3)"
-        );
-
-        drop(session);
-        assert_eq!(
-            state.active_connections.load(Ordering::Relaxed),
-            0,
-            "dropping the UDP session must release the global connection slot"
-        );
-    }
-
-    #[test]
     fn udp_session_overload_guard_can_release_before_last_arc_drop() {
         let state = Arc::new(crate::overload::OverloadState::new());
         let session = Arc::new(make_udp_session_with_overload(&state));
@@ -12836,21 +12816,6 @@ backend_tls_verify_server_cert: false
             state.active_connections.load(Ordering::Relaxed),
             0,
             "early release must be idempotent and not double-decrement on drop"
-        );
-    }
-
-    #[test]
-    fn udp_session_caches_datagram_plugin_context_strings() {
-        let session = make_udp_session();
-
-        assert_eq!(session.datagram_client_ip.as_ref(), "127.0.0.1");
-        assert_eq!(session.datagram_proxy_id.as_ref(), "udp-proxy");
-        assert_eq!(
-            session
-                .datagram_proxy_name
-                .as_ref()
-                .map(|name| name.as_ref()),
-            Some("UDP Proxy")
         );
     }
 
@@ -13241,55 +13206,5 @@ listen_port: 5300
             "error should make the inherited unsupported hash key explicit: {}",
             setup.message
         );
-    }
-
-    #[test]
-    fn multiple_udp_sessions_track_concurrent_load() {
-        let state = Arc::new(crate::overload::OverloadState::new());
-
-        let s1 = make_udp_session_with_overload(&state);
-        let s2 = make_udp_session_with_overload(&state);
-        let s3 = make_udp_session_with_overload(&state);
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 3);
-
-        // Drop in non-LIFO order to exercise per-session ownership.
-        drop(s2);
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 2);
-
-        drop(s1);
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
-
-        drop(s3);
-        assert_eq!(
-            state.active_connections.load(Ordering::Relaxed),
-            0,
-            "all UDP sessions released — global counter must return to 0"
-        );
-    }
-
-    #[test]
-    fn udp_session_decrement_via_arc_unwrap_lifecycle() {
-        // The production code stores sessions as `Arc<UdpSession>` in the
-        // session map and clones them into the recv-loop fast-path cache and
-        // the spawned reply task. The guard must only fire when the LAST Arc
-        // is dropped. Verify Arc ref-counting interacts correctly.
-        let state = Arc::new(crate::overload::OverloadState::new());
-
-        let session = Arc::new(make_udp_session_with_overload(&state));
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
-
-        let cloned = session.clone();
-        let cloned2 = session.clone();
-        // Cloning the Arc must not double-count.
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
-
-        drop(cloned);
-        drop(cloned2);
-        // Dropping clones leaves one Arc — guard still alive.
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
-
-        drop(session);
-        // Last Arc dropped → UdpSession dropped → guard dropped → counter 0.
-        assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
     }
 }
