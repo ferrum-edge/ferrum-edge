@@ -8308,7 +8308,7 @@ pub mod _test_support {
         crate::config::db_loader::parse_scheme(s)
     }
 
-    pub fn parse_auth_mode(s: &str) -> AuthMode {
+    pub fn parse_auth_mode(s: &str) -> Result<AuthMode, String> {
         crate::config::db_loader::parse_auth_mode(s)
     }
 

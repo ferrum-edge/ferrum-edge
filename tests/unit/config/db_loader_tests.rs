@@ -552,20 +552,76 @@ fn plugin_config_row_mappers_decode_scope_proxy_id_and_enabled_strictly() {
 
 #[test]
 fn test_parse_auth_mode_known_values() {
-    assert!(matches!(parse_auth_mode("single"), AuthMode::Single));
-    assert!(matches!(parse_auth_mode("multi"), AuthMode::Multi));
+    assert!(matches!(parse_auth_mode("single"), Ok(AuthMode::Single)));
+    assert!(matches!(parse_auth_mode("multi"), Ok(AuthMode::Multi)));
 }
 
 #[test]
 fn test_parse_auth_mode_case_insensitive() {
-    assert!(matches!(parse_auth_mode("MULTI"), AuthMode::Multi));
-    assert!(matches!(parse_auth_mode("Single"), AuthMode::Single));
+    assert!(matches!(parse_auth_mode("MULTI"), Ok(AuthMode::Multi)));
+    assert!(matches!(parse_auth_mode("Single"), Ok(AuthMode::Single)));
 }
 
+/// Issue #7192: an unknown stored auth mode rejects the row instead of
+/// silently becoming `single`; the raw value is never echoed.
 #[test]
-fn test_parse_auth_mode_unknown_defaults_to_single() {
-    assert!(matches!(parse_auth_mode("unknown"), AuthMode::Single));
-    assert!(matches!(parse_auth_mode(""), AuthMode::Single));
+fn test_parse_auth_mode_unknown_is_rejected() {
+    let error = parse_auth_mode("unknown-mode-7192").expect_err("unknown auth_mode");
+    assert!(error.contains("unsupported auth_mode"), "{error}");
+    assert!(!error.contains("unknown-mode-7192"), "{error}");
+    assert!(parse_auth_mode("").is_err());
+}
+
+/// Issue #7192: proxy columns that used to fall back to a default on a decode
+/// failure (or an unknown enum value) now reject the row, so the last good
+/// config stays live instead of serving plaintext / single-auth / streaming
+/// behaviour nobody configured.
+#[tokio::test]
+async fn corrupt_proxy_columns_reject_the_row_instead_of_defaulting() {
+    for (column, value, marker) in [
+        ("frontend_tls", "yes", "frontend_tls"),
+        ("auth_mode", "bogus", "unsupported auth_mode"),
+        (
+            "response_body_mode",
+            "chunked",
+            "unsupported response_body_mode",
+        ),
+    ] {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("proxy-columns.db").display()
+        );
+        let store =
+            DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+                .await
+                .unwrap();
+        store
+            .create_proxy(&make_http_proxy("cols-7192"))
+            .await
+            .unwrap();
+        store
+            .load_full_config("ferrum")
+            .await
+            .expect("an intact row loads");
+        sqlx::query(&format!("UPDATE proxies SET {column} = ? WHERE id = ?"))
+            .bind(value)
+            .bind("cols-7192")
+            .execute(&store.pool())
+            .await
+            .unwrap();
+
+        let error = store
+            .load_full_config("ferrum")
+            .await
+            .expect_err("a corrupt column must reject the load");
+        assert!(
+            ferrum_edge::_test_support::is_row_decode_rejection(&error),
+            "{column}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(marker), "{column}: {rendered}");
+    }
 }
 
 // ── statement_timeout_sql ───────────────────────────────────────────────────
