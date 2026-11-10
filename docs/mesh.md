@@ -3509,7 +3509,7 @@ An unconstrained path is a **local privilege boundary** (`unix:///var/run/docker
 | `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` | *empty* | Absolute directories a socket may live under. **Empty refuses every `unix://` endpoint.** No built-in `/run` or `/var/run` allowance. |
 | `FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS` | *empty* | Admitted owner uids. Empty admits **only** the Ferrum process's own effective uid. |
 
-A root must be absolute, normalized, and not bare `/`; a malformed entry **fails startup**. Containment is a whole-component, strict-descendant match (`/var/runner/app.sock` is not inside `/var/run`). Both allowlists are process environment and change only with a restart.
+A root must be absolute, normalized, and not bare `/`; a malformed entry **fails startup**. A root that exists must also be **canonical**: because the dial compares the symlink-resolved socket path, a root that itself resolves through a symlink could never contain a socket, so it fails startup with an error naming the entry rather than being canonicalized silently. Write `/run/app`, not `/var/run/app`, on distributions where `/var/run` is a symlink to `/run`. Containment is a whole-component, strict-descendant match (`/run/appsx/app.sock` is not inside `/run/apps`). Both allowlists are process environment and change only with a restart.
 
 #### Admission
 

@@ -266,6 +266,40 @@ fn containment_roots_are_normalized_conservatively() {
     );
 }
 
+/// A root that resolves through a symlink (`/var/run/app` where `/var/run` ->
+/// `/run`) can never contain a symlink-resolved socket path, so every dial would
+/// be refused. Startup refuses it with an actionable error instead of
+/// canonicalizing it silently, while the canonical spelling is admitted.
+#[cfg(unix)]
+#[test]
+fn a_root_that_resolves_through_a_symlink_fails_startup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = std::fs::canonicalize(dir.path()).expect("canonical tempdir");
+    let real = base.join("real");
+    std::fs::create_dir(&real).expect("real root");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlinked root");
+    let real = real.to_str().expect("utf-8 path").to_string();
+    let link = link.to_str().expect("utf-8 path").to_string();
+
+    validate_allowed_roots(&roots(&[real.as_str()])).expect("a canonical root is admitted");
+    let err = validate_allowed_roots(&roots(&[real.as_str(), link.as_str()]))
+        .expect_err("a symlinked root must fail startup");
+    assert!(
+        err.contains("entry 2") && err.contains("symlink"),
+        "the diagnostic must identify the entry and the reason: {err}"
+    );
+    assert!(
+        !err.contains(&link) && !err.contains(&real),
+        "the diagnostic must not interpolate the configured path: {err}"
+    );
+    // A root that does not exist yet cannot be resolved and is left to the
+    // dial-time check.
+    let missing = format!("{link}/not-yet-created");
+    validate_allowed_roots(&roots(&[missing.as_str()]))
+        .expect("an absent root is not judged at startup");
+}
+
 /// A malformed root is a hard error, never a silently skipped entry: skipping
 /// would narrow a reviewed security allowlist with no signal at all.
 #[test]
