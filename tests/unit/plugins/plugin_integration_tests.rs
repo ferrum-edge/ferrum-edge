@@ -1368,7 +1368,7 @@ async fn test_response_cache_revalidation_respects_gate_change() {
 /// The published gate identity alone is not a sufficient provenance witness
 /// (GHSA-83rc-23c9-3g9x).
 ///
-/// Mesh publishes the gate map from `record_applied_slice`, i.e. AFTER
+/// Mesh publishes the gate map from `record_applied_slice_with_token`, i.e. AFTER
 /// `ProxyState::update_config` has published the new `RequestEpoch`. A request
 /// that pinned the previous plugin generation can therefore still pin the NEW
 /// publication identity — its authenticate/authorize phase runs before
