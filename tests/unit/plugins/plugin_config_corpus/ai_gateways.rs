@@ -419,7 +419,6 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                     "aggregate_resources": true,
                     "aggregate_prompts": true,
                     "cache_ttl_seconds": 300,
-                    "hide_denied_items": true,
                     "namespace_separator": ".",
                     "on_new_tool": "hide_until_configured",
                     "on_schema_change": "hide_until_configured"

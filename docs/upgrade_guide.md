@@ -28,6 +28,21 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `mcp_gateway`: `discovery.hide_denied_items` is removed; `emit_metadata` gates every `mcp.*` key (#7136)
+
+`discovery.hide_denied_items` duplicated `policy.hide_denied_tools`: a denied
+tool was listed only when both were `false`, so changing either one alone did
+nothing. It is now an unknown key and fails config load. Delete it, and set
+`policy.hide_denied_tools: false` where denied tools should be listed.
+
+`observability.emit_metadata: false` now also suppresses the `mcp.*` keys some
+paths recorded regardless of the flag: `mcp.route_decision` on synthetic and
+refused responses, `mcp.session.downstream`, `mcp.protocol_version`,
+`mcp.protocol_version_negotiated`, and the `mcp.sse.*` delivery tokens. Only
+`mcp.bridge.upstream_status` / `mcp.bridge.gateway_error` and the argument keys
+(governed by `log_argument_hash` / `log_raw_arguments`) are still recorded.
+Leave `emit_metadata` at its default `true` if dashboards read those keys.
+
 ### WebSocket frame records spell `direction` like every other record (#7144)
 
 `ws_frame_logging` frame records (the `ws_frame_log` tracing target) and the
