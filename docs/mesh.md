@@ -5105,6 +5105,8 @@ The node-agent variables are indexed under [Node Agent](#node-agent) in Environm
 
 Istio `VirtualService` resources are translated at the Kubernetes translation layer into Ferrum proxy configuration. The following per-route features are supported:
 
+**Generated route ids are claimed per VirtualService.** Route proxy ids (`istio-vs-<ns>-<name>-<route suffix>`) and weighted-split upstream ids (`istio-vs-upstream-<ns>-<name>-<index>`) join the name and suffix with `-` and fold `.` into `-`, so two VirtualServices in one namespace can derive the same id (`my.app` and `my-app`, or `a` `http[1]` match 0 and `a-1` `http[0]`). The VirtualService translated first (snapshot order: namespace, then name) owns the id; a later one deriving an owned proxy or upstream id is refused as a whole and reports `FerrumAccepted=False`/`Invalid` naming the owner, instead of having its route shadowed or replacing the owner's backends. Rename one of the two to resolve it. Ids in different namespaces never collide.
+
 ### Route splits and URI matches
 
 `VirtualService.http[].route` splits are preserved. A lone destination becomes a direct proxy backend and receives all traffic; multiple active destinations create a generated `Upstream` referenced through `upstream_id`, using `weighted_round_robin` only when weights differ (otherwise `round_robin`). In a multi-destination split, omitted weights and `weight: 0` destinations are inactive. Malformed or out-of-range weights are rejected.

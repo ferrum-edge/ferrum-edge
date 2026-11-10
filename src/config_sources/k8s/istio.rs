@@ -29,9 +29,9 @@ use super::{
     RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
     invalid_resource, is_vs_authority_header, mesh_route_dispatch_can_emit_rule,
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
-    mesh_route_dispatch_rules_for_proxy, optional_port_field, optional_target_weight_field,
-    parse_istio_duration_ms, port_from_u64, proxy_for_route, request_termination_plugin_for_proxy,
-    resolve_workload_entry_service_attachment, resource_id,
+    mesh_route_dispatch_rules_for_proxy, namespaced_resource_key, optional_port_field,
+    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    request_termination_plugin_for_proxy, resolve_workload_entry_service_attachment, resource_id,
     route_backends_require_node_waypoint_authz, route_local_fault_delay_for_rule,
     route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
     route_response_transformer_plugin_for_proxy, sidecar_selector_from_istio, string_array,
@@ -86,17 +86,19 @@ pub(super) fn translate(
         }
         "VirtualService" => {
             let (proxies, upstreams, plugins) = virtual_service_routes(object, acc)?;
+            claim_virtual_service_ids(acc, object, &proxies, &upstreams)?;
             for upstream in upstreams {
                 acc.upsert_upstream(upstream);
             }
             // Proxy-scoped plugins follow their proxy (GHSA-qw5p-g8jx-pmv8).
             // Plugin ids are derived from the proxy id, so pushing the plugins
-            // of a proxy `upsert_proxy` refused (another VirtualService already
-            // produced the same lossy id) would publish two plugin configs with
-            // one `(namespace, id)`, and the publish-time duplicate check would
-            // then reject every later Kubernetes reconcile cluster-wide. A
-            // replaced proxy's previous plugins are withdrawn for the same
-            // reason before this VirtualService's plugins are added.
+            // of a proxy `upsert_proxy` refused would publish two plugin
+            // configs with one `(namespace, id)`, and the publish-time
+            // duplicate check would then reject every later Kubernetes
+            // reconcile cluster-wide. A replaced proxy's previous plugins are
+            // withdrawn for the same reason before this VirtualService's
+            // plugins are added. (A second VirtualService deriving an owned id
+            // never gets here: `claim_virtual_service_ids` refuses it.)
             let mut accepted_proxy_keys: Vec<(String, String)> = Vec::new();
             let mut refused_proxy_keys: Vec<(String, String)> = Vec::new();
             for proxy in proxies {
@@ -155,6 +157,58 @@ pub(super) fn translate(
         }
         _ => Ok(false),
     }
+}
+
+/// Bind every route proxy and route upstream id `virtual_service` derived to
+/// that object (GHSA-qw5p-g8jx-pmv8).
+///
+/// `resource_id` folds `.` into `-` and joins name and route suffix with `-`,
+/// so two VirtualServices in one namespace can derive one id (`my.app` /
+/// `my-app`, or `a` `http[1]` match 0 / `a-1` `http[0]`). The object
+/// translated first (snapshot order) keeps the id; a later one is refused as a
+/// whole with `invalid_resource`, so it reports `FerrumAccepted=False` instead
+/// of having its route silently shadowed, or its upstream overwrite the
+/// owner's backends, while reporting accepted. The error is returned before
+/// anything is upserted, and the reconciler retranslates without the refused
+/// object, so the refusal is atomic.
+fn claim_virtual_service_ids(
+    acc: &mut K8sAccumulator,
+    virtual_service: &K8sObject,
+    proxies: &[Proxy],
+    upstreams: &[crate::config::types::Upstream],
+) -> Result<(), K8sTranslateError> {
+    for proxy in proxies {
+        let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
+            continue;
+        };
+        if let Some(owner) = acc.claim_istio_virtual_service_proxy(&key, virtual_service) {
+            return Err(invalid_resource(
+                virtual_service,
+                format!(
+                    "VirtualService route proxy id {:?} is already derived by VirtualService \
+                     {:?} in the same namespace; rename one of the two VirtualServices",
+                    proxy.id, owner.name
+                ),
+            ));
+        }
+    }
+    for upstream in upstreams {
+        let Some(key) = namespaced_resource_key(&upstream.namespace, &upstream.id) else {
+            continue;
+        };
+        if let Some(owner) = acc.claim_istio_virtual_service_upstream(&key, virtual_service) {
+            return Err(invalid_resource(
+                virtual_service,
+                format!(
+                    "VirtualService route upstream id {:?} is already derived by \
+                     VirtualService {:?} in the same namespace; rename one of the two \
+                     VirtualServices",
+                    upstream.id, owner.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn authorization_policy(

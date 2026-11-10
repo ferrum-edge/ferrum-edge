@@ -1089,6 +1089,14 @@ pub(crate) struct K8sAccumulator {
     /// replacing, merging into, or attaching plugins to the owner's resource.
     pub(crate) gateway_api_route_proxy_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
     pub(crate) gateway_api_route_upstream_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
+    /// The VirtualService that first derived each route proxy id and route
+    /// upstream id. `resource_id` is a lossy join (`my.app` / `my-app`, or
+    /// `a` `http[1]` match 0 / `a-1` `http[0]`), so a second VirtualService
+    /// deriving an owned `(namespace, id)` is refused as a whole instead of
+    /// being silently shadowed or overwriting the owner's upstream
+    /// (GHSA-qw5p-g8jx-pmv8).
+    pub(crate) istio_virtual_service_proxy_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
+    pub(crate) istio_virtual_service_upstream_owners: HashMap<NamespacedResourceId, K8sResourceKey>,
     /// Live materialization credit per attachment: the proxies that currently
     /// serve that exact claim. A merged claim is credited to the proxy it
     /// collapsed into, so withdrawing that proxy withdraws the merged claim
@@ -1197,6 +1205,8 @@ impl K8sAccumulator {
             gateway_api_route_proxy_attachments: HashMap::new(),
             gateway_api_route_proxy_owners: HashMap::new(),
             gateway_api_route_upstream_owners: HashMap::new(),
+            istio_virtual_service_proxy_owners: HashMap::new(),
+            istio_virtual_service_upstream_owners: HashMap::new(),
             gateway_api_materialized_route_attachments: HashMap::new(),
             gateway_api_refused_route_attachments: HashSet::new(),
             gateway_api_transport_refused_route_attachments: HashSet::new(),
@@ -1653,6 +1663,36 @@ impl K8sAccumulator {
         route: &K8sObject,
     ) -> bool {
         claim_route_resource_owner(&mut self.gateway_api_route_upstream_owners, key, route)
+    }
+
+    /// Claim a VirtualService route proxy id for `virtual_service`. Returns
+    /// the other VirtualService that already derived the same
+    /// `(namespace, id)`, if any.
+    pub(crate) fn claim_istio_virtual_service_proxy(
+        &mut self,
+        key: &NamespacedResourceId,
+        virtual_service: &K8sObject,
+    ) -> Option<K8sResourceKey> {
+        route_resource_owner_conflict(
+            &mut self.istio_virtual_service_proxy_owners,
+            key,
+            virtual_service,
+        )
+    }
+
+    /// Claim a VirtualService route upstream id for `virtual_service`.
+    /// Returns the other VirtualService that already derived the same
+    /// `(namespace, id)`, if any.
+    pub(crate) fn claim_istio_virtual_service_upstream(
+        &mut self,
+        key: &NamespacedResourceId,
+        virtual_service: &K8sObject,
+    ) -> Option<K8sResourceKey> {
+        route_resource_owner_conflict(
+            &mut self.istio_virtual_service_upstream_owners,
+            key,
+            virtual_service,
+        )
     }
 
     /// Report the `(route, parentRef, listener)` claims of a route proxy that
@@ -4438,13 +4478,24 @@ fn claim_route_resource_owner(
     key: &NamespacedResourceId,
     route: &K8sObject,
 ) -> bool {
+    route_resource_owner_conflict(owners, key, route).is_none()
+}
+
+/// Claim `key` for `route`, returning the different object that already owns
+/// it. Repeated claims by the same object succeed.
+fn route_resource_owner_conflict(
+    owners: &mut HashMap<NamespacedResourceId, K8sResourceKey>,
+    key: &NamespacedResourceId,
+    route: &K8sObject,
+) -> Option<K8sResourceKey> {
     if let Some(owner) = owners.get(key) {
-        return owner.kind == route.kind
+        let same_object = owner.kind == route.kind
             && owner.namespace == route.metadata.namespace
             && owner.name == route.metadata.name;
+        return (!same_object).then(|| owner.clone());
     }
     owners.insert(key.clone(), K8sResourceKey::from_object(route));
-    true
+    None
 }
 
 /// Build a `(namespace, id)` ownership key, failing closed on empty components.
