@@ -15560,8 +15560,7 @@ pub mod _test_support {
     /// rule's deadlines (#5646), for a total deadline `total`, an attempt
     /// budget `attempt_timeout`, and the committed attempt's budget instant
     /// `attempt_deadline`: `(a fresh attempt's budget instant, the committed
-    /// body's deadline, whether the attempt budget alone has expired, how the
-    /// body deadline ended the attempt)`.
+    /// body's deadline, how the body deadline ended the attempt)`.
     pub fn h3_route_attempt_bounds_for_test(
         total: Option<tokio::time::Instant>,
         attempt_timeout: Option<std::time::Duration>,
@@ -15569,14 +15568,12 @@ pub mod _test_support {
     ) -> (
         Option<tokio::time::Instant>,
         Option<tokio::time::Instant>,
-        bool,
         &'static str,
     ) {
         let route = crate::http3::route_deadline::H3RouteDeadlines::new(total, attempt_timeout);
         (
             route.start_attempt(),
             route.body_deadline(attempt_deadline),
-            route.attempt_budget_expired(attempt_deadline),
             route_deadline_expiry_label(route.body_expiry()),
         )
     }

@@ -315,30 +315,26 @@ async fn native_http3_bounds_the_committed_body_by_the_earlier_deadline() {
 
     // A fresh attempt budget starts now, and the committed body is cut at the
     // earlier of it and the total deadline.
-    let (fresh, body, budget_expired, _) =
-        bounds(Some(total), Some(budget), Some(attempt_deadline));
+    let (fresh, body, _) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(fresh, Some(attempt_deadline));
     assert_eq!(body, Some(attempt_deadline));
-    assert!(!budget_expired);
-    let (_, body, _, _) = bounds(Some(total), None, None);
+    let (_, body, _) = bounds(Some(total), None, None);
     assert_eq!(body, Some(total));
 
     // The attempt budget alone has expired: the retryable backend timeout.
     tokio::time::advance(budget).await;
-    let (_, _, budget_expired, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
-    assert!(budget_expired);
+    let (_, _, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(expiry, "attempt_budget");
 
     // Once the total deadline has elapsed it wins, so the spent transaction
     // is never retried.
     tokio::time::advance(Duration::from_millis(700)).await;
-    let (_, _, budget_expired, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
-    assert!(!budget_expired);
+    let (_, _, expiry) = bounds(Some(total), Some(budget), Some(attempt_deadline));
     assert_eq!(expiry, "in_flight");
 
     // A rule without timeouts arms nothing.
-    let (fresh, body, budget_expired, _) = bounds(None, None, None);
-    assert_eq!((fresh, body, budget_expired), (None, None, false));
+    let (fresh, body, _) = bounds(None, None, None);
+    assert_eq!((fresh, body), (None, None));
 }
 
 #[test]

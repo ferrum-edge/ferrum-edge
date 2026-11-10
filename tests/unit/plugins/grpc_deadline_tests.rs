@@ -8309,8 +8309,7 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
         "the late-failure owner must use the instant send() was observed"
     );
     assert!(
-        bridge.contains("route.attempt_budget_owns(")
-            && !bridge.contains("&& route.attempt_budget_expired(route_attempt_deadline) =>"),
+        bridge.contains("route.attempt_budget_owns("),
         "the prebuffered attempt budget must be attributed from captured instants"
     );
     let streamed_timer = bounded(
