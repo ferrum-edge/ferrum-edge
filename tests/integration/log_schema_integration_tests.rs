@@ -284,7 +284,7 @@ fn prospective_graph_is_namespace_scoped_across_multiple_instances() {
     .expect_err("a referrer must not resolve a definition from another namespace");
     assert!(
         errors.iter().any(|error| {
-            error.contains("namespace=\"tenant-b\"") && error.contains("unknown schema")
+            error.contains("`namespace`=\"tenant-b\"") && error.contains("unknown schema")
         }),
         "unexpected cross-namespace errors: {errors:?}"
     );
