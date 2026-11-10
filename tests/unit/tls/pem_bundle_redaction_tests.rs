@@ -255,6 +255,54 @@ fn material_load_errors_discard_source_and_provider_chains() {
     );
 }
 
+/// The multi-certificate Gateway loader labels unreadable material like the
+/// single-certificate loader and keeps only the failure class, never the raw
+/// I/O text or the source path (issue #7229).
+#[test]
+fn gateway_multi_cert_material_load_errors_keep_label_and_class_only() {
+    use ferrum_edge::config::EnvConfig;
+    use ferrum_edge::tls::TlsPolicy;
+    use ferrum_edge::tls::multi_cert::{
+        GatewayCertificateInput, load_gateway_multi_cert_tls_config,
+    };
+
+    let _env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let dir = TempDir::new().unwrap();
+    let policy = TlsPolicy::from_env_config(&EnvConfig::default()).unwrap();
+    let cert = write_pem(
+        &dir,
+        "gateway.pem",
+        &generate_self_signed_cert(&["localhost"]),
+    );
+    let missing = dir.path().join("'TLS_MISSING_SOURCE_MARKER.pem");
+    let missing = missing.to_str().unwrap().to_string();
+
+    for (cert_source, key_source, label) in [
+        (&missing, &missing, "`Gateway server TLS cert`"),
+        (&cert, &missing, "`Gateway server TLS private key`"),
+    ] {
+        let inputs = vec![GatewayCertificateInput {
+            cert_source: cert_source.clone(),
+            key_source: key_source.clone(),
+            hostname: Some("localhost".to_string()),
+            identity: "ns/gw/listener".to_string(),
+            is_default: true,
+        }];
+        let error = load_gateway_multi_cert_tls_config(&inputs, None, None, &policy, 0, 0, &[])
+            .expect_err("unreadable Gateway material must fail closed");
+        assert_eq!(
+            error.chain().count(),
+            1,
+            "raw I/O causes must not be retained"
+        );
+        assert_rendered_material_error(
+            error,
+            &[label, "failed to read TLS material", "io"],
+            &["TLS_MISSING_SOURCE_MARKER", &missing],
+        );
+    }
+}
+
 #[test]
 fn rendered_crl_parse_error_omits_malformed_pem_and_hostile_filename() {
     let _env = crate::unit::env_lock::EnvGuard::new(&[]);

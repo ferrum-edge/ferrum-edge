@@ -165,7 +165,7 @@ impl StapleTarget<'_> {
     fn rejection(self, display_source_id: &str, error: impl std::fmt::Display) -> anyhow::Error {
         match self {
             Self::ConfiguredListener => {
-                anyhow::anyhow!("OCSP response source '{display_source_id}' was rejected: {error}")
+                anyhow::anyhow!("OCSP response source {display_source_id:?} was rejected: {error}")
             }
             Self::GatewayCertificate(identity) => anyhow::anyhow!(
                 "Gateway certificate {identity} was configured with a stapled OCSP response that \
