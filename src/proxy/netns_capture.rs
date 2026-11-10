@@ -1226,7 +1226,6 @@ impl NetnsBackend for ProxyNetnsBackend {
                 conn_semaphore,
                 stop_rx,
                 mesh_direction,
-                0,
                 SourceIpOverride::Dynamic(source_ip_rx),
                 Some(expected_pod_uid),
                 None,

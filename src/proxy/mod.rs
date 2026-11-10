@@ -1199,30 +1199,26 @@ fn config_empty_ignoring_gateway_managed_plugins(config: &GatewayConfig, namespa
         })
 }
 
-fn gateway_hbone_mtls_observed(
-    dispatch_mesh_transport: bool,
-    error_class: Option<retry::ErrorClass>,
-) -> bool {
-    dispatch_mesh_transport
-        && !matches!(
-            error_class,
-            Some(
-                retry::ErrorClass::ConnectionTimeout
-                    | retry::ErrorClass::ConnectionRefused
-                    | retry::ErrorClass::ConnectionReset
-                    | retry::ErrorClass::ConnectionClosed
-                    | retry::ErrorClass::DnsLookupError
-                    | retry::ErrorClass::TlsError
-                    | retry::ErrorClass::ConnectionPoolError
-                    | retry::ErrorClass::PortExhaustion
-                    | retry::ErrorClass::ProtocolError
-                    | retry::ErrorClass::DispatchPolicyRejected
-                    | retry::ErrorClass::BackendConnectionLimit
-                    | retry::ErrorClass::TrustWithdrawn
-                    | retry::ErrorClass::RequestError
-                    | retry::ErrorClass::RequestBodyTooLarge
-            )
+fn gateway_hbone_mtls_observed(error_class: Option<retry::ErrorClass>) -> bool {
+    !matches!(
+        error_class,
+        Some(
+            retry::ErrorClass::ConnectionTimeout
+                | retry::ErrorClass::ConnectionRefused
+                | retry::ErrorClass::ConnectionReset
+                | retry::ErrorClass::ConnectionClosed
+                | retry::ErrorClass::DnsLookupError
+                | retry::ErrorClass::TlsError
+                | retry::ErrorClass::ConnectionPoolError
+                | retry::ErrorClass::PortExhaustion
+                | retry::ErrorClass::ProtocolError
+                | retry::ErrorClass::DispatchPolicyRejected
+                | retry::ErrorClass::BackendConnectionLimit
+                | retry::ErrorClass::TrustWithdrawn
+                | retry::ErrorClass::RequestError
+                | retry::ErrorClass::RequestBodyTooLarge
         )
+    )
 }
 
 /// Stamp mesh transport metadata for an outbound mesh-mTLS-secured dispatch.
@@ -1237,7 +1233,7 @@ pub(crate) fn annotate_gateway_mesh_metadata(
     let Some(transport) = transport else {
         return;
     };
-    if !gateway_hbone_mtls_observed(true, error_class) {
+    if !gateway_hbone_mtls_observed(error_class) {
         return;
     }
 
@@ -23434,7 +23430,6 @@ async fn run_bound_proxy_listener(
         conn_semaphore,
         shutdown,
         mesh_direction,
-        0,
         SourceIpOverride::none(),
         None,
         frontend_proxy_protocol,
@@ -24680,8 +24675,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
         // (already handled above) cannot leave orphan tasks behind.
         let mut handles = Vec::with_capacity(listeners.len());
 
-        for (offset, listener) in listeners.into_iter().enumerate() {
-            let i = offset + 1;
+        for listener in listeners {
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();
@@ -24697,7 +24691,6 @@ async fn start_proxy_listener_with_tls_source_and_signal(
                     semaphore,
                     shutdown_rx,
                     mesh_direction,
-                    i,
                     SourceIpOverride::none(),
                     None,
                     frontend_proxy_protocol,
@@ -24711,7 +24704,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             "Proxy listener started on {} (backlog={}, accept_threads={})",
             addr, backlog, accept_threads
         );
-        // Run thread 0 on the current task (avoids an extra spawn)
+        // Run the primary loop on the current task (avoids an extra spawn)
         run_accept_loop(
             first_listener,
             state,
@@ -24719,7 +24712,6 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             conn_semaphore,
             shutdown,
             mesh_direction,
-            0,
             SourceIpOverride::none(),
             None,
             frontend_proxy_protocol,
@@ -24741,7 +24733,6 @@ async fn start_proxy_listener_with_tls_source_and_signal(
             conn_semaphore,
             shutdown,
             mesh_direction,
-            0,
             SourceIpOverride::none(),
             None,
             frontend_proxy_protocol,
@@ -24837,7 +24828,6 @@ async fn run_accept_loop(
     conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
-    _thread_id: usize,
     // Overrides the accepted connection's client IP. Used by the node-waypoint
     // in-netns capture path: `connect4` rewrites a captured pod's egress to
     // loopback, so the accepted peer is 127.0.0.1; this carries the real source
@@ -30421,7 +30411,7 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
                 ctx.retained_response_body_ceiling() as u128,
             ));
             crate::plugins::invalidate_content_bound_response_headers(response_headers);
-            restore_authoritative_gateway_error_header(response_headers, "overload");
+            restore_authoritative_gateway_error_header(response_headers, X_GATEWAY_ERROR_OVERLOAD);
         } else {
             *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
             *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
