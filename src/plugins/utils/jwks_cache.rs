@@ -36,7 +36,7 @@
 //! latest completed union, not an eventually convergent one.
 
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, TryLockError};
@@ -807,36 +807,6 @@ fn acquire_reconcile_gate(on_contended: Option<&dyn Fn()>) -> MutexGuard<'static
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
-}
-
-/// Remove JWKS cache entries whose URIs are not in `active_uris`.
-///
-/// Lower-level test-only helper: it decides activity from a bare URI set and
-/// deliberately ignores both the committed requirement map and late
-/// contributions. Production reconciliation goes through
-/// [`retain_active_requirements`] / [`reconcile_active_requirements`].
-///
-/// Aborts the background refresh task for each removed entry so leaked tokio
-/// tasks don't accumulate across config reloads. Stores still owned by a
-/// retired plugin generation are reaped after their final external owner
-/// drops. External unit tests use this lower-level helper to exercise
-/// retirement independently from refresh-interval reconciliation.
-#[allow(dead_code)] // exercised by external unit tests
-pub fn retain_active_uris(active_uris: &HashSet<String>) {
-    let cache = global_cache();
-    cache.retain(|uri, entry| {
-        if active_uris.contains(uri) {
-            // Cancel a reaper scheduled by an older publication if this URI is
-            // active again in the newly committed plugin generation.
-            entry.active.store(true, Ordering::Release);
-            entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
-            true
-        } else {
-            entry.active.store(false, Ordering::Release);
-            retain_retired_entry(uri, entry)
-        }
-    });
-    republish_trust_health();
 }
 
 fn retain_retired_entry(uri: &str, entry: &JwksCacheEntry) -> bool {

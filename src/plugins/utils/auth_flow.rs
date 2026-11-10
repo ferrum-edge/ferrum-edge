@@ -375,17 +375,6 @@ pub enum CredentialDeadline {
     Invalid,
 }
 
-impl CredentialDeadline {
-    /// The representable deadline, if there is one. `None` for both
-    /// `Unbounded` and `Invalid`, so this must never decide admission.
-    pub fn bounded(self) -> Option<tokio::time::Instant> {
-        match self {
-            Self::Bounded(deadline) => Some(deadline),
-            Self::Unbounded | Self::Invalid => None,
-        }
-    }
-}
-
 /// Wall-clock seconds since the Unix epoch, saturating for a host clock that
 /// predates it. The conversions below then read that saturation as "nothing
 /// remains", which is the fail-closed direction.
@@ -879,13 +868,6 @@ fn parse_authentication_challenges(value: &str) -> Option<Vec<ParsedChallenge<'_
         pos = skip_list_separators(bytes, pos);
     }
     Some(challenges)
-}
-
-/// The auth-scheme token that opens a challenge (RFC 9110 §11.1).
-pub fn authentication_challenge_scheme(challenge: &str) -> &str {
-    let challenge = challenge.trim_start_matches([' ', '\t', ',']);
-    let end = scan_token(challenge.as_bytes(), 0);
-    &challenge[..end]
 }
 
 /// Whether `value` may be emitted as a `WWW-Authenticate` field value: a

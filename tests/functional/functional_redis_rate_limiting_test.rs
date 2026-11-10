@@ -1272,7 +1272,10 @@ async fn await_epoch_window_offset(window_nanos: u128, offset: std::ops::Range<u
 /// generate, so a runner slow enough to move the traffic out of the window the
 /// scenario needs is reported as a skip rather than passing vacuously.
 fn live_sub_bucket(window_seconds: u64) -> u64 {
-    ferrum_edge::_test_support::redis_sub_bucket(window_seconds).index
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after Unix epoch");
+    ferrum_edge::_test_support::redis_sub_bucket_at(now, window_seconds).index
 }
 
 /// Issue one bounded GET and return its status.

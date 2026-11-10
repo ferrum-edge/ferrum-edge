@@ -205,8 +205,7 @@ type HighWaterHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
 /// Explicit result of a non-blocking [`BatchingLogger::try_send_outcome`].
 ///
-/// [`BatchingLogger::try_send`] remains a compatibility wrapper that is `true`
-/// only for [`Self::ChannelAccepted`].
+/// [`Self::as_bool`] is `true` only for [`Self::ChannelAccepted`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrySendOutcome {
     /// Item admitted to the bounded in-memory channel.
@@ -224,7 +223,7 @@ pub enum TrySendOutcome {
 }
 
 impl TrySendOutcome {
-    /// Historical `try_send` semantics: true only when the item entered the channel.
+    /// True only when the item entered the channel.
     #[inline]
     pub fn as_bool(self) -> bool {
         matches!(self, Self::ChannelAccepted)
@@ -462,14 +461,6 @@ impl<T: Send + Sync + 'static> BatchingLogger<T> {
     pub fn close_and_abort(&mut self) {
         drop(self.sender.take());
         self.worker.abort();
-    }
-
-    /// Non-blocking send. Compatibility wrapper: `true` only when the item was
-    /// admitted to the bounded channel. Prefer [`Self::try_send_outcome`] when
-    /// diversion, full-buffer drops, and shutdown must be distinguished.
-    #[allow(dead_code)] // Retained compatibility API exercised by the external unit-test crate.
-    pub fn try_send(&self, item: T) -> bool {
-        self.try_send_outcome(item).as_bool()
     }
 
     /// Non-blocking send with an explicit ownership outcome.

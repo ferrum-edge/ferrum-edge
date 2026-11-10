@@ -6954,16 +6954,6 @@ impl RedisRateLimitClient {
         Self::window_progress(window_seconds).index
     }
 
-    /// Sub-bucket a request charges right now, from ONE wall-clock sample.
-    ///
-    /// One sample per window is what keeps the whole ladder internally
-    /// consistent: a boundary straddle can shift which sub-bucket is charged,
-    /// but it can never pair a charged bucket from one instant with older
-    /// buckets read from another.
-    pub fn sub_bucket(window_seconds: u64) -> RedisSubBucket {
-        Self::sub_bucket_at(redis_epoch_now(), window_seconds)
-    }
-
     /// Deterministic sub-bucket for a captured epoch offset.
     ///
     /// `index = floor(epoch_nanos / (window_nanos / REDIS_WINDOW_SUB_BUCKETS))`.

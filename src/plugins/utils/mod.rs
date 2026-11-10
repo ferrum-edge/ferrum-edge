@@ -87,10 +87,7 @@ pub use summary_log_budget::{
 };
 // Re-exported for external unit tests; unused inside the binary target.
 #[allow(unused_imports)]
-pub use log_helpers::{
-    HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT,
-    handle_http_batch_response,
-};
+pub use log_helpers::{HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT};
 pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
 pub use tcp_endpoint::resolve_tcp_endpoint;
 pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, resolve_udp_endpoint};

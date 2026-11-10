@@ -8015,11 +8015,6 @@ pub mod _test_support {
         RedisRateLimitClient::sub_bucket_at(now, window_seconds)
     }
 
-    /// Live-clock Redis request-quota sub-bucket (single timestamp sample).
-    pub fn redis_sub_bucket(window_seconds: u64) -> RedisSubBucket {
-        RedisRateLimitClient::sub_bucket(window_seconds)
-    }
-
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::{
         DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,

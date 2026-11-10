@@ -6490,7 +6490,7 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: &[QueuedAuditRecord]) -> Resul
         .execute_redacted(request, "ai_transcript_audit", &cfg.endpoint_url_for_logs)
         .await;
     // Sink health is derived from the raw collector response, NOT from the
-    // shared `handle_http_batch_response` result: that helper treats a
+    // shared `handle_http_batch_response_redacted` result: that helper treats a
     // non-retryable non-2xx (401/403/413, e.g. an expired sink token) as a
     // discarded-but-Ok batch so the other logging sinks do not retry it, but
     // for this plugin every record in that batch was silently lost — under

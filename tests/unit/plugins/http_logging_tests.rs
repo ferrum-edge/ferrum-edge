@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ferrum_edge::plugins::utils::handle_http_batch_response;
+use ferrum_edge::plugins::utils::handle_http_batch_response_redacted;
 use ferrum_edge::plugins::utils::sink_loss::{
     SinkLossReason, dropped_total, dropped_total_all_reasons,
 };
@@ -860,7 +860,7 @@ async fn non_retryable_4xx_records_batch_discard_once_per_record() {
             .body("")
             .unwrap()
             .into();
-        handle_http_batch_response(
+        handle_http_batch_response_redacted(
             "HTTP logging",
             "http_logging",
             records as usize,
@@ -881,7 +881,7 @@ async fn non_retryable_4xx_records_batch_discard_once_per_record() {
         .body("")
         .unwrap()
         .into();
-    handle_http_batch_response("HTTP logging", "http_logging", 5, Ok(response))
+    handle_http_batch_response_redacted("HTTP logging", "http_logging", 5, Ok(response))
         .await
         .expect("2xx remains success");
     assert_eq!(
@@ -896,7 +896,7 @@ async fn non_retryable_4xx_records_batch_discard_once_per_record() {
         .body("")
         .unwrap()
         .into();
-    handle_http_batch_response("HTTP logging", "http_logging", 3, Ok(response))
+    handle_http_batch_response_redacted("HTTP logging", "http_logging", 3, Ok(response))
         .await
         .expect_err("429 must remain retryable");
     assert_eq!(
