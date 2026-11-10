@@ -1834,8 +1834,8 @@ gateway, which may differ from the node's `status.hostIP`), so set it explicitly
 via `nodeAgent.trustedKubeletProbeSourceIps`.
 
 NodeWaypoint adds `::/0` to the capture include set so IPv6 destinations reach
-`connect6`; the legacy `ipv6_outbound_deny` flag remains clear in the normal
-dual-family path. Excluded v6 (CIDR/port excludes) still flows. The proxy writes
+`connect6`, which redirects them to `[::1]`. Excluded v6 (CIDR/port excludes)
+still flows. The proxy writes
 `<registry_dir>/.ready4/<pod_uid>` for IPv4 and
 `<registry_dir>/.ready6/<pod_uid>` for IPv6; these dotdirs are skipped by the
 pod-discovery scan.

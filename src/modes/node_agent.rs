@@ -435,13 +435,6 @@ impl NodeAgentConfig {
         let node_waypoint_in_netns = env_config.node_agent_proxy_mode
             == NodeAgentProxyMode::NodeWaypoint
             && capture_config.outbound_capture_enabled;
-        // NodeWaypoint in-netns capture now binds both pod-loopback families.
-        // Keep the global IPv6 include so dual-stack destinations are captured
-        // instead of bypassing `mesh_authz`; if a pod's IPv6 listener is not
-        // ready yet, connect6 redirects to `[::1]:<port>` and fails closed by
-        // connection refusal until the proxy publishes `.ready6`.
-        capture_contract.ipv6_outbound_deny = false;
-
         // Inbound tc ingress redirect (issue #3287). Off unless the operator
         // names at least one node capture interface: the redirect replaces the
         // node-global iptables REDIRECT for enrolled workloads and needs an
@@ -516,7 +509,7 @@ impl NodeAgentConfig {
         // is a generic per-pod map; publishing it does NOT change eBPF/redirect
         // behavior — that stays gated on `node_waypoint_in_netns` via the capture
         // contract, so a plain Ambient (LocalPod) deployment gets the registry for
-        // the UDP producer WITHOUT the NodeWaypoint ipv6-deny / connect4-deferral
+        // the UDP producer WITHOUT the NodeWaypoint `::/0` include / connect4-deferral
         // posture. The UDP gate is `udp_capture_enabled && topology == ambient`,
         // but is NOT anded with `outbound_capture_enabled`: the producer binds its own
         // `FERRUM_MESH_CAPTURE_UDP_PORT` inside each pod netns and does not use the
@@ -11225,9 +11218,9 @@ mod tests {
     #[test]
     fn from_env_config_captures_ipv6_only_in_node_waypoint_mode() {
         // NodeWaypoint in-netns capture binds both pod-loopback families, so the
-        // node-agent must include IPv6 destinations but must not set the old
-        // global deny flag. Other proxy modes leave the normal IPv4-only default
-        // include shape alone.
+        // node-agent must include IPv6 destinations (connect6 redirects them to
+        // `[::1]`). Other proxy modes leave the normal IPv4-only default include
+        // shape alone.
         let waypoint = EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
             ..EnvConfig::default()
@@ -11235,18 +11228,6 @@ mod tests {
         with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-a")], || {
             let config = NodeAgentConfig::from_env_config(&waypoint)
                 .expect("node-agent config should parse");
-            assert!(
-                !config.capture_contract.ipv6_outbound_deny,
-                "NodeWaypoint in-netns mode must redirect captured IPv6 egress to the IPv6 pod-loopback listener"
-            );
-            assert_eq!(
-                config
-                    .capture_contract
-                    .bpf_capture_config()
-                    .ipv6_outbound_deny,
-                0,
-                "the old deny flag must remain clear so connect6 redirects to [::1]"
-            );
             assert!(
                 config
                     .capture_config
@@ -11269,10 +11250,6 @@ mod tests {
             let config = NodeAgentConfig::from_env_config(&local_pod)
                 .expect("node-agent config should parse");
             assert!(
-                !config.capture_contract.ipv6_outbound_deny,
-                "non-NodeWaypoint modes do not fail-close IPv6 egress"
-            );
-            assert!(
                 !config
                     .capture_config
                     .include_cidrs
@@ -11288,7 +11265,7 @@ mod tests {
         // #2013: a plain Ambient (LocalPod) node-agent with UDP capture enabled
         // must publish the per-pod registry so the mesh proxy's per-pod-netns UDP
         // producer can discover enrolled pods — WITHOUT taking on the NodeWaypoint
-        // ipv6-deny / connect4-deferral posture (which stays gated on
+        // `::/0` include / connect4-deferral posture (which stays gated on
         // `node_waypoint_in_netns`).
         let local_pod = EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
@@ -11306,10 +11283,6 @@ mod tests {
                 assert!(
                     config.node_waypoint_pod_registry_dir.is_some(),
                     "Ambient/LocalPod + UDP capture must publish the per-pod registry (#2013)"
-                );
-                assert!(
-                    !config.capture_contract.ipv6_outbound_deny,
-                    "the UDP producer must not flip the NodeWaypoint ipv6-deny posture"
                 );
                 assert!(
                     !config

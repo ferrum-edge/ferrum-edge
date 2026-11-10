@@ -269,12 +269,6 @@ pub struct CaptureContract {
     pub hbone_redirect_port: u16,
     pub unix_socket_path: String,
     pub bpf_maps: CaptureBpfMaps,
-    /// Fail closed on captured IPv6 outbound (the `connect6` hook returns
-    /// `EPERM`) instead of redirecting it. This remains available as a safety
-    /// valve, but NodeWaypoint now keeps it disabled because the in-netns capture
-    /// manager opens an IPv6 pod-loopback listener and missing listeners fail
-    /// closed by connection refusal.
-    pub ipv6_outbound_deny: bool,
     pub node_waypoint_inbound_auth_mark: u32,
     /// Node capture interfaces that carry the tc **ingress** redirect
     /// classifier. Empty (the default) means the redirect is not installed and
@@ -403,7 +397,6 @@ impl CaptureContract {
             hbone_redirect_port,
             unix_socket_path,
             bpf_maps: CaptureBpfMaps::default(),
-            ipv6_outbound_deny: false,
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
             ingress_redirect_ifaces: Vec::new(),
             node_waypoint_ingress_redirect_mark: 0,
@@ -419,7 +412,6 @@ impl CaptureContract {
             hbone_redirect_port: INBOUND_HBONE_PORT,
             unix_socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
             bpf_maps: CaptureBpfMaps::default(),
-            ipv6_outbound_deny: false,
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
             ingress_redirect_ifaces: Vec::new(),
             node_waypoint_ingress_redirect_mark: 0,
@@ -450,7 +442,6 @@ impl CaptureContract {
             (0, 0)
         };
         BpfCaptureConfig::new(self.outbound_capture_port, self.hbone_redirect_port)
-            .with_ipv6_outbound_deny(self.ipv6_outbound_deny)
             .with_node_waypoint_inbound_auth_mark(inbound_auth_mark)
             .with_node_waypoint_ingress_redirect_mark(ingress_redirect_mark)
             .with_node_waypoint_ingress_capture_port(ingress_capture_port)
