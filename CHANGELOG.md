@@ -77,6 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inflated and never shrank after a burst. It now counts the entries the call
   writes, and a failed count fails closed (critical) as on Linux instead of
   reporting `0`. Linux is unchanged.
+- **`POST /batch` refuses stream listeners that single writes refuse**
+  (#7214). A batch could persist a stream proxy on a reserved gateway port
+  (proxy, admin or gRPC listener), on a port another process already holds,
+  or an HTTP proxy on a process-global frontend it can never be served on;
+  the conflict then surfaced only at listener reconcile (fatal at startup in
+  database mode). The batch now runs the same reserved-port, process-global
+  frontend and OS bind-probe checks as `POST /proxies` (skipped on a CP, as
+  for single writes) and reports them as `400` batch validation errors.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

@@ -9507,6 +9507,21 @@ fn stream_listener_bucket(candidate: &GatewayConfig, ports: &HashSet<u16>) -> Ga
     bucket
 }
 
+/// Batch stream ports that a persisted stream proxy in `candidate` (the
+/// namespace snapshot, before the batch is overlaid) already listens on. The
+/// running listener is expected to own those sockets, so the batch skips the
+/// OS bind probe for them, as `crud::validate_stream_port_candidate` reports
+/// for a single write.
+fn persisted_batch_stream_ports(candidate: &GatewayConfig, ports: &HashSet<u16>) -> HashSet<u16> {
+    candidate
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.dispatch_kind.is_stream())
+        .filter_map(|proxy| proxy.listen_port)
+        .filter(|port| ports.contains(port))
+        .collect()
+}
+
 fn overlay_batch_proxies(candidate: &mut GatewayConfig, proxies: &[Proxy]) {
     crud::overlay_resources_by_id(&mut candidate.proxies, proxies, |item| item.id.as_str());
 }
@@ -9722,10 +9737,19 @@ async fn handle_batch_create(
         .filter(|proxy| proxy.dispatch_kind.is_stream())
         .filter_map(|proxy| proxy.listen_port)
         .collect();
+    // Batch stream ports a persisted stream proxy already listens on; the OS
+    // bind probe below skips them. Filled from the full namespace snapshot,
+    // which one of the two branches below always loads when the batch carries
+    // stream listeners.
+    let mut persisted_stream_ports: HashSet<u16> = HashSet::new();
 
     if batch_needs_consumer_snapshot(&batch) {
         match db.load_namespace_snapshot(namespace).await {
             Ok(mut candidate_config) => {
+                persisted_stream_ports.extend(persisted_batch_stream_ports(
+                    &candidate_config,
+                    &batch_stream_ports,
+                ));
                 overlay_batch_consumers(&mut candidate_config, &batch.consumers);
                 overlay_batch_proxies(&mut candidate_config, &batch.proxies);
                 overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
@@ -9788,6 +9812,10 @@ async fn handle_batch_create(
         };
         match candidate {
             Ok(mut candidate_config) => {
+                persisted_stream_ports.extend(persisted_batch_stream_ports(
+                    &candidate_config,
+                    &batch_stream_ports,
+                ));
                 overlay_batch_proxies(&mut candidate_config, &batch.proxies);
                 overlay_batch_plugin_configs(&mut candidate_config, &batch.plugin_configs);
                 if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
@@ -9803,6 +9831,47 @@ async fn handle_batch_create(
             Err(error) => {
                 warn_persistence_failure_redacted("batch_mtls_compat_candidate_load");
                 return Ok(batch_candidate_db_failure(&error));
+            }
+        }
+    }
+
+    // Process-level listener admission, mirroring single-resource proxy
+    // writes (`after_validate` for `Proxy` in crud.rs, issue #7214): a proxy
+    // on a process-global frontend it can never be served on, a stream
+    // listener on a reserved gateway port, and a new stream port the host
+    // cannot bind are refused here rather than at listener reconcile. A CP
+    // cannot know its DPs' ports and skips these, as single writes do.
+    if state.mode != "cp" {
+        let mut probed_stream_ports: HashSet<(u16, bool)> = HashSet::new();
+        for proxy in &batch.proxies {
+            if let Some(error) = crud::process_global_frontend_conflict(state, proxy) {
+                validation_errors.push(error);
+            }
+            if !proxy.dispatch_kind.is_stream() {
+                continue;
+            }
+            let Some(port) = proxy.listen_port else {
+                continue;
+            };
+            if state.reserved_ports.contains(&port) {
+                validation_errors.push(format!(
+                    "Proxy '{}' listen_port {} conflicts with a gateway reserved port \
+                     (proxy/admin/gRPC listener)",
+                    proxy.id, port
+                ));
+                continue;
+            }
+            let udp = proxy.dispatch_kind.is_udp();
+            if persisted_stream_ports.contains(&port) || !probed_stream_ports.insert((port, udp)) {
+                continue;
+            }
+            if let Err(error) =
+                check_port_available(port, &state.stream_proxy_bind_address, udp).await
+            {
+                validation_errors.push(format!(
+                    "Proxy '{}' listen_port {} is not available on the host: {}",
+                    proxy.id, port, error
+                ));
             }
         }
     }
