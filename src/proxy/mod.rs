@@ -37146,6 +37146,12 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        // gRPC-Web carries the status in a body trailer frame, never as
+        // response header fields (issue #7155), exactly like the
+        // `allowed_methods` refusal below.
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, StatusCode::FORBIDDEN.as_u16());
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
@@ -37157,6 +37163,9 @@ async fn handle_proxy_request_inner(
             0,
         )
         .await;
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
         return Ok(build_response_from_normalized_reject(reject));
     }
 
@@ -39668,7 +39677,9 @@ async fn handle_proxy_request_inner(
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
-                let mut reject = finalize_reject_response_with_after_proxy_hooks(
+                // A gRPC-Web reject runs the committed observers once, while
+                // translating to the body-trailer representation (issue #7155).
+                let mut reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -39677,6 +39688,7 @@ async fn handle_proxy_request_inner(
                     ),
                     circuit_breaker_open_reject_headers(),
                     is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
                 )
                 .await;
                 restore_authoritative_gateway_error_header(
@@ -39684,6 +39696,13 @@ async fn handle_proxy_request_inner(
                     X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
                 );
                 apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
                 // Use `original_request_path` so the log records the path the
                 // client actually requested, not the VirtualService-rewritten
                 // backend path stored in `ctx.path` after the rewrite above.
@@ -39699,6 +39718,9 @@ async fn handle_proxy_request_inner(
                 .await;
                 ctx.terminal_record.mark_counted();
                 record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
                 return Ok(build_response_from_normalized_reject(reject));
             }
         };
