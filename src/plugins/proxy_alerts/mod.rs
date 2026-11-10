@@ -156,7 +156,8 @@ pub struct ProxyAlerts {
 /// task reaches it through a `Weak` so it never extends the instance's life.
 struct AlertCore {
     rules: Arc<Vec<Rule>>,
-    channel_by_id: Arc<HashMap<u32, Arc<NotificationChannel>>>,
+    /// Channels indexed by their dense id (`0..channels.len()`).
+    channel_by_id: Arc<Vec<Arc<NotificationChannel>>>,
     windows: Arc<WindowStore>,
     cooldowns: Arc<CooldownGate>,
     /// One incident-lifecycle gate per channel, indexed by channel id (ids are
@@ -577,8 +578,8 @@ impl ProxyAlerts {
             .core
             .channel_by_id
             .iter()
-            .find(|(_, channel)| channel.name() == channel_name)
-            .map(|(id, _)| *id)?;
+            .position(|channel| channel.name() == channel_name)
+            .and_then(|id| u32::try_from(id).ok())?;
         self.core
             .recovery_gate(channel_id)?
             .current_state(rule_id, proxy_id, ownership_generation)
@@ -997,7 +998,7 @@ impl AlertCore {
         time_driven: bool,
     ) -> Option<AdmittedDispatch> {
         let gate = self.recovery_gate(channel_id)?;
-        let channel = self.channel_by_id.get(&channel_id)?;
+        let channel = self.channel_by_id.get(channel_id as usize)?;
         let rule_id = rule.id();
         // One state read per channel per sample; evaluation reuses it.
         let previous_state = gate.current_state(rule_id, owner_key, ownership_generation);
@@ -1411,7 +1412,7 @@ impl Plugin for ProxyAlerts {
         let mut hosts: Vec<String> = self
             .core
             .channel_by_id
-            .values()
+            .iter()
             .flat_map(|channel| channel.warmup_hostnames())
             .collect();
         hosts.sort();

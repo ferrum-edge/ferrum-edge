@@ -671,8 +671,8 @@ impl WsFrameLogging {
         outcome: &'static str,
     ) {
         let dir_label = match direction {
-            WebSocketFrameDirection::ClientToBackend => "client->backend",
-            WebSocketFrameDirection::BackendToClient => "backend->client",
+            WebSocketFrameDirection::ClientToBackend => "client_to_backend",
+            WebSocketFrameDirection::BackendToClient => "backend_to_client",
         };
         let plugin_id: &str = &self.config.plugin_id;
         match self.config.log_level {

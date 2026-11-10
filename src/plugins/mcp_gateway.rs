@@ -132,7 +132,6 @@ const MCP_DISCOVERY_KEYS: &[&str] = &[
     "aggregate_resources",
     "aggregate_tools",
     "cache_ttl_seconds",
-    "hide_denied_items",
     "namespace_separator",
     "on_new_tool",
     "on_schema_change",
@@ -402,7 +401,6 @@ struct McpDiscoveryConfig {
     aggregate_prompts: bool,
     namespace_separator: String,
     cache_ttl: Duration,
-    hide_denied_items: bool,
     on_new_tool: DiscoveryBehavior,
     on_schema_change: DiscoveryBehavior,
 }
@@ -1728,7 +1726,6 @@ impl McpGateway {
                         "aggregate_resources",
                         "aggregate_tools",
                         "cache_ttl_seconds",
-                        "hide_denied_items",
                         "namespace_separator",
                         "on_new_tool",
                         "on_schema_change",
@@ -2082,7 +2079,9 @@ impl McpGateway {
                         .map(ToOwned::to_owned)
                 })
             });
-        if let Some(version) = version.as_deref() {
+        if self.observability.emit_metadata
+            && let Some(version) = version.as_deref()
+        {
             ctx.metadata.insert(
                 "mcp.protocol_version".to_string(),
                 bounded_metadata_identifier(version),
@@ -2114,8 +2113,7 @@ impl McpGateway {
         {
             return None;
         }
-        ctx.metadata
-            .insert("mcp.route_decision".to_string(), "deny".to_string());
+        self.note_route_decision(ctx, "deny");
         Some(json_response(
             400,
             json!({
@@ -3411,32 +3409,54 @@ impl McpGateway {
         true
     }
 
-    /// Write one fixed-key `mcp.*` metadata entry.
-    fn note_metadata(ctx: &mut RequestContext, key: &str, value: &str) {
-        ctx.metadata.insert(key.to_string(), value.to_string());
+    /// Write one descriptive `mcp.*` metadata entry when
+    /// `observability.emit_metadata` is on.
+    ///
+    /// Every descriptive key goes through here or an explicit
+    /// `emit_metadata` check. The exceptions are documented: the
+    /// `mcp.bridge.*` outcome keys (the client sees a `200` either way), the
+    /// argument keys governed by their own `observability.log_*` knobs, and the
+    /// internal rewrite-coordination keys other phases read.
+    fn note_metadata(&self, ctx: &mut RequestContext, key: &str, value: &str) {
+        if self.observability.emit_metadata {
+            ctx.metadata.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    /// Record the hashed downstream session id (`mcp.session.downstream`),
+    /// hashing only when metadata is emitted.
+    fn note_downstream_session(&self, ctx: &mut RequestContext, session_id: &str) {
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.session.downstream".to_string(), hash_str(session_id));
+        }
     }
 
     /// Record a fixed SSE reason token.
     ///
     /// The token comes from the error VARIANT, so no session id, JSON-RPC id,
     /// header value, or event payload can reach transaction metadata or a log.
-    fn note_sse_error(ctx: &mut RequestContext, error: AggregateSseError) {
-        Self::note_metadata(ctx, "mcp.sse.error", error.reason_token());
+    fn note_sse_error(&self, ctx: &mut RequestContext, error: AggregateSseError) {
+        self.note_metadata(ctx, "mcp.sse.error", error.reason_token());
     }
 
-    fn note_sse_cancel(ctx: &mut RequestContext, reason: &str) {
-        Self::note_metadata(ctx, "mcp.sse.cancel", reason);
+    fn note_sse_cancel(&self, ctx: &mut RequestContext, reason: &str) {
+        self.note_metadata(ctx, "mcp.sse.cancel", reason);
     }
 
-    fn note_route_decision(ctx: &mut RequestContext, decision: &str) {
-        Self::note_metadata(ctx, "mcp.route_decision", decision);
+    fn note_route_decision(&self, ctx: &mut RequestContext, decision: &str) {
+        self.note_metadata(ctx, "mcp.route_decision", decision);
     }
 
     /// Fail-closed SSE rejection: fixed status, fixed reason, fixed metadata
     /// token. No client-controlled value reaches any of the three.
-    fn sse_error_response(ctx: &mut RequestContext, error: AggregateSseError) -> PluginResult {
-        Self::note_route_decision(ctx, "deny");
-        Self::note_sse_error(ctx, error);
+    fn sse_error_response(
+        &self,
+        ctx: &mut RequestContext,
+        error: AggregateSseError,
+    ) -> PluginResult {
+        self.note_route_decision(ctx, "deny");
+        self.note_sse_error(ctx, error);
         let body = json!({"error": error.as_static_reason()});
         json_response(error.http_status(), body, None)
     }
@@ -3457,26 +3477,26 @@ impl McpGateway {
         headers: &HashMap<String, String>,
     ) -> PluginResult {
         if !self.sessions.sse_multiplexing {
-            Self::note_route_decision(ctx, "deny");
+            self.note_route_decision(ctx, "deny");
             let body = json!({"error": "aggregate MCP SSE multiplexing is disabled"});
             return json_response(405, body, None);
         }
         if !super::mcp_aggregate_sse::headers_request_aggregate_sse(headers) {
-            return Self::sse_error_response(ctx, AggregateSseError::InvalidAccept);
+            return self.sse_error_response(ctx, AggregateSseError::InvalidAccept);
         }
         let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-            return Self::sse_error_response(ctx, AggregateSseError::MissingSession);
+            return self.sse_error_response(ctx, AggregateSseError::MissingSession);
         };
         if !self.touch_downstream_session(&session_id, ctx).await {
-            Self::note_route_decision(ctx, "deny");
-            Self::note_sse_error(ctx, AggregateSseError::UnknownSession);
+            self.note_route_decision(ctx, "deny");
+            self.note_sse_error(ctx, AggregateSseError::UnknownSession);
             return session_not_found_response();
         }
         // Record only THAT a resume cursor was present. The value is
         // client-controlled, so neither it nor its length reaches metadata.
         let last_event_id = header_value(headers, "last-event-id");
         if last_event_id.is_some() {
-            Self::note_metadata(ctx, "mcp.sse.resume_requested", "true");
+            self.note_metadata(ctx, "mcp.sse.resume_requested", "true");
         }
         match self.sse_broker.attach_listener(&session_id, last_event_id) {
             Ok(listener) => {
@@ -3485,9 +3505,8 @@ impl McpGateway {
                 // duplicate delivery, and if no transport claims it, dropping
                 // the lease frees the session's single-listener slot.
                 ctx.mcp_aggregate_sse = Some(listener);
-                Self::note_route_decision(ctx, "sse_listener");
-                let session_hash = hash_str(&session_id);
-                Self::note_metadata(ctx, "mcp.session.downstream", &session_hash);
+                self.note_route_decision(ctx, "sse_listener");
+                self.note_downstream_session(ctx, &session_id);
                 PluginResult::Reject {
                     status_code: 200,
                     body: String::new(),
@@ -3504,11 +3523,11 @@ impl McpGateway {
                 if session_gone {
                     // Same shape the rest of the gateway uses to tell a client
                     // to re-initialize rather than retry on this session.
-                    Self::note_route_decision(ctx, "deny");
-                    Self::note_sse_error(ctx, error);
+                    self.note_route_decision(ctx, "deny");
+                    self.note_sse_error(ctx, error);
                     return session_not_found_response();
                 }
-                Self::sse_error_response(ctx, error)
+                self.sse_error_response(ctx, error)
             }
         }
     }
@@ -3517,8 +3536,8 @@ impl McpGateway {
     /// `post_stream` on the POST's own event stream, `inline` as
     /// `application/json` on the POST, or `suppressed` because the client
     /// cancelled it. Fixed tokens only.
-    fn note_sse_delivery(ctx: &mut RequestContext, outcome: &str) {
-        Self::note_metadata(ctx, "mcp.sse.delivery", outcome);
+    fn note_sse_delivery(&self, ctx: &mut RequestContext, outcome: &str) {
+        self.note_metadata(ctx, "mcp.sse.delivery", outcome);
     }
 
     /// Whether this dispatch may answer with a POST-attached event stream.
@@ -3586,16 +3605,16 @@ impl McpGateway {
         let identity = match StreamIdentity::from_raw_json_rpc_id(id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
-                Self::note_sse_error(ctx, error);
+                self.note_sse_error(ctx, error);
                 return;
             }
         };
         match self.sse_broker.open_stream(&session_id, &identity) {
             Ok(stream) => {
                 ctx.mcp_sse_stream = Some(stream);
-                Self::note_metadata(ctx, "mcp.sse.stream", "open");
+                self.note_metadata(ctx, "mcp.sse.stream", "open");
             }
-            Err(error) => Self::note_sse_error(ctx, error),
+            Err(error) => self.note_sse_error(ctx, error),
         }
     }
 
@@ -3669,13 +3688,13 @@ impl McpGateway {
             // than silently retaining a lease no phase will settle.
             other => {
                 stream.settle_inline();
-                Self::note_sse_delivery(ctx, "inline");
+                self.note_sse_delivery(ctx, "inline");
                 return other;
             }
         };
         if !self.is_terminal_json_rpc_dispatch_response(status_code, &body, &headers) {
             stream.settle_inline();
-            Self::note_sse_delivery(ctx, "inline");
+            self.note_sse_delivery(ctx, "inline");
             return PluginResult::Reject {
                 status_code,
                 body,
@@ -3684,15 +3703,15 @@ impl McpGateway {
         }
         match stream.settle_for_inline_response() {
             Err(AggregateSseError::StreamCancelled) => {
-                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
-                Self::note_route_decision(ctx, "sse_cancelled");
-                Self::note_sse_delivery(ctx, "suppressed");
+                self.note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                self.note_route_decision(ctx, "sse_cancelled");
+                self.note_sse_delivery(ctx, "suppressed");
                 Self::post_attached_stream_response(
                     super::mcp_aggregate_sse::post_attached_stream_without_response(),
                 )
             }
             _ => {
-                Self::note_sse_delivery(ctx, "inline");
+                self.note_sse_delivery(ctx, "inline");
                 PluginResult::Reject {
                     status_code,
                     body,
@@ -3769,7 +3788,7 @@ impl McpGateway {
         // answer settles it.
         if Self::on_synthetic_response_lifecycle(ctx) {
             stream.settle_inline();
-            Self::note_sse_delivery(ctx, "inline");
+            self.note_sse_delivery(ctx, "inline");
             return None;
         }
         // A JSON-RPC response is carried as an event only when the FINAL
@@ -3787,30 +3806,30 @@ impl McpGateway {
             && !super::utils::sse::original_response_is_event_stream(ctx, response_headers);
         if !inspectable {
             stream.settle_inline();
-            Self::note_sse_delivery(ctx, "inline");
+            self.note_sse_delivery(ctx, "inline");
             return None;
         }
         match stream.reserve_post_attached_response(body) {
             Ok((framed, publication)) => {
                 ctx.mcp_sse_publication = Some(publication);
-                Self::note_route_decision(ctx, "sse_post_stream");
-                Self::note_sse_delivery(ctx, "post_stream");
+                self.note_route_decision(ctx, "sse_post_stream");
+                self.note_sse_delivery(ctx, "post_stream");
                 Some(Self::post_attached_stream_response(framed))
             }
             Err(AggregateSseError::StreamCancelled) => {
-                Self::note_sse_error(ctx, AggregateSseError::StreamCancelled);
-                Self::note_route_decision(ctx, "sse_cancelled");
-                Self::note_sse_delivery(ctx, "suppressed");
+                self.note_sse_error(ctx, AggregateSseError::StreamCancelled);
+                self.note_route_decision(ctx, "sse_cancelled");
+                self.note_sse_delivery(ctx, "suppressed");
                 Some(Self::post_attached_stream_response(
                     super::mcp_aggregate_sse::post_attached_stream_without_response(),
                 ))
             }
             Err(AggregateSseError::ResponseEnvelopeInvalid) => {
-                Self::note_sse_error(ctx, AggregateSseError::ResponseEnvelopeInvalid);
+                self.note_sse_error(ctx, AggregateSseError::ResponseEnvelopeInvalid);
                 // Distinct from "inline" (the answer was delivered on the POST
                 // as the upstream produced it) and "suppressed" (the client
                 // cancelled): the upstream answer was DISCARDED and replaced.
-                Self::note_sse_delivery(ctx, "refused");
+                self.note_sse_delivery(ctx, "refused");
                 let refusal = json_rpc_error(
                     None,
                     -32603,
@@ -3828,8 +3847,8 @@ impl McpGateway {
                 })
             }
             Err(error) => {
-                Self::note_sse_error(ctx, error);
-                Self::note_sse_delivery(ctx, "inline");
+                self.note_sse_error(ctx, error);
+                self.note_sse_delivery(ctx, "inline");
                 None
             }
         }
@@ -3848,13 +3867,13 @@ impl McpGateway {
 
     /// Release the request's stream identity because this POST is answering
     /// inline. Idempotent, and a no-op when no stream was opened.
-    fn settle_sse_stream_inline(ctx: &mut RequestContext) {
+    fn settle_sse_stream_inline(&self, ctx: &mut RequestContext) {
         if let Some(publication) = ctx.mcp_sse_publication.take() {
             publication.abort();
         }
         if let Some(stream) = ctx.mcp_sse_stream.take() {
             stream.settle_inline();
-            Self::note_sse_delivery(ctx, "inline");
+            self.note_sse_delivery(ctx, "inline");
         }
     }
 
@@ -3877,20 +3896,20 @@ impl McpGateway {
         let request_id = envelope.raw_cancel_id.as_deref();
         let Some(request_id) = request_id else {
             let missing = AggregateSseError::StreamIdMissing;
-            Self::note_sse_cancel(ctx, missing.reason_token());
+            self.note_sse_cancel(ctx, missing.reason_token());
             return;
         };
         let max_id_bytes = self.sessions.sse_bounds.max_stream_id_bytes;
         let identity = match StreamIdentity::from_raw_json_rpc_id(request_id, max_id_bytes) {
             Ok(identity) => identity,
             Err(error) => {
-                Self::note_sse_cancel(ctx, error.reason_token());
+                self.note_sse_cancel(ctx, error.reason_token());
                 return;
             }
         };
         match self.sse_broker.cancel_stream(&session_id, &identity) {
-            Ok(()) => Self::note_sse_cancel(ctx, "cancelled"),
-            Err(error) => Self::note_sse_cancel(ctx, error.reason_token()),
+            Ok(()) => self.note_sse_cancel(ctx, "cancelled"),
+            Err(error) => self.note_sse_cancel(ctx, error.reason_token()),
         }
     }
 
@@ -4003,19 +4022,27 @@ impl McpGateway {
                 Some(cursor) => json!({ "cursor": cursor }),
                 None => json!({}),
             };
-            let response = self
+            let mut response = self
                 .request_upstream_json(ctx, downstream_session_id, server, method, params)
                 .await?;
             let result = response
-                .get("result")
-                .and_then(Value::as_object)
+                .get_mut("result")
+                .and_then(Value::as_object_mut)
                 .ok_or_else(|| format!("upstream MCP {method} response missing result"))?;
-            let page_items = result
-                .get(result_key)
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    format!("upstream MCP {method} response missing result.{result_key}")
-                })?;
+            let next_cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            // The page is owned, so its items move into the catalog list
+            // instead of being cloned.
+            let page_items = match result.get_mut(result_key) {
+                Some(Value::Array(page_items)) => std::mem::take(page_items),
+                _ => {
+                    return Err(format!(
+                        "upstream MCP {method} response missing result.{result_key}"
+                    ));
+                }
+            };
             for item in page_items {
                 if items.len() >= max_items {
                     warn!(
@@ -4028,7 +4055,7 @@ impl McpGateway {
                         "upstream MCP {method} catalog exceeded {max_items} items"
                     ));
                 }
-                let item_bytes = serde_json::to_vec(item).map_err(|error| {
+                let item_bytes = serialized_json_len(&item).map_err(|error| {
                     warn!(
                         server_id = %server.server_id,
                         method,
@@ -4037,7 +4064,7 @@ impl McpGateway {
                     );
                     format!("upstream MCP {method} catalog item could not be measured: {error}")
                 })?;
-                if total_item_bytes.saturating_add(item_bytes.len()) > max_bytes {
+                if total_item_bytes.saturating_add(item_bytes) > max_bytes {
                     warn!(
                         server_id = %server.server_id,
                         method,
@@ -4048,13 +4075,10 @@ impl McpGateway {
                         "upstream MCP {method} catalog exceeded {max_bytes} bytes"
                     ));
                 }
-                total_item_bytes += item_bytes.len();
-                items.push(item.clone());
+                total_item_bytes += item_bytes;
+                items.push(item);
             }
-            cursor = result
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
+            cursor = next_cursor;
             if cursor.is_none() {
                 return Ok(items);
             }
@@ -5145,8 +5169,7 @@ impl McpGateway {
             .filter(|entry| {
                 !entry.hidden_from_discovery
                     && !entry.schema_quarantined()
-                    && (entry.enabled
-                        || !(self.discovery.hide_denied_items || self.policy.hide_denied_tools))
+                    && (entry.enabled || !self.policy.hide_denied_tools)
                     && grant_view.as_ref().is_none_or(|view| {
                         self.policy
                             .grant_for_tool(&entry.public_name)
@@ -5154,17 +5177,20 @@ impl McpGateway {
                     })
                     && self.bridge_tool_allowed_on_route(route_ctx, entry)
             })
-            .map(tool_entry_to_public_value)
+            .map(PublicToolItem::from_entry)
             .collect();
-        json_response(
-            200,
-            json!({
-                "jsonrpc": "2.0",
-                "id": envelope.id.clone().unwrap_or(Value::Null),
-                "result": { "tools": tools }
-            }),
-            None,
-        )
+        // Serialized straight from the catalog's shared schemas: building a
+        // `Value` per tool would deep-clone every input and output schema on
+        // every `tools/list`.
+        let response = ToolsListResponse {
+            jsonrpc: "2.0",
+            id: envelope.id.as_ref().unwrap_or(&Value::Null),
+            result: ToolsListResult { tools },
+        };
+        match serde_json::to_string(&response) {
+            Ok(body) => json_body_response(200, body, None),
+            Err(_) => json_rpc_error(None, -32603, "MCP response serialization failed", None),
+        }
     }
 
     async fn aggregate_prompts_list(
@@ -5396,8 +5422,7 @@ impl McpGateway {
                     "mcp.policy_decision".to_string(),
                     policy_action.as_policy_decision().to_string(),
                 );
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                self.note_route_decision(ctx, "deny");
             }
             return tool_call_denied(envelope.id.clone());
         }
@@ -5415,8 +5440,7 @@ impl McpGateway {
                         "mcp.policy_decision".to_string(),
                         denial.as_policy_decision().to_string(),
                     );
-                    ctx.metadata
-                        .insert("mcp.route_decision".to_string(), "deny".to_string());
+                    self.note_route_decision(ctx, "deny");
                 }
                 return tool_call_denied(envelope.id.clone());
             }
@@ -5433,8 +5457,7 @@ impl McpGateway {
                     "mcp.policy_decision".to_string(),
                     "method_not_allowed".to_string(),
                 );
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                self.note_route_decision(ctx, "deny");
             }
             return if self.policy.has_grants() {
                 tool_call_denied(envelope.id.clone())
@@ -5504,8 +5527,7 @@ impl McpGateway {
                         if self.observability.emit_metadata {
                             ctx.metadata
                                 .insert("mcp.schema_validation".to_string(), "fail".to_string());
-                            ctx.metadata
-                                .insert("mcp.route_decision".to_string(), "deny".to_string());
+                            self.note_route_decision(ctx, "deny");
                         }
                         return json_rpc_error(
                             envelope.id.clone(),
@@ -6042,8 +6064,7 @@ impl McpGateway {
                 .insert("mcp.item_type".to_string(), item_type.to_string());
             ctx.metadata
                 .insert("mcp.policy_decision".to_string(), "deny".to_string());
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
         }
     }
 
@@ -6149,8 +6170,7 @@ impl McpGateway {
                             // deny decision so the rejection stays observable.
                             self.clear_batch_item_routing_state(ctx);
                             self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
-                            ctx.metadata
-                                .insert("mcp.route_decision".to_string(), "deny".to_string());
+                            self.note_route_decision(ctx, "deny");
                             return restore_response_id(response, envelope.raw_id.as_deref());
                         }
                         responses.push(Value::Null);
@@ -6208,19 +6228,13 @@ impl McpGateway {
                 ) {
                     self.clear_batch_item_routing_state(ctx);
                     self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
-                    ctx.metadata.insert(
-                        "mcp.route_decision".to_string(),
-                        "synthetic_response".to_string(),
-                    );
+                    self.note_route_decision(ctx, "synthetic_response");
                     return response;
                 }
             }
             self.clear_batch_item_routing_state(ctx);
             self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
+            self.note_route_decision(ctx, "synthetic_response");
             return self.bounded_batch_json_response(bounded_responses);
         }
 
@@ -6485,10 +6499,7 @@ impl McpGateway {
         self.clear_batch_item_routing_state(ctx);
         *headers = inbound_headers;
         self.restore_batch_request_metadata(ctx, headers, &catalog_degraded);
-        ctx.metadata.insert(
-            "mcp.route_decision".to_string(),
-            "synthetic_response".to_string(),
-        );
+        self.note_route_decision(ctx, "synthetic_response");
 
         if !saw_response_bearing {
             // Notification-only batches carry no per-item response element, so
@@ -6551,10 +6562,7 @@ impl McpGateway {
         // A fail-closed batch publishes no catalog-degradation summary: the
         // members that would have contributed one never completed.
         self.restore_batch_request_metadata(ctx, inbound_headers, &BTreeSet::new());
-        ctx.metadata.insert(
-            "mcp.route_decision".to_string(),
-            "synthetic_response".to_string(),
-        );
+        self.note_route_decision(ctx, "synthetic_response");
         *headers = inbound_headers.clone();
         response
     }
@@ -6872,10 +6880,7 @@ impl McpGateway {
                     | "resources/read"
             )
         {
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
+            self.note_route_decision(ctx, "synthetic_response");
             return empty_response(202);
         }
         if let Some(response) =
@@ -6890,8 +6895,7 @@ impl McpGateway {
             {
                 return session_not_found_response();
             }
-            ctx.metadata
-                .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
+            self.note_downstream_session(ctx, &session_id);
         }
 
         if self.mode == McpGatewayMode::TransparentProxy {
@@ -6950,10 +6954,7 @@ impl McpGateway {
                     }
                     Some(_) => {
                         let negotiated = self.preferred_protocol_version().to_string();
-                        ctx.metadata.insert(
-                            "mcp.protocol_version_negotiated".to_string(),
-                            negotiated.clone(),
-                        );
+                        self.note_metadata(ctx, "mcp.protocol_version_negotiated", &negotiated);
                         negotiated
                     }
                     None => self.preferred_protocol_version().to_string(),
@@ -6983,7 +6984,7 @@ impl McpGateway {
                         // together. Refusing here keeps the two cardinalities
                         // consistent instead of handing back a session that can
                         // never attach its event stream.
-                        Self::note_sse_error(ctx, error);
+                        self.note_sse_error(ctx, error);
                         return json_rpc_error(
                             envelope.id.clone(),
                             MCP_SSE_SESSION_UNAVAILABLE,
@@ -6992,21 +6993,12 @@ impl McpGateway {
                         );
                     }
                 };
-                ctx.metadata.insert(
-                    "mcp.session.downstream".to_string(),
-                    hash_str(&downstream_session_id),
-                );
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
+                self.note_downstream_session(ctx, &downstream_session_id);
+                self.note_route_decision(ctx, "synthetic_response");
                 self.synthetic_initialize_response(envelope, &version, &downstream_session_id)
             }
             "notifications/initialized" | "ping" => {
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
+                self.note_route_decision(ctx, "synthetic_response");
                 if envelope.message_kind == McpMessageKind::Notification {
                     return empty_response(202);
                 }
@@ -7132,10 +7124,7 @@ impl McpGateway {
                 }
             }
             _ if envelope.message_kind == McpMessageKind::Notification => {
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
+                self.note_route_decision(ctx, "synthetic_response");
                 empty_response(202)
             }
             _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
@@ -7245,8 +7234,7 @@ impl McpGateway {
                 "mcp.policy_decision".to_string(),
                 denial.as_policy_decision().to_string(),
             );
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
         }
         Self::correlate_gateway_terminal(ctx, tool_call_denied(None), &[])
     }
@@ -7259,8 +7247,7 @@ impl McpGateway {
         if self.observability.emit_metadata {
             ctx.metadata
                 .insert("mcp.policy_decision".to_string(), "deny".to_string());
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
             ctx.metadata
                 .insert("mcp.admission_violation".to_string(), reason.to_string());
         }
@@ -7323,8 +7310,7 @@ impl McpGateway {
                 "mcp.result_schema_validation".to_string(),
                 "fail".to_string(),
             );
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
         }
         // Reason is a gateway-controlled category string — never a result body.
         warn_sampled!(
@@ -7372,8 +7358,8 @@ pub(crate) struct McpAdminCatalogSnapshot {
     pub(crate) on_new_tool: &'static str,
     pub(crate) on_schema_change: &'static str,
     pub(crate) default_action: &'static str,
-    /// Whether a denied tool is left out of `tools/list` (either of
-    /// `discovery.hide_denied_items` / `policy.hide_denied_tools`).
+    /// Whether a denied tool is left out of `tools/list`
+    /// (`policy.hide_denied_tools`).
     pub(crate) hide_denied_tools: bool,
     pub(crate) max_catalog_items_per_list: usize,
     pub(crate) max_catalog_bytes_per_list: usize,
@@ -7481,7 +7467,7 @@ impl McpGateway {
                 *slot = name.as_str();
             }
         }
-        let hide_denied_tools = self.discovery.hide_denied_items || self.policy.hide_denied_tools;
+        let hide_denied_tools = self.policy.hide_denied_tools;
         let mut tools: Vec<McpAdminToolSnapshot> = catalog
             .map(|catalog| {
                 catalog
@@ -7944,8 +7930,7 @@ impl Plugin for McpGateway {
                     "mcp.policy_decision".to_string(),
                     "hidden_schema_changed".to_string(),
                 );
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                self.note_route_decision(ctx, "deny");
             }
             return Self::correlate_gateway_terminal(ctx, tool_call_denied(None), &[]);
         }
@@ -7977,8 +7962,7 @@ impl Plugin for McpGateway {
             // A reserved descendant is refused, exactly like the 405 below, so
             // the decision has to read as a denial rather than as this plugin
             // never having applied.
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
             return PluginResult::Reject {
                 status_code: 404,
                 body: json_rpc_error_value(None, -32600, "Unknown MCP endpoint").to_string(),
@@ -8022,20 +8006,15 @@ impl Plugin for McpGateway {
             // rather than a success the client cannot tell from a real
             // termination.
             let Some(session_id) = self.downstream_session_id_from_headers(headers) else {
-                ctx.metadata
-                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+                self.note_route_decision(ctx, "deny");
                 return missing_session_response(None);
             };
             if !self.touch_downstream_session(&session_id, ctx).await {
                 return session_not_found_response();
             }
             self.remove_downstream_session(&session_id, ctx).await;
-            ctx.metadata
-                .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
+            self.note_downstream_session(ctx, &session_id);
+            self.note_route_decision(ctx, "synthetic_response");
             return PluginResult::Reject {
                 status_code: 200,
                 body: "{}".to_string(),
@@ -8047,8 +8026,7 @@ impl Plugin for McpGateway {
         }
 
         if !ctx.method.eq_ignore_ascii_case("POST") {
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            self.note_route_decision(ctx, "deny");
             return PluginResult::Reject {
                 status_code: 405,
                 body: json!({"error": "unsupported MCP HTTP method"}).to_string(),
@@ -8496,7 +8474,7 @@ impl Plugin for McpGateway {
         // converted (normalization skipped, or its replacement refused by the
         // retained-response budget) is never released as the raw REST body.
         if self.bridge_response_unconverted(ctx) {
-            Self::settle_sse_stream_inline(ctx);
+            self.settle_sse_stream_inline(ctx);
             let observed = ctx
                 .mcp_bridge
                 .as_ref()
@@ -8506,7 +8484,7 @@ impl Plugin for McpGateway {
         }
         let enforced = self.enforce_final_response_body(ctx, response_headers, body);
         if !matches!(enforced, PluginResult::Continue) {
-            Self::settle_sse_stream_inline(ctx);
+            self.settle_sse_stream_inline(ctx);
             return Self::correlate_gateway_terminal(ctx, enforced, body);
         }
         let deferred =
@@ -9631,6 +9609,10 @@ async fn upstream_sse_json_rpc_response(
 ) -> Result<Value, String> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
+    // Bytes of `buffer` already searched without finding an event delimiter.
+    // Each chunk resumes the search just before this point instead of
+    // rescanning the whole buffer.
+    let mut scanned = 0usize;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             warn!(
@@ -9653,10 +9635,8 @@ async fn upstream_sse_json_rpc_response(
                 "upstream MCP SSE event exceeded {MAX_UPSTREAM_SSE_EVENT_BYTES} bytes"
             ));
         }
-        while let Some((event_end, delimiter_len)) = find_sse_event_delimiter(&buffer) {
-            let event = buffer[..event_end].to_vec();
-            buffer.drain(..event_end + delimiter_len);
-            let event = std::str::from_utf8(&event).map_err(|error| {
+        while let Some((event_end, delimiter_len)) = find_sse_event_delimiter(&buffer, scanned) {
+            let event = std::str::from_utf8(&buffer[..event_end]).map_err(|error| {
                 warn!(
                     server_id,
                     method,
@@ -9668,7 +9648,10 @@ async fn upstream_sse_json_rpc_response(
             if let Some(value) = parse_sse_json_rpc_response(event) {
                 return Ok(value);
             }
+            buffer.drain(..event_end + delimiter_len);
+            scanned = 0;
         }
+        scanned = buffer.len();
     }
 
     if !buffer.is_empty() {
@@ -9693,7 +9676,17 @@ async fn upstream_sse_json_rpc_response(
     Err("upstream MCP SSE response did not contain a JSON-RPC response".to_string())
 }
 
-fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+/// Earliest SSE event delimiter in `buffer`, searching from just before
+/// `scanned` (the prefix a previous call already searched). Backing up by one
+/// byte less than the longest delimiter finds a delimiter that straddles the
+/// previous end; one wholly inside the searched prefix would have been found
+/// then, so the earliest delimiter is never missed.
+fn find_sse_event_delimiter(buffer: &[u8], scanned: usize) -> Option<(usize, usize)> {
+    const LONGEST_DELIMITER: usize = 4;
+    let start = scanned
+        .saturating_sub(LONGEST_DELIMITER - 1)
+        .min(buffer.len());
+    let tail = &buffer[start..];
     [
         b"\n\n".as_slice(),
         b"\r\n\r\n".as_slice(),
@@ -9701,10 +9694,9 @@ fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
     ]
     .into_iter()
     .filter_map(|delimiter| {
-        buffer
-            .windows(delimiter.len())
+        tail.windows(delimiter.len())
             .position(|window| window == delimiter)
-            .map(|position| (position, delimiter.len()))
+            .map(|position| (start + position, delimiter.len()))
     })
     .min_by_key(|(position, _)| *position)
 }
@@ -10281,13 +10273,22 @@ fn json_response(
     body: Value,
     session_header: Option<(&str, &str)>,
 ) -> PluginResult {
+    json_body_response(status_code, body.to_string(), session_header)
+}
+
+/// [`json_response`] for a body that is already serialized JSON.
+fn json_body_response(
+    status_code: u16,
+    body: String,
+    session_header: Option<(&str, &str)>,
+) -> PluginResult {
     let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     if let Some((name, value)) = session_header {
         headers.insert(name.to_ascii_lowercase(), value.to_string());
     }
     PluginResult::Reject {
         status_code,
-        body: body.to_string(),
+        body,
         headers,
     }
 }
@@ -10595,26 +10596,67 @@ fn build_bridge_tool_parts(
     built
 }
 
-fn tool_entry_to_public_value(entry: &ToolCatalogEntry) -> Value {
-    let mut object = Map::new();
-    object.insert("name".to_string(), Value::String(entry.public_name.clone()));
-    if let Some(title) = &entry.title {
-        object.insert("title".to_string(), Value::String(title.clone()));
+/// `tools/list` response, serialized by reference from the session catalog.
+#[derive(serde::Serialize)]
+struct ToolsListResponse<'a> {
+    jsonrpc: &'static str,
+    id: &'a Value,
+    result: ToolsListResult<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct ToolsListResult<'a> {
+    tools: Vec<PublicToolItem<'a>>,
+}
+
+/// One public `tools/list` item. Borrows the entry's `Arc`-shared schemas
+/// instead of cloning them; only the namespaced description is built.
+#[derive(serde::Serialize)]
+struct PublicToolItem<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "inputSchema")]
+    input_schema: &'a Value,
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    output_schema: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<&'a Value>,
+}
+
+impl<'a> PublicToolItem<'a> {
+    fn from_entry(entry: &'a ToolCatalogEntry) -> Self {
+        Self {
+            name: &entry.public_name,
+            title: entry.title.as_deref(),
+            description: entry
+                .description
+                .as_ref()
+                .map(|description| format!("[{}] {}", entry.namespace, description)),
+            input_schema: &entry.input_schema,
+            output_schema: entry.output_schema.as_deref(),
+            annotations: entry.annotations.as_ref(),
+        }
     }
-    if let Some(description) = &entry.description {
-        object.insert(
-            "description".to_string(),
-            Value::String(format!("[{}] {}", entry.namespace, description)),
-        );
+}
+
+/// Serialized size of `value` as compact JSON, without allocating the bytes.
+fn serialized_json_len(value: &Value) -> serde_json::Result<usize> {
+    struct ByteCounter(usize);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    object.insert("inputSchema".to_string(), Value::clone(&entry.input_schema));
-    if let Some(output_schema) = &entry.output_schema {
-        object.insert("outputSchema".to_string(), Value::clone(output_schema));
-    }
-    if let Some(annotations) = &entry.annotations {
-        object.insert("annotations".to_string(), annotations.clone());
-    }
-    Value::Object(object)
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 fn prompt_entry_to_public_value(entry: &PromptCatalogEntry) -> Value {
@@ -11011,8 +11053,6 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<McpDiscoveryConfig, St
             .unwrap_or(true),
         namespace_separator,
         cache_ttl: Duration::from_secs(cache_ttl_seconds),
-        hide_denied_items: optional_bool_from_object(discovery, "hide_denied_items")?
-            .unwrap_or(true),
         on_new_tool,
         on_schema_change,
     })

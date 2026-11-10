@@ -20331,7 +20331,7 @@ components:
               type: boolean
               description: |
                 Denied tools are left out of `tools/list`
-                (`discovery.hide_denied_items` or `policy.hide_denied_tools`).
+                (`policy.hide_denied_tools`).
         limits:
           type: object
           required: [max_catalog_items_per_list, max_catalog_bytes_per_list]
@@ -40747,7 +40747,6 @@ components:
                     - required: [aggregate_prompts]
                     - required: [namespace_separator]
                     - required: [cache_ttl_seconds]
-                    - required: [hide_denied_items]
                     - required: [on_new_tool]
                     - required: [on_schema_change]
               # transparent_proxy has no mediated tool catalog, so result
@@ -40833,7 +40832,7 @@ components:
         discovery:
           type: [object, "null"]
           additionalProperties: false
-          description: Catalog discovery requires aggregate_router. Explicit aggregate_tools, aggregate_resources, aggregate_prompts, namespace_separator, cache_ttl_seconds, hide_denied_items, on_new_tool, and on_schema_change fields are rejected in transparent_proxy, including explicit defaults, because every one of them is inert without a mediated catalog. An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does.
+          description: Catalog discovery requires aggregate_router. Explicit aggregate_tools, aggregate_resources, aggregate_prompts, namespace_separator, cache_ttl_seconds, on_new_tool, and on_schema_change fields are rejected in transparent_proxy, including explicit defaults, because every one of them is inert without a mediated catalog. An explicit null block, and an explicit null on any field below, selects the defaults exactly as omission does.
           properties:
             aggregate_tools:
               type: [boolean, "null"]
@@ -40854,9 +40853,6 @@ components:
               minimum: 1
               default: 300
               description: Also bounds recovery from a wholly unavailable catalog family — that outage is cached for this long before the family is retried.
-            hide_denied_items:
-              type: [boolean, "null"]
-              default: true
             on_new_tool:
               type: [string, "null"]
               enum: [allow, allow_immediately, expose, hide_until_configured, null]

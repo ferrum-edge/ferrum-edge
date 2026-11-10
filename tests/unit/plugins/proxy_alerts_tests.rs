@@ -257,6 +257,78 @@ fn rejects_zero_threshold_percent() {
 }
 
 #[test]
+fn rule_errors_name_the_plugin_and_rule_path_once() {
+    let mut missing_name = minimal_config();
+    missing_name["rules"][0]
+        .as_object_mut()
+        .expect("rule object")
+        .remove("name");
+    let mut missing_type = minimal_config();
+    missing_type["rules"][0]
+        .as_object_mut()
+        .expect("rule object")
+        .remove("type");
+    let mut not_object = minimal_config();
+    not_object["rules"][0] = json!("proxy_5xx");
+    let mut unknown_key = minimal_config();
+    unknown_key["rules"][0]["thresold"] = json!(1);
+    let mut bad_threshold = minimal_config();
+    bad_threshold["rules"][0]["threshold_percent"] = json!(150.0);
+    let mut bad_recovery = minimal_config();
+    bad_recovery["rules"][0]["recovery"] = json!({"resolved_windows": 30});
+
+    for (config, needle) in [
+        (missing_name, "`name` is required"),
+        (missing_type, "`type` is required"),
+        (not_object, "must be an object"),
+        (unknown_key, "rules[0].thresold"),
+        (bad_threshold, "`threshold_percent` must be in"),
+        (bad_recovery, "rules[0].recovery.resolved_windows"),
+    ] {
+        let err = ProxyAlerts::new(&config, http_client()).unwrap_err();
+        assert!(err.contains(needle), "expected `{needle}` in: {err}");
+        assert!(
+            err.starts_with("proxy_alerts: `rules[0]`: "),
+            "rule errors start with one plugin + rule path prefix: {err}"
+        );
+        assert_eq!(
+            err.matches("proxy_alerts:").count(),
+            1,
+            "plugin prefix repeated: {err}"
+        );
+        assert!(!err.contains("rule[0]"), "second rule-path spelling: {err}");
+    }
+}
+
+#[test]
+fn channels_are_indexed_by_dense_alphabetical_id() {
+    let parsed = parse_config(&json!({
+        "channels": {
+            "zulu": { "type": "slack", "webhook_url": "https://hooks.slack.com/z" },
+            "alpha": { "type": "slack", "webhook_url": "https://hooks.slack.com/a" },
+            "mike": { "type": "slack", "webhook_url": "https://hooks.slack.com/m" }
+        },
+        "rules": [{
+            "name": "errors",
+            "type": "error_rate",
+            "status_codes": [500],
+            "threshold_percent": 5.0,
+            "channels": ["zulu", "alpha"]
+        }]
+    }))
+    .expect("valid config");
+    let names: Vec<&str> = parsed.channel_by_id.iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["alpha", "mike", "zulu"]);
+    let rule_channels: Vec<&str> = parsed.rules[0]
+        .common()
+        .channel_ids
+        .iter()
+        .map(|id| parsed.channel_by_id[*id as usize].name())
+        .collect();
+    assert_eq!(rule_channels, ["zulu", "alpha"]);
+}
+
+#[test]
 fn rejects_latency_threshold_above_histogram_range() {
     let cfg = json!({
         "channels": {
