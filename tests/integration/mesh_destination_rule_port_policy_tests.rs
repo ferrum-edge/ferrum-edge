@@ -11,12 +11,15 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshCorsUnmatchedPreflights, MeshDestinationRule, MeshLoadBalancer,
-    MeshOutlierDetection, MeshSimpleLb, MeshTrafficPolicy, cors_plugin_config_from_mesh_policy,
+    AppProtocol, MeshConfig, MeshConsistentHash, MeshCorsUnmatchedPreflights, MeshDestinationRule,
+    MeshLoadBalancer, MeshOutlierDetection, MeshSimpleLb, MeshTrafficPolicy, ServicePort,
+    WorkloadPort, cors_plugin_config_from_mesh_policy,
 };
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
 };
+
+use super::mesh_test_support::{service_for, workload_for};
 
 fn runtime() -> MeshRuntimeConfig {
     MeshRuntimeConfig {
@@ -3466,4 +3469,232 @@ fn destination_rule_http2_max_requests_precedence_is_port_over_subset_over_top_l
         Some(3),
         "an explicit portLevelSettings budget wins for that destination port"
     );
+}
+
+// ── Top-level connectTimeout on proxy-less relay upstreams (issue #7232) ──
+//
+// Raw-TCP egress upstreams are referenced by no config proxy; the relay the
+// router synthesizes reads the connect timeout from the upstream's per-port
+// overrides. A top-level `connectionPool.tcp.connectTimeout` must therefore be
+// seeded onto those port slots, as it already was for UDP egress upstreams.
+
+/// A Sidecar client slice with one in-mesh `db` service exposing raw TCP 5432
+/// beside HTTP 8080, backed by one workload, and a DestinationRule for it.
+fn raw_tcp_destination_rule_config(
+    traffic_policy: Option<MeshTrafficPolicy>,
+    port_level_settings: HashMap<u16, MeshTrafficPolicy>,
+) -> GatewayConfig {
+    let mut db = workload_for("db", "default", [("app", "db")], ["10.0.0.7"]);
+    db.ports = vec![
+        WorkloadPort {
+            port: 5432,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+        },
+        WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        },
+    ];
+    let mut service = service_for("db", "default", &[&db]);
+    // Raw-TCP egress is keyed by the Service VIP; the per-port TCP upstream
+    // materializes only for a Service that has one.
+    service.cluster_ips = vec!["10.96.0.60".to_string()];
+    service.ports = vec![
+        ServicePort {
+            port: 5432,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        },
+    ];
+    GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            workloads: vec![db],
+            services: vec![service],
+            destination_rules: vec![MeshDestinationRule {
+                name: "db-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "db.default.svc.cluster.local".to_string(),
+                traffic_policy,
+                port_level_settings,
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    }
+}
+
+fn sidecar_client_runtime() -> MeshRuntimeConfig {
+    let mut runtime = runtime();
+    runtime.workload_spiffe_id = Some("spiffe://cluster.local/ns/default/sa/client".to_string());
+    runtime
+}
+
+fn port_connect_timeout(config: &GatewayConfig, upstream_id: &str, port: u16) -> Option<u64> {
+    config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.id == upstream_id)
+        .unwrap_or_else(|| panic!("upstream {upstream_id} materialized"))
+        .port_overrides
+        .get(&port)
+        .and_then(|slot| slot.connect_timeout_ms)
+}
+
+const DB_TCP_UPSTREAM: &str = "__mesh-out-tcp-upstream-default-db-5432";
+const DB_HTTP_UPSTREAM: &str = "__mesh-out-upstream-default-db-8080";
+
+#[test]
+fn destination_rule_top_level_connect_timeout_reaches_raw_tcp_egress_upstream() {
+    let config = raw_tcp_destination_rule_config(
+        Some(MeshTrafficPolicy {
+            connect_timeout_ms: Some(750),
+            ..MeshTrafficPolicy::default()
+        }),
+        HashMap::new(),
+    );
+
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &sidecar_client_runtime()).expect("mesh config");
+
+    assert_eq!(
+        port_connect_timeout(&prepared, DB_TCP_UPSTREAM, 5432),
+        Some(750),
+        "top-level connectTimeout must seed the raw-TCP relay's policy port"
+    );
+    // HTTP upstreams reach config proxies, which apply the top-level value
+    // themselves; a seeded port slot would outrank a subset connectTimeout.
+    assert_eq!(
+        port_connect_timeout(&prepared, DB_HTTP_UPSTREAM, 8080),
+        None
+    );
+    let http_proxy = prepared
+        .proxies
+        .iter()
+        .find(|proxy| proxy.upstream_id.as_deref() == Some(DB_HTTP_UPSTREAM))
+        .expect("HTTP outbound route");
+    assert_eq!(http_proxy.backend_connect_timeout_ms, 750);
+}
+
+#[test]
+fn destination_rule_port_level_connect_timeout_wins_over_top_level_on_raw_tcp() {
+    let config = raw_tcp_destination_rule_config(
+        Some(MeshTrafficPolicy {
+            connect_timeout_ms: Some(750),
+            ..MeshTrafficPolicy::default()
+        }),
+        HashMap::from([(
+            5432u16,
+            MeshTrafficPolicy {
+                connect_timeout_ms: Some(300),
+                ..MeshTrafficPolicy::default()
+            },
+        )]),
+    );
+
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &sidecar_client_runtime()).expect("mesh config");
+
+    assert_eq!(
+        port_connect_timeout(&prepared, DB_TCP_UPSTREAM, 5432),
+        Some(300),
+        "portLevelSettings must win over the top-level seed"
+    );
+}
+
+// ── Stale `hash_on` after switching to a non-hash algorithm (issue #7232) ──
+
+#[test]
+fn destination_rule_simple_load_balancer_clears_a_stale_upstream_hash_key() {
+    let mut operator_upstream = upstream();
+    operator_upstream.algorithm = LoadBalancerAlgorithm::ConsistentHashing;
+    operator_upstream.hash_on = Some("header:x-user".to_string());
+    let mut config = GatewayConfig {
+        upstreams: vec![operator_upstream],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    load_balancer: Some(MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin)),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+                export_to: vec!["*".to_string()],
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+
+    assert_eq!(
+        prepared.upstreams[0].algorithm,
+        LoadBalancerAlgorithm::RoundRobin
+    );
+    assert_eq!(
+        prepared.upstreams[0].hash_on, None,
+        "a non-hash algorithm must not keep a hash key"
+    );
+}
+
+#[test]
+fn later_simple_destination_rule_clears_an_earlier_rules_hash_key() {
+    let rule = |name: &str, load_balancer: MeshLoadBalancer| MeshDestinationRule {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        host: "reviews.default.svc.cluster.local".to_string(),
+        traffic_policy: Some(MeshTrafficPolicy {
+            load_balancer: Some(load_balancer),
+            ..MeshTrafficPolicy::default()
+        }),
+        port_level_settings: HashMap::new(),
+        subsets: Vec::new(),
+        export_to: vec!["*".to_string()],
+    };
+    let mut config = GatewayConfig {
+        upstreams: vec![upstream()],
+        mesh: Some(Box::new(MeshConfig {
+            // Applied in (namespace, name) order: `a-hash` then `b-round-robin`.
+            destination_rules: vec![
+                rule(
+                    "b-round-robin",
+                    MeshLoadBalancer::Simple(MeshSimpleLb::RoundRobin),
+                ),
+                rule(
+                    "a-hash",
+                    MeshLoadBalancer::ConsistentHash(MeshConsistentHash {
+                        http_header_name: Some("x-user".to_string()),
+                        http_cookie_name: None,
+                        use_source_ip: false,
+                    }),
+                ),
+            ],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+
+    assert_eq!(
+        prepared.upstreams[0].algorithm,
+        LoadBalancerAlgorithm::RoundRobin
+    );
+    assert_eq!(prepared.upstreams[0].hash_on, None);
 }

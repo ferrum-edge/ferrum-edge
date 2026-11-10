@@ -629,6 +629,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from their scheme, as the outbound raw-TCP relay already did; the
   NodeWaypoint UDP listener port reservation and the non-Linux scoped-policy
   UDP fail-closed strip now also see these proxies as stream proxies.
+- **DestinationRule top-level `connectTimeout` now reaches mesh raw-TCP
+  egress, and a non-hash `loadBalancer` clears a stale hash key** (issue
+  #7232). A top-level `connectionPool.tcp.connectTimeout` was applied only to
+  proxies that reference the upstream, plus the in-mesh UDP egress upstreams;
+  the raw-TCP egress upstreams (by Service VIP and by workload address) and
+  the external UDP egress upstreams are dialed only by synthesized relays, so
+  their tunnel dials kept the relay's 5 s default unless the value was
+  repeated under `portLevelSettings`. It is now seeded onto every target
+  policy port of those upstreams that has no per-port value. Separately, a
+  winning rule with a `simple` load balancer set the upstream algorithm but
+  left an earlier rule's (or the operator's) `hash_on` in place, which still
+  produced a per-request hash strategy; the upstream-level projection now
+  clears it, as the per-port projection already did.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

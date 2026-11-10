@@ -8417,6 +8417,21 @@ pub(crate) fn mesh_external_udp_upstream_id(
         .replace(['/', '.', ':'], "-")
 }
 
+/// True for the mesh egress upstream families that no `config.proxies` entry
+/// references: each is dialed only through a relay proxy the router table
+/// synthesizes, which reads per-port DestinationRule policy from its
+/// `dispatch_port_overrides`. Covers raw TCP by VIP
+/// ([`mesh_outbound_tcp_upstream_id`]), raw TCP by workload
+/// ([`mesh_outbound_tcp_bywl_upstream_id`]), in-mesh UDP
+/// ([`mesh_outbound_udp_upstream_id`]) and external UDP
+/// ([`mesh_external_udp_upstream_id`]).
+fn is_proxyless_mesh_relay_upstream_id(id: &str) -> bool {
+    id.starts_with("__mesh-out-tcp-upstream-")
+        || id.starts_with("__mesh-out-tcp-bywl-upstream-")
+        || id.starts_with(MESH_OUTBOUND_UDP_UPSTREAM_ID_PREFIX)
+        || id.starts_with(MESH_EXTERNAL_UDP_UPSTREAM_ID_PREFIX)
+}
+
 /// Build the synthesized relay proxy backing one SOURCE-side external UDP egress
 /// route (issue #3263). Same deterministic shape and pool-config contract as the
 /// in-mesh UDP relay proxy — `BackendScheme::Udp`, shared builder — so the dial
@@ -11230,25 +11245,31 @@ pub(crate) fn apply_destination_rules_with_tenant_file_roots(
                 upstream.resolved_subset_tls.clear();
             }
 
-            // Top-level `trafficPolicy.connectTimeout` for a UDP egress upstream
-            // (codex r6 P2). The top-level timeout is applied to `config.proxies`
-            // below, but a UDP egress upstream (`__mesh-out-udp-upstream-*`) is
-            // referenced by NO config proxy — it materializes a synthesized relay
-            // proxy in the router table that dials via
-            // `hbone_pool::get_datagram_tunnel`, which reads the connect timeout
-            // from `dispatch_port_overrides` (projected from `port_overrides`) and
-            // otherwise falls back to the relay proxy's hardcoded default. Seed the
-            // top-level value onto each materialized target policy port carrying no
-            // per-port `portLevelSettings.connectTimeout`, so the UDP relay honors
-            // the operator's top-level connectTimeout instead of the 5s default.
+            // Top-level `trafficPolicy.connectTimeout` for a proxy-less relay
+            // upstream (codex r6 P2, issue #7232). The top-level timeout is
+            // applied to `config.proxies` below, but the raw-TCP
+            // (`__mesh-out-tcp-upstream-*`, `__mesh-out-tcp-bywl-upstream-*`) and
+            // UDP (`__mesh-out-udp-upstream-*`, `__mesh-out-udp-ext-upstream-*`)
+            // egress upstreams are referenced by NO config proxy. Each
+            // materializes a synthesized relay proxy in the router table whose
+            // `dispatch_port_overrides` are projected from `port_overrides`; the
+            // relay dials (`HboneConnectionPool::get_tunnel_via`,
+            // `MeshMtlsConnectionPool::open_connect_tunnel`,
+            // `hbone_pool::get_datagram_tunnel`) read the per-port connect
+            // timeout from there and otherwise fall back to the relay proxy's
+            // hardcoded default. Seed the top-level value onto each materialized
+            // target policy port carrying no per-port
+            // `portLevelSettings.connectTimeout`, so the relay honors the
+            // operator's top-level connectTimeout instead of the 5s default.
             // Per-port entries written above already win (only unset slots are
-            // seeded); other lanes are unaffected — raw-TCP relay proxies do not
-            // read `dispatch_port_overrides`, and HTTP upstreams reach config
-            // proxies. Keyed by the selected target's policy port because
-            // `get_datagram_tunnel` receives both the dial app port and the owning
-            // Service-port policy key for targetPort-remapped UDP services.
+            // seeded). HTTP upstreams are deliberately not seeded: they reach
+            // config proxies below, and a seeded port slot would outrank a
+            // selected subset's `connectTimeout` there. Keyed by the selected
+            // target's policy port because the relay dials receive both the dial
+            // app port and the owning Service-port policy key for
+            // targetPort-remapped services.
             if let Some(timeout_ms) = connect_timeout_ms
-                && upstream.id.starts_with("__mesh-out-udp-upstream-")
+                && is_proxyless_mesh_relay_upstream_id(&upstream.id)
             {
                 let mut target_policy_ports: Vec<u16> = upstream
                     .targets
@@ -11877,9 +11898,11 @@ fn apply_traffic_policy_to_upstream(
 ) -> Result<(), anyhow::Error> {
     if let Some(algorithm) = mesh_lb_to_ferrum(&policy.load_balancer) {
         upstream.algorithm = algorithm;
-    }
-    if let Some(hash_on) = mesh_hash_on_to_ferrum(&policy.load_balancer) {
-        upstream.hash_on = Some(hash_on);
+        // Unconditional, like the per-port slot: switching the upstream to a
+        // non-hash algorithm clears a stale hash key, which
+        // `HashOnStrategy::parse` would otherwise still turn into a
+        // per-request hash strategy.
+        upstream.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
 
     // Outlier detection -> passive health check.
