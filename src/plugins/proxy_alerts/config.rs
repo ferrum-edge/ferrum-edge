@@ -740,12 +740,16 @@ fn parse_stream_disconnect_cause(
                 common.name
             )
         })?;
-        let cause = disconnect_cause_from_str(name).ok_or_else(|| {
-            format!(
-                "proxy_alerts: rule {:?}: unknown disconnect cause {name:?}",
-                common.name
-            )
-        })?;
+        // Read through `DisconnectCause`'s own serde contract, as `classes`
+        // reads `ErrorClass`, so a new cause is accepted without a second table.
+        let cause = serde_json::from_value::<DisconnectCause>(Value::String(name.to_string()))
+            .ok()
+            .ok_or_else(|| {
+                format!(
+                    "proxy_alerts: rule {:?}: unknown disconnect cause {name:?}",
+                    common.name
+                )
+            })?;
         if !causes.contains(&cause) {
             causes.push(cause);
         }
@@ -1164,16 +1168,5 @@ fn read_optional_bool(config: &Value, key: &str, context: &str) -> Result<Option
             .as_bool()
             .map(Some)
             .ok_or_else(|| format!("{context}: `{key}` must be a boolean")),
-    }
-}
-
-fn disconnect_cause_from_str(s: &str) -> Option<DisconnectCause> {
-    match s {
-        "idle_timeout" => Some(DisconnectCause::IdleTimeout),
-        "recv_error" => Some(DisconnectCause::RecvError),
-        "backend_error" => Some(DisconnectCause::BackendError),
-        "graceful_shutdown" => Some(DisconnectCause::GracefulShutdown),
-        "gateway_policy" => Some(DisconnectCause::GatewayPolicy),
-        _ => None,
     }
 }

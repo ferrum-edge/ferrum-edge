@@ -75,6 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     early or extend its failure streak.
 
 ### Fixed
+- **`proxy_alerts` no longer counts cooled-down reminders as dropped alerts**
+  (#7141). An `Active` incident maps every breaching sample to a Trigger, and
+  the dispatch permit was taken before the cooldown was consulted, so with the
+  dispatch semaphore full (a hung channel retrying) every breaching request
+  incremented `ferrum_notification_delivery_backpressure_dropped_total` and
+  the "dropping alert" warning although the cooldown would have suppressed the
+  reminder anyway. The cooldown is now checked first; only alerts actually
+  owed are counted. `stream_disconnect_cause` rules also read `causes`
+  through `DisconnectCause`'s serialized names, so a new cause is accepted
+  without a second table.
 - **`hmac_auth`'s pre-buffered success path commits through the shared
   authentication boundary** (#7139). A signed request whose body was buffered
   before `authenticate` set `identified_consumer` / `auth_method` by hand
