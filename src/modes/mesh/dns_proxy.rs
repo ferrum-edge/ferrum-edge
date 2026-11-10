@@ -175,11 +175,25 @@ impl DnsResolutionTable {
         Self::empty_with_response_cache_max_entries(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES)
     }
 
+    #[cfg(test)]
     fn empty_with_response_cache_max_entries(response_cache_max_entries: usize) -> Self {
+        Self::empty_with_response_cache(
+            response_cache_max_entries,
+            crate::util::sharding::pool_shard_amount(0),
+        )
+    }
+
+    /// `response_cache_shard_amount` must come from
+    /// [`crate::util::sharding::pool_shard_amount`]: the response cache is read
+    /// and written on every locally answered query.
+    fn empty_with_response_cache(
+        response_cache_max_entries: usize,
+        response_cache_shard_amount: usize,
+    ) -> Self {
         Self {
             exact: HashMap::new(),
             wildcard_suffixes: HashMap::new(),
-            response_cache: DashMap::new(),
+            response_cache: DashMap::with_shard_amount(response_cache_shard_amount),
             response_cache_entries: AtomicUsize::new(0),
             response_cache_max_entries: response_cache_max_entries.max(1),
         }
@@ -190,23 +204,31 @@ impl DnsResolutionTable {
     /// Indexes `ServiceEntry.hosts` mapped to their endpoint IPs, plus
     /// `MeshService` short names (`{name}.{namespace}.svc.cluster.local`)
     /// mapped to workload addresses resolved through the slice.
-    #[allow(dead_code)]
-    pub fn from_mesh_slice(slice: &MeshSlice) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_mesh_slice(slice: &MeshSlice) -> Self {
         Self::from_mesh_slice_with_cluster_domain(slice, DEFAULT_CLUSTER_DOMAIN)
     }
 
-    pub fn from_mesh_slice_with_cluster_domain(slice: &MeshSlice, cluster_domain: &str) -> Self {
-        Self::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+    #[cfg(test)]
+    pub(crate) fn from_mesh_slice_with_cluster_domain(
+        slice: &MeshSlice,
+        cluster_domain: &str,
+    ) -> Self {
+        Self::from_mesh_slice_with_cluster_domain_and_response_cache(
             slice,
             cluster_domain,
             DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+            crate::util::sharding::pool_shard_amount(0),
         )
     }
 
-    pub fn from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+    /// `response_cache_shard_amount` must come from
+    /// [`crate::util::sharding::pool_shard_amount`] (hot-path `DashMap`).
+    pub fn from_mesh_slice_with_cluster_domain_and_response_cache(
         slice: &MeshSlice,
         cluster_domain: &str,
         response_cache_max_entries: usize,
+        response_cache_shard_amount: usize,
     ) -> Self {
         let cluster_domain = normalize_dns_name(cluster_domain);
         let mut exact: HashMap<String, DnsRecordSet> = HashMap::new();
@@ -356,15 +378,15 @@ impl DnsResolutionTable {
         Self {
             exact,
             wildcard_suffixes,
-            response_cache: DashMap::new(),
+            response_cache: DashMap::with_shard_amount(response_cache_shard_amount),
             response_cache_entries: AtomicUsize::new(0),
             response_cache_max_entries: response_cache_max_entries.max(1),
         }
     }
 
     /// Resolve a hostname against the table. Returns `None` for non-mesh names.
-    #[allow(dead_code)]
-    pub fn resolve(&self, name: &str) -> Option<ResolvedDnsRecords<'_>> {
+    #[cfg(test)]
+    pub(crate) fn resolve(&self, name: &str) -> Option<ResolvedDnsRecords<'_>> {
         let normalized = normalize_dns_name(name);
         self.resolve_normalized(&normalized)
     }
@@ -581,6 +603,8 @@ pub struct MeshDnsProxy {
     ttl_seconds: u32,
     max_concurrent_queries: usize,
     response_cache_max_entries: usize,
+    /// Resolved `pool_shard_amount` for every rebuilt table's response cache.
+    response_cache_shard_amount: usize,
     cluster_domain: String,
 }
 
@@ -598,19 +622,24 @@ impl MeshDnsProxy {
         max_concurrent_queries: usize,
         response_cache_max_entries: usize,
         cluster_domain: String,
+        pool_shard_amount: usize,
     ) -> Self {
         let response_cache_max_entries = response_cache_max_entries.max(1);
+        let response_cache_shard_amount =
+            crate::util::sharding::pool_shard_amount(pool_shard_amount);
         Self {
             listen_addr,
             resolution_table: Arc::new(ArcSwap::new(Arc::new(
-                DnsResolutionTable::empty_with_response_cache_max_entries(
+                DnsResolutionTable::empty_with_response_cache(
                     response_cache_max_entries,
+                    response_cache_shard_amount,
                 ),
             ))),
             upstream_resolver,
             ttl_seconds,
             max_concurrent_queries: max_concurrent_queries.max(1),
             response_cache_max_entries,
+            response_cache_shard_amount,
             cluster_domain: normalize_dns_name(&cluster_domain),
         }
     }
@@ -627,12 +656,12 @@ impl MeshDnsProxy {
 
     /// Rebuild the resolution table from a new mesh slice.
     pub fn update_from_slice(&self, slice: &MeshSlice) {
-        let new_table =
-            DnsResolutionTable::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
-                slice,
-                &self.cluster_domain,
-                self.response_cache_max_entries,
-            );
+        let new_table = DnsResolutionTable::from_mesh_slice_with_cluster_domain_and_response_cache(
+            slice,
+            &self.cluster_domain,
+            self.response_cache_max_entries,
+            self.response_cache_shard_amount,
+        );
         let exact_count = new_table.exact_count();
         let wildcard_count = new_table.wildcard_count();
         self.resolution_table.store(Arc::new(new_table));
@@ -3107,6 +3136,48 @@ mod tests {
             table.response_cache_len(),
             DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES
         );
+    }
+
+    #[test]
+    fn mesh_dns_proxy_sizes_response_cache_from_pool_shard_amount() {
+        // Hot-path DashMaps take `pool_shard_amount` (CLAUDE.md, #7249): an
+        // explicit override rounds up to a power of two, `0` auto-sizes.
+        let proxy = |override_value| {
+            MeshDnsProxy::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:53".parse().unwrap(),
+                30,
+                16,
+                8,
+                "cluster.local".to_string(),
+                override_value,
+            )
+        };
+        assert_eq!(proxy(3).response_cache_shard_amount, 4);
+        assert_eq!(
+            proxy(0).response_cache_shard_amount,
+            crate::util::sharding::pool_shard_amount(0)
+        );
+
+        // A rebuilt table still answers through its response cache.
+        let proxy = proxy(3);
+        proxy.update_from_slice(&MeshSlice::default());
+        let table = proxy.resolution_table.load();
+        let key = DnsResponseCacheKey {
+            name: Arc::from("svc.example.com"),
+            qtype: QTYPE_A,
+            qclass: QCLASS_IN,
+            rd: true,
+            cd: false,
+            ad: false,
+            ttl: 60,
+            max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+            opt_record_len: 0,
+        };
+        let _ = table.cached_mesh_response(key, &cache_materialization_query(), || {
+            vec![0x12, 0x34, 0x81, 0x80]
+        });
+        assert_eq!(table.response_cache_len(), 1);
     }
 
     #[test]
