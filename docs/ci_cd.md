@@ -398,7 +398,8 @@ while PR-controlled planner bytes remain at the executed path. Filenames in the
 plan summary are JSON-escaped then HTML-escaped
 inside `<code>` so a hostile name cannot break Markdown.
 
-**FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
+**FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit; the
+required `FIPS Build & Test` aggregate needs it and fails unless it succeeded.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
 policy/key-admission/handshake tests share one cache layer plus an immutable
 artifact handoff:

@@ -6,7 +6,9 @@ name: FIPS Build Policy
 #
 # 1. `feature-policy` is the cheap REQUIRED graph audit. It reads `Cargo.toml`
 #    and the resolved feature graph for both profiles and fails when a ring
-#    feature could still be in control of a nominal FIPS build.
+#    feature could still be in control of a nominal FIPS build. The required
+#    `FIPS Build & Test` aggregate needs it and fails unless it succeeded, on
+#    every event and whether or not the expensive jobs were planned.
 # 2. `fips-plan` decides whether the expensive compile/claimed-check/clippy/
 #    test-binary/test jobs run.
 #    The planner is read from the trusted base; a missing or unknown planner
@@ -2907,6 +2909,7 @@ jobs:
     name: FIPS Build & Test
     runs-on: ubuntu-26.04
     needs:
+      - feature-policy
       - fips-plan
       - fips-compile
       - fips-claimed-checks
@@ -2915,6 +2918,10 @@ jobs:
       - fips-test
     if: always()
     steps:
+      - name: Fail when FIPS feature policy did not succeed
+        if: needs.feature-policy.result != 'success'
+        run: exit 1
+
       - name: Fail when FIPS planning fails
         if: needs.fips-plan.result != 'success'
         run: exit 1

@@ -1206,7 +1206,8 @@ Rules:
   resolved (`cargo tree -e normal,build --prefix none -f '{p}|{f}'`) for
   *both* profiles and
   fails on any surviving ring selection in the FIPS graph. It runs in the
-  required `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`.
+  `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`, which the
+  required `FIPS Build & Test` aggregate needs and requires to succeed.
   The `normal,build` edge filter is load-bearing: test fixtures pin `ring` and
   `rustls/ring` as dev-dependencies so the suite can verify both profiles
   without those edges entering a shipped binary. Package-row feature output is

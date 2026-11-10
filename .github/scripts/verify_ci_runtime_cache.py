@@ -4746,6 +4746,47 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS aggregate must fail closed when tests fail",
         failures,
     )
+    check_fips_feature_policy_gate(aggregate, failures)
+
+
+# `FIPS Feature Policy` is not itself a required check: branch protection and
+# the publication inventory name `FIPS Build & Test`. The aggregate therefore
+# must depend on the feature-policy audit and fail unless it succeeded, in an
+# unconditional step placed before the planner's irrelevant-diff skip, so a
+# failed audit on a FIPS-irrelevant pull request still blocks the merge.
+FIPS_FEATURE_POLICY_FAIL_STEP = (
+    "      - name: Fail when FIPS feature policy did not succeed\n"
+    "        if: needs.feature-policy.result != 'success'\n"
+    "        run: exit 1\n"
+)
+
+
+def check_fips_feature_policy_gate(aggregate: str, failures: list[str]) -> None:
+    require(
+        "feature-policy" in job_needs_list(aggregate),
+        "FIPS Build & Test aggregate must depend on FIPS Feature Policy",
+        failures,
+    )
+    gate_steps = [
+        step
+        for step in job_steps(aggregate)
+        if "needs.feature-policy.result" in step
+    ]
+    require(
+        len(gate_steps) == 1
+        and gate_steps[0].rstrip("\n") + "\n" == FIPS_FEATURE_POLICY_FAIL_STEP,
+        "FIPS Build & Test aggregate must fail with exactly one unconditional "
+        "step when FIPS Feature Policy did not succeed",
+        failures,
+    )
+    gate_position = aggregate.find(FIPS_FEATURE_POLICY_FAIL_STEP)
+    skip_position = aggregate.find("needs.fips-plan.outputs.relevant == 'false'")
+    require(
+        gate_position != -1 and skip_position != -1 and gate_position < skip_position,
+        "FIPS Build & Test aggregate must check FIPS Feature Policy before the "
+        "irrelevant-diff skip",
+        failures,
+    )
 
 
 # The eBPF image has the same target/profile/features as Ambient's trusted
@@ -7704,6 +7745,59 @@ def self_test() -> int:
             for item in special_tar_member_failures
         ),
         "self-test: accepting special tar members must fail",
+        failures,
+    )
+
+    # GHSA-cgg3-3m23-23gx: the required aggregate must not pass while the
+    # feature-policy audit fails.
+    no_feature_policy_need = handoff_channel.replace(
+        "    needs:\n      - feature-policy\n      - fips-plan\n",
+        "    needs:\n      - fips-plan\n",
+        1,
+    )
+    no_feature_policy_gate = handoff_channel.replace(
+        FIPS_FEATURE_POLICY_FAIL_STEP + "\n", "", 1
+    )
+    late_feature_policy_gate = no_feature_policy_gate.replace(
+        "      - name: Report FIPS compile gate\n",
+        FIPS_FEATURE_POLICY_FAIL_STEP + "\n      - name: Report FIPS compile gate\n",
+        1,
+    )
+    conditional_feature_policy_gate = handoff_channel.replace(
+        "        if: needs.feature-policy.result != 'success'\n",
+        "        if: needs.fips-plan.outputs.relevant == 'true' && "
+        "needs.feature-policy.result != 'success'\n",
+        1,
+    )
+    for label, mutated, expected in (
+        ("dropped feature-policy need", no_feature_policy_need,
+         "must depend on FIPS Feature Policy"),
+        ("dropped feature-policy fail step", no_feature_policy_gate,
+         "exactly one unconditional step"),
+        ("feature-policy step after the skip", late_feature_policy_gate,
+         "before the irrelevant-diff skip"),
+        ("relevance-scoped feature-policy step", conditional_feature_policy_gate,
+         "exactly one unconditional step"),
+    ):
+        require(
+            mutated != handoff_channel,
+            f"self-test: {label} fixture must alter the workflow",
+            failures,
+        )
+        mutated_failures: list[str] = []
+        check_fips(mutated, mutated_failures)
+        require(
+            any(expected in item for item in mutated_failures),
+            f"self-test: {label} must fail the FIPS aggregate contract",
+            failures,
+        )
+    current_feature_policy_failures: list[str] = []
+    check_fips_feature_policy_gate(
+        extract_job(handoff_channel, "fips-build"), current_feature_policy_failures
+    )
+    require(
+        not current_feature_policy_failures,
+        "self-test: the checked-in FIPS aggregate must gate on FIPS Feature Policy",
         failures,
     )
 

@@ -94,7 +94,9 @@ the module certificate's tested-platform list (see §"The module boundary").
 ### CI gate and caches
 
 `.github/workflows/fips-build.yml` is the hosted FIPS gate. `FIPS Feature Policy`
-always audits the resolved feature graph. `FIPS Build & Test` compiles the
+always audits the resolved feature graph, and the `FIPS Build & Test` aggregate
+fails unless that audit succeeded, including when the expensive jobs are skipped
+as irrelevant. `FIPS Build & Test` compiles the
 locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
 and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
 
