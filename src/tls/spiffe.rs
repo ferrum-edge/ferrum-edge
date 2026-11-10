@@ -5,8 +5,8 @@
 //! the SPIFFE peer-cert verifier, and the outbound client config for
 //! `FERRUM_MESH_CA_BACKEND`-issued (and file-gateway) SVIDs. They consume the
 //! `Arc<ArcSwap<Option<SvidBundle>>>` slot produced by
-//! [`crate::identity::workload_api::fetch_loop`] /
-//! [`crate::identity::rotation`] so cert rotation is lock-free and atomic
+//! [`crate::identity::workload_api::fetch_loop`] or the internal mesh CA
+//! rotation loop in [`crate::modes::mesh`], so cert rotation is lock-free and atomic
 //! from the rustls resolver's perspective — no listener restart, no per-
 //! request cloning of the bundle.
 //!

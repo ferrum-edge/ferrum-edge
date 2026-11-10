@@ -869,6 +869,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a flush (with retries) that outlasted several `flush_interval_ms` periods,
   the flush timer fired the missed ticks back to back and sent the recovering
   collector a run of tiny batches. It now resumes one interval later.
+- **UDP capture teardown no longer spins when a jump cannot be deleted**
+  (#7265). The loop that removes every `mangle` jump into a UDP guard or
+  capture chain exited only when the rule check failed. When the check kept
+  matching and the delete kept failing (for example an xtables lock held past
+  `-w`), the best-effort teardown scripts and the node-agent cleanup runner,
+  which run without `set -e`, never returned. The delete failure now exits
+  with its own status and an error message.
+- **The node-agent surfaces failed `includeOutboundPorts` removals and refuses
+  an unscoped inbound redirect** (#7266). Removing a pod's include-ports entry
+  from the eBPF map now tolerates only a missing entry and returns any other
+  map error, so the node-agent keeps retrying instead of leaving a narrowing
+  keyed by a cgroup inode that a later pod can reuse. The NodeWaypoint inbound
+  tc redirect now refuses to attach (failing startup) when the loaded BPF ELF
+  lacks the `FERRUM_POD_INBOUND_PORTS*` scope maps, as its comments and
+  warning already described, instead of arming a classifier that every pod
+  enrollment then fails to scope.
+- **The internal mesh CA fails an SVID issuance when the system RNG fails**
+  (#7268) instead of falling back to a process counter for the certificate
+  serial, which produced predictable serials that repeated across restarts.
+  The dev root bootstrap already failed this way; both now share one helper.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

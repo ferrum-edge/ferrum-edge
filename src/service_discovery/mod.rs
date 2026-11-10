@@ -2359,13 +2359,7 @@ async fn run_discovery_loop(
                 .await
                 {
                     DiscoveryApplyControl::Continue => {}
-                    DiscoveryApplyControl::Stop => {
-                        return if *cancel_rx.borrow() {
-                            DiscoveryLoopExit::Canceled
-                        } else {
-                            DiscoveryLoopExit::Shutdown
-                        };
-                    }
+                    DiscoveryApplyControl::Stop => return lifecycle_exit(&cancel_rx),
                 }
             }
             Err(e) => {

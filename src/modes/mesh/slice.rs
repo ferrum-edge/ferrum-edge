@@ -150,7 +150,6 @@ impl MeshSliceRequest {
 
     /// Returns `self` bound to a GAMMA Waypoint name. Used by mesh-mode
     /// startup when `topology == ServiceWaypoint`; tests use it directly.
-    #[allow(dead_code)]
     pub fn with_waypoint_name(mut self, name: Option<String>) -> Self {
         self.waypoint_name = name.filter(|value| !value.trim().is_empty());
         self

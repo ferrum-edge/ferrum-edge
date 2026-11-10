@@ -1139,32 +1139,6 @@ impl From<&XdsNodeMetadata> for XdsNodeScoping {
 
 /// Encode `Node.metadata` bytes for an outgoing DP request. Returns empty when
 /// there is nothing to carry, matching the prior no-metadata wire shape.
-pub fn encode_node_metadata(workload_spiffe_id: Option<&str>) -> Vec<u8> {
-    encode_node_metadata_with_waypoint(workload_spiffe_id, None)
-}
-
-pub fn encode_node_metadata_with_waypoint(
-    workload_spiffe_id: Option<&str>,
-    waypoint_name: Option<&str>,
-) -> Vec<u8> {
-    encode_node_metadata_with_waypoint_and_udp_scope(workload_spiffe_id, waypoint_name, false)
-}
-
-pub fn encode_node_metadata_with_waypoint_and_udp_scope(
-    workload_spiffe_id: Option<&str>,
-    waypoint_name: Option<&str>,
-    ambient_udp_source_scoping: bool,
-) -> Vec<u8> {
-    encode_node_metadata_with_scoping(
-        workload_spiffe_id,
-        waypoint_name,
-        XdsNodeScoping {
-            ambient_udp_source_scoping,
-            node_waypoint_capture_scoping: false,
-        },
-    )
-}
-
 pub fn encode_node_metadata_with_scoping(
     workload_spiffe_id: Option<&str>,
     waypoint_name: Option<&str>,
@@ -1325,20 +1299,26 @@ mod tests {
     #[test]
     fn node_metadata_round_trips_workload_spiffe() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
-        let bytes = encode_node_metadata_with_waypoint(Some(spiffe), Some("waypoint"));
+        let none = XdsNodeScoping::default();
+        let bytes = encode_node_metadata_with_scoping(Some(spiffe), Some("waypoint"), none);
         assert!(!bytes.is_empty());
         let metadata = decode_node_metadata(&bytes);
         assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
         assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
-        let udp_scope = decode_node_metadata(&encode_node_metadata_with_waypoint_and_udp_scope(
-            None, None, true,
+        let udp_scope = decode_node_metadata(&encode_node_metadata_with_scoping(
+            None,
+            None,
+            XdsNodeScoping {
+                ambient_udp_source_scoping: true,
+                node_waypoint_capture_scoping: false,
+            },
         ));
         assert!(udp_scope.ambient_udp_source_scoping);
         // Absent / empty identity encodes to empty bytes (prior no-metadata
         // wire shape) and decodes to no identity.
-        assert!(encode_node_metadata(None).is_empty());
-        assert!(encode_node_metadata(Some("")).is_empty());
-        assert!(encode_node_metadata_with_waypoint(None, Some(" \t")).is_empty());
+        assert!(encode_node_metadata_with_scoping(None, None, none).is_empty());
+        assert!(encode_node_metadata_with_scoping(Some(""), None, none).is_empty());
+        assert!(encode_node_metadata_with_scoping(None, Some(" \t"), none).is_empty());
         assert_eq!(decode_node_metadata(&[]).workload_spiffe_id, None);
         // Malformed metadata never errors/panics — it is advisory, so it
         // decodes to no identity rather than rejecting the stream.

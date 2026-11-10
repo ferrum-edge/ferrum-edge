@@ -205,7 +205,7 @@ pub struct FetchLoopConfig {
 impl Default for FetchLoopConfig {
     fn default() -> Self {
         Self {
-            socket_path: super::client::DEFAULT_WORKLOAD_API_SOCKET.to_string(),
+            socket_path: crate::identity::ca::spire::DEFAULT_SPIRE_AGENT_SOCKET.to_string(),
             expected_spiffe_id: None,
             reconnect_backoff: Duration::from_secs(1),
             max_reconnect_backoff: Duration::from_secs(30),
@@ -337,7 +337,6 @@ pub fn install_test_bundle(handle: &SvidFetchHandle, bundle: SvidBundle) {
 /// Convert a bundle's notAfter into a duration-from-now (used by the fetch
 /// loop's bundle metrics). Returns `Duration::ZERO` for already-expired
 /// bundles.
-#[allow(dead_code)]
 pub(crate) fn time_until_expiry(bundle: &SvidBundle) -> Duration {
     use chrono::Utc;
     use x509_parser::prelude::*;

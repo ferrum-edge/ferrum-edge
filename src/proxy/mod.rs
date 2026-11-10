@@ -8158,9 +8158,8 @@ pub struct ProxyState {
     ///
     /// The gateway SVID source watcher publishes to this sender when
     /// `FERRUM_GATEWAY_SVID_*` sources are configured and a validated reload
-    /// succeeds. In-memory producers can also wire in by cloning the
-    /// sender and handing the clone to `RotationConfig.revision_tx`
-    /// ([`crate::identity::rotation::RotationConfig::new`]) or
+    /// succeeds. The internal mesh CA rotation loop sends here directly, and
+    /// the SPIRE fetch loop is wired in through
     /// `SvidFetchHandle::with_revision_tx`. Until at least one producer is
     /// bound, the channel stays at generation 0 — pool keys carry `|svidg=0`
     /// and no rotation drain fires.

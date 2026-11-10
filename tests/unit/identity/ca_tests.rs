@@ -131,6 +131,51 @@ async fn internal_ca_signs_generate_request() {
 }
 
 #[tokio::test]
+async fn internal_ca_issues_random_positive_serials() {
+    use x509_parser::prelude::*;
+
+    let root = dev_root("td.internal-ca-serial-test");
+    let trust_domain = TrustDomain::new("td.internal-ca-serial-test").unwrap();
+    let cfg = internal::InternalCaConfig {
+        root_cert_pem: root.root_cert_pem,
+        root_key_pem: root.root_key_pem,
+        trust_domain: trust_domain.clone(),
+        bundle_refresh_hint_secs: Some(60),
+        default_svid_ttl_secs: 600,
+        max_svid_ttl_secs: 3600,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
+    };
+    let ca = internal::InternalCa::new(cfg).expect("CA initialised");
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/serial").unwrap();
+
+    let mut serials = Vec::new();
+    for _ in 0..2 {
+        let svid = ca
+            .issue_svid(IssuanceRequest::Generate {
+                spiffe_id: id.clone(),
+                ttl_secs: 600,
+            })
+            .await
+            .expect("generate succeeds");
+        let (_, parsed) =
+            X509Certificate::from_der(&svid.cert_chain_der[0]).expect("issued cert parses");
+        let serial = parsed.raw_serial().to_vec();
+        assert!(!serial.is_empty());
+        assert_eq!(serial[0] & 0x80, 0, "RFC 5280 requires a positive serial");
+        assert!(
+            serial.iter().any(|byte| *byte != 0),
+            "serial must not be zero"
+        );
+        serials.push(serial);
+    }
+    // Serials come from the system RNG, never a process counter.
+    assert_ne!(serials[0], serials[1]);
+}
+
+#[tokio::test]
 async fn internal_ca_csr_svid_not_after_matches_leaf_cert() {
     let root = dev_root("td.internal-ca-csr-test");
     let trust_domain = TrustDomain::new("td.internal-ca-csr-test").unwrap();
@@ -436,7 +481,6 @@ fn ca_backend_default_is_none() {
 fn spire_agent_ca_config_default_socket_path() {
     let cfg = ferrum_edge::identity::ca::spire::SpireAgentCaConfig::default();
     assert_eq!(cfg.socket_path, "/run/spire/sockets/agent.sock");
-    assert_eq!(cfg.cert_ttl_secs, 3600);
 }
 
 #[test]
@@ -444,5 +488,15 @@ fn spire_agent_ca_default_socket_constant() {
     assert_eq!(
         ferrum_edge::identity::ca::spire::DEFAULT_SPIRE_AGENT_SOCKET,
         "/run/spire/sockets/agent.sock"
+    );
+}
+
+#[test]
+fn fetch_loop_default_socket_matches_the_spire_agent_default() {
+    // The fetch loop and the SPIRE CA adapter dial the same agent, so their
+    // defaults must agree (they once named two different paths).
+    assert_eq!(
+        ferrum_edge::identity::workload_api::FetchLoopConfig::default().socket_path,
+        ferrum_edge::identity::ca::spire::DEFAULT_SPIRE_AGENT_SOCKET
     );
 }

@@ -39,7 +39,13 @@ use crate::grpc::proto::ConfigUpdate;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::xds::carrier::XdsNodeScoping;
 
+/// Defence-in-depth cap on distinct subscribed type URLs per stream.
+///
+/// Unreachable today: `ensure_supported_type_url` runs first and admits only
+/// the fixed `XDS_TYPE_URLS` set, which the assert below keeps under this cap.
+/// It bounds per-stream state if that admission is ever widened.
 const MAX_SUBSCRIPTIONS_PER_STREAM: usize = 32;
+const _: () = assert!(super::translator::XDS_TYPE_URLS.len() <= MAX_SUBSCRIPTIONS_PER_STREAM);
 const MAX_RESOURCE_NAMES_PER_REQUEST: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
