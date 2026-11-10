@@ -58,8 +58,12 @@ pub(super) struct CompiledStreamSignatures {
 
 impl CompiledStreamSignatures {
     /// Metadata for every signature matching `data`.
+    ///
+    /// Clean traffic (the common case: every UDP datagram and TCP first-bytes
+    /// scan) is decided by `is_match` alone, which neither builds the per-set
+    /// match list nor allocates; only a matching payload pays for both.
     pub(super) fn matches<'a>(&'a self, data: &[u8]) -> Vec<&'a StreamSignatureMeta> {
-        if self.meta.is_empty() {
+        if self.meta.is_empty() || !self.set.is_match(data) {
             return Vec::new();
         }
         self.set
