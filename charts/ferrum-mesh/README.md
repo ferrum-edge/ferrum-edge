@@ -87,8 +87,16 @@ kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
 ```
 
 A mismatch is an operator failure. Either leave `crds.install=true` so the
-next upgrade applies the template, or apply that YAML with
-`kubectl apply --server-side` and set `crds.skipInstallAcknowledged=true`.
+next upgrade applies the template, or set `crds.skipInstallAcknowledged=true`
+and apply the rendered CRD yourself (the template file is a Helm template, not
+plain YAML):
+
+```bash
+helm template <release> ./charts/ferrum-mesh -n <namespace> \
+  --show-only templates/crds-udpresponseamplificationpolicy.yaml \
+  --set crds.install=true | kubectl apply --server-side -f -
+```
+
 `crds.install=false` without that acknowledgement fails render.
 
 Existing clusters that installed this CRD from the former `crds/` directory

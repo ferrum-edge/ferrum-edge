@@ -363,10 +363,18 @@ kubectl get crd udpresponseamplificationpolicies.gateway.ferrum.io \
   -o jsonpath='{.metadata.annotations.gateway\.ferrum\.io/crd-schema-version}'
 ```
 
-A mismatch is an operator failure. Leave `crds.install=true`, or apply the
-template YAML with `kubectl apply --server-side` and set
-`crds.skipInstallAcknowledged=true`. `crds.install=false` without that
-acknowledgement fails `helm template` / `helm upgrade`.
+A mismatch is an operator failure. Leave `crds.install=true`, or set
+`crds.skipInstallAcknowledged=true` and apply the rendered CRD yourself (the
+template file is a Helm template, not plain YAML):
+
+```bash
+helm template <release> ./charts/ferrum-mesh -n <namespace> \
+  --show-only templates/crds-udpresponseamplificationpolicy.yaml \
+  --set crds.install=true | kubectl apply --server-side -f -
+```
+
+`crds.install=false` without that acknowledgement fails `helm template` /
+`helm upgrade`.
 
 Existing clusters that installed this CRD from the former
 `charts/ferrum-mesh/crds/` directory must adopt it once so Helm can update it.
