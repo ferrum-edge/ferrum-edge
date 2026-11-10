@@ -568,12 +568,13 @@ fn control_plane_poll_tick_records_on_every_normal_exit_without_async_wrapper() 
     assert_fallthrough_records_completion(tick, "control_plane");
 
     let continue_count = tick.lines().filter(|l| l.trim() == "continue;").count();
-    // 11 in base main, plus the two exits per-namespace isolation added
-    // (#2983/#2984): a delta whose namespaces all rejected, and a non-empty
-    // delta that partitioned to no attributable namespace. Both still record
+    // 11 in base main, plus the exit per-namespace isolation added
+    // (#2983/#2984) for a delta whose namespaces all rejected. It still records
     // completion, which `assert_every_continue_records_completion` above proves.
+    // The "partitioned to no attributable namespace" exit was unreachable and
+    // is gone (#7252).
     assert_eq!(
-        continue_count, 13,
+        continue_count, 12,
         "control-plane poll tick handled-continue exit count drifted"
     );
     let record_count = tick.matches("record_poll_completed()").count();
