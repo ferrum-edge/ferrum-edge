@@ -21555,7 +21555,7 @@ components:
           properties:
             op:
               type: string
-              const: min_latency_ms
+              enum: [min_latency_ms, latency_above_ms]
             value:
               type: integer
               minimum: 0

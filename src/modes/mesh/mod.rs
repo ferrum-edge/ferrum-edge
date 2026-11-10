@@ -321,19 +321,6 @@ impl MeshTopology {
         }
     }
 
-    /// Whether this topology terminates HBONE inbound on the shared waypoint
-    /// listener (port 15008 by default). True for `Ambient`, `NodeWaypoint`,
-    /// and `ServiceWaypoint`. No runtime path consults it: listener spawning
-    /// derives the HBONE listener from `listener_plan()`. Only the topology
-    /// conformance matrix and integration tests read it.
-    #[inline]
-    pub fn terminates_hbone(self) -> bool {
-        matches!(
-            self,
-            Self::Ambient | Self::NodeWaypoint | Self::ServiceWaypoint
-        )
-    }
-
     /// Whether this topology is a waypoint flavor (node or service scope).
     /// Used by slice-filter and admin-endpoint dispatch to identify the
     /// shared-listener topologies that need extra scoping beyond Ambient's
@@ -1399,9 +1386,7 @@ impl MeshRuntimeConfig {
         if self.topology != MeshTopology::NodeWaypoint {
             return Ok(());
         }
-        if node_waypoint_udp_listeners_enabled_from_env()?
-            && node_waypoint_udp_local_node_name_from_env().is_none()
-        {
+        if node_waypoint_udp_listeners_enabled_from_env()? && k8s_node_name_from_env().is_none() {
             return Err(
                 "FERRUM_K8S_NODE_NAME must be set to the current Kubernetes node when \
                  FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true"
@@ -2277,15 +2262,21 @@ pub(crate) fn node_waypoint_udp_listeners_enabled_from_env() -> Result<bool, Str
     }
 }
 
-/// Exact Kubernetes node whose local workloads this NodeWaypoint may reach.
+/// This process's Kubernetes node name (`FERRUM_K8S_NODE_NAME`, downward API
+/// `spec.nodeName`), trimmed; `None` when unset or blank.
 ///
-/// The UDP relay's eBPF authorization mark is socket-local metadata and does
-/// not cross a node boundary. A listener must therefore never select a backing
-/// workload owned by another node, even when that workload is in the same
-/// cluster. The serving path rejects an enabled listener surface when this
-/// downward-API value is absent; read-only materialization remains infallible
-/// and emits no listeners in that state.
-fn node_waypoint_udp_local_node_name_from_env() -> Option<String> {
+/// Read from the process environment only, never `ferrum.conf`: the value
+/// names the machine the process runs on, so a settings-file copy could name
+/// another node. It is the one reader for both consumers (issue #7237):
+///
+/// - NodeWaypoint UDP/DTLS listeners, which must never select a backing
+///   workload owned by another node (the UDP relay's eBPF authorization mark
+///   is socket-local and does not cross a node boundary). The serving path
+///   rejects an enabled listener surface when this is absent; read-only
+///   materialization remains infallible and emits no listeners in that state.
+/// - `ferrum-edge ambient-udp-preflight`, which binds its `get nodes` lookup
+///   to this node.
+pub fn k8s_node_name_from_env() -> Option<String> {
     std::env::var("FERRUM_K8S_NODE_NAME")
         .ok()
         .map(|value| value.trim().to_string())
@@ -2489,7 +2480,7 @@ fn materialize_node_waypoint_udp_listeners(
         config.node_waypoint_udp_destination_routes.clear();
         return;
     }
-    let Some(local_node_name) = node_waypoint_udp_local_node_name_from_env() else {
+    let Some(local_node_name) = k8s_node_name_from_env() else {
         config.node_waypoint_udp_steer_destinations.clear();
         config.node_waypoint_udp_destination_routes.clear();
         warn!(
@@ -13264,6 +13255,12 @@ fn build_egress_upstream_targets(
 /// re-encryption) is not an egress-gateway capability today; if that is ever
 /// needed it would be a distinct stream-family egress mode, not a remap of this
 /// scheme. See #1727.
+///
+/// `Http2` and `Grpc` also map to `Https`: the egress gateway always originates
+/// verified TLS to such a port, and a DestinationRule `tls.mode: DISABLE` does
+/// not undo it. That diverges from Istio, where these ports are plaintext unless
+/// a DestinationRule requests origination; `docs/mesh.md` lists it under Istio
+/// Compatibility Gaps (issue #7236).
 fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
         AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
@@ -13725,6 +13722,12 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
 /// destination index resolves (`node_waypoint_route_upstreams`), with each
 /// target's Service identity. Shared by `mesh_authz` and RequestAuthentication
 /// destination selection so both resolve a route to the same workloads.
+///
+/// Empty on every slice-built config: `gateway_config_from_mesh_slice_with_federation`
+/// materializes only `istio-vs-l4-upstream-*` upstreams, so no
+/// `istio-vs-upstream-` / `gwapi-route-upstream-` id reaches this filter in
+/// production. Only the whole-config `prepare_gateway_config_for_mesh` test
+/// entry point supplies such upstreams (issue #7233).
 fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json::Value> {
     config
         .upstreams
@@ -16081,13 +16084,6 @@ async fn arm_mesh_runtime_startup(
         if let Some(initial_slice) = initial_applied_mesh_slice.as_ref() {
             let snapshot = resolver.build_policy_scope_snapshot_from_slice(initial_slice);
             resolver.install_policy_scope_snapshot(snapshot);
-        }
-        if let Some(handle) = node_waypoint::spawn_cgroup_sweep_task(
-            resolver.clone(),
-            env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
-            shutdown_tx.subscribe(),
-        ) {
-            owner.push_mesh_background(handle);
         }
         if let Some(handle) = node_waypoint::spawn_idle_identity_gc_task(
             resolver.clone(),
@@ -18972,10 +18968,11 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
     //     for the identical condition. So a configured SVID that fails to load —
     //     including an expired/mid-rotation leaf — aborts startup; it does not
     //     silently degrade to chain-only.
-    //   - Live reload: `stage_mesh_inbound_spiffe_bundle_with_federation` keeps
-    //     the PREVIOUS trust bundle (the running verifier is retained, not
-    //     dropped to chain-only), so a transient mid-rotation failure does not
-    //     drop inbound trust-domain enforcement.
+    //   - Live reload: slice applies never rebuild this slot from files; they
+    //     stage only the trust overlay (`stage_gateway_runtime_spiffe_bundle_with_federation`)
+    //     and republish from the runtime SVID, so the running verifier is
+    //     retained and a transient mid-rotation failure does not drop inbound
+    //     trust-domain enforcement.
     // We intentionally do not load only the trust bundle here: the gateway leaf
     // must also be currently valid for the listener to present a usable server
     // identity, so an expired leaf is a real fault, not a reason to half-load.
@@ -19095,66 +19092,6 @@ fn merge_trust_overlay_into_svid_bundle(
         .or_insert_with(|| runtime.local.clone());
 }
 
-/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID material plus
-/// the current slice's federated bundles, returning it STAGED (not yet stored
-/// into the live slot). The caller publishes it into the live slot only after
-/// the candidate proxy config is accepted, so a rejected slice cannot leave new
-/// federated trust domains active for inbound handshakes. A rebuild failure
-/// returns `None` (logged) and the caller leaves the previous trust bundles in
-/// place — this never fails the slice.
-#[allow(clippy::too_many_arguments)]
-fn stage_mesh_inbound_spiffe_bundle_with_federation(
-    proxy_state: &ProxyState,
-    slot: Option<&tls::SharedBundleSlot>,
-    runtime_trust_overlay_slot: Option<&SharedMeshInboundTrustOverlaySlot>,
-    env_config: &EnvConfig,
-    slice: &MeshSlice,
-    federation: Option<&federation::FederationSnapshot>,
-    activation: FederationActivation,
-) -> Option<StagedSpiffeBundle> {
-    let slot = slot?;
-    if runtime_trust_overlay_slot.is_some() {
-        return stage_gateway_runtime_spiffe_bundle_with_federation(
-            proxy_state,
-            Some(slot),
-            runtime_trust_overlay_slot,
-            slice,
-            federation,
-            activation,
-        );
-    }
-    if !gateway_svid_material_configured(env_config) {
-        return stage_gateway_runtime_spiffe_bundle_with_federation(
-            proxy_state,
-            Some(slot),
-            runtime_trust_overlay_slot,
-            slice,
-            federation,
-            activation,
-        );
-    }
-    match build_mesh_inbound_spiffe_slot_with_federation(
-        env_config,
-        Some(slice),
-        federation,
-        activation,
-        None,
-    ) {
-        Some(rebuilt) => Some(StagedSpiffeBundle::DirectSlot {
-            slot: slot.clone(),
-            bundle: rebuilt.load_full(),
-        }),
-        None => {
-            warn!(
-                mesh_slice_version = %sanitize_startup_scalar(slice.version.to_string()),
-                "Unable to rebuild mesh inbound SPIFFE trust-bundle slot from slice; \
-                 keeping previous trust bundles"
-            );
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 fn stage_gateway_runtime_spiffe_bundle(
     proxy_state: &ProxyState,
@@ -19172,6 +19109,15 @@ fn stage_gateway_runtime_spiffe_bundle(
     )
 }
 
+/// Stage the inbound SPIFFE trust update for the current slice: the accepted
+/// slice/federation trust overlay, published into the live slot (re-read from
+/// the latest runtime SVID) only after the candidate proxy config is accepted,
+/// so a rejected slice cannot leave new federated trust domains active for
+/// inbound handshakes. Every inbound SPIFFE slot has a runtime trust overlay
+/// slot (both exist exactly when gateway SVID material or a CA backend is
+/// configured), so this is the only staging path. A staging failure returns
+/// `None` (logged) and the caller leaves the previous trust bundles in place —
+/// this never fails the slice.
 fn stage_gateway_runtime_spiffe_bundle_with_federation(
     proxy_state: &ProxyState,
     slot: Option<&tls::SharedBundleSlot>,
@@ -19208,7 +19154,7 @@ fn stage_gateway_runtime_spiffe_bundle_with_federation(
         );
         return None;
     }
-    Some(StagedSpiffeBundle::RuntimeSlot {
+    Some(StagedSpiffeBundle {
         slot: slot.clone(),
         trust_overlay_slot: runtime_trust_overlay_slot.clone(),
         trust_overlay,
@@ -19972,23 +19918,14 @@ enum MeshInboundTlsReloadPlan {
 
 /// A staged inbound SPIFFE trust update. Staging keeps the live verifier
 /// reading the previous trust bundles until the candidate proxy config is
-/// accepted.
-enum StagedSpiffeBundle {
-    /// File-backed SVID path: replace the dedicated inbound verifier slot.
-    DirectSlot {
-        slot: tls::SharedBundleSlot,
-        bundle: Arc<Option<crate::identity::SvidBundle>>,
-    },
-    /// Runtime-backed SVID path: update the dedicated inbound verifier slot
-    /// from the latest raw SVID plus the accepted slice trust overlay. The
-    /// SVID itself is intentionally not captured at staging time because a
-    /// file/CA rotation can complete while the candidate slice is still being
-    /// planned.
-    RuntimeSlot {
-        slot: tls::SharedBundleSlot,
-        trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
-        trust_overlay: Option<crate::identity::TrustBundleSet>,
-    },
+/// accepted. Publishing updates the dedicated inbound verifier slot from the
+/// latest raw SVID plus the accepted slice trust overlay. The SVID itself is
+/// intentionally not captured at staging time because a file/CA rotation can
+/// complete while the candidate slice is still being planned.
+struct StagedSpiffeBundle {
+    slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    trust_overlay: Option<crate::identity::TrustBundleSet>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20074,11 +20011,10 @@ fn plan_mesh_inbound_tls_reload_with_federation(
     // when the operator client CA bundle and mTLS mode are otherwise unchanged.
     // Only the accepted slice trust overlay is recomputed; the SVID cert/key
     // and local roots stay anchored to the current file or CA runtime source.
-    let staged_spiffe = stage_mesh_inbound_spiffe_bundle_with_federation(
+    let staged_spiffe = stage_gateway_runtime_spiffe_bundle_with_federation(
         proxy_state,
         spiffe_bundle_slot,
         runtime_trust_overlay_slot,
-        &proxy_state.env_config,
         slice,
         federation,
         activation,
@@ -20774,31 +20710,28 @@ fn start_remote_cluster_discovery_reconcile_task(
 /// The verifier holds an `Arc` to this slot and observes the new bundle on its
 /// next handshake.
 ///
-/// Both arms publish through `ProxyState::publish_mesh_inbound_trust_bundle`
-/// (issue #5568), so every accepted change to inbound trust re-judges live
+/// It publishes through `publish_runtime_svid_to_inbound_slot` and so
+/// `ProxyState::publish_mesh_inbound_trust_bundle` (issue #5568), so every
+/// accepted change to inbound trust re-judges live
 /// HBONE tunnels against it. A republish that carries the same X.509 material
 /// costs one coalesced sweep and no certificate path building, because the
 /// slot's trust revision does not move.
 fn publish_staged_spiffe_bundle(proxy_state: &ProxyState, staged: Option<StagedSpiffeBundle>) {
-    match staged {
-        Some(StagedSpiffeBundle::DirectSlot { slot, bundle }) => {
-            proxy_state.publish_mesh_inbound_trust_bundle(&slot, bundle);
-        }
-        Some(StagedSpiffeBundle::RuntimeSlot {
-            slot,
-            trust_overlay_slot,
-            trust_overlay,
-        }) => {
-            // Publish the accepted trust overlay, then republish the inbound slot
-            // from the LATEST runtime SVID under the rotation lock (a CA rotation
-            // may have landed since this slice was staged). `publish_runtime_svid_to_inbound_slot`
-            // re-reads `gateway_file_svid_bundle` itself, so a rotation cannot be
-            // clobbered by a stale staged snapshot.
-            trust_overlay_slot.store(Arc::new(trust_overlay));
-            publish_runtime_svid_to_inbound_slot(proxy_state, &slot, &trust_overlay_slot);
-        }
-        None => {}
-    }
+    let Some(StagedSpiffeBundle {
+        slot,
+        trust_overlay_slot,
+        trust_overlay,
+    }) = staged
+    else {
+        return;
+    };
+    // Publish the accepted trust overlay, then republish the inbound slot from
+    // the LATEST runtime SVID under the rotation lock (a CA rotation may have
+    // landed since this slice was staged). `publish_runtime_svid_to_inbound_slot`
+    // re-reads `gateway_file_svid_bundle` itself, so a rotation cannot be
+    // clobbered by a stale staged snapshot.
+    trust_overlay_slot.store(Arc::new(trust_overlay));
+    publish_runtime_svid_to_inbound_slot(proxy_state, &slot, &trust_overlay_slot);
 }
 
 /// Stage the exact effective mesh/federation gateway trust decision before any
@@ -20963,11 +20896,10 @@ async fn apply_mesh_slice_generation(
     let staged_inbound_spiffe = if live_reload_enabled {
         None
     } else {
-        stage_mesh_inbound_spiffe_bundle_with_federation(
+        stage_gateway_runtime_spiffe_bundle_with_federation(
             proxy_state,
             inbound_tls_reload.spiffe_bundle_slot.as_ref(),
             inbound_tls_reload.runtime_trust_overlay_slot.as_ref(),
-            &proxy_state.env_config,
             base_slice,
             Some(federation_snapshot),
             federation_activation,
@@ -37683,52 +37615,6 @@ mod tests {
         assert!(disabled.is_none(), "DISABLE has no TLS, so no verifier");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn staged_spiffe_bundle_publish_stores_into_live_slot() {
-        // F4: `publish_staged_spiffe_bundle` is the post-accept publish step
-        // that moves a staged inbound SPIFFE trust-bundle into the live slot.
-        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
-
-        let state = make_test_proxy_state(GatewayConfig::default());
-        let td = TrustDomain::new("td.stage-test").unwrap();
-        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
-        let original = Arc::new(Some(SvidBundle {
-            spiffe_id: id.clone(),
-            cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new().into(),
-            trust_bundles: TrustBundleSet::local_only(TrustBundle {
-                trust_domain: td.clone(),
-                x509_authorities: vec![vec![4, 5, 6]],
-                jwt_authorities: Vec::new(),
-                refresh_hint_seconds: None,
-            }),
-        }));
-        let slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(original));
-
-        let replacement = Arc::new(Some(SvidBundle {
-            spiffe_id: id,
-            cert_chain_der: vec![vec![7, 8, 9]],
-            private_key_pkcs8_der: Vec::new().into(),
-            trust_bundles: TrustBundleSet::local_only(TrustBundle {
-                trust_domain: td,
-                x509_authorities: vec![vec![10, 11, 12]],
-                jwt_authorities: Vec::new(),
-                refresh_hint_seconds: None,
-            }),
-        }));
-        let staged = Some(StagedSpiffeBundle::DirectSlot {
-            slot: slot.clone(),
-            bundle: replacement.clone(),
-        });
-
-        // Publishing (post-accept) swaps the slot to the staged bundle.
-        publish_staged_spiffe_bundle(&state, staged);
-        assert!(
-            Arc::ptr_eq(&slot.load_full(), &replacement),
-            "publish must store the staged bundle into the live slot"
-        );
-    }
-
     #[test]
     fn gateway_config_validation_keeps_fail_closed_federation_bootstrap_bundle() {
         use base64::Engine;
@@ -39729,10 +39615,12 @@ mod tests {
         runtime
     }
 
-    fn reviews_peer_auth_selector() -> config::WorkloadSelector {
-        config::WorkloadSelector {
-            labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
-            namespace: None,
+    fn reviews_peer_auth_scope() -> config::PolicyScope {
+        config::PolicyScope::WorkloadSelector {
+            selector: config::WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+                namespace: Some("default".to_string()),
+            },
         }
     }
 
@@ -39743,8 +39631,7 @@ mod tests {
         config::PeerAuthentication {
             name: "ns-policy".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: Some(reviews_peer_auth_selector()),
+            scope: reviews_peer_auth_scope(),
             mtls_mode: config::MtlsMode::Permissive,
             port_overrides: HashMap::from([(port, mode)]),
         }
@@ -39754,8 +39641,9 @@ mod tests {
         config::PeerAuthentication {
             name: "ns-policy".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: None,
+            scope: config::PolicyScope::Namespace {
+                namespace: "default".to_string(),
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }
@@ -39797,8 +39685,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "mixed".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -39825,8 +39712,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "selector-scoped".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -39856,8 +39742,7 @@ mod tests {
             peer_authentications: vec![config::PeerAuthentication {
                 name: "service-port-is-not-an-app-port".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (80, config::MtlsMode::Disable),
@@ -39884,8 +39769,7 @@ mod tests {
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "ingress".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -40025,10 +39909,9 @@ mod tests {
         let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
             name: "namespace-strict".to_string(),
             namespace: "default".to_string(),
-            scope: Some(config::PolicyScope::WorkloadSelector {
-                selector: empty_selector.clone(),
-            }),
-            selector: Some(empty_selector),
+            scope: config::PolicyScope::WorkloadSelector {
+                selector: empty_selector,
+            },
             mtls_mode: config::MtlsMode::Strict,
             port_overrides: HashMap::from([(8080, config::MtlsMode::Disable)]),
         }]);
@@ -40072,8 +39955,7 @@ mod tests {
             let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
                 name: "transport-port-collision".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(reviews_peer_auth_selector()),
+                scope: reviews_peer_auth_scope(),
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([(transport_port, config::MtlsMode::Permissive)]),
             }]);

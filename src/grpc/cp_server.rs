@@ -1877,20 +1877,12 @@ impl CpGrpcServer {
         namespace: &str,
         root_namespace: &str,
     ) -> bool {
-        if let Some(scope) = &policy.scope {
-            return Self::policy_scope_can_apply_to_namespace(
-                &policy.namespace,
-                scope,
-                namespace,
-                root_namespace,
-            );
-        }
-
-        policy.namespace == namespace
-            && policy
-                .selector
-                .as_ref()
-                .is_none_or(|selector| Self::selector_can_apply_to_namespace(selector, namespace))
+        Self::policy_scope_can_apply_to_namespace(
+            &policy.namespace,
+            &policy.scope,
+            namespace,
+            root_namespace,
+        )
     }
 
     fn selector_can_apply_to_namespace(selector: &WorkloadSelector, namespace: &str) -> bool {
@@ -3652,8 +3644,7 @@ mod tests {
                 peer_authentications: vec![PeerAuthentication {
                     name: "root-peer".to_string(),
                     namespace: "istio-system".to_string(),
-                    scope: Some(PolicyScope::MeshWide),
-                    selector: None,
+                    scope: PolicyScope::MeshWide,
                     mtls_mode: MtlsMode::Strict,
                     port_overrides: Default::default(),
                 }],
@@ -4533,10 +4524,9 @@ mod tests {
         let namespace_peer_auth = |namespace: &str, mode: MtlsMode| PeerAuthentication {
             name: format!("{namespace}-default"),
             namespace: namespace.to_string(),
-            scope: Some(PolicyScope::Namespace {
+            scope: PolicyScope::Namespace {
                 namespace: namespace.to_string(),
-            }),
-            selector: None,
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         };

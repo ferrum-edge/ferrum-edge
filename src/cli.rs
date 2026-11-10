@@ -629,9 +629,10 @@ pub fn execute_ambient_udp_preflight(args: &AmbientUdpPreflightArgs) -> Result<(
     })?;
     let explicit_node_uid =
         parse_explicit_k8s_node_uid(resolve_ferrum_var("FERRUM_K8S_NODE_UID").as_deref())?;
-    let node_name = resolve_ferrum_var("FERRUM_K8S_NODE_NAME")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    // Environment only, shared with the NodeWaypoint UDP listeners: the node
+    // name always comes from the downward API, and a `ferrum.conf` copy could
+    // name another machine.
+    let node_name = crate::modes::mesh::k8s_node_name_from_env();
     let target_proc_root = args
         .host_proc_root
         .as_deref()

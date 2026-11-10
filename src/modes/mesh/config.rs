@@ -3144,34 +3144,125 @@ pub fn destination_rule_lookup_tier(
     }
 }
 
-pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
-    entry: &ServiceEntry,
-    workload_namespace: &str,
-    _workload_labels: &L,
-) -> bool {
+/// Whether `entry` applies to a workload in `workload_namespace`: export
+/// visibility only. `ServiceEntry.workload_selector` is carried but not
+/// consumed (no endpoint selection from selected workloads), and Kubernetes
+/// status reports it as a deferred field.
+pub fn service_entry_applies_to_workload(entry: &ServiceEntry, workload_namespace: &str) -> bool {
     service_entry_exported_to_namespace(entry, workload_namespace)
 }
 
 // ── PeerAuthentication ────────────────────────────────────────────────────
 
-/// Closed (`deny_unknown_fields`, issue #6616) like the authorization grammar
-/// and `MeshRequestAuthentication`: a misspelled `mtls_mode` would otherwise
-/// default the policy to `PERMISSIVE`, admitting plaintext the operator meant
-/// to refuse.
+/// A PeerAuthentication. `scope` is its only applicability shape, the same
+/// [`PolicyScope`] every other mesh policy resource carries (issue #7243);
+/// `namespace` is the declaring namespace, as on [`MeshPolicy`].
+///
+/// Serializes with `scope` only. Deserializes through
+/// `PeerAuthenticationWire`, which is closed (`deny_unknown_fields`, issue
+/// #6616) like the authorization grammar and `MeshRequestAuthentication`: a
+/// misspelled `mtls_mode` would otherwise default the policy to `PERMISSIVE`,
+/// admitting plaintext the operator meant to refuse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PeerAuthenticationWire")]
 pub struct PeerAuthentication {
     pub name: String,
     pub namespace: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<PolicyScope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
-    pub selector: Option<WorkloadSelector>,
-    #[serde(default)]
+    pub scope: PolicyScope,
     pub mtls_mode: MtlsMode,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub port_overrides: HashMap<u16, MtlsMode>,
+}
+
+/// The JSON a [`PeerAuthentication`] is read from. It accepts exactly what
+/// earlier builds accepted, because the shape rides the ConfigSync snapshot
+/// (`GatewayConfig.mesh`) and the mesh slice carriers: the earlier form with no
+/// `scope` (the policy namespace plus an optional `selector`), and the
+/// `selector` copy earlier translators wrote beside a workload-selector
+/// `scope`. Both convert to the one `scope` at decode time, so nothing past
+/// deserialization reads the earlier form. Refusing it outright changes the
+/// snapshot contract and needs a `CONFIG_SYNC_PROTOCOL_REVISION` bump.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerAuthenticationWire {
+    name: String,
+    namespace: String,
+    #[serde(default)]
+    scope: Option<PolicyScope>,
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
+    selector: Option<WorkloadSelector>,
+    #[serde(default)]
+    mtls_mode: MtlsMode,
+    #[serde(default)]
+    port_overrides: HashMap<u16, MtlsMode>,
+}
+
+impl TryFrom<PeerAuthenticationWire> for PeerAuthentication {
+    type Error = String;
+
+    fn try_from(wire: PeerAuthenticationWire) -> Result<Self, Self::Error> {
+        let scope = match (wire.scope, wire.selector) {
+            (Some(scope), None) => scope,
+            (Some(scope), Some(selector)) => {
+                let redundant_copy = matches!(
+                    &scope,
+                    PolicyScope::WorkloadSelector { selector: scoped } if *scoped == selector
+                );
+                if !redundant_copy {
+                    return Err(format!(
+                        "PeerAuthentication {:?}: `selector` differs from `scope`; set `scope` only",
+                        wire.name
+                    ));
+                }
+                scope
+            }
+            (None, selector) => scope_from_namespace_and_selector(&wire.namespace, selector)
+                .ok_or_else(|| {
+                    format!(
+                        "PeerAuthentication {:?}: selector.namespace differs from the policy \
+                         namespace; set `scope` instead",
+                        wire.name
+                    )
+                })?,
+        };
+        Ok(Self {
+            name: wire.name,
+            namespace: wire.namespace,
+            scope,
+            mtls_mode: wire.mtls_mode,
+            port_overrides: wire.port_overrides,
+        })
+    }
+}
+
+/// The [`PolicyScope`] a scope-less PeerAuthentication in `namespace` meant:
+/// a selector with labels selects those workloads in the policy's own
+/// namespace, and no selector (or one with no labels) is the namespace
+/// default. `None` when the selector names another namespace: that form
+/// applied to no workload at all, and no scope expresses it.
+fn scope_from_namespace_and_selector(
+    namespace: &str,
+    selector: Option<WorkloadSelector>,
+) -> Option<PolicyScope> {
+    let namespace_scope = || PolicyScope::Namespace {
+        namespace: namespace.to_string(),
+    };
+    let Some(mut selector) = selector else {
+        return Some(namespace_scope());
+    };
+    if selector
+        .namespace
+        .as_deref()
+        .is_some_and(|selector_namespace| selector_namespace != namespace)
+    {
+        return None;
+    }
+    if !selector.has_labels() {
+        return Some(namespace_scope());
+    }
+    selector.namespace = Some(namespace.to_string());
+    Some(PolicyScope::WorkloadSelector { selector })
 }
 
 impl PeerAuthentication {
@@ -3179,18 +3270,10 @@ impl PeerAuthentication {
     /// canonical predicate for PeerAuthentication scope classification and
     /// `portLevelMtls` applicability across translated and native slices.
     pub fn has_workload_selector(&self) -> bool {
-        match self.scope.as_ref() {
-            Some(PolicyScope::WorkloadSelector { selector }) => selector.has_labels(),
-            Some(
-                PolicyScope::MeshWide
-                | PolicyScope::Namespace { .. }
-                | PolicyScope::TargetRefs { .. },
-            ) => false,
-            None => self
-                .selector
-                .as_ref()
-                .is_some_and(WorkloadSelector::has_labels),
-        }
+        matches!(
+            &self.scope,
+            PolicyScope::WorkloadSelector { selector } if selector.has_labels()
+        )
     }
 }
 
@@ -4400,12 +4483,6 @@ pub struct MeshTrafficPolicy {
 /// resolved slots and dispatch wiring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeshConnectionPoolHttp {
-    /// Deprecated carrier for `maxRequestsPerConnection`. New K8s translation
-    /// validates and warns on the field, reports it as deferred, and does not
-    /// populate this slot because Ferrum has no backend close-after-N-requests
-    /// behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_requests_per_connection: Option<u32>,
     /// Mapped from `idleTimeout` (parsed as an Istio duration, persisted
     /// as milliseconds). Translator rejects sub-second durations because
     /// the proxy-level `pool_idle_timeout_seconds` field is whole-second
@@ -7568,14 +7645,12 @@ fn validate_mesh_config_internal(
             &pa.namespace,
             &mut errors,
         );
-        if let Some(scope) = pa.scope.as_ref() {
-            reject_unsupported_target_refs_scope(
-                "PeerAuthentication",
-                &pa.name,
-                scope,
-                &mut errors,
-            );
-        }
+        reject_unsupported_target_refs_scope(
+            "PeerAuthentication",
+            &pa.name,
+            &pa.scope,
+            &mut errors,
+        );
         for port in pa.port_overrides.keys() {
             validate_non_zero_port(
                 format!(

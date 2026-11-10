@@ -3338,9 +3338,9 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     // the verifier's slot themselves. Every `.store(` inside each publisher's
     // own body is enumerated, because the two writers bind the inbound slot
     // under DIFFERENT names (`inbound_slot` and, in `publish_staged_spiffe_
-    // bundle`'s `DirectSlot` arm, plain `slot`): pinning one variable name
-    // leaves the other free to regress, and only the sibling call-count
-    // assertion would notice — and only because the call disappeared.
+    // bundle`, plain `slot`): pinning one variable name leaves the other free
+    // to regress, and only the sibling call-count assertion would notice —
+    // and only because the call disappeared.
     let mesh = include_str!("../../src/modes/mesh/mod.rs");
     for (what, publisher, permitted_stores) in [
         (
@@ -3385,9 +3385,9 @@ fn every_trust_publisher_stores_before_it_requests_a_sweep() {
     }
     assert_eq!(
         mesh.matches("publish_mesh_inbound_trust_bundle(").count(),
-        2,
-        "exactly the two inbound-slot writers — the runtime SVID republisher and the staged \
-         slice publisher — may publish inbound trust"
+        1,
+        "exactly one inbound-slot writer — the runtime SVID republisher, which the staged \
+         slice publisher also goes through — may publish inbound trust"
     );
 }
 

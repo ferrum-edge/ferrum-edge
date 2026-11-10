@@ -224,7 +224,8 @@ this Istio config supported by Ferrum Edge?".
   `ferrum.log.level`).
 - **`mesh_topology_matrix`** — every mesh topology (`Sidecar`, `Ambient`,
   `NodeWaypoint`, `ServiceWaypoint`, `EastWestGateway`, `EgressGateway`)
-  boots from a minimal config; `terminates_hbone` classification invariant.
+  boots from a minimal config; HBONE termination listener invariant (read
+  from the runtime `listener_plan()`).
 - **`mesh_config_transport`**, **`mesh_spiffe_identity`**,
   **`mesh_multicluster_federation`** — hermetic semantics for the native
   `MeshSubscribe` config transport, SPIRE-backed identity decisions, and the

@@ -1623,3 +1623,47 @@ fn service_entry_static_wildcard_host_with_endpoints_is_not_deferred() {
         "a STATIC wildcard entry with endpoints materializes and must not be deferred: {deferred:?}"
     );
 }
+
+/// Issue #7243: `spec.workloadSelector` is carried but not consumed (no
+/// endpoint selection from the selected workloads), so status must report it
+/// as deferred instead of presenting the entry as fully effective.
+#[test]
+fn service_entry_workload_selector_is_reported_deferred() {
+    let deferred_for = |spec: Value| -> Vec<String> {
+        let obj = object("networking.istio.io/v1", "ServiceEntry", "selected", spec);
+        let updates = plan_istio_status_updates(&[obj], options());
+        let condition = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(condition["status"].as_str(), Some("True"));
+        updates[0].ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    };
+    let base = json!({
+        "hosts": ["api.example.com"],
+        "resolution": "DNS",
+        "location": "MESH_EXTERNAL",
+        "ports": [{"number": 443, "name": "https", "protocol": "TLS"}]
+    });
+    let mut selected = base.clone();
+    selected["workloadSelector"] = json!({"labels": {"app": "vm"}});
+
+    assert!(
+        deferred_for(selected)
+            .iter()
+            .any(|field| field.starts_with("spec.workloadSelector")),
+        "a ServiceEntry workloadSelector must be reported deferred"
+    );
+    assert!(
+        !deferred_for(base)
+            .iter()
+            .any(|field| field.starts_with("spec.workloadSelector")),
+        "an entry without workloadSelector must not report it"
+    );
+}

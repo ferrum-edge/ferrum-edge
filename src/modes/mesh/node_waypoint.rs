@@ -59,31 +59,20 @@
 //!
 //! [`socket_cookie`]: crate::socket_opts::socket_cookie
 //!
-//! ## Cgroup-inode lifecycle binding (GAP-2M.5)
+//! ## Identity lifecycle
 //!
-//! Pods get evicted, restarted, or rescheduled all the time. The kubelet
-//! creates a fresh cgroup directory for every pod instance, so a pod restart
-//! is observable as a cgroup-inode change at the same path. The resolver
-//! optionally binds each enrolled identity to a cgroup v2 path captured at
-//! enrollment time (`upsert_identity_with_cgroup`). Enrollment stores the
-//! inode plus a small metadata fingerprint so inode reuse does not mask pod
-//! restarts. A periodic sweep task (driven by
-//! `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS`) re-stats those
-//! paths and evicts identities whose fingerprint no longer matches (pod
-//! restarted under the same UID) or whose path is gone (pod removed), so a
-//! fresh enrollment from the control plane / eBPF side is required before
-//! traffic for the new pod instance is honoured. Identities enrolled without
-//! a cgroup path are reclaimed by an independent idle-identity GC task driven
-//! by `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS`; disabling cgroup
-//! stats does not disable lazy-enrollment churn cleanup. Both passes are
-//! best-effort garbage collection, not security invariants. The fail-closed
-//! invariant on the accept path is unchanged: an unknown cookie or pod is
-//! still rejected before traffic enters the plugin chain.
+//! Identities are enrolled lazily from the eBPF cookie record (hash join in
+//! `resolve_record`). An idle-identity GC task driven by
+//! `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS` reclaims an identity once
+//! no live cookie record references its pod and no open connection holds it.
+//! It is best-effort garbage collection, not a security invariant: the
+//! fail-closed accept path still rejects an unknown cookie or pod before
+//! traffic enters the plugin chain, and per-pod scope is reclaimed by slice
+//! updates, not by identity lifecycle.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -95,7 +84,7 @@ use ferrum_ebpf_common::{OrigDst4, OrigDst6};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::Workload;
@@ -167,37 +156,6 @@ pub struct NodeWaypointIdentity {
     pub pod_uid: [u8; 16],
     pub spiffe_id: SpiffeId,
     pub workload_spiffe_hash: u64,
-    /// Filesystem path to the pod's cgroup v2 directory captured at
-    /// enrollment. `None` when the enrollment source didn't supply a cgroup
-    /// path — the cgroup sweep skips such identities and leaves them to the
-    /// idle-identity GC.
-    pub cgroup_path: Option<PathBuf>,
-    /// Inode of `cgroup_path` at enrollment time. Pod restart yields a new
-    /// inode at the same path; the sweep task evicts the identity when the
-    /// current inode no longer matches this value. `None` when
-    /// `cgroup_path` is `None`, or on platforms / filesystems where the
-    /// inode cannot be read (`stat` returned an error at enrollment) —
-    /// see `upsert_identity_with_cgroup`'s caller for the warning path.
-    pub cgroup_inode: Option<u64>,
-    /// Full Unix metadata fingerprint captured with the inode. Some
-    /// filesystems can reuse inode numbers after a directory is deleted, so
-    /// sweep compares this fingerprint when available and falls back to
-    /// inode-only matching for identities built through `with_cgroup`.
-    pub cgroup_fingerprint: Option<CgroupFingerprint>,
-}
-
-/// `ctime` (inode-metadata change time) is used rather than `mtime` because
-/// kubelet writes to files *inside* the cgroup directory (`cgroup.procs`,
-/// thresholds, etc.) update the directory's `mtime` without indicating a
-/// new pod incarnation. `ctime` only advances when the directory's own
-/// metadata changes — which for a kubelet-managed cgroup means
-/// creation/replacement, exactly the signal the sweep needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CgroupFingerprint {
-    pub device: u64,
-    pub inode: u64,
-    pub ctime_seconds: i64,
-    pub ctime_nanoseconds: i64,
 }
 
 impl NodeWaypointIdentity {
@@ -207,28 +165,7 @@ impl NodeWaypointIdentity {
             pod_uid,
             spiffe_id,
             workload_spiffe_hash,
-            cgroup_path: None,
-            cgroup_inode: None,
-            cgroup_fingerprint: None,
         }
-    }
-
-    pub fn with_cgroup(mut self, path: PathBuf, inode: u64) -> Self {
-        self.cgroup_path = Some(path);
-        self.cgroup_inode = Some(inode);
-        self.cgroup_fingerprint = None;
-        self
-    }
-
-    pub fn with_cgroup_fingerprint(
-        mut self,
-        path: PathBuf,
-        fingerprint: CgroupFingerprint,
-    ) -> Self {
-        self.cgroup_path = Some(path);
-        self.cgroup_inode = Some(fingerprint.inode);
-        self.cgroup_fingerprint = Some(fingerprint);
-        self
     }
 }
 
@@ -593,52 +530,6 @@ pub struct NodeWaypointIdentityResolver {
     /// readers lives inside the published payload and is therefore coherent
     /// with its identity/scope maps.
     next_slice_generation: AtomicU64,
-    // Sweep counters below are intentionally NOT `CachePadded` (unlike the
-    // accept-path `node_waypoint_*_drops` atomics in `OverloadState`). They
-    // are written at most once per sweep tick (default 30s) on a single
-    // background task and read only via cold-path admin endpoints, so no
-    // hot writer/reader pair can land on the same cache line.
-    /// Monotonic count of identities evicted because their cgroup path was
-    /// gone at sweep time. Operator/admin endpoints can read this to
-    /// surface pod-churn signal.
-    cgroup_sweep_path_missing: AtomicU64,
-    /// Monotonic count of identities evicted because the cgroup inode at
-    /// the same path no longer matches the enrolled value (pod restarted
-    /// under the same UID).
-    cgroup_sweep_inode_changed: AtomicU64,
-    /// Sweep-pass counter — increments once per sweep tick regardless of
-    /// whether anything was evicted. Useful for "is the sweep task alive"
-    /// liveness diagnostics.
-    cgroup_sweep_passes: AtomicU64,
-    /// Monotonic count of lazily-enrolled (non-cgroup-bound) identities
-    /// reclaimed by the sweep because no live cookie record still referenced
-    /// the pod — the churn-reclamation path for the production enrollment
-    /// model, which binds no cgroup. Operators can watch this to see pod
-    /// turnover.
-    idle_unreferenced_evicted: AtomicU64,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct CgroupSweepReport {
-    pub evicted_inode_changed: usize,
-    pub evicted_path_missing: usize,
-    /// Lazily-enrolled (non-cgroup-bound) identities reclaimed because no live
-    /// cookie record still referenced the pod (pod churn).
-    pub evicted_idle_unreferenced: usize,
-}
-
-impl CgroupSweepReport {
-    pub fn total_evicted(&self) -> usize {
-        self.evicted_inode_changed + self.evicted_path_missing + self.evicted_idle_unreferenced
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CgroupSweepSnapshot {
-    pub passes: u64,
-    pub inode_changed_total: u64,
-    pub path_missing_total: u64,
-    pub idle_unreferenced_total: u64,
 }
 
 impl NodeWaypointIdentityResolver {
@@ -650,10 +541,6 @@ impl NodeWaypointIdentityResolver {
             identities_by_pod_uid: DashMap::with_shard_amount(shards),
             slice: ArcSwap::from_pointee(NodeWaypointSlice::default()),
             next_slice_generation: AtomicU64::new(1),
-            cgroup_sweep_path_missing: AtomicU64::new(0),
-            cgroup_sweep_inode_changed: AtomicU64::new(0),
-            cgroup_sweep_passes: AtomicU64::new(0),
-            idle_unreferenced_evicted: AtomicU64::new(0),
         }
     }
 
@@ -708,204 +595,22 @@ impl NodeWaypointIdentityResolver {
         identity
     }
 
-    /// Enroll an identity that is lifecycle-bound to a cgroup v2 directory.
-    /// Reads the inode and metadata fingerprint of `cgroup_path` once and
-    /// stores them on the identity. A subsequent sweep evicts the identity
-    /// if the path is gone or the fingerprint changed (pod restart yields a
-    /// fresh cgroup at the same path, even when the inode number is reused).
-    ///
-    /// On stat error the identity is still inserted but without inode
-    /// binding — sweep treats it like a non-cgroup enrollment (left to the
-    /// idle-identity GC). The recorded `cgroup_path` in that case is
-    /// informational only: with `cgroup_inode == None` and
-    /// `cgroup_fingerprint == None` the sweep's candidate filter rejects
-    /// the entry and never re-stats the path. The caller decides whether
-    /// to warn; a control plane that requires lifecycle binding can check
-    /// the returned identity's `cgroup_inode` and reject when `None`.
-    pub fn upsert_identity_with_cgroup(
-        &self,
-        mut identity: NodeWaypointIdentity,
-        cgroup_path: PathBuf,
-    ) -> Arc<NodeWaypointIdentity> {
-        match read_cgroup_fingerprint(&cgroup_path) {
-            Ok(fingerprint) => {
-                identity.cgroup_path = Some(cgroup_path);
-                identity.cgroup_inode = Some(fingerprint.inode);
-                identity.cgroup_fingerprint = Some(fingerprint);
-            }
-            Err(error) => {
-                warn!(
-                    pod_uid = %pod_uid_label(&identity.pod_uid),
-                    cgroup_path = %cgroup_path.display(),
-                    %error,
-                    "Enrolling node-waypoint identity without cgroup-inode lifecycle binding (stat failed)"
-                );
-                identity.cgroup_path = Some(cgroup_path);
-                identity.cgroup_inode = None;
-                identity.cgroup_fingerprint = None;
-            }
-        }
-        self.upsert_identity(identity)
-    }
-
-    pub fn remove_identity(&self, pod_uid: &[u8; 16]) {
-        self.identities_by_pod_uid.remove(pod_uid);
-    }
-
-    /// Run both identity lifecycle passes once and return a combined report.
-    /// Production starts cgroup-bound and idle-unreferenced reclamation from
-    /// separate tasks so operators can disable cgroup stat sweeps without also
-    /// disabling lazy-enrollment garbage collection.
-    pub fn sweep_cgroup_stale_identities(&self) -> CgroupSweepReport {
-        let mut report = self.sweep_cgroup_bound_stale_identities();
-        report.evicted_idle_unreferenced = self.sweep_idle_unreferenced_identities();
-        report
-    }
-
-    /// Evict cgroup-bound identities when their enrolled cgroup path is gone
-    /// or its inode/fingerprint no longer matches the enrolled value.
-    fn sweep_cgroup_bound_stale_identities(&self) -> CgroupSweepReport {
-        #[derive(Clone, Copy)]
-        enum CgroupExpectation {
-            Fingerprint(CgroupFingerprint),
-            Inode(u64),
-        }
-
-        impl CgroupExpectation {
-            fn inode(self) -> u64 {
-                match self {
-                    Self::Fingerprint(fingerprint) => fingerprint.inode,
-                    Self::Inode(inode) => inode,
-                }
-            }
-
-            fn matches(self, current: CgroupFingerprint) -> bool {
-                match self {
-                    Self::Fingerprint(fingerprint) => fingerprint == current,
-                    Self::Inode(inode) => inode == current.inode,
-                }
-            }
-
-            fn still_attached_to(self, identity: &NodeWaypointIdentity) -> bool {
-                match self {
-                    Self::Fingerprint(fingerprint) => {
-                        identity.cgroup_fingerprint == Some(fingerprint)
-                    }
-                    Self::Inode(inode) => {
-                        identity.cgroup_inode == Some(inode)
-                            && identity.cgroup_fingerprint.is_none()
-                    }
-                }
-            }
-        }
-
-        enum EvictionReason {
-            BindingChanged { current_inode: u64 },
-            PathMissing { error: String },
-        }
-
-        let mut report = CgroupSweepReport::default();
-
-        // Snapshot cgroup bindings first so filesystem metadata calls don't
-        // hold DashMap shard locks used by accept-time identity resolution.
-        let candidates: Vec<([u8; 16], PathBuf, CgroupExpectation)> = self
-            .identities_by_pod_uid
-            .iter()
-            .filter_map(|entry| {
-                let identity = entry.value();
-                let expectation = identity
-                    .cgroup_fingerprint
-                    .map(CgroupExpectation::Fingerprint)
-                    .or_else(|| identity.cgroup_inode.map(CgroupExpectation::Inode))?;
-                Some((
-                    *entry.key(),
-                    identity.cgroup_path.as_ref()?.clone(),
-                    expectation,
-                ))
-            })
-            .collect();
-
-        for (pod_uid, path, expectation) in candidates {
-            let Some(reason) = (match read_cgroup_fingerprint(&path) {
-                Ok(current) if expectation.matches(current) => None,
-                Ok(current) => Some(EvictionReason::BindingChanged {
-                    current_inode: current.inode,
-                }),
-                Err(error) => Some(EvictionReason::PathMissing {
-                    error: error.to_string(),
-                }),
-            }) else {
-                continue;
-            };
-
-            let removed = self
-                .identities_by_pod_uid
-                .remove_if(&pod_uid, |_, identity| {
-                    expectation.still_attached_to(identity)
-                        && identity.cgroup_path.as_deref() == Some(path.as_path())
-                });
-            if removed.is_none() {
-                continue;
-            }
-
-            match reason {
-                EvictionReason::BindingChanged { current_inode } => {
-                    info!(
-                        pod_uid = %pod_uid_label(&pod_uid),
-                        expected_inode = expectation.inode(),
-                        current_inode,
-                        cgroup_path = %path.display(),
-                        "Evicting node-waypoint identity (cgroup binding changed)"
-                    );
-                    report.evicted_inode_changed += 1;
-                }
-                EvictionReason::PathMissing { error } => {
-                    debug!(
-                        pod_uid = %pod_uid_label(&pod_uid),
-                        cgroup_path = %path.display(),
-                        %error,
-                        "Evicting node-waypoint identity (cgroup path missing)"
-                    );
-                    report.evicted_path_missing += 1;
-                }
-            }
-        }
-
-        self.cgroup_sweep_passes.fetch_add(1, Ordering::Relaxed);
-        if report.evicted_inode_changed > 0 {
-            self.cgroup_sweep_inode_changed
-                .fetch_add(report.evicted_inode_changed as u64, Ordering::Relaxed);
-        }
-        if report.evicted_path_missing > 0 {
-            self.cgroup_sweep_path_missing
-                .fetch_add(report.evicted_path_missing as u64, Ordering::Relaxed);
-        }
-        report
-    }
-
-    /// Evict identities without a cgroup binding when no live cookie record and
-    /// no open HTTP/HBONE connection still references the pod. This is the
-    /// churn-reclamation path for lazy hash-join enrollment, which binds no
-    /// cgroup and has no explicit removal API in production.
+    /// Evict identities when no live cookie record and no open HTTP/HBONE
+    /// connection still references the pod. This is the churn-reclamation
+    /// path for lazy hash-join enrollment, which has no explicit removal API.
     ///
     /// Per-pod policy scope is slice-driven (`policy_scope_for_pod`), not stored
     /// on the identity, so evicting an identity from `identities_by_pod_uid` is
     /// sufficient. A stale PolicyScopeCache from a previous incarnation can
     /// never apply to a newly enrolled pod with the same UID.
     fn sweep_idle_unreferenced_identities(&self) -> usize {
-        // Idle-unreferenced pass (see method docs): reclaim non-cgroup-bound
-        // (lazily-enrolled) identities whose pod is no longer referenced by any
-        // live cookie record. Snapshot candidates first so filesystem-free
-        // bookkeeping doesn't hold shard locks. Only when at least one unbound
-        // identity exists do we walk cookie records, and the referenced UIDs
-        // stay in a sorted Vec instead of rebuilding a HashSet every tick.
+        // Snapshot candidates first so the bookkeeping doesn't hold shard
+        // locks. Only when at least one identity exists do we walk cookie
+        // records, and the referenced UIDs stay in a sorted Vec instead of
+        // rebuilding a HashSet every tick.
         let idle_candidates: Vec<[u8; 16]> = self
             .identities_by_pod_uid
             .iter()
-            .filter(|entry| {
-                let identity = entry.value();
-                identity.cgroup_path.is_none() || identity.cgroup_inode.is_none()
-            })
             .map(|entry| *entry.key())
             .collect();
         let referenced: Vec<[u8; 16]> = if idle_candidates.is_empty() {
@@ -928,11 +633,6 @@ impl NodeWaypointIdentityResolver {
             let removed = self
                 .identities_by_pod_uid
                 .remove_if(&pod_uid, |_, identity| {
-                    // Re-check "still unbound" under the shard lock so a
-                    // concurrent cgroup enrollment is never reclaimed here.
-                    if identity.cgroup_path.is_some() && identity.cgroup_inode.is_some() {
-                        return false;
-                    }
                     // Skip if an open connection still holds this identity Arc.
                     // The HTTP/HBONE accept path stores the resolved
                     // `Arc<NodeWaypointIdentity>` on the connection for its whole
@@ -952,20 +652,7 @@ impl NodeWaypointIdentityResolver {
             }
         }
 
-        if evicted > 0 {
-            self.idle_unreferenced_evicted
-                .fetch_add(evicted as u64, Ordering::Relaxed);
-        }
         evicted
-    }
-
-    pub fn cgroup_sweep_snapshot(&self) -> CgroupSweepSnapshot {
-        CgroupSweepSnapshot {
-            passes: self.cgroup_sweep_passes.load(Ordering::Relaxed),
-            inode_changed_total: self.cgroup_sweep_inode_changed.load(Ordering::Relaxed),
-            path_missing_total: self.cgroup_sweep_path_missing.load(Ordering::Relaxed),
-            idle_unreferenced_total: self.idle_unreferenced_evicted.load(Ordering::Relaxed),
-        }
     }
 
     /// Per-pod policy scope from the current slice, keyed by the same `[u8; 16]`
@@ -1397,7 +1084,7 @@ impl NodeWaypointIdentityResolver {
             // genuinely removed/re-keyed workloads, never a still-valid one. The
             // stale cache entry is left in place: it never resolves while its hash
             // is absent, is re-validated for free if the workload returns, and is
-            // reclaimed by the cgroup-inode / idle sweep when the pod exits.
+            // reclaimed by the idle identity GC when the pod exits.
             //
             // Compare the slice's CURRENT SPIFFE for the hash against the cached
             // `spiffe_id` rather than merely checking presence: a later slice that
@@ -1522,74 +1209,9 @@ pub fn workload_spiffe_hash(spiffe_id: &SpiffeId) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-#[cfg(unix)]
-fn read_cgroup_fingerprint(path: &Path) -> std::io::Result<CgroupFingerprint> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    Ok(CgroupFingerprint {
-        device: meta.dev(),
-        inode: meta.ino(),
-        ctime_seconds: meta.ctime(),
-        ctime_nanoseconds: meta.ctime_nsec(),
-    })
-}
-
-#[cfg(not(unix))]
-fn read_cgroup_fingerprint(_path: &Path) -> std::io::Result<CgroupFingerprint> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "cgroup-inode lifecycle binding is Linux/Unix-only",
-    ))
-}
-
-/// Spawn a periodic sweep task that re-stats every enrolled cgroup path and
-/// evicts stale cgroup-bound identities. `interval_secs == 0` disables only
-/// this cgroup sweep and returns `None` so callers don't need to track an
-/// unused task handle. The task exits when `shutdown` is notified.
-pub fn spawn_cgroup_sweep_task(
-    resolver: Arc<NodeWaypointIdentityResolver>,
-    interval_secs: u64,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Option<JoinHandle<()>> {
-    if interval_secs == 0 {
-        info!(
-            "Node-waypoint cgroup sweep disabled (FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS=0)"
-        );
-        return None;
-    }
-    let period = Duration::from_secs(interval_secs);
-    let handle = tokio::spawn(async move {
-        let mut ticker = interval(period);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        info!(interval_secs, "Node-waypoint cgroup sweep task started");
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let report = resolver.sweep_cgroup_bound_stale_identities();
-                    if report.evicted_inode_changed > 0 || report.evicted_path_missing > 0 {
-                        info!(
-                            evicted_inode_changed = report.evicted_inode_changed,
-                            evicted_path_missing = report.evicted_path_missing,
-                            "Node-waypoint cgroup sweep evicted stale identities"
-                        );
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        info!("Node-waypoint cgroup sweep task shutting down");
-                        return;
-                    }
-                }
-            }
-        }
-    });
-    Some(handle)
-}
-
-/// Spawn a periodic GC task for lazily-enrolled identities that have no cgroup
-/// binding. This is intentionally independent from the cgroup-inode sweep: an
-/// operator may disable cgroup stat sweeps while still needing bounded memory
-/// under ordinary pod churn.
+/// Spawn a periodic GC task for lazily-enrolled identities
+/// ([`NodeWaypointIdentityResolver::sweep_idle_unreferenced_identities`]).
+/// `interval_secs == 0` disables it and returns `None`.
 pub fn spawn_idle_identity_gc_task(
     resolver: Arc<NodeWaypointIdentityResolver>,
     interval_secs: u64,
@@ -2084,192 +1706,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn upsert_with_cgroup_captures_inode_and_sweep_keeps_identity_when_inode_unchanged() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cgroup_path = tmp.path().join("pod.scope");
-        std::fs::create_dir(&cgroup_path).expect("create cgroup dir");
-
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
-        let arc = resolver.upsert_identity_with_cgroup(
-            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api")),
-            cgroup_path.clone(),
-        );
-        assert!(
-            arc.cgroup_inode.is_some(),
-            "successful enrollment must record inode"
-        );
-        assert!(
-            arc.cgroup_fingerprint.is_some(),
-            "successful enrollment must record full cgroup fingerprint"
-        );
-
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.total_evicted(), 0);
-        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
-        let snapshot = resolver.cgroup_sweep_snapshot();
-        assert_eq!(snapshot.passes, 1);
-        assert_eq!(snapshot.inode_changed_total, 0);
-        assert_eq!(snapshot.path_missing_total, 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sweep_evicts_identity_when_cgroup_path_disappears() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cgroup_path = tmp.path().join("pod.scope");
-        std::fs::create_dir(&cgroup_path).expect("create cgroup dir");
-
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
-        resolver.upsert_identity_with_cgroup(
-            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api")),
-            cgroup_path.clone(),
-        );
-        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
-
-        // Simulate pod removal: delete the cgroup dir.
-        std::fs::remove_dir_all(&cgroup_path).expect("remove cgroup dir");
-
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.evicted_path_missing, 1);
-        assert_eq!(report.evicted_inode_changed, 0);
-        assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
-        // Per-pod scope is slice-driven and decoupled from identity eviction
-        // (reclaimed by slice updates, not by this sweep) — see
-        // `later_slice_dropping_workload_reclaims_pod_scope`.
-        let snapshot = resolver.cgroup_sweep_snapshot();
-        assert_eq!(snapshot.path_missing_total, 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sweep_evicts_identity_when_cgroup_inode_changes() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cgroup_path = tmp.path().join("pod.scope");
-        std::fs::create_dir(&cgroup_path).expect("create cgroup dir");
-        let current_fingerprint =
-            read_cgroup_fingerprint(&cgroup_path).expect("read cgroup fingerprint");
-        let stale_inode = current_fingerprint.inode.wrapping_add(1);
-
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
-        resolver.upsert_identity(
-            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"))
-                .with_cgroup(cgroup_path.clone(), stale_inode),
-        );
-
-        // Simulate a restart with a stale enrolled inode. Recreate-based tests
-        // are flaky because filesystems may reuse the removed directory's inode.
-        assert_ne!(stale_inode, current_fingerprint.inode);
-
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.evicted_inode_changed, 1);
-        assert_eq!(report.evicted_path_missing, 0);
-        assert!(
-            !resolver.identities_by_pod_uid.contains_key(&pod_uid),
-            "stale identity for pod-restart UID must be evicted"
-        );
-        let snapshot = resolver.cgroup_sweep_snapshot();
-        assert_eq!(snapshot.inode_changed_total, 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sweep_evicts_identity_when_cgroup_fingerprint_changes_even_if_inode_matches() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cgroup_path = tmp.path().join("pod.scope");
-        std::fs::create_dir(&cgroup_path).expect("create cgroup dir");
-        let current_fingerprint =
-            read_cgroup_fingerprint(&cgroup_path).expect("read cgroup fingerprint");
-        let stale_fingerprint = CgroupFingerprint {
-            ctime_nanoseconds: current_fingerprint.ctime_nanoseconds.wrapping_add(1),
-            ..current_fingerprint
-        };
-
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
-        resolver.upsert_identity(
-            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api"))
-                .with_cgroup_fingerprint(cgroup_path.clone(), stale_fingerprint),
-        );
-
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.evicted_inode_changed, 1);
-        assert_eq!(report.evicted_path_missing, 0);
-        assert!(
-            !resolver.identities_by_pod_uid.contains_key(&pod_uid),
-            "stale identity must be evicted even if the inode number was reused"
-        );
-    }
-
-    /// Scope is keyed by the slice's per-pod-UID index, NOT by the enrolled
-    /// identity, so `remove_identity` (cgroup/idle reclamation) leaves the pod's
-    /// scope intact — it is reclaimed by slice updates, not identity lifecycle.
-    /// The previous model cleared scope on identity removal; that coupling is
-    /// what let a captured pod fall back to a same-SPIFFE workload's scope when
-    /// its own identity churned, which H1 removes.
-    #[test]
-    fn remove_identity_does_not_affect_slice_driven_scope() {
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
-        resolver.install_policy_scopes_from_workloads(&[workload_with_uid(
-            "spiffe://td/ns/default/sa/api",
-            "default",
-            "api",
-            HashMap::new(),
-            "11111111-1111-1111-1111-111111111111",
-        )]);
-        resolver.upsert_identity(NodeWaypointIdentity::new(
-            pod_uid,
-            spiffe("spiffe://td/ns/default/sa/api"),
-        ));
-        assert!(resolver.policy_scope_for_pod(&pod_uid).is_some());
-
-        resolver.remove_identity(&pod_uid);
-
-        // Identity is gone, but the slice still carries the pod's UID → scope
-        // stays available (decoupled from identity lifecycle).
-        assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
-        assert!(
-            resolver.policy_scope_for_pod(&pod_uid).is_some(),
-            "scope is slice-driven and must survive identity removal"
-        );
-    }
-
-    #[test]
-    fn remove_identity_is_a_noop_when_identity_already_missing() {
-        // Scope is slice-driven (keyed by pod UID), so a pod whose UID is not in
-        // the slice's per-UID index has no scope regardless of identity state,
-        // and removing a never-enrolled identity is a harmless no-op. The
-        // installed workload below is uid-less, so it contributes no per-UID
-        // scope for this pod (it only populates the SPIFFE-keyed VM index).
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
-        resolver.install_policy_scopes_from_workloads(&[workload(
-            "spiffe://td/ns/default/sa/api",
-            "default",
-            "api",
-            HashMap::new(),
-        )]);
-
-        // No per-UID scope for this pod, and no identity was ever enrolled.
-        assert!(resolver.policy_scope_for_pod(&pod_uid).is_none());
-        resolver.remove_identity(&pod_uid);
-        assert!(
-            resolver.policy_scope_for_pod(&pod_uid).is_none(),
-            "a pod whose UID is absent from the slice has no scope"
-        );
-    }
-
     #[test]
     fn sweep_keeps_referenced_unbound_identity() {
-        // An unbound (lazily-enrolled, no cgroup) identity that is still
-        // referenced by a live cookie record must be kept: the idle pass only
-        // reclaims pods that no longer have any live cookie, and the cgroup pass
-        // ignores unbound entries entirely.
+        // A lazily-enrolled identity that is still referenced by a live cookie
+        // record must be kept: the idle pass only reclaims pods that no longer
+        // have any live cookie.
         let resolver = NodeWaypointIdentityResolver::new(0);
         let pod_uid = parse_pod_uid("22222222-2222-2222-2222-222222222222").unwrap();
         let identity =
@@ -2279,16 +1720,14 @@ mod tests {
         // A live cookie record keeps the pod referenced.
         resolver.record_orig_dst4(7, orig_dst4(pod_uid, hash));
 
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.total_evicted(), 0);
+        assert_eq!(resolver.sweep_idle_unreferenced_identities(), 0);
         assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
     }
 
     #[test]
     fn sweep_evicts_unreferenced_lazy_identity() {
-        // GAP-2M lifecycle (P2): the production lazy hash-join enrollment binds
-        // no cgroup, so the cgroup pass never reclaims it and nothing calls
-        // remove_identity. When the pod churns away its cookies age out of
+        // GAP-2M lifecycle (P2): the production lazy hash-join enrollment has
+        // no explicit removal API. When the pod churns away its cookies age out of
         // cookie_records; the idle pass must then reclaim the orphaned identity
         // so it does not grow without bound. (Per-pod scope is slice-driven and
         // reclaimed by slice updates, not by this sweep — see
@@ -2306,47 +1745,14 @@ mod tests {
         assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
 
         // While the cookie is live the idle pass keeps it.
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.evicted_idle_unreferenced, 0);
+        assert_eq!(resolver.sweep_idle_unreferenced_identities(), 0);
         assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
 
         // Pod dies → its accept-side cookies age out of the mirrored map.
         resolver.retain_cookie_records(&std::collections::HashSet::new());
 
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.evicted_idle_unreferenced, 1);
+        assert_eq!(resolver.sweep_idle_unreferenced_identities(), 1);
         assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
-    }
-
-    #[test]
-    fn cgroup_bound_sweep_does_not_reclaim_unbound_idle_identity() {
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("99999999-9999-9999-9999-999999999999").unwrap();
-        resolver.upsert_identity(NodeWaypointIdentity::new(
-            pod_uid,
-            spiffe("spiffe://td/ns/default/sa/web"),
-        ));
-
-        let report = resolver.sweep_cgroup_bound_stale_identities();
-        assert_eq!(report.total_evicted(), 0);
-        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
-
-        let evicted = resolver.sweep_idle_unreferenced_identities();
-        assert_eq!(evicted, 1);
-        assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
-    }
-
-    #[tokio::test]
-    async fn cgroup_sweep_disabled_does_not_disable_idle_identity_gc_task() {
-        let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-        assert!(spawn_cgroup_sweep_task(resolver.clone(), 0, shutdown_rx.clone()).is_none());
-
-        let handle = spawn_idle_identity_gc_task(resolver, 30, shutdown_rx)
-            .expect("idle identity GC should be independently spawnable");
-        handle.abort();
-        let _ = handle.await;
     }
 
     #[test]
@@ -2378,9 +1784,9 @@ mod tests {
         // while the connection is still open.
         resolver.retain_cookie_records(&std::collections::HashSet::new());
 
-        let report = resolver.sweep_cgroup_stale_identities();
         assert_eq!(
-            report.evicted_idle_unreferenced, 0,
+            resolver.sweep_idle_unreferenced_identities(),
+            0,
             "a pod whose identity an open connection still holds must not be evicted"
         );
         assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
@@ -2388,64 +1794,8 @@ mod tests {
 
         // Once the connection closes (Arc dropped), the next sweep reclaims it.
         drop(conn_identity);
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.evicted_idle_unreferenced, 1);
+        assert_eq!(resolver.sweep_idle_unreferenced_identities(), 1);
         assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sweep_keeps_cgroup_bound_identity_when_unreferenced() {
-        // cgroup-bound identities are the cgroup pass's domain; the idle pass
-        // must never reclaim them even with no live cookie reference, or it
-        // would race the cgroup lifecycle.
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("77777777-7777-7777-7777-777777777777").unwrap();
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let cgroup_path = tmp.path().join("pod");
-        std::fs::create_dir_all(&cgroup_path).expect("create cgroup dir");
-
-        let identity = resolver.upsert_identity_with_cgroup(
-            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/web")),
-            cgroup_path,
-        );
-        assert!(identity.cgroup_inode.is_some(), "binding must be recorded");
-
-        // No cookie record references the pod, but it is cgroup-bound.
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(report.evicted_idle_unreferenced, 0);
-        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn upsert_with_cgroup_records_none_inode_on_stat_failure() {
-        // Missing path: enrollment still inserts the identity (so a control
-        // plane that doesn't yet provide a cgroup path is not blocked), but
-        // marks `cgroup_inode = None` and the sweep ignores it.
-        let resolver = NodeWaypointIdentityResolver::new(0);
-        let pod_uid = parse_pod_uid("33333333-3333-3333-3333-333333333333").unwrap();
-        let missing = PathBuf::from("/this/path/does/not/exist/ferrum-test");
-
-        let identity = resolver.upsert_identity_with_cgroup(
-            NodeWaypointIdentity::new(pod_uid, spiffe("spiffe://td/ns/default/sa/api")),
-            missing,
-        );
-        assert!(
-            identity.cgroup_inode.is_none(),
-            "stat failure must leave cgroup_inode unset"
-        );
-        // A live cookie keeps the pod referenced so the idle pass leaves it
-        // alone; the point under test is that the *cgroup* pass ignores an
-        // entry with no recorded inode (it never tries to stat the missing path).
-        resolver.record_orig_dst4(7, orig_dst4(pod_uid, identity.workload_spiffe_hash));
-        let report = resolver.sweep_cgroup_stale_identities();
-        assert_eq!(
-            report.total_evicted(),
-            0,
-            "cgroup pass ignores identities without a recorded inode"
-        );
-        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
     }
 
     #[test]
@@ -3026,9 +2376,6 @@ mod tests {
             pod_uid,
             spiffe_id: spiffe_a,
             workload_spiffe_hash: collision_hash,
-            cgroup_path: None,
-            cgroup_inode: None,
-            cgroup_fingerprint: None,
         });
 
         assert_eq!(
@@ -3058,9 +2405,6 @@ mod tests {
             pod_uid,
             spiffe_id: spiffe_a.clone(),
             workload_spiffe_hash: hash,
-            cgroup_path: None,
-            cgroup_inode: None,
-            cgroup_fingerprint: None,
         });
         resolver.record_orig_dst4(11, orig_dst4(pod_uid, hash));
 

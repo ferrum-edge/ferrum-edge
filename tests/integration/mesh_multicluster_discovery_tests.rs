@@ -830,7 +830,8 @@ mod remove_fences_first_sight_install {
     use ferrum_edge::modes::mesh::config::{MultiClusterConfig, RemoteCluster};
     use ferrum_edge::modes::mesh::multicluster::{
         RemoteClusterPollContext, RemoteDiscoveryCandidate, RemoteDiscoveryConfig,
-        RemoteDiscoveryManager, RemoteDiscoveryTlsConfig, RemoteEndpointStore, RemoteServiceSource,
+        RemoteDiscoveryFailure, RemoteDiscoveryManager, RemoteDiscoveryTlsConfig,
+        RemoteEndpointStore, RemoteServiceSource,
     };
     use ferrum_edge::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
 
@@ -842,7 +843,7 @@ mod remove_fences_first_sight_install {
 
     #[async_trait::async_trait]
     impl RemoteServiceSource for NeverCompletes {
-        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
+        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, RemoteDiscoveryFailure> {
             std::future::pending().await
         }
     }

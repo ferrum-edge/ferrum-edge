@@ -55,7 +55,7 @@ use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 pub const FERRUM_CARRIER_TYPE_URL_PREFIX: &str = "type.googleapis.com/ferrum.config.extension.v3.";
 
 /// Inner `type_url` for the full `MeshService` carrier (protocol + per-service
-/// workload refs that the name-only CDS/EDS reconstruction cannot express).
+/// workload refs). The DP's only source of slice `services` over xDS.
 pub const FERRUM_ECDS_SERVICES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.ServicesCarrier";
 /// Inner `type_url` for the inbound-only view of the local workload's own
@@ -885,15 +885,8 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
         ));
     }
     // Emitted UNCONDITIONALLY (unlike the other field groups, which are gated
-    // on non-empty), even when `slice.labels` is empty. This push is
-    // load-bearing: it is what makes `recovered.slice_carrier_seen` reliably
-    // true for any Ferrum CP, which is the DP's "this CP is carrier-aware"
-    // sentinel that selects the carried `services` over the name-only CDS/EDS
-    // reconstruction (see `reverse_translate`). Do NOT make this conditional
-    // (e.g. "skip when empty") without introducing an explicit carrier-aware
-    // flag — otherwise a Ferrum CP with empty labels AND empty services would
-    // set `slice_carrier_seen=false` and silently fall back to reconstructing
-    // services the carrier path intended to be empty.
+    // on non-empty), even when `slice.labels` is empty; `docs/mesh.md` lists
+    // it among the carriers whose presence is evidence.
     carriers.push(MeshSliceCarrier::WorkloadLabels(slice.labels.clone()));
     // Ambiguous-labels marker: emitted only when set (the DP defaults it to
     // false). It tells the DP that the `WorkloadLabels` carrier above is a

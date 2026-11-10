@@ -120,6 +120,7 @@ Keep the **transport** (how a peer is reached on the wire) distinct from **mater
 ## Scope And Policy Semantics
 
 - Scope-aware resources must use the shared `policy_scope_applies_to_workload` / `scope_applies_to_workload` helpers. Do not fork predicates.
+- `PeerAuthentication.scope` is a required `PolicyScope` like every sibling policy (issue #7243). The earlier scope-less `namespace`+`selector` JSON is still DECODED by `PeerAuthenticationWire` (`config.rs`), converted to `scope` at deserialize and never serialized, because that shape rides the ConfigSync snapshot and the mesh carriers; refusing it needs a `CONFIG_SYNC_PROTOCOL_REVISION` bump. Nothing past deserialization reads the earlier form.
 - Single-winner precedence (`WorkloadSelector` > `Namespace` > `MeshWide`) applies only where one effective setting is resolved, such as `PeerAuthentication` and `MeshProxyConfig`.
 - `MeshPolicy` and `MeshRequestAuthentication` are additive after filtering. `MeshTelemetryResource` merges by section.
 - Authorization evaluation is DENY first, then ALLOW. Any ALLOW rule with no match causes implicit deny.

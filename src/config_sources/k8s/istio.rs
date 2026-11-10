@@ -29,9 +29,9 @@ use super::{
     RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
     invalid_resource, is_vs_authority_header, mesh_route_dispatch_can_emit_rule,
     mesh_route_dispatch_has_unsupported_predicate, mesh_route_dispatch_plugin_from_rules,
-    mesh_route_dispatch_rules_for_proxy, optional_port_field, optional_target_weight_field,
-    parse_istio_duration_ms, port_from_u64, proxy_for_route, request_termination_plugin_for_proxy,
-    resolve_workload_entry_service_attachment, resource_id,
+    mesh_route_dispatch_rules_for_proxy, namespaced_resource_key, optional_port_field,
+    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
+    request_termination_plugin_for_proxy, resolve_workload_entry_service_attachment, resource_id,
     route_backends_require_node_waypoint_authz, route_local_fault_delay_for_rule,
     route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
     route_response_transformer_plugin_for_proxy, sidecar_selector_from_istio, string_array,
@@ -86,17 +86,19 @@ pub(super) fn translate(
         }
         "VirtualService" => {
             let (proxies, upstreams, plugins) = virtual_service_routes(object, acc)?;
+            claim_virtual_service_ids(acc, object, &proxies, &upstreams)?;
             for upstream in upstreams {
                 acc.upsert_upstream(upstream);
             }
             // Proxy-scoped plugins follow their proxy (GHSA-qw5p-g8jx-pmv8).
             // Plugin ids are derived from the proxy id, so pushing the plugins
-            // of a proxy `upsert_proxy` refused (another VirtualService already
-            // produced the same lossy id) would publish two plugin configs with
-            // one `(namespace, id)`, and the publish-time duplicate check would
-            // then reject every later Kubernetes reconcile cluster-wide. A
-            // replaced proxy's previous plugins are withdrawn for the same
-            // reason before this VirtualService's plugins are added.
+            // of a proxy `upsert_proxy` refused would publish two plugin
+            // configs with one `(namespace, id)`, and the publish-time
+            // duplicate check would then reject every later Kubernetes
+            // reconcile cluster-wide. A replaced proxy's previous plugins are
+            // withdrawn for the same reason before this VirtualService's
+            // plugins are added. (A second VirtualService deriving an owned id
+            // never gets here: `claim_virtual_service_ids` refuses it.)
             let mut accepted_proxy_keys: Vec<(String, String)> = Vec::new();
             let mut refused_proxy_keys: Vec<(String, String)> = Vec::new();
             for proxy in proxies {
@@ -155,6 +157,58 @@ pub(super) fn translate(
         }
         _ => Ok(false),
     }
+}
+
+/// Bind every route proxy and route upstream id `virtual_service` derived to
+/// that object (GHSA-qw5p-g8jx-pmv8).
+///
+/// `resource_id` folds `.` into `-` and joins name and route suffix with `-`,
+/// so two VirtualServices in one namespace can derive one id (`my.app` /
+/// `my-app`, or `a` `http[1]` match 0 / `a-1` `http[0]`). The object
+/// translated first (snapshot order) keeps the id; a later one is refused as a
+/// whole with `invalid_resource`, so it reports `FerrumAccepted=False` instead
+/// of having its route silently shadowed, or its upstream overwrite the
+/// owner's backends, while reporting accepted. The error is returned before
+/// anything is upserted, and the reconciler retranslates without the refused
+/// object, so the refusal is atomic.
+fn claim_virtual_service_ids(
+    acc: &mut K8sAccumulator,
+    virtual_service: &K8sObject,
+    proxies: &[Proxy],
+    upstreams: &[crate::config::types::Upstream],
+) -> Result<(), K8sTranslateError> {
+    for proxy in proxies {
+        let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
+            continue;
+        };
+        if let Some(owner) = acc.claim_istio_virtual_service_proxy(&key, virtual_service) {
+            return Err(invalid_resource(
+                virtual_service,
+                format!(
+                    "VirtualService route proxy id {:?} is already derived by VirtualService \
+                     {:?} in the same namespace; rename one of the two VirtualServices",
+                    proxy.id, owner.name
+                ),
+            ));
+        }
+    }
+    for upstream in upstreams {
+        let Some(key) = namespaced_resource_key(&upstream.namespace, &upstream.id) else {
+            continue;
+        };
+        if let Some(owner) = acc.claim_istio_virtual_service_upstream(&key, virtual_service) {
+            return Err(invalid_resource(
+                virtual_service,
+                format!(
+                    "VirtualService route upstream id {:?} is already derived by \
+                     VirtualService {:?} in the same namespace; rename one of the two \
+                     VirtualServices",
+                    upstream.id, owner.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn authorization_policy(
@@ -1166,18 +1220,11 @@ fn peer_authentication(
 
     let selector = object.spec.get("selector");
     let scope = istio_policy_scope(options, object, selector);
-    let selector = match &scope {
-        PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-        PolicyScope::MeshWide | PolicyScope::Namespace { .. } | PolicyScope::TargetRefs { .. } => {
-            None
-        }
-    };
 
     Ok(PeerAuthentication {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
-        scope: Some(scope),
-        selector,
+        scope,
         mtls_mode: effective_mtls_mode,
         port_overrides,
     })
@@ -2233,7 +2280,6 @@ fn translate_connection_pool_http(
     };
 
     let overlay = MeshConnectionPoolHttp {
-        max_requests_per_connection: None,
         idle_timeout_ms,
         http2_max_requests,
         max_concurrent_streams,
@@ -9816,7 +9862,7 @@ mod tests {
             let mesh = result.config.mesh.expect("mesh config");
             assert!(matches!(
                 mesh.peer_authentications[0].scope,
-                Some(PolicyScope::MeshWide)
+                PolicyScope::MeshWide
             ));
         }
     }
@@ -9847,13 +9893,9 @@ mod tests {
             assert!(
                 matches!(
                     &peer_auth.scope,
-                    Some(PolicyScope::Namespace { namespace }) if namespace == "default"
+                    PolicyScope::Namespace { namespace } if namespace == "default"
                 ),
-                "{case} selector must use namespace scope"
-            );
-            assert!(
-                peer_auth.selector.is_none(),
-                "{case} selector must not become a workload selector"
+                "{case} selector must use namespace scope, not a workload selector"
             );
             assert_eq!(
                 crate::modes::mesh::slice::resolve_effective_mtls_mode(
@@ -11783,7 +11825,7 @@ mod tests {
             filter.expression,
             Some(AccessLogFilterExpr::Or {
                 left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
-                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+                right: Box::new(AccessLogFilterExpr::LatencyAboveMs { value: 1000 }),
             })
         );
         assert_eq!(filter.status_code_min, None);
@@ -11798,7 +11840,7 @@ mod tests {
             filter.expression,
             Some(AccessLogFilterExpr::Or {
                 left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
-                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+                right: Box::new(AccessLogFilterExpr::LatencyAboveMs { value: 1000 }),
             })
         );
     }
@@ -11954,7 +11996,13 @@ mod tests {
             .expect("filter parses")
             .expect("filter is present");
 
-        assert_eq!(filter.min_latency_ms, Some(101));
+        // Latency is fractional milliseconds, so `> 100` is a strict bound,
+        // not `>= 101` (issue #7245): it stays an expression tree.
+        assert_eq!(filter.min_latency_ms, None);
+        assert_eq!(
+            filter.expression,
+            Some(AccessLogFilterExpr::LatencyAboveMs { value: 100 })
+        );
     }
 
     #[test]
@@ -21084,10 +21132,6 @@ extensionProviders:
         let dr = &mesh.destination_rules[0];
         let tp = dr.traffic_policy.as_ref().expect("traffic policy");
         let http = tp.connection_pool_http.as_ref().expect("http overlay");
-        assert!(
-            http.max_requests_per_connection.is_none(),
-            "maxRequestsPerConnection is validated but deferred, not projected"
-        );
         assert_eq!(http.idle_timeout_ms, Some(300_000));
         assert_eq!(http.http2_max_requests, Some(1000));
         assert!(
@@ -21129,7 +21173,6 @@ extensionProviders:
             .as_ref()
             .unwrap();
         assert_eq!(http.http2_max_requests, Some(500));
-        assert!(http.max_requests_per_connection.is_none());
         assert!(http.idle_timeout_ms.is_none());
     }
 
@@ -21166,10 +21209,6 @@ extensionProviders:
             .connection_pool_http
             .as_ref()
             .expect("port http overlay");
-        assert!(
-            http.max_requests_per_connection.is_none(),
-            "maxRequestsPerConnection is deferred at port level too"
-        );
         assert_eq!(http.idle_timeout_ms, Some(60_000));
         assert_eq!(http.http2_max_requests, Some(200));
         assert!(
@@ -21514,7 +21553,6 @@ extensionProviders:
         );
         assert_eq!(http.http1_max_pending_requests, Some(1024));
         // Unset fields stay None.
-        assert!(http.max_requests_per_connection.is_none());
         assert!(http.idle_timeout_ms.is_none());
     }
 

@@ -1669,6 +1669,17 @@ fn service_entry_status(
         );
     }
 
+    // `spec.workloadSelector` is translated onto `ServiceEntry.workload_selector`
+    // but nothing consumes it: Ferrum does not select the entry's endpoints from
+    // the matching Pods/WorkloadEntries (Istio's meaning), so the entry serves
+    // only its declared `endpoints[]` (issue #7243).
+    if object.spec.get("workloadSelector").is_some() {
+        deferred.push(
+            "spec.workloadSelector — endpoint selection from the selected workloads is \
+             not implemented; only the declared endpoints[] are used",
+        );
+    }
+
     match result {
         Ok(_translation) => {
             let message = if deferred.is_empty() {

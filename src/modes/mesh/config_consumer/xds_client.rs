@@ -23,8 +23,7 @@ use super::stream_lifecycle::{
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
-    AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, PolicyScope,
-    PolicyTargetAttachment, ServicePort,
+    MeshDestinationRule, MeshRuntimeOverlay, MeshService, PolicyScope, PolicyTargetAttachment,
 };
 use crate::modes::mesh::revision::MeshRevisionRejection;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, XdsConvergenceSnapshot};
@@ -1643,29 +1642,26 @@ fn reverse_translate(
     accumulator: &ResourceAccumulator,
     config: &XdsClientConfig,
 ) -> Result<MeshSlice, String> {
-    let mut service_ports: BTreeMap<(String, String), BTreeSet<u16>> = BTreeMap::new();
+    // CDS/EDS/LDS names are validated for the Ferrum shape and index the
+    // services they announce, which only the RDS warming check below reads.
+    // The slice's `services` come from the Ferrum Services carrier alone.
+    let mut announced_services: BTreeSet<(String, String)> = BTreeSet::new();
 
     for type_url in [CDS_TYPE_URL, EDS_TYPE_URL] {
         for resource in accumulator.resources(type_url) {
             let parsed = parse_service_port_resource_name(&resource.name, "cluster")?;
-            service_ports
-                .entry((parsed.namespace, parsed.service))
-                .or_default()
-                .insert(parsed.port);
+            announced_services.insert((parsed.namespace, parsed.service));
         }
     }
 
     for resource in accumulator.resources(LDS_TYPE_URL) {
         let parsed = parse_service_port_resource_name(&resource.name, "listener")?;
-        service_ports
-            .entry((parsed.namespace, parsed.service))
-            .or_default()
-            .insert(parsed.port);
+        announced_services.insert((parsed.namespace, parsed.service));
     }
 
     for resource in accumulator.resources(RDS_TYPE_URL) {
         let parsed = parse_route_resource_name(&resource.name)?;
-        if !service_ports.contains_key(&(parsed.namespace.clone(), parsed.service.clone())) {
+        if !announced_services.contains(&(parsed.namespace.clone(), parsed.service.clone())) {
             // Resource warming: xDS types arrive as independent responses, so a
             // route can legitimately land before the CDS/EDS/LDS response that
             // introduces its service. Treat a route referencing a not-yet-present
@@ -1676,7 +1672,7 @@ fn reverse_translate(
             // would be lost. Skipping keeps the RDS in the accumulator so it
             // validates cleanly once its service arrives; in Ferrum's name-only
             // model the route adds no slice content either way (services come
-            // from CDS/EDS/LDS names or the ECDS Services carrier), so a
+            // from the ECDS Services carrier), so a
             // genuinely dangling route is simply inert (Envoy-aligned: a route
             // to an unknown cluster is ACKed, not NACKed) and never wedges
             // slice application for unrelated updates.
@@ -1733,17 +1729,7 @@ fn reverse_translate(
         destination_rules.push(dr);
     }
     if !dr_carrier_seen && !accumulator.resources(CDS_TYPE_URL).is_empty() {
-        // Per-DR diagnostic replaces the historical one-shot startup warning.
-        // Operators using standard xDS without the carrier path see this once
-        // per slice apply with the exact list of fields that cannot be
-        // round-tripped from CDS/EDS. The carrier path silences this log.
-        debug!(
-            "xDS slice has no DR-carrier ECDS resources; per-cluster DR fields \
-             (connectTimeout, loadBalancer, outlierDetection, subsets, tls.sni, \
-             tls.subjectAltNames, tls.mode, exportTo) are not recoverable from CDS/EDS alone. \
-             Set FERRUM_MESH_CONFIG_PROTOCOL=native or have the CP emit Ferrum \
-             DR-carrier ECDS resources to round-trip full DR semantics."
-        );
+        debug!("xDS slice carries no DestinationRules; DR fields come only from DR carriers");
     }
 
     // GAP-1a: recover the security- and policy-bearing slice fields from the
@@ -1757,40 +1743,12 @@ fn reverse_translate(
     let recovered = recover_slice_carriers(accumulator)?;
     validate_waypoint_gateway_class_carrier(&recovered, config)?;
 
-    // Prefer the full `MeshService` shape recovered from the Services carrier
-    // (protocol + per-service workload refs) over the name-only CDS/EDS
-    // reconstruction. The reconstruction stays as the fallback for an older
-    // Ferrum-shaped xDS CP that emits CDS/EDS but no Ferrum carrier.
-    let services = if let Some(services) = recovered.services {
-        services
-    } else if recovered.slice_carrier_seen {
-        Vec::new()
-    } else {
-        service_ports
-            .into_iter()
-            .map(|((namespace, name), ports)| MeshService {
-                name,
-                namespace,
-                ports: ports
-                    .into_iter()
-                    .map(|port| ServicePort {
-                        port,
-                        protocol: AppProtocol::Unknown,
-                        name: None,
-                        target_port: None,
-                    })
-                    .collect(),
-                workloads: Vec::new(),
-                protocol_overrides: HashMap::new(),
-                // The name-only CDS/EDS reconstruction carries no Service
-                // spec, so VIPs are unknown; the Ferrum Services carrier
-                // (preferred branch above) round-trips them via serde.
-                cluster_ips: Vec::new(),
-                uid: None,
-                allow_path_parameters: false,
-            })
-            .collect()
-    };
+    // Services come only from the Ferrum Services carrier (protocol, ports,
+    // workload refs, VIPs). There is no name-only reconstruction from CDS/EDS
+    // names: that produced the protocol-less, policy-less view the ECDS
+    // requirement exists to prevent, for a CP version Ferrum does not support
+    // (issue #7244). A CP that sends no Services carrier has no services.
+    let services = recovered.services;
 
     let mut trust_domains = Vec::new();
     let mut ignored_sds_names = Vec::new();
@@ -2145,16 +2103,12 @@ fn recovered_labels_are_authoritative(
 
 /// Slice fields recovered from Ferrum mesh-slice ECDS carriers (GAP-1a).
 ///
-/// `services` is `Option` so the caller can distinguish "the CP shipped a
-/// Services carrier" (use it verbatim) from "no carrier; fall back to the
-/// name-only CDS/EDS reconstruction". The other fields default to empty/`None`,
-/// which matches both "carrier absent" and "carrier present but empty" — the
-/// same indistinguishability native config has between an empty list and an
-/// absent list.
+/// Fields default to empty/`None`, which matches both "carrier absent" and
+/// "carrier present but empty" — the same indistinguishability native config
+/// has between an empty list and an absent list.
 #[derive(Debug, Default)]
 struct RecoveredSliceCarriers {
-    slice_carrier_seen: bool,
-    services: Option<Vec<MeshService>>,
+    services: Vec<MeshService>,
     local_inbound_services: Vec<MeshService>,
     local_inbound_workloads: Option<Vec<crate::modes::mesh::config::Workload>>,
     local_ingress_listeners: Vec<crate::modes::mesh::config::ResolvedIngressListener>,
@@ -2626,9 +2580,8 @@ fn apply_recovered_carrier(
     carrier: crate::xds::carrier::MeshSliceCarrier,
 ) -> Result<(), String> {
     use crate::xds::carrier::MeshSliceCarrier;
-    recovered.slice_carrier_seen = true;
     match carrier {
-        MeshSliceCarrier::Services(value) => recovered.services = Some(value),
+        MeshSliceCarrier::Services(value) => recovered.services = value,
         MeshSliceCarrier::LocalInboundServices(value) => recovered.local_inbound_services = value,
         MeshSliceCarrier::LocalInboundWorkloads(value) => {
             recovered.local_inbound_workloads = Some(value)
@@ -2762,22 +2715,19 @@ fn validate_resource_name_shape(type_url: &str, name: &str) -> Result<(), String
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ServicePortResourceName {
-    namespace: String,
-    service: String,
-    port: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceResourceName {
     namespace: String,
     service: String,
 }
 
+/// Validate a Ferrum `{prefix}/{namespace}/{service}/{port}` name and return
+/// the service it names. The port is validated but not returned: slice
+/// services come from the Services carrier, so only the service identity is
+/// needed (RDS resource warming).
 fn parse_service_port_resource_name(
     name: &str,
     expected_prefix: &str,
-) -> Result<ServicePortResourceName, String> {
+) -> Result<ServiceResourceName, String> {
     let parts: Vec<&str> = name.split('/').collect();
     if parts.len() != 4 || parts[0] != expected_prefix {
         return Err(format!(
@@ -2799,10 +2749,9 @@ fn parse_service_port_resource_name(
     if port == 0 {
         return Err("resource name <redacted scalar> must use a non-zero port".to_string());
     }
-    Ok(ServicePortResourceName {
+    Ok(ServiceResourceName {
         namespace: namespace.to_string(),
         service: service.to_string(),
-        port,
     })
 }
 
@@ -2893,6 +2842,7 @@ fn xds_type_short_name(type_url: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modes::mesh::config::{AppProtocol, ServicePort};
     use crate::modes::mesh::config_consumer::stream_lifecycle::{
         MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamTimings,
         MeshStreamTracker,
@@ -3721,11 +3671,7 @@ mod tests {
             .map(|resource| resource.name.as_str())
             .collect();
         assert!(route_names.contains(&"route/default/web"));
-        let services = service_port_map(&cds_after.slice);
-        assert!(
-            services.contains_key(&("default".to_string(), "web".to_string())),
-            "web service is present in the slice once its CDS arrives"
-        );
+        assert_eq!(cds_after.slice.version, "v2");
         let ack = rx.recv().await.expect("ACK for CDS");
         assert_eq!(ack.type_url, CDS_TYPE_URL);
         assert!(ack.error_detail.is_none());
@@ -3870,8 +3816,6 @@ mod tests {
             } else {
                 let pending = pending.expect("last required v2 response builds coherent slice");
                 assert_eq!(pending.slice.version, "v2");
-                assert_eq!(pending.slice.services.len(), 1);
-                assert_eq!(pending.slice.services[0].name, "api");
                 assert!(!accumulator.required_versions_skewed());
             }
         }
@@ -4895,8 +4839,35 @@ mod tests {
         assert!(accumulator.has_required_types());
     }
 
+    fn http_service(namespace: &str, name: &str, port: u16) -> MeshService {
+        MeshService {
+            cluster_ips: Vec::new(),
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            ports: vec![ServicePort {
+                port,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            uid: None,
+            allow_path_parameters: false,
+        }
+    }
+
+    fn services_carrier_resource(services: Vec<MeshService>) -> proto::Any {
+        let carrier = crate::xds::carrier::MeshSliceCarrier::Services(services);
+        typed_extension_resource(
+            &carrier.resource_name(),
+            carrier.type_url(),
+            carrier.encode_value().expect("Services carrier encodes"),
+        )
+    }
+
     #[test]
-    fn reverse_translate_cluster_name() {
+    fn reverse_translate_takes_services_from_the_services_carrier() {
         let mut accumulator = ResourceAccumulator::new();
         accumulator
             .apply_sotw_response(
@@ -4905,6 +4876,14 @@ mod tests {
                 "v1",
             )
             .expect("response applies");
+        let carried = vec![http_service("default", "api", 8080)];
+        accumulator
+            .apply_sotw_response(
+                ECDS_TYPE_URL,
+                &[services_carrier_resource(carried.clone())],
+                "v1",
+            )
+            .expect("Services carrier applies");
         apply_all_empty(&mut accumulator);
 
         let slice = accumulator
@@ -4912,10 +4891,7 @@ mod tests {
             .expect("reverse translate succeeds")
             .expect("all types are present");
 
-        assert_eq!(slice.services.len(), 1);
-        assert_eq!(slice.services[0].name, "api");
-        assert_eq!(slice.services[0].namespace, "default");
-        assert_eq!(slice.services[0].ports[0].port, 8080);
+        assert_eq!(slice.services, carried);
     }
 
     #[test]
@@ -4933,36 +4909,6 @@ mod tests {
             .expect_err("non-Ferrum xDS names are not supported");
 
         assert!(err.contains("cluster/{namespace}/{service}/{port}"));
-    }
-
-    #[test]
-    fn reverse_translate_deduplicates_services() {
-        let mut accumulator = ResourceAccumulator::new();
-        accumulator
-            .apply_sotw_response(
-                CDS_TYPE_URL,
-                &[any_resource(CDS_TYPE_URL, "cluster/default/api/8080")],
-                "v1",
-            )
-            .expect("CDS response applies");
-        accumulator
-            .apply_sotw_response(
-                LDS_TYPE_URL,
-                &[any_resource(LDS_TYPE_URL, "listener/default/api/9090")],
-                "v1",
-            )
-            .expect("LDS response applies");
-        apply_all_empty(&mut accumulator);
-
-        let slice = accumulator
-            .try_build_mesh_slice(&test_config())
-            .expect("reverse translate succeeds")
-            .expect("all types are present");
-
-        assert_eq!(
-            service_port_map(&slice).get(&("default".to_string(), "api".to_string())),
-            Some(&vec![8080, 9090])
-        );
     }
 
     #[test]
@@ -5029,7 +4975,6 @@ mod tests {
             .expect("reverse translate succeeds")
             .expect("required non-SDS types are present");
 
-        assert_eq!(slice.services.len(), 1);
         assert!(slice.trust_bundles.is_none());
     }
 
@@ -6049,11 +5994,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "selector-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -6202,7 +6148,7 @@ mod tests {
         );
         assert_eq!(recovered.sidecar_egress_scope, native.sidecar_egress_scope);
         // Services round-trip with full protocol + workload-ref shape via the
-        // Services carrier (not the name-only CDS/EDS reconstruction).
+        // Services carrier, their only source.
         assert_eq!(recovered.services, native.services);
         assert_eq!(
             recovered.service_waypoint_bound_services, native.service_waypoint_bound_services,
@@ -6698,11 +6644,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "selector-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -6750,11 +6697,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "selector-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("app".to_string(), "web".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "web".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -6806,11 +6754,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "role-api-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("role".to_string(), "api".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -6875,22 +6824,24 @@ mod tests {
                 PeerAuthentication {
                     name: "app-shared-strict".to_string(),
                     namespace: "default".to_string(),
-                    scope: None,
-                    selector: Some(WorkloadSelector {
-                        labels: HashMap::from([("app".to_string(), "shared".to_string())]),
-                        namespace: None,
-                    }),
+                    scope: PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([("app".to_string(), "shared".to_string())]),
+                            namespace: Some("default".to_string()),
+                        },
+                    },
                     mtls_mode: MtlsMode::Strict,
                     port_overrides: HashMap::new(),
                 },
                 PeerAuthentication {
                     name: "role-api-permissive".to_string(),
                     namespace: "default".to_string(),
-                    scope: None,
-                    selector: Some(WorkloadSelector {
-                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
-                        namespace: None,
-                    }),
+                    scope: PolicyScope::WorkloadSelector {
+                        selector: WorkloadSelector {
+                            labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                            namespace: Some("default".to_string()),
+                        },
+                    },
                     mtls_mode: MtlsMode::Permissive,
                     port_overrides: HashMap::new(),
                 },
@@ -6952,11 +6903,12 @@ mod tests {
             peer_authentications: vec![PeerAuthentication {
                 name: "role-api-strict".to_string(),
                 namespace: "default".to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("role".to_string(), "api".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::new(),
             }],
@@ -7076,11 +7028,11 @@ mod tests {
     }
 
     #[test]
-    fn xds_round_trip_without_carriers_falls_back_to_name_only_services() {
-        // Simulate an older Ferrum-shaped xDS CP: CDS/EDS names only, no
-        // Ferrum carriers.
-        // The DP must still reconstruct service ports (fail-open routing) but
-        // with empty security fields — the documented degraded mode.
+    fn xds_without_carriers_builds_no_services_from_cds_names() {
+        // Issue #7244: a CP that sends Ferrum-shaped CDS/EDS names but no
+        // Ferrum carriers is unsupported. The DP must not reconstruct
+        // protocol-less services from the names (the unprotected name-only
+        // view); the slice simply has no services.
         let mut accumulator = ResourceAccumulator::new();
         accumulator
             .apply_sotw_response(
@@ -7106,8 +7058,7 @@ mod tests {
             .expect("reverse translate succeeds")
             .expect("required types present");
 
-        assert_eq!(recovered.services.len(), 1);
-        assert_eq!(recovered.services[0].name, "api");
+        assert!(recovered.services.is_empty());
         assert!(recovered.mesh_policies.is_empty());
         assert!(recovered.peer_authentications.is_empty());
         assert!(recovered.trust_bundles.is_none());
