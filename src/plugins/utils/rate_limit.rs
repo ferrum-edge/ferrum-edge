@@ -1949,6 +1949,10 @@ pub fn apply_rate_limit_cleanup<K, A>(
     }
 }
 
+/// Test-only view of [`weighted_window_count`] over one configured limit.
+///
+/// No plugin constructs it; the external decay tests use it to exercise the
+/// shared formula. Production paths call [`weighted_window_count`] directly.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct FixedWindow {
@@ -1961,10 +1965,10 @@ pub struct FixedWindow {
 ///
 /// This is the TOKEN-ACCOUNTING estimate, and it is the ONLY place the formula
 /// is written down. Every production caller reasons in it through this
-/// function — [`FixedWindow`], the three `ai_rate_limiter` `INCRBY` arms
-/// (`Check`, `Reserve`, `AdjustUsage`), and the `ws_rate_limiting` frame
-/// budget — so a change to the formula cannot leave one path on the old shape
-/// and a test green on another. Those paths reserve an estimate under one
+/// function — the three `ai_rate_limiter` `INCRBY` arms (`Check`, `Reserve`,
+/// `AdjustUsage`) and the `ws_rate_limiting` frame budget, plus the test-only
+/// [`FixedWindow`] helper — so a change to the formula cannot leave one path on
+/// the old shape and a test green on another. Those paths reserve an estimate under one
 /// window index and reconcile it against that same index after the response,
 /// so the count has to be a continuous function of one `(previous, current)`
 /// pair.
@@ -3019,8 +3023,10 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
     type State = DynamicHttpRateLimitState;
     type Op = DynamicRateLimitOp;
 
-    /// Same ladder as [`HttpRateLimitAlgorithm`], with the windows resolved
-    /// per request (`graphql`, `grpc_method_router`).
+    /// The request-quota sub-bucket ladder (`check_http_windows`), with the
+    /// windows resolved per request. This is the only request-quota algorithm
+    /// in production (`rate_limiting`, `graphql`, `grpc_method_router`); the
+    /// `#[cfg(test)]` `HttpRateLimitAlgorithm` is an inline-test fixture.
     const REQUIRES_SERVER_CLOCK: bool = true;
 
     fn new_state(&self) -> Self::State {

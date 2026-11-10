@@ -111,17 +111,11 @@ pub struct SseParse {
 ///
 /// Consumes leading UTF-8 BOMs, splits lines on CRLF, LF, or CR, skips
 /// comments, strips the `data: ` (or `data:`) prefix, skips empty data,
-/// the `[DONE]` sentinel, and frames that are not valid JSON. Returns the
-/// parsed frames in order. Returns an empty `Vec` if the body is not valid
-/// UTF-8 — callers receive no JSON frames but no error either. Use
-/// [`parse_sse_data_frames_checked`] when "had unparseable data" must be
-/// distinguished from "had no data".
-pub fn parse_sse_data_frames(body: &[u8]) -> Vec<Value> {
-    parse_sse_data_frames_checked(body).frames
-}
-
-/// Like [`parse_sse_data_frames`], but also reports whether the entire body was
-/// inspectable (see [`SseParse::fully_parsed`]).
+/// the `[DONE]` sentinel, and frames that are not valid JSON, returning the
+/// parsed frames in order. [`SseParse::fully_parsed`] reports whether the
+/// entire body was inspectable, so "had unparseable data" (including a body
+/// that is not valid UTF-8, which yields no frames) is distinguished from "had
+/// no data".
 pub fn parse_sse_data_frames_checked(body: &[u8]) -> SseParse {
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s,
@@ -2991,7 +2985,7 @@ mod tests {
     #[test]
     fn parse_sse_frames_basic() {
         let body = b"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"id\":\"2\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\ndata: [DONE]\n\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["id"], "1");
         assert_eq!(frames[1]["id"], "2");
@@ -2999,13 +2993,13 @@ mod tests {
 
     #[test]
     fn parse_sse_frames_empty_body() {
-        assert!(parse_sse_data_frames(b"").is_empty());
+        assert!(parse_sse_data_frames_checked(b"").frames.is_empty());
     }
 
     #[test]
     fn parse_sse_frames_skips_done_and_comments() {
         let body = b": comment\ndata: [DONE]\n\ndata: {\"ok\":true}\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["ok"], true);
     }
@@ -3013,7 +3007,7 @@ mod tests {
     #[test]
     fn parse_sse_frames_no_space_after_colon() {
         let body = b"data:{\"v\":1}\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["v"], 1);
     }
@@ -3021,7 +3015,7 @@ mod tests {
     #[test]
     fn parse_sse_frames_multiline_data_event() {
         let body = b"data: {\"id\":\"1\",\ndata: \"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"id\":\"2\"}\n\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["id"], "1");
         assert_eq!(frames[0]["choices"][0]["delta"]["content"], "Hello");
@@ -3031,14 +3025,14 @@ mod tests {
     #[test]
     fn parse_sse_frames_skips_invalid_json() {
         let body = b"data: not-json\n\ndata: {\"ok\":true}\n";
-        let frames = parse_sse_data_frames(body);
+        let frames = parse_sse_data_frames_checked(body).frames;
         assert_eq!(frames.len(), 1);
     }
 
     #[test]
     fn parse_sse_frames_invalid_utf8() {
         let body: &[u8] = &[0xff, 0xfe, 0xfd];
-        assert!(parse_sse_data_frames(body).is_empty());
+        assert!(parse_sse_data_frames_checked(body).frames.is_empty());
     }
 
     #[test]
@@ -3082,7 +3076,7 @@ mod tests {
         assert!(text.starts_with("event: error\ndata: {"));
         assert!(text.ends_with("\n\ndata: [DONE]\n\n"));
         // The data payload round-trips through the parser as one JSON frame.
-        let frames = parse_sse_data_frames(&bytes);
+        let frames = parse_sse_data_frames_checked(&bytes).frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0]["error"]["code"],
@@ -3095,7 +3089,7 @@ mod tests {
     fn encode_sse_error_event_escapes_payload() {
         // Embedded quotes / newlines must not break out of the single data line.
         let bytes = encode_sse_error_event("c", "line1\nline2 \"q\"");
-        let frames = parse_sse_data_frames(&bytes);
+        let frames = parse_sse_data_frames_checked(&bytes).frames;
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["error"]["message"], "line1\nline2 \"q\"");
     }
@@ -3103,10 +3097,12 @@ mod tests {
     #[test]
     fn assistant_content_concatenates_choice_and_responses_text() {
         let mut r = SseReassembler::new();
-        for frame in parse_sse_data_frames(
+        for frame in parse_sse_data_frames_checked(
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"}}]}\n\n\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
-        ) {
+        )
+        .frames
+        {
             r.push_frame(&frame);
         }
         assert_eq!(r.assistant_content(), "Hello world.");
@@ -3119,9 +3115,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
     #[test]
     fn drain_assistant_prefix_keeps_tail_and_snaps_boundaries() {
         let mut r = SseReassembler::new();
-        for frame in parse_sse_data_frames(
+        for frame in parse_sse_data_frames_checked(
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello world.\"}}]}\n\n",
-        ) {
+        )
+        .frames
+        {
             r.push_frame(&frame);
         }
         // Drop the first sentence, keep the tail.
@@ -3132,9 +3130,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         // A prefix landing mid-multibyte-char snaps down (retains a few extra
         // bytes) rather than panicking or dropping a partial char.
         let mut m = SseReassembler::new();
-        for frame in parse_sse_data_frames(
+        for frame in parse_sse_data_frames_checked(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"aé\"}}]}\n\n".as_bytes(),
-        ) {
+        )
+        .frames
+        {
             m.push_frame(&frame);
         }
         m.drain_assistant_prefix(2); // index 2 is mid-'é' → floors to 1
@@ -3142,9 +3142,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
 
         // Tool-call accumulators are NOT drained by a prose-prefix drain.
         let mut t = SseReassembler::new();
-        for frame in parse_sse_data_frames(
+        for frame in parse_sse_data_frames_checked(
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"exec\",\"arguments\":\"{}\"}}]}}]}\n\n",
-        ) {
+        )
+        .frames
+        {
             t.push_frame(&frame);
         }
         t.drain_assistant_prefix(100);
@@ -3202,7 +3204,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         let frame = format!(
             "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"run\",\"arguments\":\"{big}\"}}}}]}}}}]}}\n\n"
         );
-        for f in parse_sse_data_frames(frame.as_bytes()) {
+        for f in parse_sse_data_frames_checked(frame.as_bytes()).frames {
             r.push_frame(&f);
         }
         r.truncate_streamed_tool_state(64);
@@ -3231,7 +3233,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         let frame = format!(
             "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"{name}\",\"arguments\":\"{arguments}\"}}}},{{\"index\":1,\"function\":{{\"name\":\"{name}\",\"arguments\":\"{arguments}\"}}}}]}}}}]}}\n\n"
         );
-        for parsed in parse_sse_data_frames(frame.as_bytes()) {
+        for parsed in parse_sse_data_frames_checked(frame.as_bytes()).frames {
             r.push_frame(&parsed);
         }
         assert!(r.retained_text_len() > 64);
@@ -3276,7 +3278,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
 
     fn reassemble(body: &[u8]) -> Vec<SseText> {
         let mut reassembler = SseReassembler::new();
-        for frame in parse_sse_data_frames(body) {
+        for frame in parse_sse_data_frames_checked(body).frames {
             reassembler.push_frame(&frame);
         }
         reassembler.into_texts()
