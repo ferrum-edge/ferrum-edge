@@ -436,45 +436,29 @@ pub fn infer_file_mode() {
     let Ok(conf) = ConfFile::load() else {
         return;
     };
-    if conf.get("FERRUM_FILE_CONFIG_PATH").is_none()
+    infer_file_mode_from_conf(conf.get("FERRUM_MODE"), conf.get("FERRUM_FILE_CONFIG_PATH"));
+}
+
+/// The file-mode smart default, given the `FERRUM_MODE` and
+/// `FERRUM_FILE_CONFIG_PATH` values of the already-loaded settings snapshot.
+///
+/// [`infer_file_mode`] is the only production caller. It is public so tests
+/// can drive the precedence rules with several settings values without
+/// replacing the process-wide `OnceLock` snapshot.
+#[doc(hidden)]
+pub fn infer_file_mode_from_conf(conf_mode: Option<&str>, conf_spec_path: Option<&str>) {
+    if conf_spec_path.is_none()
         && let Some(path) = resolve_spec_path(None)
     {
         // SAFETY: startup only, before logging workers or the serving runtime.
         unsafe { std::env::set_var("FERRUM_FILE_CONFIG_PATH", path) };
     }
-    if direct_env_var_is_set("FERRUM_MODE")
-        || conf
-            .get("FERRUM_MODE")
-            .is_some_and(|mode| !mode.trim().is_empty())
+    if direct_env_var_is_set("FERRUM_MODE") || conf_mode.is_some_and(|mode| !mode.trim().is_empty())
     {
         return;
     }
-    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH")
-        || conf.get("FERRUM_FILE_CONFIG_PATH").is_some()
-    {
+    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH") || conf_spec_path.is_some() {
         // SAFETY: startup only, before logging workers or the serving runtime.
-        unsafe { std::env::set_var("FERRUM_MODE", "file") };
-    }
-}
-
-/// Apply the file-mode smart default after the immutable settings snapshot has
-/// already been resolved.
-///
-/// Kept as a small public seam because process-level callers may already hold
-/// the accepted `ferrum.conf` value, and tests must not attempt to replace the
-/// process-wide `OnceLock` snapshot with several different files.
-#[doc(hidden)]
-pub fn infer_file_mode_from_conf_mode(conf_mode: Option<&str>) {
-    // Preserve CLI/direct-env precedence even for callers that already loaded
-    // the settings snapshot.
-    if direct_env_var_is_set("FERRUM_MODE") {
-        return;
-    }
-    if conf_mode.is_some_and(|mode| !mode.trim().is_empty()) {
-        return;
-    }
-    if direct_env_var_is_set("FERRUM_FILE_CONFIG_PATH") {
-        // SAFETY: single-threaded context, before the multi-threaded runtime.
         unsafe { std::env::set_var("FERRUM_MODE", "file") };
     }
 }

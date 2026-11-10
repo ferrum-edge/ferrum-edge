@@ -342,7 +342,7 @@ async fn test_pool_clear() {
     let _client = pool.get_client(&proxy).await.unwrap();
     assert_eq!(pool.get_stats().total_pools, 1);
 
-    pool.clear();
+    pool.force_drain_all();
     assert_eq!(pool.get_stats().total_pools, 0);
 }
 
