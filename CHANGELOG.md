@@ -597,6 +597,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **UDP capture teardown no longer spins when a jump cannot be deleted**
+  (#7265). The loop that removes every `mangle` jump into a UDP guard or
+  capture chain exited only when the rule check failed. When the check kept
+  matching and the delete kept failing (for example an xtables lock held past
+  `-w`), the best-effort teardown scripts and the node-agent cleanup runner,
+  which run without `set -e`, never returned. The delete failure now exits
+  with its own status and an error message.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

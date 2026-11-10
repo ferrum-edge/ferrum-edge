@@ -751,6 +751,12 @@ pub const NODE_WAYPOINT_INGRESS_REDIRECT_TABLE: u32 = 33134;
 /// UDP TPROXY rule it must sort BELOW the kernel `main` rule (priority 32766)
 /// or `main` resolves the marked packet first and the redirect black-holes.
 /// One above the UDP rule (`100`) so the two are independently deletable.
+///
+/// The host-netns UDP capture rule (`TPROXY_HOST_ROUTE_RULE_PRIORITY` in the
+/// gateway's `capture` module) shares this priority in the host netns. Both
+/// rules are added and deleted by priority AND table, never by priority alone,
+/// and their tables differ (`33134` here, `33135` there); the gateway crate
+/// asserts both facts at compile time.
 pub const NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY: u32 = 101;
 
 // The two NodeWaypoint marks must stay distinct from each other and from the

@@ -525,7 +525,9 @@ valid, unambiguous host route remains.
 guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`
 priority `101` — all disjoint from the pod-netns path (`33133`/`100`) and from the
 node-agent's tc ingress-redirect table (`33134`), so neither teardown can remove
-the other's state. Startup reaps the previous generation before installing
+the other's state. The ingress-redirect rule also uses priority `101` in the host
+netns; every add and delete names both the priority and the table, so the two
+rules stay individually addressable. Startup reaps the previous generation before installing
 anything — but only **after** discharging its durable readiness handshake (next
 paragraph); a deployment that is **not** using this placement runs the same
 recovery-then-reap, so a switched-away node cannot keep a jump into a chain no
