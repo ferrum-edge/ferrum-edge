@@ -2737,11 +2737,14 @@ config:
       client_auth:
         method: client_secret_basic
         client_id: ferrum-edge
-        client_secret: "${INTROSPECTION_CLIENT_SECRET}"
+        # Literal value: plugin config does not expand environment variables.
+        client_secret: "<client secret issued by the IdP>"
       required_scopes: ["orders:read"]
       claim_headers:
         sub: X-Authenticated-Subject
 ```
+
+Plugin config values are literal: `client_auth.client_secret` does not read an environment variable, so a `${NAME}` value is sent to the provider as written. Substitute the real secret (for example with your deployment tooling) before applying the config.
 
 ### `oidc_relying_party`
 
@@ -2837,15 +2840,20 @@ config:
       callback_path: "/oidc/callback"
       client_auth:
         method: client_secret_basic
-        client_secret: "${OIDC_CLIENT_SECRET}"
+        # Literal value: plugin config does not expand environment variables.
+        client_secret: "<client secret issued by the IdP>"
       audiences: ["ferrum-edge"]
       claim_headers:
         email: X-Authenticated-Email
   session:
+    # Replace with a unique random secret of at least 32 bytes. Admission
+    # rejects this placeholder (and any unresolved ${NAME}) as written.
     encryption_secret: "${OIDC_SESSION_SECRET_32_BYTES_MIN}"
   behavior:
     post_login_default_path: "/"
 ```
+
+As with `oauth2_introspection`, these values are literal: neither `client_auth.client_secret` nor `session.encryption_secret` reads an environment variable. Substitute real secrets before applying the config.
 
 OIDC relying-party JWKS uses the same shared bounded-trust store as
 `jwks_auth`, with the secure one-hour maximum-stale default. Discovery success
