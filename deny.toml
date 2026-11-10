@@ -115,6 +115,30 @@ ignore = [
     # with `tar` (testcontainers/testcontainers-rs#1006, open); retire this
     # when a testcontainers release ships that change.
     { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar 0.6.2 unmaintained (Astral ended maintenance 2026-11-03, patched = [], informational, no known vulnerability). Only parent is testcontainers 0.28.0 (latest, checked 2026-11-06), a dev-dependency of the secrets_functional and service_integration test targets; not in the shipped binary or images. Retire when a testcontainers release replaces it (testcontainers-rs#1006). [expires:2026-12-31]" },
+
+    # ── libsqlite3-sys 0.30.1 — RUSTSEC-2026-0459 (C SQLite CVE-2026-119375).
+    # SQLite < 3.54.0 can return uninitialized page-cache memory when a process
+    # opens a database together with a sibling `-wal` file whose page size
+    # differs. Fixed in libsqlite3-sys 0.39.0 (bundled SQLite 3.54.0), but no
+    # SQLx release can reach it (checked 2026-11-09): sqlx-sqlite 0.8.6
+    # requires `^0.30.1` and sqlx-sqlite 0.9.0 requires `>=0.30.1, <0.38.0`.
+    # One parent reaches it: sqlx-sqlite 0.8.6 via sqlx's `sqlite` feature
+    # (bundled), in the root, fuzz/ and tests/performance/mesh/ lockfiles.
+    # Exposure: production opens SQLite only at operator-configured database
+    # URLs: FERRUM_DB_URL (default `sqlite://ferrum.db`), FERRUM_DB_FAILOVER_URLS
+    # and FERRUM_DB_READ_REPLICA_URL. Every other open is an in-memory or
+    # tempdir database in tests. Exploiting it needs a less-trusted party to
+    # write one of those database files together with its `-wal`. This
+    # exception rests on every such database, its `-wal`/`-shm` files and their
+    # containing directory having only trusted writers (the gateway and its
+    # operators). For the primary and failover databases a writer already
+    # controls the gateway's configuration. A read replica is different:
+    # authoritative admin reads exclude it (`admin_read_pool`), so a replica
+    # written by a less-trusted replication account WOULD be a new boundary.
+    # Deployments with such a replica need patched SQLite, not this exception.
+    # Retire when an SQLx release allows libsqlite3-sys >= 0.39 (or a vendored
+    # sqlx-sqlite patch does).
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 bundles SQLite < 3.54.0 (CVE-2026-119375, crafted db + -wal pair returns uninitialized page-cache bytes; local, needs the victim to open attacker-written files). Fixed in 0.39.0, unreachable: sqlx-sqlite 0.8.6 requires ^0.30.1 and 0.9.0 requires <0.38.0 (checked 2026-11-09). Production opens SQLite only at operator-configured URLs (FERRUM_DB_URL, FERRUM_DB_FAILOVER_URLS, FERRUM_DB_READ_REPLICA_URL). Accepted on the condition that every such database, its -wal/-shm and directory have only trusted writers; a SQLite read replica written by a less-trusted account is NOT covered and needs patched SQLite. Retire when an SQLx release allows libsqlite3-sys >= 0.39. [expires:2026-12-31]" },
 ]
 
 [bans]
