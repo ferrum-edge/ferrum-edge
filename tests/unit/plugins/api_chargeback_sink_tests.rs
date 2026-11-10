@@ -29,7 +29,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     publish_dead_letter_payload_with_identity_for_tests, reconcile_active_spool_usage_for_tests,
     render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
-    serialize_json_each_row, serialize_json_each_row_projected, set_spool_walk_hook_for_tests,
+    replay_spool_tick_off_worker_for_tests, serialize_json_each_row,
+    serialize_json_each_row_projected, set_spool_walk_hook_for_tests,
     set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     spool_index_entry_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
@@ -14845,6 +14846,145 @@ async fn cancelled_replay_releases_its_claim_for_the_next_generation() {
         String::from_utf8_lossy(&requests[0].body).contains("evt-cancelled-replay"),
         "the replayed row must keep its original event_id"
     );
+    assert!(!record.exists(), "a delivered artifact leaves the spool");
+}
+
+/// Issue #7111: a replay tick's synchronous spool work (listing, claim,
+/// streaming preflight, dead-letter publication) runs on the blocking pool, so
+/// another task on a one-worker runtime keeps making progress while the tick
+/// is held inside that work.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn replay_tick_synchronous_work_leaves_the_runtime_worker_free() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = Arc::new(test_spool(&temp));
+    let record = spool
+        .write_events(&[sample_event("evt-off-worker-replay")])
+        .unwrap();
+
+    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
+    let (progress_tx, progress_rx) = mpsc::channel::<()>();
+    let progress_rx = Mutex::new(progress_rx);
+    let entered = Arc::new(AtomicBool::new(false));
+    let progressed = Arc::new(AtomicBool::new(false));
+    let entered_hook = Arc::clone(&entered);
+    let progressed_hook = Arc::clone(&progressed);
+    let _clear = ClearReplayHookOnDrop;
+    set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
+        if point != SpoolReplayHookPoint::AfterStreamingPreflight
+            || !claimed.starts_with(&namespace_root)
+        {
+            return;
+        }
+        entered_hook.store(true, Ordering::Release);
+        // Hold the tick inside its synchronous section until a task that
+        // needs the runtime's only worker reports progress.
+        let reported = progress_rx
+            .lock()
+            .expect("progress receiver")
+            .recv_timeout(Duration::from_secs(10))
+            .is_ok();
+        progressed_hook.store(reported, Ordering::Release);
+    })));
+
+    let probe_entered = Arc::clone(&entered);
+    let probe = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !probe_entered.load(Ordering::Acquire) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let _ = progress_tx.send(());
+    });
+    let uri = server.uri();
+    let tick_spool = Arc::clone(&spool);
+    let tick =
+        tokio::spawn(async move { replay_spool_tick_off_worker_for_tests(tick_spool, &uri).await });
+
+    tick.await
+        .expect("replay tick task")
+        .expect("replay tick delivers the record");
+    probe.await.expect("progress probe task");
+    assert!(
+        entered.load(Ordering::Acquire),
+        "the tick must reach its synchronous streaming preflight"
+    );
+    assert!(
+        progressed.load(Ordering::Acquire),
+        "another task on the runtime's only worker must run while the tick is inside synchronous spool work"
+    );
+    assert!(!record.exists(), "a delivered artifact leaves the spool");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// Aborting the production replay task (what a retiring generation does) while
+/// the off-worker tick awaits its POST still releases the claim back to the
+/// durable replayable name: the cancellation reaches the blocking-pool tick at
+/// its next await.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_off_worker_replay_tick_releases_its_claim() {
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+        .mount(&slow)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = Arc::new(test_spool(&temp));
+    let record = spool
+        .write_events(&[sample_event("evt-cancelled-off-worker-replay")])
+        .unwrap();
+
+    let uri = slow.uri();
+    let tick_spool = Arc::clone(&spool);
+    let tick =
+        tokio::spawn(async move { replay_spool_tick_off_worker_for_tests(tick_spool, &uri).await });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while slow
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the replay tick must reach its delivery POST"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    tick.abort();
+    let _ = tick.await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !record.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "a cancelled off-worker tick must release its claim back to the durable replayable name"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        spool
+            .list_owned_spool_files_for_tests()
+            .unwrap()
+            .iter()
+            .all(|path| !path.to_string_lossy().ends_with(".inflight")),
+        "no stranded in-flight claim may remain after cancellation"
+    );
+
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&healthy)
+        .await;
+    replay_spool_once_for_tests(&spool, &healthy.uri())
+        .await
+        .expect("the released artifact must replay once ClickHouse recovers");
+    assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
     assert!(!record.exists(), "a delivered artifact leaves the spool");
 }
 

@@ -13436,7 +13436,32 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
     batch_size: usize,
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<(), String> {
-    let flush_config = ClickHouseFlushConfig {
+    let flush_config = replay_flush_config_for_tests(spool, insert_url, ceiling);
+    replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+}
+
+/// Replay one tick exactly as the production replayer schedules it: on the
+/// blocking pool, cancellable by dropping the returned future.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn replay_spool_tick_off_worker_for_tests(
+    spool: Arc<SpoolManager>,
+    insert_url: &str,
+) -> Result<(), String> {
+    let flush_config = Arc::new(replay_flush_config_for_tests(
+        &spool,
+        insert_url,
+        process_ceiling(),
+    ));
+    replay_spool_tick_off_worker(spool, flush_config, default_batch_size()).await
+}
+
+fn replay_flush_config_for_tests(
+    spool: &SpoolManager,
+    insert_url: &str,
+    ceiling: &'static RetainedByteCeiling,
+) -> ClickHouseFlushConfig {
+    ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(DedicatedPluginClient::fixed(reqwest::Client::new())),
         insert_url: insert_url.to_string(),
         redacted_insert_url: redacted_endpoint_url_str(insert_url),
@@ -13446,8 +13471,7 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
         metrics: Arc::clone(&spool.metrics),
         ceiling,
         projection: spool.projection.clone(),
-    };
-    replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+    }
 }
 
 /// Deterministic body-materialization probe for external unit tests.
@@ -13897,11 +13921,16 @@ fn start_spool_replayer(
     commit_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let batch_size = batch_size.max(1);
+    let flush_config = Arc::new(flush_config);
     tokio::spawn(async move {
         if !wait_until_committed(commit_rx).await {
             return;
         }
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
+        // A tick that overran its interval (a large spool during a ClickHouse
+        // outage) waits a full interval before the next one instead of being
+        // followed by a burst of catch-up ticks.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             timer.tick().await;
             // Prepare and refresh owned-usage gauges off the Tokio worker so a
@@ -13932,10 +13961,60 @@ fn start_spool_replayer(
                     continue;
                 }
             }
-            if let Err(error) = replay_spool_once(&spool, &flush_config, batch_size).await {
+            if let Err(error) = replay_spool_tick_off_worker(
+                Arc::clone(&spool),
+                Arc::clone(&flush_config),
+                batch_size,
+            )
+            .await
+            {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
             }
         }
+    })
+}
+
+/// Run one [`replay_spool_once`] tick on Tokio's blocking pool.
+///
+/// A tick walks the spool tree, takes the cross-process namespace lock (before
+/// every delivery attempt, for claim renewal), decodes and validates whole
+/// artifacts before the first request, and fsyncs and renames dead-letter
+/// evidence — all synchronous file work that must not pin a runtime worker
+/// while unrelated tasks wait behind it (issue #7111). The tick is therefore
+/// driven by `Handle::block_on` on a blocking-pool thread; its ClickHouse POSTs
+/// stay asynchronous on the runtime's I/O and timer drivers.
+///
+/// Cancellation keeps its previous meaning. Dropping this future (a retiring
+/// generation aborts its replay task; runtime shutdown drops it) drops the
+/// cancellation sender, and the tick stops at its next await — the delivery
+/// POST — where dropping the replay future runs [`ReplayCancellationRelease`]
+/// and returns the in-flight claim to its durable replayable name.
+async fn replay_spool_tick_off_worker(
+    spool: Arc<SpoolManager>,
+    flush_config: Arc<ClickHouseFlushConfig>,
+    batch_size: usize,
+) -> Result<(), String> {
+    let handle = tokio::runtime::Handle::current();
+    let (cancel_tx, mut cancel_rx) = watch::channel(());
+    let tick = tokio::task::spawn_blocking(move || {
+        handle.block_on(async move {
+            tokio::select! {
+                biased;
+                // No value is ever sent: `changed` resolves only when the
+                // sender is dropped, i.e. when this tick was cancelled.
+                _ = cancel_rx.changed() => Err(format!(
+                    "{PLUGIN_NAME}: spool replay tick cancelled"
+                )),
+                result = replay_spool_once(&spool, &flush_config, batch_size) => result,
+            }
+        })
+    });
+    let outcome = tick.await;
+    drop(cancel_tx);
+    outcome.unwrap_or_else(|error| {
+        Err(format!(
+            "{PLUGIN_NAME}: spool replay worker did not complete: {error}"
+        ))
     })
 }
 
