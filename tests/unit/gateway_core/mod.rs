@@ -59,6 +59,7 @@ mod dp_config_admission_sites_tests;
 mod dp_config_freshness_tests;
 mod dp_config_stale_fence_helm_tests;
 mod dp_listener_supervision_tests;
+mod dtls_backend_relay_failure_tests;
 mod dtls_frontend_app_send_tests;
 mod dtls_recv_loop_supervision_tests;
 mod dtls_session_identity_tests;

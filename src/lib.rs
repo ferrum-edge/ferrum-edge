@@ -12888,6 +12888,16 @@ pub mod _test_support {
         }
     }
 
+    /// Classify a DTLS-frontend session that ended because its backend leg
+    /// failed, exactly as the reply task wraps the backend receive error and
+    /// the accept loop derives the disconnect summary (issue #7186).
+    pub fn dtls_backend_relay_failure_for_test(
+        cause: anyhow::Error,
+    ) -> DtlsAuthorizationExpiryForTest {
+        let error: anyhow::Error = crate::proxy::udp_proxy::DtlsBackendRelayFailure(cause).into();
+        classify_dtls_session_failure_for_test(&error, 0, crate::plugins::MetadataMap::default())
+    }
+
     /// Settle a RELAY-phase DTLS authorization expiry exactly as the session
     /// relay's deadline arm does: record the bounded class once through the
     /// session's shared latch, stamp it into the session metadata that reaches
