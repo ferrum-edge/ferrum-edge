@@ -93,7 +93,7 @@ without a dependency panic. The diagnostic does not echo the address or token.
 | `FERRUM_ACME_AUTO_RENEW_ENABLED` | No | `false` | Enable the ACME renewal scheduler in serving modes. Requires the `acme` Cargo feature. When any active frontend or admin TLS cert/key source is an `acme://` URI, this also requires `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`: renewed material is published into the ACME certificate store and then offered only to TLS surfaces that registered a force-reload sender, and the frontend/admin surfaces register theirs exclusively from the live-reload watcher. The combination `FERRUM_ACME_AUTO_RENEW_ENABLED=true` + an `acme://` serving source + `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=false` is **refused at startup** rather than renewing into a listener that keeps serving the previous certificate |
 | `FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS` | No | `30` | Renew ACME-issued certificates when their `not_after` is within this many days. Clamped to 1 day minimum and 365 days maximum |
 | `FERRUM_ACME_RENEW_CHECK_INTERVAL_SECONDS` | No | `3600` | Interval between ACME renewal scans. Clamped to 60 seconds minimum and 24 hours maximum |
-| `FERRUM_ACME_RENEW_CHALLENGE_TYPE` | No | `http01` | Challenge type prepared by automatic renewal: `http01`, `tls_alpn01`, or `dns01` |
+| `FERRUM_ACME_RENEW_CHALLENGE_TYPE` | No | `http01` | Challenge type prepared by automatic renewal: `http01`, `tls_alpn01`, or `dns01` (the hyphenated `http-01`, `tls-alpn-01`, and `dns-01` spellings are also accepted, case-insensitive). With `FERRUM_ACME_AUTO_RENEW_ENABLED=true` any other value is **refused at startup** and by `ferrum-edge validate` |
 | `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS` | No | `60` | Maximum ACME readiness/certificate polling time per automatic renewal. Clamped to 1 second minimum and 600 seconds maximum |
 | `FERRUM_ACME_DNS01_HOOK_COMMAND` | No | — | Executable provider hook for DNS-01 automation. Ferrum invokes it without a shell and passes `FERRUM_ACME_DNS01_ACTION`, `FERRUM_ACME_DNS01_IDENTIFIER`, `FERRUM_ACME_DNS01_TOKEN`, `FERRUM_ACME_DNS01_TXT_RECORD_NAME`, and `FERRUM_ACME_DNS01_TXT_VALUE` |
 | `FERRUM_ACME_DNS01_PROPAGATION_SECONDS` | No | `60` | Wait time after DNS-01 hook publication before Ferrum asks the ACME directory to validate the challenge. Clamped to `0..=3600` |
@@ -1205,7 +1205,7 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD` | No | `0.85` | Request usage ratio above which keepalive is disabled |
 | `FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD` | No | `0.95` | Request usage ratio above which new requests receive 503 |
 | `FERRUM_OVERLOAD_LOOP_WARN_US` | No | `10000` | Event-loop latency warning threshold |
-| `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | No | `500000` | Event-loop latency threshold for rejecting new connections |
+| `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | No | `500000` | Event-loop latency threshold for rejecting new connections. The latency probe waits at most this long, bounded by `FERRUM_OVERLOAD_CHECK_INTERVAL_MS`, so a value above the check interval cannot be reached (see [overload_manager.md](overload_manager.md#configuration)) |
 
 ### Advanced Performance
 

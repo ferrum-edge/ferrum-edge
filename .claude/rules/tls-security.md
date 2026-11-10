@@ -50,6 +50,7 @@ paths:
 - Frontend cert/key live reload is enabled only when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`.
 - Frontend watcher covers proxy HTTPS/H2/H3 and admin HTTPS cert/key paths at `FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS`, default 30s.
 - On validated frontend change, rebuild rustls `ServerConfig`, rerun early-data and kTLS-secret-extraction settings, swap `SharedFrontendTls`, and notify H3 to call `Endpoint::set_server_config`.
+- A failed rebuild is never treated as applied (issue #7196): all three `tls::source::subscription` reload loops (blocking, async, dynamic/backend) keep the accepted fingerprint (the dynamic loop keeps a retry-pending flag) and retry the candidate at the watcher cadence, recording the `tls::events` entry and `warn!` once per distinct failing candidate.
 - The same opt-in also watches frontend DTLS cert/key/client-CA/CRL sources. A candidate is validated as one immutable generation, then published into every active `DtlsServer` without rebinding; listeners created or restarted after the publish receive the same accepted generation. A rejected candidate retains the complete last accepted generation on every listener.
 - Reload parse, expiry, not-yet-valid, or key mismatch failures keep the previous config and emit `warn!`.
 - In-flight TLS/DTLS sessions keep their original handshake snapshot across

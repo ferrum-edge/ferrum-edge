@@ -1091,6 +1091,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     "not ambient" (which disabled the Ambient pod registry and UDP readiness
     guard).
   - `FERRUM_NODE_AGENT_FALLBACK_MODE` is trimmed before parsing.
+- **Replica-set MongoDB orphan-upstream cleanup is namespace-scoped**
+  (#7193). Deleting a proxy, or running the explicit orphan cleanup, on a
+  replica-set MongoDB store counted proxies that reference the upstream id in
+  every namespace. Upstream ids are unique only per namespace, so another
+  namespace's proxy with the same upstream id kept the deleting namespace's
+  orphaned upstream alive and suppressed its delete change record. The check
+  now counts proxies in the deleting namespace only, as standalone MongoDB
+  and the SQL backends already did.
+- **Managed TLS and ACME deletes no longer collide on id prefixes** (#7199).
+  `DELETE /admin/tls/certificates/{id}` (and the other managed collections and
+  ACME certificates) decided whether a record was still referenced by
+  substring-matching the id against every source reference, so deleting an
+  unused `prod` was refused with `409` naming the users of `prod-2`, and an id
+  such as `cert` or `ca` matched every reference. The guard now compares the
+  record id exactly against the last path segment of each reference.
+- **An unknown `FERRUM_ACME_RENEW_CHALLENGE_TYPE` is refused at startup**
+  (#7194). With `FERRUM_ACME_AUTO_RENEW_ENABLED=true`, a value the renewal
+  scheduler cannot parse (for example `http` or `tls-alpn`) used to pass
+  `ferrum-edge validate`, log one warning, and leave the scheduler off, so
+  certificates silently stopped renewing. Startup and `ferrum-edge validate`
+  now reject it. The value is still ignored while auto-renewal is disabled.
+- **TLS live-reload watchers retry a failed rebuild** (#7196). The frontend
+  proxy HTTPS/H2/H3, admin HTTPS and CP/DP gRPC TLS watchers, and the backend
+  TLS watcher for ordinary source rotations, recorded a failed rebuild as the
+  accepted source state, so a transient failure (a source deadline, a provider
+  blip, or a rotated-in certificate whose `notBefore` was still ahead) left the
+  listener on the old certificate until the source bytes changed again or the
+  process restarted. They now retry the candidate on every poll, as the
+  frontend DTLS watcher already did. The TLS event and warning are still
+  recorded once per distinct failing candidate.
+- **`FERRUM_OVERLOAD_LOOP_CRITICAL_US` is honoured by the event-loop probe**
+  (#7197). The probe waited a fixed 250 ms and reported a fixed 500 ms on
+  timeout, so a critical threshold above 500 ms never tripped, and with the
+  default a 250 ms stall was reported as 500 ms and rejected new connections.
+  The probe now waits up to the configured critical threshold, bounded by
+  `FERRUM_OVERLOAD_CHECK_INTERVAL_MS`, and reports at least that budget on
+  timeout. A critical threshold above the check interval still cannot be
+  reached; the docs now say so.
+- **SQL plugin-config rows with an unknown scope are rejected, not made
+  global** (#7192). The SQL loaders mapped any `plugin_configs.scope` other
+  than `proxy` or `proxy_group` to `global`, so a corrupted or out-of-band
+  value such as `Proxy` widened a proxy-scoped plugin to every proxy in the
+  namespace (MongoDB already rejected it). The scope is now matched exactly
+  and an unknown value fails the row like any other decode error, keeping the
+  last good config. A `proxy_id` or `enabled` value that cannot be decoded
+  also fails the row instead of detaching or enabling the plugin.
+- **A refused plugin-cache reload no longer promotes its named log schemas**
+  (#7198). Full and incremental plugin-cache builds promoted the
+  process-global `transaction_log_schema` registry before their last fallible
+  steps (proxy lifecycle generations, the mesh BPF metrics exporter on full
+  builds, and the `api_chargeback` overflow reservations). A reload refused at
+  one of those steps, for example by the chargeback `max_retained_bytes`
+  budget, left the registry on the rejected definitions while the published
+  cache stayed on the old ones, so later incremental builds constructed
+  loggers against schemas that were never accepted. The registry is now
+  promoted only after every step succeeds.
+- **Completing an ACME order skips authorizations that are already valid**
+  (#7195). Driving a persisted order to `ready` looked up the configured
+  challenge type on every authorization, so an authorization that had become
+  valid elsewhere (CAs reuse valid authorizations across orders, and a reused
+  one may list only the challenge that validated it) failed the order on every
+  scan. Valid authorizations are now skipped, pending ones are driven as
+  before, and invalid, revoked, expired or deactivated ones fail closed with a
+  fixed diagnostic. Preparing a new order still requires the configured
+  challenge on every authorization.
+- **The admin audit spool ceiling also bounds finalized records without an
+  intent** (#7200). Under `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_open`, a
+  mutation whose pre-mutation intent was refused because the spool was full
+  still ran, and its finalized record was then written to the spool with no
+  ceiling check, so a long audit-database outage grew the spool by one fsynced
+  file per mutation. A finalized record that does not replace a prepared
+  intent is now admitted against `FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS` like an
+  intent; when the spool is full it is refused and counted as a failed durable
+  handoff. Finalizing an admitted intent is unaffected.
+- **One malformed datagram no longer ends a DTLS session**
+  (GHSA-7464-frfx-85p6). Frontend DTLS listeners match datagrams to sessions
+  by UDP source address only, and a session ended on any record-processing
+  error, so an off-path attacker who could forge a client's address ended its
+  established session (or in-progress handshake) with a single 1-byte
+  datagram. Backend DTLS connections, including the `udp_logging` DTLS sink,
+  had the same handling. Truncated or malformed records, DTLS 1.2 records
+  that fail authentication, datagrams over the per-datagram record or
+  receive-queue bounds, and post-handshake renegotiation attempts are now
+  dropped as RFC 6347 §4.1.2.7 and RFC 9147 §4.5.2 require; authenticated
+  fatal alerts and handshake certificate or security failures still end the
+  session, and handshake deadlines still bound a stalled handshake.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

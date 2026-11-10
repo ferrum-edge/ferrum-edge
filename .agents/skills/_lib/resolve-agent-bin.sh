@@ -26,7 +26,8 @@ agent_bin_is_conductor_owned() {
 # relative result (a relative PATH entry) is resolved against the
 # CURRENT directory, because dispatchers save the result and then `cd`
 # to the worker worktree: an unresolved relative name would launch
-# whatever same-named file the worktree contains instead (#394). A bare
+# whatever same-named file the worktree contains instead
+# (GHSA-574h-c7q8-frmg; ported from ferrum-anvil #420). A bare
 # name with no slash (alias, builtin, or function) is not a file path
 # and fails.
 agent_bin_absolute() {

@@ -8281,6 +8281,10 @@ pub mod _test_support {
         crate::config::db_loader::parse_auth_mode(s)
     }
 
+    pub fn parse_plugin_scope(s: &str) -> Result<crate::config::types::PluginScope, String> {
+        crate::config::db_loader::parse_plugin_scope(s)
+    }
+
     pub fn lock_wait_timeout_sql(timeout_seconds: u64, is_mysql: bool) -> Option<String> {
         crate::config::db_loader::lock_wait_timeout_sql(timeout_seconds, is_mysql)
     }
@@ -16247,6 +16251,10 @@ pub mod _test_support {
     /// retransmits) must not reserve a handshake-timeout slot.
     pub fn dtls_datagram_opens_session_for_test(data: &[u8]) -> bool {
         crate::dtls::dtls_datagram_opens_session_for_test(data)
+    }
+
+    pub fn dtls_packet_error_is_droppable_for_test(error: &dimpl::Error) -> bool {
+        crate::dtls::dtls_packet_error_is_droppable_for_test(error)
     }
 
     /// External regression coverage for issue #2959 (DTLS demux identity-aware

@@ -2684,19 +2684,34 @@ fn validate_jwks_json(jwks_json: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether an inventory source identifier names the record `id`.
+///
+/// `managed://` and `acme://` references have the shape
+/// `<scheme>://[<collection>/]<id>[#<part>]`, and their loaders
+/// (`ManagedSourceReference::parse`, `AcmeSourceReference::parse`) take the
+/// record id as the last path segment before the fragment. Match it exactly:
+/// a substring match made `prod` look referenced by `prod-2` (issue #7199).
+fn source_identifier_names_record(identifier: &str, id: &str) -> bool {
+    let reference = identifier
+        .split_once("://")
+        .map_or(identifier, |(_, reference)| reference);
+    let path = reference
+        .split_once('#')
+        .map_or(reference, |(path, _)| path);
+    let record = path.rsplit_once('/').map_or(path, |(_, record)| record);
+    record == id
+}
+
 fn managed_record_usage(
     state: &AdminState,
     id: &str,
 ) -> Vec<crate::tls::inventory::TlsInventoryUsage> {
-    let needle_collection = format!("/{id}");
-    let needle_short = format!("://{id}");
     collect_inventory(state)
         .entries
         .into_iter()
         .filter(|entry| {
             entry.source.kind == "managed"
-                && (entry.source.identifier.contains(&needle_collection)
-                    || entry.source.identifier.contains(&needle_short))
+                && source_identifier_names_record(&entry.source.identifier, id)
         })
         .flat_map(|entry| entry.used_by)
         .collect()
@@ -2706,15 +2721,12 @@ fn acme_certificate_usage(
     state: &AdminState,
     id: &str,
 ) -> Vec<crate::tls::inventory::TlsInventoryUsage> {
-    let needle_collection = format!("/{id}");
-    let needle_short = format!("://{id}");
     collect_inventory(state)
         .entries
         .into_iter()
         .filter(|entry| {
             entry.source.kind == "acme"
-                && (entry.source.identifier.contains(&needle_collection)
-                    || entry.source.identifier.contains(&needle_short))
+                && source_identifier_names_record(&entry.source.identifier, id)
         })
         .flat_map(|entry| entry.used_by)
         .collect()
@@ -3114,5 +3126,40 @@ mod tests {
             !rejected.contains("PRIVATE KEY") && !rejected.contains("not-base64"),
             "admin preflight must stay content-free: {rejected}"
         );
+    }
+
+    /// Issue #7199: the delete guard matches the referenced record id exactly,
+    /// never as a substring of a longer id or of a collection segment.
+    #[test]
+    fn source_identifier_names_record_matches_the_exact_record_id() {
+        for (identifier, id) in [
+            ("managed://certificates/prod#cert", "prod"),
+            ("managed://certificates/prod", "prod"),
+            ("managed://prod#key", "prod"),
+            ("managed://prod", "prod"),
+            ("managed://ca-bundles/api.v2#ca-bundle", "api.v2"),
+            ("acme://certificates/edge-cert#cert", "edge-cert"),
+            ("acme://edge-cert", "edge-cert"),
+        ] {
+            assert!(
+                source_identifier_names_record(identifier, id),
+                "{identifier} must name {id}"
+            );
+        }
+        for (identifier, id) in [
+            ("managed://certificates/prod-2#cert", "prod"),
+            ("managed://prod-2", "prod"),
+            ("managed://certificates/edge-eu#cert", "edge"),
+            ("managed://ca-bundles/api.v2#ca-bundle", "api"),
+            ("managed://certificates/prod#cert", "cert"),
+            ("managed://certificates/prod#cert", "certificates"),
+            ("managed://ca-bundles/root#ca", "ca"),
+            ("acme://certificates/edge-cert#cert", "edge"),
+        ] {
+            assert!(
+                !source_identifier_names_record(identifier, id),
+                "{identifier} must not name {id}"
+            );
+        }
     }
 }

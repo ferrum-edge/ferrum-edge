@@ -6,7 +6,8 @@ use ferrum_edge::_test_support::{
     db_wrap_mysql_isolation_read_error, effective_pool_connect_timeout_seconds,
     is_config_validation_rejection, lock_wait_timeout_sql, mysql_config_change_lock_insert_sql,
     mysql_mtls_dns_admission_lock_insert_sql, mysql_proxy_route_lock_insert_sql, parse_auth_mode,
-    parse_scheme, statement_timeout_sql, validate_tcp_connection_throttle_attachments,
+    parse_plugin_scope, parse_scheme, statement_timeout_sql,
+    validate_tcp_connection_throttle_attachments,
 };
 use ferrum_edge::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, checked_next_config_topology_epoch,
@@ -443,6 +444,108 @@ fn test_parse_scheme_rejects_unknown_or_removed_aliases() {
             "scheme rejection must stay actionable: {err}"
         );
     }
+}
+
+// ── parse_plugin_scope ───────────────────────────────────────────────────────
+
+/// Issue #7192: an unknown stored plugin scope is a row-decode failure, never
+/// `Global` (which widened a proxy-scoped plugin to every proxy).
+#[test]
+fn test_parse_plugin_scope_is_exact() {
+    assert_eq!(parse_plugin_scope("global").unwrap(), PluginScope::Global);
+    assert_eq!(parse_plugin_scope("proxy").unwrap(), PluginScope::Proxy);
+    assert_eq!(
+        parse_plugin_scope("proxy_group").unwrap(),
+        PluginScope::ProxyGroup
+    );
+    for value in [
+        "Proxy",
+        "PROXY",
+        "Global",
+        "proxy-group",
+        "proxy ",
+        "",
+        "consumer",
+    ] {
+        let err = parse_plugin_scope(value).expect_err(&format!(
+            "{value:?} should not be accepted as a plugin scope"
+        ));
+        assert!(
+            err.contains("unsupported scope"),
+            "scope rejection must stay actionable: {err}"
+        );
+        assert!(
+            value.trim().is_empty() || !err.contains(value),
+            "scope rejection must not embed the raw column body: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_plugin_scope_rejects_the_row_instead_of_widening_to_global() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let db_url = format!(
+        "sqlite:{}?mode=rwc",
+        directory.path().join("scope.db").display()
+    );
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    store
+        .create_plugin_config(&make_global_tcp_throttle("scope-7192"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE plugin_configs SET scope = 'Proxy' WHERE id = ?")
+        .bind("scope-7192")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+    let error = store.load_full_config("ferrum").await.unwrap_err();
+    assert!(ferrum_edge::_test_support::is_row_decode_rejection(&error));
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("unsupported scope"), "{rendered}");
+    assert!(
+        store
+            .get_plugin_config("ferrum", "scope-7192")
+            .await
+            .is_err(),
+        "a point read must fail closed too"
+    );
+}
+
+/// Issue #7192: the plugin-config row mapper and the association reference
+/// lookup decode `scope` strictly, and `proxy_id` / `enabled` propagate decode
+/// failures instead of detaching or enabling the plugin.
+#[test]
+fn plugin_config_row_mappers_decode_scope_proxy_id_and_enabled_strictly() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let mapper = source
+        .split("fn row_to_plugin_config_inner(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfn ").next())
+        .expect("row_to_plugin_config_inner body");
+    assert!(
+        mapper.contains("parse_plugin_scope(&scope_str)"),
+        "{mapper}"
+    );
+    assert!(
+        mapper.contains("proxy_id: optional_utf8_text_column(row, \"proxy_id\")?"),
+        "{mapper}"
+    );
+    assert!(
+        mapper.contains("enabled: row.try_get::<i32, _>(\"enabled\")? != 0"),
+        "{mapper}"
+    );
+    assert!(!mapper.contains("_ => PluginScope::Global"), "{mapper}");
+
+    let refs = source
+        .split("async fn load_plugin_config_refs_from_pool(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("load_plugin_config_refs_from_pool body");
+    assert!(refs.contains("parse_plugin_scope(&scope_raw)"), "{refs}");
+    assert!(!refs.contains("_ => PluginScope::Global"), "{refs}");
 }
 
 // ── parse_auth_mode ──────────────────────────────────────────────────────────

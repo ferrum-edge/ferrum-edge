@@ -2718,10 +2718,10 @@ pub fn global_account_store() -> Result<Arc<AcmeAccountStore>, String> {
         .clone()
 }
 
-// Also compiled for `test` without the `acme` feature: the renewal-resumption
-// planner infers this type from persisted challenge records, and that inference
-// is pure store logic that must be provable without real ACME networking.
-#[cfg(any(feature = "acme", test))]
+// Compiled without the `acme` feature too: `EnvConfig::validate` checks
+// `FERRUM_ACME_RENEW_CHALLENGE_TYPE` with `parse` in every build (issue #7194),
+// and the renewal-resumption planner infers this type from persisted challenge
+// records, which is pure store logic provable without real ACME networking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcmeRenewalChallengeType {
     Http01,
@@ -2729,7 +2729,6 @@ pub enum AcmeRenewalChallengeType {
     Dns01,
 }
 
-#[cfg(any(feature = "acme", test))]
 impl AcmeRenewalChallengeType {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -4193,8 +4192,9 @@ pub mod client {
     use hyper_util::client::legacy::Client as HyperClient;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use instant_acme::{
-        Account, AccountCredentials, BodyWrapper, BytesBody, BytesResponse, ChallengeStatus,
-        ChallengeType, HttpClient, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+        Account, AccountCredentials, AuthorizationStatus, BodyWrapper, BytesBody, BytesResponse,
+        ChallengeStatus, ChallengeType, HttpClient, Identifier, NewAccount, NewOrder, OrderStatus,
+        RetryPolicy,
     };
     use serde::Serialize;
     use thiserror::Error;
@@ -4922,6 +4922,36 @@ pub mod client {
         }
     }
 
+    /// What a resumed order does with one of its authorizations.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AuthorizationCompletionAction {
+        /// Still awaiting validation: drive its challenge.
+        DriveChallenge,
+        /// Already valid (validated by this order earlier, or reused by the CA
+        /// from another order, RFC 8555 §7.1.3): nothing to do. A reused valid
+        /// authorization may list only the challenge type that validated it.
+        Skip,
+    }
+
+    /// Decide what a resumed order does with one remote authorization status
+    /// (issue #7195). `Pending` → drive its challenge, `Valid` → skip it, and
+    /// every terminal state fails closed with a fixed diagnostic.
+    pub(crate) fn authorization_completion_action(
+        status: AuthorizationStatus,
+    ) -> Result<AuthorizationCompletionAction, AcmeClientError> {
+        match status {
+            AuthorizationStatus::Pending => Ok(AuthorizationCompletionAction::DriveChallenge),
+            AuthorizationStatus::Valid => Ok(AuthorizationCompletionAction::Skip),
+            AuthorizationStatus::Invalid
+            | AuthorizationStatus::Revoked
+            | AuthorizationStatus::Expired
+            | AuthorizationStatus::Deactivated => Err(AcmeClientError::Client(
+                "ACME authorization is no longer pending or valid and cannot be completed"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Drive a persisted order to a certificate, whatever state the CA is in.
     ///
     /// Idempotent across a crash: the private key is never generated here, only
@@ -4987,6 +5017,14 @@ pub mod client {
                                 .map_err(|error| {
                                     AcmeClientError::EgressPolicy(error.to_string())
                                 })?;
+                            // An authorization that became valid elsewhere
+                            // may no longer list this challenge type; it needs
+                            // no challenge at all (issue #7195).
+                            if authorization_completion_action(authorization.status)?
+                                == AuthorizationCompletionAction::Skip
+                            {
+                                continue;
+                            }
                             let Some(mut challenge) =
                                 authorization.challenge(challenge_type.clone())
                             else {
@@ -5769,6 +5807,35 @@ pub mod client {
                 let error = completion_call_result(result, OrderStatus::Invalid).unwrap_err();
                 assert!(matches!(error, AcmeClientError::TerminalInvalidOrder));
                 assert!(!error.to_string().contains("CA problem detail"));
+            }
+        }
+
+        /// Issue #7195: a resumed order skips an authorization that is already
+        /// valid (it may not list the configured challenge type any more),
+        /// drives a pending one, and fails closed on every terminal state.
+        #[test]
+        fn authorization_completion_plan_covers_every_remote_status() {
+            assert_eq!(
+                authorization_completion_action(AuthorizationStatus::Pending).expect("pending"),
+                AuthorizationCompletionAction::DriveChallenge,
+            );
+            assert_eq!(
+                authorization_completion_action(AuthorizationStatus::Valid).expect("valid"),
+                AuthorizationCompletionAction::Skip,
+            );
+            for status in [
+                AuthorizationStatus::Invalid,
+                AuthorizationStatus::Revoked,
+                AuthorizationStatus::Expired,
+                AuthorizationStatus::Deactivated,
+            ] {
+                let error = authorization_completion_action(status)
+                    .expect_err("a terminal authorization must fail closed");
+                assert!(matches!(error, AcmeClientError::Client(_)));
+                assert!(
+                    error.to_string().contains("cannot be completed"),
+                    "unexpected diagnostic: {error}"
+                );
             }
         }
 

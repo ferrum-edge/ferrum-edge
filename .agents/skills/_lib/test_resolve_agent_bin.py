@@ -2,10 +2,11 @@
 
 Run: python3 .agents/skills/_lib/test_resolve_agent_bin.py
 
-The regression that matters (#394): with a relative PATH entry, the
-resolver used to print the relative result, so a dispatcher that saved
-it, changed into a worker worktree, and executed it launched whatever
-same-named file the worktree contained. The result must be the
+The regression that matters (GHSA-574h-c7q8-frmg, ported from
+ferrum-anvil #420): with a relative PATH entry, the resolver used to
+print the relative result, so a dispatcher that saved it, changed into
+a worker worktree, and executed it launched whatever same-named file
+the worktree contained. The result must be the
 executable chosen in the caller's directory, as an absolute path.
 """
 

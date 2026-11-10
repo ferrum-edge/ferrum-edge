@@ -2809,7 +2809,93 @@ async fn mongo_replica_set_conditional_restore_checks_state_and_lease_in_transac
     })
     .await;
     assert_http_restore_spans_keeper_renewal(db.clone()).await;
+    assert_orphan_upstream_cleanup_is_namespace_scoped(db.as_ref()).await;
     assert_mongo_legacy_consumer_tags(db, &raw).await;
+}
+
+/// Issue #7193: upstream ids are unique only per namespace, so the
+/// "is this upstream still referenced" check in both orphan-cleanup paths
+/// must count proxies in the deleting namespace only. A proxy in another
+/// namespace that references the same bare upstream id must not keep the
+/// deleting namespace's orphan alive (the replica-set transaction paths used
+/// to count across namespaces).
+async fn assert_orphan_upstream_cleanup_is_namespace_scoped(db: &dyn DatabaseBackend) {
+    use ferrum_edge::config::types::{Proxy, Upstream};
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let deleting = format!("orphan-a-{suffix}");
+    let other = format!("orphan-b-{suffix}");
+    for namespace in [&deleting, &other] {
+        for upstream_id in ["shared-delete", "shared-cleanup"] {
+            let upstream: Upstream = serde_json::from_value(json!({
+                "id": upstream_id,
+                "namespace": namespace,
+                "targets": [{"host": "backend.example.com", "port": 8080}]
+            }))
+            .unwrap();
+            db.create_upstream(&upstream).await.unwrap();
+            let proxy: Proxy = serde_json::from_value(json!({
+                "id": format!("proxy-{upstream_id}"),
+                "namespace": namespace,
+                "listen_path": format!("/{upstream_id}"),
+                "backend_host": "backend.example.com",
+                "backend_port": 8080,
+                "upstream_id": upstream_id
+            }))
+            .unwrap();
+            db.create_proxy(&proxy).await.unwrap();
+        }
+    }
+
+    // Proxy delete with orphan cleanup.
+    assert!(
+        db.delete_proxy(&deleting, "proxy-shared-delete")
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.get_upstream(&deleting, "shared-delete")
+            .await
+            .unwrap()
+            .is_none(),
+        "the deleting namespace's orphaned upstream must be cascade-deleted"
+    );
+    assert!(
+        db.get_upstream(&other, "shared-delete")
+            .await
+            .unwrap()
+            .is_some(),
+        "the other namespace's referenced upstream must survive"
+    );
+
+    // Explicit orphan cleanup after a delete that skipped it.
+    assert!(
+        db.delete_proxy_with_orphan_cleanup(&deleting, "proxy-shared-cleanup", false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.get_upstream(&deleting, "shared-cleanup")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.cleanup_orphaned_upstream(&deleting, "shared-cleanup")
+        .await
+        .unwrap();
+    assert!(
+        db.get_upstream(&deleting, "shared-cleanup")
+            .await
+            .unwrap()
+            .is_none(),
+        "cleanup_orphaned_upstream must ignore other namespaces' references"
+    );
+    assert!(
+        db.get_upstream(&other, "shared-cleanup")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]

@@ -9586,6 +9586,74 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
     }
 }
 
+/// Issue #7198: the process-global named-schema registry is promoted only
+/// after every fallible step of a cache build. Committing before the
+/// lifecycle generations, the mesh exporter or the api_chargeback overflow
+/// reservations let a refused reload (for example an overflow budget that
+/// cannot reserve new rows) leave the registry on the rejected generation
+/// while the published cache stayed on the old one. The overflow refusal
+/// depends on process-global billing state, so the ordering is pinned
+/// structurally, like the other plugin-cache source guards in this file.
+#[test]
+fn named_schema_registry_commits_after_every_fallible_cache_build_step() {
+    let source = include_str!("../../../src/plugin_cache.rs");
+    let body = |start: &str, end: &str| -> &str {
+        source
+            .split(start)
+            .nth(1)
+            .and_then(|rest| rest.split(end).next())
+            .unwrap_or_else(|| panic!("missing {start}"))
+    };
+    let assert_commit_after = |name: &str, body: &str, steps: &[&str]| {
+        let commit = body
+            .find("registry::commit_reload()")
+            .unwrap_or_else(|| panic!("{name} must commit the registry"));
+        for step in steps {
+            let position = body
+                .find(step)
+                .unwrap_or_else(|| panic!("{name} must run {step}"));
+            assert!(
+                position < commit,
+                "{name}: {step} must run before commit_reload"
+            );
+        }
+    };
+
+    let full = body(
+        "fn build_inner_with_prior_states(",
+        "fn build_inner_with_existing_client(",
+    );
+    assert_commit_after(
+        "full build",
+        full,
+        &[
+            "Self::build_cache(",
+            "build_proxy_lifecycle_generations(",
+            "extract_mesh_bpf_metrics_exporter(&globals)",
+            "prepare_global_overflow_reservations(config)",
+        ],
+    );
+    let build_cache = body("fn build_cache(", "\n}\n");
+    assert!(
+        !build_cache.contains("commit_reload()"),
+        "build_cache must return its bracket open for the caller to commit"
+    );
+
+    let delta = body(
+        "fn build_delta_inner_with_country_mmdb_session(",
+        "pub fn apply_delta(",
+    );
+    assert_commit_after(
+        "delta build",
+        delta,
+        &[
+            "extract_mesh_bpf_metrics_exporter(&new_globals)",
+            "build_proxy_lifecycle_generations_with_advances(",
+            "prepare_global_overflow_reservations(config)",
+        ],
+    );
+}
+
 #[test]
 fn transaction_log_schema_delta_reload_rebuilds_proxy_group_schema_ref_consumers() {
     // Regression: a proxy-group logger with `schema_ref` was retained across
