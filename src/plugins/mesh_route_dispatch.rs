@@ -2072,7 +2072,7 @@ fn rule_answers_before_dispatch(
 /// shape is `HTTPMatchRequest.sourceNamespace: string` (exact-only); the
 /// translator projects exactly that. An empty string would silently match
 /// every workload that has any encoded namespace (a `""` predicate against
-/// `extract_namespace(...).is_some_and(|ns| ns == "")` would only match a
+/// `SpiffeId::namespace().is_some_and(|ns| ns == "")` would only match a
 /// degenerate SPIFFE ID, but the operator clearly meant to gate by a real
 /// namespace), so we reject the empty case at config-load time rather than
 /// shipping a never-firing rule. Patterns are preserved verbatim — Kubernetes
