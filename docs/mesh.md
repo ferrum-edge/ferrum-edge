@@ -2835,21 +2835,11 @@ Frontend cert/key paths are independently controlled by `FERRUM_FRONTEND_TLS_LIV
 
 Invalid startup mode fails closed with or without live reload. With live reload enabled, invalid incoming slices are rejected and the last good config stays active. In development, `Sidecar` accepts any resolved mode (`Disable` produces a plaintext inbound listener). In production, Sidecar `PERMISSIVE` with usable TLS is accepted but runs TLS-only, while a mode that cannot produce usable TLS (including `Disable`) fails closed. `EastWestGateway` accepts any resolved mode because it performs SNI passthrough and does not use the resolved terminating-TLS mode.
 
-### NodeWaypoint cgroup-inode lifecycle binding
+### NodeWaypoint identity lifecycle
 
-In NodeWaypoint topology one HBONE listener serves many pods. The node-agent enrolls each pod's identity into the proxy via `NodeWaypointIdentityResolver`. When the agent supplies the pod's cgroup v2 directory at enrollment time (`upsert_identity_with_cgroup`), the resolver captures the directory inode plus a small Unix metadata fingerprint, and a periodic sweep (`FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS`, default 30s) re-stats the path:
+In NodeWaypoint topology one HBONE listener serves many pods. Identities are enrolled lazily into `NodeWaypointIdentityResolver` from the eBPF cookie record (the `(pod_uid, workload_spiffe_hash)` stamp joined against the slice's workload index). An idle identity GC task (`FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS`, default 30s) reclaims an identity only when its pod UID is no longer referenced by a live cookie record and its identity `Arc` has no other holder (`strong_count == 1`, so an open HTTP/HBONE connection keeps it). This removes the identity-map entry; the per-pod policy scope is held in a separate slice-published map and changes only when a later accepted slice publishes a replacement. A recreated pod has a new pod UID and enrolls separately; a container restart keeps the pod UID and its identity.
 
-- Inode/fingerprint unchanged → identity kept.
-- Inode or fingerprint changed → pod restarted under the same UID; the identity-map entry is evicted so a fresh enrollment is required before traffic for the new instance is honoured. The fingerprint prevents missed restarts when the filesystem reuses the old inode number.
-- Path gone → pod removed; the identity-map entry is evicted. The per-pod policy scope is a separate slice-published map and remains until a later accepted slice replaces it.
-
-**Current status:** no production enrollment path supplies a cgroup path yet. Identities are enrolled lazily from the eBPF cookie record and bind no cgroup, so the cgroup sweep finds no candidates and pod restarts are not detected by this inode check; the idle identity GC below is what reclaims them (issue #7246).
-
-An independent idle identity GC task (`FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS`, default 30s) reclaims identities enrolled **without** a cgroup path. It evicts an identity only when its pod UID is no longer referenced by a live cookie record and its identity `Arc` has no other holder (`strong_count == 1`). This removes the identity-map entry; the per-pod policy scope is held in a separate slice-published map and changes only when a later accepted slice publishes a replacement. cgroup-bound identities are left to the cgroup-binding pass above.
-
-Set `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS=0` to disable only the cgroup-inode stat sweep. Set `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS=0` to disable lazy identity GC. Both tasks are best-effort GC, not security boundaries: the accept-path check on unknown socket cookies remains fail-closed regardless of sweep cadence.
-
-Picking the cgroup interval is a tradeoff between eviction lag (worst-case time a stale cgroup-bound identity remains after pod removal/restart) and per-sweep stat cost. Each enrolled cgroup-bound identity costs one `stat(2)` per sweep — on the order of tens of microseconds on a warm dentry cache, so even at thousands of pods per node a sweep finishes in a few milliseconds and the work runs on a dedicated background task off the accept path. Shorten the interval to tighten the eviction window on heavy pod churn; lengthen it (or set `0`) if the operator already drives cgroup-bound identity removal explicitly from the node-agent and treats the sweep as a defence-in-depth backstop. Keep the idle GC interval enabled unless another component explicitly removes lazy identities; otherwise the lazy identity map can grow across pod churn.
+Set `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS=0` to disable the GC (tests only: nothing else removes lazy identities, so the map would grow across pod churn). The GC is best-effort, not a security boundary: the accept-path check on unknown socket cookies remains fail-closed regardless of cadence.
 
 ## Transparent DNS Proxy
 

@@ -2997,14 +2997,9 @@ pub struct EnvConfig {
     /// rather than black-holing. Only affects mesh upstreams. Sourced from
     /// `FERRUM_MESH_LOCALITY_LB_STRICT`.
     pub mesh_locality_lb_strict: bool,
-    /// Node-waypoint cgroup-inode lifecycle sweep interval (seconds).
-    /// Identities enrolled with a cgroup v2 path are evicted when the
-    /// cgroup is gone or its inode/fingerprint changes (pod restart,
-    /// including inode-reuse cases). Set to `0` to disable. Defaults to `30`.
-    pub mesh_node_waypoint_cgroup_sweep_interval_secs: u64,
-    /// Node-waypoint lazy identity GC interval (seconds). Identities enrolled
-    /// without a cgroup binding are evicted when no live cookie record and no
-    /// open connection still references the pod. Set to `0` to disable.
+    /// Node-waypoint lazy identity GC interval (seconds). Lazily enrolled
+    /// identities are evicted when no live cookie record and no open
+    /// connection still references the pod. Set to `0` to disable.
     /// Defaults to `30`.
     pub mesh_node_waypoint_idle_gc_interval_secs: u64,
     /// Directory where the node-agent publishes the enrolled-pod registry (one
@@ -4620,7 +4615,6 @@ impl Default for EnvConfig {
             mesh_remote_discovery_credentials: None,
             mesh_cluster_audience: None,
             mesh_locality_lb_strict: false,
-            mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
             mesh_node_waypoint_pod_registry_dir: "/run/ferrum/node-waypoint-pods".to_string(),
             mesh_app_probe_max_connections:
@@ -5274,7 +5268,6 @@ impl EnvConfig {
             mesh_remote_discovery_credentials: Option<String> = "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS";
             mesh_cluster_audience: Option<String> = "FERRUM_MESH_CLUSTER_AUDIENCE";
             mesh_locality_lb_strict: bool = "FERRUM_MESH_LOCALITY_LB_STRICT" => false;
-            mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_pod_registry_dir: String = "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" => "/run/ferrum/node-waypoint-pods".to_string();
             mesh_app_probe_max_connections: usize = "FERRUM_MESH_APP_PROBE_MAX_CONNECTIONS" => crate::modes::mesh::app_probe::DEFAULT_APP_PROBE_MAX_CONNECTIONS;
@@ -6190,7 +6183,6 @@ impl EnvConfig {
             mesh_remote_discovery_credentials,
             mesh_cluster_audience,
             mesh_locality_lb_strict,
-            mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,
             mesh_node_waypoint_pod_registry_dir,
             mesh_app_probe_max_connections,

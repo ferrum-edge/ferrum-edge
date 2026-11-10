@@ -16087,13 +16087,6 @@ async fn arm_mesh_runtime_startup(
             let snapshot = resolver.build_policy_scope_snapshot_from_slice(initial_slice);
             resolver.install_policy_scope_snapshot(snapshot);
         }
-        if let Some(handle) = node_waypoint::spawn_cgroup_sweep_task(
-            resolver.clone(),
-            env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
-            shutdown_tx.subscribe(),
-        ) {
-            owner.push_mesh_background(handle);
-        }
         if let Some(handle) = node_waypoint::spawn_idle_identity_gc_task(
             resolver.clone(),
             env_config.mesh_node_waypoint_idle_gc_interval_secs,
