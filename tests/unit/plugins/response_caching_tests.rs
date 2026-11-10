@@ -15,8 +15,8 @@ use ferrum_edge::_test_support::{
     response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     retry_response_decision_context_for_test, run_after_proxy_hooks_for_test,
-    run_after_proxy_hooks_reject_for_test, set_replay_credential_headers_for_test,
-    set_replay_request_body_empty_proven_for_test, set_request_wire_protocol_for_test,
+    run_after_proxy_hooks_reject_for_test, set_replay_request_body_empty_proven_for_test,
+    set_request_headers_to_redact_for_test, set_request_wire_protocol_for_test,
     set_response_presentation_policy_digest_for_test, stamp_original_response_metadata_for_test,
 };
 use ferrum_edge::config::types::{Consumer, HttpWireTransport};
@@ -6704,7 +6704,7 @@ fn ctx_with_stripped_custom_credential(token: &str) -> RequestContext {
     );
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     ctx.authenticated_identity = Some("alice@example.com".to_string());
-    set_replay_credential_headers_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
+    set_request_headers_to_redact_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
     let mut raw = http::HeaderMap::new();
     raw.insert(
         "x-tenant-jwt",
