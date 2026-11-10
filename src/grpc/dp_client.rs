@@ -412,19 +412,6 @@ pub struct DpFrontendTlsRuntime {
     pub h3_pairing: Option<Arc<DpFrontendH3Pairing>>,
 }
 
-impl DpFrontendTlsRuntime {
-    #[allow(dead_code)] // compatibility wrapper and external unit-test construction
-    pub fn new(listener_slot: crate::tls::SharedFrontendTls) -> Self {
-        Self {
-            listener_slot,
-            restore_source_slot: None,
-            h3_revision_tx: None,
-            cp_materialized: Arc::new(AtomicBool::new(false)),
-            h3_pairing: None,
-        }
-    }
-}
-
 /// What an operator-candidate publication should do to the H1/H2/TCP listener
 /// slot. H3 is always woken by the caller after the coherent candidate,
 /// shared listener slot, and stream-listener publication finishes.
@@ -2131,64 +2118,6 @@ pub async fn connect_and_subscribe(
         None,
         Arc::new(AtomicBool::new(false)),
         Arc::new(ArcSwap::new(Arc::new(None))),
-        None,
-        None,
-        0,
-        0,
-        &mut authority,
-        &ConfigSyncDivergenceMetrics::default(),
-        Arc::new(Notify::new()),
-        ConfigSyncStreamTimings::production(),
-    )
-    .await?
-    {
-        DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
-        DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
-        DpStreamEnd::StaleSnapshotFenced
-        | DpStreamEnd::InvalidDeltaFreshness
-        | DpStreamEnd::InvalidSubscriptionBase
-        | DpStreamEnd::ResyncAfterAcceptedConfig
-        | DpStreamEnd::BuildMismatch
-        | DpStreamEnd::TransportFailure { .. } => Ok(()),
-    }
-}
-
-/// Connect to CP and optionally flip startup readiness after the first applied snapshot.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // compatibility wrapper; production uses the lifecycle-aware inner entry point
-pub async fn connect_and_subscribe_with_startup_ready(
-    cp_url: &str,
-    jwt_secret: &GrpcJwtSecret,
-    node_id: &str,
-    proxy_state: &ProxyState,
-    tls_config: Option<&DpGrpcTlsConfig>,
-    startup_ready: Option<Arc<AtomicBool>>,
-    namespace: &str,
-    connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
-    is_primary: bool,
-    frontend_tls_slot: Option<&crate::tls::SharedFrontendTls>,
-) -> Result<(), anyhow::Error> {
-    let frontend_tls_runtime =
-        frontend_tls_slot.map(|slot| DpFrontendTlsRuntime::new(slot.clone()));
-    let mut authority = None;
-    match connect_and_subscribe_with_startup_ready_inner(
-        cp_url,
-        jwt_secret,
-        node_id,
-        proxy_state,
-        tls_config,
-        startup_ready,
-        namespace,
-        connection_state,
-        is_primary,
-        frontend_tls_slot,
-        frontend_tls_runtime.as_ref(),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(ArcSwap::new(Arc::new(
-            frontend_tls_slot
-                .map(|slot| slot.load_full().as_ref().clone())
-                .unwrap_or(None),
-        ))),
         None,
         None,
         0,
