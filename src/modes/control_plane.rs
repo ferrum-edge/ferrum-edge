@@ -187,7 +187,7 @@ async fn reconcile_plugin_migrations_after_cp_reconnect(
     if !*needs_reconcile {
         return true;
     }
-    match crate::modes::handle_recovery_plugin_migrations(db, auto_apply, "cp-recovery").await {
+    match crate::modes::handle_startup_plugin_migrations(db, auto_apply, "cp-recovery").await {
         Ok(()) => {
             *needs_reconcile = false;
             true
@@ -5073,7 +5073,8 @@ mod tests {
         let source = &source[..test_module];
         assert!(
             source.contains("async fn reconcile_plugin_migrations_after_cp_reconnect(")
-                && source.contains("handle_recovery_plugin_migrations("),
+                && source
+                    .contains("handle_startup_plugin_migrations(db, auto_apply, \"cp-recovery\")"),
             "CP recovery must share the startup custom-plugin migration policy"
         );
         assert!(
