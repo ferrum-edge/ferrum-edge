@@ -5413,18 +5413,20 @@ async fn process_new_session_datagram(
     // order, then atomically remove the pending gate. Each drained datagram
     // goes through the same per-datagram plugin hooks and debug-level
     // packet-error handling as the established-session path.
-    'drain: while let Some(batch) = take_pending_datagrams(pending_sessions, &session_key) {
+    while let Some(batch) = take_pending_datagrams(pending_sessions, &session_key) {
         for dgram in batch {
             // Stop the drain the moment the admitted credential stops
             // authorizing this session: no further hook runs and no further
             // backend datagram is produced for this source. The forward below
-            // would refuse anyway; breaking here also keeps a slow
-            // `on_udp_datagram` hook from running post-expiry. The gate entry
-            // was already removed under the shard lock by
-            // `take_pending_datagrams`, so `gate.disarm()` below is still
-            // correct on this path.
+            // would refuse anyway; stopping here also keeps a slow
+            // `on_udp_datagram` hook from running post-expiry. A non-empty
+            // `take_pending_datagrams` leaves the gate entry in place, so
+            // return with the gate still ARMED: its `Drop` removes the entry
+            // and anything queued meanwhile. Disarming here would leak the
+            // entry, blackholing this client tuple and holding a pending slot
+            // against `max_sessions` for the listener's lifetime.
             if session.refuse_if_authorization_expired().is_some() {
-                break 'drain;
+                return Ok(());
             }
             // The pending gate is keyed by the full session identity, but the
             // client tuple inside that key is still forgeable. Re-authorize
@@ -5512,8 +5514,9 @@ async fn process_new_session_datagram(
                 .fetch_add(dgram.data.len() as u64, Ordering::Relaxed);
         }
     }
-    // `take_pending_datagrams` removed the gate entry under the shard lock;
-    // disarm so Drop doesn't double-remove (harmless, but explicit).
+    // The loop only ends when `take_pending_datagrams` found the queue empty
+    // and removed the gate entry under the shard lock; disarm so Drop doesn't
+    // double-remove (harmless, but explicit).
     gate.disarm();
     Ok(())
 }
