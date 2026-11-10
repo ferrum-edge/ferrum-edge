@@ -92,6 +92,7 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
+use super::utils::log_sampling::warn_sampled;
 use super::{RequestContext, strip_auth_scheme};
 
 pub const LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS: u64 = 0;
@@ -1818,7 +1819,7 @@ impl LdapAuth {
             match self.authenticate_user(endpoint, username, password).await {
                 Err(AuthError::Unavailable(message)) => {
                     if index + 1 < self.endpoints.len() {
-                        warn!("{message}; trying the next configured directory endpoint");
+                        warn_sampled!("{message}; trying the next configured directory endpoint");
                     }
                     last_unavailable = Some(message);
                 }
@@ -1851,7 +1852,7 @@ impl LdapAuth {
             {
                 Err(AuthError::Unavailable(message)) => {
                     if index + 1 < self.endpoints.len() {
-                        warn!("{message}; trying the next configured directory endpoint");
+                        warn_sampled!("{message}; trying the next configured directory endpoint");
                     }
                     last_unavailable = Some(message);
                 }
@@ -2251,12 +2252,14 @@ impl LdapAuth {
         // by directory ACLs. Surface that distinction so operators can tell an
         // entitlement denial from a misconfigured search permission (finding #33).
         if rs.is_empty() && !used_service_account {
-            warn!(
-                "ldap_auth: group search for user '{}' under '{}' returned no entries over an \
-                 anonymous bind; this is either a genuine no-membership result or the directory \
-                 restricts anonymous reads of group objects — configure 'service_account_dn'/\
+            // Request-path diagnostic: sampled, and without the user identity,
+            // so a client cannot drive the WARN rate.
+            warn_sampled!(
+                "ldap_auth: group search under '{}' returned no entries over an anonymous bind; \
+                 this is either a genuine no-membership result or the directory restricts \
+                 anonymous reads of group objects — configure 'service_account_dn'/\
                  'service_account_password' if groups are not being matched",
-                canonical_identity, group_base
+                group_base
             );
         }
 
@@ -2431,7 +2434,7 @@ impl LdapAuth {
             }
         }
         if !found_candidate && !used_service_account {
-            warn!(
+            warn_sampled!(
                 "ldap_auth: no required group was found under '{}' over an anonymous bind; configure a service account if the directory restricts group reads",
                 group_base
             );
@@ -3587,7 +3590,7 @@ impl AuthMechanism for LdapAuth {
     async fn verify(
         &self,
         credential: ExtractedCredential,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> VerifyOutcome {
         let ExtractedCredential::BasicAuth { username, password } = credential else {
             return VerifyOutcome::NotApplicable;
@@ -3604,14 +3607,13 @@ impl AuthMechanism for LdapAuth {
         if let Some(cached) = self.check_cache(&username, &password) {
             debug!("ldap_auth: cache hit for user '{}'", username);
             if !cached.groups_due {
-                return self.identity_outcome(&cached.canonical_identity, consumer_index);
+                return self.identity_outcome(&cached.canonical_identity);
             }
             match self
                 .revalidate_cached_groups(
                     &username,
                     &password,
                     cached,
-                    consumer_index,
                     deadline,
                     &mut member_of_proofs_remaining,
                 )
@@ -3638,7 +3640,7 @@ impl AuthMechanism for LdapAuth {
                 return VerifyOutcome::Invalid(r#"{"error":"LDAP authentication failed"}"#.into());
             }
             AccountAdmission::Saturated => {
-                warn!(
+                warn_sampled!(
                     "ldap_auth: per-username failure tracker is full of live state; refusing an untracked username"
                 );
                 return VerifyOutcome::Internal(
@@ -3650,7 +3652,7 @@ impl AuthMechanism for LdapAuth {
         let _permit = match self.ldap_concurrency.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
-                warn!("ldap_auth: maximum concurrent authentication work reached");
+                warn_sampled!("ldap_auth: maximum concurrent authentication work reached");
                 return VerifyOutcome::Internal(
                     r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
                 );
@@ -3659,18 +3661,15 @@ impl AuthMechanism for LdapAuth {
 
         match tokio::time::timeout_at(
             deadline,
-            self.verify_uncached(
-                &username,
-                &password,
-                consumer_index,
-                &mut member_of_proofs_remaining,
-            ),
+            self.verify_uncached(&username, &password, &mut member_of_proofs_remaining),
         )
         .await
         {
             Ok(outcome) => outcome,
             Err(_) => {
-                warn!("ldap_auth: authentication exceeded the configured wall-clock deadline");
+                warn_sampled!(
+                    "ldap_auth: authentication exceeded the configured wall-clock deadline"
+                );
                 VerifyOutcome::Internal(
                     r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
                 )
@@ -3747,7 +3746,6 @@ impl LdapAuth {
         username: &str,
         password: &str,
         cached: CachedAuthentication,
-        consumer_index: &ConsumerIndex,
         deadline: tokio::time::Instant,
         member_of_proofs_remaining: &mut usize,
     ) -> CachedGroupRevalidation {
@@ -3761,7 +3759,7 @@ impl LdapAuth {
         let _permit = match self.ldap_concurrency.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
-                warn!("ldap_auth: maximum concurrent authentication work reached");
+                warn_sampled!("ldap_auth: maximum concurrent authentication work reached");
                 return CachedGroupRevalidation::Decided(VerifyOutcome::Internal(
                     r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
                 ));
@@ -3781,27 +3779,30 @@ impl LdapAuth {
                 if !self.mark_cached_groups_verified(username, password, cached.generation) {
                     return CachedGroupRevalidation::Stale;
                 }
-                self.identity_outcome(&cached.canonical_identity, consumer_index)
+                self.identity_outcome(&cached.canonical_identity)
             }
             Ok(Ok(false)) => {
                 self.evict_cached_authentication(username, password, cached.generation);
-                warn!(
+                debug!(
                     "ldap_auth: cached user '{}' is no longer a member of any required group",
                     cached.canonical_identity
                 );
+                warn_sampled!("ldap_auth: cached user is no longer a member of any required group");
                 VerifyOutcome::Forbidden(
                     r#"{"error":"User is not a member of any required group"}"#.into(),
                 )
             }
             Ok(Err(e)) => {
-                warn!("{}", e.log_message());
+                warn_sampled!("{}", e.log_message());
                 VerifyOutcome::Internal(r#"{"error":"LDAP group membership check failed"}"#.into())
             }
             Err(_) if Instant::now() >= cached.expires_at => {
                 return CachedGroupRevalidation::Stale;
             }
             Err(_) => {
-                warn!("ldap_auth: group re-check exceeded the configured wall-clock deadline");
+                warn_sampled!(
+                    "ldap_auth: group re-check exceeded the configured wall-clock deadline"
+                );
                 VerifyOutcome::Internal(
                     r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
                 )
@@ -3814,25 +3815,24 @@ impl LdapAuth {
         &self,
         presented_username: &str,
         password: &str,
-        consumer_index: &ConsumerIndex,
         member_of_proofs_remaining: &mut usize,
     ) -> VerifyOutcome {
         // Authenticate against LDAP. Distinguish a genuine credential failure
         // (401) from a backend/config failure (500); see finding #32. The
         // client always receives a generic message — the specific cause is only
-        // logged via `warn!`.
+        // logged, through `warn_sampled!` so a client cannot drive the WARN rate.
         let authenticated_user = match self
             .authenticate_user_with_failover(presented_username, password)
             .await
         {
             Ok(user) => user,
             Err(AuthError::Credential(e)) => {
-                warn!("{}", e);
+                warn_sampled!("{}", e);
                 self.record_credential_failure(presented_username, password);
                 return VerifyOutcome::Invalid(r#"{"error":"LDAP authentication failed"}"#.into());
             }
             Err(AuthError::Backend(e) | AuthError::Unavailable(e)) => {
-                warn!("{}", e);
+                warn_sampled!("{}", e);
                 return VerifyOutcome::Internal(
                     r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
                 );
@@ -3853,16 +3853,17 @@ impl LdapAuth {
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    warn!(
+                    debug!(
                         "ldap_auth: user '{}' is not a member of any required group",
                         authenticated_user.canonical_identity
                     );
+                    warn_sampled!("ldap_auth: user is not a member of any required group");
                     return VerifyOutcome::Forbidden(
                         r#"{"error":"User is not a member of any required group"}"#.into(),
                     );
                 }
                 Err(e) => {
-                    warn!("{}", e.log_message());
+                    warn_sampled!("{}", e.log_message());
                     return VerifyOutcome::Internal(
                         r#"{"error":"LDAP group membership check failed"}"#.into(),
                     );
@@ -3876,11 +3877,11 @@ impl LdapAuth {
             "ldap_auth: authenticated canonical identity '{}'",
             authenticated_user.canonical_identity
         );
-        self.identity_outcome(&authenticated_user.canonical_identity, consumer_index)
+        self.identity_outcome(&authenticated_user.canonical_identity)
     }
 
     /// Build the auth result for a successfully authenticated LDAP user.
-    fn identity_outcome(&self, username: &str, _consumer_index: &ConsumerIndex) -> VerifyOutcome {
+    fn identity_outcome(&self, username: &str) -> VerifyOutcome {
         // A directory username is not a Consumer credential binding. Until
         // mappings can name the directory authority explicitly, keep the
         // verified principal external.

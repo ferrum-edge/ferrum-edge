@@ -969,7 +969,9 @@ impl Plugin for OtelTracing {
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        tracing::info!(
+        // Per-transaction diagnostic, emitted before the sampling and export
+        // decision (and carrying the client address), so DEBUG, not INFO.
+        tracing::debug!(
             target: "otel",
             service_name = %self.service_name,
             trace_id = %trace_id,
@@ -998,7 +1000,9 @@ impl Plugin for OtelTracing {
         let Some(trace_id) = ctx.metadata.get("trace_id") else {
             return;
         };
-        tracing::info!(
+        // Per-transaction diagnostic, emitted before the sampling and export
+        // decision (and carrying the client address), so DEBUG, not INFO.
+        tracing::debug!(
             target: "otel",
             service_name = %self.service_name,
             trace_id = %trace_id,
@@ -1252,7 +1256,9 @@ impl Plugin for OtelTracing {
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        tracing::info!(
+        // Per-transaction diagnostic, emitted before the sampling and export
+        // decision (and carrying the client address), so DEBUG, not INFO.
+        tracing::debug!(
             target: "otel",
             service_name = %self.service_name,
             trace_id = %trace_id,

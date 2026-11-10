@@ -600,6 +600,43 @@ async fn test_otel_tracing_log_emits_without_otlp() {
 }
 
 #[tokio::test]
+async fn per_transaction_trace_records_are_not_info_logs() {
+    // Issue #7140: the per-request / per-stream / per-WebSocket "trace" record
+    // is emitted before the sampling and export decision and carries the
+    // client address, so it must not appear at FERRUM_LOG_LEVEL=info.
+    super::plugin_utils::install_interest_floor();
+    let logs = super::plugin_utils::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+
+    let plugin =
+        OtelTracing::new_with_http_client(&json!({}), PluginHttpClient::default()).unwrap();
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    plugin
+        .on_stream_disconnect(&make_stream_summary(make_trace_metadata()))
+        .await;
+    // Positive control: the capture does record INFO events on this target.
+    tracing::info!(target: "otel", "otel capture control 7140");
+
+    let contents = logs.contents();
+    assert!(
+        contents.contains("otel capture control 7140"),
+        "capture must observe INFO events: {contents}"
+    );
+    for record in ["request trace", "stream trace"] {
+        assert!(
+            !contents.contains(record),
+            "`{record}` must not be an INFO record: {contents}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_otel_tracing_with_otlp_endpoint() {
     // Start a wiremock server to receive OTLP spans
     let mock_server = wiremock::MockServer::start().await;

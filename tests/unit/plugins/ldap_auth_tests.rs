@@ -6027,3 +6027,37 @@ async fn test_member_of_proof_budget_spans_stale_cache_fallback() {
         "one warm-up proof, one eviction proof, and 16 across the re-check and fallback"
     );
 }
+
+/// Issue #7140: every refusal on the request path (wrong password, unknown
+/// user, non-membership, saturation, deadline, directory failover) must log
+/// through `warn_sampled!`, so neither an unauthenticated client nor plain
+/// overload controls the WARN rate. A bare `warn!` in one of these functions
+/// would log once per request.
+#[test]
+fn request_path_refusals_log_through_the_warning_sampler() {
+    let src = include_str!("../../../src/plugins/ldap_auth.rs");
+    for signature in [
+        "async fn verify(",
+        "async fn verify_uncached(",
+        "async fn revalidate_cached_groups(",
+        "async fn authenticate_user_with_failover(",
+        "async fn check_group_membership_with_failover(",
+        "async fn search_required_groups(",
+        "async fn search_member_of_groups(",
+    ] {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` not found in ldap_auth.rs"));
+        let rest = &src[start + signature.len()..];
+        let end = ["\n    fn ", "\n    async fn ", "\n    pub ", "\n}\n"]
+            .iter()
+            .filter_map(|boundary| rest.find(boundary))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("warn!("),
+            "`{signature}` logs a request-path refusal with an unsampled `warn!`"
+        );
+    }
+}

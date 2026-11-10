@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Changed
+- **Request-path logging in `ldap_auth`, `kafka_logging` and `otel_tracing`
+  no longer scales with traffic** (#7140).
+  - `ldap_auth` logs request-path refusals (wrong password, unknown user,
+    non-membership, saturated failure tracker or concurrency limit,
+    deadlines, directory failover) through the sampled warning gate: at most
+    one WARN per site per 10 seconds with a `suppressed_events` count, the
+    detail at DEBUG. Non-membership warnings no longer name the user; the
+    identity is logged at DEBUG only.
+  - `kafka_logging` rate-limits its delivery-failure and admission-saturation
+    warnings with a lock-free gate instead of a mutex every request's `log`
+    hook took once the channel was full. The warnings now carry
+    `suppressed_events`.
+  - `otel_tracing`'s per-transaction `request trace` / `stream trace` /
+    `websocket session trace` records (target `otel`) are DEBUG instead of
+    INFO: they were emitted for every traced transaction before the sampling
+    decision and carried the client address.
 - **Mesh HTTP/2 backend connections use the same builder settings as the
   direct-H2 and gRPC pools** (issue #7071).
   - Sidecar mesh-mTLS connections and the nested HTTP/2 connection a native
