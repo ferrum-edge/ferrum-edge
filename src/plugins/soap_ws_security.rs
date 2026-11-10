@@ -5707,13 +5707,12 @@ impl SoapWsSecurity {
 
     /// Common request entry point for both phases.
     ///
-    /// `commit_identity` is `false` for the timestamp-only configuration, which
-    /// runs in `before_proxy` and has no principal to publish.
+    /// A timestamp-only configuration reaches this from `before_proxy` and
+    /// yields no principal, so nothing is committed.
     async fn run_soap_policy(
         &self,
         ctx: &mut RequestContext,
         content_type_header: Option<String>,
-        _consumer_index: Option<&ConsumerIndex>,
     ) -> PluginResult {
         let media_class = match self.classify_request(content_type_header.as_deref()) {
             SoapRequestDisposition::Governed(class) => class,
@@ -6146,14 +6145,13 @@ impl Plugin for SoapWsSecurity {
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         if !self.establishes_identity() {
             return PluginResult::Continue;
         }
         let content_type = ctx.headers.get("content-type").cloned();
-        self.run_soap_policy(ctx, content_type, Some(consumer_index))
-            .await
+        self.run_soap_policy(ctx, content_type).await
     }
 
     async fn before_proxy(
@@ -6168,7 +6166,7 @@ impl Plugin for SoapWsSecurity {
         // Read from `headers` param (not `ctx.headers`) because the handler may
         // temporarily move headers out of ctx when no plugin modifies them.
         let content_type = headers.get("content-type").cloned();
-        self.run_soap_policy(ctx, content_type, None).await
+        self.run_soap_policy(ctx, content_type).await
     }
 
     /// Delete the verified credential from the backend-visible body
@@ -6566,9 +6564,11 @@ fn element_text(node: Node<'_, '_>) -> Result<Option<String>, String> {
 
 /// [`element_text`] for a value whose XML Schema datatype carries
 /// `whiteSpace = "collapse"`: an `xsd:dateTime` instant (`wsu:Created`,
-/// `wsu:Expires`) or an `xsd:base64Binary` payload (`wsse:Nonce`,
-/// `ds:SignatureValue`, `ds:DigestValue`, `wsse:BinarySecurityToken`,
-/// `ds:X509Certificate`).
+/// `wsu:Expires`) or the `xsd:base64Binary` `wsse:Nonce`. The signature-path
+/// Base64 carriers (`ds:SignatureValue`, `ds:DigestValue`,
+/// `wsse:BinarySecurityToken`, `ds:X509Certificate`) are read through
+/// [`element_text`] and have every whitespace character removed at their call
+/// sites instead.
 ///
 /// Removing leading and trailing whitespace from those is the datatype's own
 /// lexical normalization, not a transformation of an opaque value: neither a

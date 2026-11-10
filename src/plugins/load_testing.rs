@@ -90,7 +90,6 @@ use crate::proxy::headers::{
     SecondaryRequestHostPolicy, field_names_equivalent_for_backends,
     filter_secondary_request_headers,
 };
-use crate::retry::classify_reqwest_error;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Authoritative closed set of top-level `load_testing` configuration keys.
@@ -1553,9 +1552,8 @@ impl Plugin for LoadTesting {
                                     }
                                 }
                                 Err(err) => {
-                                    // Classify without logging the raw reqwest error (URL/query
+                                    // Never log the raw reqwest error (URL/query
                                     // credentials must never reach structured logs).
-                                    let _ = classify_reqwest_error(&err);
                                     if err.is_timeout() {
                                         counters.request_timeouts =
                                             counters.request_timeouts.saturating_add(1);
