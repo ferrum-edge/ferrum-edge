@@ -1823,10 +1823,11 @@ fn reverse_translate(
         // the DP's own `FERRUM_MESH_WORKLOAD_LABELS` with a partial set and drop
         // the candidate-only selector policies the slice deliberately carried as
         // a superset — fail-open whenever the intersection is non-empty. So when
-        // ambiguous AND the DP has its own local labels, prefer the DP's labels
-        // so it re-filters the superset against its real identity. The DP keeps
-        // the (informational) intersection only when it has no local labels at
-        // all.
+        // ambiguous AND the DP has its own local labels, merge the DP's labels
+        // onto the intersection (local labels win on collision) so it re-filters
+        // the superset against its real identity. The DP keeps the
+        // (informational) intersection alone only when it has no local labels
+        // at all.
         labels: pick_recovered_labels(
             recovered.labels.filter(|l| !l.is_empty()),
             recovered.labels_ambiguous,
@@ -1835,10 +1836,11 @@ fn reverse_translate(
         // Clear the marker only when the recovered `labels` above are actually
         // authoritative for THIS DP: either the CP labels were unambiguous, or
         // the CP marked them ambiguous but the DP had its own local labels that
-        // `pick_recovered_labels` preferred over the partial intersection. When
-        // the CP marked them ambiguous AND the DP had no local labels, the
-        // recovered `labels` are only the (partial/empty) intersection — NOT
-        // authoritative — so the marker is PRESERVED. Clearing it there would
+        // `pick_recovered_labels` merged onto the intersection (local labels
+        // win on collision). When the CP marked them ambiguous AND the DP had
+        // no local labels, the recovered `labels` are only the (partial/empty)
+        // intersection — NOT authoritative — so the marker is PRESERVED.
+        // Clearing it there would
         // defeat the mesh_authz ambiguous-slice fail-closed check: the cold-path
         // retain would silently drop the candidate-only selector policies the
         // slice carried as a superset and fall back to allow-by-default
@@ -2078,8 +2080,9 @@ fn pick_recovered_labels(
 /// non-empty carrier — or the DP's own local labels for an empty carrier — is
 /// trustworthy), or when the CP marked them ambiguous but the DP supplied its
 /// own local `FERRUM_MESH_WORKLOAD_LABELS` that [`pick_recovered_labels`] then
-/// preferred over the partial intersection. When the CP marked the labels
-/// ambiguous AND the DP had no local labels, `pick_recovered_labels` falls back
+/// merged onto the intersection (local labels win on collision). When the CP
+/// marked the labels ambiguous AND the DP had no local labels,
+/// `pick_recovered_labels` falls back
 /// to the partial intersection (or empty), which is NOT this workload's real
 /// label set: the candidate-only selector policies the slice carried as a
 /// superset cannot be re-filtered here, so the marker MUST be preserved so the

@@ -112,12 +112,10 @@ enum CookieFamily {
     V6,
 }
 
-/// Identity-affecting fields of an eBPF original-destination record.
-///
-/// The full BPF records ([`OrigDst4`] / [`OrigDst6`]) also carry the original
-/// destination address and port. Those bytes are used by the node-agent for
-/// telemetry but are never read by the proxy's identity resolver, so we
-/// project them out of the userspace cookie map to keep memory tight.
+/// Userspace projection of an eBPF original-destination record
+/// ([`OrigDst4`] / [`OrigDst6`]): the pod UID, workload SPIFFE hash, address
+/// family and the original destination, which stream resolution returns as
+/// the NodeWaypoint routing signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CookieRecord {
     pod_uid: [u8; 16],
@@ -170,7 +168,8 @@ pub struct NodeWaypointIdentity {
     pub workload_spiffe_hash: u64,
     /// Filesystem path to the pod's cgroup v2 directory captured at
     /// enrollment. `None` when the enrollment source didn't supply a cgroup
-    /// path — sweep treats such identities as opt-out and never evicts them.
+    /// path — the cgroup sweep skips such identities and leaves them to the
+    /// idle-identity GC.
     pub cgroup_path: Option<PathBuf>,
     /// Inode of `cgroup_path` at enrollment time. Pod restart yields a new
     /// inode at the same path; the sweep task evicts the identity when the
@@ -715,8 +714,8 @@ impl NodeWaypointIdentityResolver {
     /// fresh cgroup at the same path, even when the inode number is reused).
     ///
     /// On stat error the identity is still inserted but without inode
-    /// binding — sweep treats it like a non-cgroup enrollment (kept until
-    /// explicit removal). The recorded `cgroup_path` in that case is
+    /// binding — sweep treats it like a non-cgroup enrollment (left to the
+    /// idle-identity GC). The recorded `cgroup_path` in that case is
     /// informational only: with `cgroup_inode == None` and
     /// `cgroup_fingerprint == None` the sweep's candidate filter rejects
     /// the entry and never re-stats the path. The caller decides whether
