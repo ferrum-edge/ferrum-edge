@@ -31,6 +31,7 @@ use http::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -4817,8 +4818,12 @@ const CHARGE_ROW_JSON_OVERHEAD_BYTES: usize = 1_024;
 /// Conservative upper bound on the JSONEachRow request body for `batch`.
 ///
 /// Charge-event strings are raw, so JSON escaping can expand each byte six-fold.
-fn charge_body_byte_bound(
-    batch: &[ChargeEvent],
+///
+/// Generic over owned and borrowed events so the live INSERT body (built from
+/// `&ChargeEvent` borrows of queued records) and the durable spool artifact
+/// (owned events) share one bound, one validator, and one writer.
+fn charge_body_byte_bound<E: Borrow<ChargeEvent>>(
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Option<usize> {
     // A projection can only ADD bytes per row (renamed keys, injected static /
@@ -4829,7 +4834,8 @@ fn charge_body_byte_bound(
     for event in batch {
         total = total
             .checked_add(
-                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
+                charge_event_retained_bytes(event.borrow())
+                    .checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
             )?
             .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
             .checked_add(projection_row_bytes)?;
@@ -4843,17 +4849,18 @@ fn charge_body_byte_bound(
 /// second attacker-shaped copy: it is reserved against the retained-byte ceiling
 /// before serialization and stays charged until the request (and every retry
 /// handle taken from it) is gone.
-fn materialize_charge_body(
+fn materialize_charge_body<E: Borrow<ChargeEvent>>(
     cfg: &ClickHouseFlushConfig,
-    batch: &[ChargeEvent],
+    batch: &[E],
 ) -> Result<ReservedPayload, String> {
     materialize_json_each_row(cfg.ceiling, batch, cfg.projection.as_deref())
 }
 
 /// Reject a batch whose charges cannot be represented in JSON before any
 /// attacker-shaped representation of it is allocated.
-fn validate_charge_batch(batch: &[ChargeEvent]) -> Result<(), String> {
+fn validate_charge_batch<E: Borrow<ChargeEvent>>(batch: &[E]) -> Result<(), String> {
     for event in batch {
+        let event: &ChargeEvent = event.borrow();
         for (field, value) in [
             ("charge_call", event.charge_call),
             ("charge_bytes_sent", event.charge_bytes_sent),
@@ -4880,12 +4887,13 @@ fn validate_charge_batch(batch: &[ChargeEvent]) -> Result<(), String> {
 /// a file written before a schema change replays under the schema in force when
 /// it was written. Internal identities (`SnapshotEntry` keys, spool ownership,
 /// accumulator keys) never pass through here and are untouched by projection.
-fn write_json_each_row<W: Write>(
+fn write_json_each_row<W: Write, E: Borrow<ChargeEvent>>(
     writer: &mut W,
-    batch: &[ChargeEvent],
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Result<(), String> {
     for (index, event) in batch.iter().enumerate() {
+        let event: &ChargeEvent = event.borrow();
         if index > 0 {
             writer
                 .write_all(b"\n")
@@ -4913,9 +4921,9 @@ fn write_json_each_row<W: Write>(
 /// Every producer of an attacker-shaped JSONEachRow representation — the HTTP
 /// delivery body and the durable spool artifact alike — goes through here, so
 /// no caller can serialize first and measure afterwards.
-fn materialize_json_each_row(
+fn materialize_json_each_row<E: Borrow<ChargeEvent>>(
     ceiling: &'static RetainedByteCeiling,
-    batch: &[ChargeEvent],
+    batch: &[E],
     projection: Option<&ChargeEventProjection>,
 ) -> Result<ReservedPayload, String> {
     validate_charge_batch(batch)?;
@@ -4931,93 +4939,13 @@ fn materialize_json_each_row(
     .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
 }
 
-fn charge_body_byte_bound_refs(
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Option<usize> {
-    let projection_row_bytes = projection.map_or(0, |p| p.row_overhead_bytes);
-    let mut total = CHARGE_ROW_JSON_OVERHEAD_BYTES;
-    for event in batch {
-        total = total
-            .checked_add(
-                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
-            )?
-            .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
-            .checked_add(projection_row_bytes)?;
-    }
-    Some(total)
-}
-
-fn validate_charge_batch_refs(batch: &[&ChargeEvent]) -> Result<(), String> {
-    for event in batch {
-        for (field, value) in [
-            ("charge_call", event.charge_call),
-            ("charge_bytes_sent", event.charge_bytes_sent),
-            ("charge_bytes_received", event.charge_bytes_received),
-            ("charge_total", event.charge_total),
-        ] {
-            require_finite_charge(value, field).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: event '{}' cannot be serialized: {error}",
-                    event.event_id
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn write_json_each_row_refs<W: Write>(
-    writer: &mut W,
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Result<(), String> {
-    for (index, event) in batch.iter().enumerate() {
-        if index > 0 {
-            writer
-                .write_all(b"\n")
-                .map_err(|error| format!("failed to write row separator: {error}"))?;
-        }
-        let result = match projection {
-            None => serde_json::to_writer(&mut *writer, event),
-            Some(projection) => serde_json::to_writer(
-                &mut *writer,
-                &SchemaView {
-                    summary: *event,
-                    schema: &projection.schema,
-                },
-            ),
-        };
-        result.map_err(|error| format!("failed to serialize charge event: {error}"))?;
-    }
-    Ok(())
-}
-
-fn materialize_json_each_row_refs(
-    ceiling: &'static RetainedByteCeiling,
-    batch: &[&ChargeEvent],
-    projection: Option<&ChargeEventProjection>,
-) -> Result<ReservedPayload, String> {
-    validate_charge_batch_refs(batch)?;
-    let bound = charge_body_byte_bound_refs(batch, projection).ok_or_else(|| {
-        format!(
-            "{PLUGIN_NAME}: {}",
-            PayloadMaterializationError::BoundOverflowed.reason()
-        )
-    })?;
-    materialize_reserved_payload(ceiling, bound, |writer| {
-        write_json_each_row_refs(writer, batch, projection)
-    })
-    .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
-}
-
 async fn send_batch(
     cfg: &ClickHouseFlushConfig,
     batch: &[QueuedChargeEvent],
 ) -> Result<(), String> {
     let event_count = batch.len();
     let events: Vec<&ChargeEvent> = batch.iter().map(|queued| &queued.event).collect();
-    let body = materialize_charge_body_refs(cfg, &events).inspect_err(|error| {
+    let body = materialize_charge_body(cfg, &events).inspect_err(|error| {
         cfg.metrics
             .record_failure(FailureReason::Serialize, error.clone());
     })?;
@@ -5036,13 +4964,6 @@ async fn send_batch(
         }
         other => Err(other.safe_message().to_string()),
     }
-}
-
-fn materialize_charge_body_refs(
-    cfg: &ClickHouseFlushConfig,
-    batch: &[&ChargeEvent],
-) -> Result<ReservedPayload, String> {
-    materialize_json_each_row_refs(cfg.ceiling, batch, cfg.projection.as_deref())
 }
 
 async fn post_json_each_row(
@@ -13509,9 +13430,11 @@ pub fn probe_charge_body_materialization_with_projection_for_tests(
         ceiling,
         projection: projection.clone(),
     };
-    let bound = charge_body_byte_bound(batch, projection.as_deref())
+    // The same borrowed-event instantiation `send_batch` delivers through.
+    let events: Vec<&ChargeEvent> = batch.iter().collect();
+    let bound = charge_body_byte_bound(&events, projection.as_deref())
         .ok_or_else(|| format!("{PLUGIN_NAME}: bound overflowed"))?;
-    let body = materialize_charge_body(&cfg, batch)?;
+    let body = materialize_charge_body(&cfg, &events)?;
     let held = ceiling.used();
     drop(body);
     Ok((bound, held, ceiling.used()))
