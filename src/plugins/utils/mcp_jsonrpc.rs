@@ -118,13 +118,6 @@ pub struct MemberRef<'a> {
     pub tool_call: Option<ToolCallRef<'a>>,
 }
 
-impl MemberRef<'_> {
-    /// Whether this member expects a JSON-RPC response.
-    pub fn is_request(&self) -> bool {
-        self.id.is_some()
-    }
-}
-
 /// What a request body carries, as far as `tools/call` is concerned.
 #[derive(Debug)]
 pub enum RequestScan<'a> {

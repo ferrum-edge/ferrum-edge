@@ -67,7 +67,9 @@ use super::{
 /// proxy-side and plugin-side writers/readers from drifting apart. See
 /// `should_release_gateway_rejection` (`BACKEND_STATUS_METADATA_KEY`) and the
 /// shared presence marker `RESERVED_TOKENS_METADATA_KEY` that gates it.
-use crate::proxy::{BACKEND_STATUS_METADATA_KEY, RESERVED_TOKENS_METADATA_KEY};
+use crate::proxy::{
+    BACKEND_STATUS_METADATA_KEY, REJECTION_RESPONSE_METADATA_KEY, RESERVED_TOKENS_METADATA_KEY,
+};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 const MAX_STATE_ENTRIES: usize = 100_000;
@@ -78,7 +80,6 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const CAPACITY_REJECT_BODY: &str = r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
-const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const UNKNOWN_MODEL_REJECT_BODY: &str = r#"{"error":"AI request model unavailable","details":"model_limits requires an uncompressed, parseable request body so the requested model's token budget can be enforced"}"#;
 
 /// Base names of every per-request reservation-lifecycle metadata entry this
@@ -2460,10 +2461,12 @@ enum RequestClass {
 /// True when a `content-encoding` header marks the request body as encoded with
 /// anything other than `identity`.
 ///
-/// `ai_rate_limiter` runs in `before_proxy`, but request-body decompression (the
-/// `compression` plugin's `decompress_request`) only happens later in
-/// `transform_request_body`. At this phase `ctx.metadata["request_body"]` still
-/// holds the *compressed wire bytes*, not UTF-8 JSON — so a token estimate
+/// `ai_rate_limiter` runs in `before_proxy`. A co-located `compression` plugin
+/// with `decompress_request: true` decodes supported request codings in the
+/// shared pre-`before_proxy` normalization phase and strips `content-encoding`,
+/// so when this still returns true nothing produced plaintext and
+/// `ctx.metadata["request_body"]` holds the *compressed wire bytes*, not UTF-8
+/// JSON — so a token estimate
 /// derived from it would parse-fail (estimate 0) or, worse, undercount, letting
 /// compressed AI requests dodge the estimate-based pre-reservation. When this
 /// returns true the caller skips pre-reservation entirely and falls back to the

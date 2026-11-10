@@ -18,7 +18,7 @@
 //!
 //! # Caching
 //!
-//! Per CLAUDE.md ("Performance Rules": pre-compute / cache at config-reload
+//! Per CLAUDE.md ("Hot-Path Invariants": pre-compute / cache at config-reload
 //! time), the fetched spec body is cached in-process with a TTL so that
 //! `/specz` requests do not re-fetch the upstream document on every call.
 //! The cache is opportunistic: the first request triggers a fetch and stores

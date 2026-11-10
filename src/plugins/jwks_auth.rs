@@ -2672,7 +2672,7 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
     verify_jwt_with_compiled_validation(token, store, &provider.validation)
 }
 
-/// Parse a JSON value as an array of strings, or empty vec if not present/valid.
+/// A validated `jwks_uri` / `discovery_url` and its hostname.
 struct ParsedEndpoint {
     url: String,
     hostname: String,

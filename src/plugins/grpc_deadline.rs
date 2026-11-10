@@ -96,9 +96,10 @@ impl GrpcDeadline {
         }
 
         // Reject configurations where the plugin does no useful work — same policy as
-        // other admission/observability plugins (see CLAUDE.md "Plugin Config Validation").
+        // other admission/observability plugins (see `.claude/rules/plugins.md`
+        // "Adding Or Validating Plugins").
         //
-        // Any of the four fields is a legitimate standalone rule:
+        // Any of the five fields is a legitimate standalone rule:
         //   - `max_deadline_ms`: caps incoming deadlines
         //   - `default_deadline_ms`: injects a deadline when the client omits one
         //   - `reject_no_deadline`: rejects requests arriving without a deadline

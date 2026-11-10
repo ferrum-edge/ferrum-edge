@@ -1,7 +1,8 @@
 //! Anchored `*`-only glob matching for AI provider `model_patterns`.
 //!
-//! `ai_stream_router` (and, historically, `ai_federation`) route a request by
-//! matching the client's `model` against operator-configured globs. Matching
+//! `ai_stream_router` and `ai_federation` route a request, and
+//! `ai_token_metrics` selects a `model_pricing` entry, by matching the client's
+//! `model` against operator-configured globs. Matching
 //! and admission live here so the plugins that consume them cannot drift:
 //!
 //! 1. **Anchoring.** A pattern matches the WHOLE model name. There is no

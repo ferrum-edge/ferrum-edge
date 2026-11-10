@@ -369,26 +369,6 @@ pub(crate) fn content_encoding_requires_decode_judgment(encoding: &str) -> bool 
         .all(|token| token.eq_ignore_ascii_case("identity"))
 }
 
-/// Whether a `q=` parameter value is a syntactically valid weight of exactly
-/// zero, i.e. an explicit refusal.
-///
-/// RFC 9110 §12.4.2 defines the grammar exactly:
-///
-/// ```text
-/// qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )
-/// ```
-///
-/// This validates that SHAPE rather than parsing a float, because the two are
-/// not the same language. `f32::parse` accepts a strictly larger set —
-/// `0e0`, `.0`, `0.0000`, `0_`-free scientific and arbitrary-precision decimal
-/// forms all parse to floating-point zero while none of them is a `qvalue`. A
-/// float-based test therefore reads a syntactically invalid parameter as an
-/// explicit refusal, and this predicate's ONLY power is to turn an
-/// otherwise-servable response into a `502`. Rejecting live traffic because a
-/// client or intermediary emitted an unparseable weight protects nothing, so
-/// malformed must stay on the acceptable side — the grammar check is what keeps
-/// it there.
-///
 /// Whether the client will accept identity-coded (uncompressed) bytes.
 ///
 /// RFC 9110 §12.5.3: an absent `Accept-Encoding` places no constraint, an empty

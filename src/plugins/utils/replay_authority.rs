@@ -1142,12 +1142,6 @@ fn resolve_process_lane(
     Ok(lane)
 }
 
-/// Number of live process replay lanes (test support).
-#[allow(dead_code)] // exercised by external unit tests
-pub fn process_lane_count_for_tests() -> usize {
-    process_lane_count()
-}
-
 /// Whether a domain currently owns a registered process lane (test support).
 #[allow(dead_code)] // exercised by external unit tests
 pub fn process_lane_registered_for_tests(domain: &ReplayDomain) -> bool {
@@ -1218,8 +1212,9 @@ fn shared_authority_health() -> (u64, u64) {
 /// Whether any registered shared replay authority is currently unavailable.
 ///
 /// Protected requests on those policies are failing closed, which is a
-/// readiness-relevant condition rather than a per-request error. Consumed by
-/// the admin `/health` + `/status` readiness decision.
+/// readiness-relevant condition rather than a per-request error. Test
+/// support: the admin `/health` + `/status` readiness decision reads
+/// [`shared_health_snapshot`] directly.
 #[allow(dead_code)] // exercised by external unit tests
 pub fn shared_authority_degraded() -> bool {
     shared_health_snapshot().unavailable()

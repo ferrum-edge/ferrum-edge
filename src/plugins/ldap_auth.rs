@@ -33,7 +33,8 @@
 //! TLS stack everywhere else). The plugin respects:
 //! - `FERRUM_TLS_CA_BUNDLE_PATH` — custom CA bundle for verifying the LDAP
 //!   server certificate. When set, the rustls trust store is built from this
-//!   bundle ALONE (CA exclusivity per CLAUDE.md "TLS Architecture") — public
+//!   bundle ALONE (CA exclusivity per `.claude/rules/tls-security.md` "Backend
+//!   Trust") — public
 //!   CAs in the system / webpki bundle are NOT trusted, preventing a
 //!   public-CA-issued certificate from MITM-ing the LDAP connection.
 //! - `FERRUM_TLS_NO_VERIFY` — skip TLS certificate verification (testing only)
@@ -2926,7 +2927,7 @@ fn parse_string_array(config: &Map<String, Value>, field: &str) -> Result<Vec<St
 /// Build a rustls `ClientConfig` for LDAP connections.
 ///
 /// Integrates with gateway TLS settings while honouring the project-wide
-/// "CA exclusivity" rule (CLAUDE.md "TLS Architecture"):
+/// "CA exclusivity" rule (`.claude/rules/tls-security.md` "Backend Trust"):
 ///
 /// - `FERRUM_TLS_CA_BUNDLE_PATH` set: builds the trust store from
 ///   `RootCertStore::empty()` and adds ONLY the PEM certs from this bundle.
@@ -3889,9 +3890,10 @@ impl LdapAuth {
 
 #[cfg(test)]
 mod tests {
-    //! Inline tests for private TLS-config helpers. Lives here per CLAUDE.md
-    //! "Test Placement": private fns are tested via inline `#[cfg(test)]`
-    //! modules — they cannot be promoted to `pub` solely for external testing.
+    //! Inline tests for private TLS-config helpers. Lives here per
+    //! `.claude/rules/testing.md` "Test Placement": private fns are tested via
+    //! inline `#[cfg(test)]` modules — they cannot be promoted to `pub` solely
+    //! for external testing.
 
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};

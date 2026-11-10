@@ -7232,7 +7232,7 @@ mod tests {
         stale.integrity = Some(hex::encode(stale_mac));
         assert!(
             plugin.admit_redis_hit(stale, TEST_REDIS_KEY).is_none(),
-            "an authenticated entry at the TTL boundary must be quarantined"
+            "an authenticated entry past the TTL is a plain miss, never served"
         );
 
         // Missing MAC / cross-key MAC / cross-version envelopes are quarantined.

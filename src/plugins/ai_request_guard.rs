@@ -43,26 +43,23 @@
 //!
 //! ### Compressed request bodies — fail closed
 //!
-//! `ai_request_guard` runs reject-style policy in `before_proxy`, but a
-//! `Content-Encoding: gzip|br|…` body is still the compressed (non-UTF-8) bytes
-//! at that phase — request decompression (the `compression` plugin's
-//! `decompress_request`) only happens in the later `transform_request_body`
-//! phase. The guard therefore cannot evaluate JSON policy on a compressed body
-//! in `before_proxy`, so it defers: it Continues there (without enforcing
-//! policy) and re-runs inspection in `on_final_request_body`, which executes
-//! *after* all `transform_request_body` hooks.
+//! `ai_request_guard` runs reject-style policy in `before_proxy`. A co-located
+//! `compression` plugin with `decompress_request: true` decodes supported
+//! gzip/Brotli uploads in the shared pre-`before_proxy` normalization phase, so
+//! the guard normally sees plaintext JSON there with `Content-Encoding` already
+//! removed, and enforces every policy directly.
 //!
-//! By `on_final_request_body` time there are two cases:
-//!
-//! - A `compression` plugin with `decompress_request: true` is co-located: the
-//!   body has been decompressed and `Content-Encoding` stripped, so the guard
-//!   inspects the now-plaintext JSON and enforces every policy normally.
-//! - No decompression happened (no `compression` plugin, or it could not decode
-//!   the body): the body is still compressed and `Content-Encoding` is still
-//!   present. The guard treats this as an **uninspectable** body and applies
-//!   `fail_on_uninspectable_body` — rejecting by default (reason
-//!   `compressed_body`). Operators who deliberately forward compressed AI
-//!   uploads uninspected must opt out with `fail_on_uninspectable_body: false`.
+//! A body that still carries a non-identity `Content-Encoding` at
+//! `before_proxy` is one nothing normalized (no `compression` plugin, an
+//! unsupported coding, or a path where `compression` could not claim the
+//! body). The guard cannot evaluate JSON policy on those bytes, so it defers:
+//! it Continues there (without enforcing policy) and re-runs inspection in
+//! `on_final_request_body`, which executes *after* all
+//! `transform_request_body` hooks. If the body is still compressed there, the
+//! guard treats it as an **uninspectable** body and applies
+//! `fail_on_uninspectable_body` — rejecting by default (reason
+//! `compressed_body`). Operators who deliberately forward compressed AI
+//! uploads uninspected must opt out with `fail_on_uninspectable_body: false`.
 //!
 //! This closes the otherwise trivial bypass where a caller gzips the request
 //! body to skip all reject-style policy (model allow/block, token/prompt limits,
@@ -193,15 +190,13 @@ fn is_framed_grpc_content_type(content_type: &str) -> bool {
 /// True when a `content-encoding` header marks the request body as encoded with
 /// anything other than `identity`.
 ///
-/// Used in two phases. In `before_proxy` the buffered body is still the
-/// compressed bytes (request-body decompression — the `compression` plugin's
-/// `decompress_request` — only runs later in `transform_request_body`), so a
-/// non-`identity` encoding means the guard must defer inspection rather than
-/// parse the compressed bytes. In `on_final_request_body` the same check against
-/// the final backend headers tells whether decompression actually happened: if
-/// the encoding is still present, the body was never decoded and is
-/// uninspectable (fail closed). Allocation-free; tolerant of comma-separated
-/// encoding lists.
+/// Used in two phases. In `before_proxy` a non-`identity` encoding means no
+/// `compression` plugin normalized the body in the pre-`before_proxy` phase, so
+/// the guard must defer inspection rather than parse the compressed bytes. In
+/// `on_final_request_body` the same check against the final backend headers
+/// tells whether anything decoded it since: if the encoding is still present,
+/// the body was never decoded and is uninspectable (fail closed).
+/// Allocation-free; tolerant of comma-separated encoding lists.
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
     headers.get("content-encoding").is_some_and(|value| {
         value
@@ -2833,10 +2828,10 @@ impl Plugin for AiRequestGuard {
             return PluginResult::Continue;
         }
 
-        // If the body is still encoded, no `transform_request_body` decompressed
-        // it. It cannot be inspected — fail closed (or pass through in
-        // compatibility mode). This is the deliberate-bypass case: a caller that
-        // gzipped the body to skip policy on a proxy without `compression`.
+        // If the body is still encoded, nothing decompressed it. It cannot be
+        // inspected — fail closed (or pass through in compatibility mode). This
+        // is the deliberate-bypass case: a caller that gzipped the body to skip
+        // policy on a proxy without `compression`.
         if has_non_identity_content_encoding(headers) {
             return self.handle_uninspectable_body(ctx, "compressed_body", 400, || {
                 "Request body is still compressed after request transforms and cannot be inspected"

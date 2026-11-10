@@ -41,17 +41,6 @@
 //! `apply_route_overrides_with_upstreams`. Once the upgrade succeeds, the
 //! HBONE tunnel is a transparent TCP relay — inner H2 frames are not
 //! re-classified per stream, mirroring the post-upgrade WebSocket pinning.
-//!
-//! ## Wire compatibility
-//!
-//! Old data planes that lack this plugin will receive a `create_plugin`
-//! warning and skip the instance, preserving the existing "drop the
-//! header/method match" behavior. The CP can emit the plugin instances
-//! unconditionally — they're a no-op on old binaries.
-//! `retry_disabled` / `timeout_disabled` are intentionally build-out-era
-//! additive config: older DPs that do know this plugin but do not know those
-//! fields will ignore them, so operators must upgrade DPs before relying on
-//! collapsed routes that clear inherited retry or timeout policy.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
@@ -4314,8 +4303,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_regex_method_match_at_load() {
-        // CLAUDE.md "Plugin Config Validation": invalid regex MUST be a hard
-        // error from `Plugin::new()`, never `Ok` with a runtime panic.
+        // .claude/rules/plugins.md "Adding Or Validating Plugins": invalid regex
+        // MUST be a hard error from `Plugin::new()`, never `Ok` with a runtime panic.
         let err = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"methods": [{"regex": "["}]},
@@ -4601,8 +4590,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_regex_header_match_at_load() {
-        // CLAUDE.md "Plugin Config Validation": invalid regex MUST be a hard
-        // error from `Plugin::new()`, never `Ok` with a runtime panic.
+        // .claude/rules/plugins.md "Adding Or Validating Plugins": invalid regex
+        // MUST be a hard error from `Plugin::new()`, never `Ok` with a runtime panic.
         let err = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"headers": {"X-Tier": {"regex": "["}}},
@@ -5218,8 +5207,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_regex_authority_at_load() {
-        // CLAUDE.md "Plugin Config Validation": invalid regex MUST be a
-        // hard error from `Plugin::new()`, never `Ok` with a runtime panic.
+        // .claude/rules/plugins.md "Adding Or Validating Plugins": invalid regex
+        // MUST be a hard error from `Plugin::new()`, never `Ok` with a runtime panic.
         let err = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"authority": {"regex": "["}},
@@ -5816,8 +5805,8 @@ mod tests {
 
     #[test]
     fn rejects_invalid_uri_regex_at_load() {
-        // CLAUDE.md "Plugin Config Validation": invalid regex MUST be a hard
-        // error from `Plugin::new()`, never `Ok` with a runtime panic.
+        // .claude/rules/plugins.md "Adding Or Validating Plugins": invalid regex
+        // MUST be a hard error from `Plugin::new()`, never `Ok` with a runtime panic.
         let err = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"uri": {"regex": "["}, "methods": ["GET"]},

@@ -154,7 +154,7 @@ still Chat Completions JSON:
   an SSE-**labeled** body that is actually JSON-shaped is governed as buffered
   JSON.
 - A buffered SSE-labeled body with a `Content-Encoding` is **decoded first**
-  (gzip/br, the same decode as the final re-check) and the decoded frames are
+  (gzip/br/zstd, the same decode as the final re-check) and the decoded frames are
   governed.
 - Released back to the streaming path: framed gRPC / gRPC-Web content types
   (owned by the gRPC machinery) always, and `text/event-stream` **only when
@@ -279,12 +279,12 @@ forwarded ungoverned:
   handling.
 - **Encoded response bodies**: a governed buffered 2xx that carries a
   `Content-Encoding` the plugin cannot decode for inspection — an unsupported
-  encoding (`deflate`, `zstd`, …), corrupt `gzip`/`br` bytes, or decoded
+  encoding (`deflate`, …), corrupt `gzip`/`br`/`zstd` bytes, or decoded
   output past the **4 MiB** cap — fails closed. This applies to a
   JSON-labeled backend response, an SSE-labeled encoded body, and the
   post-transform final re-check **regardless of how a transform relabeled the
   `Content-Type`** (only framed gRPC / gRPC-Web, which the plugin never
-  buffers or governs, is out of scope). Decodable `gzip`/`br` bodies are
+  buffers or governs, is out of scope). Decodable `gzip`/`br`/`zstd` bodies are
   decompressed and the decoded bytes governed normally.
 - **Streaming path**: held tool-call frames plus the partial-event carry are
   capped at **4 MiB**; past that the stream is cut with the terminal SSE error

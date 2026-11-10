@@ -86,10 +86,12 @@ const MCP_BATCH_NOTIFICATION_FAILED: i64 = -32011;
 /// JSON-RPC application error: a `tools/call` result failed declared
 /// `outputSchema` validation (or could not be decoded for validation).
 const MCP_INVALID_TOOL_RESULT: i64 = -32012;
-/// JSON-RPC application error: `initialize` could not admit the paired
-/// aggregate SSE broker session, so the minted MCP session would have been
-/// usable for POST JSON but never able to attach its event stream. Admission
-/// fails closed instead of returning a half-working session.
+/// JSON-RPC application error: `initialize` could not admit a new MCP
+/// session — the session store is at `sessions.max_sessions`, or (with
+/// `sse_multiplexing`) the paired aggregate SSE broker session could not be
+/// admitted, so the minted session would have been usable for POST JSON but
+/// never able to attach its event stream. Admission fails closed instead of
+/// returning a half-working session.
 const MCP_SSE_SESSION_UNAVAILABLE: i64 = -32013;
 /// JSON-RPC application error: the final backend-visible request no longer
 /// matches what the aggregate router admitted (method, selected upstream,
@@ -899,7 +901,7 @@ fn raw_json_rpc_correlation_ids(body: &[u8]) -> (Option<Box<RawValue>>, Option<B
 /// refusal has no such budget: without this bound a multi-megabyte id would be
 /// mirrored back at request size. An id past the bound is refused with a fixed
 /// `-32600` that does not echo it.
-const MCP_MAX_REFLECTED_ID_BYTES: usize = 4096;
+const MCP_MAX_REFLECTED_ID_BYTES: usize = mcp_jsonrpc::MAX_REFLECTED_ID_BYTES;
 
 /// Keep the original id token while serializing a mediated envelope. This is
 /// deliberately local to MCP; all other JSON values retain their existing

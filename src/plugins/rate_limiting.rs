@@ -525,8 +525,9 @@ impl RateLimiting {
     }
 
     /// Effective `redis_failure_policy` for advisory coverage: `None` for a
-    /// local-only config, `FailClosed` unless the operator opted into
-    /// `local_fallback`. Not a production API.
+    /// local-only config; otherwise the effective policy (`LocalFallback` by
+    /// default for `rate_limiting`, `FailClosed` when the operator set
+    /// `redis_failure_policy: fail_closed`). Not a production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn redis_failure_policy_for_test(
         &self,

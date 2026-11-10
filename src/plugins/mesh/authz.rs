@@ -3194,16 +3194,6 @@ impl MeshAuthz {
     }
 }
 
-/// Whether a policy carries at least one ENFORCING rule (`Allow` / `Deny`).
-///
-/// An `Audit`-only policy is non-enforcing per Istio semantics:
-/// `evaluate_mesh_authorization_policies` records `mesh_authz.audit_policy`
-/// metadata and returns `Continue`, so dropping an audit-only policy never
-/// changes the allow/deny outcome (it is NOT the allow-by-default fail-open the
-/// scope-resolution guards below protect against). The construction-time
-/// fail-closed branches must therefore gate on this, exactly as the per-pod
-/// missing-scope check in `MeshAuthz::new` (`has_scoped_policies`) already does
-/// — an unscopable audit-only selector policy is skipped, not rejected.
 /// The `503` a refused RequestAuthentication answers with, matching the
 /// mesh-managed `request_termination` refusal body.
 fn refused_request_auth_reject() -> PluginResult {
@@ -3218,6 +3208,16 @@ fn refused_request_auth_reject() -> PluginResult {
     }
 }
 
+/// Whether a policy carries at least one ENFORCING rule (`Allow` / `Deny`).
+///
+/// An `Audit`-only policy is non-enforcing per Istio semantics:
+/// `evaluate_mesh_authorization_policies` records `mesh_authz.audit_policy`
+/// metadata and returns `Continue`, so dropping an audit-only policy never
+/// changes the allow/deny outcome (it is NOT the allow-by-default fail-open the
+/// scope-resolution guards below protect against). The construction-time
+/// fail-closed branches must therefore gate on this, exactly as the per-pod
+/// missing-scope check in `MeshAuthz::new` (`has_scoped_policies`) already does
+/// — an unscopable audit-only selector policy is skipped, not rejected.
 fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
     policy.rules.iter().any(|rule| rule.action.is_enforcing())
 }

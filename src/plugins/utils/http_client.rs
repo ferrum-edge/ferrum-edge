@@ -19,8 +19,6 @@
 //!   `:authority` disagree
 //! - **Idle timeout**: Stale connections cleaned up automatically
 //! - **DNS caching**: Uses the gateway's `DnsCache` for shared, warmed DNS
-//! - **No ambient proxy discovery**: standard client builders ignore
-//!   process-level proxy environment variables
 //! - **No redirect following**: outbound calls reach only the configured
 //!   endpoint; server-chosen 3xx targets (e.g. a cloud metadata IP) are never
 //!   followed — SSRF defense-in-depth
@@ -50,8 +48,8 @@
 //! }
 //!
 //! impl MyPlugin {
-//!     pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
-//!         Self { http_client, endpoint: "...".into() }
+//!     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+//!         Ok(Self { http_client, endpoint: "...".into() })
 //!     }
 //! }
 //!
@@ -1169,9 +1167,8 @@ fn build_fail_closed_plugin_client(
 /// Used as a fallback when a fully-configured builder fails (e.g., due to
 /// unsupported pool/keep-alive settings). Keeps the DNS cache attached so
 /// plugin outbound calls do not silently fall through to system DNS — every
-/// call would otherwise burn an ephemeral port through a fresh OS resolver,
-/// which CLAUDE.md explicitly forbids ("DnsCacheResolver must be plugged into
-/// every reqwest::Client in production").
+/// call would otherwise burn an ephemeral port through a fresh OS resolver and
+/// bypass the hostname egress screen and the shared DNS cache.
 ///
 /// TLS posture is already resolved by the startup-only caller and is applied
 /// again here so falling back never widens trust from a configured custom CA

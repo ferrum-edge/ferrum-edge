@@ -2427,27 +2427,6 @@ impl MetricsRegistry {
             .load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
-    pub fn service_discovery_tasks_kept_total(&self) -> u64 {
-        self.service_discovery_tasks_kept.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn service_discovery_tasks_started_total(&self) -> u64 {
-        self.service_discovery_tasks_started.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn service_discovery_tasks_replaced_total(&self) -> u64 {
-        self.service_discovery_tasks_replaced
-            .load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn service_discovery_tasks_stopped_total(&self) -> u64 {
-        self.service_discovery_tasks_stopped.load(Ordering::Relaxed)
-    }
-
     // Test-crate observation seams for issue #3719 / #3718 / #3720 counters.
     #[allow(dead_code)]
     pub fn service_discovery_provider_normalization_rejected_total(&self) -> u64 {
@@ -2476,12 +2455,6 @@ impl MetricsRegistry {
     #[allow(dead_code)]
     pub fn service_discovery_response_oversized_total(&self) -> u64 {
         self.service_discovery_response_oversized
-            .load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    pub fn service_discovery_body_budget_rejected_total(&self) -> u64 {
-        self.service_discovery_body_budget_rejected
             .load(Ordering::Relaxed)
     }
 
@@ -5718,9 +5691,9 @@ impl MetricsRegistry {
             }
         }
 
-        // Stream disconnect counter, labelled by cause and direction. Unlike
-        // the connection counter this is always emitted because graceful vs.
-        // error ratios are useful to operators even on well-behaved traffic.
+        // Stream disconnect counter, labelled by cause and direction. Recorded
+        // for every stream (clean shutdowns included); emitted once any series
+        // exists, like the connection counter.
         if !self.stream_disconnect_counter.is_empty() {
             output.push_str(
                 "# HELP ferrum_stream_disconnects_total Stream disconnects (TCP/UDP) by cause, direction, and optional error_class.\n",

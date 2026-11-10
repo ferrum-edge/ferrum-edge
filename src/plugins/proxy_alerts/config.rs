@@ -154,11 +154,6 @@ pub struct ProxyAlertsConfig {
     /// Bounded, jittered retry policy for transient channel failures.
     pub delivery_retry: DeliveryRetryPolicy,
     pub quiet_hours: Vec<QuietHourWindow>,
-    /// Channels indexed by name; kept around for admin debug surfaces and
-    /// future use cases (e.g., a `/proxy_alerts` admin endpoint that lists
-    /// configured channels).
-    #[allow(dead_code)]
-    pub channels: Arc<HashMap<String, Arc<NotificationChannel>>>,
     pub channel_by_id: Arc<HashMap<u32, Arc<NotificationChannel>>>,
     pub rules: Arc<Vec<Rule>>,
 }
@@ -373,7 +368,6 @@ impl ProxyAlertsConfig {
             max_concurrent_dispatches,
             delivery_retry,
             quiet_hours,
-            channels: Arc::new(channels),
             channel_by_id: Arc::new(channel_by_id),
             rules: Arc::new(rules),
         })

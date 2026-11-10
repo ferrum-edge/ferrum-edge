@@ -907,7 +907,7 @@ on a native-gRPC request.
   is a plain fixed window with no previous-window term.
 - HTTP/GraphQL/gRPC quota admission is CHARGE-THEN-COMPENSATE over that
   algorithm, on the shared pooled multiplexed connections: ONE atomic
-  `MULTI`/`EXEC` charges every configured window (`GET` each of the 17 older
+  `MULTI`/`EXEC` charges every configured window (`GETRANGE` each of the 17 older
   sub-buckets and the one forward sub-bucket, `INCR` the charged sub-bucket,
   `EXPIRE` it) so the decision is
   tied to the caller's own increment, and any refusal issues ONE compensating
@@ -937,7 +937,7 @@ on a native-gRPC request.
   the per-request window and counter buffers are fixed-capacity and inline, not
   `Vec`s, so one transaction touches at most
   `MAX_REDIS_ADMISSION_WINDOWS * (REDIS_WINDOW_SUB_BUCKETS + 3)` keys (3 × 19 =
-  57) — eighteen `GET`s, one `INCR`, and one ignored `EXPIRE` per window, plus
+  57) — eighteen `GETRANGE`s, one `INCR`, and one ignored `EXPIRE` per window, plus
   ONE `TIME` per transaction, unconditionally (validate the reply length for
   exactly that shape; an unreadable counter or an unreadable server clock is an
   unusable endpoint, never a zero). Each

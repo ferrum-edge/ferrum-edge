@@ -4573,21 +4573,6 @@ impl Plugin for AiResponseGuard {
         })
     }
 
-    /// The final verification seam for a promised redaction.
-    ///
-    /// A `redact` detection returns `Continue` from inspection and relies on the
-    /// producer phase to install the replacement. Every way that can fail —
-    /// a refused retained ceiling, a refused scratch pass, a serialization
-    /// error, a representation the rewriter declines — surfaces as `None`, which
-    /// the shared transform loop reads as "unchanged". This hook runs after
-    /// every transform over the bytes the client would actually receive, so an
-    /// undischarged promise here means the original detected body is still in
-    /// flight and must be replaced by a rejection rather than delivered
-    /// (GHSA-pwcm-6rh8-f2gh).
-    ///
-    /// The gateway's own capacity terminal is not affected: when the transform
-    /// phase installs it, the response is already replaced and this hook is not
-    /// reached at all.
     /// Claim an ORIGIN-ENCODED buffered response so the shared representation
     /// gate decodes it to plaintext — or fails it closed — before detection
     /// (`GHSA-4vqr-427g-5cg7`).

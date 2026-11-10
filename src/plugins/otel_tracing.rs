@@ -1325,15 +1325,6 @@ pub(crate) struct TraceExporterOptions {
 }
 
 impl TraceExporterOptions {
-    /// Rebind these options to an explicit ceiling. External tests use this so
-    /// batch-materialization assertions run against their own leaked ceiling.
-    // The binary target always keeps the process ceiling from `from_config`.
-    #[allow(dead_code)]
-    pub(crate) fn with_ceiling(mut self, ceiling: &'static RetainedByteCeiling) -> Self {
-        self.ceiling = ceiling;
-        self
-    }
-
     pub(crate) fn from_config(
         config: &Value,
         service_name: String,

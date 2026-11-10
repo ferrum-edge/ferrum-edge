@@ -415,7 +415,7 @@ impl PendingSnapshotFinalization {
 
     fn age_secs(&self, now: Instant) -> u64 {
         match self {
-            Self::Full(lifecycle) => lifecycle.closed_age_secs(now),
+            Self::Full(lifecycle) => lifecycle.closed_age_secs(),
             Self::Compact(recovery) => now.saturating_duration_since(recovery.closed_at).as_secs(),
         }
     }
@@ -1952,7 +1952,7 @@ struct SpoolDelivery {
 }
 
 impl SpoolDelivery {
-    fn try_enqueue(&self, events: Arc<Vec<QueuedChargeEvent>>, _reason: &'static str) -> bool {
+    fn try_enqueue(&self, events: Arc<Vec<QueuedChargeEvent>>) -> bool {
         if events.is_empty() {
             return true;
         }
@@ -2322,7 +2322,7 @@ impl SnapshotLifecycle {
         }
     }
 
-    fn closed_age_secs(&self, _now: Instant) -> u64 {
+    fn closed_age_secs(&self) -> u64 {
         let closed = self.closed_at_secs.load(Ordering::Acquire);
         if closed <= 0 {
             return 0;
@@ -3189,7 +3189,7 @@ impl ApiChargebackSink {
                     invalidate_status_cache();
                     return true;
                 }
-                let accepted = overflow_enqueue.try_enqueue(Arc::new(vec![queued]), reason);
+                let accepted = overflow_enqueue.try_enqueue(Arc::new(vec![queued]));
                 if accepted && reason == "queue high water" {
                     overflow_metrics
                         .queue_high_water_diversions_total
@@ -3212,7 +3212,7 @@ impl ApiChargebackSink {
                         // Terminal failure receives the shared batch handle; spool
                         // ownership continues under the same Arc without cloning
                         // ChargeEvent records.
-                        enqueue.try_enqueue(batch, "export failure")
+                        enqueue.try_enqueue(batch)
                     } else {
                         warn_sampled!(
                             plugin = PLUGIN_NAME,
@@ -3295,7 +3295,6 @@ impl ApiChargebackSink {
         if let (Some(spool), Some(replay_http)) = (runtime.spool.clone(), replay_http) {
             background_tasks.push(start_spool_replayer(
                 Arc::clone(&spool),
-                runtime.summary.clone(),
                 ClickHouseFlushConfig {
                     http: replay_http,
                     insert_url,
@@ -13292,7 +13291,7 @@ pub async fn probe_shared_spool_batch_clone_for_tests(
     let _ = commit_tx.send(true);
 
     assert!(
-        delivery.try_enqueue(shared, "shared spool clone probe"),
+        delivery.try_enqueue(shared),
         "{PLUGIN_NAME}: shared spool clone probe failed to enqueue"
     );
 
@@ -13888,7 +13887,6 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
 
 fn start_spool_replayer(
     spool: Arc<SpoolManager>,
-    _summary: SinkSummary,
     flush_config: ClickHouseFlushConfig,
     batch_size: usize,
     replay_interval_secs: u64,

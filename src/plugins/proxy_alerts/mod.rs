@@ -84,7 +84,7 @@
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::sync::{Mutex, MutexGuard};
@@ -322,28 +322,6 @@ impl ProxyAlerts {
         self.core.retain_proxies(active_proxy_generations);
     }
 
-    /// Compatibility helper for tests that only have an active-ID set.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn retain_proxy_ids_for_test(&self, active_proxy_ids: &HashSet<&str>) {
-        let generations: HashMap<&str, u64> = active_proxy_ids
-            .iter()
-            .copied()
-            .map(|id| {
-                let generation = self
-                    .core
-                    .active_proxy_generations
-                    .load()
-                    .as_ref()
-                    .as_ref()
-                    .and_then(|map| map.get(id).copied())
-                    .unwrap_or(1);
-                (id, generation)
-            })
-            .collect();
-        self.retain_proxies(&generations);
-    }
-
     /// Seed cooldown + Active recovery state (on every channel) for
     /// deterministic external tests.
     #[doc(hidden)]
@@ -530,15 +508,6 @@ impl ProxyAlerts {
         self.core
             .active_proxy_generations
             .store(Arc::new(Some(owned)));
-    }
-
-    /// Cancel admission for this instance's dispatch generation (test hook).
-    #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
-    pub fn cancel_dispatch_generation_for_test(&self) {
-        self.core.dispatch_generation.cancel();
     }
 
     /// Borrow this instance's dispatch generation so a deterministic external
