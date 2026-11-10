@@ -4261,7 +4261,7 @@ fn l4_route_backend_binding(
 /// — that list is the only withdrawal mechanism for translator-generated
 /// upstreams, so a prefix missing from it makes every compose append another
 /// copy instead of replacing it.
-const L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+const L4_UPSTREAM_ID_PREFIX: &str = crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX;
 
 /// Hex characters of the identity digest every generated L4 upstream id
 /// carries. 64 bits is far past birthday relevance for the per-cluster

@@ -4175,7 +4175,9 @@ fn decode_virtual_service_l4_upstreams(
                         )
                     })?;
             if upstream.namespace != slice.namespace
-                || !upstream.id.starts_with("istio-vs-l4-upstream-")
+                || !upstream
+                    .id
+                    .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX)
                 || !referenced.contains(upstream.id.as_str())
                 || upstream.targets.is_empty()
             {
