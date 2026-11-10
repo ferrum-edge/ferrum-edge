@@ -433,7 +433,6 @@ UPLOAD_ARTIFACT_ACTION = re.compile(r"^actions/upload-artifact(?:@|\s*$)", re.IG
 # A repo-local composite action is a step like any other and can run the upload
 # itself. The calling job is not knowable from the action file, so a local action
 # is never a digest owner.
-LOCAL_ACTION_STEP_REFERENCE = re.compile(r"^\.{1,2}/")
 # The Docker jobs never name the protected ARM64 artifact literally. They
 # select it through matrix values that the download step and the context step
 # interpolate, so freezing the job's `needs`/`if` alone would still let a pull
@@ -5451,10 +5450,6 @@ YAML_DYNAMIC_COMMAND_FIELD = re.compile(
 )
 YAML_DYNAMIC_USES_FIELD = re.compile(
     r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*[*!&]"
-)
-HEREDOC_START = re.compile(
-    r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)"
-    r"(?P=quote)"
 )
 BLOCK_SCALAR_HEADER = re.compile(
     r"^[|>](?:(?:[1-9][+-]?)|(?:[+-][1-9]?))?(?:\s+#.*)?$"
@@ -22029,7 +22024,7 @@ pre_build = []
                 f"duplicate CI job generation tuple for {job_name!r}"
             )
         seen_job_generation_tuples.add((job_name, retired, adopted))
-        if job_name in {CI_FUZZ_SMOKE_JOB_NAME, "build-arm64-cross"}:
+        if job_name == CI_FUZZ_SMOKE_JOB_NAME or job_name in PROTECTED_BUILD_JOB_NAMES:
             failures.append(
                 f"CI job generation {job_name!r} collides with a whole-text freeze"
             )
