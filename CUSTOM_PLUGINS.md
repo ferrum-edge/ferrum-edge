@@ -1483,7 +1483,7 @@ ferrum-edge/
 
 Custom plugins that need their own database tables can declare migrations that run alongside the gateway's core schema migrations. This uses the same `FERRUM_MODE=migrate` infrastructure, with a separate tracking table (`_ferrum_plugin_migrations`) so plugin version numbers are scoped per-plugin and never conflict with core migrations.
 
-> **MongoDB note:** The `CustomPluginMigration` system is SQL-only. When `FERRUM_DB_TYPE=mongodb`, custom plugin SQL migrations are skipped. Custom plugins that need MongoDB-specific collections or indexes should create them in their `create_plugin()` initialization function using the MongoDB driver's idempotent `createIndex` API. Prefix collection names with the plugin name to avoid collisions (e.g., `my_plugin_audit_log`).
+> **MongoDB note:** The `CustomPluginMigration` system is SQL-only. When `FERRUM_DB_TYPE=mongodb`, custom plugin SQL migrations are skipped. Custom plugins that need MongoDB-specific collections or indexes create them from their own background worker with the MongoDB driver's idempotent `createIndex` API, before the worker's first write: stage the worker in `start_background_tasks()` and let it touch the database only after `commit_background_tasks()` releases it. Never do this in `create_plugin()` or `new()`; the constructor is also the validator and must not dial the network (see [Config Validation Rules](#config-validation-rules)). Prefix collection names with the plugin name to avoid collisions (e.g., `my_plugin_audit_log`).
 
 ### How It Works
 
