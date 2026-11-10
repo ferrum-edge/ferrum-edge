@@ -467,6 +467,101 @@ fn stock_tcp_proxy_listener_classifies_the_port_as_tcp_and_names_the_vip() {
     );
 }
 
+/// Only an OUTBOUND listener names a service VIP: an inbound listener's
+/// concrete bind is this proxy's own wiring, never a peer service's address.
+#[test]
+fn stock_inbound_listener_bind_is_never_a_service_vip() {
+    let mut accumulator = StockXdsAccumulator::default();
+    let cluster = "outbound|3306||mysql.data.svc.cluster.local";
+    let san = "spiffe://cluster.local/ns/data/sa/mysql";
+    accumulator
+        .apply_sotw(
+            CDS_TYPE_URL,
+            &[any(CDS_TYPE_URL, &eds_cluster(cluster, &[san]))],
+            "cds-1",
+        )
+        .expect("CDS applies");
+    accumulator
+        .apply_sotw(
+            EDS_TYPE_URL,
+            &[any(
+                EDS_TYPE_URL,
+                &cla(cluster, vec![lb_endpoint("10.2.0.7", 3306, 1)]),
+            )],
+            "eds-1",
+        )
+        .expect("EDS applies");
+    let mut inbound = tcp_listener("10.2.0.7_3306", "10.2.0.7", 3306, cluster);
+    // TrafficDirection::INBOUND
+    inbound.traffic_direction = 1;
+    accumulator
+        .apply_sotw(LDS_TYPE_URL, &[any(LDS_TYPE_URL, &inbound)], "lds-1")
+        .expect("LDS applies");
+
+    let discovery = accumulator.discovery();
+    assert_eq!(discovery.services.len(), 1);
+    assert!(
+        discovery.services[0].cluster_ips.is_empty(),
+        "an inbound listener's bind address must not become a service VIP"
+    );
+}
+
+/// Two CDS names that resolve to one `(namespace, service, port)` must not
+/// share an identity: the first (by name) claims the service port and the
+/// second is refused whole, so a cluster with no pinned identity can never
+/// publish its endpoints under its sibling's pin.
+#[test]
+fn stock_second_cluster_for_a_claimed_service_port_is_refused() {
+    let unpinned = "outbound|9080||reviews.default.svc.cluster.local.";
+    let mut accumulator = StockXdsAccumulator::default();
+    accumulator
+        .apply_sotw(
+            CDS_TYPE_URL,
+            &[
+                any(CDS_TYPE_URL, &eds_cluster(REVIEWS_CLUSTER, &[REVIEWS_SAN])),
+                any(CDS_TYPE_URL, &eds_cluster(unpinned, &[])),
+            ],
+            "cds-1",
+        )
+        .expect("CDS applies");
+    accumulator
+        .apply_sotw(
+            EDS_TYPE_URL,
+            &[
+                any(
+                    EDS_TYPE_URL,
+                    &cla(REVIEWS_CLUSTER, vec![lb_endpoint("10.1.2.3", 9080, 1)]),
+                ),
+                any(
+                    EDS_TYPE_URL,
+                    &cla(unpinned, vec![lb_endpoint("10.9.9.9", 9080, 1)]),
+                ),
+            ],
+            "eds-1",
+        )
+        .expect("EDS applies");
+
+    let discovery = accumulator.discovery();
+    let addresses: Vec<&str> = discovery
+        .workloads
+        .iter()
+        .flat_map(|workload| workload.addresses.iter().map(String::as_str))
+        .collect();
+    assert_eq!(
+        addresses,
+        vec!["10.1.2.3"],
+        "only the claiming cluster's own pinned endpoints are dialable"
+    );
+    assert!(
+        discovery.refusals.iter().any(|refused| {
+            refused.reason == refusal::DUPLICATE_SERVICE_PORT_CLUSTER
+                && refused.resource == unpinned
+        }),
+        "the second cluster must be refused visibly: {:?}",
+        discovery.refusals
+    );
+}
+
 #[test]
 fn stock_endpoint_container_port_becomes_the_service_target_port() {
     let mut accumulator = StockXdsAccumulator::default();

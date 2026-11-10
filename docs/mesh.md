@@ -599,7 +599,7 @@ stock server never receives Ferrum CP/DP credentials.
 | `Cluster` (`outbound\|<port>\|\|<svc>.<ns>.svc.<domain>`, `EDS` or `STATIC`) | a `MeshService` port in `<ns>/<svc>` |
 | `Cluster.transport_socket` → `UpstreamTlsContext` URI SAN matcher | the pinned peer SPIFFE identity for that service port |
 | `ClusterLoadAssignment` | `Workload` entries (address, container port → `targetPort`, weight, locality); `UNHEALTHY` / `DRAINING` / `TIMEOUT` endpoints are excluded |
-| `Listener` filter chains | per-port protocol classification (HCM → HTTP/HTTP2, TcpProxy → TCP) and, for a concrete-bind listener, the service VIP |
+| `Listener` filter chains | per-port protocol classification (HCM → HTTP/HTTP2, TcpProxy → TCP) and, for a concrete-bind `OUTBOUND` listener, the service VIP (an inbound or unspecified-direction listener never names a VIP) |
 | `RouteConfiguration` virtual hosts | IP-literal domains become `MeshService.cluster_ips` |
 
 **Namespace narrowing applies unchanged.** Discovered services flow through the
@@ -615,6 +615,11 @@ endpoint metadata. A cluster with no pinned SPIFFE, or with more than one
 candidate, publishes the service shape with **no dialable endpoint** plus an
 explicit `no_pinned_peer_identity` / `ambiguous_peer_identity` diagnostic —
 Ferrum will not dial a peer whose identity the control plane did not assert.
+Each `(namespace, service, port)` belongs to exactly one cluster: when two CDS
+names resolve to the same service port (for example a trailing-dot host or a
+different cluster domain), the first by name claims it and the others are
+refused with `duplicate_service_port_cluster`, so one cluster's endpoints are
+never published under another cluster's pinned identity.
 
 **Protocol behaviour.** State-of-the-world ADS with per-type nonces, ACK/NACK
 carrying a field-specific `error_detail`, dependency-ordered subscriptions (EDS
