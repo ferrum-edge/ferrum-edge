@@ -1198,8 +1198,15 @@ impl ValidateNamespaceFilter {
         self.count_fields.iter().map(|(_, count)| *count).sum()
     }
 
-    /// Operator-facing diagnostic naming the active namespace, the namespaces
-    /// present in the document, and the post-filter counts.
+    /// Operator-facing diagnostic: the post-filter counts and how many
+    /// namespaces the document resources use.
+    ///
+    /// Namespace names are supplied values, so they appear only as
+    /// Debug-quoted spans that the startup renderer withholds
+    /// (`.claude/rules/validation-diagnostics.md`); the counts stay visible.
+    /// The active namespace is also printed on the report `Namespace:` line.
+    /// The text must not contain an apostrophe: the renderer would read it as
+    /// an opening quote and withhold the rest of the cause.
     pub fn diagnostic(&self) -> String {
         let counts = self
             .count_fields
@@ -1207,14 +1214,16 @@ impl ValidateNamespaceFilter {
             .map(|(name, count)| format!("{name}={count}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let namespaces = if self.document_namespaces.is_empty() {
-            "(none)".to_string()
-        } else {
-            self.document_namespaces.join(", ")
+        let namespaces = match self.document_namespaces.len() {
+            0 => String::new(),
+            count => format!(
+                "; the document resources use {count} namespace(s): {:?}",
+                self.document_namespaces.join(", ")
+            ),
         };
         format!(
             "namespace filter mismatch: active namespace {:?} left 0 surviving resources \
-             ({counts}); document namespaces: {namespaces:?}",
+             ({counts}){namespaces}",
             report_field("FERRUM_NAMESPACE", &self.active_namespace)
         )
     }
@@ -1237,8 +1246,9 @@ fn report_empty_namespace_filter(
         Ok(())
     } else {
         Err(format!(
-            "{diagnostic}. Set FERRUM_NAMESPACE to a namespace present in the document, \
-             or pass --allow-empty-namespace to accept an empty filtered document."
+            "{diagnostic}. Set FERRUM_NAMESPACE to the namespace in the `namespace` fields \
+             of the document resources, or pass --allow-empty-namespace to accept an empty \
+             filtered document."
         ))
     }
 }
