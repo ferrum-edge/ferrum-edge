@@ -9561,11 +9561,11 @@ fn spool_temp_is_stale(path: &Path, now: SystemTime, age_secs: u64) -> Result<bo
     Ok(elapsed >= Duration::from_secs(age_secs))
 }
 
-/// Parsed generation-owned atomic-write temp marker.
+/// Parsed generation-owned atomic-write temp marker. The generation segment
+/// must parse as a `u64` for the name to be recognized, but ownership is
+/// decided by the process tag alone, so the value is not retained.
 struct SpoolWriteTemp<'a> {
     process_tag: &'a str,
-    #[allow(dead_code)] // retained for diagnostics and future lease policy
-    generation: u64,
 }
 
 /// `<data-name>.write-<process_tag>-<generation>.tmp`
@@ -9584,20 +9584,16 @@ fn parse_spool_write_temp(name: &str) -> Option<SpoolWriteTemp<'_>> {
     let marker = name.strip_suffix(SPOOL_TMP_SUFFIX)?;
     let (_, attribution) = marker.rsplit_once(SPOOL_WRITE_MARKER)?;
     let (process_tag, generation) = attribution.rsplit_once('-')?;
-    if process_tag.is_empty() {
+    if process_tag.is_empty() || generation.parse::<u64>().is_err() {
         return None;
     }
-    Some(SpoolWriteTemp {
-        process_tag,
-        generation: generation.parse().ok()?,
-    })
+    Some(SpoolWriteTemp { process_tag })
 }
 
-/// Parsed in-flight replay claim marker.
+/// Parsed in-flight replay claim marker. The generation segment must parse as
+/// a `u64` for the name to be recognized; it is not retained.
 struct SpoolClaim<'a> {
     process_tag: &'a str,
-    #[allow(dead_code)] // retained for diagnostics and future lease policy
-    generation: u64,
     lease_deadline_unix: i64,
 }
 
@@ -9622,14 +9618,15 @@ fn parse_spool_claim(name: &str) -> Option<SpoolClaim<'_>> {
     let (_, attribution) = marker.rsplit_once(SPOOL_CLAIM_MARKER)?;
     let mut parts = attribution.split('-');
     let process_tag = parts.next()?;
-    let generation = parts.next()?.parse().ok()?;
+    if parts.next()?.parse::<u64>().is_err() {
+        return None;
+    }
     let lease_deadline_unix = parts.next()?.parse().ok()?;
     if process_tag.is_empty() || parts.next().is_some() {
         return None;
     }
     Some(SpoolClaim {
         process_tag,
-        generation,
         lease_deadline_unix,
     })
 }
@@ -12220,113 +12217,6 @@ fn open_spool_file_no_follow(path: &Path) -> Result<File, String> {
     })
 }
 
-/// One decoded spool artifact retained by the decode-only external test helper.
-///
-/// Production replay uses [`StreamingSpoolReader`] and never materializes this
-/// artifact-wide representation.
-struct ReservedSpoolArtifact {
-    text: String,
-    /// Charge on the decoded buffer. Reserved before the file is read, shrunk
-    /// to the buffer's real allocation, released on drop.
-    _text_reservation: ProcessByteReservation,
-}
-
-impl ReservedSpoolArtifact {
-    #[allow(dead_code)] // used by the external decode test helper
-    fn into_text(self) -> String {
-        self.text
-    }
-}
-
-/// Decode one spool artifact into a representation that is charged to `ceiling`
-/// for its whole life.
-///
-/// The decoded upper bound is reserved *before* the file is read, so a process
-/// already at its retained-byte ceiling refuses the artifact instead of
-/// materializing an unbounded owned copy of it.
-fn decode_spool_artifact(
-    path: &Path,
-    ceiling: &'static RetainedByteCeiling,
-) -> Result<ReservedSpoolArtifact, SpoolDecodeError> {
-    let file = File::open(path).map_err(|error| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: failed to open spool file '{}': {error}",
-            path.display()
-        ))
-    })?;
-    let encoded_len = file
-        .metadata()
-        .map_err(|error| {
-            SpoolDecodeError::Unreadable(format!(
-                "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
-                path.display()
-            ))
-        })?
-        .len();
-    if encoded_len > SPOOL_MAX_ARTIFACT_BYTES {
-        return Err(SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' exceeds the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
-            path.display()
-        )));
-    }
-    let compressed = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains(".ndjson.zst"));
-    // An uncompressed artifact decodes to exactly its on-disk size. Treat a
-    // zstd frame's declared content size only as a tighter bound: the header is
-    // unauthenticated, so it must never bypass the decompression-ratio limit.
-    let mut file = file;
-    let decoded_bound = if compressed {
-        let ratio_limit = spool_decompression_limit(encoded_len);
-        match read_zstd_frame_content_size(&mut file, path)? {
-            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared.min(ratio_limit),
-            Some(declared) => {
-                return Err(SpoolDecodeError::Unreadable(format!(
-                    "{PLUGIN_NAME}: spool file '{}' declares a {declared}-byte decoded size above the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
-                    path.display()
-                )));
-            }
-            None => ratio_limit,
-        }
-    } else {
-        encoded_len
-    };
-    let decoded_bound = usize::try_from(decoded_bound).map_err(|_| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' decoded bound exceeds this platform's addressable size",
-            path.display()
-        ))
-    })?;
-    let text_reservation = ceiling.try_acquire(decoded_bound).ok_or_else(|| {
-        SpoolDecodeError::CeilingExhausted(format!(
-            "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
-            path.display(),
-            PayloadMaterializationError::CeilingExhausted.reason()
-        ))
-    })?;
-
-    let decoded = if compressed {
-        decode_zstd_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
-    } else {
-        read_spool_bytes_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
-    };
-    let text = String::from_utf8(decoded).map_err(|error| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' is not valid UTF-8 JSONEachRow: {error}",
-            path.display()
-        ))
-    })?;
-    // Charge only what the buffer really holds; `from_utf8` reuses the `Vec`
-    // allocation, so `capacity` is the true retained size.
-    text_reservation.shrink_to(text.capacity());
-
-    Ok(ReservedSpoolArtifact {
-        text,
-        _text_reservation: text_reservation,
-    })
-}
-
 /// Bytes of a zstd frame prefix that always contain the complete frame header.
 ///
 /// A zstd frame header is at most 18 bytes (4-byte magic + 14-byte header).
@@ -12513,29 +12403,30 @@ fn read_spool_bytes_bounded(
     Ok(decoded)
 }
 
-fn decode_zstd_bounded(reader: impl Read, limit: usize, path: &Path) -> Result<Vec<u8>, String> {
-    let decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
-            path.display()
-        )
-    })?;
-    read_spool_bytes_bounded(decoder, limit, path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: spool file '{}' exceeded its decompression bound: {error}",
-            path.display()
-        )
-    })
-}
-
-/// Decode-only helper for external unit tests. The returned `String` outlives
-/// its ceiling reservation, which is exactly why production never uses this
-/// shape: [`decode_spool_artifact`] keeps the charge for the buffer's life.
+/// Decode-only helper for external unit tests.
+///
+/// Reads the artifact through the same bounded [`StreamingSpoolReader`] replay
+/// uses — identical size, ratio, row, UTF-8, and JSON-object checks — and
+/// returns the validated rows joined by `\n`. The returned `String` outlives
+/// every ceiling reservation, which is why production never uses this shape.
 #[allow(dead_code)]
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
-    decode_spool_artifact(path, process_ceiling())
-        .map(ReservedSpoolArtifact::into_text)
-        .map_err(SpoolDecodeError::into_message)
+    let mut reader = StreamingSpoolReader::open(path, process_ceiling())
+        .map_err(SpoolDecodeError::into_message)?;
+    let mut text = String::new();
+    while let Some(batch) = reader
+        .next_batch()
+        .map_err(SpoolDecodeError::into_message)?
+    {
+        let body = batch.body_range(0, batch.row_count())?;
+        let rows = std::str::from_utf8(&body)
+            .map_err(|_| format!("{PLUGIN_NAME}: decoded spool rows are not UTF-8"))?;
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(rows);
+    }
+    Ok(text)
 }
 
 #[doc(hidden)]

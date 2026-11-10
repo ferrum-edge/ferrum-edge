@@ -6893,9 +6893,7 @@ fn admission_eviction_never_unlinks_a_fresh_peer_process_temp() {
 fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
-    let bomb =
-        encode_spool_bytes_without_content_size_for_tests(&bomb_plain, SpoolCompression::Zstd)
-            .unwrap();
+    let bomb = zstd_frame_within_ratio_window(&bomb_plain, false);
     assert!(
         bomb.len() < 4096,
         "the fixture must exercise a high compression ratio"
@@ -6906,17 +6904,48 @@ fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
         .err()
         .unwrap_or_else(|| panic!("a high-ratio archive must not expand without bound"));
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 
     // A record within the expansion allowance still decodes normally.
-    let ok_plain = vec![b'\n'; 512 * 1024];
+    let (ok_plain, ok_rows) = compressible_json_rows(512 * 1024);
     let ok = encode_spool_bytes_for_tests(&ok_plain, SpoolCompression::Zstd).unwrap();
     let ok_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB4.ndjson.zst");
     fs::write(&ok_path, &ok).unwrap();
     let decoded = decode_spool_file_for_tests(&ok_path).unwrap();
-    assert_eq!(decoded.len(), ok_plain.len());
+    assert_eq!(decoded, ok_rows);
+}
+
+/// A zstd frame whose back-reference window (1 MiB) fits the window replay
+/// grants a frame at the ratio floor, so the bounded streaming reader refuses an
+/// oversized frame by its decoded-byte bound rather than by its window cap.
+/// `declare_size` records the decompressed size in the frame header.
+fn zstd_frame_within_ratio_window(bytes: &[u8], declare_size: bool) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+    encoder.window_log(20).unwrap();
+    if declare_size {
+        encoder
+            .set_pledged_src_size(Some(bytes.len() as u64))
+            .unwrap();
+    }
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Highly compressible JSONEachRow rows totalling about `total_bytes`, as the
+/// spool file bytes (trailing newline) and as the rows the bounded streaming
+/// reader yields (joined by `\n`).
+fn compressible_json_rows(total_bytes: usize) -> (Vec<u8>, String) {
+    const ROW_PAD: usize = 64 * 1024;
+    let rows: Vec<String> = (0..total_bytes.div_ceil(ROW_PAD))
+        .map(|index| format!(r#"{{"row":{index},"pad":"{}"}}"#, "a".repeat(ROW_PAD)))
+        .collect();
+    let joined = rows.join("\n");
+    let mut file = joined.clone().into_bytes();
+    file.push(b'\n');
+    (file, joined)
 }
 
 #[test]
@@ -13502,19 +13531,16 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
     // them, and the clamp must still fail closed on a high-ratio bomb.
     let temp = tempfile::tempdir().unwrap();
 
-    let plain = vec![b'\n'; 512 * 1024];
-    let legacy =
-        encode_spool_bytes_without_content_size_for_tests(&plain, SpoolCompression::Zstd).unwrap();
+    let (plain, rows) = compressible_json_rows(512 * 1024);
+    let legacy = zstd_frame_within_ratio_window(&plain, false);
     let legacy_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC1.ndjson.zst");
     fs::write(&legacy_path, &legacy).unwrap();
     let decoded = decode_spool_file_for_tests(&legacy_path)
         .expect("a frame without a content size must still decode");
-    assert_eq!(decoded.len(), plain.len());
+    assert_eq!(decoded, rows);
 
     let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
-    let bomb =
-        encode_spool_bytes_without_content_size_for_tests(&bomb_plain, SpoolCompression::Zstd)
-            .unwrap();
+    let bomb = zstd_frame_within_ratio_window(&bomb_plain, false);
     let bomb_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC2.ndjson.zst");
     fs::write(&bomb_path, &bomb).unwrap();
     let err = decode_spool_file_for_tests(&bomb_path)
@@ -13523,7 +13549,7 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
             panic!("the ratio clamp must still bound a header-less high-ratio archive")
         });
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 }
@@ -13555,7 +13581,7 @@ fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
     // must not let a planted high-ratio archive bypass the ratio limit.
     let temp = tempfile::tempdir().unwrap();
     let plain = vec![b'\n'; 2 * 1024 * 1024];
-    let encoded = encode_spool_bytes_without_ratio_padding_for_tests(&plain).unwrap();
+    let encoded = zstd_frame_within_ratio_window(&plain, true);
     let ratio_bound = spool_decompression_limit_for_tests(encoded.len() as u64);
     assert!(
         ratio_bound < plain.len() as u64,
@@ -13569,7 +13595,7 @@ fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
         .err()
         .unwrap_or_else(|| panic!("a declared size must not bypass the decompression-ratio limit"));
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 }
