@@ -1,4 +1,4 @@
-//! Generated from the Public Suffix List bundled with `psl` 2.1.245
+//! Generated from the Public Suffix List bundled with `psl` 2.1.248
 //! (`data/rules.txt`). Do not edit by hand.
 //!
 //! Every domain that is NOT itself a public suffix but has a PSL rule strictly
@@ -283,6 +283,7 @@ pub(crate) const PSL_SUFFIX_ANCESTORS: &[&str] = &[
     "fr-par.scw.cloud",
     "funkfeuer.at",
     "gov-ncloudstorage.com",
+    "grok.bot",
     "hedmark.no",
     "her.name",
     "his.name",
