@@ -597,6 +597,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **WebSocket backend URLs are logged without the client's query string**
+  (GHSA-pwwg-8543-q37r). The H1/H2 and HTTP/3 WebSocket backend-failure
+  `ERROR`, the upgrade `INFO`/`DEBUG` lines and the HTTPS-to-plaintext `WARN`
+  logged the full backend URL, so a `?access_token=` a browser WebSocket client
+  sends in the query reached the gateway log. The query is now stripped, as
+  every other backend-URL log already did.
+- **The CONNECT-UDP per-client tunnel cap honours `FERRUM_PER_IP_IPV6_PREFIX`
+  above `/64`** (GHSA-grwg-8jpx-q8p9). With a `/96` or `/128` prefix every
+  client in one `/64` still shared a single
+  `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` budget.
+- **BREAKING — an invalid `FERRUM_STREAM_PROXY_BIND_ADDRESS` refuses startup**
+  (GHSA-9gqf-79hq-v2v2). A value that is not an IP address used to fall back
+  silently to `FERRUM_PROXY_BIND_ADDRESS` (`0.0.0.0` by default), exposing
+  TCP/UDP/DTLS stream listeners meant for loopback or an internal interface.
+  It is now validated like the proxy and admin bind addresses.
+- **Stream refusals from untrusted sources no longer log one `WARN` each**
+  (GHSA-wfg6-vhp9-hj45). TCP stream PROXY-protocol refusals and DTLS accept
+  refusals are sampled, and a plain-UDP per-source session refusal is logged at
+  `DEBUG` (it stays counted by the rate-limited per-source rejection warning).
+- **HTTP/3 plain-bridge client terminals no longer move backend health**
+  (GHSA-3c72-7f45-wvr2). A gateway `401` (authorization expiry) or `413`
+  (oversized streamed upload) on the H3 to HTTP/1.1/HTTP/2 bridge was recorded
+  as a breaker success, so a client could close a `HALF_OPEN` circuit breaker
+  against a backend that never answered; a route-deadline cut of a parked
+  response head also charged `ai_federation`'s provider circuit. Both are now
+  neutral.
+- **A plain-UDP session whose authorization expires while queued datagrams
+  drain no longer leaks its pending entry** (GHSA-4wqw-qq7v-pwhp). The leak
+  blackholed that client tuple and held a pending slot against
+  `FERRUM_UDP_MAX_SESSIONS` until the listener restarted.
+- **HTTP/3 and H1/H2 terminals that skipped the access log or the request
+  counter are recorded** (#7156, #7157). The native-H3 oversized-upload `413`
+  and oversized declared-response `502` now emit a transaction summary, the
+  CONNECT-UDP stalled-`200` authorization expiry is counted as its `401`, and
+  the H1/H2 "Invalid backend path coordinates" and WebSocket missing-upgrade
+  `500`s are counted (the H1/H2 body is now JSON).
+- **gRPC-Web clients get gRPC-Web framing on the H1/H2 route-admission `403`
+  and circuit-breaker-open `503`** (#7155), instead of a native-gRPC
+  header-only status they cannot read.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
