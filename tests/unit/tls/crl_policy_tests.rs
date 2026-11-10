@@ -1673,3 +1673,26 @@ fn a_crl_inventory_entry_carries_next_update_and_reaches_the_prometheus_gauge() 
         .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(stored, next_update.timestamp());
 }
+
+/// Issue #7206: a probe verifier that fails to build for a reason unrelated to
+/// `backend_tls_san_allow_list` (here an unparseable CRL, with no SAN
+/// allow-list configured) must fail closed without blaming the SAN allow-list.
+#[test]
+fn probe_verifier_build_failure_without_san_list_is_not_reported_as_san_pinning() {
+    ensure_crypto_provider();
+    let tls = BackendTlsConfig::default_verify();
+    assert!(tls.san_allow_list.is_empty());
+    let crls = crl_list(vec![b"not a CRL".to_vec()]);
+    let error = match build_probe_server_verifier_for_test(&tls, None, &crls) {
+        Ok(_) => panic!("an unparseable CRL must not build a probe verifier"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("health-check client could not be built"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !error.contains("SAN allow-list"),
+        "a verifier build failure must not name the SAN allow-list: {error}"
+    );
+}
