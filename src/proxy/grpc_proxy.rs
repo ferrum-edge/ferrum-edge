@@ -49,6 +49,7 @@ use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
 use crate::pool::{CoalescedCreateAttempt, GenericPool, PoolCreateCaller, PoolManager};
+use crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 use crate::proxy::hbone_pool::HbonePoolError;
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
@@ -3094,13 +3095,6 @@ pub(crate) fn http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     }
 }
 
-/// The non-standard `499 Client Closed Request` status the gateway records for
-/// a client that disconnected before the response. Defined once in
-/// [`crate::proxy::client_abort`] (issue #6772); this path stays valid for
-/// every existing user.
-pub(crate) const CLIENT_CLOSED_REQUEST_STATUS: u16 =
-    crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
-
 /// Map a gRPC status code to the closest HTTP status — the reverse of
 /// [`http_reject_status_to_grpc_status`]. Used to feed the adaptive-concurrency
 /// limiter a backend-health signal for gRPC responses whose failure rides in the
@@ -4927,10 +4921,6 @@ impl GrpcPooledSender {
             inner_lease: Some(Arc::new(lease)),
         }
     }
-
-    fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
-        None
-    }
 }
 
 impl std::ops::Deref for GrpcPooledSender {
@@ -4975,18 +4965,6 @@ impl std::fmt::Display for GrpcDispatchSendError {
 }
 
 impl GrpcDispatchSender {
-    /// The backend socket this transport writes to, when it can safely support
-    /// a per-request post-EOS send-queue drain bound.
-    ///
-    /// All current variants return `None`: H2 is multiplexed, while mesh-mTLS
-    /// owns its socket outside this dispatcher.
-    fn backend_socket(&self) -> Option<Arc<crate::proxy::backend_send_queue::BackendSocketHandle>> {
-        match self {
-            Self::H2(sender) => sender.backend_socket(),
-            Self::MeshMtls(_) => None,
-        }
-    }
-
     /// Send the outbound gRPC request. The mesh-mTLS arm wraps the SHARED
     /// [`GrpcBody`] rather than re-encoding it, so request framing (DATA plus a
     /// terminal TRAILERS frame), inline receive-limit accounting, upload
@@ -5971,10 +5949,10 @@ async fn proxy_grpc_streaming_dispatch(
     // connect is not backend-body write inactivity. Start the write watermark
     // only now that a sender exists and immediately before dispatch.
     if let Some(pump) = upload_pump.as_mut() {
+        // No backend socket is bound: gRPC rides multiplexed HTTP/2 (and
+        // mesh-mTLS owns its socket outside this dispatcher), so there is no
+        // per-request post-EOS send-queue drain bound (issue #4411).
         pump.arm_write_watermark();
-        // Same seam publishes the backend socket, so `backend_write_timeout_ms`
-        // also bounds the post-EOS drain of the local send queue (issue #4411).
-        pump.bind_backend_socket(sender.backend_socket());
     }
     // The response-header wait is held to the authorization lifetime as well
     // (GHSA-xcg4-wj3x-gjj2) when the credential expires before the wait's own
@@ -6515,10 +6493,10 @@ pub(crate) async fn proxy_grpc_request_core(
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1)
     });
     if let Some(pump) = upload_pump.as_mut() {
+        // No backend socket is bound: gRPC rides multiplexed HTTP/2 (and
+        // mesh-mTLS owns its socket outside this dispatcher), so there is no
+        // per-request post-EOS send-queue drain bound (issue #4411).
         pump.arm_write_watermark();
-        // Same seam publishes the backend socket, so `backend_write_timeout_ms`
-        // also bounds the post-EOS drain of the local send queue (issue #4411).
-        pump.bind_backend_socket(sender.backend_socket());
     }
     let map_send_err = |e: GrpcDispatchSendError| {
         map_grpc_dispatch_send_error(e, |e| {

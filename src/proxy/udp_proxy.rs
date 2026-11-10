@@ -930,7 +930,6 @@ where
 /// still hold an `Arc` in `last_client`. Clearing on the fast-path expired
 /// check prevents a quiet listener from pinning the backend socket/session
 /// until some later datagram overwrites the cache.
-#[allow(dead_code)] // also reached via `_test_support`
 pub(crate) fn take_udp_last_client_if_live<T>(
     last_client: &mut Option<(UdpSessionKey, Arc<T>)>,
     client_addr: &UdpSessionKey,

@@ -53,11 +53,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 pub enum ProxyProtocolResult {
     /// A forwarded source address was parsed and should be used as the
     /// resolved `client_ip`. The socket peer remains the `direct_client_ip`.
-    Forwarded {
-        src: SocketAddr,
-        #[allow(dead_code)]
-        dst: SocketAddr,
-    },
+    Forwarded { src: SocketAddr, dst: SocketAddr },
     /// The header was a v2 LOCAL command or a v1/v2 UNKNOWN/unrecognised
     /// family — treat the socket peer as the client (health checks from the LB
     /// itself; pass-through for connection-level checks).

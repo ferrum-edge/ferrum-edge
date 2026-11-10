@@ -339,7 +339,6 @@ impl AuthorizationConnectionCloser {
     /// mask a silent `watch::Sender::send` drop. Production observes the same
     /// value through [`subscribe`](Self::subscribe) and
     /// [`authorization_close_requested`].
-    #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
     #[must_use]
     pub fn close_requested(&self) -> bool {
         *self.0.borrow()

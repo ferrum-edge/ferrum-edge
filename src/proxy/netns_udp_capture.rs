@@ -2254,26 +2254,14 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             }))
         };
 
-        // Best-effort in-netns teardown helper (pod removal / failure paths).
-        // `Fn` (clones its captures per call) so it can be borrowed on the error
-        // paths AND moved into the loop's cleanup task.
-        let teardown = {
-            let netns = netns.clone();
-            // A verified replacement guard may coexist with this live producer
-            // while its task shuts down. Remove only normal capture state here;
-            // guard ownership lives in the manager and must survive until the
-            // replacement socket and rules are ready.
-            let teardown_script = capture_teardown_script.clone();
-            move || {
-                let netns = netns.clone();
-                let teardown_script = teardown_script.clone();
-                let _ = super::netns_capture::run_in_netns(netns.as_ref(), move || {
-                    run_shell_script(&teardown_script)
-                });
-            }
-        };
-        // Capture-only cleanup leaves the pre-bind fail-closed guard in place.
-        // Used on bind/adoption/setup failures so a retry never reopens egress.
+        // Best-effort in-netns teardown of the normal capture rules only. It
+        // leaves the pre-bind fail-closed guard in place, so a retry after a
+        // bind/adoption/setup failure never reopens egress, and a verified
+        // replacement guard that coexists with this producer while its task
+        // shuts down survives: guard ownership lives in the manager until the
+        // replacement socket and rules are ready. `Fn` (clones its captures per
+        // call) so it can be borrowed on the error paths AND moved into the
+        // loop's cleanup task.
         let teardown_capture_rules = {
             let netns = netns.clone();
             let capture_teardown_script = capture_teardown_script.clone();
@@ -2439,7 +2427,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                         );
                     }
                 } else {
-                    teardown();
+                    teardown_capture_rules();
                 }
                 debug!(pod_uid = %pod_uid, retain_guard = *retain_guard_rx.borrow(), "Ambient UDP producer: per-pod-netns UDP stop cleanup completed");
             })

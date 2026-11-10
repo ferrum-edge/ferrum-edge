@@ -3515,7 +3515,14 @@ fn parse_reqwest_method(method: &str) -> Result<reqwest::Method, ()> {
 ///
 /// Request-body plugins require buffering and transformation before forwarding,
 /// which the direct H2 path does not implement. Those requests must stay on the
-/// reqwest path so the final backend body matches the plugin output.
+/// reqwest path so the final backend body matches the plugin output; retry body
+/// replay forces reqwest the same way.
+///
+/// `get_sender()` may dial or probe the backend, so callers must use this
+/// predicate before opening an H2 sender. Body-size limits do not gate it: they
+/// are enforced in-path on the direct-H2 sender / response collectors (413 /
+/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`), including frame by
+/// frame when `Content-Length` is absent.
 pub(crate) fn can_use_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
@@ -3524,38 +3531,12 @@ pub(crate) fn can_use_direct_http2_pool(
     enable_http2 && !retain_request_body && !requires_request_body_buffering
 }
 
-/// Whether HTTPS requests may dispatch over the direct hyper HTTP/2 backend pool.
-///
-/// `get_sender()` may dial or probe the backend, so callers must use this
-/// predicate before opening an H2 sender. Body-size limits are enforced
-/// in-path on the direct-H2 sender / response collectors (413 /
-/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`) — including
-/// frame-by-frame when `Content-Length` is absent — so nonzero
-/// `FERRUM_MAX_*_BODY_SIZE_BYTES` no longer disqualifies ordinary
-/// (non-SNI) routes from the multiplexed pool. The retained size-limit
-/// parameters keep call-site signatures stable; they do not gate
-/// dispatch. Retry body replay and request-body-buffering plugins still
-/// force the reqwest path via [`can_use_direct_http2_pool`].
-pub(crate) fn can_dispatch_direct_http2_pool(
-    enable_http2: bool,
-    retain_request_body: bool,
-    requires_request_body_buffering: bool,
-    _max_request_body_size_bytes: usize,
-    _max_response_body_size_bytes: usize,
-) -> bool {
-    can_use_direct_http2_pool(
-        enable_http2,
-        retain_request_body,
-        requires_request_body_buffering,
-    )
-}
-
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
 /// folding in the DestinationRule `connectionPool.http.h2UpgradePolicy`
 /// override on top of the capability-registry verdict.
 ///
 /// `can_dispatch` is the body-compat/`enable_http2` gate
-/// ([`can_dispatch_direct_http2_pool`]). `supports` is the registry's
+/// ([`can_use_direct_http2_pool`]). `supports` is the registry's
 /// `h2_tls == Supported`; `known_unsupported` is `h2_tls == Unsupported`
 /// (absence / `Unknown` is neither). `requires_sni` forces direct-H2 because
 /// reqwest cannot apply a per-request backend SNI.
@@ -8188,7 +8169,6 @@ pub struct ProxyState {
     /// for the consumer: [`ProxyState::advance_backend_security_generation`]
     /// sends here AND stores into `backend_svid_generation` itself, because the
     /// publication fence lifts before the consumer task can be scheduled.
-    #[allow(dead_code)]
     pub backend_svid_rotation_tx: tokio::sync::watch::Sender<u64>,
     /// Current backend client SVID generation shared by backend pools.
     ///
@@ -8196,7 +8176,6 @@ pub struct ProxyState {
     /// by [`ProxyState::advance_backend_security_generation`]. Both use
     /// `fetch_max`, so the generation is monotonic under any interleaving of
     /// the two writers.
-    #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
     pub backend_svid_generation: BackendSvidGeneration,
     /// Shared SOCK_OPS metrics state populated by the kernel ringbuf
     /// consumer. `Some(_)` only when the gateway runs the SOCK_OPS event
@@ -11648,6 +11627,7 @@ impl ProxyState {
             Arc::clone(&request_epoch),
             Arc::clone(&mesh_inbound_tls_policy),
             Arc::clone(&mesh_inbound_admission),
+            pool_shard_amount,
         ));
 
         let state = Self {
@@ -11671,7 +11651,7 @@ impl ProxyState {
                 // Pre-populate common HTTP status codes so the hot path uses
                 // DashMap::get() (shared read lock) instead of entry() (write lock).
                 // After warmup, virtually all requests hit the fast read path.
-                let map = dashmap::DashMap::with_capacity(16);
+                let map = dashmap::DashMap::with_capacity_and_shard_amount(16, pool_shard_amount);
                 for code in [
                     200u16, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502,
                     503, 504,
@@ -52180,12 +52160,10 @@ async fn proxy_to_backend(
         // response collectors (413 / 502), including for ordinary
         // (non-SNI) routes — same semantics as the SNI arm and the
         // reqwest path's ErrorClass / connection_error contracts.
-        let direct_h2_can_dispatch = can_dispatch_direct_http2_pool(
+        let direct_h2_can_dispatch = can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-            effective_max_request_body_size_bytes,
-            effective_max_response_body_size_bytes,
         );
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
         // (projected onto the effective proxy) into the registry verdict. Scope
@@ -68227,10 +68205,8 @@ mod tests {
             trip_on_connection_errors: true,
         });
         cb.record_failure(500, false, false);
-        assert!(
-            cb.can_execute().unwrap(),
-            "the request claims the probe slot"
-        );
+        let (ticket, _) = cb.admit().expect("the request claims the probe slot");
+        assert!(ticket.is_probe(), "the request claims the probe slot");
         assert_eq!(cb.half_open_in_flight(), 1);
 
         let stalled_upload = std::future::pending::<Result<(), ()>>();
@@ -68240,7 +68216,20 @@ mod tests {
             "a never-ending buffered upload must hit the configured deadline"
         );
 
-        cb.record_neutral(true);
+        // Settle through the production path: the upload-timeout arms return
+        // `request_body_timeout_backend_response`, and the outcome recorder
+        // classifies it with `apply_circuit_breaker_outcome`. A 408 is not in
+        // `failure_status_codes`, so a non-neutral class would record a
+        // success here and close the breaker.
+        let response = super::request_body_timeout_backend_response(None);
+        assert_eq!(response.status_code, 408);
+        super::backend_dispatch::apply_circuit_breaker_outcome(
+            &cb,
+            response.status_code,
+            response.connection_error,
+            response.error_class,
+            ticket,
+        );
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(
             cb.state_name(),
@@ -75869,14 +75858,31 @@ mod tests {
     /// fingerprint only asserts the hard-to-drive HBONE-vs-gate source order.
     #[test]
     fn registry_only_route_miss_gate_precedes_generic_not_found() {
-        let src = include_str!("mod.rs");
+        // Production source only: this test's own needles live in the test
+        // module and would otherwise satisfy every lookup below.
+        let full_src = include_str!("mod.rs");
+        let test_module_start = full_src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("proxy test module marker not found");
+        let src = &full_src[..test_module_start];
+        let gate_needle = "enforcement.http_route_miss_reject_status";
+        let not_found_needle = "No route matched for request path";
+        assert_eq!(
+            src.matches(gate_needle).count(),
+            1,
+            "exactly one REGISTRY_ONLY route-miss gate call is expected"
+        );
+        assert_eq!(
+            src.matches(not_found_needle).count(),
+            1,
+            "exactly one generic route-miss log is expected"
+        );
         let gate_pos = src
-            .find("enforcement.http_route_miss_reject_status")
+            .find(gate_needle)
             .expect("REGISTRY_ONLY route-miss gate helper call not found");
-        let not_found_pos = gate_pos
-            + src[gate_pos..]
-                .find("No route matched for request path")
-                .expect("generic route-miss log after the REGISTRY_ONLY gate not found");
+        let not_found_pos = src
+            .find(not_found_needle)
+            .expect("generic route-miss log not found");
         assert!(
             gate_pos < not_found_pos,
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
@@ -81128,14 +81134,26 @@ mod tests {
         // Source-level seam: every backend retry family that can rotate targets
         // must call the shared allocation-free helper with the original route
         // ceiling rather than a permanently lowered initial-port projection.
+        //
+        // Scan only the production part of this file: the test module repeats
+        // every needle below, so a whole-file scan keeps passing after the
+        // production calls are deleted.
         let helper = "retry_attempt_allowed_for_target";
-        let proxy_src = include_str!("mod.rs");
-        assert!(
-            proxy_src.matches(helper).count() >= 4,
-            "H1/H2 WebSocket, gRPC, and HTTP retry loops must call {helper}"
+        let full_src = include_str!("mod.rs");
+        let test_module_start = full_src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("proxy test module marker not found");
+        let proxy_src = &full_src[..test_module_start];
+        let helper_call = format!("{helper}(");
+        let helper_definition = format!("fn {helper}(");
+        assert_eq!(
+            proxy_src.matches(&helper_call).count() - proxy_src.matches(&helper_definition).count(),
+            4,
+            "H1/H2 WebSocket, gRPC, and HTTP retry loops and current_retry_attempt_allowed must \
+             call {helper}; update this guard when adding or removing a rotating retry loop"
         );
         assert!(
-            proxy_src.contains("route_retry_ceiling"),
+            proxy_src.contains("route_retry_ceiling(&proxy)"),
             "H1/H2 path must retain the original route retry ceiling"
         );
         assert!(

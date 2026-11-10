@@ -912,8 +912,8 @@ impl<B: NetnsBackend> NetnsCaptureManager<B> {
 /// init container WITHOUT pod-scoped `hostPID` and is handed the host's own
 /// procfs on a read-only mount instead. See
 /// [`first_pid_in_cgroup_via_proc_root_until`].
-// Only the Linux netns paths consume these; the bin target compiles this module
-// privately, so they would read as dead code on the macOS/Windows builds.
+// Only the Linux netns paths consume these, so they would read as dead code on
+// the macOS/Windows builds.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const DEFAULT_PROC_ROOT: &str = "/proc";
 

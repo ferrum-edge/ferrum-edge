@@ -1067,13 +1067,17 @@ const NO_DEADLINE: u64 = u64::MAX;
 const TRUST_NOT_IN_FORCE_WARN_INTERVAL_NANOS: u64 = 60 * 1_000_000_000;
 
 impl HboneAdmissionFence {
+    /// `shard_amount` sizes the live-tunnel map, which takes an insert, a
+    /// lookup and a remove per HBONE CONNECT; pass the gateway's
+    /// `crate::util::sharding::pool_shard_amount` value (a power of two >= 2).
     pub fn new(
         request_epoch: Arc<RequestEpochStore>,
         mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
         mesh_inbound_admission: SharedInboundAdmissionArtifact,
+        shard_amount: usize,
     ) -> Self {
         Self {
-            tunnels: DashMap::new(),
+            tunnels: DashMap::with_shard_amount(shard_amount),
             next_id: AtomicU64::new(1),
             sweeps_requested: AtomicU64::new(0),
             sweeps_completed: AtomicU64::new(0),
