@@ -628,6 +628,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`traffic_policy.connection_pool_http.http1_max_pending_requests`,
   `max_connections`, `tcp_idle_timeout_seconds`, …) with the Istio name in
   parentheses, instead of Istio paths that do not exist in the native schema.
+- **Quieter mesh DNS overload and headless-service logs** (#7245). The mesh
+  DNS proxy's per-query overload warnings (query and TCP session limits, full
+  forward queue, upstream forward limit and transaction-ID exhaustion,
+  upstream timeouts) are now sampled to one warning per site per 10 seconds
+  with a suppressed count, so log volume no longer grows with query rate under
+  saturation. A headless service with TCP-family ports no longer warns on
+  every slice apply that it "cannot be egress-routed": its direct pod-IP dials
+  are routed, so the message is now a debug event; the UDP equivalent stays a
+  warning but is sampled.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

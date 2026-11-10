@@ -283,9 +283,9 @@ pub struct MeshService {
     /// stream, and a port number alone is never enough to pick a service
     /// (two services may share one). Populated by the K8s translator from
     /// the Service spec; file-source operators set it directly. Optional:
-    /// HTTP-family routing never consults it, and a TCP-family port on a
-    /// VIP-less service simply cannot be egress-routed (warned at
-    /// materialization, the captured connection fails as before).
+    /// HTTP-family routing never consults it. A TCP-family port on a VIP-less
+    /// (headless) service gets no VIP route; direct pod-IP dials to its
+    /// workloads are still routed by workload address.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cluster_ips: Vec<String>,
     /// Kubernetes Service `metadata.uid` when translated from a cluster

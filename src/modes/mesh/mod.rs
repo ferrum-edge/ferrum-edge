@@ -8039,10 +8039,11 @@ fn materialize_mesh_outbound_proxies(
 /// CONNECT tunnel to the peer's `:15006`; the destination sidecar's inbound
 /// listener recognizes a bare H2 CONNECT and relays it like HBONE does) — but
 /// the materialization is identical: per-port upstreams keyed to the service
-/// VIP. Headless / VIP-less services materialize nothing routable and warn (raw
-/// streams carry no Host, so captured dials are matched strictly by `(VIP,
-/// port)`). NodeWaypoint skips this materialization until the eBPF datapath can
-/// deliver HBONE to a reachable peer address.
+/// VIP. Headless / VIP-less services get no VIP upstream (raw streams carry no
+/// Host, so captured dials are matched strictly by `(VIP, port)`); their direct
+/// pod-IP dials are still routed through the per-workload upstreams built at the
+/// end of this function. NodeWaypoint skips this materialization until the eBPF
+/// datapath can deliver HBONE to a reachable peer address.
 fn materialize_mesh_outbound_tcp_upstreams(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -8071,15 +8072,16 @@ fn materialize_mesh_outbound_tcp_upstreams(
             continue;
         }
         if service.cluster_ips.is_empty() {
-            warn!(
+            // Headless services land here on every apply, and their direct
+            // pod-IP dials are routed by the per-workload index below, so this
+            // is not an operator-actionable warning.
+            debug!(
                 service = %sanitize_startup_scalar(service.name.to_string()),
                 namespace = %sanitize_startup_scalar(service.namespace.to_string()),
                 tcp_ports = tcp_ports.len(),
-                "In-mesh service declares stream-family (TCP) ports but carries no cluster_ips; \
-                 raw-TCP egress maps captured original destinations to services strictly by \
-                 service VIP (a raw stream has no Host header and a bare port number is \
-                 ambiguous), so these ports cannot be egress-routed. Headless services are \
-                 expected here; otherwise populate cluster_ips."
+                "In-mesh service declares stream-family (TCP) ports but carries no cluster_ips \
+                 (headless or VIP-less); no VIP route is materialized for them. Direct pod-IP \
+                 dials are routed by workload address."
             );
             continue;
         }
@@ -8299,7 +8301,8 @@ fn materialize_mesh_outbound_udp_upstreams(
             continue;
         }
         if service.cluster_ips.is_empty() {
-            warn!(
+            // Sampled: a headless service repeats this on every slice apply.
+            crate::warn_sampled!(
                 service = %sanitize_startup_scalar(service.name.to_string()),
                 namespace = %sanitize_startup_scalar(service.namespace.to_string()),
                 udp_ports = udp_ports.len(),

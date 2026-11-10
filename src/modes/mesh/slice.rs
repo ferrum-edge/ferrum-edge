@@ -2746,9 +2746,12 @@ fn narrow_workload_identities(
         );
     } else if admitted_services.is_empty() {
         debug!(
-            node_id = request.node_id.as_str(),
-            namespace = request.namespace.as_str(),
-            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
+            node_id = %sanitize_startup_cause(format!("{:?}", request.node_id.as_str()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", request.namespace.as_str()), &[]),
+            workload_spiffe_id = %sanitize_startup_cause(
+                format!("{:?}", request.workload_spiffe_id.as_deref().unwrap_or("")),
+                &[]
+            ),
             "Sidecar workload identity narrowing found no admitted services; slice workloads will be empty"
         );
     }
@@ -4126,8 +4129,11 @@ fn resolve_applicable_sidecar_outbound_policy(
             && let Some(policy) = selected_policy
         {
             debug!(
-                sidecar = %sidecar.name,
-                namespace = %sidecar.namespace,
+                sidecar = %sanitize_startup_cause(format!("{:?}", sidecar.name.as_str()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", sidecar.namespace.as_str()),
+                    &[]
+                ),
                 policy = ?policy,
                 "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
             );

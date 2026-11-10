@@ -690,7 +690,7 @@ impl MeshDnsProxy {
                                 ) {
                                     let _ = socket.send_to(&response, src).await;
                                 }
-                                warn!(src = %src, "DNS proxy query concurrency limit reached");
+                                crate::warn_sampled!(src = %src, "DNS proxy query concurrency limit reached");
                                 continue;
                             };
                             let packet = buf[..len].to_vec();
@@ -774,7 +774,7 @@ fn try_acquire_dns_tcp_session_permit(
     match semaphore.clone().try_acquire_owned() {
         Ok(permit) => Some(permit),
         Err(_) => {
-            warn!(client = %src, "DNS proxy TCP session concurrency limit reached");
+            crate::warn_sampled!(client = %src, "DNS proxy TCP session concurrency limit reached");
             None
         }
     }
@@ -822,7 +822,7 @@ async fn handle_dns_query_udp(
                     max_response_size,
                 );
                 let _ = socket.send_to(&response, src).await;
-                warn!(client = %src, "DNS upstream forward queue is full");
+                crate::warn_sampled!(client = %src, "DNS upstream forward queue is full");
             }
         }
         DnsDecision::Drop => {}
@@ -859,7 +859,11 @@ async fn handle_dns_tcp_connection(
         }
 
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-            warn!(client = %src, payload_bytes = len, "DNS proxy TCP query concurrency limit reached");
+            crate::warn_sampled!(
+                client = %src,
+                payload_bytes = len,
+                "DNS proxy TCP query concurrency limit reached"
+            );
             return;
         };
 
@@ -1241,9 +1245,9 @@ async fn run_udp_forwarder_with_entropy(
                 if pending.len() >= max_outstanding {
                     if upstream_id_space_exhausted(pending.len()) {
                         record_upstream_id_exhaustion();
-                        warn!("DNS upstream transaction ID space exhausted");
+                        crate::warn_sampled!("DNS upstream transaction ID space exhausted");
                     } else {
-                        warn!(
+                        crate::warn_sampled!(
                             client = %request.src,
                             outstanding = pending.len(),
                             "DNS upstream forward limit reached"
@@ -1271,7 +1275,7 @@ async fn run_udp_forwarder_with_entropy(
                     }
                     Err(UpstreamIdAllocError::Exhausted) => {
                         record_upstream_id_exhaustion();
-                        warn!("DNS upstream transaction ID space exhausted");
+                        crate::warn_sampled!("DNS upstream transaction ID space exhausted");
                         send_udp_servfail(&client_socket, &request.query, request.src).await;
                         continue;
                     }
@@ -1379,7 +1383,7 @@ async fn run_udp_forwarder_with_entropy(
                 for id in expired_ids.drain(..) {
                     if let Some(request) = pending.remove(&id) {
                         request.abort.abort();
-                        warn!(
+                        crate::warn_sampled!(
                             client = %request.client,
                             upstream = %upstream,
                             "Upstream DNS query timed out"

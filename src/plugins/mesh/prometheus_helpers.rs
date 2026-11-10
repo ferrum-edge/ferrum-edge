@@ -1190,7 +1190,8 @@ pub fn mesh_tracing_spans_dropped_count(
 /// token refuses commit publication while retaining the last committed state.
 ///
 /// `reason` is a compile-time constant
-/// (`MeshRevisionRejectReason::as_metric_label` or `missing_apply_token`), so
+/// (`MeshRevisionRejectReason::as_metric_label` or
+/// `revision::MISSING_APPLY_TOKEN_REJECTION_LABEL`), so
 /// cardinality is fixed and no control-plane-supplied authority or sequence can
 /// reach `/metrics`. Local-slice detail rides the JWT-authenticated
 /// `GET /mesh/config-drift` `revision` block; local and remote-discovery gates
