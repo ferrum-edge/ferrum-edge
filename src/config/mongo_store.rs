@@ -1141,67 +1141,6 @@ mod inner {
         }
     }
 
-    /// Step labels for the standalone-mongod (no-replica-set) `delete_proxy`
-    /// path, in execution order. Documented as data so the order can be
-    /// regression-tested without a running MongoDB server.
-    pub(super) const DELETE_PROXY_SEQUENTIAL_ORDER: &[&str] = &[
-        "delete_proxy_document",
-        "delete_proxy_scoped_plugin_configs",
-        "cleanup_orphaned_proxy_group_plugins",
-    ];
-
-    /// Step labels for the standalone-mongod (no-replica-set)
-    /// `replace_api_spec_bundle` delete phase, in execution order. The proxy
-    /// document is removed first so any later partial failure leaves no live
-    /// route with missing plugin/upstream dependencies.
-    pub(super) const REPLACE_API_SPEC_STANDALONE_DELETE_ORDER: &[&str] = &[
-        "delete_proxy_document",
-        "delete_spec_owned_plugin_configs",
-        "delete_spec_owned_upstreams",
-        "delete_api_spec_document",
-    ];
-
-    /// Step labels for the standalone-mongod (no-replica-set)
-    /// `delete_api_spec` path, in execution order. The proxy document is removed
-    /// first for the same runtime-safety reason as `delete_proxy`.
-    pub(super) const DELETE_API_SPEC_STANDALONE_ORDER: &[&str] = &[
-        "delete_proxy_document",
-        "delete_spec_owned_plugin_configs",
-        "delete_proxy_scoped_plugin_configs",
-        "cleanup_orphaned_proxy_group_plugins",
-        "delete_spec_owned_upstreams",
-        "delete_api_spec_document",
-    ];
-
-    /// Step labels for standalone-mongod api-spec bundle inserts/reinserts.
-    /// Dependency documents are created before the proxy document so polling can
-    /// never observe a live proxy that points at missing plugin/upstream docs.
-    pub(super) const API_SPEC_STANDALONE_INSERT_ORDER: &[&str] = &[
-        "insert_upstream_document",
-        "insert_plugin_config_documents",
-        "insert_proxy_document",
-        "insert_api_spec_document",
-    ];
-
-    /// Step labels for compensating rollback after a partial standalone insert.
-    /// The proxy is removed before plugin/upstream dependencies so rollback
-    /// failures preserve a runtime-safe route if the proxy cannot be deleted.
-    pub(super) const COMPENSATE_BUNDLE_INSERT_ORDER: &[&str] = &[
-        "delete_api_spec_document",
-        "delete_proxy_document",
-        "delete_plugin_config_documents",
-        "delete_upstream_document",
-    ];
-
-    /// Step labels for the standalone-mongod (no-replica-set) `update_proxy`
-    /// path, in execution order. Cleanup runs after the replace because the
-    /// new proxy.plugins array determines which proxy_group plugin_configs
-    /// are still referenced.
-    pub(super) const UPDATE_PROXY_SEQUENTIAL_ORDER: &[&str] = &[
-        "replace_proxy_document",
-        "cleanup_orphaned_proxy_group_plugins",
-    ];
-
     /// Topology label passed to Mongo reconnect publication test hooks
     /// (issue #3001).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20299,29 +20238,6 @@ mod inner {
         // -------------------------------------------------------------------
 
         #[test]
-        fn delete_proxy_sequential_order_proxy_first() {
-            assert_eq!(
-                DELETE_PROXY_SEQUENTIAL_ORDER,
-                &[
-                    "delete_proxy_document",
-                    "delete_proxy_scoped_plugin_configs",
-                    "cleanup_orphaned_proxy_group_plugins",
-                ],
-                "delete_proxy must delete the proxy document BEFORE its plugin_configs \
-                 so a partial failure can't leave a dangling-reference proxy in the DB"
-            );
-        }
-
-        #[test]
-        fn delete_proxy_sequential_order_first_step_is_proxy() {
-            assert_eq!(
-                DELETE_PROXY_SEQUENTIAL_ORDER.first().copied(),
-                Some("delete_proxy_document"),
-                "delete_proxy MUST start by removing the proxy document"
-            );
-        }
-
-        #[test]
         fn delete_proxy_standalone_implementation_deletes_proxy_before_plugins() {
             let source = include_str!("mongo_store.rs");
             let standalone_start = source
@@ -20390,35 +20306,6 @@ mod inner {
         }
 
         #[test]
-        fn update_proxy_sequential_order_replace_then_cleanup() {
-            assert_eq!(
-                UPDATE_PROXY_SEQUENTIAL_ORDER,
-                &[
-                    "replace_proxy_document",
-                    "cleanup_orphaned_proxy_group_plugins",
-                ],
-                "update_proxy must replace the proxy document BEFORE cleaning up \
-                 orphan proxy_group plugin_configs so the cleanup observes the new \
-                 plugins.plugin_config_id references"
-            );
-        }
-
-        #[test]
-        fn replace_api_spec_standalone_delete_order_proxy_first() {
-            assert_eq!(
-                REPLACE_API_SPEC_STANDALONE_DELETE_ORDER,
-                &[
-                    "delete_proxy_document",
-                    "delete_spec_owned_plugin_configs",
-                    "delete_spec_owned_upstreams",
-                    "delete_api_spec_document",
-                ],
-                "standalone replace_api_spec_bundle must delete the proxy before \
-                 dependencies so partial failures leave no live dangling route"
-            );
-        }
-
-        #[test]
         fn replace_api_spec_standalone_implementation_deletes_proxy_before_plugins() {
             let source = include_str!("mongo_store.rs");
             let standalone_start = source
@@ -20464,23 +20351,6 @@ mod inner {
         }
 
         #[test]
-        fn delete_api_spec_standalone_order_proxy_first() {
-            assert_eq!(
-                DELETE_API_SPEC_STANDALONE_ORDER,
-                &[
-                    "delete_proxy_document",
-                    "delete_spec_owned_plugin_configs",
-                    "delete_proxy_scoped_plugin_configs",
-                    "cleanup_orphaned_proxy_group_plugins",
-                    "delete_spec_owned_upstreams",
-                    "delete_api_spec_document",
-                ],
-                "standalone delete_api_spec must delete the proxy before \
-                 plugin cleanup so partial failures stay runtime-safe"
-            );
-        }
-
-        #[test]
         fn delete_api_spec_standalone_implementation_deletes_proxy_before_plugins() {
             let source = include_str!("mongo_store.rs");
             let delete_api_spec_start = source
@@ -20503,21 +20373,6 @@ mod inner {
                 proxy_delete < plugin_cleanup,
                 "standalone delete_api_spec must remove the proxy before \
                  deleting plugin_configs"
-            );
-        }
-
-        #[test]
-        fn api_spec_standalone_insert_order_dependencies_before_proxy() {
-            assert_eq!(
-                API_SPEC_STANDALONE_INSERT_ORDER,
-                &[
-                    "insert_upstream_document",
-                    "insert_plugin_config_documents",
-                    "insert_proxy_document",
-                    "insert_api_spec_document",
-                ],
-                "standalone api-spec bundle writes must create dependencies before \
-                 the proxy document becomes pollable"
             );
         }
 
@@ -20568,20 +20423,6 @@ mod inner {
                 plugin_insert < proxy_insert,
                 "standalone replace_api_spec_bundle must reinsert plugin_configs before \
                  the proxy so a partial reinsert cannot expose a proxy with missing plugins"
-            );
-        }
-
-        #[test]
-        fn compensate_bundle_insert_order_proxy_before_dependencies() {
-            assert_eq!(
-                COMPENSATE_BUNDLE_INSERT_ORDER,
-                &[
-                    "delete_api_spec_document",
-                    "delete_proxy_document",
-                    "delete_plugin_config_documents",
-                    "delete_upstream_document",
-                ],
-                "compensating rollback must remove the proxy before dependencies"
             );
         }
 
