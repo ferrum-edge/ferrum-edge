@@ -892,11 +892,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   above `/64`** (GHSA-grwg-8jpx-q8p9). With a `/96` or `/128` prefix every
   client in one `/64` still shared a single
   `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` budget.
-- **BREAKING — an invalid `FERRUM_STREAM_PROXY_BIND_ADDRESS` refuses startup**
+- **An invalid `FERRUM_STREAM_PROXY_BIND_ADDRESS` refuses startup**
   (GHSA-9gqf-79hq-v2v2). A value that is not an IP address used to fall back
   silently to `FERRUM_PROXY_BIND_ADDRESS` (`0.0.0.0` by default), exposing
   TCP/UDP/DTLS stream listeners meant for loopback or an internal interface.
-  It is now validated like the proxy and admin bind addresses.
+  It is now validated like the proxy and admin bind addresses; only a
+  deployment that was already misconfigured is affected, and it must set a
+  literal IP address.
 - **Stream refusals from untrusted sources no longer log one `WARN` each**
   (GHSA-wfg6-vhp9-hj45). TCP stream PROXY-protocol refusals and DTLS accept
   refusals are sampled, and a plain-UDP per-source session refusal is logged at
