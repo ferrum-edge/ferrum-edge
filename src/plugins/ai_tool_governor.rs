@@ -143,7 +143,7 @@ use super::utils::sse::{
 };
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
-    ResponseStreamInspector,
+    ResponseStreamInspector, allocate_response_stream_handoff_id,
 };
 
 /// Accepted top-level configuration keys. Nested free-form maps (`tools` tool
@@ -1977,13 +1977,15 @@ pub struct AiToolGovernor {
     /// True when any tool policy uses `redact_args` — enables the response body
     /// transform on the buffered path.
     needs_response_transform: bool,
-    /// Inspector-completed observability batches waiting for the mutable
-    /// response-stream terminal hook. Entries exist only for concrete streams
-    /// that attached this plugin's inspector with metadata emission enabled.
-    pending_stream_metadata: Arc<DashMap<u64, StreamMetadataSlot>>,
+    /// This instance's key in the request-owned response-stream handoff, where
+    /// the stream inspector leaves its observability batch for the mutable
+    /// terminal hook. Published only for concrete streams that attached this
+    /// plugin's inspector with metadata emission enabled.
+    stream_handoff_key: u64,
 }
 
-type StreamMetadataSlot = Arc<std::sync::Mutex<HashMap<String, String>>>;
+type StreamMetadataCell = std::sync::Mutex<HashMap<String, String>>;
+type StreamMetadataSlot = Arc<StreamMetadataCell>;
 
 impl AiToolGovernor {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
@@ -2035,9 +2037,7 @@ impl AiToolGovernor {
                 },
                 engine: Arc::new(engine),
                 needs_response_transform: false,
-                pending_stream_metadata: Arc::new(DashMap::with_shard_amount(
-                    approval_cache_shard_amount,
-                )),
+                stream_handoff_key: allocate_response_stream_handoff_id(),
             });
         }
 
@@ -2212,9 +2212,7 @@ impl AiToolGovernor {
             inspect,
             engine: Arc::new(engine),
             needs_response_transform,
-            pending_stream_metadata: Arc::new(DashMap::with_shard_amount(
-                approval_cache_shard_amount,
-            )),
+            stream_handoff_key: allocate_response_stream_handoff_id(),
         })
     }
 
@@ -4744,11 +4742,10 @@ impl Plugin for AiToolGovernor {
         let provider = federation_provider(ctx);
         let corr = self.correlation(ctx, model, provider.as_deref());
         let stream_metadata = if self.engine.observability.emit_metadata
-            && let Some(stream_id) = ctx.response_stream_id()
+            && let Some(handoff) = ctx.response_stream_handoff()
         {
-            let slot = Arc::new(std::sync::Mutex::new(HashMap::new()));
-            self.pending_stream_metadata
-                .insert(stream_id, Arc::clone(&slot));
+            let slot: StreamMetadataSlot = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            handoff.publish(self.stream_handoff_key, Arc::clone(&slot));
             Some(slot)
         } else {
             None
@@ -4770,10 +4767,10 @@ impl Plugin for AiToolGovernor {
         if !self.engine.observability.emit_metadata {
             return;
         }
-        let Some(stream_id) = ctx.response_stream_id() else {
-            return;
-        };
-        let Some((_, slot)) = self.pending_stream_metadata.remove(&stream_id) else {
+        let Some(slot) = ctx
+            .response_stream_handoff()
+            .and_then(|handoff| handoff.take::<StreamMetadataCell>(self.stream_handoff_key))
+        else {
             return;
         };
         let pending = match slot.lock() {
@@ -4795,10 +4792,6 @@ impl AiToolGovernor {
 
     pub fn approval_cache_max_entries() -> usize {
         MAX_APPROVAL_CACHE_ENTRIES
-    }
-
-    pub fn pending_stream_metadata_len(&self) -> usize {
-        self.pending_stream_metadata.len()
     }
 
     /// Maximum distinct values one `ai_tool_governor.*` observation ledger

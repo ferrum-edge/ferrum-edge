@@ -5180,7 +5180,6 @@ async fn streamed_dry_run_decision_writes_transaction_metadata_at_termination() 
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("stream inspector");
-    assert_eq!(plugin.pending_stream_metadata_len(), 1);
 
     let body = legacy_function_call_stream(&["rm_rf"], &["{\"path\":\"/etc\"}"]);
     let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
@@ -5191,7 +5190,6 @@ async fn streamed_dry_run_decision_writes_transaction_metadata_at_termination() 
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
         .await;
-    assert_eq!(plugin.pending_stream_metadata_len(), 0);
     assert_eq!(
         ctx.metadata
             .get("ai_tool_governor.decision")
@@ -5261,10 +5259,9 @@ fn ineligible_stream_creates_no_governor_writeback_slot() {
     let inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 500, Some("text/event-stream"));
     assert!(inspector.is_none());
-    assert_eq!(
-        plugin.pending_stream_metadata_len(),
-        0,
-        "no inspector must mean no per-request write-back allocation"
+    assert!(
+        ctx.response_stream_handoff().is_none(),
+        "no inspector must mean no per-request write-back handoff"
     );
 }
 
@@ -12866,11 +12863,6 @@ async fn drive_ledger_stream(plugin: Arc<AiToolGovernor>, body: String) -> Reque
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
         .await;
-    assert_eq!(
-        plugin.pending_stream_metadata_len(),
-        0,
-        "the terminal hook must release the per-stream slot"
-    );
     ctx
 }
 
