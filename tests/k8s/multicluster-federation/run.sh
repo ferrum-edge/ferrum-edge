@@ -619,6 +619,9 @@ $federated_block
   peer_authentications:
     - name: mesh-strict
       namespace: $NS
+      scope:
+        kind: namespace
+        namespace: $NS
       mtls_mode: strict
 YAML
 )"

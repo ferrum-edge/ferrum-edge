@@ -1180,6 +1180,23 @@ export_to: ["*"]
 
 Per-workload mTLS mode with optional per-port overrides. The object is closed (issue #6616): an unknown member is rejected, because a misspelled `mtls_mode` would otherwise default the policy to `PERMISSIVE`.
 
+Applicability is the same `scope` every other mesh policy resource carries (issue #7243): `kind: mesh_wide`, `kind: namespace` with `namespace`, or `kind: workload_selector` with `selector` (`labels`, plus `namespace` unless the policy is mesh-wide by selector). `namespace` is the declaring namespace. The Kubernetes translator writes the Istio root-namespace rule into `scope`.
+
+```yaml
+name: "api-strict"
+namespace: "default"
+scope:
+  kind: workload_selector
+  selector:
+    labels: { app: "api" }
+    namespace: "default"
+mtls_mode: strict
+port_overrides:
+  8080: permissive
+```
+
+Write `scope` in new configuration. Until a ConfigSync protocol revision removes it, a policy without `scope` is still read: no `selector` (or one with no labels) is a namespace default, and a labelled `selector` selects those workloads in the policy's own namespace. It is converted to `scope` when the document is read and is never written back. A `selector` beside a `scope` must repeat the scope's selector exactly, and a scope-less `selector.namespace` naming another namespace is refused.
+
 ### MeshRequestAuthentication
 
 Declares valid JWTs for a workload scope. Permissive by default (see [RequestAuthentication](#requestauthentication)). The resource and its `jwt_rules`, `from_headers`, and `output_claim_to_headers` entries are closed (issue #6616), so a misspelled `refused` or `jwt_rules` cannot drop a refusal or a token requirement.
@@ -2786,9 +2803,12 @@ optional client authentication on port 8081:
 ```yaml
 name: "mixed-mode"
 namespace: "default"
-selector:
-  labels:
-    app: my-service
+scope:
+  kind: workload_selector
+  selector:
+    labels:
+      app: my-service
+    namespace: "default"
 mtls_mode: permissive
 port_overrides:
   8080: strict
@@ -4874,6 +4894,9 @@ mesh:
   peer_authentications:
     - name: mesh-strict
       namespace: $MESH_NS
+      scope:
+        kind: namespace
+        namespace: $MESH_NS
       mtls_mode: strict
 YAML
 ```
