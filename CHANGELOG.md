@@ -612,6 +612,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unused `prod` was refused with `409` naming the users of `prod-2`, and an id
   such as `cert` or `ca` matched every reference. The guard now compares the
   record id exactly against the last path segment of each reference.
+- **An unknown `FERRUM_ACME_RENEW_CHALLENGE_TYPE` is refused at startup**
+  (#7194). With `FERRUM_ACME_AUTO_RENEW_ENABLED=true`, a value the renewal
+  scheduler cannot parse (for example `http` or `tls-alpn`) used to pass
+  `ferrum-edge validate`, log one warning, and leave the scheduler off, so
+  certificates silently stopped renewing. Startup and `ferrum-edge validate`
+  now reject it. The value is still ignored while auto-renewal is disabled.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With

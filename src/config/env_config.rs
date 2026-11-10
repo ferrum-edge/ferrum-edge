@@ -8712,6 +8712,33 @@ impl EnvConfig {
         // ACME auto-renewal that can never reach the listener (issue #4506).
         self.validate_acme_renewal_reachability()?;
 
+        // ACME auto-renewal with a challenge type it cannot prepare (#7194).
+        self.validate_acme_renewal_challenge_type()?;
+
+        Ok(())
+    }
+
+    /// Reject `FERRUM_ACME_RENEW_CHALLENGE_TYPE` values the renewal scheduler
+    /// cannot parse while `FERRUM_ACME_AUTO_RENEW_ENABLED=true` (issue #7194).
+    ///
+    /// The scheduler used to log one warning and not start, so a typo passed
+    /// `ferrum-edge validate` and renewal silently stopped until the
+    /// certificate expired. Like [`Self::validate_acme_renewal_reachability`],
+    /// automation that cannot renew must not start silently. The configured
+    /// value is withheld from the message.
+    pub fn validate_acme_renewal_challenge_type(&self) -> Result<(), String> {
+        if !self.acme_auto_renew_enabled {
+            return Ok(());
+        }
+        if crate::tls::acme::AcmeRenewalChallengeType::parse(&self.acme_renew_challenge_type)
+            .is_none()
+        {
+            return Err(
+                "FERRUM_ACME_RENEW_CHALLENGE_TYPE must be one of `http01`, `tls_alpn01`, or \
+                 `dns01` when FERRUM_ACME_AUTO_RENEW_ENABLED=true"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 

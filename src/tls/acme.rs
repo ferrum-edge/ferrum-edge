@@ -2713,10 +2713,10 @@ pub fn global_account_store() -> Result<Arc<AcmeAccountStore>, String> {
         .clone()
 }
 
-// Also compiled for `test` without the `acme` feature: the renewal-resumption
-// planner infers this type from persisted challenge records, and that inference
-// is pure store logic that must be provable without real ACME networking.
-#[cfg(any(feature = "acme", test))]
+// Compiled without the `acme` feature too: `EnvConfig::validate` checks
+// `FERRUM_ACME_RENEW_CHALLENGE_TYPE` with `parse` in every build (issue #7194),
+// and the renewal-resumption planner infers this type from persisted challenge
+// records, which is pure store logic provable without real ACME networking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcmeRenewalChallengeType {
     Http01,
@@ -2724,7 +2724,6 @@ pub enum AcmeRenewalChallengeType {
     Dns01,
 }
 
-#[cfg(any(feature = "acme", test))]
 impl AcmeRenewalChallengeType {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
