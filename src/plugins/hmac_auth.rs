@@ -21,10 +21,6 @@
 //!   ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}\n{NONCE}
 //!   ```
 //!
-//! Version 1 (`ferrum-hmac-v1`) is the same base without the trailing
-//! `{NONCE}` field and without any single-use guarantee — see "Replay
-//! protection" below.
-//!
 //! `{PATH}` is the request path component only; `{QUERY}` is the raw query
 //! string as received (percent-encoded, without the leading `?`, empty when
 //! there is no query). Binding the query means query parameters cannot be
@@ -44,7 +40,7 @@
 //! field's literal value.
 //!
 //! When the policy configures `signed_headers`, each named header is appended
-//! to the Ferrum base (after `{NONCE}` under v2, after the digest under v1) as
+//! to the Ferrum base (after `{NONCE}`) as
 //! one `\n{name}:{value}` line in configuration order, where `{value}` is the
 //! RFC 9421 §2.1 canonical value (every field line trimmed of surrounding
 //! whitespace, joined by `", "`). A configured header that is absent fails
@@ -87,17 +83,6 @@
 //! expresses at-most-once application semantics with its own idempotency key —
 //! that is an application/backend contract and is deliberately not conflated
 //! with gateway proof uniqueness.
-//!
-//! ### Legacy `ferrum-hmac-v1`
-//!
-//! Version 1 has no nonce and no replay store: a captured, fully valid signed
-//! request can be replayed verbatim any number of times until the `Date` window
-//! elapses. It is **not** selected by default and cannot be selected by
-//! accident — it requires both `signing_profile: "ferrum-hmac-v1"` and the
-//! explicit `allow_unsafe_replayable_v1: true` acknowledgement — and every
-//! acceptance under it increments the fixed-cardinality
-//! `legacy_unsafe_profile_accepted` counter. Do not use it on non-idempotent
-//! routes.
 //!
 //! ## Retention horizon
 //!
@@ -157,7 +142,6 @@ pub const MAX_HMAC_REPLAY_MAX_ENTRIES: usize = 10_000_000;
 /// Most `signed_headers` entries one policy may require.
 pub const MAX_HMAC_SIGNED_HEADERS: usize = 32;
 const MAX_HMAC_SIGNED_HEADER_NAME_BYTES: usize = 128;
-const HMAC_SIGNING_VERSION_V1: &str = "ferrum-hmac-v1";
 const HMAC_SIGNING_VERSION_V2: &str = "ferrum-hmac-v2";
 const HMAC_SIGNING_VERSION_RFC9421: &str = "rfc9421";
 
@@ -221,8 +205,8 @@ pub(crate) fn bounded_hmac_verification_rounds(configured_limit: usize) -> usize
 ///
 /// Bounded because the fixed replay retention horizon must dominate the widest
 /// acceptance window any admissible configuration can open. A larger freshness
-/// window is also poor practice on its own: it is the interval during which a
-/// captured `ferrum-hmac-v1` request stays replayable.
+/// window is also poor practice on its own: it is the interval a signed request
+/// stays fresh.
 pub const MAX_HMAC_CLOCK_SKEW_SECONDS: u64 = 300;
 
 /// Fixed retention horizon for an admitted `ferrum-hmac-v2` nonce marker.
@@ -272,7 +256,6 @@ const HMAC_NONCE_MAX_CHARS: usize = 86;
 pub const HMAC_AUTH_CONFIG_KEYS: &[&str] = &[
     "clock_skew_seconds",
     "signing_profile",
-    "allow_unsafe_replayable_v1",
     "replay_scope",
     "replay_max_entries",
     "signed_headers",
@@ -291,9 +274,6 @@ fn root_config_keys() -> Vec<&'static str> {
 /// Versioned signing profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HmacSigningProfile {
-    /// Freshness-only. No nonce, no replay store, no single-use guarantee.
-    /// Selectable only with an explicit unsafe acknowledgement.
-    V1Unsafe,
     /// Mandatory client nonce, cryptographically bound and claimed exactly once.
     V2,
     /// RFC 9421 HTTP Message Signatures (`hmac-sha256`), verification only.
@@ -304,15 +284,9 @@ pub enum HmacSigningProfile {
 impl HmacSigningProfile {
     fn version(self) -> &'static str {
         match self {
-            Self::V1Unsafe => HMAC_SIGNING_VERSION_V1,
             Self::V2 => HMAC_SIGNING_VERSION_V2,
             Self::Rfc9421 => HMAC_SIGNING_VERSION_RFC9421,
         }
-    }
-
-    /// Whether accepted requests are claimed against a replay authority.
-    fn is_single_use(self) -> bool {
-        !matches!(self, Self::V1Unsafe)
     }
 }
 
@@ -323,8 +297,6 @@ const REPLAY_CAPACITY_BODY: &str = r#"{"error":"Signed-request replay protection
 const REPLAY_UNAVAILABLE_BODY: &str = r#"{"error":"Signed-request replay protection unavailable"}"#;
 const MISSING_NONCE_BODY: &str = r#"{"error":"Missing nonce in HMAC authorization"}"#;
 const MALFORMED_NONCE_BODY: &str = r#"{"error":"Malformed nonce in HMAC authorization"}"#;
-const UNEXPECTED_NONCE_BODY: &str =
-    r#"{"error":"HMAC authorization nonce is not accepted by this signing profile"}"#;
 const MISSING_DIGEST_BODY: &str = r#"{"error":"Missing required Digest header"}"#;
 const AMBIGUOUS_DIGEST_BODY: &str = r#"{"error":"Ambiguous Digest and Content-Digest headers"}"#;
 const MALFORMED_DIGEST_BODY: &str = r#"{"error":"Malformed digest header"}"#;
@@ -943,7 +915,7 @@ struct ParsedHmacAuthorization {
     username: String,
     algorithm: String,
     signature: String,
-    nonce: Option<String>,
+    nonce: String,
 }
 
 fn is_auth_param_name_char(byte: u8) -> bool {
@@ -1045,18 +1017,9 @@ fn parse_hmac_auth_segment(
     Ok(())
 }
 
-/// Parse the `Authorization: hmac …` parameters.
-///
-/// `profile` decides the nonce contract, and both directions are enforced: v2
-/// requires a syntactically valid nonce, and v1 **rejects** one outright. A
-/// client that sends a nonce believes its request is single-use; silently
-/// ignoring it under v1 would leave that belief unfalsified while the request
-/// stayed replayable, and the nonce is not part of the v1 signing base so it
-/// would also be attacker-mutable.
-fn parse_hmac_authorization(
-    params: &str,
-    profile: HmacSigningProfile,
-) -> Result<ParsedHmacAuthorization, &'static str> {
+/// Parse the `Authorization: hmac …` parameters. A syntactically valid nonce
+/// is mandatory: every Ferrum signed request is single-use.
+fn parse_hmac_authorization(params: &str) -> Result<ParsedHmacAuthorization, &'static str> {
     let mut start = 0usize;
     let mut quoted = false;
     let mut escaped = false;
@@ -1109,23 +1072,10 @@ fn parse_hmac_authorization(
         .filter(|value| !value.is_empty())
         .ok_or(r#"{"error":"Missing signature in HMAC authorization"}"#)?;
 
-    let nonce = match profile {
-        // `rfc9421` never parses `Authorization`; it shares v2's nonce rule
-        // only so this match stays exhaustive and fail-closed.
-        HmacSigningProfile::V2 | HmacSigningProfile::Rfc9421 => {
-            let nonce = nonce.ok_or(MISSING_NONCE_BODY)?;
-            if !nonce_wire_form_is_valid(&nonce) {
-                return Err(MALFORMED_NONCE_BODY);
-            }
-            Some(nonce)
-        }
-        HmacSigningProfile::V1Unsafe => {
-            if nonce.is_some() {
-                return Err(UNEXPECTED_NONCE_BODY);
-            }
-            None
-        }
-    };
+    let nonce = nonce.ok_or(MISSING_NONCE_BODY)?;
+    if !nonce_wire_form_is_valid(&nonce) {
+        return Err(MALFORMED_NONCE_BODY);
+    }
 
     Ok(ParsedHmacAuthorization {
         username,
@@ -1139,13 +1089,13 @@ fn parse_hmac_authorization(
 /// preverified authorization.
 ///
 /// A request can be screened by several `hmac_auth` instances at once — sibling
-/// proxy/global policies, a legacy `ferrum-hmac-v1` instance beside a
-/// `ferrum-hmac-v2` one, or two v2 policies with different replay domains. A
+/// proxy/global policies, an `rfc9421` instance beside a `ferrum-hmac-v2`
+/// one, or two v2 policies with different replay domains. A
 /// staged record therefore may not be a request-global slot: it carries a
 /// Consumer snapshot that one *specific* policy authenticated under one
 /// *specific* signing profile and replay domain. Handing it to another instance
-/// lets that instance skip its own verification and, worse, take a decision path
-/// (v1's "no claim at all") for a proof that a different profile verified.
+/// lets that instance skip its own verification and, worse, claim a proof that a
+/// different profile verified in the wrong replay domain.
 ///
 /// Identity is per **constructed instance** rather than per config id: the
 /// plugin object that stages and the plugin object that consumes are the same
@@ -1173,7 +1123,7 @@ impl HmacPrebufferOwner {
         namespace: &str,
         policy_config_id: &str,
         profile: HmacSigningProfile,
-        replay_domain: Option<&ReplayDomain>,
+        replay_domain: &ReplayDomain,
     ) -> Self {
         let serial = HMAC_INSTANCE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut hasher =
@@ -1182,10 +1132,7 @@ impl HmacPrebufferOwner {
         hasher.text("owner.namespace", namespace);
         hasher.text("owner.config_id", policy_config_id);
         hasher.text("owner.profile", profile.version());
-        match replay_domain {
-            Some(domain) => hasher.nested("owner.replay_domain", &domain.digest()),
-            None => hasher.count("owner.replay_domain", 0),
-        }
+        hasher.nested("owner.replay_domain", &replay_domain.digest());
         Self(hasher.digest())
     }
 }
@@ -1209,12 +1156,12 @@ struct CachedHmacAuthorization {
     path: String,
     query: String,
     digest_header: String,
-    /// `ferrum-hmac-v2` client nonce. `None` under the legacy v1 profile.
+    /// Client nonce (`ferrum-hmac-v2` or `rfc9421`).
     ///
     /// Not re-validated by `cached_request_binding_matches`: the nonce is an
     /// `Authorization` parameter, so the retained SHA-256 fingerprint of that
     /// header already binds it byte-for-byte.
-    nonce: Option<String>,
+    nonce: String,
     /// Canonical `signed_headers` values the preverified signature covered.
     signed_header_values: Vec<String>,
     /// `rfc9421` only: SHA-256 of the signature base the preverified
@@ -1228,9 +1175,9 @@ struct CachedHmacAuthorization {
 /// Owner-partitioned staging set for one request.
 type StagedHmacRecords = Vec<(HmacPrebufferOwner, CachedHmacAuthorization)>;
 
-/// Completion of the pre-buffered path: absent, verified consumer + v2 nonce, or
-/// a fixed JSON authentication error.
-type PrebufferedHmacAuthCompletion = Option<Result<(Arc<Consumer>, Option<String>), String>>;
+/// Completion of the pre-buffered path: absent, verified consumer + nonce, or a
+/// fixed JSON authentication error.
+type PrebufferedHmacAuthCompletion = Option<Result<(Arc<Consumer>, String), String>>;
 
 /// Request-scoped bridge between HMAC's pre-body signature check and its
 /// post-body digest check, **partitioned by owning plugin instance**.
@@ -1245,9 +1192,7 @@ type PrebufferedHmacAuthCompletion = Option<Result<(Arc<Consumer>, Option<String
 ///
 /// The partition is the security property. A single request-global slot let the
 /// first instance to preverify hand its record to whichever instance consumed
-/// first: an unsafe `ferrum-hmac-v1` policy could consume a `ferrum-hmac-v2`
-/// instance's verified record and then take v1's "no single-use claim" path, and
-/// two sibling v2 policies could cross-consume and claim in the wrong replay
+/// first: two sibling policies could cross-consume and claim in the wrong replay
 /// domain. Every record here is readable and removable **only** by the exact
 /// instance/policy/profile/replay-domain that staged it; one owner can neither
 /// observe nor erase another's.
@@ -1317,12 +1262,12 @@ impl HmacPrebufferState {
 pub struct HmacAuth {
     clock_skew_seconds: u64,
     profile: HmacSigningProfile,
-    /// Stable protection-domain identity for this policy's v2 nonces.
-    /// Precomputed at construction; `None` under the legacy v1 profile.
-    replay_domain: Option<ReplayDomain>,
-    /// Single-use authority v2 nonces are claimed against. Owned by the shared
+    /// Stable protection-domain identity for this policy's nonces.
+    /// Precomputed at construction.
+    replay_domain: ReplayDomain,
+    /// Single-use authority nonces are claimed against. Owned by the shared
     /// registry, so an equivalent reload inherits live markers.
-    replay_authority: Option<Arc<ReplayAuthority>>,
+    replay_authority: Arc<ReplayAuthority>,
     /// Ownership token for this instance's request-scoped prebuffer records.
     /// Precomputed at construction, so no request path hashes configuration.
     prebuffer_owner: HmacPrebufferOwner,
@@ -1454,12 +1399,6 @@ impl HmacAuth {
             ));
         }
 
-        let allow_unsafe_v1 = match config_obj.get("allow_unsafe_replayable_v1") {
-            None => false,
-            Some(value) => value.as_bool().ok_or_else(|| {
-                "hmac_auth: `allow_unsafe_replayable_v1` must be a boolean".to_string()
-            })?,
-        };
         let profile = match config_obj.get("signing_profile") {
             None => HmacSigningProfile::V2,
             Some(value) => {
@@ -1470,38 +1409,16 @@ impl HmacAuth {
                 // and the published enum lists only the canonical spellings.
                 match value {
                     HMAC_SIGNING_VERSION_V2 => HmacSigningProfile::V2,
-                    HMAC_SIGNING_VERSION_V1 => HmacSigningProfile::V1Unsafe,
                     HMAC_SIGNING_VERSION_RFC9421 => HmacSigningProfile::Rfc9421,
                     _ => {
                         return Err(format!(
                             "hmac_auth: `signing_profile` must be exactly \
-                             `{HMAC_SIGNING_VERSION_V2}`, `{HMAC_SIGNING_VERSION_RFC9421}`, or \
-                             `{HMAC_SIGNING_VERSION_V1}`"
+                             `{HMAC_SIGNING_VERSION_V2}` or `{HMAC_SIGNING_VERSION_RFC9421}`"
                         ));
                     }
                 }
             }
         };
-        // v1 provides no single-use guarantee at all. Requiring a second,
-        // separately named acknowledgement means it can never be reached by a
-        // copied config snippet or a one-word typo.
-        if profile == HmacSigningProfile::V1Unsafe && !allow_unsafe_v1 {
-            return Err(format!(
-                "hmac_auth: `signing_profile` = `{HMAC_SIGNING_VERSION_V1}` has no replay \
-                 protection — a captured valid request can be replayed verbatim for the whole \
-                 `clock_skew_seconds` window. It is unsuitable for non-idempotent routes and \
-                 requires an explicit `allow_unsafe_replayable_v1`: true acknowledgement. Prefer \
-                 `{HMAC_SIGNING_VERSION_V2}`, which binds a mandatory client nonce and makes each \
-                 signed request single-use."
-            ));
-        }
-        if profile != HmacSigningProfile::V1Unsafe && allow_unsafe_v1 {
-            return Err(format!(
-                "hmac_auth: `allow_unsafe_replayable_v1` is only meaningful with \
-                 `signing_profile` = `{HMAC_SIGNING_VERSION_V1}`"
-            ));
-        }
-
         let signed_headers = parse_signed_headers(config_obj.get("signed_headers"))?;
         let required_components =
             parse_required_components(config_obj.get("required_components"), profile)?;
@@ -1590,70 +1507,49 @@ impl HmacAuth {
             }
         };
 
-        match (profile, declared_scope) {
-            // The scope has no default. A gateway cannot observe its own
-            // replica count, so declaring it is what distinguishes "this really
-            // is one process" from "we silently accept one replay per replica".
-            (profile, None) if profile.is_single_use() => {
-                return Err(format!(
-                    "hmac_auth: `replay_scope` is required for `{}` — use `shared` together \
-                     with sync_mode: `redis` for any deployment running more than one gateway \
-                     replica, or `process` to declare a single-process deployment whose replay \
-                     protection is not cross-replica",
-                    profile.version()
-                ));
-            }
-            (HmacSigningProfile::V1Unsafe, Some(_)) => {
-                return Err(format!(
-                    "hmac_auth: `replay_scope` is not accepted with `signing_profile` = \
-                     `{HMAC_SIGNING_VERSION_V1}`, which has no replay state at all"
-                ));
-            }
-            _ => {}
-        }
-        if profile == HmacSigningProfile::V1Unsafe && config_obj.contains_key("replay_max_entries")
-        {
+        // The scope has no default. A gateway cannot observe its own replica
+        // count, so declaring it is what distinguishes "this really is one
+        // process" from "we silently accept one replay per replica".
+        let Some(declared_scope) = declared_scope else {
             return Err(format!(
-                "hmac_auth: `replay_max_entries` is not accepted with `signing_profile` = \
-                 `{HMAC_SIGNING_VERSION_V1}`, which has no replay state at all"
+                "hmac_auth: `replay_scope` is required for `{}` — use `shared` together \
+                 with sync_mode: `redis` for any deployment running more than one gateway \
+                 replica, or `process` to declare a single-process deployment whose replay \
+                 protection is not cross-replica",
+                profile.version()
             ));
-        }
-        if profile == HmacSigningProfile::V1Unsafe && redis_configured {
-            return Err(format!(
-                "hmac_auth: sync_mode: `redis` is not accepted with `signing_profile` = \
-                 `{HMAC_SIGNING_VERSION_V1}`, which has no replay state at all"
-            ));
-        }
-        if let Some(scope) = declared_scope {
-            validate_scope_backend("hmac_auth", "replay_scope", scope, redis_configured)?;
-        }
+        };
+        validate_scope_backend(
+            "hmac_auth",
+            "replay_scope",
+            declared_scope,
+            redis_configured,
+        )?;
 
         // The profile version is part of the domain, so `rfc9421` nonces and
         // `ferrum-hmac-v2` nonces never share markers.
-        let replay_domain = profile.is_single_use().then(|| {
-            ReplayDomain::new(
-                profile.version(),
-                namespace,
-                "hmac_auth",
-                policy_config_id,
-                "",
-            )
-        });
+        let replay_domain = ReplayDomain::new(
+            profile.version(),
+            namespace,
+            "hmac_auth",
+            policy_config_id,
+            "",
+        );
         let retention = std::time::Duration::from_secs(HMAC_MARKER_RETENTION_SECONDS);
-        let replay_authority = match (declared_scope, replay_domain.as_ref()) {
-            (Some(ReplayScope::Process), Some(domain)) => {
+        let replay_authority = match declared_scope {
+            ReplayScope::Process => {
                 let shard_amount = http_client
                     .map(|client| client.pool_shard_amount())
                     .unwrap_or_else(|| crate::util::sharding::pool_shard_amount(0));
-                Some(Arc::new(ReplayAuthority::process(
+                Arc::new(ReplayAuthority::process(
                     "hmac_auth",
-                    domain,
+                    &replay_domain,
                     replay_max_entries,
                     retention,
                     shard_amount,
-                )?))
+                )?)
             }
-            (Some(ReplayScope::Shared), Some(_)) => {
+            ReplayScope::Shared => {
                 // `validate_scope_backend` above already rejected `shared`
                 // without a backend, so `redis_config` is present here.
                 let redis_config = redis_config.ok_or_else(|| {
@@ -1673,13 +1569,12 @@ impl HmacAuth {
                 // plugin in the same candidate, or this instance if it is never
                 // installed, must not mark live readiness unavailable or dial
                 // Redis.
-                Some(Arc::new(ReplayAuthority::shared(client, retention)))
+                Arc::new(ReplayAuthority::shared(client, retention))
             }
-            _ => None,
         };
 
         let prebuffer_owner =
-            HmacPrebufferOwner::new(namespace, policy_config_id, profile, replay_domain.as_ref());
+            HmacPrebufferOwner::new(namespace, policy_config_id, profile, &replay_domain);
 
         Ok(Self {
             clock_skew_seconds,
@@ -1705,11 +1600,11 @@ impl HmacAuth {
         self.profile
     }
 
-    /// Replay-authority mode (`None` under the legacy v1 profile). Test support.
+    /// Replay-authority mode. Test support.
     #[doc(hidden)]
     #[allow(dead_code)] // exercised by external unit tests
-    pub fn replay_mode(&self) -> Option<&'static str> {
-        self.replay_authority.as_ref().map(|a| a.mode())
+    pub fn replay_mode(&self) -> &'static str {
+        self.replay_authority.mode()
     }
 
     /// Whether this instance's shared Redis recovery checker has been armed.
@@ -1717,9 +1612,7 @@ impl HmacAuth {
     #[doc(hidden)]
     #[allow(dead_code)] // exercised by external unit tests
     pub fn shared_replay_recovery_started_for_test(&self) -> bool {
-        self.replay_authority
-            .as_ref()
-            .is_some_and(|authority| authority.recovery_checker_started_for_test())
+        self.replay_authority.recovery_checker_started_for_test()
     }
 
     /// Marker this policy would claim for `consumer_id` + `nonce`. Test-only
@@ -1727,12 +1620,10 @@ impl HmacAuth {
     /// contracts.
     #[doc(hidden)]
     #[allow(dead_code)] // exercised by external unit tests
-    pub fn replay_marker_digest(&self, consumer_id: &str, nonce: &str) -> Option<[u8; 32]> {
-        self.replay_domain.as_ref().map(|domain| {
-            domain
-                .marker(&[consumer_id.as_bytes(), nonce.as_bytes()])
-                .digest()
-        })
+    pub fn replay_marker_digest(&self, consumer_id: &str, nonce: &str) -> [u8; 32] {
+        self.replay_domain
+            .marker(&[consumer_id.as_bytes(), nonce.as_bytes()])
+            .digest()
     }
 
     /// Claim a fully verified signed request for exactly one use.
@@ -1742,27 +1633,9 @@ impl HmacAuth {
     /// traffic can never consume replay capacity or a shared-backend round
     /// trip. Every non-admitted outcome is terminal; there is no path from a
     /// replay, a capacity refusal, or an unavailable authority to acceptance.
-    async fn claim_single_use(
-        &self,
-        nonce: Option<&str>,
-        consumer: &Consumer,
-    ) -> Result<(), ClaimRefusal> {
-        if self.profile == HmacSigningProfile::V1Unsafe {
-            // Explicitly acknowledged freshness-only posture. Counted so the
-            // dependency is visible in runtime metrics rather than implicit.
-            replay_authority::record_legacy_unsafe_profile_accepted();
-            return Ok(());
-        }
-        let (Some(domain), Some(authority), Some(nonce)) = (
-            self.replay_domain.as_ref(),
-            self.replay_authority.as_ref(),
-            nonce,
-        ) else {
-            // Unreachable for an admitted v2 configuration. Refuse rather than
-            // accept a signed request that would not be made single-use.
-            warn!("hmac_auth: replay authority is not configured; refusing the signed request");
-            return Err(ClaimRefusal::new(503, REPLAY_UNAVAILABLE_BODY, false));
-        };
+    async fn claim_single_use(&self, nonce: &str, consumer: &Consumer) -> Result<(), ClaimRefusal> {
+        let domain = &self.replay_domain;
+        let authority = &self.replay_authority;
 
         // The marker binds the consumer's stable resource id (not the
         // attacker-supplied username spelling) to the client nonce, inside a
@@ -1819,7 +1692,7 @@ impl HmacAuth {
     ///
     /// This enforces only the bounded freshness window
     /// (`now ± clock_skew_seconds`). Version 2 separately claims its nonce for
-    /// single use; explicitly acknowledged version 1 has no replay store.
+    /// single use.
     fn validate_date(&self, date_str: &str) -> bool {
         if date_str.is_empty() {
             // No Date header means no freshness bound at all — reject.
@@ -1862,7 +1735,7 @@ impl HmacAuth {
     fn is_fresh(&self, date: &str, created: Option<i64>, expires: Option<i64>) -> bool {
         match self.profile {
             HmacSigningProfile::Rfc9421 => self.rfc9421_window_is_open(created, expires),
-            HmacSigningProfile::V1Unsafe | HmacSigningProfile::V2 => self.validate_date(date),
+            HmacSigningProfile::V2 => self.validate_date(date),
         }
     }
 
@@ -1870,7 +1743,7 @@ impl HmacAuth {
     fn stale_body(&self) -> &'static str {
         match self.profile {
             HmacSigningProfile::Rfc9421 => STALE_SIGNATURE_BODY,
-            HmacSigningProfile::V1Unsafe | HmacSigningProfile::V2 => STALE_DATE_BODY,
+            HmacSigningProfile::V2 => STALE_DATE_BODY,
         }
     }
 
@@ -2323,7 +2196,7 @@ impl HmacAuth {
             query: ctx.raw_query_string().unwrap_or_default().to_string(),
             digest_header,
             digest_is_rfc9530: true,
-            nonce: Some(nonce),
+            nonce,
             signed_header_values: Vec::new(),
             rfc9421_base: Some(parsed.base),
             created: Some(created),
@@ -2388,7 +2261,7 @@ impl AuthMechanism for HmacAuth {
             algorithm,
             signature,
             nonce,
-        } = match parse_hmac_authorization(params_str, self.profile) {
+        } = match parse_hmac_authorization(params_str) {
             Ok(parsed) => parsed,
             Err(body) => return ExtractedCredential::InvalidFormat(body.to_string()),
         };
@@ -2525,10 +2398,7 @@ async fn run_hmac_auth(
     match mechanism.take_prebuffered_auth(ctx, consumer_index) {
         Some(Err(body)) => return hmac_reject(401, body),
         Some(Ok((consumer, nonce))) => {
-            if let Err(refusal) = mechanism
-                .claim_single_use(nonce.as_deref(), &consumer)
-                .await
-            {
+            if let Err(refusal) = mechanism.claim_single_use(&nonce, &consumer).await {
                 if refusal.replay {
                     mechanism.record_replay_attribution(ctx, &consumer);
                 }
@@ -2578,7 +2448,7 @@ async fn run_hmac_auth(
         ..
     } = &outcome
     {
-        let claim = mechanism.claim_single_use(nonce.as_deref(), consumer).await;
+        let claim = mechanism.claim_single_use(&nonce, consumer).await;
         if let Err(refusal) = claim {
             if refusal.replay {
                 mechanism.record_replay_attribution(ctx, consumer);
@@ -2660,17 +2530,12 @@ auth_flow::impl_auth_plugin!(
     /// A shared replay authority is dialed on the authentication path, so its
     /// endpoint belongs in gateway DNS warmup like any other plugin egress.
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.replay_authority
-            .as_ref()
-            .map(|authority| authority.warmup_hostnames())
-            .unwrap_or_default()
+        self.replay_authority.warmup_hostnames()
     }
 
     /// Publish the shared replay authority after this generation is installed.
     fn commit_background_tasks(&self) {
-        if let Some(authority) = self.replay_authority.as_ref() {
-            authority.activate();
-        }
+        self.replay_authority.activate();
     }
 
     fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
@@ -2813,12 +2678,11 @@ fn default_replay_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> S
 /// newline-separated:
 ///
 /// ```text
-/// {VERSION}\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}[\n{NONCE}]
+/// {VERSION}\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}\n{NONCE}
 /// ```
 ///
-/// The version is the **first** field, so a v1 signature can never verify as v2
-/// (or the reverse) even if every other field matches: downgrading the profile
-/// does not downgrade the signature.
+/// The version is the **first** field, so a signature for another profile
+/// version can never verify as v2 even if every other field matches.
 ///
 /// `query` is the raw request query string as received (percent-encoded, no
 /// leading `?`), empty when the request has no query. Binding it prevents an
@@ -2826,9 +2690,8 @@ fn default_replay_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> S
 /// altered or added query parameters. Clients must sign the byte-for-byte raw
 /// query string the gateway receives.
 ///
-/// `nonce` is appended for `ferrum-hmac-v2` only, and the parser guarantees it
-/// is present exactly when the profile is v2 — so a v2 base is never built with
-/// an empty trailing field, and a nonce is never left unsigned.
+/// `nonce` is always appended; the parser guarantees it is present and
+/// well-formed, so a nonce is never left unsigned.
 ///
 /// Each configured `signed_headers` entry follows as one `\n{name}:{value}`
 /// line in configuration order, `{value}` being the canonical field value.
@@ -2840,7 +2703,7 @@ fn build_signing_string(
     signed_headers: &[String],
 ) -> String {
     let version = profile.version();
-    let nonce = credential.nonce.as_deref().unwrap_or("");
+    let nonce = credential.nonce.as_str();
     let signed_headers_len: usize = signed_headers
         .iter()
         .zip(&credential.signed_header_values)
@@ -2877,10 +2740,8 @@ fn build_signing_string(
     signing_string.push_str(&credential.date);
     signing_string.push('\n');
     signing_string.push_str(&credential.digest_header);
-    if profile == HmacSigningProfile::V2 {
-        signing_string.push('\n');
-        signing_string.push_str(nonce);
-    }
+    signing_string.push('\n');
+    signing_string.push_str(nonce);
     for (name, value) in signed_headers.iter().zip(&credential.signed_header_values) {
         signing_string.push('\n');
         signing_string.push_str(name);

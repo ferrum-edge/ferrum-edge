@@ -195,7 +195,6 @@ static CAPACITY_REFUSED: AtomicU64 = AtomicU64::new(0);
 static AUTHORITY_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
 static ADMITTED_PROCESS: AtomicU64 = AtomicU64::new(0);
 static ADMITTED_SHARED: AtomicU64 = AtomicU64::new(0);
-static LEGACY_UNSAFE_PROFILE_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the replay-authority counters for the runtime metrics endpoint.
 ///
@@ -216,9 +215,6 @@ pub struct ReplayAuthorityCounters {
     pub admitted_process: u64,
     /// Markers admitted against the shared (cross-replica) authority.
     pub admitted_shared: u64,
-    /// Requests accepted under an explicitly unsafe legacy freshness-only
-    /// signing profile that provides no single-use guarantee.
-    pub legacy_unsafe_profile_accepted: u64,
     /// Registered shared authorities whose backend is currently unavailable.
     /// Non-zero means protected requests on those policies are failing closed.
     pub shared_authorities_unavailable: u64,
@@ -237,17 +233,10 @@ pub fn counters() -> ReplayAuthorityCounters {
         authority_unavailable: AUTHORITY_UNAVAILABLE.load(Ordering::Relaxed),
         admitted_process: ADMITTED_PROCESS.load(Ordering::Relaxed),
         admitted_shared: ADMITTED_SHARED.load(Ordering::Relaxed),
-        legacy_unsafe_profile_accepted: LEGACY_UNSAFE_PROFILE_ACCEPTED.load(Ordering::Relaxed),
         shared_authorities_unavailable,
         shared_authorities,
         process_lanes: process_lane_count() as u64,
     }
-}
-
-/// Record one acceptance under an explicitly unsafe legacy freshness-only
-/// profile, so operators can see that a deployment still depends on it.
-pub fn record_legacy_unsafe_profile_accepted() {
-    LEGACY_UNSAFE_PROFILE_ACCEPTED.fetch_add(1, Ordering::Relaxed);
 }
 
 // ── Scope ───────────────────────────────────────────────────────────────────

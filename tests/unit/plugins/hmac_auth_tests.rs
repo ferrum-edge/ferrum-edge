@@ -26,17 +26,16 @@ const TEST_SECRET: &str = "my-hmac-secret-key-at-least-32-bytes";
 const TEST_USERNAME: &str = "hmacuser";
 const TEST_AUTHORITY: &str = "api.example.com";
 
-/// The legacy `ferrum-hmac-v1` profile, explicitly acknowledged as unsafe.
+/// The default `ferrum-hmac-v2` profile on the standalone process replay lane.
 ///
-/// Most cases in this file predate `ferrum-hmac-v2` and exercise the v1 signing
-/// base, canonical-request binding, digest handling, and parser hardening. They
-/// keep testing exactly that surface; the v2 single-use contract has its own
-/// section at the end of the file.
+/// The canonical-request binding, digest handling, and parser-hardening cases
+/// sign through [`sign_sha256_for_identity`] / [`sign_sha512`], which mint a
+/// fresh nonce per signature, and [`hmac_auth_header`] puts that nonce on the
+/// wire. Every standalone instance in this binary shares one replay lane, so a
+/// nonce is never reused. The v2 single-use contract itself has its own section
+/// below.
 fn default_config() -> Value {
-    json!({
-        "signing_profile": "ferrum-hmac-v1",
-        "allow_unsafe_replayable_v1": true
-    })
+    json!({"replay_scope": "process"})
 }
 
 /// The default `ferrum-hmac-v2` profile with a process-scoped replay lane.
@@ -129,22 +128,40 @@ fn current_date() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-/// Version 1 binds credential identity and authority before the request fields.
-/// `make_ctx` produces requests with no
-/// query, so the helpers below sign an empty query by default; tests that set
-/// a query string use `sign_sha256_with_query`.
-fn build_signing_string(input: HmacSigningInput<'_>) -> String {
-    format!(
-        "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        input.namespace,
-        input.username,
-        input.authority,
-        input.method,
-        input.path,
-        input.query,
-        input.date,
-        input.digest_header
-    )
+/// Nonces the signing helpers bound into each signature, keyed by signature,
+/// so [`hmac_auth_header`] can send the matching nonce.
+fn signed_nonces() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static NONCES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    NONCES.get_or_init(Default::default)
+}
+
+/// A nonce no other signature in this binary uses (32 hex characters, distinct
+/// from the [`test_nonce`] seeds the v2 section picks).
+fn fresh_nonce() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{:016x}{next:016x}", 0x7e57_5167_0000_0000u64)
+}
+
+/// Remember the nonce `signature` was computed over.
+fn remember_nonce(signature: &str, nonce: String) {
+    signed_nonces()
+        .lock()
+        .unwrap()
+        .insert(signature.to_string(), nonce);
+}
+
+/// The nonce a helper-signed `signature` covers, or a fresh one for a literal
+/// or tampered signature (which then fails as an invalid signature, not as a
+/// missing nonce).
+fn nonce_for_signature(signature: &str) -> String {
+    signed_nonces()
+        .lock()
+        .unwrap()
+        .get(signature)
+        .cloned()
+        .unwrap_or_else(fresh_nonce)
 }
 
 /// Compute an HMAC-SHA256 signature over an empty-body, no-query request.
@@ -155,22 +172,28 @@ fn sign_sha256(secret: &str, method: &str, path: &str, date: &str) -> String {
 /// Compute an HMAC-SHA512 signature over an empty-body, no-query request.
 fn sign_sha512(secret: &str, method: &str, path: &str, date: &str) -> String {
     let digest_header = sha256_digest_header(&[]);
-    let signing_string = build_signing_string(HmacSigningInput {
-        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
-        username: TEST_USERNAME,
-        authority: TEST_AUTHORITY,
-        method,
-        path,
-        query: "",
-        date,
-        digest_header: &digest_header,
-    });
+    let nonce = fresh_nonce();
+    let signing_string = build_v2_signing_string(
+        HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            username: TEST_USERNAME,
+            authority: TEST_AUTHORITY,
+            method,
+            path,
+            query: "",
+            date,
+            digest_header: &digest_header,
+        },
+        &nonce,
+    );
     let mut mac = HmacSha512::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    remember_nonce(&signature, nonce);
+    signature
 }
 
-/// Compute an HMAC-SHA256 signature over version 1 with the default test
+/// Compute an HMAC-SHA256 `ferrum-hmac-v2` signature with the default test
 /// identity, authority, and an empty query.
 fn sign_sha256_with_digest(
     secret: &str,
@@ -205,11 +228,13 @@ struct HmacSigningInput<'a> {
     digest_header: &'a str,
 }
 
+/// Sign `input` under `ferrum-hmac-v2` with a fresh nonce, remembered for
+/// [`hmac_auth_header`].
 fn sign_sha256_for_identity(secret: &str, input: HmacSigningInput<'_>) -> String {
-    let signing_string = build_signing_string(input);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(signing_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    let nonce = fresh_nonce();
+    let signature = sign_v2(secret, input, &nonce);
+    remember_nonce(&signature, nonce);
+    signature
 }
 
 /// Compute an HMAC-SHA256 signature binding a specific raw query string.
@@ -269,14 +294,15 @@ fn sha512_digest_header(body: &[u8]) -> String {
     format!("sha-512={}", b64)
 }
 
-/// Build the Authorization header value.
+/// Build the Authorization header value, carrying the nonce `signature` was
+/// computed over.
 fn hmac_auth_header(username: &str, algorithm: Option<&str>, signature: &str) -> String {
+    let nonce = nonce_for_signature(signature);
     match algorithm {
         Some(alg) => format!(
-            r#"hmac username="{}", algorithm="{}", signature="{}""#,
-            username, alg, signature
+            r#"hmac username="{username}", algorithm="{alg}", nonce="{nonce}", signature="{signature}""#
         ),
-        None => format!(r#"hmac username="{}", signature="{}""#, username, signature),
+        None => format!(r#"hmac username="{username}", nonce="{nonce}", signature="{signature}""#),
     }
 }
 
@@ -326,8 +352,7 @@ async fn test_hmac_auth_plugin_creation() {
 async fn test_hmac_auth_custom_clock_skew() {
     let plugin = HmacAuth::new(&json!({
         "clock_skew_seconds": 120,
-        "signing_profile": "ferrum-hmac-v1",
-        "allow_unsafe_replayable_v1": true
+        "replay_scope": "process"
     }))
     .unwrap();
     assert_eq!(plugin.name(), "hmac_auth");
@@ -351,24 +376,17 @@ fn test_hmac_auth_rejects_invalid_config() {
         json!({"replay_scope": "prosess"}),
         json!({"replay_scope": true}),
         json!({"replay_scope": "process", "replay_max_entries": 0}),
-        // The legacy profile needs its own explicit acknowledgement, and the
-        // acknowledgement is meaningless without it.
-        json!({"signing_profile": "ferrum-hmac-v1"}),
-        json!({"signing_profile": "ferrum-hmac-v3", "allow_unsafe_replayable_v1": true}),
-        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
-        // The legacy profile has no replay state at all, so replay knobs and a
-        // Redis backend must be refused rather than silently ignored.
+        // The replayable `ferrum-hmac-v1` profile and its acknowledgement are
+        // gone (issue #7114): neither spelling is admitted any more.
+        json!({"signing_profile": "ferrum-hmac-v1", "replay_scope": "process"}),
         json!({
             "signing_profile": "ferrum-hmac-v1",
             "allow_unsafe_replayable_v1": true,
             "replay_scope": "process"
         }),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "sync_mode": "redis",
-            "redis_url": "redis://127.0.0.1:6379"
-        }),
+        json!({"signing_profile": "ferrum-hmac-v3", "replay_scope": "process"}),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": false}),
         // Scope and backend must agree in both directions.
         json!({"replay_scope": "shared"}),
         json!({
@@ -512,7 +530,8 @@ async fn test_auth_params_accept_quoted_commas_escapes_and_mixed_case_names() {
     ctx.headers.insert(
         "authorization".to_string(),
         format!(
-            r#"hmac UserName="ops,\"blue\\team", ALGORITHM="hmac-sha256", Signature="{}""#,
+            r#"hmac UserName="ops,\"blue\\team", ALGORITHM="hmac-sha256", Nonce="{}", Signature="{}""#,
+            nonce_for_signature(&signature),
             signature
         ),
     );
@@ -1075,13 +1094,10 @@ async fn test_missing_date_header() {
 
 #[tokio::test]
 async fn test_expired_date_header() {
-    // Use a very tight clock skew of 1 second. The signing helper below builds a
-    // `ferrum-hmac-v1` base, so this fixture is deliberately the acknowledged
-    // legacy profile rather than the modern default.
+    // Use a very tight clock skew of 1 second.
     let plugin = HmacAuth::new(&json!({
         "clock_skew_seconds": 1,
-        "signing_profile": "ferrum-hmac-v1",
-        "allow_unsafe_replayable_v1": true
+        "replay_scope": "process"
     }))
     .unwrap();
     let consumer = create_hmac_consumer();
@@ -1618,10 +1634,7 @@ async fn test_hmac_multi_secret_old_secret_still_works() {
     let mut ctx = make_ctx("GET", "/api");
     ctx.headers.insert(
         "authorization".to_string(),
-        format!(
-            "hmac username=\"hmacuser\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-            sig
-        ),
+        hmac_auth_header("hmacuser", Some("hmac-sha256"), &sig),
     );
     ctx.headers.insert("date".to_string(), date);
     ctx.identified_consumer = None;
@@ -1642,10 +1655,7 @@ async fn test_hmac_multi_secret_new_secret_works() {
     let mut ctx = make_ctx("GET", "/api");
     ctx.headers.insert(
         "authorization".to_string(),
-        format!(
-            "hmac username=\"hmacuser\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-            sig
-        ),
+        hmac_auth_header("hmacuser", Some("hmac-sha256"), &sig),
     );
     ctx.headers.insert("date".to_string(), date);
     ctx.identified_consumer = None;
@@ -1666,10 +1676,7 @@ async fn test_hmac_multi_secret_wrong_secret_rejected() {
     let mut ctx = make_ctx("GET", "/api");
     ctx.headers.insert(
         "authorization".to_string(),
-        format!(
-            "hmac username=\"hmacuser\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-            sig
-        ),
+        hmac_auth_header("hmacuser", Some("hmac-sha256"), &sig),
     );
     ctx.headers.insert("date".to_string(), date);
     ctx.identified_consumer = None;
@@ -2036,7 +2043,7 @@ fn v2_plugin_named(config_id: &str) -> HmacAuth {
 #[test]
 fn v2_is_the_default_profile_and_requires_a_declared_replay_scope() {
     let plugin = HmacAuth::new(&v2_config()).expect("declared process scope");
-    assert_eq!(plugin.replay_mode(), Some("process"));
+    assert_eq!(plugin.replay_mode(), "process");
 
     let error = HmacAuth::new(&json!({}))
         .map(|_| ())
@@ -2170,11 +2177,11 @@ async fn v2_binds_every_signed_field() {
     );
 }
 
-/// A v1 signature must not verify under v2 (and the reverse): the profile
-/// version is the signing base's first field, so downgrading the profile does
-/// not downgrade the signature.
+/// A signature over the retired `ferrum-hmac-v1` base (no nonce) never
+/// verifies: the profile version is the signing base's first field, so a
+/// client still signing v1 cannot authenticate under v2 (issue #7114).
 #[tokio::test]
-async fn v1_signature_does_not_verify_under_v2() {
+async fn retired_v1_signature_base_does_not_verify_under_v2() {
     let plugin = v2_plugin_named("v2-no-v1-crossover");
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
@@ -2182,7 +2189,14 @@ async fn v1_signature_does_not_verify_under_v2() {
     let path = "/api/orders";
     let date = current_date();
     let digest = sha256_digest_header(b"");
-    let v1_signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+    let v1_base = format!(
+        "ferrum-hmac-v1\n{}\n{TEST_USERNAME}\n{TEST_AUTHORITY}\n{method}\n{path}\n\n{date}\n{digest}",
+        ferrum_edge::config::types::DEFAULT_NAMESPACE
+    );
+    let mut mac = HmacSha256::new_from_slice(TEST_SECRET.as_bytes()).unwrap();
+    mac.update(v1_base.as_bytes());
+    let v1_signature =
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
     let mut ctx = make_ctx(method, path);
     ctx.headers.insert(
@@ -2210,7 +2224,10 @@ async fn v2_rejects_a_missing_or_malformed_nonce_before_backend_dispatch() {
     let mut ctx = request.context();
     ctx.headers.insert(
         "authorization".to_string(),
-        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &request.signature),
+        format!(
+            r#"hmac username="{TEST_USERNAME}", algorithm="hmac-sha256", signature="{}""#,
+            request.signature
+        ),
     );
     assert_reject(
         plugin.authenticate(&mut ctx, &consumer_index).await,
@@ -2267,31 +2284,6 @@ async fn all_hex_nonces_are_held_to_the_hex_entropy_floor() {
     assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
 }
 
-#[tokio::test]
-async fn v1_rejects_a_nonce_rather_than_ignoring_it() {
-    let plugin = HmacAuth::new(&default_config()).unwrap();
-    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
-
-    let method = "POST";
-    let path = "/api/orders";
-    let date = current_date();
-    let digest = sha256_digest_header(b"");
-    let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
-
-    let mut ctx = make_ctx(method, path);
-    ctx.headers.insert(
-        "authorization".to_string(),
-        v2_auth_header(TEST_USERNAME, &test_nonce(60), &signature),
-    );
-    ctx.headers.insert("date".to_string(), date);
-    ctx.headers.insert("digest".to_string(), digest);
-    ctx.identified_consumer = None;
-    assert_reject(
-        plugin.authenticate(&mut ctx, &consumer_index).await,
-        Some(401),
-    );
-}
-
 // ── domain identity ─────────────────────────────────────────────────
 
 /// An equivalent reload derives the same protection domain (so the replacement
@@ -2322,13 +2314,6 @@ fn v2_protection_domains_converge_on_reload_and_isolate_across_policies() {
         marker,
         first.replay_marker_digest("consumer-2", &test_nonce(70)),
         "consumers must not burn one another's nonces"
-    );
-    assert!(
-        HmacAuth::new(&default_config())
-            .unwrap()
-            .replay_marker_digest("consumer-1", &test_nonce(70))
-            .is_none(),
-        "the legacy profile has no replay domain at all"
     );
 }
 
@@ -2421,21 +2406,10 @@ async fn invalid_traffic_does_not_consume_replay_capacity() {
 // `hmac_auth` verifies the signature BEFORE request-body collection and stages
 // the result on the request context, then completes the digest check after the
 // body arrives. Several `hmac_auth` instances can screen one request — sibling
-// proxy/global policies, a legacy v1 instance beside a v2 one, two v2 policies
-// with different replay domains — so a single request-global staging slot would
-// let one instance consume another's verified record. The worst shape is a v1
-// instance consuming a v2 record: v1's claim path is a no-op, so the request
-// would be accepted with no single-use guarantee at all. Every record is bound
-// to the exact instance/policy/profile/replay-domain that staged it.
-
-fn v1_plugin_named(config_id: &str) -> HmacAuth {
-    HmacAuth::new_with_http_client_and_config_id(
-        &default_config(),
-        ferrum_edge::plugins::utils::PluginHttpClient::default(),
-        Some(config_id),
-    )
-    .expect("acknowledged legacy v1 config")
-}
+// proxy/global policies, two v2 policies with different replay domains — so a
+// single request-global staging slot would let one instance consume another's
+// verified record and claim it in the wrong replay domain. Every record is
+// bound to the exact instance/policy/profile/replay-domain that staged it.
 
 /// How many preverified authorizations are staged on this request.
 ///
@@ -2456,99 +2430,6 @@ fn staged_prebuffer_records(ctx: &RequestContext) -> usize {
     rest[..end]
         .parse()
         .expect("the staged count renders as an integer")
-}
-
-/// A legacy v1 instance must not consume a v2 instance's preverified record.
-///
-/// This is the bypass the ownership binding exists to close: v1 makes no
-/// single-use claim, so consuming a v2 record would accept a `ferrum-hmac-v2`
-/// request without ever claiming its nonce — and the nonce would then still be
-/// replayable.
-#[tokio::test]
-async fn a_v1_instance_cannot_consume_a_v2_instances_preverified_record() {
-    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
-    let v2 = v2_plugin_named("owner-v2-first");
-    let v1 = v1_plugin_named("owner-v1-sibling");
-    let request = V2Request::new(&test_nonce(200));
-
-    let mut ctx = request.context();
-    assert!(
-        v2.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
-        "the v2 instance preverifies and stages"
-    );
-    assert!(
-        !v1.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
-        "a v2 nonce is not accepted by the v1 profile, so v1 stages nothing"
-    );
-    assert_eq!(staged_prebuffer_records(&ctx), 1);
-
-    // The v1 instance runs first. It must not read the v2 record: it falls
-    // through to its own extraction, which refuses the unexpected nonce.
-    assert_reject(v1.authenticate(&mut ctx, &consumer_index).await, Some(401));
-    assert!(
-        ctx.identified_consumer.is_none(),
-        "a refused instance must publish no identity"
-    );
-    assert_eq!(
-        staged_prebuffer_records(&ctx),
-        1,
-        "one instance must not erase another owner's staged record"
-    );
-
-    // The owning v2 instance still finds its record and claims the nonce.
-    assert_continue(v2.authenticate(&mut ctx, &consumer_index).await);
-    assert_eq!(staged_prebuffer_records(&ctx), 0);
-
-    // The claim really happened: the same signed request is now a replay.
-    let mut replay = request.context();
-    assert_reject(
-        v2.authenticate(&mut replay, &consumer_index).await,
-        Some(401),
-    );
-}
-
-/// The reverse order: a v1 instance stages first, and the v2 instance must not
-/// adopt that record — it would otherwise authenticate a v1-signed request under
-/// the v2 profile with no nonce to claim.
-#[tokio::test]
-async fn a_v2_instance_cannot_consume_a_v1_instances_preverified_record() {
-    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
-    let v1 = v1_plugin_named("owner-v1-first");
-    let v2 = v2_plugin_named("owner-v2-sibling");
-
-    // A v1-signed request: no nonce anywhere in the Authorization header.
-    let method = "POST";
-    let path = "/api/orders";
-    let date = current_date();
-    let digest = sha256_digest_header(b"");
-    let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
-    let mut ctx = make_ctx(method, path);
-    ctx.headers.insert(
-        "authorization".to_string(),
-        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
-    );
-    ctx.headers.insert("date".to_string(), date);
-    ctx.headers.insert("digest".to_string(), digest);
-
-    assert!(
-        v1.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
-        "the v1 instance preverifies and stages"
-    );
-    assert!(
-        !v2.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
-        "the v2 profile requires a nonce, so it stages nothing here"
-    );
-    assert_eq!(staged_prebuffer_records(&ctx), 1);
-
-    assert_reject(v2.authenticate(&mut ctx, &consumer_index).await, Some(401));
-    assert_eq!(
-        staged_prebuffer_records(&ctx),
-        1,
-        "the v2 instance must not consume or erase the v1 owner's record"
-    );
-
-    assert_continue(v1.authenticate(&mut ctx, &consumer_index).await);
-    assert_eq!(staged_prebuffer_records(&ctx), 0);
 }
 
 /// Two sibling v2 policies on one request: each stages and consumes only its
@@ -3628,12 +3509,6 @@ fn replay_max_entries_is_bounded_and_refused_without_replay_state() {
     for config in [
         json!({"replay_scope": "process", "replay_max_entries": MAX_HMAC_REPLAY_MAX_ENTRIES + 1}),
         json!({"replay_scope": "process", "replay_max_entries": 999_999_999_999u64}),
-        // v1 has no replay state, so a cap there would be silently inert.
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "replay_max_entries": 1000
-        }),
     ] {
         assert!(
             HmacAuth::new(&config).is_err(),
@@ -3729,14 +3604,8 @@ fn signed_headers_and_required_components_are_validated() {
             "replay_scope": "process",
             "required_components": ["@path", "@path"]
         }),
-        // RFC 9421 is single-use: it needs a declared scope and refuses the
-        // unsafe acknowledgement.
+        // RFC 9421 is single-use: it needs a declared scope.
         json!({"signing_profile": "rfc9421"}),
-        json!({
-            "signing_profile": "rfc9421",
-            "replay_scope": "process",
-            "allow_unsafe_replayable_v1": true
-        }),
     ] {
         assert!(
             HmacAuth::new(&config).is_err(),

@@ -18883,7 +18883,6 @@ components:
         - authority_unavailable
         - admitted_process
         - admitted_shared
-        - legacy_unsafe_profile_accepted
         - shared_authorities_unavailable
         - shared_authorities
         - process_lanes
@@ -18918,14 +18917,6 @@ components:
           type: integer
           format: uint64
           description: Markers admitted against the shared (cross-replica) authority.
-        legacy_unsafe_profile_accepted:
-          type: integer
-          format: uint64
-          description: |
-            Requests accepted under an explicitly unsafe legacy freshness-only
-            signing profile (`hmac_auth` `signing_profile: ferrum-hmac-v1` with
-            `allow_unsafe_replayable_v1: true`), which provides no single-use
-            guarantee. A nonzero value means a deployment still depends on it.
         shared_authorities_unavailable:
           type: integer
           format: uint64
@@ -26430,8 +26421,8 @@ components:
       description: >-
         Plugin: hmac_auth — versioned HMAC request authentication with
         mandatory request-body integrity protection. The Ferrum profiles
-        (`ferrum-hmac-v2`, `ferrum-hmac-v1`) use `Authorization: hmac` and a
-        Ferrum signing base; the `rfc9421` profile verifies RFC 9421 HTTP
+        (`ferrum-hmac-v2`) uses `Authorization: hmac` and a Ferrum signing
+        base; the `rfc9421` profile verifies RFC 9421 HTTP
         Message Signatures (`Signature-Input` / `Signature`, `hmac-sha256`,
         key looked up by `keyid` among the Consumers' `hmac_auth` secrets).
         RFC 9530 defines Content-Digest. Requests must include exactly one of
@@ -26465,12 +26456,10 @@ components:
             Maximum allowed clock skew in seconds for the Date header freshness
             window. Bounded because the fixed replay retention horizon (601s) is
             derived from twice this ceiling, so no reload can shorten an
-            already-admitted request's protection. Under the legacy
-            ferrum-hmac-v1 profile this window is also exactly how long a
-            captured valid request stays replayable.
+            already-admitted request's protection.
         signing_profile:
           type: string
-          enum: [ferrum-hmac-v2, rfc9421, ferrum-hmac-v1]
+          enum: [ferrum-hmac-v2, rfc9421]
           default: ferrum-hmac-v2
           description: >-
             Versioned signing profile. 'ferrum-hmac-v2' requires a client nonce
@@ -26488,27 +26477,12 @@ components:
             Supported derived components are @method (the wire method:
             CONNECT for an HTTP/2 or HTTP/3 WebSocket Extended CONNECT),
             @authority, @path, @query, and @request-target (the target as
-            sent, including HTTP/1.1 absolute form and an empty query). 'ferrum-hmac-v1' is
-            freshness-only — a captured valid request can be replayed verbatim
-            for the whole clock_skew_seconds window — and additionally requires
-            allow_unsafe_replayable_v1 true. v1 rejects a nonce parameter
-            outright rather than ignoring one.
-        allow_unsafe_replayable_v1:
-          type: boolean
-          default: false
-          description: >-
-            Explicit acknowledgement that ferrum-hmac-v1 provides no replay
-            protection and is unsuitable for non-idempotent routes. Required
-            with signing_profile 'ferrum-hmac-v1' and rejected otherwise, so the
-            unsafe profile can never be reached by a copied snippet or a typo.
-            Every acceptance under it increments the unlabeled
-            legacy_unsafe_profile_accepted runtime counter.
+            sent, including HTTP/1.1 absolute form and an empty query).
         replay_scope:
           type: string
           enum: [process, shared]
           description: >-
-            Required for ferrum-hmac-v2 and rfc9421 and rejected for
-            ferrum-hmac-v1; there is no default. Use 'shared' together with sync_mode 'redis' for any
+            Required for every profile; there is no default. Use 'shared' together with sync_mode 'redis' for any
             deployment running more than one gateway replica: every replica then
             claims each nonce through one atomic Redis SET NX EX. Use 'process'
             to declare a single-process deployment whose replay protection is
@@ -26530,8 +26504,7 @@ components:
             Repeated full-live refusals are O(1) until an expiry is actually
             due, and a due reclamation pops only markers whose expiry has
             passed from an ordered expiry index, never rescanning live markers. An equivalent reload applies the
-            new cap without forgetting live markers. Ignored for 'shared';
-            rejected with ferrum-hmac-v1, which has no replay state.
+            new cap without forgetting live markers. Ignored for 'shared'.
         signed_headers:
           type: array
           maxItems: 32
@@ -26547,7 +26520,7 @@ components:
             Lowercase request header names every accepted signature must cover,
             for all profiles. Under the Ferrum profiles each is appended to the
             signing base, in this order, as one '\n{name}:{value}' line after
-            the nonce (v2) or digest (v1), where value is the RFC 9421 section
+            the nonce, where value is the RFC 9421 section
             2.1 canonical value (each field line trimmed, joined by ', '). Under
             rfc9421 each must appear in the covered components. A configured
             header missing from the request is refused (401). Signature
@@ -26626,35 +26599,9 @@ components:
         redis_password:
           type: string
           description: Redis password
+      # Every profile has a mandatory, default-free replay scope.
+      required: [replay_scope]
       allOf:
-        # The constructor's profile/scope/backend admission, expressed exactly.
-        # An omitted `signing_profile` means `ferrum-hmac-v2`, so the v2 rules
-        # live in the `else` branch rather than in a second `if`.
-        - if:
-            required: [signing_profile]
-            properties:
-              signing_profile:
-                const: ferrum-hmac-v1
-          then:
-            # v1 has no replay state at all: it demands the unsafe
-            # acknowledgement and refuses every replay knob.
-            required: [allow_unsafe_replayable_v1]
-            properties:
-              allow_unsafe_replayable_v1:
-                const: true
-              sync_mode:
-                const: local
-            not:
-              anyOf:
-                - required: [replay_scope]
-                - required: [replay_max_entries]
-          else:
-            # ferrum-hmac-v2 (the default) and rfc9421 have no default replay
-            # scope, and the unsafe acknowledgement is only meaningful with v1.
-            required: [replay_scope]
-            properties:
-              allow_unsafe_replayable_v1:
-                const: false
         # `required_components` is an RFC 9421 policy.
         - if:
             required: [required_components]

@@ -5891,8 +5891,7 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
 /// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
 /// no conditional constraints at all, so schema-based tooling approved
 /// deployments the gateway refuses to start with — an empty configuration,
-/// unsafe v1 without its acknowledgement, v2 without a replay scope, and every
-/// impossible Redis/scope pairing. This is the real schema-vs-runtime
+/// a profile without a replay scope, and every impossible Redis/scope pairing. This is the real schema-vs-runtime
 /// acceptance matrix.
 #[test]
 fn hmac_auth_schema_acceptance_matches_runtime_admission() {
@@ -5917,12 +5916,6 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": "process", "sync_mode": "local"}),
         json!({"signing_profile": "ferrum-hmac-v2", "replay_scope": "process"}),
         json!({
-            "signing_profile": "ferrum-hmac-v2",
-            "replay_scope": "process",
-            "allow_unsafe_replayable_v1": false
-        }),
-        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": true}),
-        json!({
             "replay_scope": "shared",
             "sync_mode": "redis",
             "redis_url": redis_url
@@ -5933,11 +5926,6 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": "process", "signed_headers": ["x-tenant-id", "content-type"]}),
         json!({"replay_scope": "process", "signed_headers": []}),
         json!({"replay_scope": "process", "max_body_bytes": 268_435_456}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "signed_headers": ["idempotency-key"]
-        }),
         json!({"signing_profile": "rfc9421", "replay_scope": "process"}),
         json!({
             "signing_profile": "rfc9421",
@@ -5958,26 +5946,22 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
     }
 
     let rejected = [
-        // Profile / acknowledgement / scope admission (the #5001 matrix).
+        // Profile / scope admission (the #5001 matrix). The replayable
+        // `ferrum-hmac-v1` profile and its acknowledgement are gone (#7114).
         json!({}),
         json!({"clock_skew_seconds": 60}),
         json!({"signing_profile": "ferrum-hmac-v1"}),
-        json!({"signing_profile": "ferrum-hmac-v1", "allow_unsafe_replayable_v1": false}),
+        json!({"signing_profile": "ferrum-hmac-v1", "replay_scope": "process"}),
         json!({
             "signing_profile": "ferrum-hmac-v1",
             "allow_unsafe_replayable_v1": true,
             "replay_scope": "process"
         }),
         json!({"replay_scope": "process", "allow_unsafe_replayable_v1": true}),
+        json!({"replay_scope": "process", "allow_unsafe_replayable_v1": false}),
         json!({"replay_scope": "shared"}),
         json!({"replay_scope": "shared", "sync_mode": "redis"}),
         json!({"replay_scope": "process", "sync_mode": "redis", "redis_url": redis_url}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "sync_mode": "redis",
-            "redis_url": redis_url
-        }),
         // Scalar spellings: the enums are exact on both surfaces.
         json!({"replay_scope": " PROCESS "}),
         json!({"replay_scope": "Process"}),
@@ -5995,13 +5979,8 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": true}),
         json!({"replay_scope": "process", "replay_scop": "shared"}),
         json!({"replay_scope": "process", "require_digest": true}),
-        // Replay capacity is bounded and meaningless without replay state.
+        // Replay capacity is bounded.
         json!({"replay_scope": "process", "replay_max_entries": 10_000_001}),
-        json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true,
-            "replay_max_entries": 1000
-        }),
         // Signed headers, body ceiling, and RFC 9421 policy bounds.
         json!({"replay_scope": "process", "signed_headers": ["X-Tenant-Id"]}),
         json!({"replay_scope": "process", "signed_headers": ["authorization"]}),

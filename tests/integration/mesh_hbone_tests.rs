@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::common::{empty_digest_header, generate_hmac_signature};
+use crate::common::{empty_digest_header, hmac_v2_authorization};
 
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, DEFAULT_TRUST_DOMAIN, default_mesh_runtime, service_for, workload_for,
@@ -214,8 +214,7 @@ fn hmac_auth_plugin_config() -> PluginConfig {
         plugin_name: "hmac_auth".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
-            "signing_profile": "ferrum-hmac-v1",
-            "allow_unsafe_replayable_v1": true
+            "replay_scope": "process"
         }),
         scope: PluginScope::Global,
         proxy_id: None,
@@ -729,23 +728,19 @@ async fn hbone_connect_with_body_auth_plugin_is_rejected() {
     let method = "CONNECT";
     let path = "/";
     let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-    let signature = generate_hmac_signature(
+    let authorization = hmac_v2_authorization(
         method,
         path,
         &date,
         "hmacuser",
         "orders.default.svc.cluster.local:8080",
         HMAC_SECRET,
+        &empty_digest_header(),
     );
     let req = Request::builder()
         .method(Method::CONNECT)
         .uri("orders.default.svc.cluster.local:8080")
-        .header(
-            "authorization",
-            format!(
-                r#"hmac username="hmacuser", algorithm="hmac-sha256", signature="{signature}""#
-            ),
-        )
+        .header("authorization", authorization)
         .header("date", date)
         .header("digest", empty_digest_header())
         .body(())
