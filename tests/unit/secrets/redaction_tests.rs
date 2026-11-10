@@ -1366,9 +1366,10 @@ fn a_null_scalar_value_is_redacted() {
 //
 // Records here are built with explicit `serde_json::Map`s rather than `json!`
 // so the dynamic keys are unambiguously runtime strings, and emission *order*
-// is asserted against the raw line: `serde_json::Map` is a `BTreeMap` in this
-// build (no `preserve_order` feature), so a parsed record would report sorted
-// keys and could not distinguish preserved order from re-sorted order.
+// is asserted against the raw line: whether a parsed `serde_json::Map` keeps
+// order depends on the transitively enabled `preserve_order` feature, so a
+// parsed record cannot be trusted to distinguish preserved order from
+// re-sorted order.
 // ---------------------------------------------------------------------------
 
 /// Build a JSON object preserving the given entry order on the wire.

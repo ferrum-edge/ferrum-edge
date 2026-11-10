@@ -3680,9 +3680,11 @@ fn build_native_grpc_terminate_response(
     }
 
     // Never collect/sort/join an unbounded inventory of unknown names solely for
-    // logging. serde_json::Map iterates in sorted key order, so the first
-    // sample slots are deterministic; only a bounded sample plus a count is
-    // rendered, and each name fragment is escaped/capped.
+    // logging. serde_json::Map iterates in a fixed order for a given body (the
+    // `preserve_order` feature is enabled transitively, by `bson`, so that is
+    // document order), so the first sample slots are deterministic; only a
+    // bounded sample plus a count is rendered, and each name fragment is
+    // escaped/capped.
     if let Some(detail) = unknown_grpc_terminate_fields_detail(
         object
             .keys()
@@ -4005,15 +4007,7 @@ pub mod test_helpers {
                 .filter(|s| !s.is_empty())
                 .map(String::from),
         };
-        aws_sigv4::sign_request(
-            &config,
-            "lambda",
-            "POST",
-            url,
-            "application/json",
-            payload,
-            now,
-        )
+        sign_lambda_request(&config, url, payload, now)
     }
 
     /// Serving-node construction with `fetcher` standing in for the AWS SDK
