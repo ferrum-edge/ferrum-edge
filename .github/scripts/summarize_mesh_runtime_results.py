@@ -523,7 +523,7 @@ def self_test() -> int:
         md = render_markdown(summary)
         assert "Throughput (median RPS)" in md
         assert "1,000" in md
-        assert "KiB" in render_markdown(summary) or True
+        assert "1KiB" in md and "75MiB" in md, md  # payload and proxy memory
     print("self-test OK")
     return 0
 

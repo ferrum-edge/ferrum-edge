@@ -1601,7 +1601,6 @@ def _self_test_health_probes(required_reps: int) -> str:
 
 
 def self_test() -> int:
-    assert abs((((100.0 - 80.0) / 100.0) * 100.0) - 20.0) < 1e-9
     assert "µs" in fmt_duration_ns(1500.0) or "us" in fmt_duration_ns(1500.0)
     assert required_repetitions(None) == 3
     assert required_repetitions(5) == 5
@@ -1652,6 +1651,10 @@ def self_test() -> int:
         assert evidence["gateway"]["actual"] == 1
         assert evidence["direct"]["actual"] == 1
         assert evidence["gateway"]["ok"] is False
+        # The overhead formula is exercised through summarize_hbone, not a
+        # literal: gateway 80 rps against direct 100 rps is 20% (issue #7282).
+        under_overhead = hbone_under["1kib_c50_30s"]["overhead_percent_mean"]
+        assert under_overhead is not None and abs(under_overhead - 20.0) < 1e-9
 
         # --- duplicate relevant blobs in one run file must not satisfy reps ---
         dup = root / "dup_blobs" / "hbone" / "1kib_c50_30s"
