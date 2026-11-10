@@ -36,6 +36,10 @@ pub use istio::{MAX_L4_CANDIDATE_PROXIES, MAX_PROJECTED_L4_PROXIES};
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
 pub(crate) use istio::cors_policy_translatable;
+// Shared with the Istio status writer the same way: Istio-valid retry settings
+// the translator accepts without enforcing, and Telemetry entries past the
+// first translated one, are reported by the same predicates that decide them.
+pub(crate) use istio::{telemetry_deferred_fields, virtual_service_retry_deferred_fields};
 // Shared with the Istio status writer the same way: Sidecar `ingress[]`
 // classification used by resolution and deferred-field reporting is one
 // predicate, so modeled HTTP and stream listeners cannot be reported deferred.
@@ -61,6 +65,9 @@ pub(crate) use istio::service_entry_port_protocol_is_udp;
 // dispatch concretizes the target per request instead), so the status writer
 // reports it as deferred through the SAME predicate rather than re-deriving it.
 pub(crate) use istio::service_entry_spec_has_unresolvable_stream_wildcard_host;
+// Same contract for address-less `endpoints[]` that name a `network`: skipped by
+// the translator and reported as deferred by the status writer.
+pub(crate) use istio::service_entry_endpoint_is_network_gateway_only;
 
 use std::collections::{HashMap, HashSet};
 

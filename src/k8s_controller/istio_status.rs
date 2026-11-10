@@ -102,9 +102,10 @@ use tracing::warn;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions, SidecarOutboundPolicy,
     classify_sidecar_outbound_traffic_policy, route_local_fault_delay_for_rule,
-    service_entry_port_protocol_is_udp, service_entry_spec_has_unresolvable_stream_wildcard_host,
-    sidecar_selector_from_istio, translate_k8s_objects_collecting_skips,
-    workload_entry_service_key_from_host, workload_selector_from_istio,
+    service_entry_endpoint_is_network_gateway_only, service_entry_port_protocol_is_udp,
+    service_entry_spec_has_unresolvable_stream_wildcard_host, sidecar_selector_from_istio,
+    translate_k8s_objects_collecting_skips, workload_entry_service_key_from_host,
+    workload_selector_from_istio,
 };
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::status::StatusTranslationReuse;
@@ -1511,6 +1512,21 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
              share of a weighted split — move them to http[].headers)",
         );
     }
+    // Istio-valid `retries` settings the translator accepts but does not
+    // enforce (`perTryTimeout`, `retryRemoteLocalities`, and `retryOn`
+    // policies outside Ferrum's retry model). Invalid `retryOn` tokens refuse
+    // the resource instead and surface through the `Invalid` arm.
+    for retries in http_routes
+        .into_iter()
+        .flatten()
+        .filter_map(|route| route.get("retries"))
+    {
+        for field in crate::config_sources::k8s::virtual_service_retry_deferred_fields(retries) {
+            if !deferred.contains(&field) {
+                deferred.push(field);
+            }
+        }
+    }
     deferred
 }
 
@@ -1638,6 +1654,23 @@ fn service_entry_status(
              deferred (a stream-family wildcard host is only materializable with \
              resolution: STATIC and a non-empty endpoints[]; a raw stream has no request \
              authority from which to concretize the dial target)",
+        );
+    }
+
+    // An address-less endpoint that names a `network` is valid Istio (reached
+    // through that network's gateway) but is skipped by the translator through
+    // the SAME shared predicate; report it rather than counting it served.
+    if object
+        .spec
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(service_entry_endpoint_is_network_gateway_only)
+    {
+        deferred.push(
+            "spec.endpoints[] without address (network-gateway endpoints are not \
+             materialized)",
         );
     }
 
@@ -2298,7 +2331,8 @@ fn telemetry_status(
 
     match result {
         Ok(_translation) => {
-            let message = if sections.is_empty() {
+            let deferred = crate::config_sources::k8s::telemetry_deferred_fields(&object.spec);
+            let mut message = if sections.is_empty() {
                 "Ferrum accepted this Telemetry (no tracing/metrics/accessLogging sections)"
                     .to_string()
             } else {
@@ -2307,10 +2341,14 @@ fn telemetry_status(
                     sections.join(", ")
                 )
             };
+            if !deferred.is_empty() {
+                message.push_str(&format!("; deferred fields: {}", deferred.join(", ")));
+            }
             let detail = json!({
                 "translation": {
                     "sections": sections,
                     "target_refs_declared": declared_target_refs,
+                    "deferred_fields": deferred,
                 }
             });
             accepted_status(object, true, "Accepted", &message, Some(detail))
@@ -4963,6 +5001,91 @@ mod tests {
             .collect();
         assert!(sections.contains(&"metrics"));
         assert!(sections.contains(&"accessLogging"));
+    }
+
+    #[test]
+    fn telemetry_reports_entries_past_the_first_as_deferred() {
+        let obj = object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "multi-provider",
+            json!({
+                "metrics": [
+                    { "providers": [ { "name": "prometheus" } ] },
+                    { "providers": [ { "name": "stackdriver" } ], "overrides": [ { "disabled": true } ] }
+                ],
+                "accessLogging": [ { "disabled": false } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(deferred.len(), 1, "{deferred:?}");
+        assert!(deferred[0].starts_with("metrics[1..]"));
+        assert!(
+            c["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("deferred fields: metrics[1..]"))
+        );
+    }
+
+    #[test]
+    fn virtual_service_reports_unenforced_retry_settings_as_deferred() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "retry-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "retries": { "attempts": 2, "retryOn": "5xx,retriable-4xx", "perTryTimeout": "1s" }
+                    },
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "retries": { "attempts": 2, "perTryTimeout": "1s" }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            deferred
+                .iter()
+                .filter(|field| field.starts_with("http[].retries.perTryTimeout"))
+                .count(),
+            1,
+            "{deferred:?}"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|field| field.starts_with("http[].retries.retryOn")),
+            "{deferred:?}"
+        );
     }
 
     #[test]

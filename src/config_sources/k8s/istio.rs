@@ -3229,7 +3229,18 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         .flatten()
     {
         let Some(address) = string_field(endpoint, "address") else {
-            continue;
+            // Istio allows an address-less endpoint only when `network` names
+            // the network whose gateway reaches it. Ferrum does not
+            // materialize those (reported in `deferred_fields` through
+            // `service_entry_endpoint_is_network_gateway_only`); without a
+            // `network` the endpoint is malformed.
+            if service_entry_endpoint_is_network_gateway_only(endpoint) {
+                continue;
+            }
+            return Err(invalid_resource(
+                object,
+                "ServiceEntry endpoints[].address is required unless endpoints[].network is set",
+            ));
         };
         let mut ports = HashMap::new();
         for (name, port) in endpoint
@@ -3238,12 +3249,16 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
             .into_iter()
             .flat_map(|ports| ports.iter())
         {
-            if let Some(raw_port) = port.as_u64() {
-                ports.insert(
-                    name.clone(),
-                    port_from_u64(object, raw_port, "endpoints[].ports")?,
-                );
-            }
+            let Some(raw_port) = port.as_u64() else {
+                return Err(invalid_resource(
+                    object,
+                    "ServiceEntry endpoints[].ports values must be integer port numbers",
+                ));
+            };
+            ports.insert(
+                name.clone(),
+                port_from_u64(object, raw_port, "endpoints[].ports")?,
+            );
         }
         endpoints.push(MeshEndpoint {
             address: address.to_string(),
@@ -3258,10 +3273,21 @@ fn service_entry(object: &K8sObject) -> Result<ServiceEntry, K8sTranslateError> 
         namespace: object.metadata.namespace.clone(),
         hosts,
         endpoints,
-        resolution: service_entry_resolution(&object.spec),
+        resolution: service_entry_resolution(&object.spec).ok_or_else(|| {
+            invalid_resource(
+                object,
+                "ServiceEntry spec.resolution must be NONE, STATIC, DNS, or DNS_ROUND_ROBIN",
+            )
+        })?,
         location: match string_field(&object.spec, "location").unwrap_or("MESH_EXTERNAL") {
+            "MESH_EXTERNAL" => ServiceEntryLocation::MeshExternal,
             "MESH_INTERNAL" => ServiceEntryLocation::MeshInternal,
-            _ => ServiceEntryLocation::MeshExternal,
+            _ => {
+                return Err(invalid_resource(
+                    object,
+                    "ServiceEntry spec.location must be MESH_EXTERNAL or MESH_INTERNAL",
+                ));
+            }
         },
         ports: service_ports(object)?,
         export_to,
@@ -5188,7 +5214,7 @@ fn virtual_service_routes(
                 )
             };
 
-        let retry = route_retry_config(http);
+        let retry = route_retry_config(object, http)?;
         let timeout_ms = route_timeout_ms(object, http)?;
 
         let match_count = route_candidates.len();
@@ -5613,17 +5639,21 @@ fn route_backends(
         .collect();
     let preserve_single_destination = routes.len() == 1;
     let mut skipped_zero = 0usize;
-    let mut active_route_without_backend = false;
     for route in routes {
         let weight = route_weight(object, route)?;
+        // `HTTPRouteDestination.destination` is required in Istio. Refuse a
+        // missing one even on a zero-weight leg, like the L4 path, instead of
+        // silently dropping that share of the split.
+        let Some(destination) = route.get("destination") else {
+            return Err(invalid_resource(
+                object,
+                "VirtualService http[].route[] requires a destination",
+            ));
+        };
         if weight == 0 && !preserve_single_destination {
             skipped_zero += 1;
             continue;
         }
-        let Some(destination) = route.get("destination") else {
-            active_route_without_backend = true;
-            continue;
-        };
         let Some(host) = string_field(destination, "host") else {
             return Err(invalid_resource(
                 object,
@@ -5654,7 +5684,7 @@ fn route_backends(
         });
     }
     if skipped_zero > 0 {
-        if backends.is_empty() && !active_route_without_backend {
+        if backends.is_empty() {
             acc.warnings.push(format!(
                 "VirtualService {:?} HTTP route {} has only zero-weight split destinations; no \
                  proxy was materialized",
@@ -5780,6 +5810,99 @@ fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateEr
     optional_target_weight_field(object, route, "VirtualService route.weight", 0)
 }
 
+/// `HTTPRetry.retryOn` policies Istio's validation admits that Ferrum does not
+/// enforce. They are reported in `deferred_fields` rather than refused, because
+/// the resource is valid Istio; the enforced retry policy is built from the
+/// remaining tokens.
+const UNENFORCED_RETRY_ON_POLICIES: &[&str] = &[
+    "retriable-4xx",
+    "retriable-headers",
+    "envoy-ratelimited",
+    "reset-before-request",
+    "http3-post-connect-failure",
+    "cancelled",
+    "deadline-exceeded",
+    "internal",
+    "resource-exhausted",
+    "unavailable",
+];
+
+/// `HTTPRetry` fields Ferrum parses past without enforcing, with the
+/// `deferred_fields` text the Istio status writer reports for each.
+const UNENFORCED_RETRY_FIELDS: &[(&str, &str)] = &[
+    (
+        "perTryTimeout",
+        "http[].retries.perTryTimeout (not enforced; the route-level timeout bounds the \
+         backend read)",
+    ),
+    (
+        "retryRemoteLocalities",
+        "http[].retries.retryRemoteLocalities (not enforced)",
+    ),
+];
+
+/// How Ferrum treats one `retryOn` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryOnToken {
+    /// Enforced by the emitted [`RetryConfig`].
+    Enforced,
+    /// Valid Istio policy Ferrum does not enforce (see
+    /// [`UNENFORCED_RETRY_ON_POLICIES`]).
+    Unenforced,
+    /// Neither an Istio retry policy nor an HTTP status code; Istio's own
+    /// validation refuses it.
+    Invalid,
+}
+
+fn classify_retry_on_token(token: &str) -> RetryOnToken {
+    match token {
+        "5xx"
+        | "gateway-error"
+        | "connect-failure"
+        | "reset"
+        | "refused-stream"
+        | "retriable-status-codes" => RetryOnToken::Enforced,
+        _ if UNENFORCED_RETRY_ON_POLICIES.contains(&token) => RetryOnToken::Unenforced,
+        _ if token.bytes().all(|byte| byte.is_ascii_digit())
+            && token
+                .parse::<u16>()
+                .is_ok_and(|code| (100..=599).contains(&code)) =>
+        {
+            RetryOnToken::Enforced
+        }
+        _ => RetryOnToken::Invalid,
+    }
+}
+
+fn retry_on_tokens(retries: &Value) -> impl Iterator<Item = &str> {
+    string_field(retries, "retryOn")
+        .into_iter()
+        .flat_map(|retry_on| retry_on.split(','))
+        .map(str::trim)
+}
+
+/// `deferred_fields` entries for one VirtualService `http[].retries` block:
+/// Istio-valid retry settings the translator accepts but does not enforce.
+/// Shared with `istio_status` so the report cannot diverge from translation.
+pub(crate) fn virtual_service_retry_deferred_fields(retries: &Value) -> Vec<&'static str> {
+    let mut deferred = Vec::new();
+    if retry_on_tokens(retries)
+        .any(|token| classify_retry_on_token(token) == RetryOnToken::Unenforced)
+    {
+        deferred.push(
+            "http[].retries.retryOn policies Ferrum does not enforce (retriable-4xx, \
+             retriable-headers, envoy-ratelimited, reset-before-request, \
+             http3-post-connect-failure, gRPC status policies)",
+        );
+    }
+    for (field, description) in UNENFORCED_RETRY_FIELDS {
+        if retries.get(*field).is_some_and(|value| !value.is_null()) {
+            deferred.push(*description);
+        }
+    }
+    deferred
+}
+
 /// Extract Istio VirtualService `http[].retries` into a Ferrum [`RetryConfig`].
 ///
 /// Maps:
@@ -5788,12 +5911,30 @@ fn route_weight(object: &K8sObject, route: &Value) -> Result<u32, K8sTranslateEr
 ///     or bare numeric codes) and `retry_on_connect_failure` (from `connect-failure`,
 ///     `reset`, `refused-stream`)
 ///
+/// A `retryOn` token that is neither an Istio retry policy nor an HTTP status
+/// code (`100..=599`) refuses the resource, as Istio's validation does; Istio
+/// policies Ferrum does not enforce are reported via
+/// [`virtual_service_retry_deferred_fields`].
+///
 /// Returns `None` when no `retries` block is present or when `attempts` is zero.
-fn route_retry_config(http: &Value) -> Option<RetryConfig> {
-    let retries = http.get("retries")?;
+fn route_retry_config(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<Option<RetryConfig>, K8sTranslateError> {
+    let Some(retries) = http.get("retries") else {
+        return Ok(None);
+    };
+    if retry_on_tokens(retries).any(|token| classify_retry_on_token(token) == RetryOnToken::Invalid)
+    {
+        return Err(invalid_resource(
+            object,
+            "VirtualService http[].retries.retryOn contains a value that is neither an Istio \
+             retry policy nor an HTTP status code (100-599)",
+        ));
+    }
     let attempts = retries.get("attempts").and_then(Value::as_u64).unwrap_or(0);
     if attempts == 0 {
-        return None;
+        return Ok(None);
     }
 
     let mut retry = RetryConfig {
@@ -5801,11 +5942,11 @@ fn route_retry_config(http: &Value) -> Option<RetryConfig> {
         ..RetryConfig::default()
     };
 
-    if let Some(retry_on) = string_field(retries, "retryOn") {
+    if string_field(retries, "retryOn").is_some() {
         let mut status_codes = Vec::new();
         let mut connect_failure = false;
 
-        for token in retry_on.split(',').map(str::trim) {
+        for token in retry_on_tokens(retries) {
             match token {
                 "5xx" => {
                     status_codes.extend(500..=599);
@@ -5835,7 +5976,7 @@ fn route_retry_config(http: &Value) -> Option<RetryConfig> {
         retry.retry_on_connect_failure = connect_failure;
     }
 
-    Some(retry)
+    Ok(Some(retry))
 }
 
 fn retriable_status_codes(retries: &Value) -> impl Iterator<Item = u16> + '_ {
@@ -6910,7 +7051,10 @@ fn service_ports(object: &K8sObject) -> Result<Vec<ServicePort>, K8sTranslateErr
         .flatten()
         .try_for_each(|port| {
             let Some(raw_port) = port.get("number").and_then(Value::as_u64) else {
-                return Ok(());
+                return Err(invalid_resource(
+                    object,
+                    "ServiceEntry ports[].number is required and must be an integer",
+                ));
             };
             // Istio ServiceEntry `targetPort` is a numeric container port.
             let target_port = port
@@ -7003,16 +7147,27 @@ pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool
 }
 
 /// Parse an Istio `ServiceEntry` `spec.resolution` string, defaulting to `NONE`
-/// exactly as Istio does. Shared by the ServiceEntry translator and by
-/// [`service_entry_spec_has_unresolvable_stream_wildcard_host`] so the raw-spec
-/// predicate can never classify a resolution differently from the translation
-/// that feeds materialization.
-fn service_entry_resolution(spec: &Value) -> Resolution {
+/// exactly as Istio does. `DNS_ROUND_ROBIN` resolves through DNS like `DNS`
+/// (Ferrum has one DNS resolution mode); any other value is `None` and the
+/// translator refuses the resource. Shared by the ServiceEntry translator and
+/// by [`service_entry_spec_has_unresolvable_stream_wildcard_host`] so the
+/// raw-spec predicate can never classify a resolution differently from the
+/// translation that feeds materialization.
+fn service_entry_resolution(spec: &Value) -> Option<Resolution> {
     match string_field(spec, "resolution").unwrap_or("NONE") {
-        "DNS" => Resolution::Dns,
-        "STATIC" => Resolution::Static,
-        _ => Resolution::None,
+        "DNS" | "DNS_ROUND_ROBIN" => Some(Resolution::Dns),
+        "STATIC" => Some(Resolution::Static),
+        "NONE" => Some(Resolution::None),
+        _ => None,
     }
+}
+
+/// Whether a `ServiceEntry` `endpoints[]` entry has no `address` but names a
+/// `network`: Istio reaches such an endpoint through that network's gateway,
+/// which Ferrum does not model, so the translator skips it and the Istio
+/// status writer reports it in `deferred_fields`.
+pub(crate) fn service_entry_endpoint_is_network_gateway_only(endpoint: &Value) -> bool {
+    string_field(endpoint, "address").is_none() && string_field(endpoint, "network").is_some()
 }
 
 /// Whether an Istio `ServiceEntry` `spec.ports[].protocol` string names a
@@ -7061,7 +7216,11 @@ pub(crate) fn service_entry_spec_has_unresolvable_stream_wildcard_host(spec: &Va
     if !has_stream_port {
         return false;
     }
-    let resolution = service_entry_resolution(spec);
+    let Some(resolution) = service_entry_resolution(spec) else {
+        // An unknown resolution refuses the whole resource; nothing is
+        // materialized, so there is no inert stream host to report.
+        return false;
+    };
     let endpoint_count = spec
         .get("endpoints")
         .and_then(Value::as_array)
@@ -7294,6 +7453,29 @@ fn report_sidecar_outbound_policy_degradation(namespace: &str, name: &str, reaso
              emitted once per process; enable debug logging for per-resource detail)",
         );
     }
+}
+
+/// `deferred_fields` entries for an Istio `Telemetry` spec.
+///
+/// Ferrum has one metrics pipeline and one access-log pipeline per workload,
+/// so [`telemetry`] translates only the first `metrics[]` and
+/// `accessLogging[]` entry (every `tracing[]` entry is merged). Later entries
+/// (typically per-provider overrides) are accepted but not enforced; shared
+/// with `istio_status` so the report names exactly what the translator skips.
+pub(crate) fn telemetry_deferred_fields(spec: &Value) -> Vec<&'static str> {
+    let entries = |section: &str| {
+        spec.get(section)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let mut deferred = Vec::new();
+    if entries("metrics") > 1 {
+        deferred.push("metrics[1..] (only the first metrics entry is translated)");
+    }
+    if entries("accessLogging") > 1 {
+        deferred.push("accessLogging[1..] (only the first accessLogging entry is translated)");
+    }
+    deferred
 }
 
 fn telemetry(
@@ -8836,6 +9018,72 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn service_entry_refuses_malformed_fields_instead_of_dropping_them() {
+        let translate = |patch: Value| {
+            let mut spec = serde_json::json!({
+                "hosts": ["api.example.com"],
+                "resolution": "STATIC",
+                "ports": [{"number": 443, "name": "https", "protocol": "TLS"}],
+                "endpoints": [{"address": "203.0.113.10", "ports": {"https": 8443}}]
+            });
+            for (key, value) in patch.as_object().expect("patch object") {
+                spec[key] = value.clone();
+            }
+            translate_k8s_objects(&[object("ServiceEntry", spec)], options())
+        };
+
+        for (patch, expected) in [
+            (
+                serde_json::json!({"location": "MESH_ELSEWHERE"}),
+                "spec.location must be",
+            ),
+            (
+                serde_json::json!({"resolution": "LOGICAL_DNS"}),
+                "spec.resolution must be",
+            ),
+            (
+                serde_json::json!({"ports": [{"name": "https", "protocol": "TLS"}]}),
+                "ports[].number is required",
+            ),
+            (
+                serde_json::json!({"ports": [{"number": "443", "name": "https"}]}),
+                "ports[].number is required",
+            ),
+            (
+                serde_json::json!({"endpoints": [{"ports": {"https": 8443}}]}),
+                "endpoints[].address is required",
+            ),
+            (
+                serde_json::json!({"endpoints": [{"address": "203.0.113.10", "ports": {"https": "8443"}}]}),
+                "endpoints[].ports values must be integer",
+            ),
+        ] {
+            let error = translate(patch.clone())
+                .expect_err("malformed ServiceEntry field must refuse the resource");
+            assert!(
+                error.to_string().contains(expected),
+                "patch {patch}: unexpected error {error}"
+            );
+        }
+
+        // Istio-valid values that used to be silently remapped still translate.
+        let result = translate(serde_json::json!({
+            "resolution": "DNS_ROUND_ROBIN",
+            "location": "MESH_INTERNAL",
+            "endpoints": [
+                {"address": "203.0.113.10"},
+                {"network": "remote-network", "ports": {"https": 8443}}
+            ]
+        }))
+        .expect("Istio-valid ServiceEntry translates");
+        let mesh = result.config.mesh.expect("mesh config");
+        let entry = &mesh.service_entries[0];
+        assert_eq!(entry.resolution, Resolution::Dns);
+        assert_eq!(entry.location, ServiceEntryLocation::MeshInternal);
+        assert_eq!(entry.endpoints.len(), 1, "network-only endpoint is skipped");
     }
 
     #[test]
@@ -14561,7 +14809,38 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_retries_numeric_code_out_of_range_filtered() {
+    fn virtual_service_retries_refuse_invalid_retry_on_tokens() {
+        // Istio's validation refuses a retryOn token that is neither a retry
+        // policy nor an HTTP status code; dropping it would report Accepted
+        // while retrying on less than the operator asked for.
+        for retry_on in ["503,9999", "42", "5xx,5XX", "5xx,", "connect_failure"] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "VirtualService",
+                    serde_json::json!({
+                        "hosts": ["api.example.com"],
+                        "http": [{
+                            "match": [{"uri": {"prefix": "/v1"}}],
+                            "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                            "retries": {
+                                "attempts": 1,
+                                "retryOn": retry_on
+                            }
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("invalid retryOn token must refuse the VirtualService");
+            assert!(
+                err.to_string().contains("http[].retries.retryOn"),
+                "unexpected error for {retry_on:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_service_retries_keep_enforced_tokens_beside_unenforced_policies() {
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -14572,20 +14851,58 @@ extensionProviders:
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
                         "retries": {
                             "attempts": 1,
-                            "retryOn": "503,9999,42,418"
+                            "retryOn": "503,418,retriable-4xx,unavailable",
+                            "perTryTimeout": "2s"
                         }
                     }]
                 }),
             )],
             options(),
         )
-        .expect("translation succeeds");
+        .expect("Istio-valid retry policies translate");
 
         let retry = result.config.proxies[0].retry.as_ref().expect("retry");
-        assert!(retry.retryable_status_codes.contains(&503));
-        assert!(retry.retryable_status_codes.contains(&418));
-        assert!(!retry.retryable_status_codes.contains(&9999));
-        assert!(!retry.retryable_status_codes.contains(&42));
+        assert_eq!(retry.retryable_status_codes, vec![418, 503]);
+        assert_eq!(
+            virtual_service_retry_deferred_fields(&serde_json::json!({
+                "retryOn": "503,retriable-4xx",
+                "perTryTimeout": "2s",
+                "retryRemoteLocalities": true
+            }))
+            .len(),
+            3
+        );
+        assert!(
+            virtual_service_retry_deferred_fields(&serde_json::json!({
+                "attempts": 2,
+                "retryOn": "5xx,connect-failure"
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn virtual_service_http_route_without_destination_is_refused() {
+        for routes in [
+            serde_json::json!([{"weight": 100}]),
+            serde_json::json!([
+                {"destination": {"host": "api.default.svc.cluster.local"}, "weight": 100},
+                {"weight": 0}
+            ]),
+        ] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "VirtualService",
+                    serde_json::json!({
+                        "hosts": ["api.example.com"],
+                        "http": [{"route": routes}]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("a route[] entry without destination must refuse the VirtualService");
+            assert!(err.to_string().contains("route[] requires a destination"));
+        }
     }
 
     #[test]

@@ -3972,6 +3972,13 @@ the whole namespace — or, in the Istio root namespace, to `MeshWide` — so a
 resource meant to disable access logging for one gateway would disable it mesh
 wide. Scope it with a workload selector instead.
 
+**One metrics and one access-log entry per resource.** A workload has one
+metrics pipeline and one access-log pipeline, so the Kubernetes translator
+reads only `metrics[0]` and `accessLogging[0]`; every `tracing[]` entry is
+merged. Later `metrics[]` / `accessLogging[]` entries (typically per-provider
+overrides) are accepted but not enforced and are listed in
+`status.ferrum.translation.deferred_fields`.
+
 Each section (tracing, metrics, access logging) is merged independently. Within the same scope level, later resources win. Deterministic ordering is ensured by namespace/name tie-breaking.
 
 **Tracing configuration**:
@@ -5132,9 +5139,10 @@ Example: `match: [{ uri: { prefix: "/api" }, authority: { prefix: "api." } }]` r
 VirtualService `retries` populate the emitted proxy's retry policy and are also projected onto each emitted `mesh_route_dispatch` rule as route-local `retry` (Ferrum `RetryConfig` after strict admission):
 
 - `attempts` -> `max_retries`
-- `retryOn` supports `5xx`, `gateway-error`, `connect-failure`, `reset`, `refused-stream`, `retriable-status-codes`, and numeric HTTP status codes (for example `503`); `retriable-4xx` is not recognized.
+- `retryOn` enforces `5xx`, `gateway-error`, `connect-failure`, `reset`, `refused-stream`, `retriable-status-codes`, and numeric HTTP status codes `100`-`599` (for example `503`). The other Istio policies (`retriable-4xx`, `retriable-headers`, `envoy-ratelimited`, `reset-before-request`, `http3-post-connect-failure`, and the gRPC `cancelled` / `deadline-exceeded` / `internal` / `resource-exhausted` / `unavailable`) are accepted, not enforced, and reported in `status.ferrum.translation.deferred_fields`. A token that is neither an Istio policy nor a status code in that range refuses the VirtualService (`FerrumAccepted=False`), as Istio's validation does.
 - When `retryOn` includes `retriable-status-codes`, `retriableStatusCodes` supplies the explicit status codes to retry (valid codes are 100 through 599).
-- `perTryTimeout` is not translated; the separate route-level `timeout` controls the backend read timeout.
+- `perTryTimeout` and `retryRemoteLocalities` are not translated and are reported in `deferred_fields`; the separate route-level `timeout` controls the backend read timeout.
+- Every `http[].route[]` entry needs a `destination` (Istio requires it); an entry without one refuses the VirtualService instead of silently dropping that share of a split.
 
 Route-local `retry` and destination `backend_tls` objects reject unknown keys at plugin admission (same fail-closed contract as `reject_unmatched` / `requires_node_waypoint_authz`). Shared proxy/upstream `RetryConfig` and `BackendTlsConfig` deserialization is not affected; only the mesh-route wire shapes are strict.
 
