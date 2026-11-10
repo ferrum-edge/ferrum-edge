@@ -8361,6 +8361,22 @@ impl EnvConfig {
                 )
             ));
         }
+        // Stream listeners must never fall back to another bind address: a
+        // typo meant to keep TCP/UDP/DTLS listeners on loopback would
+        // otherwise expose them on the proxy bind address (0.0.0.0).
+        if self
+            .stream_proxy_bind_address
+            .parse::<std::net::IpAddr>()
+            .is_err()
+        {
+            return Err(format!(
+                "Invalid FERRUM_STREAM_PROXY_BIND_ADDRESS {}. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                crate::startup::quoted_config_value(
+                    "FERRUM_STREAM_PROXY_BIND_ADDRESS",
+                    &self.stream_proxy_bind_address
+                )
+            ));
+        }
 
         self.validate_gateway_listener_bindings()?;
 

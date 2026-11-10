@@ -11437,17 +11437,17 @@ impl ProxyState {
             health_check_restart_rx.clone(),
         ));
 
-        // Parse stream proxy bind address
+        // `EnvConfig::validate` refuses an unparseable stream bind address at
+        // startup. Never fall back to another address here: that would bind
+        // stream listeners an operator meant to restrict on a wider interface.
         let stream_bind_addr: std::net::IpAddr = env_config_arc
             .stream_proxy_bind_address
             .parse()
-            .unwrap_or_else(|_| {
-                // Fall back to the proxy bind address, then to IPv4 unspecified
-                env_config_arc
-                    .proxy_bind_address
-                    .parse()
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-            });
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid FERRUM_STREAM_PROXY_BIND_ADDRESS: expected a valid IP address (e.g., 0.0.0.0 or ::)"
+                )
+            })?;
 
         let adaptive_buffer = Arc::new(crate::adaptive_buffer::AdaptiveBufferTracker::new(
             env_config_arc.adaptive_buffer_enabled,
