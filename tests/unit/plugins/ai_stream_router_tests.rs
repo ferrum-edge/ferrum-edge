@@ -9485,6 +9485,61 @@ async fn test_gemini_claim_fail_closed_roles_tools_and_legacy_pairing() {
     );
 }
 
+/// Anthropic routes validate `tools` whether or not `tool_choice` is present
+/// (issue #7126): the translator never drops a declaration, so a malformed
+/// list is refused at claim time with an OpenAI-shaped `400` naming `tools`,
+/// exactly as the Gemini route refuses it.
+#[tokio::test]
+async fn test_anthropic_claim_fail_closed_on_malformed_tools_without_tool_choice() {
+    let anthropic = build(openai_and_anthropic_config());
+    let gemini = build(gemini_config());
+    let malformed_tools = [
+        json!({"not": "an-array"}),
+        json!([{"type": "function", "function": {"description": "no name"}}]),
+        json!([{"type": "function", "function": {"name": "bad name!"}}]),
+        json!([{"type": "web_search", "function": {"name": "lookup"}}]),
+        json!([{"name": "lookup", "parameters": {"type": "object"}}]),
+        json!([
+            {"type": "function", "function": {"name": "lookup"}},
+            "not-an-object"
+        ]),
+    ];
+    for tools in malformed_tools {
+        for (plugin, model) in [
+            (&anthropic, "claude-3-5-sonnet"),
+            (&gemini, "gemini-1.5-flash"),
+        ] {
+            let body = json!({
+                "model": model,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+            });
+            let mut ctx = post_ctx(&body);
+            let mut headers = json_headers();
+            let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+            assert_eq!(reject_status(&result), Some(400), "{model}: {tools}");
+            assert_eq!(
+                rejected_param(&result).as_deref(),
+                Some("tools"),
+                "{model}: the 400 must name `tools`, not `tool_choice`: {tools}"
+            );
+        }
+    }
+
+    // A well-formed list without `tool_choice` is still translated in full.
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": weather_tools(),
+    });
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("well-formed tools translate");
+    assert_eq!(parsed["tools"][0]["name"], json!("get_weather"));
+}
+
 #[tokio::test]
 async fn test_gemini_alt_sse_query_merge_variants() {
     // Client query is preserved and alt=sse is appended.

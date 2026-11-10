@@ -620,6 +620,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the plugin's other SSE paths. The docs now state that `ai_transcript_audit`
   and `ai_tool_governor` read `ai_token_metrics` output only under its
   default `ai` metadata prefix.
+- **`ai_stream_router` refuses malformed `tools` on Anthropic routes**
+  (issue #7126). Tool declarations were validated only when `tool_choice`
+  (or extended thinking) was present; otherwise a non-array `tools` produced
+  no tools, entries without a string name were skipped, invalid names were
+  forwarded, and non-`function` entries were sent as functions, so the
+  request succeeded with tools missing. Anthropic routes now apply the same
+  closed `{type:"function", function:{name}}` check as Gemini routes and
+  `ai_federation`, on every request. The claim-time `400` for a malformed
+  `tools` list on Anthropic and Gemini routes now reports `param: "tools"`
+  (`code: "invalid_tools"`) instead of `tool_choice`.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
