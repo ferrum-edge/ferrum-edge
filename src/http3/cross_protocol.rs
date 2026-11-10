@@ -5399,7 +5399,10 @@ where
                 );
 
                 let max_req_bytes = effective_max_request_body_size_bytes;
-                let capacity = state.env_config.http3_request_body_channel_capacity;
+                // `mpsc::channel(0)` panics. The env parser clamps to >= 1, but
+                // `EnvConfig` is also built in code, so both H3 bridges guard
+                // the capacity the same way.
+                let capacity = state.env_config.http3_request_body_channel_capacity.max(1);
                 let (tx, rx) =
                     tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
                 // `tx` is borrowed by `reader_future` below, so the receiver cannot
@@ -12931,6 +12934,9 @@ where
     Ok(())
 }
 
+/// Write a fixed JSON error terminal for the one defensive arm that reaches
+/// it (a WebSocket flavor that should have been routed to
+/// `handle_h3_websocket`).
 async fn write_error<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
@@ -12941,26 +12947,9 @@ async fn write_error<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    write_error_with_header(stream, status, body, None, backend_start, bytes_sent).await
-}
-
-async fn write_error_with_header<S>(
-    stream: &mut RequestStream<S, Bytes>,
-    status: StatusCode,
-    body: &'static str,
-    extra_header: Option<(&'static str, &'static str)>,
-    backend_start: Instant,
-    bytes_sent: u64,
-) -> Result<CrossProtocolOutcome, anyhow::Error>
-where
-    S: RecvStream + SendStream<Bytes>,
-{
     let mut builder = Response::builder()
         .status(status)
         .header("content-type", "application/json");
-    if let Some((name, value)) = extra_header {
-        builder = builder.header(name, value);
-    }
     // A `HEAD` response keeps its representation `Content-Length` and carries
     // no body bytes (RFC 9110 §9.3.2).
     let omit_body = crate::http3::server::h3_request_is_head() && !body.is_empty();
