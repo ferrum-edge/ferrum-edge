@@ -651,7 +651,6 @@ def parse_dns_report(
         "transport": transport,
         "qps": qps,
         "p50_us": p50,
-        "p95_us": p90,  # retained for draft compatibility naming
         "p90_us": p90,
         "p99_us": p99,
         "total_errors": errors,

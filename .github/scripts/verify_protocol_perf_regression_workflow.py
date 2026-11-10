@@ -580,8 +580,9 @@ def validate_scenarios_contract(text: str, failures: list[str]) -> None:
     )
 
 
-def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
-    """Required PR CI must run lightweight protocol-perf validators without benches."""
+def validate_performance_lane_contract(text: str, failures: list[str]) -> None:
+    """The out-of-band `performance-regression.yml` lane must run the lightweight
+    protocol-perf validators without benches."""
     performance_job = _PERFORMANCE_REGRESSION_JOB_RE.search(text)
     require(
         performance_job is not None,
@@ -700,7 +701,7 @@ def validate_repository_contract(failures: list[str]) -> None:
 
     if CI_WORKFLOW_PATH.is_file():
         ci_workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
-        validate_pr_ci_contract(ci_workflow, failures)
+        validate_performance_lane_contract(ci_workflow, failures)
         validate_performance_regression_workspaces(ci_workflow, failures)
 
     if SETUP_RUST_CI_PATH.is_file():
@@ -760,7 +761,8 @@ def validate_repository_contract(failures: list[str]) -> None:
         )
         require(
             "protocol-perf" in ci_cd.lower() and "static" in ci_cd.lower(),
-            "docs/ci_cd.md must document protocol-perf static PR CI validation",
+            "docs/ci_cd.md must document the out-of-band `performance-regression.yml` "
+            "lane's static protocol-perf validation",
             failures,
         )
         require(
@@ -801,7 +803,8 @@ def validate_repository_contract(failures: list[str]) -> None:
         require(
             "Performance Regression Check" in runbook
             or "protocol-perf contracts" in runbook.lower(),
-            "runbook must document PR CI static protocol-perf contract checks",
+            "runbook must document the out-of-band `performance-regression.yml` "
+            "lane's static protocol-perf contract checks",
             failures,
         )
         require(
@@ -809,7 +812,8 @@ def validate_repository_contract(failures: list[str]) -> None:
             and "workspaces" in runbook
             and "tests/performance/mesh" in runbook
             and ". -> target" in runbook,
-            "runbook must document PR CI mesh workspace rust-cache coverage",
+            "runbook must document the out-of-band `performance-regression.yml` "
+            "lane's mesh workspace rust-cache coverage",
             failures,
         )
 
@@ -921,14 +925,15 @@ SIGHUP was not delivered
         run: echo detect
 """
     pr_ci_failures: list[str] = []
-    validate_pr_ci_contract(pr_ci_good, pr_ci_failures)
+    validate_performance_lane_contract(pr_ci_good, pr_ci_failures)
     if pr_ci_failures:
         failures.append(
-            f"self-test unexpectedly rejected good PR CI snippet: {pr_ci_failures}"
+            "self-test unexpectedly rejected a good performance-regression.yml "
+            f"snippet: {pr_ci_failures}"
         )
 
     pr_ci_bad_failures: list[str] = []
-    validate_pr_ci_contract(
+    validate_performance_lane_contract(
         """
   performance-regression:
     steps:
@@ -938,7 +943,10 @@ SIGHUP was not delivered
         pr_ci_bad_failures,
     )
     if not any("static" in item for item in pr_ci_bad_failures):
-        failures.append("self-test expected missing protocol-perf static PR CI detection")
+        failures.append(
+            "self-test expected the performance-regression.yml lane's missing "
+            "static protocol-perf checks to be detected"
+        )
 
     good_setup_rust_ci = """
 name: Setup Rust CI environment

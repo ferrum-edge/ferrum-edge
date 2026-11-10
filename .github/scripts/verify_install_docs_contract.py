@@ -13,10 +13,9 @@ README = REPO_ROOT / "README.md"
 CLI_MD = REPO_ROOT / "docs" / "cli.md"
 CI_CD_MD = REPO_ROOT / "docs" / "ci_cd.md"
 RELEASE_YML = REPO_ROOT / ".github/workflows/release.yml"
-CI_YML = REPO_ROOT / ".github/workflows/ci.yml"
 
 COPY_TRUSTED_DEST = re.compile(
-    r'copy_trusted_asset (?:release-binaries-|binary-)[^/]+/([^\s]+) ([^\s]+)'
+    r'copy_trusted_asset release-binaries-[^/]+/([^\s]+) ([^\s]+)'
 )
 FORBIDDEN_INSTALL_PATTERNS = (
     re.compile(r"releases/latest/download"),
@@ -47,21 +46,17 @@ def check_operator_install_docs(
     cli_md: str,
     ci_cd_md: str,
     release_workflow: str,
-    latest_workflow: str,
 ) -> list[str]:
     errors: list[str] = []
-    for workflow_label, workflow in (
-        ("stable release workflow", release_workflow),
-    ):
-        gateway_assets = release_gateway_assets(workflow)
-        if LINUX_X86_64_BINARY not in gateway_assets:
-            errors.append(
-                f"{workflow_label} is missing the Linux x86_64 gateway binary asset"
-            )
-        if LINUX_X86_64_CHECKSUM not in gateway_assets:
-            errors.append(
-                f"{workflow_label} is missing the Linux x86_64 checksum asset"
-            )
+    gateway_assets = release_gateway_assets(release_workflow)
+    if LINUX_X86_64_BINARY not in gateway_assets:
+        errors.append(
+            "stable release workflow is missing the Linux x86_64 gateway binary asset"
+        )
+    if LINUX_X86_64_CHECKSUM not in gateway_assets:
+        errors.append(
+            "stable release workflow is missing the Linux x86_64 checksum asset"
+        )
 
     for label, text in (
         ("README.md", readme),
@@ -107,27 +102,23 @@ def check_operator_install_docs(
 
 
 def check_repository() -> list[str]:
-    release_workflow = RELEASE_YML.read_text(encoding="utf-8")
-    latest_workflow = CI_YML.read_text(encoding="utf-8")
     return check_operator_install_docs(
         README.read_text(encoding="utf-8"),
         CLI_MD.read_text(encoding="utf-8"),
         CI_CD_MD.read_text(encoding="utf-8"),
-        release_workflow,
-        latest_workflow,
+        RELEASE_YML.read_text(encoding="utf-8"),
     )
 
 
 def run_self_test() -> list[str]:
     failures: list[str] = []
     release_workflow = RELEASE_YML.read_text(encoding="utf-8")
-    latest_workflow = CI_YML.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
     cli_md = CLI_MD.read_text(encoding="utf-8")
     ci_cd_md = CI_CD_MD.read_text(encoding="utf-8")
 
     if check_operator_install_docs(
-        readme, cli_md, ci_cd_md, release_workflow, latest_workflow
+        readme, cli_md, ci_cd_md, release_workflow
     ):
         failures.append("the checked-in install docs do not satisfy the contract")
         return failures
@@ -138,7 +129,7 @@ def run_self_test() -> list[str]:
         1,
     )
     if not check_operator_install_docs(
-        broken_readme, cli_md, ci_cd_md, release_workflow, latest_workflow
+        broken_readme, cli_md, ci_cd_md, release_workflow
     ):
         failures.append("broken tarball install recipe was not rejected")
 
@@ -148,9 +139,17 @@ def run_self_test() -> list[str]:
         1,
     )
     if not check_operator_install_docs(
-        readme, cli_md, broken_ci_cd, release_workflow, latest_workflow
+        readme, cli_md, broken_ci_cd, release_workflow
     ):
         failures.append("broken releases/latest API download recipe was not rejected")
+
+    stripped_release = release_workflow.replace(
+        f" {LINUX_X86_64_BINARY}\n", " renamed-binary\n"
+    )
+    if stripped_release == release_workflow or not check_operator_install_docs(
+        readme, cli_md, ci_cd_md, stripped_release
+    ):
+        failures.append("a release workflow without the Linux x86_64 asset was accepted")
 
     return failures
 

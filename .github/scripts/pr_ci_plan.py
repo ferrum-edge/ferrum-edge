@@ -551,8 +551,9 @@ FULL_CI_DOCUMENTATION_PATHS: frozenset[str] = frozenset()
 
 # Vendored-patch lifecycle governance inputs. The fail-closed parity gate that
 # reads them (`scripts/check_vendored_patch_lifecycle.py`, run by the
-# `dependency-audit` job) must keep its `mode == 'full'` guard — that is
-# asserted by .github/scripts/verify_required_ci.py's DIRECT_FULL_CI_JOBS — so a
+# `dependency-audit` job) keeps its `mode == 'full'` guard and its
+# `run_dependency_audit` path gate, both asserted by
+# .github/scripts/verify_required_ci.py's PATH_GATED_JOBS, so a
 # governance-doc-only pull request would otherwise skip the only check that
 # guards these files. Hyper artifact changes also reconstruct the pinned patch
 # stack in that job without requiring Rust test artifacts.

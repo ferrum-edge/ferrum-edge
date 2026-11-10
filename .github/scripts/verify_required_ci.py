@@ -122,11 +122,10 @@ REQUIRED_JOBS = {
     "standalone-cargo",
 }
 
-# Every compile-based job is now path-gated by the PR planner: a job runs on
-# a pull request only when the planner proves a path it owns changed, and on
-# every push to `main` (the planner force-schedules every gate there). No job
-# remains that requires full mode without also naming its gate.
-DIRECT_FULL_CI_JOBS: set[str] = set()
+# Every compile-based job is path-gated by the PR planner (PATH_GATED_JOBS): a
+# job runs on a pull request only when the planner proves a path it owns
+# changed, and on every push to `main` (the planner force-schedules every gate
+# there).
 
 # Job -> planner output that schedules it. Several jobs share the broad
 # `run_rust` compile-and-test gate; the rest carry a narrow owner-path gate.
@@ -1693,13 +1692,6 @@ def main() -> int:
     if "(CI mirror)" in ci_yml:
         planner_errors.append("ci.yml must not contain runner-holding CI mirror jobs")
 
-    for job in sorted(DIRECT_FULL_CI_JOBS):
-        body = extract_job_body(ci_yml, job)
-        if not job_needs(body, "ci-plan"):
-            planner_errors.append(f"jobs.{job} must directly need ci-plan")
-        if "needs.ci-plan.outputs.mode == 'full'" not in body:
-            planner_errors.append(f"jobs.{job} must require full CI mode")
-
     for job, output in sorted(PATH_GATED_JOBS.items()):
         body = extract_job_body(ci_yml, job)
         if not job_needs(body, "ci-plan"):
@@ -1731,12 +1723,12 @@ def main() -> int:
             if not workflow_has_exact_name(workflow_yml, expected_workflow_name):
                 planner_errors.append(
                     f"{workflow_path} must keep workflow name "
-                    f"`{expected_workflow_name}` for the main publish gate"
+                    f"`{expected_workflow_name}` for the publication inventory"
                 )
             if not main_push_trigger_is_unconditional(workflow_yml):
                 planner_errors.append(
-                    f"{workflow_path} must run on every push to main for the "
-                    "main publish gate"
+                    f"{workflow_path} must run on every push to main so each "
+                    "main commit carries the release evidence"
                 )
         if not pull_request_trigger_is_unconditional(workflow_yml):
             planner_errors.append(
@@ -2367,7 +2359,7 @@ def main() -> int:
     if not missing and not extra and not planner_errors:
         print(
             f"Required CI aggregate covers {len(REQUIRED_JOBS)} jobs; "
-            f"{len(DIRECT_FULL_CI_JOBS)} roots and "
+            f"{len(PATH_GATED_JOBS)} path-gated jobs and "
             f"{len(required_full_ci_docs)} live-suite docs enforce the CI plan."
         )
         return 0

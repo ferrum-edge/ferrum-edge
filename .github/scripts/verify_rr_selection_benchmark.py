@@ -16,7 +16,6 @@ import statistics
 from pathlib import Path
 
 PARALLEL_THREADS = 8
-ITERATIONS_PER_THREAD = 50_000
 ROUNDS = 3
 NOISE_THRESHOLD = 0.01
 

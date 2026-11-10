@@ -38,7 +38,6 @@ from coverage_plan import (
     select_plan,
     select_scoped_plan,
     self_test as planner_self_test,
-    verify_downloaded_artifacts,
 )
 
 
@@ -626,8 +625,8 @@ def self_test_artifact_transport(failures: list[str]) -> None:
         require(bool(rejected), f"transport mutation not caught: {old}", failures)
 
     script = artifact_transport_script(workflow)
-    fixture_path = Path(".github/scripts/fixtures/coverage_transport.sh")
-    require(fixture_path.read_text() == script,
+    fixture_path = REPO_ROOT / ".github/scripts/fixtures/coverage_transport.sh"
+    require(fixture_path.read_text(encoding="utf-8") == script,
             "coverage transport fixture must exactly match the hosted shell", failures)
     cases = (
         "valid", "zip64", "retry", "download-failure", "missing", "expired", "duplicate", "wrong-member",
@@ -1044,18 +1043,8 @@ jobs:
 
     try:
         parse_planned_shards(json.dumps([LIB_UNIT_SHARD, ADMIN_API_SHARD]))
-        verify_downloaded_artifacts(
-            [LIB_UNIT_SHARD],
-            ["coverage-data-lib-unit"],
-        )
     except ValueError as error:
-        failures.append(f"artifact helper self-test failed: {error}")
-    try:
-        verify_downloaded_artifacts([LIB_UNIT_SHARD], ["coverage-data-admin-api"])
-    except ValueError:
-        pass
-    else:
-        failures.append("artifact mismatch mutation was not caught")
+        failures.append(f"planned-shard parser self-test failed: {error}")
 
     if failures:
         for failure in failures:

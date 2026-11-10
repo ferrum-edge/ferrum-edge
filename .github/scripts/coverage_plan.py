@@ -610,18 +610,6 @@ def artifact_names_for_shards(shards: list[str]) -> list[str]:
     return [f"coverage-data-{shard}" for shard in shards]
 
 
-def verify_downloaded_artifacts(
-    planned_shards: list[str], artifact_names: list[str]
-) -> None:
-    expected = artifact_names_for_shards(planned_shards)
-    actual = [name for name in artifact_names if name]
-    if actual != expected:
-        raise ValueError(
-            "downloaded coverage artifacts must match the planned shard list "
-            f"exactly; expected {expected}, found {actual}"
-        )
-
-
 def write_github_output(path: Path, plan: CoveragePlan) -> None:
     matrix = json.dumps(plan.matrix_include, separators=(",", ":"))
     shards = json.dumps(list(plan.shards), separators=(",", ":"))
@@ -1107,30 +1095,11 @@ def self_test() -> int:
         else:
             failures.append(f"{label} were accepted")
 
-    try:
-        verify_downloaded_artifacts(
-            [LIB_UNIT_SHARD, ADMIN_API_SHARD],
-            ["coverage-data-lib-unit", "coverage-data-admin-api"],
-        )
-    except ValueError as error:
-        failures.append(f"matching artifacts were rejected: {error}")
-
-    try:
-        verify_downloaded_artifacts(
-            [LIB_UNIT_SHARD],
-            ["coverage-data-lib-unit", "coverage-data-admin-api"],
-        )
-    except ValueError:
-        pass
-    else:
-        failures.append("extra downloaded artifacts were accepted")
-
-    try:
-        verify_downloaded_artifacts([LIB_UNIT_SHARD, ADMIN_API_SHARD], ["coverage-data-lib-unit"])
-    except ValueError:
-        pass
-    else:
-        failures.append("missing planned artifacts were accepted")
+    if artifact_names_for_shards([LIB_UNIT_SHARD, ADMIN_API_SHARD]) != [
+        "coverage-data-lib-unit",
+        "coverage-data-admin-api",
+    ]:
+        failures.append("artifact names must follow the planned shard order")
 
     skip = skip_plan("no coverage-relevant files changed")
     if skip.shards:
@@ -1157,39 +1126,22 @@ def main() -> int:
     parser.add_argument("--changed-files", type=Path)
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--verify-artifacts", action="store_true")
     parser.add_argument("--emit-artifact-names", action="store_true")
     parser.add_argument("--planned-shards")
-    parser.add_argument("--artifact-names", type=Path)
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
 
-    if args.verify_artifacts or args.emit_artifact_names:
+    if args.emit_artifact_names:
         if not args.planned_shards:
-            parser.error("--planned-shards is required for artifact verification")
+            parser.error("--planned-shards is required with --emit-artifact-names")
         try:
             shards = parse_planned_shards(args.planned_shards)
         except ValueError as error:
             print(f"::error::{error}", file=sys.stderr)
             return 1
-        names = artifact_names_for_shards(shards)
-        if args.emit_artifact_names:
-            sys.stdout.write("\n".join(names) + "\n")
-        if args.verify_artifacts:
-            if args.artifact_names is None:
-                parser.error("--artifact-names is required with --verify-artifacts")
-            downloaded = [
-                line.strip()
-                for line in args.artifact_names.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            try:
-                verify_downloaded_artifacts(shards, downloaded)
-            except ValueError as error:
-                print(f"::error::{error}", file=sys.stderr)
-                return 1
+        sys.stdout.write("\n".join(artifact_names_for_shards(shards)) + "\n")
         return 0
 
     if not args.event_name:

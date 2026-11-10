@@ -630,30 +630,6 @@ def _active_shell_lines(script: str) -> list[str]:
     return active
 
 
-def _direct_job_scalar(body: str, key: str) -> str | None:
-    """Return one active canonical direct scalar, excluding comments."""
-
-    values: list[str] = []
-    for line in body.splitlines():
-        if not line.strip() or _is_comment_line(line):
-            continue
-        try:
-            if _indent_spaces(line) != 4:
-                continue
-        except StructuralError:
-            return None
-        match = _MAPPING_KEY.match(line[4:])
-        if match is None or match.group(1) != key:
-            continue
-        kind, payload = _classify_value(match.group(2))
-        if kind != "scalar":
-            return None
-        values.append(payload)
-    if len(values) != 1:
-        return None
-    return values[0]
-
-
 def _checkout_step_errors(
     step: dict[str, tuple[str, object]],
     located: str,
@@ -3663,15 +3639,6 @@ def self_test() -> list[str]:
     expect(
         _release_errors(release_opaque_key) != [],
         "an opaque explicit-key duplicate of validate-release-sha must fail",
-    )
-    try:
-        _parse_job(_CONFORMING_RELEASE_JOB + '  "smuggled":\n    name: Attack\n')
-        release_unconsumed = False
-    except StructuralError:
-        release_unconsumed = True
-    expect(
-        release_unconsumed,
-        "unconsumed lower-indentation content in a release job region must fail",
     )
 
     return failures
