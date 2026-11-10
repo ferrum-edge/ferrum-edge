@@ -270,7 +270,6 @@ const DEFAULT_CONTENT_TYPES: &[&str] = &[
 /// alongside the classic `204` / `304` no-body statuses.
 const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 205, 304];
 
-const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
@@ -2564,7 +2563,7 @@ impl Plugin for CompressionPlugin {
         // (the monotonic request-global HIT marker) — including legacy identity
         // responses that omit `Vary: Accept-Encoding` (#2355) — so auth/policy
         // rejections keep their original status.
-        let on_rejection = ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY);
+        let on_rejection = ctx.metadata.contains_key(crate::proxy::REJECTION_RESPONSE_METADATA_KEY);
 
         // Settle this instance's share of the chain-wide negotiation decision
         // before any early return below, so a hard-skipping or ineligible
