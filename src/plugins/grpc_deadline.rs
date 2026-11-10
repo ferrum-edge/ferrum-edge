@@ -294,22 +294,6 @@ fn record_adjusted_deadline_metadata(ctx: &mut RequestContext, deadline_ms: u64)
     );
 }
 
-fn initialize_deadline_from_headers(ctx: &mut RequestContext, headers: &HashMap<String, String>) {
-    if ctx.grpc_deadline_initialized {
-        return;
-    }
-    let deadline_ms = timeout_header(headers)
-        .and_then(parse_grpc_timeout)
-        .and_then(duration_millis_ceil_saturating);
-    if let Some(original_ms) = deadline_ms {
-        ctx.metadata.insert(
-            "grpc_original_deadline_ms".to_string(),
-            original_ms.to_string(),
-        );
-    }
-    ctx.initialize_grpc_deadline_budget(deadline_ms);
-}
-
 /// Establish the request's single typed gRPC deadline before any plugin or
 /// request-body await. Policies are applied in configured execution order, so
 /// multiple scoped instances compose once without repeatedly deducting elapsed
@@ -362,7 +346,6 @@ pub fn prepare_request_deadline(
         // `subtract_gateway_processing` is enabled.
         record_preflight_adjusted_metadata(ctx);
     }
-    ctx.grpc_deadline_preflight_complete = true;
     PluginResult::Continue
 }
 
@@ -489,21 +472,8 @@ impl Plugin for GrpcDeadline {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Direct plugin tests and custom embedders may call `before_proxy`
-        // without the gateway's receipt-time preparation pass. Preserve that
-        // API by initializing and applying this policy once on the fallback
-        // path; normal gateway requests arrive here already fully prepared.
-        if !ctx.grpc_deadline_preflight_complete {
-            if !ctx.grpc_deadline_initialized {
-                initialize_deadline_from_headers(ctx, headers);
-            }
-            if let reject @ (PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }) =
-                self.prepare_grpc_deadline(ctx)
-            {
-                return reject;
-            }
-        }
-
+        // Every gateway ladder runs `prepare_request_deadline` at receipt, so
+        // the budget below is already established for this request.
         let client_timeout_invalid = client_grpc_timeout_is_invalid(headers);
 
         let Some(effective_ms) = ctx.grpc_deadline_budget_ms else {

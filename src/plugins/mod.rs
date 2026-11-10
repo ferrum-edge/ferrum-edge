@@ -2656,10 +2656,6 @@ pub struct RequestContext {
     /// Monotonic receipt instant captured with the request context. Effective
     /// budgets are added to this exact anchor, independent of wall-clock jumps.
     pub(crate) grpc_deadline_received_at: tokio::time::Instant,
-    /// Whether the gateway's full ordered deadline-policy preflight completed.
-    /// Direct plugin callers that skip the preflight still apply each instance
-    /// from `before_proxy` for backward-compatible composition.
-    pub(crate) grpc_deadline_preflight_complete: bool,
     /// Effective receipt-anchored gRPC budget after every `grpc_deadline`
     /// policy has applied its default/cap decision. Kept separate from the
     /// relative header forwarded upstream so retries never re-arm the budget.
@@ -4734,7 +4730,6 @@ impl RequestContext {
             grpc_deadline_had_valid_client_timeout: false,
             request_body_integrity_retirement: false,
             grpc_deadline_received_at: tokio::time::Instant::now(),
-            grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
             grpc_deadline_policy_budget_ms: None,
             grpc_deadline_ceiling_ms: None,
@@ -6383,7 +6378,6 @@ impl RequestContext {
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
             request_body_integrity_retirement: self.request_body_integrity_retirement,
             grpc_deadline_received_at: self.grpc_deadline_received_at,
-            grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
             grpc_deadline_policy_budget_ms: self.grpc_deadline_policy_budget_ms,
             grpc_deadline_ceiling_ms: self.grpc_deadline_ceiling_ms,
