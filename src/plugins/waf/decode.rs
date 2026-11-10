@@ -11,12 +11,11 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle_bytes))
 }
 
+/// Any encoded percent sign. Every narrower double-encoded form (`%252e`,
+/// `%252f`, `%255c`, `%2500`, `%2525`) contains `%25`, so this one check is the
+/// whole predicate.
 pub fn has_double_encoded_marker(value: &str) -> bool {
     contains_case_insensitive(value, "%25")
-        || contains_case_insensitive(value, "%252e")
-        || contains_case_insensitive(value, "%252f")
-        || contains_case_insensitive(value, "%255c")
-        || contains_case_insensitive(value, "%2500")
 }
 
 pub fn has_percent_null_byte(value: &str) -> bool {

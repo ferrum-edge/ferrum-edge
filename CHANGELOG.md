@@ -70,6 +70,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when an index already exists; any other failure (even one whose text
   contains "1061") fails the migration. The V001 checksum changes: recreate
   development databases.
+- **Request-path logging in `ldap_auth`, `kafka_logging` and `otel_tracing`
+  no longer scales with traffic** (#7140).
+  - `ldap_auth` logs request-path refusals (wrong password, unknown user,
+    non-membership, saturated failure tracker or concurrency limit,
+    deadlines, directory failover) through the sampled warning gate: at most
+    one WARN per site per 10 seconds with a `suppressed_events` count, the
+    detail at DEBUG. Non-membership warnings no longer name the user; the
+    identity is logged at DEBUG only.
+  - `kafka_logging` rate-limits its delivery-failure and admission-saturation
+    warnings with a lock-free gate instead of a mutex every request's `log`
+    hook took once the channel was full. The warnings now carry
+    `suppressed_events`.
+  - `otel_tracing`'s per-transaction `request trace` / `stream trace` /
+    `websocket session trace` records (target `otel`) are DEBUG instead of
+    INFO: they were emitted for every traced transaction before the sampling
+    decision and carried the client address.
 - **Mesh HTTP/2 backend connections use the same builder settings as the
   direct-H2 and gRPC pools** (issue #7071).
   - Sidecar mesh-mTLS connections and the nested HTTP/2 connection a native
@@ -236,6 +252,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai_stream_router`, a `stop` that is not a string or an array of strings is
   now a `400` instead of being forwarded as an empty list. Anthropic's 4096
   default for an unbounded `ai_federation` request is now documented.
+- **WAF `FE-ENCODING-002` no longer flags URL-encoded emoji and Indic/Thai
+  text** (#7142). Its URL regex `(?i)%(?:c0|e0|f0)%` matched every valid
+  `%E0..` and `%F0..` UTF-8 sequence, so `?q=%F0%9F%98%80` recorded a Medium
+  hit (3 of the default anomaly threshold 7) and was blocked once the rule was
+  promoted to `enforce`. The regex now matches exactly the overlong pairs the
+  rule's special checks (`%c0%ae`, `%c0%af`, `%e0%80`, `%f0%80`). On URLs an
+  overlong marker is also no longer reported under `FE-ENCODING-001` as well:
+  it belongs to `FE-ENCODING-002` only, as it already did for bodies, so one
+  marker scores once and disabling `FE-ENCODING-002` stops it.
+- **`proxy_alerts` no longer counts cooled-down reminders as dropped alerts**
+  (#7141). An `Active` incident maps every breaching sample to a Trigger, and
+  the dispatch permit was taken before the cooldown was consulted, so with the
+  dispatch semaphore full (a hung channel retrying) every breaching request
+  incremented `ferrum_notification_delivery_backpressure_dropped_total` and
+  the "dropping alert" warning although the cooldown would have suppressed the
+  reminder anyway. The cooldown is now checked first; only alerts actually
+  owed are counted. `stream_disconnect_cause` rules also read `causes`
+  through `DisconnectCause`'s serialized names, so a new cause is accepted
+  without a second table.
+- **`hmac_auth`'s pre-buffered success path commits through the shared
+  authentication boundary** (#7139). A signed request whose body was buffered
+  before `authenticate` set `identified_consumer` / `auth_method` by hand
+  instead of calling `commit_authentication_attempt`, so it added an HMAC
+  Consumer beside an external identity an earlier mechanism had already
+  committed and skipped the shared identity/realm, credential-deadline,
+  principal-state and cleanup steps. Both paths now share one commit tail.
+- **`ai_rate_limiter` reserves every output cap `ai_request_guard`
+  evaluates** (#7135). The limiter read caps only as JSON unsigned integers
+  and only as `generationConfig.maxOutputTokens` /
+  `generation_config.max_output_tokens`, while the guard also accepts
+  integral floats and exponents (`4096.0`, `1e5`), quoted integers, and the
+  mixed Gemini spellings. A request such as `{"max_tokens": 1e5}` was judged
+  as a 100000-token completion by the guard but reserved nothing in
+  `count_mode: completion_tokens`. Both plugins now share one integer parser,
+  the limiter reads all four Gemini spellings, and the prompt estimate
+  excludes caps at exactly the same paths and values.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then

@@ -3082,6 +3082,111 @@ async fn completion_count_mode_uses_max_output_tokens_field() {
     );
 }
 
+/// Completion-mode reservation for one raw JSON request body.
+async fn completion_tokens_reserved_for_raw_body(body: &str) -> u64 {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1_000_000,
+            "window_seconds": 60,
+            "count_mode": "completion_tokens",
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    reserved_tokens(&ctx)
+}
+
+#[tokio::test]
+async fn completion_count_mode_reads_caps_the_way_ai_request_guard_does() {
+    // Issue #7135: every cap `ai_request_guard` evaluates must also be reserved,
+    // otherwise a request the guard judged as a large completion reserves 0 here.
+    // Integral floats, exponents, and quoted integers are caps to the guard
+    // (and to the providers), as are all four Gemini ProtoJSON spellings.
+    for (body, expected) in [
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":1e5}"#,
+            100_000,
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":4096.0}"#,
+            4096,
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":"2048"}"#,
+            2048,
+        ),
+        (
+            r#"{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":300}}"#,
+            300,
+        ),
+        (
+            r#"{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"max_output_tokens":301}}"#,
+            301,
+        ),
+        (
+            r#"{"contents":[{"parts":[{"text":"hi"}]}],"generation_config":{"maxOutputTokens":302}}"#,
+            302,
+        ),
+        (
+            r#"{"contents":[{"parts":[{"text":"hi"}]}],"generation_config":{"max_output_tokens":303}}"#,
+            303,
+        ),
+    ] {
+        assert_eq!(
+            completion_tokens_reserved_for_raw_body(body).await,
+            expected,
+            "cap in {body} must be reserved"
+        );
+    }
+
+    // Values the guard rejects as invalid are not caps here either.
+    for body in [
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":-5}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":12.5}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":"lots"}"#,
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":true}"#,
+    ] {
+        assert_eq!(
+            completion_tokens_reserved_for_raw_body(body).await,
+            0,
+            "invalid cap in {body} must not be reserved"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prompt_estimate_excludes_every_gemini_cap_spelling() {
+    // The prompt walk excludes caps at exactly the paths the completion
+    // reservation reads, including the mixed Gemini spellings (#7135).
+    let base = prompt_tokens_reserved(json!({
+        "contents": [{"parts": [{"text": "abcd"}]}],
+        "generationConfig": {"temperature": 0},
+        "generation_config": {"temperature": 0}
+    }))
+    .await;
+    let with_caps = prompt_tokens_reserved(json!({
+        "contents": [{"parts": [{"text": "abcd"}]}],
+        "generationConfig": {"temperature": 0, "max_output_tokens": 999_999_999},
+        "generation_config": {"temperature": 0, "maxOutputTokens": 999_999_999}
+    }))
+    .await;
+    assert_eq!(
+        with_caps, base,
+        "mixed-spelling Gemini caps must stay excluded from the prompt estimate"
+    );
+}
+
 // Build a POST JSON request whose ONLY recognized prompt field is a single
 // `prompt` string (plus a token-cap field that must stay excluded).
 fn ai_prompt_field_ctx(prompt: &str, max_tokens: u64) -> RequestContext {

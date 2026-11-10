@@ -118,8 +118,10 @@ pub struct PluginTriggerCarrierCounters {
     /// session carried an explicit `false` decision for that instance.
     pub skipped_session_hooks: u64,
     /// Contextless hooks that RAN because no decision was carried for the
-    /// instance. Backward compatible by design; a sustained nonzero rate on a
-    /// triggered deployment means a summary/session path is not stamping the
+    /// instance. Backward compatible by design. Identity-reading triggers are
+    /// undecided by design on stream connections and on HTTP requests that end
+    /// at or before `authenticate`, so they count here too; without them, a
+    /// sustained nonzero rate means a summary/session path is not stamping the
     /// carrier.
     pub missing_decision_carriers: u64,
 }

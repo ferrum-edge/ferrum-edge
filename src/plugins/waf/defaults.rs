@@ -451,7 +451,10 @@ pub fn default_rules() -> Vec<WafRule> {
         r("FE-COOKIE-002", "Session fixation cookie name", "cookie_attack", Severity::Low, RuleTarget::Cookies, r"(?i)\b(?:jsessionid|phpsessid|asp\.net_sessionid)\s*="),
         r("FE-HPP-001", "Conflicting duplicate query key", "parameter_pollution", Severity::Medium, RuleTarget::FullUrl, r"$^"),
         r("FE-ENCODING-001", "Double URL encoding", "encoding_evasion", Severity::Medium, RuleTarget::FullUrl, r"(?i)%25(?:25|2e|2f|5c|00)"),
-        r("FE-ENCODING-002", "Overlong UTF-8 marker", "encoding_evasion", Severity::Medium, RuleTarget::FullUrl, r"(?i)%(?:c0|e0|f0)%"),
+        // Exactly the overlong pairs `decode::has_overlong_utf8_marker` checks.
+        // A bare `%(?:c0|e0|f0)%` also matched every valid `%E0..` (Indic,
+        // Thai, ...) and `%F0..` (emoji) sequence.
+        r("FE-ENCODING-002", "Overlong UTF-8 marker", "encoding_evasion", Severity::Medium, RuleTarget::FullUrl, r"(?i)%(?:c0%a[ef]|[ef]0%80)"),
         r("FE-METHOD-001", "Disallowed method", "method_abuse", Severity::Medium, RuleTarget::Method, r"$^"),
         r("FE-RESP-STACK-001", "Java stack trace disclosure", "stack_trace", Severity::Medium, RuleTarget::ResponseBody, r"(?m)\bat\s+[A-Za-z0-9_.$]+\([^)]*\.java:\d+\)"),
         r("FE-RESP-STACK-002", "Python traceback disclosure", "stack_trace", Severity::Medium, RuleTarget::ResponseBody, r"Traceback \(most recent call last\)"),

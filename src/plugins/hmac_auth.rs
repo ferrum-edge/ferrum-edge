@@ -2540,18 +2540,11 @@ async fn run_hmac_auth(
                 }
                 return hmac_reject(refusal.status, refusal.body);
             }
-            if ctx.identified_consumer.is_none() {
-                debug!(
-                    "{}: identified consumer '{}'",
-                    mechanism.mechanism_name(),
-                    consumer.username
-                );
-                ctx.identified_consumer = Some(consumer);
-            }
-            if ctx.auth_method.is_none() {
-                ctx.auth_method = Some(mechanism.mechanism_name());
-            }
-            return super::PluginResult::Continue;
+            // The same atomic commit boundary as the ordinary path, so a
+            // principal another mechanism already committed is never joined by
+            // a second one, and every commit step (identity/realm, deadline,
+            // principal state, credential cleanup) applies here too.
+            return commit_hmac_outcome(mechanism, ctx, VerifyOutcome::consumer(consumer));
         }
         None => {}
     }
@@ -2600,6 +2593,17 @@ async fn run_hmac_auth(
         }
     }
 
+    commit_hmac_outcome(mechanism, ctx, outcome)
+}
+
+/// The commit tail both `hmac_auth` paths share: publish a verified (and
+/// already single-use-claimed) outcome through
+/// [`commit_authentication_attempt`] and map its refusals to `hmac` rejections.
+fn commit_hmac_outcome(
+    mechanism: &HmacAuth,
+    ctx: &mut RequestContext,
+    outcome: VerifyOutcome,
+) -> super::PluginResult {
     match commit_authentication_attempt(
         ctx,
         AuthenticationAttempt::new(),

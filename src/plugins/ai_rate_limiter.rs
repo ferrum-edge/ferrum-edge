@@ -42,7 +42,8 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::utils::ai_providers::{
-    AiProvider, detect_response_provider, extract_response_usage, parse_ai_provider,
+    AiProvider, IntegerControl, detect_response_provider, extract_response_usage,
+    parse_ai_provider, parse_integer_control,
 };
 use super::utils::ai_usage_stream::{
     UsageAccumulator, UsageStreamExtractor, UsageStreamFormat, is_aws_event_stream_content_type,
@@ -2175,9 +2176,13 @@ const TOP_LEVEL_TOKEN_CAP_FIELDS: &[&str] = &[
 /// Named provider containers whose immediate numeric child is an output cap.
 /// Only the root-level `(container, field)` pairs listed here match
 /// [`requested_completion_tokens`]; the same spellings deeper in tool schemas
-/// or content are billed prompt material.
+/// or content are billed prompt material. Gemini's container and field are
+/// each accepted in both ProtoJSON spellings (lowerCamelCase JSON name and
+/// snake_case proto name), exactly as `ai_request_guard` reads them.
 const NESTED_TOKEN_CAP_FIELDS: &[(&str, &str)] = &[
     ("generationConfig", "maxOutputTokens"),
+    ("generationConfig", "max_output_tokens"),
+    ("generation_config", "maxOutputTokens"),
     ("generation_config", "max_output_tokens"),
     ("inferenceConfig", "maxTokens"),
     ("inference_config", "max_tokens"),
@@ -2189,10 +2194,17 @@ fn is_top_level_token_cap_field(key: &str) -> bool {
     TOP_LEVEL_TOKEN_CAP_FIELDS.contains(&key)
 }
 
-fn nested_token_cap_field_for_container(container: &str) -> Option<&'static str> {
+/// The listed container name when `container` names a cap container.
+fn token_cap_container(container: &str) -> Option<&'static str> {
     NESTED_TOKEN_CAP_FIELDS
         .iter()
-        .find_map(|(name, field)| (*name == container).then_some(*field))
+        .find_map(|(name, _)| (*name == container).then_some(*name))
+}
+
+fn is_nested_token_cap_field(container: &str, key: &str) -> bool {
+    NESTED_TOKEN_CAP_FIELDS
+        .iter()
+        .any(|(name, field)| *name == container && *field == key)
 }
 
 /// Output-token cap requested by the client, across OpenAI and provider-native
@@ -2204,13 +2216,16 @@ fn nested_token_cap_field_for_container(container: &str) -> Option<&'static str>
 /// `max_output_tokens`, legacy Anthropic `max_tokens_to_sample`, TGI/HuggingFace
 /// `max_new_tokens`, and the rarer top-level provider forms `maxOutputTokens` /
 /// `maxTokens`. Nested provider containers: Gemini/Vertex
-/// `generationConfig.maxOutputTokens`, AWS Bedrock Converse
-/// `inferenceConfig.maxTokens`, Amazon Titan `textGenerationConfig.maxTokenCount`,
-/// and TGI `parameters.max_new_tokens`. Without the nested forms a native Gemini,
-/// Bedrock, or Titan request reserves 0 in `completion_tokens` mode, so a burst of
-/// capped completions can oversubscribe the budget until post-response
-/// reconciliation. Mirrors the token-field coverage in `ai_request_guard`.
-/// Field lists and the unsigned acceptance contract are shared with prompt-walk
+/// `generationConfig.maxOutputTokens` (and its other ProtoJSON spellings), AWS
+/// Bedrock Converse `inferenceConfig.maxTokens`, Amazon Titan
+/// `textGenerationConfig.maxTokenCount`, and TGI `parameters.max_new_tokens`.
+/// Without the nested forms a native Gemini, Bedrock, or Titan request reserves
+/// 0 in `completion_tokens` mode, so a burst of capped completions can
+/// oversubscribe the budget until post-response reconciliation. Every cap
+/// location `ai_request_guard` evaluates is read here too (this list adds the
+/// snake_case `inference_config.max_tokens`), and values are read through the
+/// guard's own integer parser, so a cap the guard evaluates is always reserved.
+/// Field lists and the acceptance contract are shared with prompt-walk
 /// exclusion via [`TOP_LEVEL_TOKEN_CAP_FIELDS`] / [`NESTED_TOKEN_CAP_FIELDS`] and
 /// [`token_cap_u64`].
 fn requested_completion_tokens(json: &Value) -> u64 {
@@ -2233,10 +2248,16 @@ fn requested_completion_tokens(json: &Value) -> u64 {
     top_level.max(nested)
 }
 
-/// Unsigned output-cap values accepted by [`requested_completion_tokens`].
-/// Negative and fractional JSON numbers are not recognized controls.
+/// Output-cap values accepted by [`requested_completion_tokens`]: the same
+/// reading `ai_request_guard` applies ([`parse_integer_control`]), so JSON
+/// integers, integral floats and exponents (`8192.0`, `1e5`), and quoted
+/// spellings of those are caps. Negative, fractional, non-finite, and
+/// non-numeric values are not recognized controls.
 fn token_cap_u64(value: &Value) -> Option<u64> {
-    value.as_u64()
+    match parse_integer_control(Some(value)) {
+        IntegerControl::Value(value) => Some(value),
+        IntegerControl::Absent | IntegerControl::Invalid => None,
+    }
 }
 
 /// Strong, LLM-idiomatic top-level fields — each marks an AI request on its own.
@@ -2585,8 +2606,8 @@ fn is_media_content_part(family: ContentFamily, part: &serde_json::Map<String, V
 /// depth:
 /// - Numeric output caps are excluded only at the exact paths read by
 ///   [`requested_completion_tokens`] (root-level cap fields and the documented
-///   named provider containers) and only when the value is an unsigned integer
-///   accepted by that helper (`as_u64`). Nested schema/content numbers with the
+///   named provider containers) and only when the value is a cap accepted by
+///   that helper ([`token_cap_u64`]). Nested schema/content numbers with the
 ///   same spelling, and negative/fractional numbers at cap paths, count
 ///   fail-closed.
 /// - Multimodal binary URL/base64/file payloads are excluded only as **leaves**
@@ -2657,9 +2678,9 @@ enum PromptLocation {
     /// Members of the request root object.
     RootObject,
     /// Immediate members of a root-level provider cap container
-    /// (`generationConfig`, `parameters`, …). `field` is the only numeric key
-    /// excluded here.
-    RootCapContainer { field: &'static str },
+    /// (`generationConfig`, `parameters`, …). Only the cap fields
+    /// [`NESTED_TOKEN_CAP_FIELDS`] lists for `container` are excluded here.
+    RootCapContainer { container: &'static str },
     /// Root-level `messages` / `contents` / `input` / `chat_history` value.
     ProviderMessages { family: ContentFamily },
     /// One element of a provider messages array (a message / content object).
@@ -2692,7 +2713,7 @@ const BINARY_SOURCE_TYPES: &[&str] = &["base64", "url", "file"];
 const MIN_BASE64_PAYLOAD_LEN: usize = 48;
 
 /// Whether this object member is an output-cap control at a path also read by
-/// [`requested_completion_tokens`]. Uses the same unsigned (`as_u64`) acceptance
+/// [`requested_completion_tokens`]. Uses the same [`token_cap_u64`] acceptance
 /// contract so negative/fractional numbers count fail-closed.
 fn is_excluded_token_cap_member(ctx: PromptWalkCtx, key: &str, value: &Value) -> bool {
     if token_cap_u64(value).is_none() {
@@ -2700,7 +2721,7 @@ fn is_excluded_token_cap_member(ctx: PromptWalkCtx, key: &str, value: &Value) ->
     }
     match ctx.location {
         PromptLocation::RootObject => is_top_level_token_cap_field(key),
-        PromptLocation::RootCapContainer { field } => key == field,
+        PromptLocation::RootCapContainer { container } => is_nested_token_cap_field(container, key),
         _ => false,
     }
 }
@@ -2769,8 +2790,8 @@ fn json_number_literal_character_count(n: &serde_json::Number) -> u64 {
 fn child_context_for_member(ctx: PromptWalkCtx, key: &str) -> PromptWalkCtx {
     match ctx.location {
         PromptLocation::RootObject => {
-            if let Some(field) = nested_token_cap_field_for_container(key) {
-                return PromptWalkCtx::at(PromptLocation::RootCapContainer { field });
+            if let Some(container) = token_cap_container(key) {
+                return PromptWalkCtx::at(PromptLocation::RootCapContainer { container });
             }
             let family = match key {
                 "messages" => Some(ContentFamily::Messages),
