@@ -7943,6 +7943,72 @@ mod configsync_identity_binding {
         assert_eq!(admission.active_streams(), 0);
         assert_eq!(tx.receiver_count(), 0);
     }
+
+    /// Issue #7202: refusals that are not credential failures are audited
+    /// with their own closed class instead of a shared "request refused",
+    /// and the record never echoes the DP-supplied build identity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn configsync_audits_build_and_real_ip_refusals_with_their_own_class() {
+        let server = CpGrpcServer::builder(
+            Arc::new(ArcSwap::from_pointee(create_test_config(1))),
+            TEST_JWT_SECRET.to_string(),
+        )
+        .build();
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        crate::diagnostic_test_interest::ensure_interest_floor();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut wrong_build = request("audit-class-dp", "audit-class-dp");
+        wrong_build.get_mut().config_sync_build = "foreign-build-identity-7202".to_string();
+        let status = match server.subscribe(wrong_build).await {
+            Ok(_) => panic!("a different build must be refused"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let mut wrong_real_ip = request("audit-class-dp", "audit-class-dp");
+        wrong_real_ip.get_mut().real_ip_header = None;
+        let status = match server.subscribe(wrong_real_ip).await {
+            Ok(_) => panic!("a missing real IP header advertisement must be refused"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let failures: Vec<&str> = captured
+            .lines()
+            .filter(|line| {
+                line.contains("audit.event=\"tenant_subscription\"")
+                    && line.contains("result=\"failure\"")
+            })
+            .collect();
+        assert!(
+            failures
+                .iter()
+                .any(|line| line.contains("reason=\"config_sync build identity mismatch\"")),
+            "build mismatch must be audited with its own class: {captured}"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|line| line.contains("reason=\"real IP header mismatch\"")),
+            "real IP header mismatch must be audited with its own class: {captured}"
+        );
+        assert!(
+            !failures.iter().any(|line| line.contains("request refused")),
+            "no refusal may collapse into the generic class: {captured}"
+        );
+        assert!(
+            !captured.contains("foreign-build-identity-7202"),
+            "the audit must not echo the DP-supplied build identity: {captured}"
+        );
+    }
 }
 
 mod configsync_size_bounds {
