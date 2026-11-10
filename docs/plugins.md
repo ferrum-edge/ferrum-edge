@@ -1652,7 +1652,7 @@ The configuration object is closed: any key outside the table above is rejected.
 
 Generates and propagates correlation IDs for request tracing across services. With the default `inbound_policy: "preserve"`, an inbound value is preserved only when it is non-empty, no longer than 256 bytes, and matches `[A-Za-z0-9._-]+`. UUIDs and ULID-style values are accepted; printable punctuation such as `order:123`, `Root=1-abc;Parent=def`, spaces, slashes, plus signs, and non-ASCII text are rejected. Every missing or rejected value is replaced by a fresh UUID v4; values are never truncated.
 
-Set `inbound_policy: "generate"` on an edge-facing instance when the gateway must own the event identifier (support, audit, and cross-service log joins that cannot trust a caller's choice). Every HTTP/gRPC/WebSocket request then receives a fresh UUID v4 that overwrites any inbound value on that header, even a well-formed one, so two requests carrying the same caller ID get distinct IDs. The generated value is the one forwarded to the backend, echoed downstream (including successful WebSocket handshakes), recorded as the canonical `request_id` when this instance owns it, and recorded as gateway-generated for `response_caching`. To keep the caller's value as well, add a second instance with a different `header_name` and the default `preserve` policy; a caller cannot defeat a `generate` instance by also supplying its header. TCP/UDP sessions always generate regardless of the policy.
+Set `inbound_policy: "generate"` on an edge-facing instance when the gateway must own the event identifier (support, audit, and cross-service log joins that cannot trust a caller's choice). Every HTTP/gRPC/WebSocket request then receives a fresh UUID v4 that overwrites any inbound value on that header, even a well-formed one, so two requests carrying the same caller ID get distinct IDs. The generated value is the one forwarded to the backend, echoed downstream (including successful WebSocket handshakes), recorded as the canonical `request_id` when this instance owns it, and recorded as gateway-generated for `response_caching` and `ai_semantic_cache`. To keep the caller's value as well, add a second instance with a different `header_name` and the default `preserve` policy; a caller cannot defeat a `generate` instance by also supplying its header. TCP/UDP sessions always generate regardless of the policy.
 
 Global instances also cover unmatched-route 404s on HTTP/1.1, HTTP/2, and HTTP/3, including their gRPC/gRPC-Web error representations. They resolve IDs using the same `inbound_policy` and echo each resolved header when `echo_downstream` is enabled. The canonical `request_id` is included in the unrouted transaction record sent to global `stdout_logging` instances. Proxy and proxy-group instances require a matched route. Without a global correlation policy, correlation adds only an optional-pointer check to route misses, with no header materialization or allocation.
 
@@ -1660,7 +1660,7 @@ The first configured `correlation_id` instance in lifecycle/priority order owns 
 
 Canonical ownership is private request/session lifecycle state, not inferred from plugin-writable metadata. An earlier custom plugin therefore cannot claim ownership by pre-populating either `request_id` or the documented instance namespace. Effective instances on the same proxy chain that overlap on at least one supported protocol must normalize to distinct `header_name` values and must have distinct effective priorities; configure `priority_override` on all but at most one overlapping instance to make the canonical owner deterministic across storage backends and reloads. Admission and reload reject either ambiguous composition. The same header or priority remains valid on disjoint proxy chains and between custom owners whose supported protocol sets do not overlap.
 
-When this plugin generates a header because the client omitted a valid inbound value (or the inbound value was rejected and replaced, or the instance uses `inbound_policy: "generate"`), that generation is recorded in the same private request-scoped correlation state. `response_caching` omits only that generated header/value from the shared-cache key and Vary digest so otherwise-identical anonymous GETs can HIT, while still forwarding the header upstream and echoing it downstream as configured. A client-supplied value on the same header remains an origin-visible cache dimension. Public metadata and extra request headers cannot mark a value as generated. Provenance is bounded by the number of admitted instances, is not logged as a separate marker, and is dropped with the request context (including retry clones of that context).
+When this plugin generates a header because the client omitted a valid inbound value (or the inbound value was rejected and replaced, or the instance uses `inbound_policy: "generate"`), that generation is recorded in the same private request-scoped correlation state. `response_caching` omits only that generated header/value from the shared-cache key and Vary digest so otherwise-identical anonymous GETs can HIT, and [`ai_semantic_cache`](plugins/ai_semantic_cache.md) omits it from its request-context partition so otherwise-identical completions can replay, while still forwarding the header upstream and echoing it downstream as configured. A client-supplied value on the same header remains an origin-visible cache dimension. Public metadata and extra request headers cannot mark a value as generated. Provenance is bounded by the number of admitted instances, is not logged as a separate marker, and is dropped with the request context (including retry clones of that context).
 
 `ai_tool_governor` approval requests read private canonical correlation state first, then fall back to custom-plugin `request_id` and `correlation_id` metadata when no built-in producer claimed a canonical value. `api_chargeback_sink` reads canonical `request_id` first. Its older `x-request-id` and `correlation_id` metadata spellings remain fallback-only for compatibility with custom plugins that predate the canonical contract. WebSocket disconnect logging likewise prefers `request_id` and falls back to custom `correlation_id` metadata. Built-in producers and consumers use `request_id`.
 
@@ -2737,11 +2737,14 @@ config:
       client_auth:
         method: client_secret_basic
         client_id: ferrum-edge
-        client_secret: "${INTROSPECTION_CLIENT_SECRET}"
+        # Literal value: plugin config does not expand environment variables.
+        client_secret: "<client secret issued by the IdP>"
       required_scopes: ["orders:read"]
       claim_headers:
         sub: X-Authenticated-Subject
 ```
+
+Plugin config values are literal: `client_auth.client_secret` does not read an environment variable, so a `${NAME}` value is sent to the provider as written. Substitute the real secret (for example with your deployment tooling) before applying the config.
 
 ### `oidc_relying_party`
 
@@ -2837,15 +2840,20 @@ config:
       callback_path: "/oidc/callback"
       client_auth:
         method: client_secret_basic
-        client_secret: "${OIDC_CLIENT_SECRET}"
+        # Literal value: plugin config does not expand environment variables.
+        client_secret: "<client secret issued by the IdP>"
       audiences: ["ferrum-edge"]
       claim_headers:
         email: X-Authenticated-Email
   session:
+    # Replace with a unique random secret of at least 32 bytes. Admission
+    # rejects this placeholder (and any unresolved ${NAME}) as written.
     encryption_secret: "${OIDC_SESSION_SECRET_32_BYTES_MIN}"
   behavior:
     post_login_default_path: "/"
 ```
+
+As with `oauth2_introspection`, these values are literal: neither `client_auth.client_secret` nor `session.encryption_secret` reads an environment variable. Substitute real secrets before applying the config.
 
 OIDC relying-party JWKS uses the same shared bounded-trust store as
 `jwks_auth`, with the secure one-hour maximum-stale default. Discovery success
@@ -6685,7 +6693,7 @@ Runs after `ai_federation` (4060) and before `ai_response_guard` (4075). A guard
 | `provider` | String | `"auto"` | LLM provider format |
 | `include_model` | Boolean | `true` | Extract model name into metadata |
 | `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately |
-| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (1–64 ASCII letters, digits, `.`, `_`, or `-`) |
+| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (1–64 ASCII letters, digits, `.`, `_`, or `-`). `ai_transcript_audit` and `ai_tool_governor` read only the default `ai_*` keys: with another prefix the audit record's `tokens` section and model/provider fields, and the governor's request-metadata model/provider fallback, stay empty |
 | `buffer_streaming_responses` | Boolean | `false` | Buffer `text/event-stream` responses and meter them after the full response is collected; this disables streaming delivery for those responses. Not required for SSE token accounting, which observes streams incrementally by default |
 | `cost_per_prompt_token` | Number or null | *(none)* | Prompt-token cost rate, from `0` through `18446744073709.55`; omission or `null` disables this rate |
 | `cost_per_completion_token` | Number or null | *(none)* | Completion-token cost rate, from `0` through `18446744073709.55`; omission or `null` disables this rate |

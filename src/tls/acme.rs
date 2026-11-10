@@ -55,7 +55,6 @@ use crate::tls::source::MaterialKind;
 const STORE_FILE_NAME: &str = "acme-certificates.json";
 const ORDER_STORE_FILE_NAME: &str = "acme-orders.json";
 const ACCOUNT_STORE_FILE_NAME: &str = "acme-accounts.json";
-const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
 const HTTP01_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 /// Longest HTTP-01 token [`validate_http01_token`] accepts.
 const MAX_HTTP01_TOKEN_LEN: usize = 256;
@@ -2490,7 +2489,12 @@ impl AcmeResolverFallback {
 
 pub struct AcmeTlsAlpnResolver {
     fallback: AcmeResolverFallback,
-    cache: Mutex<BTreeMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    /// TLS-ALPN-01 validation certificates keyed by server name, each with
+    /// the key authorization it was built for. Holds at most one entry per
+    /// name: a new challenge replaces the previous key, and a name whose
+    /// challenge is no longer pending is evicted on its next `acme-tls/1`
+    /// handshake, so served validation keys do not accumulate.
+    cache: Mutex<BTreeMap<String, (String, Arc<rustls::sign::CertifiedKey>)>>,
 }
 
 impl std::fmt::Debug for AcmeTlsAlpnResolver {
@@ -2549,16 +2553,26 @@ impl AcmeTlsAlpnResolver {
     }
 
     fn tls_alpn_certified_key(&self, server_name: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let key_authorization = tls_alpn01_key_authorization_for_identifier(server_name)?;
-        let cache_key = format!("{server_name}\0{key_authorization}");
+        let Some(key_authorization) = tls_alpn01_key_authorization_for_identifier(server_name)
+        else {
+            // No pending challenge for this name any more: release its key.
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.remove(server_name);
+            }
+            return None;
+        };
         if let Ok(cache) = self.cache.lock()
-            && let Some(certified_key) = cache.get(&cache_key)
+            && let Some((cached_authorization, certified_key)) = cache.get(server_name)
+            && *cached_authorization == key_authorization
         {
             return Some(certified_key.clone());
         }
         let certified_key = build_tls_alpn01_certified_key(server_name, &key_authorization).ok()?;
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(cache_key, certified_key.clone());
+            cache.insert(
+                server_name.to_string(),
+                (key_authorization, certified_key.clone()),
+            );
         }
         Some(certified_key)
     }
@@ -2669,15 +2683,6 @@ pub fn http01_key_authorization_for_path(path: &str) -> Option<String> {
     global_order_store().ok()?.http01_key_authorization(&token)
 }
 
-fn acme_store_dir_from_env() -> PathBuf {
-    let path = crate::config::env_config::tls_managed_store_path_from_env();
-    if path.is_empty() {
-        PathBuf::from(DEFAULT_STORE_DIR)
-    } else {
-        PathBuf::from(path)
-    }
-}
-
 static GLOBAL_ACME_CERTIFICATE_STORE: OnceLock<Result<Arc<AcmeCertificateStore>, String>> =
     OnceLock::new();
 static GLOBAL_ACME_ORDER_STORE: OnceLock<Result<Arc<AcmeOrderStore>, String>> = OnceLock::new();
@@ -2686,7 +2691,7 @@ static GLOBAL_ACME_ACCOUNT_STORE: OnceLock<Result<Arc<AcmeAccountStore>, String>
 pub fn global_certificate_store() -> Result<Arc<AcmeCertificateStore>, String> {
     GLOBAL_ACME_CERTIFICATE_STORE
         .get_or_init(|| {
-            AcmeCertificateStore::open(acme_store_dir_from_env())
+            AcmeCertificateStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2696,7 +2701,7 @@ pub fn global_certificate_store() -> Result<Arc<AcmeCertificateStore>, String> {
 pub fn global_order_store() -> Result<Arc<AcmeOrderStore>, String> {
     GLOBAL_ACME_ORDER_STORE
         .get_or_init(|| {
-            AcmeOrderStore::open(acme_store_dir_from_env())
+            AcmeOrderStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
@@ -2706,17 +2711,17 @@ pub fn global_order_store() -> Result<Arc<AcmeOrderStore>, String> {
 pub fn global_account_store() -> Result<Arc<AcmeAccountStore>, String> {
     GLOBAL_ACME_ACCOUNT_STORE
         .get_or_init(|| {
-            AcmeAccountStore::open(acme_store_dir_from_env())
+            AcmeAccountStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })
         .clone()
 }
 
-// Also compiled for `test` without the `acme` feature: the renewal-resumption
-// planner infers this type from persisted challenge records, and that inference
-// is pure store logic that must be provable without real ACME networking.
-#[cfg(any(feature = "acme", test))]
+// Compiled without the `acme` feature too: `EnvConfig::validate` checks
+// `FERRUM_ACME_RENEW_CHALLENGE_TYPE` with `parse` in every build (issue #7194),
+// and the renewal-resumption planner infers this type from persisted challenge
+// records, which is pure store logic provable without real ACME networking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcmeRenewalChallengeType {
     Http01,
@@ -2724,7 +2729,6 @@ pub enum AcmeRenewalChallengeType {
     Dns01,
 }
 
-#[cfg(any(feature = "acme", test))]
 impl AcmeRenewalChallengeType {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -2735,7 +2739,7 @@ impl AcmeRenewalChallengeType {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Http01 => "http01",
             Self::TlsAlpn01 => "tls_alpn01",
@@ -4188,8 +4192,9 @@ pub mod client {
     use hyper_util::client::legacy::Client as HyperClient;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use instant_acme::{
-        Account, AccountCredentials, BodyWrapper, BytesBody, BytesResponse, ChallengeStatus,
-        ChallengeType, HttpClient, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+        Account, AccountCredentials, AuthorizationStatus, BodyWrapper, BytesBody, BytesResponse,
+        ChallengeStatus, ChallengeType, HttpClient, Identifier, NewAccount, NewOrder, OrderStatus,
+        RetryPolicy,
     };
     use serde::Serialize;
     use thiserror::Error;
@@ -4917,6 +4922,36 @@ pub mod client {
         }
     }
 
+    /// What a resumed order does with one of its authorizations.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AuthorizationCompletionAction {
+        /// Still awaiting validation: drive its challenge.
+        DriveChallenge,
+        /// Already valid (validated by this order earlier, or reused by the CA
+        /// from another order, RFC 8555 §7.1.3): nothing to do. A reused valid
+        /// authorization may list only the challenge type that validated it.
+        Skip,
+    }
+
+    /// Decide what a resumed order does with one remote authorization status
+    /// (issue #7195). `Pending` → drive its challenge, `Valid` → skip it, and
+    /// every terminal state fails closed with a fixed diagnostic.
+    pub(crate) fn authorization_completion_action(
+        status: AuthorizationStatus,
+    ) -> Result<AuthorizationCompletionAction, AcmeClientError> {
+        match status {
+            AuthorizationStatus::Pending => Ok(AuthorizationCompletionAction::DriveChallenge),
+            AuthorizationStatus::Valid => Ok(AuthorizationCompletionAction::Skip),
+            AuthorizationStatus::Invalid
+            | AuthorizationStatus::Revoked
+            | AuthorizationStatus::Expired
+            | AuthorizationStatus::Deactivated => Err(AcmeClientError::Client(
+                "ACME authorization is no longer pending or valid and cannot be completed"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Drive a persisted order to a certificate, whatever state the CA is in.
     ///
     /// Idempotent across a crash: the private key is never generated here, only
@@ -4982,6 +5017,14 @@ pub mod client {
                                 .map_err(|error| {
                                     AcmeClientError::EgressPolicy(error.to_string())
                                 })?;
+                            // An authorization that became valid elsewhere
+                            // may no longer list this challenge type; it needs
+                            // no challenge at all (issue #7195).
+                            if authorization_completion_action(authorization.status)?
+                                == AuthorizationCompletionAction::Skip
+                            {
+                                continue;
+                            }
                             let Some(mut challenge) =
                                 authorization.challenge(challenge_type.clone())
                             else {
@@ -5764,6 +5807,35 @@ pub mod client {
                 let error = completion_call_result(result, OrderStatus::Invalid).unwrap_err();
                 assert!(matches!(error, AcmeClientError::TerminalInvalidOrder));
                 assert!(!error.to_string().contains("CA problem detail"));
+            }
+        }
+
+        /// Issue #7195: a resumed order skips an authorization that is already
+        /// valid (it may not list the configured challenge type any more),
+        /// drives a pending one, and fails closed on every terminal state.
+        #[test]
+        fn authorization_completion_plan_covers_every_remote_status() {
+            assert_eq!(
+                authorization_completion_action(AuthorizationStatus::Pending).expect("pending"),
+                AuthorizationCompletionAction::DriveChallenge,
+            );
+            assert_eq!(
+                authorization_completion_action(AuthorizationStatus::Valid).expect("valid"),
+                AuthorizationCompletionAction::Skip,
+            );
+            for status in [
+                AuthorizationStatus::Invalid,
+                AuthorizationStatus::Revoked,
+                AuthorizationStatus::Expired,
+                AuthorizationStatus::Deactivated,
+            ] {
+                let error = authorization_completion_action(status)
+                    .expect_err("a terminal authorization must fail closed");
+                assert!(matches!(error, AcmeClientError::Client(_)));
+                assert!(
+                    error.to_string().contains("cannot be completed"),
+                    "unexpected diagnostic: {error}"
+                );
             }
         }
 

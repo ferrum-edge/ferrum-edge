@@ -1750,18 +1750,24 @@ fn every_plain_udp_setup_stage_runs_under_the_authorization_deadline() {
         .find("let first_datagram_allowed =")
         .expect("the bounded first-datagram policy stage");
     assert!(first_datagram > admit_at);
-    // The pending drain stops at expiry.
+    // The pending drain stops at expiry. It returns with the pending gate still
+    // armed, so the gate's `Drop` removes the entry (GHSA-4wqw-qq7v-pwhp; see
+    // `pending_drain_authorization_expiry_returns_with_the_gate_armed`).
     let drain_gate = new_session
-        .find("'drain: while let Some(batch) = take_pending_datagrams(")
-        .expect("the labeled pending-datagram drain");
-    let drain_break = new_session[drain_gate..]
-        .find("break 'drain;")
-        .expect("the drain's expiry break");
+        .find("while let Some(batch) = take_pending_datagrams(")
+        .expect("the pending-datagram drain");
+    let drain_expiry = new_session[drain_gate..]
+        .find("if session.refuse_if_authorization_expired().is_some() {")
+        .expect("the drain's expiry check");
+    let drain_stop = new_session[drain_gate + drain_expiry..]
+        .find("return Ok(());")
+        .map(|at| drain_expiry + at)
+        .expect("the drain's expiry stop");
     let drain_hook = new_session[drain_gate..]
         .find("udp_datagram_allowed(")
         .expect("the drain's per-datagram hook");
     assert!(
-        drain_break < drain_hook,
+        drain_expiry < drain_stop && drain_stop < drain_hook,
         "the pending-datagram drain must stop at expiry BEFORE running another hook"
     );
 
@@ -2378,4 +2384,43 @@ async fn an_unauthenticated_dtls_c2b_stage_has_no_timer() {
     let _ = release_tx.send(());
     assert_eq!(raced.await.expect("join"), Ok(4));
     assert!(emitted.load(Ordering::SeqCst));
+}
+
+/// GHSA-4wqw-qq7v-pwhp: an authorization expiry while the queued setup
+/// datagrams drain must leave the pending-session gate ARMED. A non-empty
+/// `take_pending_datagrams` keeps the map entry, and nothing else removes it,
+/// so disarming on that path leaked the entry: every later datagram from the
+/// client tuple was queued and tail-dropped, and the leaked entry held a
+/// pending slot against `max_sessions` for the listener's lifetime.
+///
+/// The drain runs inside `process_new_session_datagram` with no seam to expire
+/// a credential mid-drain, so this pins the shape structurally: the loop has
+/// no `break` (the only exit that reaches `gate.disarm()` is the empty take
+/// that removed the entry) and the expiry check returns with the gate armed.
+#[test]
+fn pending_drain_authorization_expiry_returns_with_the_gate_armed() {
+    const UDP_PROXY_SOURCE: &str = include_str!("../../../src/proxy/udp_proxy.rs");
+    let drain = UDP_PROXY_SOURCE
+        .split("while let Some(batch) = take_pending_datagrams(pending_sessions, &session_key) {")
+        .nth(1)
+        .expect("post-setup pending datagram drain")
+        .split("gate.disarm();")
+        .next()
+        .expect("drain ends at the gate disarm");
+    assert!(
+        !drain
+            .lines()
+            .any(|line| line.trim_start().starts_with("break")),
+        "no drain exit may reach `gate.disarm()` while the pending entry is still mapped"
+    );
+    let expiry = drain
+        .split("if session.refuse_if_authorization_expired().is_some() {")
+        .nth(1)
+        .expect("mid-drain authorization expiry check");
+    let arm = expiry.split('}').next().unwrap_or_default();
+    assert_eq!(
+        arm.trim(),
+        "return Ok(());",
+        "a mid-drain authorization expiry must return with the gate still armed"
+    );
 }

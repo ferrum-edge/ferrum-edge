@@ -751,7 +751,6 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
     let mut best_json: Option<u32> = None;
     let mut best_yaml: Option<u32> = None;
     let mut best_wildcard: Option<u32> = None;
-    let mut best_stored: Option<u32> = None;
 
     for entry in accept.split(',') {
         // Split type/subtype from parameters.
@@ -777,16 +776,9 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
             {
                 best_yaml = Some(q);
             }
-            m if m
-                == match stored {
-                    SpecFormat::Json => "application/json",
-                    SpecFormat::Yaml => "application/yaml",
-                }
-                && best_stored.is_none_or(|prev| q > prev) =>
-            {
-                best_stored = Some(q);
-            }
-            _ => {} // unknown media type — ignored
+            // Unknown media types, and lower-quality repeats of a listed
+            // one, are ignored.
+            _ => {}
         }
     }
 
@@ -794,32 +786,16 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
     //   - An explicit `q=0` for a media range means the client refuses that
     //     representation; the wildcard fallback does NOT override it.
     //   - An absent media range falls back to the wildcard quality if any.
-    //   - The exact-stored bucket is treated like an explicit listing of the
-    //     stored format.
     let wildcard_q = best_wildcard.unwrap_or(0);
 
     // For each format: explicit value (incl. q=0) wins; otherwise inherit wildcard.
-    let json_explicit = best_json.or(if stored == SpecFormat::Json {
-        best_stored
-    } else {
-        None
-    });
-    let yaml_explicit = best_yaml.or(if stored == SpecFormat::Yaml {
-        best_stored
-    } else {
-        None
-    });
+    let json_q = best_json.unwrap_or(wildcard_q);
+    let yaml_q = best_yaml.unwrap_or(wildcard_q);
 
-    let json_q = json_explicit.unwrap_or(wildcard_q);
-    let yaml_q = yaml_explicit.unwrap_or(wildcard_q);
-
-    // Did the client mention any of OUR buckets at all? (json/yaml/wildcard
-    // /exact-stored). If not, we default to stored as before — RFC permits
-    // serving any representation when no Accept rules match.
-    let saw_relevant = best_json.is_some()
-        || best_yaml.is_some()
-        || best_wildcard.is_some()
-        || best_stored.is_some();
+    // Did the client mention any of OUR buckets at all? (json/yaml/wildcard).
+    // If not, we default to stored as before — RFC permits serving any
+    // representation when no Accept rules match.
+    let saw_relevant = best_json.is_some() || best_yaml.is_some() || best_wildcard.is_some();
     if !saw_relevant {
         return stored;
     }

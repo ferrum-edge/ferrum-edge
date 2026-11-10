@@ -520,6 +520,20 @@ impl JwksAuth {
         // activates them, matching every other Redis-backed plugin: toggling a
         // provider to `shared` later cannot suddenly activate a malformed URL,
         // a wrong scalar type, or a zero connection bound.
+        // The shared Redis helper ASCII-lowercases `sync_mode` before matching,
+        // which would admit spellings the published enum does not list. Screen
+        // the exact wire form here first (same pattern as `hmac_auth` and
+        // `graphql`) so the schema and the constructor accept the same set.
+        match config_obj.get("sync_mode") {
+            None => {}
+            Some(Value::String(mode)) if matches!(mode.as_str(), "local" | "redis") => {}
+            Some(Value::String(mode)) => {
+                return Err(format!(
+                    "jwks_auth: `sync_mode` must be exactly `local` or `redis`, got: {mode:?}"
+                ));
+            }
+            Some(_) => return Err("jwks_auth: `sync_mode` must be a string".to_string()),
+        }
         let default_redis_prefix = default_dpop_redis_key_prefix(&namespace, &policy_config_id);
         let redis_config = RedisConfig::from_plugin_config(config, &default_redis_prefix)?;
         let redis_configured = redis_config.is_some();
@@ -793,6 +807,19 @@ impl JwksAuth {
             // deployment that simply set `require_dpop: true`.
             let declared_scope = match optional_provider_string(prov_obj, "dpop_replay_scope", idx)?
             {
+                // `ReplayScope::parse` trims and ASCII-lowercases, which would
+                // admit spellings the published enum does not list. Screen the
+                // exact wire form first (as `hmac_auth` does for
+                // `replay_scope`); the shared parser still owns the mapping.
+                Some(value) if !matches!(value.as_str(), "process" | "shared") => {
+                    return Err(format!(
+                        "jwks_auth: `provider[{idx}].dpop_replay_scope` must be exactly \
+                         `process` or `shared` — use `shared` together with sync_mode: `redis` \
+                         for any deployment running more than one gateway replica, or `process` \
+                         to declare a single-process deployment whose replay protection is not \
+                         cross-replica"
+                    ));
+                }
                 Some(value) => Some(ReplayScope::parse(
                     "jwks_auth",
                     &format!("provider[{idx}].dpop_replay_scope"),

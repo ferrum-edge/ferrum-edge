@@ -3532,8 +3532,6 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
         ("ai_semantic_cache.7.cache_match", "semantic"),
         ("ai_semantic_cache.7.cache_similarity", "0.950000"),
         ("ai_semantic_cache.12.cache_status", "MISS"),
-        // Pre-namespace spelling still lands in the cache section.
-        ("ai_cache_status", "BYPASS"),
         // Separate producer, separate key.
         ("request_deduplication.replayed", "true"),
     ];
@@ -3541,6 +3539,10 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
         // The staged prompt fingerprint is not telemetry and must never ship.
         ("ai_semantic_cache.7.cache_key", "0123456789abcdef01234567"),
         ("ai_cache_key", "0123456789abcdef01234567"),
+        // Pre-namespace spellings no built-in writes (issue #7115).
+        ("ai_cache_status", "BYPASS"),
+        ("ai_cache_match", "semantic"),
+        ("ai_cache_similarity", "0.950000"),
         // Right namespace, invented field — must not become an export channel.
         ("ai_semantic_cache.7.prompt", "who is the ceo of acme corp"),
         ("ai_semantic_cache.7.cache_status.extra", "HIT"),
@@ -3612,10 +3614,10 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
 
 /// Oversized multi-instance chains must truncate the `cache` section in sorted
 /// key order (not `HashMap` iteration order) so the surviving subset is stable,
-/// and only along the per-instance axis: the fixed-name producer keys sort
-/// around the `ai_semantic_cache.*` block — `request_deduplication.replayed`
-/// sorts after all of it — so a plain sorted cut would drop the documented
-/// replay marker before an eleventh cache instance's status.
+/// and only along the per-instance axis: the fixed-name producer key
+/// `request_deduplication.replayed` sorts after the whole `ai_semantic_cache.*`
+/// block, so a plain sorted cut would drop the documented replay marker before
+/// an eleventh cache instance's status.
 #[tokio::test]
 async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
     let server = mock_sink().await;
@@ -3633,16 +3635,13 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
 
-    // Two fixed-name keys: one sorting before the namespaced block, one after.
-    let fixed: &[(&str, &str)] = &[
-        ("ai_cache_status", "BYPASS"),
-        ("request_deduplication.replayed", "true"),
-    ];
+    // The one fixed-name key, sorting after the namespaced block.
+    let fixed: &[(&str, &str)] = &[("request_deduplication.replayed", "true")];
     for &(key, value) in fixed {
         ctx.metadata.insert(key.to_string(), value.to_string());
     }
-    // 40 instances against a 32-entry cap with 2 fixed-name keys reserved
-    // leaves a 30-entry budget on the per-instance axis.
+    // 40 instances against a 32-entry cap with 1 fixed-name key reserved
+    // leaves a 31-entry budget on the per-instance axis.
     let mut expected_namespaced = std::collections::BTreeMap::new();
     for instance_id in 0..40u64 {
         let key = format!("ai_semantic_cache.{instance_id}.cache_status");
@@ -3650,7 +3649,7 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
         ctx.metadata.insert(key.clone(), value.to_string());
         expected_namespaced.insert(key, value.to_string());
     }
-    let boundary = expected_namespaced.keys().nth(30).cloned();
+    let boundary = expected_namespaced.keys().nth(31).cloned();
     if let Some(boundary) = boundary {
         expected_namespaced.retain(|key, _| *key < boundary);
     }
@@ -3664,7 +3663,7 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
         .as_object()
         .expect("cache section is an object");
     assert_eq!(cache.len(), 32);
-    assert_eq!(expected_namespaced.len(), 30);
+    assert_eq!(expected_namespaced.len(), 31);
     for &(key, value) in fixed {
         assert_eq!(
             cache.get(key).and_then(|entry| entry.as_str()),
@@ -5315,10 +5314,6 @@ async fn transcript_internal_lifecycle_state_never_reaches_transaction_log_metad
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    ctx.metadata.insert(
-        "ai_transcript_audit.stream_marker.0x7ffeeabc".to_string(),
-        "true".to_string(),
-    );
     let logged = clone_log_metadata(&ctx);
     for key in logged.keys() {
         assert!(
@@ -5328,8 +5323,8 @@ async fn transcript_internal_lifecycle_state_never_reaches_transaction_log_metad
                     | "ai_transcript_audit.sample_hit"
                     | "ai_transcript_audit.stream_request"
                     | "ai_transcript_audit.final_req_seen"
-            ) && !key.starts_with("ai_transcript_audit.stream_marker"),
-            "internal or pointer-derived transcript state leaked to logs: {key}"
+            ),
+            "internal transcript state leaked to logs: {key}"
         );
     }
     assert!(
@@ -13443,6 +13438,19 @@ async fn mcp_roundtrip(
     final_body: &[u8],
     response: &Value,
 ) -> Vec<Value> {
+    let response = serde_json::to_vec(response).expect("serialize response");
+    mcp_roundtrip_raw(overrides, ctx, final_body, &response, &json_headers()).await
+}
+
+/// [`mcp_roundtrip`] with the client-visible response given as raw bytes and
+/// headers, for event-stream framings.
+async fn mcp_roundtrip_raw(
+    overrides: Value,
+    ctx: &mut RequestContext,
+    final_body: &[u8],
+    response: &[u8],
+    response_headers: &HashMap<String, String>,
+) -> Vec<Value> {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -13467,9 +13475,8 @@ async fn mcp_roundtrip(
     plugin
         .on_final_request_body_with_context(ctx, &headers, final_body)
         .await;
-    let response = serde_json::to_vec(response).expect("serialize response");
     plugin
-        .capture_final_response_body(ctx, 200, &json_headers(), &response)
+        .capture_final_response_body(ctx, 200, response_headers, response)
         .await;
     wait_for_records(&server).await
 }
@@ -13940,6 +13947,47 @@ async fn a_jsonrpc_error_outcome_is_an_error_for_retention() {
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["capture_reason"], "error");
     assert_eq!(records[0]["mcp"]["calls"][0]["error_code"], json!(-32001));
+}
+
+/// An MCP server may answer a `tools/call` with an event stream, framed with
+/// any WHATWG line terminator and optionally BOM-prefixed. The outcome parser
+/// must split it the way a client does (issue #7134): otherwise a JSON-RPC
+/// error is missed and `always_capture_on_error` drops the failed call.
+#[tokio::test]
+async fn mcp_event_stream_outcomes_accept_cr_and_bom_framing() {
+    // (label, leading BOM, line terminator)
+    let framings = [
+        ("CR", "", "\r"),
+        ("CRLF", "", "\r\n"),
+        ("BOM+LF", "\u{feff}", "\n"),
+    ];
+    for (label, bom, eol) in framings {
+        let request = mcp_call_value(json!(21), "pets.deletePet", json!({"petId": "7"}));
+        let mut ctx = mcp_ctx(&request);
+        let body = request.to_string();
+        // A progress notification precedes the answer, so the stream holds
+        // two events and the call is matched by id.
+        let stream = format!(
+            "{bom}event: message{eol}\
+             data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progress\":1}}}}{eol}{eol}\
+             event: message{eol}\
+             data: {{\"jsonrpc\":\"2.0\",\"id\":21,\"error\":{{\"code\":-32001,\"message\":\"x\"}}}}{eol}{eol}"
+        );
+        let overrides = json!({ "sampling": { "rate": 0.0, "always_capture_on_error": true } });
+        let records = mcp_roundtrip_raw(
+            overrides,
+            &mut ctx,
+            body.as_bytes(),
+            stream.as_bytes(),
+            &content_type_headers("text/event-stream"),
+        )
+        .await;
+        assert_eq!(records.len(), 1, "{label}: {records:?}");
+        assert_eq!(records[0]["capture_reason"], "error", "{label}");
+        let call = &records[0]["mcp"]["calls"][0];
+        assert_eq!(call["result"], "error", "{label}: {call}");
+        assert_eq!(call["error_code"], json!(-32001), "{label}: {call}");
+    }
 }
 
 #[tokio::test]

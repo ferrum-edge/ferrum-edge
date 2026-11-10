@@ -605,6 +605,9 @@ plus `principal` — the authority-qualified caller: `{"kind":"consumer",
 opaque hex digest of the verifying authority (it reveals no issuer or URL). The
 display `consumer` field alone cannot distinguish the same subject issued by two
 accepted authorities; `principal` can.
+When routing metadata names no model or provider, the governor falls back to
+the `ai_model` / `ai_provider` keys `ai_token_metrics` publishes under its
+default `metadata_prefix`; with another prefix that fallback is empty.
 Request correlation prefers private canonical state from the built-in
 `correlation_id` plugin. On custom-only chains it falls back to transaction
 metadata `request_id`, then legacy `correlation_id`; canonical state always wins

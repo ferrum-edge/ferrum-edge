@@ -73,7 +73,8 @@ use crate::plugins::{
     TransactionSummary,
 };
 use crate::proxy::ProxyState;
-use crate::proxy::grpc_proxy::{CLIENT_CLOSED_REQUEST_STATUS, grpc_status};
+use crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
+use crate::proxy::grpc_proxy::grpc_status;
 use crate::retry::ErrorClass;
 use crate::runtime_metrics::TerminalOutcome;
 

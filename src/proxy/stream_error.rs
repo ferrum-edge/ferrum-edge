@@ -449,6 +449,8 @@ mod tests {
             None
         );
         assert_eq!(StreamSetupKind::UnsupportedStreamPolicy.tls_side(), None);
+        assert_eq!(StreamSetupKind::AuthorizationExpired.tls_side(), None);
+        assert_eq!(StreamSetupKind::ClientTrustWithdrawn.tls_side(), None);
         assert_eq!(StreamSetupKind::SniAdmissionRefused.tls_side(), None);
     }
 
@@ -460,6 +462,8 @@ mod tests {
             StreamSetupKind::FrontendTlsHandshake,
             StreamSetupKind::RejectedByPlugin,
             StreamSetupKind::ClientDisconnectedDuringAdmission,
+            StreamSetupKind::AuthorizationExpired,
+            StreamSetupKind::ClientTrustWithdrawn,
             StreamSetupKind::SniAdmissionRefused,
         ] {
             assert!(
@@ -482,6 +486,24 @@ mod tests {
             assert!(
                 !kind.is_client_side(),
                 "{kind:?} should be backend-side (BackendError-mapped)"
+            );
+        }
+        // Credential expiry and withdrawn client trust are gateway decisions
+        // about the client's own credential (issues #3816, #3857): attributed
+        // to the client leg as a RecvError, never a BackendError.
+        for kind in [
+            StreamSetupKind::AuthorizationExpired,
+            StreamSetupKind::ClientTrustWithdrawn,
+        ] {
+            assert_eq!(
+                kind.direction(),
+                crate::plugins::Direction::ClientToBackend,
+                "{kind:?} is attributed to the client leg"
+            );
+            assert_eq!(
+                kind.disconnect_cause(),
+                crate::plugins::DisconnectCause::RecvError,
+                "{kind:?} maps to RecvError, not BackendError"
             );
         }
     }
@@ -527,6 +549,14 @@ mod tests {
         assert_eq!(
             StreamSetupKind::UnsupportedStreamPolicy.prefix(),
             "Unsupported stream policy"
+        );
+        assert_eq!(
+            StreamSetupKind::AuthorizationExpired.prefix(),
+            "Authenticated stream authorization lifetime elapsed during setup"
+        );
+        assert_eq!(
+            StreamSetupKind::ClientTrustWithdrawn.prefix(),
+            "Frontend client trust withdrawn during setup"
         );
         assert_eq!(
             StreamSetupKind::SniAdmissionRefused.prefix(),

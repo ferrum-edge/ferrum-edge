@@ -8,10 +8,6 @@
 
 use std::path::Path;
 
-/// Minimum kernel version required for cgroup-based eBPF capture.
-pub const MIN_KERNEL_MAJOR: u32 = 5;
-pub const MIN_KERNEL_MINOR: u32 = 7;
-
 /// Kernel capability probe result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelProbeResult {

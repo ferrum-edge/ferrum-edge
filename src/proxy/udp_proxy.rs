@@ -930,7 +930,6 @@ where
 /// still hold an `Arc` in `last_client`. Clearing on the fast-path expired
 /// check prevents a quiet listener from pinning the backend socket/session
 /// until some later datagram overwrites the cache.
-#[allow(dead_code)] // also reached via `_test_support`
 pub(crate) fn take_udp_last_client_if_live<T>(
     last_client: &mut Option<(UdpSessionKey, Arc<T>)>,
     client_addr: &UdpSessionKey,
@@ -2153,6 +2152,39 @@ impl Drop for UdpSessionSlotReservation {
     }
 }
 
+/// Typed refusal returned by [`reserve_udp_session_slot`] when a session
+/// admission bound (listener-wide or per-source) is full.
+///
+/// Client/policy noise: the sender controls its rate (and, over UDP, can spoof
+/// its source), so [`is_client_or_policy_udp_setup_drop`] keeps it at `debug!`.
+/// The per-source refusal is already reported through the rate-limited,
+/// fixed-cardinality [`record_udp_per_ip_rejection`].
+#[derive(Debug)]
+struct UdpSessionAdmissionRefused {
+    per_source: bool,
+    limit: u64,
+}
+
+impl std::fmt::Display for UdpSessionAdmissionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.per_source {
+            write!(
+                f,
+                "UDP per-source session limit reached ({}), dropping datagram",
+                self.limit
+            )
+        } else {
+            write!(
+                f,
+                "UDP session limit reached ({}), dropping datagram",
+                self.limit
+            )
+        }
+    }
+}
+
+impl std::error::Error for UdpSessionAdmissionRefused {}
+
 /// Reserve one session slot against BOTH the listener-wide
 /// `FERRUM_UDP_MAX_SESSIONS` bound and the per-effective-source-IP
 /// `FERRUM_UDP_MAX_SESSIONS_PER_IP` bound (issue #4544).
@@ -2172,10 +2204,10 @@ fn reserve_udp_session_slot(
     let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
     if prev >= max_sessions as u64 {
         metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-        return Err(anyhow::anyhow!(
-            "UDP session limit reached ({}), dropping datagram",
-            max_sessions
-        ));
+        return Err(anyhow::Error::new(UdpSessionAdmissionRefused {
+            per_source: false,
+            limit: max_sessions as u64,
+        }));
     }
     let mut reservation = UdpSessionSlotReservation {
         metrics: Arc::clone(metrics),
@@ -2187,10 +2219,10 @@ fn reserve_udp_session_slot(
         Err(crate::proxy::PerIpLimitExceeded) => {
             record_udp_per_ip_rejection(metrics, proxy_id, listen_port);
             // `reservation` releases the listener-wide slot on drop.
-            return Err(anyhow::anyhow!(
-                "UDP per-source session limit reached ({}), dropping datagram",
-                metrics.per_ip_admission.max
-            ));
+            return Err(anyhow::Error::new(UdpSessionAdmissionRefused {
+                per_source: true,
+                limit: metrics.per_ip_admission.max,
+            }));
         }
     }
 
@@ -4103,7 +4135,7 @@ pub async fn start_udp_listener_holding_port(
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
-                                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                                    debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                                 }
                                                 offset = end;
                                             }
@@ -4152,7 +4184,7 @@ pub async fn start_udp_listener_holding_port(
                                     )
                                     .await;
                                     if let Err(e) = result {
-                                        debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                        debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                     }
                                 }
                                 total_drained += n;
@@ -4286,11 +4318,10 @@ pub async fn start_udp_listener_holding_port(
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, addr2) = recv_batch.datagram(i);
-                                    let local2 = if pktinfo_active {
-                                        recv_batch.local_addr(i)
-                                    } else {
-                                        None
-                                    };
+                                    // This arm runs only while PKTINFO is not the
+                                    // primary receive path (`!pktinfo_primary`),
+                                    // so no per-datagram local address exists.
+                                    let local2: Option<crate::socket_opts::PktinfoLocal> = None;
 
                                     // Reject datagrams from new clients under
                                     // critical overload, or while the DP's
@@ -4363,7 +4394,7 @@ pub async fn start_udp_listener_holding_port(
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
-                                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                                    debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                                 }
                                                 offset = end;
                                             }
@@ -4412,7 +4443,7 @@ pub async fn start_udp_listener_holding_port(
                                     )
                                     .await;
                                     if let Err(e) = result {
-                                        debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                        debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                     }
                                 }
                                 total_drained += n;
@@ -4489,7 +4520,7 @@ pub async fn start_udp_listener_holding_port(
                                 )
                                 .await;
                                 if let Err(e) = result {
-                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                    debug!(proxy_id = %proxy_id, client = %udp_client_log_addr(addr2), "UDP forward error: {}", e);
                                 }
                             }
                             Err(_) => break, // WouldBlock — socket drained
@@ -5008,10 +5039,16 @@ fn is_client_or_policy_udp_setup_drop(error: &anyhow::Error) -> bool {
         return true;
     }
 
+    if error
+        .chain()
+        .any(|cause| cause.is::<UdpSessionAdmissionRefused>())
+    {
+        return true;
+    }
+
     let message = error.to_string();
     message.starts_with("Dropping DTLS continuation fragment")
         || message.starts_with("No matching passthrough proxy for SNI")
-        || message.starts_with("UDP session limit reached")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5374,18 +5411,20 @@ async fn process_new_session_datagram(
     // order, then atomically remove the pending gate. Each drained datagram
     // goes through the same per-datagram plugin hooks and debug-level
     // packet-error handling as the established-session path.
-    'drain: while let Some(batch) = take_pending_datagrams(pending_sessions, &session_key) {
+    while let Some(batch) = take_pending_datagrams(pending_sessions, &session_key) {
         for dgram in batch {
             // Stop the drain the moment the admitted credential stops
             // authorizing this session: no further hook runs and no further
             // backend datagram is produced for this source. The forward below
-            // would refuse anyway; breaking here also keeps a slow
-            // `on_udp_datagram` hook from running post-expiry. The gate entry
-            // was already removed under the shard lock by
-            // `take_pending_datagrams`, so `gate.disarm()` below is still
-            // correct on this path.
+            // would refuse anyway; stopping here also keeps a slow
+            // `on_udp_datagram` hook from running post-expiry. A non-empty
+            // `take_pending_datagrams` leaves the gate entry in place, so
+            // return with the gate still ARMED: its `Drop` removes the entry
+            // and anything queued meanwhile. Disarming here would leak the
+            // entry, blackholing this client tuple and holding a pending slot
+            // against `max_sessions` for the listener's lifetime.
             if session.refuse_if_authorization_expired().is_some() {
-                break 'drain;
+                return Ok(());
             }
             // The pending gate is keyed by the full session identity, but the
             // client tuple inside that key is still forgeable. Re-authorize
@@ -5473,8 +5512,9 @@ async fn process_new_session_datagram(
                 .fetch_add(dgram.data.len() as u64, Ordering::Relaxed);
         }
     }
-    // `take_pending_datagrams` removed the gate entry under the shard lock;
-    // disarm so Drop doesn't double-remove (harmless, but explicit).
+    // The loop only ends when `take_pending_datagrams` found the queue empty
+    // and removed the gate entry under the shard lock; disarm so Drop doesn't
+    // double-remove (harmless, but explicit).
     gate.disarm();
     Ok(())
 }
@@ -6078,7 +6118,11 @@ async fn start_dtls_frontend_listener(
                 ) {
                     Ok(reservation) => reservation,
                     Err(e) => {
-                        warn!(
+                        // Sampled: the refusal rate is the client's
+                        // connection rate (GHSA-wfg6-vhp9-hj45); the
+                        // per-source refusal is also counted by
+                        // `record_udp_per_ip_rejection`.
+                        crate::warn_sampled!(
                             proxy_id = %proxy_id,
                             "Rejecting DTLS connection: {}",
                             e
@@ -9165,7 +9209,7 @@ async fn create_session(
     let reply_metrics = metrics.clone();
     let reply_sessions = sessions.clone();
     let reply_dtls = dtls_conn;
-    let reply_plugins = plugins.to_vec();
+    let reply_plugins = Arc::clone(&plugins);
     let reply_proxy_name = proxy_name.clone();
     let reply_proxy_namespace = proxy_namespace.clone();
     let reply_backend_scheme = backend_scheme;
@@ -12475,6 +12519,44 @@ backend_tls_verify_server_cert: false
             0,
             "dropping an unclaimed UDP session reservation must release the active slot"
         );
+    }
+
+    /// GHSA-wfg6-vhp9-hj45: both admission refusals are client/policy noise,
+    /// so a source flooding new flows past its cap is logged at `debug!`, not
+    /// one unsampled WARN (with its address) per refused datagram.
+    #[test]
+    fn udp_session_admission_refusals_are_client_or_policy_drops() {
+        let listener_full = Arc::new(super::UdpProxyMetrics::default());
+        let _held = reserve_udp_session_slot(&listener_full, 1, "198.51.100.1", "p", 9000).unwrap();
+        let Err(listener_refusal) =
+            reserve_udp_session_slot(&listener_full, 1, "198.51.100.2", "p", 9000)
+        else {
+            panic!("a full listener must refuse a new session");
+        };
+        assert!(super::is_client_or_policy_udp_setup_drop(&listener_refusal));
+
+        let per_source = Arc::new(super::UdpProxyMetrics::with_per_ip_admission(
+            crate::proxy::PerIpStreamAdmission {
+                counts: Some(Arc::new(dashmap::DashMap::new())),
+                max: 1,
+                ipv6_prefix: 64,
+            },
+        ));
+        let _first = reserve_udp_session_slot(&per_source, 8, "198.51.100.1", "p", 9000).unwrap();
+        let Err(per_source_refusal) =
+            reserve_udp_session_slot(&per_source, 8, "198.51.100.1", "p", 9000)
+        else {
+            panic!("a source over its cap must be refused");
+        };
+        assert!(
+            per_source_refusal
+                .to_string()
+                .starts_with("UDP per-source session limit reached (1)")
+        );
+        assert!(super::is_client_or_policy_udp_setup_drop(
+            &per_source_refusal.context("UDP session setup")
+        ));
+        assert_eq!(per_source.per_ip_rejections.load(Ordering::Relaxed), 1);
     }
 
     #[test]

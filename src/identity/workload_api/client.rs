@@ -39,10 +39,6 @@ use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
 use std::collections::BTreeMap;
 
-/// Default Unix-socket path used by `FetchLoopConfig::default()`. The mesh
-/// runtime always supplies `FERRUM_MESH_SPIRE_AGENT_SOCKET` instead.
-pub const DEFAULT_WORKLOAD_API_SOCKET: &str = "/run/spire/agent/agent.sock";
-
 /// SPIFFE Workload API security header. Per the SPIFFE Workload Endpoint spec
 /// (`SPIFFE_Workload_Endpoint.md`), every RPC must carry this metadata; servers
 /// MUST reject calls that omit it. We attach it to every request via

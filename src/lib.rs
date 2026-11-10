@@ -187,7 +187,7 @@ pub mod _test_support {
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =
-        crate::proxy::grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS;
+        crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 
     /// Mark a request context as already counted by its handler, as every
     /// H1/H2 handler counting site does (issue #6768 client-abort scope tests).
@@ -3031,6 +3031,37 @@ pub mod _test_support {
             "127.0.0.1",
             false,
             hyper::Version::HTTP_11,
+        )
+        .await
+    }
+
+    /// One native-H3 retry attempt (`proxy_to_backend_http3_retry`) for a
+    /// plain `GET` with no body, upstream target, or plugins.
+    pub async fn proxy_to_backend_http3_retry_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        backend_url: &str,
+    ) -> crate::retry::BackendResponse {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        crate::proxy::proxy_to_backend_http3_retry(
+            state,
+            proxy,
+            backend_url,
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            false,
+            &[],
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            true,
+            hyper::Version::HTTP_3,
         )
         .await
     }
@@ -8281,6 +8312,10 @@ pub mod _test_support {
         crate::config::db_loader::parse_auth_mode(s)
     }
 
+    pub fn parse_plugin_scope(s: &str) -> Result<crate::config::types::PluginScope, String> {
+        crate::config::db_loader::parse_plugin_scope(s)
+    }
+
     pub fn lock_wait_timeout_sql(timeout_seconds: u64, is_mysql: bool) -> Option<String> {
         crate::config::db_loader::lock_wait_timeout_sql(timeout_seconds, is_mysql)
     }
@@ -10699,22 +10734,6 @@ pub mod _test_support {
         )
     }
 
-    pub fn can_dispatch_direct_http2_pool(
-        enable_http2: bool,
-        retain_request_body: bool,
-        requires_request_body_buffering: bool,
-        max_request_body_size_bytes: usize,
-        max_response_body_size_bytes: usize,
-    ) -> bool {
-        crate::proxy::can_dispatch_direct_http2_pool(
-            enable_http2,
-            retain_request_body,
-            requires_request_body_buffering,
-            max_request_body_size_bytes,
-            max_response_body_size_bytes,
-        )
-    }
-
     /// Issue #3942: ordinary unlimited direct-H2 must not wrap
     /// `SizeLimitedIncoming` (the adapter treats `max_bytes = 0` as deny-all
     /// and a `usize::MAX` wrap still costs a per-frame atomic + limit compare).
@@ -10885,14 +10904,27 @@ pub mod _test_support {
             &transformed,
         )
         .await;
-        ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
-        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
-        let request_body = ctx.metadata.remove("request_body");
-        ctx.metadata = hook_ctx.metadata;
-        if let Some(body) = request_body {
-            ctx.metadata.insert("request_body".to_string(), body);
-        }
+        ctx.adopt_final_request_body_hook_context(hook_ctx);
         (transformed, result)
+    }
+
+    /// The listen port a WebSocket session's disconnect metadata reports
+    /// (issue #7164).
+    pub fn websocket_session_listen_port_for_test(
+        ctx: &crate::plugins::RequestContext,
+        is_tls: bool,
+        env_config: &crate::config::EnvConfig,
+    ) -> u16 {
+        crate::proxy::websocket_session_listen_port(ctx, is_tls, env_config)
+    }
+
+    /// Stage a typed AI usage snapshot on `ctx`, as a built-in AI plugin
+    /// does, so hook hand-back tests can observe which context's value wins.
+    pub fn stage_ai_usage_export_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        export: crate::plugins::AiUsageExport,
+    ) {
+        ctx.stage_ai_usage_export(export);
     }
 
     pub async fn apply_buffered_request_body_normalization_before_before_proxy_for_test(
@@ -16271,6 +16303,10 @@ pub mod _test_support {
         crate::dtls::dtls_datagram_opens_session_for_test(data)
     }
 
+    pub fn dtls_packet_error_is_droppable_for_test(error: &dimpl::Error) -> bool {
+        crate::dtls::dtls_packet_error_is_droppable_for_test(error)
+    }
+
     /// External regression coverage for issue #2959 (DTLS demux identity-aware
     /// session removal). See
     /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].
@@ -19666,18 +19702,6 @@ pub mod _test_support {
             topology_stream,
         )
         .await
-    }
-
-    pub fn node_agent_cni_topology_readiness_rejection_for_test(
-        verb: crate::cni::rpc::RpcVerb,
-        initial_sync_complete: bool,
-        startup_ready: bool,
-    ) -> Option<&'static str> {
-        crate::modes::node_agent::cni_topology_readiness_rejection_for_test(
-            verb,
-            initial_sync_complete,
-            startup_ready,
-        )
     }
 
     pub fn node_agent_cni_capture_readiness_rejection_for_test(

@@ -820,6 +820,26 @@ fn test_consumer_colon_username_with_basicauth_is_rejected() {
     );
 }
 
+/// Issue #7217: a credential type key that fails the path-safe name rule is
+/// reported once, by that rule, which Debug-quotes it. The per-entry checks
+/// that render the key bare in a `credentials.<type>[<n>]` path must not run.
+#[test]
+fn test_consumer_unsafe_credential_type_is_not_rendered_in_entry_paths() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer
+        .credentials
+        .insert("bad key'".into(), serde_json::json!([]));
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("credential type")),
+        "the name rule must report the key: {errs:?}"
+    );
+    assert!(
+        errs.iter().all(|e| !e.contains("credentials.bad key")),
+        "an unsafe key must not be interpolated bare: {errs:?}"
+    );
+}
+
 #[test]
 fn test_consumer_colon_username_without_basicauth_is_admitted() {
     // The restriction is Basic-specific: other credential types represent a

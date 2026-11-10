@@ -488,6 +488,44 @@ fn nonce_tracker_rejects_missing_unknown_and_stale_nonces() {
     );
 }
 
+/// The peer-supplied `response_nonce` / `version_info` carried by the
+/// `StaleNonce` / `VersionDrift` outcomes are Debug-formatted into the CP's
+/// "xDS ACK ignored" warn line, so a hostile megabyte value must come back
+/// bounded like the NACK message (GHSA-pwf8-cvp7-cm5w, residue of #4813).
+#[test]
+fn nonce_tracker_bounds_hostile_megabyte_stale_nonce_and_drift_version() {
+    let bound = ferrum_edge::xds::MAX_XDS_LOG_VALUE_CHARS + "(truncated)".len();
+    let hostile = "n".repeat(1024 * 1024);
+    let tracker = XdsNonceTracker::new();
+    let current = tracker.issue_nonce("node-a", LDS_TYPE_URL, "v1");
+
+    let AckOutcome::StaleNonce { expected, actual } =
+        tracker.record_response("node-a", LDS_TYPE_URL, &hostile, "v1", None)
+    else {
+        panic!("a nonce other than the last issued one must be StaleNonce");
+    };
+    assert_eq!(expected, current);
+    assert!(
+        actual.len() <= bound,
+        "stale nonce must be bounded, got {} bytes",
+        actual.len()
+    );
+    assert!(actual.ends_with("(truncated)"));
+
+    let AckOutcome::VersionDrift { expected, actual } =
+        tracker.record_response("node-a", LDS_TYPE_URL, &current, &hostile, None)
+    else {
+        panic!("a matching nonce with a different version must be VersionDrift");
+    };
+    assert_eq!(expected, "v1");
+    assert!(
+        actual.len() <= bound,
+        "drifted version must be bounded, got {} bytes",
+        actual.len()
+    );
+    assert!(actual.ends_with("(truncated)"));
+}
+
 #[test]
 fn nonce_tracker_clears_error_on_new_issue_and_removes_one_node_only() {
     let tracker = XdsNonceTracker::new();

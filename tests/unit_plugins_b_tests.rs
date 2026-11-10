@@ -5,8 +5,8 @@
 //! alone are half of that, so they are split alphabetically by test-file
 //! name (`a`–`j` in `unit_plugins_a_tests`, `k`–`z` in
 //! `unit_plugins_b_tests`) and compiled in parallel by the Unit Tests matrix.
-//! Shared helper modules the other half depends on are declared here too;
-//! the few helper modules that also carry tests run in both halves.
+//! Test-free helper modules shared with the other half are declared here too;
+//! no test file runs in both halves.
 //!
 //! Run with: cargo test --test unit_plugins_b_tests [filter]
 
@@ -32,11 +32,7 @@ mod unit {
         pub(crate) mod redis_resp;
 
         #[allow(dead_code, unused_imports)]
-        mod jwks_auth_support; // shared helper, also compiled by the other half
-        #[allow(dead_code, unused_imports)]
-        mod jwks_auth_tests; // shared helper, also compiled by the other half
-        #[allow(dead_code, unused_imports)]
-        mod jwks_cache_tests; // shared helper, also compiled by the other half
+        mod jwks_auth_support; // test-free helper, also compiled by the other half
         mod kafka_logging_tests;
         mod key_auth_tests;
         mod ldap_auth_tests;

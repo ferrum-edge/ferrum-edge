@@ -61,7 +61,8 @@ use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin
 use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
     BatchConfigDefaults, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
-    MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config, wait_until_committed_or_closed,
+    MAX_BUFFER_CAPACITY, PluginHttpClient, redacted_endpoint_url, validate_batch_config,
+    wait_until_committed_or_closed,
 };
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
@@ -94,13 +95,14 @@ pub const WS_LOGGING_CONFIG_KEYS: &[&str] = &[
 ];
 
 /// Default / hard maxima for per-entry serialization and aggregate queued,
-/// batch-assembly, and retry bytes.
-pub const WS_DEFAULT_MAX_ENTRY_BYTES: usize = 64 * 1024;
-pub const WS_MAX_MAX_ENTRY_BYTES: usize = 1024 * 1024;
-pub const WS_DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
-pub const WS_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// batch-assembly, and retry bytes: the shared sink byte-budget limits, so
+/// this sink cannot drift from the others.
+pub const WS_DEFAULT_MAX_ENTRY_BYTES: usize = super::utils::byte_budget::DEFAULT_MAX_ENTRY_BYTES;
+pub const WS_MAX_MAX_ENTRY_BYTES: usize = super::utils::byte_budget::HARD_MAX_ENTRY_BYTES;
+pub const WS_DEFAULT_BUFFER_MAX_BYTES: usize = super::utils::byte_budget::DEFAULT_BUFFER_MAX_BYTES;
+pub const WS_MAX_BUFFER_MAX_BYTES: usize = super::utils::byte_budget::HARD_MAX_BUFFER_MAX_BYTES;
 
-const WS_MIN_RESOURCE_BYTES: usize = 1024;
+const WS_MIN_RESOURCE_BYTES: usize = super::utils::byte_budget::MIN_MAX_ENTRY_BYTES;
 const WS_MIN_BUFFER_MAX_BYTES: usize = (WS_MIN_RESOURCE_BYTES + 1) * 2;
 const WS_DROP_WARN_EVERY: u64 = 100;
 /// Fixed `plugin` label for this sink's process-wide loss accounting.
@@ -1053,10 +1055,6 @@ where
             None
         }
     }
-}
-
-fn redacted_endpoint_url(endpoint: &Url) -> String {
-    crate::plugins::loki_logging::redacted_endpoint_url(endpoint)
 }
 
 fn bounded_u64(

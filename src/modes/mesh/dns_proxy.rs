@@ -175,11 +175,25 @@ impl DnsResolutionTable {
         Self::empty_with_response_cache_max_entries(DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES)
     }
 
+    #[cfg(test)]
     fn empty_with_response_cache_max_entries(response_cache_max_entries: usize) -> Self {
+        Self::empty_with_response_cache(
+            response_cache_max_entries,
+            crate::util::sharding::pool_shard_amount(0),
+        )
+    }
+
+    /// `response_cache_shard_amount` must come from
+    /// [`crate::util::sharding::pool_shard_amount`]: the response cache is read
+    /// and written on every locally answered query.
+    fn empty_with_response_cache(
+        response_cache_max_entries: usize,
+        response_cache_shard_amount: usize,
+    ) -> Self {
         Self {
             exact: HashMap::new(),
             wildcard_suffixes: HashMap::new(),
-            response_cache: DashMap::new(),
+            response_cache: DashMap::with_shard_amount(response_cache_shard_amount),
             response_cache_entries: AtomicUsize::new(0),
             response_cache_max_entries: response_cache_max_entries.max(1),
         }
@@ -190,23 +204,31 @@ impl DnsResolutionTable {
     /// Indexes `ServiceEntry.hosts` mapped to their endpoint IPs, plus
     /// `MeshService` short names (`{name}.{namespace}.svc.cluster.local`)
     /// mapped to workload addresses resolved through the slice.
-    #[allow(dead_code)]
-    pub fn from_mesh_slice(slice: &MeshSlice) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_mesh_slice(slice: &MeshSlice) -> Self {
         Self::from_mesh_slice_with_cluster_domain(slice, DEFAULT_CLUSTER_DOMAIN)
     }
 
-    pub fn from_mesh_slice_with_cluster_domain(slice: &MeshSlice, cluster_domain: &str) -> Self {
-        Self::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+    #[cfg(test)]
+    pub(crate) fn from_mesh_slice_with_cluster_domain(
+        slice: &MeshSlice,
+        cluster_domain: &str,
+    ) -> Self {
+        Self::from_mesh_slice_with_cluster_domain_and_response_cache(
             slice,
             cluster_domain,
             DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+            crate::util::sharding::pool_shard_amount(0),
         )
     }
 
-    pub fn from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
+    /// `response_cache_shard_amount` must come from
+    /// [`crate::util::sharding::pool_shard_amount`] (hot-path `DashMap`).
+    pub fn from_mesh_slice_with_cluster_domain_and_response_cache(
         slice: &MeshSlice,
         cluster_domain: &str,
         response_cache_max_entries: usize,
+        response_cache_shard_amount: usize,
     ) -> Self {
         let cluster_domain = normalize_dns_name(cluster_domain);
         let mut exact: HashMap<String, DnsRecordSet> = HashMap::new();
@@ -356,15 +378,15 @@ impl DnsResolutionTable {
         Self {
             exact,
             wildcard_suffixes,
-            response_cache: DashMap::new(),
+            response_cache: DashMap::with_shard_amount(response_cache_shard_amount),
             response_cache_entries: AtomicUsize::new(0),
             response_cache_max_entries: response_cache_max_entries.max(1),
         }
     }
 
     /// Resolve a hostname against the table. Returns `None` for non-mesh names.
-    #[allow(dead_code)]
-    pub fn resolve(&self, name: &str) -> Option<ResolvedDnsRecords<'_>> {
+    #[cfg(test)]
+    pub(crate) fn resolve(&self, name: &str) -> Option<ResolvedDnsRecords<'_>> {
         let normalized = normalize_dns_name(name);
         self.resolve_normalized(&normalized)
     }
@@ -581,6 +603,8 @@ pub struct MeshDnsProxy {
     ttl_seconds: u32,
     max_concurrent_queries: usize,
     response_cache_max_entries: usize,
+    /// Resolved `pool_shard_amount` for every rebuilt table's response cache.
+    response_cache_shard_amount: usize,
     cluster_domain: String,
 }
 
@@ -598,19 +622,24 @@ impl MeshDnsProxy {
         max_concurrent_queries: usize,
         response_cache_max_entries: usize,
         cluster_domain: String,
+        pool_shard_amount: usize,
     ) -> Self {
         let response_cache_max_entries = response_cache_max_entries.max(1);
+        let response_cache_shard_amount =
+            crate::util::sharding::pool_shard_amount(pool_shard_amount);
         Self {
             listen_addr,
             resolution_table: Arc::new(ArcSwap::new(Arc::new(
-                DnsResolutionTable::empty_with_response_cache_max_entries(
+                DnsResolutionTable::empty_with_response_cache(
                     response_cache_max_entries,
+                    response_cache_shard_amount,
                 ),
             ))),
             upstream_resolver,
             ttl_seconds,
             max_concurrent_queries: max_concurrent_queries.max(1),
             response_cache_max_entries,
+            response_cache_shard_amount,
             cluster_domain: normalize_dns_name(&cluster_domain),
         }
     }
@@ -627,12 +656,12 @@ impl MeshDnsProxy {
 
     /// Rebuild the resolution table from a new mesh slice.
     pub fn update_from_slice(&self, slice: &MeshSlice) {
-        let new_table =
-            DnsResolutionTable::from_mesh_slice_with_cluster_domain_and_response_cache_max_entries(
-                slice,
-                &self.cluster_domain,
-                self.response_cache_max_entries,
-            );
+        let new_table = DnsResolutionTable::from_mesh_slice_with_cluster_domain_and_response_cache(
+            slice,
+            &self.cluster_domain,
+            self.response_cache_max_entries,
+            self.response_cache_shard_amount,
+        );
         let exact_count = new_table.exact_count();
         let wildcard_count = new_table.wildcard_count();
         self.resolution_table.store(Arc::new(new_table));
@@ -690,7 +719,7 @@ impl MeshDnsProxy {
                                 ) {
                                     let _ = socket.send_to(&response, src).await;
                                 }
-                                warn!(src = %src, "DNS proxy query concurrency limit reached");
+                                crate::warn_sampled!(src = %src, "DNS proxy query concurrency limit reached");
                                 continue;
                             };
                             let packet = buf[..len].to_vec();
@@ -774,7 +803,7 @@ fn try_acquire_dns_tcp_session_permit(
     match semaphore.clone().try_acquire_owned() {
         Ok(permit) => Some(permit),
         Err(_) => {
-            warn!(client = %src, "DNS proxy TCP session concurrency limit reached");
+            crate::warn_sampled!(client = %src, "DNS proxy TCP session concurrency limit reached");
             None
         }
     }
@@ -822,7 +851,7 @@ async fn handle_dns_query_udp(
                     max_response_size,
                 );
                 let _ = socket.send_to(&response, src).await;
-                warn!(client = %src, "DNS upstream forward queue is full");
+                crate::warn_sampled!(client = %src, "DNS upstream forward queue is full");
             }
         }
         DnsDecision::Drop => {}
@@ -859,7 +888,11 @@ async fn handle_dns_tcp_connection(
         }
 
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-            warn!(client = %src, payload_bytes = len, "DNS proxy TCP query concurrency limit reached");
+            crate::warn_sampled!(
+                client = %src,
+                payload_bytes = len,
+                "DNS proxy TCP query concurrency limit reached"
+            );
             return;
         };
 
@@ -1241,9 +1274,9 @@ async fn run_udp_forwarder_with_entropy(
                 if pending.len() >= max_outstanding {
                     if upstream_id_space_exhausted(pending.len()) {
                         record_upstream_id_exhaustion();
-                        warn!("DNS upstream transaction ID space exhausted");
+                        crate::warn_sampled!("DNS upstream transaction ID space exhausted");
                     } else {
-                        warn!(
+                        crate::warn_sampled!(
                             client = %request.src,
                             outstanding = pending.len(),
                             "DNS upstream forward limit reached"
@@ -1271,7 +1304,7 @@ async fn run_udp_forwarder_with_entropy(
                     }
                     Err(UpstreamIdAllocError::Exhausted) => {
                         record_upstream_id_exhaustion();
-                        warn!("DNS upstream transaction ID space exhausted");
+                        crate::warn_sampled!("DNS upstream transaction ID space exhausted");
                         send_udp_servfail(&client_socket, &request.query, request.src).await;
                         continue;
                     }
@@ -1379,7 +1412,7 @@ async fn run_udp_forwarder_with_entropy(
                 for id in expired_ids.drain(..) {
                     if let Some(request) = pending.remove(&id) {
                         request.abort.abort();
-                        warn!(
+                        crate::warn_sampled!(
                             client = %request.client,
                             upstream = %upstream,
                             "Upstream DNS query timed out"
@@ -3110,6 +3143,48 @@ mod tests {
     }
 
     #[test]
+    fn mesh_dns_proxy_sizes_response_cache_from_pool_shard_amount() {
+        // Hot-path DashMaps take `pool_shard_amount` (CLAUDE.md, #7249): an
+        // explicit override rounds up to a power of two, `0` auto-sizes.
+        let proxy = |override_value| {
+            MeshDnsProxy::new(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:53".parse().unwrap(),
+                30,
+                16,
+                8,
+                "cluster.local".to_string(),
+                override_value,
+            )
+        };
+        assert_eq!(proxy(3).response_cache_shard_amount, 4);
+        assert_eq!(
+            proxy(0).response_cache_shard_amount,
+            crate::util::sharding::pool_shard_amount(0)
+        );
+
+        // A rebuilt table still answers through its response cache.
+        let proxy = proxy(3);
+        proxy.update_from_slice(&MeshSlice::default());
+        let table = proxy.resolution_table.load();
+        let key = DnsResponseCacheKey {
+            name: Arc::from("svc.example.com"),
+            qtype: QTYPE_A,
+            qclass: QCLASS_IN,
+            rd: true,
+            cd: false,
+            ad: false,
+            ttl: 60,
+            max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+            opt_record_len: 0,
+        };
+        let _ = table.cached_mesh_response(key, &cache_materialization_query(), || {
+            vec![0x12, 0x34, 0x81, 0x80]
+        });
+        assert_eq!(table.response_cache_len(), 1);
+    }
+
+    #[test]
     fn mesh_response_cache_honors_configured_entry_cap() {
         let table = DnsResolutionTable::empty_with_response_cache_max_entries(2);
         let query = cache_materialization_query();
@@ -3655,13 +3730,6 @@ mod tests {
     }
 
     #[test]
-    fn resolution_table_empty_slice() {
-        let table = DnsResolutionTable::from_mesh_slice(&MeshSlice::default());
-        assert_eq!(table.exact_count(), 0);
-        assert_eq!(table.wildcard_count(), 0);
-    }
-
-    #[test]
     fn resolution_table_deduplicates_ips() {
         let spiffe1 = "spiffe://cluster.local/ns/default/sa/api-1";
         let spiffe2 = "spiffe://cluster.local/ns/default/sa/api-2";
@@ -3881,31 +3949,6 @@ mod tests {
     // ── Wildcard resolution edge cases ──────────────────────────────────
 
     #[test]
-    fn wildcard_does_not_match_base_domain() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(vec!["*.corp.io"], vec!["10.0.0.1"])],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        assert!(table.resolve("corp.io").is_none());
-    }
-
-    #[test]
-    fn wildcard_does_not_match_multi_level_subdomain() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(vec!["*.example.com"], vec!["10.0.0.1"])],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        // Multi-level subdomain should NOT match a single-label wildcard
-        assert!(table.resolve("deep.sub.example.com").is_none());
-        // Single-level subdomain should match
-        assert!(table.resolve("api.example.com").is_some());
-    }
-
-    #[test]
     fn wildcard_multiple_overlapping_suffixes() {
         let slice = MeshSlice {
             service_entries: vec![
@@ -4093,22 +4136,6 @@ mod tests {
             DnsDecision::Respond(_) => panic!("non-mesh name should be forwarded"),
             DnsDecision::Drop => panic!("valid query should not be dropped"),
         }
-    }
-
-    #[test]
-    fn resolution_table_case_insensitive_query() {
-        let slice = MeshSlice {
-            service_entries: vec![test_service_entry(
-                vec!["my-service.example.com"],
-                vec!["10.0.0.1"],
-            )],
-            ..MeshSlice::default()
-        };
-
-        let table = DnsResolutionTable::from_mesh_slice(&slice);
-        assert!(table.resolve("MY-SERVICE.EXAMPLE.COM").is_some());
-        assert!(table.resolve("My-Service.Example.Com").is_some());
-        assert!(table.resolve("my-service.example.com").is_some());
     }
 
     #[test]

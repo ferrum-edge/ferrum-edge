@@ -891,12 +891,10 @@ struct CaptureSession {
     /// this task observing the closed channel is never clobbered (codex r1 P2:
     /// remove-after-replace race).
     session_id: u64,
-    /// Egress channel to the per-session task. `None` for a session whose
-    /// orig-dst matched no routable `mesh_udp_egress` entry — but such flows are
-    /// never inserted (they drop without a session), so in practice this is
-    /// always `Some` for a live session. Kept as `Option` only so the unit
-    /// tests can exercise the keying/cap logic without a live tunnel.
-    tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    /// Egress channel to the per-session task. A flow whose orig-dst matches
+    /// no routable `mesh_udp_egress` entry is dropped without a session, so
+    /// every inserted session has one.
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     /// SHARED count of bytes currently queued in the egress channel (codex r3).
     /// Bumped by the recv loop on a successful enqueue, decremented by the egress
     /// task as it drains each datagram, so a per-session BYTE cap
@@ -1134,12 +1132,16 @@ where
             let session = occupied.get_mut();
             // Refresh the SHARED clock (the sweep + watchdog both read it).
             session.last_activity.store(now, Ordering::Relaxed);
-            if let Some(tx) = session.tx.as_ref() {
-                // Drop-on-full by datagram COUNT (the channel bound) OR by queued
-                // BYTES (the per-session memory cap) — UDP backpressure is "drop",
-                // and we must never block the bounded recv-loop drain.
-                enqueue_egress_datagram(tx, &session.queued_bytes, data, key.client, key.orig_dst);
-            }
+            // Drop-on-full by datagram COUNT (the channel bound) OR by queued
+            // BYTES (the per-session memory cap) — UDP backpressure is "drop",
+            // and we must never block the bounded recv-loop drain.
+            enqueue_egress_datagram(
+                &session.tx,
+                &session.queued_bytes,
+                data,
+                key.client,
+                key.orig_dst,
+            );
             SessionAdmission::Refreshed
         }
         Entry::Vacant(vacant) => {
@@ -1188,7 +1190,7 @@ where
             vacant.insert(CaptureSession {
                 last_activity: last_activity.clone(),
                 session_id,
-                tx: Some(tx),
+                tx,
                 queued_bytes: queued_bytes.clone(),
                 outcome_signal: outcome_signal.clone(),
                 idle_timeout_ms,

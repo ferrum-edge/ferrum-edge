@@ -169,7 +169,7 @@ impl Schema {
                 "spiffe_id_pattern namespace_pattern trust_domain trust_domain_pattern",
             ),
             (Self::Fields(POLICY_RULE), "to") => Self::Fields(
-                "methods paths hosts ports not_methods not_paths not_hosts not_ports not_port_patterns",
+                "methods paths hosts headers ports port_patterns not_methods not_paths not_hosts not_ports not_port_patterns",
             ),
             (Self::Fields(POLICY_RULE), "when") => Self::Fields("key values not_values"),
             (Self::Fields(POLICY_RULE), "source_negation") => Self::Fields(
@@ -233,7 +233,8 @@ const SLICE: &str = "node_id namespace istio_root_namespace workload_spiffe_id w
 const WORKLOAD: &str = "spiffe_id selector service_name service_namespace addresses ports \
     trust_domain namespace network cluster weight locality service_account pod_uid \
     node_waypoint";
-const SERVICE: &str = "name namespace ports workloads protocol_overrides cluster_ips uid";
+const SERVICE: &str = "name namespace ports workloads protocol_overrides cluster_ips uid \
+    allow_path_parameters";
 const POLICY_RULE: &str = "from to when request_principals not_request_principals \
     source_negation never_matches action";
 const ROUTE_RULE: &str = "name match destination timeout_ms timeout_disabled request_timeout_ms \

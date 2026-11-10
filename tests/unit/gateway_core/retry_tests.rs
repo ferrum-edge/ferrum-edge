@@ -3319,3 +3319,76 @@ fn backend_loop_detected_is_never_retried_even_when_listed() {
         );
     }
 }
+
+/// Issue #7160: a native-H3 retry attempt screens the effective `dns_override`
+/// exactly as the first attempt does, refusing a denied override before any
+/// pool call with the health-neutral egress-policy `502`, instead of relying
+/// on the DNS layer's later error.
+#[tokio::test]
+async fn native_h3_retry_screens_a_denied_dns_override_before_dialing() {
+    use ferrum_edge::config::types::{GatewayConfig, Proxy};
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, EnvConfig};
+    use ferrum_edge::proxy::ProxyState;
+
+    let proxy: Proxy = serde_json::from_value(serde_json::json!({
+        "id": "h3-retry-dns-override",
+        "listen_path": "/retry",
+        "backend_scheme": "https",
+        "backend_host": "backend.example.test",
+        "backend_port": 443,
+        "dns_override": "169.254.169.254",
+    }))
+    .expect("proxy fixture");
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+    let proxy = config.proxies[0].clone();
+    assert_eq!(proxy.dns_override.as_deref(), Some("169.254.169.254"));
+
+    let env_config = EnvConfig {
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+        ..EnvConfig::default()
+    };
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (state, _) = ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None, None)
+        .expect("test proxy state should build");
+
+    let response = ferrum_edge::_test_support::proxy_to_backend_http3_retry_for_test(
+        &state,
+        &proxy,
+        "https://backend.example.test/retry",
+    )
+    .await;
+
+    assert_eq!(response.status_code, 502);
+    assert_eq!(
+        response.error_class,
+        Some(ErrorClass::DispatchPolicyRejected),
+        "a denied dns_override is a dispatch-policy refusal, not a backend failure"
+    );
+    assert!(!response.connection_error);
+    assert!(!response.request_on_wire);
+    let ResponseBody::Buffered(body) = &response.body else {
+        panic!("the egress refusal is a buffered gateway body");
+    };
+    assert_eq!(
+        String::from_utf8_lossy(body),
+        r#"{"error":"backend address blocked by egress policy"}"#
+    );
+}
+
+/// Issue #7158: the open-breaker rejection phase has one spelling on every
+/// frontend (`circuit_breaker_open`, as `docs/error_classification.md`
+/// documents), so the metrics token interner accepts only that spelling.
+#[test]
+fn open_breaker_rejection_phase_has_one_spelling() {
+    use ferrum_edge::retry::{OBS_CIRCUIT_BREAKER_OPEN, token_for_rejection_phase};
+
+    assert_eq!(
+        token_for_rejection_phase("circuit_breaker_open"),
+        Some(OBS_CIRCUIT_BREAKER_OPEN)
+    );
+    assert_eq!(token_for_rejection_phase("circuit_breaker"), None);
+}

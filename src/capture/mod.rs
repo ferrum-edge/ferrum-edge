@@ -149,8 +149,14 @@ pub(crate) const TPROXY_HOST_ROUTE_TABLE: u16 = 33135;
 /// `ip rule` priority for the host-netns UDP fwmark selector. Like
 /// [`TPROXY_ROUTE_RULE_PRIORITY`] it MUST sit below the kernel's `main` rule
 /// (32766) or transparent local delivery never engages; it is one above the
-/// pod-netns priority so the two rules are individually addressable for exact
-/// delete-by-priority teardown.
+/// pod-netns priority so the two rules are individually addressable.
+///
+/// The node-agent's tc ingress-redirect rule
+/// (`ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY`) also
+/// sits at `101` in the HOST netns. The shared slot is safe because both
+/// subsystems only ever add and delete their rule by `priority` AND
+/// `lookup <table>`, and the tables differ (`33135` vs `33134`); the asserts
+/// below fail the build if either side drifts. Never delete by priority alone.
 pub(crate) const TPROXY_HOST_ROUTE_RULE_PRIORITY: u32 = 101;
 
 const _: () = assert!(
@@ -164,6 +170,17 @@ const _: () = assert!(
 const _: () = assert!(
     TPROXY_HOST_ROUTE_RULE_PRIORITY < 32766,
     "host-netns UDP fwmark rule must sort below the kernel `main` table rule"
+);
+const _: () = assert!(
+    TPROXY_HOST_ROUTE_TABLE as u32 != ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
+    "host-netns UDP routing table must be distinct from the tc ingress-redirect table: both \
+     rules can share a priority in the host netns and are told apart only by their table"
+);
+const _: () = assert!(
+    TPROXY_HOST_ROUTE_RULE_PRIORITY
+        == ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
+    "the host UDP and tc ingress-redirect rules are documented as sharing priority 101; if one \
+     moves, update both doc comments and drop this assert"
 );
 
 /// Linux `IFNAMSIZ` is 16 bytes including the NUL terminator, so an interface
@@ -252,7 +269,8 @@ const _: () = assert!(
     "the NodeWaypoint UDP steering mark must not alias the UDP TPROXY mark"
 );
 const _: () = assert!(
-    NODE_WAYPOINT_UDP_STEER_MARK != 0x734 && NODE_WAYPOINT_UDP_STEER_MARK != 0x735,
+    NODE_WAYPOINT_UDP_STEER_MARK != ferrum_ebpf_common::NODE_WAYPOINT_INBOUND_AUTH_MARK
+        && NODE_WAYPOINT_UDP_STEER_MARK != ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
     "the NodeWaypoint UDP steering mark must not alias the relay auth mark (0x734) or the tc \
      ingress-redirect mark (0x735); a steered datagram would then be routed as a relayed one"
 );
@@ -262,8 +280,17 @@ const _: () = assert!(
 );
 const _: () = assert!(
     NODE_WAYPOINT_UDP_STEER_TABLE != TPROXY_ROUTE_TABLE
-        && NODE_WAYPOINT_UDP_STEER_TABLE != TPROXY_HOST_ROUTE_TABLE,
+        && NODE_WAYPOINT_UDP_STEER_TABLE != TPROXY_HOST_ROUTE_TABLE
+        && NODE_WAYPOINT_UDP_STEER_TABLE as u32
+            != ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
     "the NodeWaypoint UDP steering table must be distinct from every other Ferrum-owned table"
+);
+const _: () = assert!(
+    NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY != TPROXY_ROUTE_RULE_PRIORITY
+        && NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY != TPROXY_HOST_ROUTE_RULE_PRIORITY
+        && NODE_WAYPOINT_UDP_STEER_RULE_PRIORITY
+            != ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
+    "the NodeWaypoint UDP steering rule priority must be distinct from every other Ferrum rule"
 );
 
 /// Upper bound on steered `(ClusterIP, port)` destinations in one plan. Each
@@ -3346,10 +3373,16 @@ fn udp_strict_output_jump_release_for(binary: &str, chain: &str) -> String {
 /// traverses `OUTPUT`). Only an absent chain (`-S` status 1) is tolerated; any
 /// other status is a genuine xtables error that aborts, so a caller can never
 /// report a completed release while a jump is still live.
+///
+/// The block is self-contained: a failed `-D` exits with its own status instead
+/// of relying on the caller's `set -e`. The best-effort teardown scripts and the
+/// node-agent cleanup runner execute it without `errexit`, and there a `-C` that
+/// keeps matching while `-D` keeps failing (an xtables lock held past `-w`)
+/// would otherwise spin forever.
 fn udp_strict_jump_release_for(binary: &str, hook: &str, chain: &str) -> String {
     let jump = format!("-p udp -j {chain}");
     format!(
-        "if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1; then\n  while true; do\n    if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C {hook} {jump} 2>/dev/null; then\n      {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D {hook} {jump}\n    else\n      status=$?\n      if [ \"$status\" -eq 1 ]; then\n        break\n      fi\n      echo \"{binary} could not check {hook} jump {chain} (status $status)\" >&2\n      exit \"$status\"\n    fi\n  done\nelse\n  status=$?\n  if [ \"$status\" -ne 1 ]; then\n    echo \"{binary} could not inspect UDP fail-closed guard chain {chain} before release (status $status)\" >&2\n    exit \"$status\"\n  fi\nfi"
+        "if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1; then\n  while true; do\n    if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C {hook} {jump} 2>/dev/null; then\n      {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D {hook} {jump} || {{\n        status=$?\n        echo \"{binary} could not delete {hook} jump {chain} (status $status)\" >&2\n        exit \"$status\"\n      }}\n    else\n      status=$?\n      if [ \"$status\" -eq 1 ]; then\n        break\n      fi\n      echo \"{binary} could not check {hook} jump {chain} (status $status)\" >&2\n      exit \"$status\"\n    fi\n  done\nelse\n  status=$?\n  if [ \"$status\" -ne 1 ]; then\n    echo \"{binary} could not inspect UDP fail-closed guard chain {chain} before release (status $status)\" >&2\n    exit \"$status\"\n  fi\nfi"
     )
 }
 
@@ -3983,12 +4016,13 @@ iptables() {{
             script.contains("could not inspect active UDP fail-closed guard"),
             "jump probe still reports and re-raises a genuine resource error:\n{script}"
         );
-        // The two outer handlers and both error paths in each of the four
-        // expanded strict-release blocks re-raise the binary's status, so
-        // `set -e` aborts and the producer keeps the fail-closed cleanup owner.
+        // The two outer handlers and all three error paths (jump delete, jump
+        // check, chain probe) in each of the four expanded strict-release
+        // blocks re-raise the binary's status, so the script aborts and the
+        // producer keeps the fail-closed cleanup owner.
         assert_eq!(
             script.matches("exit \"$status\"").count(),
-            10,
+            14,
             "every strict probe re-raises the xtables status to fail closed:\n{script}"
         );
     }

@@ -703,6 +703,18 @@ pub(crate) enum SourceKind {
     GatewayApi,
 }
 
+/// What [`K8sAccumulator::upsert_proxy`] did with a candidate proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyUpsert {
+    /// No proxy held the `(namespace, id)`; the candidate was added.
+    Inserted,
+    /// The candidate replaced the proxy that held the `(namespace, id)`.
+    Replaced,
+    /// The candidate was dropped; the proxy already holding the
+    /// `(namespace, id)` (or none, for an empty key) stays.
+    Ignored,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct K8sResourceKey {
     pub api_version: String,
@@ -1496,13 +1508,17 @@ impl K8sAccumulator {
         self.proxy_sources.get(&key).copied()
     }
 
-    pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) {
+    /// Materialize `proxy` under its `(namespace, id)`, resolving an overlap
+    /// with an already-materialized proxy by source precedence. The returned
+    /// [`ProxyUpsert`] tells the caller whether `proxy` is now the one serving
+    /// that key, so proxy-scoped plugins can follow their proxy.
+    pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) -> ProxyUpsert {
         let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
             self.warnings.push(format!(
                 "proxy with empty namespace or id was ignored (namespace={:?}, id={:?})",
                 proxy.namespace, proxy.id
             ));
-            return;
+            return ProxyUpsert::Ignored;
         };
         if let Some(existing_source) = self.proxy_sources.get(&key).copied() {
             let istio_wins = self.options.prefer_istio_on_overlap
@@ -1517,7 +1533,7 @@ impl K8sAccumulator {
                     "Gateway API proxy {:?}/{:?} ignored because Istio resource has precedence",
                     proxy.namespace, proxy.id
                 ));
-                return;
+                return ProxyUpsert::Ignored;
             }
 
             if let Some(existing) = self.config.proxies.iter_mut().find(|candidate| {
@@ -1526,13 +1542,15 @@ impl K8sAccumulator {
                 if istio_wins || !self.options.prefer_istio_on_overlap {
                     *existing = proxy;
                     self.proxy_sources.insert(key, source);
+                    return ProxyUpsert::Replaced;
                 }
-                return;
+                return ProxyUpsert::Ignored;
             }
         }
 
         self.proxy_sources.insert(key, source);
         self.config.proxies.push(proxy);
+        ProxyUpsert::Inserted
     }
 
     /// Withdraw one already-materialized proxy and everything keyed to it.
@@ -1947,7 +1965,7 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
         }
     }
     let included: Vec<&K8sObject> = objects.iter().collect();
-    let _ = listenerset::collect_listenersets_from_snapshot(acc, &included);
+    listenerset::collect_listenersets_from_snapshot(acc, &included);
     // Keep status-context listener admission identical to the translation
     // pass (ListenerSet precedence + same-port physical refusal), or a
     // route's status would arbitrate against a listener the data plane refused.
@@ -2171,7 +2189,7 @@ where
     }
     // ListenerSets attach after Gateway listener policies exist so conflict
     // resolution can prefer parent Gateway listeners.
-    listenerset::collect_listenersets_from_snapshot(&mut acc, &included_objects)?;
+    listenerset::collect_listenersets_from_snapshot(&mut acc, &included_objects);
     // Every listener policy is now known, so same-port physical compatibility
     // can be decided before any route arbitrates or materializes against a
     // listener that could never have been bound.
@@ -3233,7 +3251,6 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     listen_path: Option<&str>,
     route_destination: MeshRouteDispatchDestination<'_>,
     route_policy: MeshRouteDispatchPolicy<'_>,
-    uri_less_only: bool,
 ) -> (Vec<Value>, bool) {
     // VirtualService `headers.{request,response}.{set,add,remove}` is a
     // per-http[] (not per-match) block. Project it onto each emitted rule so
@@ -3264,10 +3281,6 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
     let mut rules = Vec::new();
     let mut has_uri_only_match = matches.is_empty();
     for entry in matches {
-        if uri_less_only && entry.get("uri").is_some() {
-            continue;
-        }
-
         // Scope to this proxy's listen_path. A match entry with a parseable
         // URI applies only to the proxy whose listen_path was built from
         // that URI; entries without a URI (or with an unsupported URI

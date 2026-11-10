@@ -32,7 +32,6 @@ use crate::tls::shared_store::{
 use crate::tls::source::MaterialKind;
 
 const STORE_FILE_NAME: &str = "managed-tls.json";
-const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -1042,21 +1041,12 @@ fn validate_managed_id(id: &str) -> Result<(), ManagedTlsError> {
     validate_resource_id(id).map_err(ManagedTlsError::InvalidId)
 }
 
-fn managed_store_dir_from_env() -> PathBuf {
-    let path = crate::config::env_config::tls_managed_store_path_from_env();
-    if path.is_empty() {
-        PathBuf::from(DEFAULT_STORE_DIR)
-    } else {
-        PathBuf::from(path)
-    }
-}
-
 static GLOBAL_MANAGED_TLS_STORE: OnceLock<Result<Arc<ManagedTlsStore>, String>> = OnceLock::new();
 
 pub fn global_store() -> Result<Arc<ManagedTlsStore>, String> {
     GLOBAL_MANAGED_TLS_STORE
         .get_or_init(|| {
-            ManagedTlsStore::open(managed_store_dir_from_env())
+            ManagedTlsStore::open(crate::tls::store_dir::managed_store_dir())
                 .map(Arc::new)
                 .map_err(|error| error.to_string())
         })

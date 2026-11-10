@@ -772,10 +772,6 @@ fn is_numeric_port(port: &str) -> bool {
     !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn is_port_suffix(rest: &str) -> bool {
-    matches!(rest.strip_prefix(':'), Some(port) if is_numeric_port(port))
-}
-
 /// Deny-by-default sensitivity test for a lowercased header name. A header is
 /// sensitive if it is a well-known credential name, contains a built-in
 /// credential substring, or contains any operator-configured
@@ -1055,17 +1051,10 @@ pub(crate) fn append_shadow_host_suffix(authority: &str) -> String {
         return String::new();
     }
 
+    // A bracketed IPv6 literal (with or without a port) has no host label to
+    // suffix, and a malformed bracketed authority is not rewritten either:
+    // both are kept as-is.
     if authority.starts_with('[') {
-        let Some(close) = authority.find(']') else {
-            return authority.to_string();
-        };
-        let inner = &authority[1..close];
-        let rest = &authority[close + 1..];
-        if inner.parse::<std::net::Ipv6Addr>().is_ok() && (rest.is_empty() || is_port_suffix(rest))
-        {
-            // Bracketed IPv6 (+ optional port): keep a valid authority as-is.
-            return authority.to_string();
-        }
         return authority.to_string();
     }
 

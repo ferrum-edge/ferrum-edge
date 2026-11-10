@@ -245,7 +245,9 @@ where
     let mut matched_deny: Option<String> = None;
     let mut custom: Option<MeshAuthzCustomDelegation> = None;
     let mut custom_provider_conflict = false;
-    let normalized_host = request.host.as_deref().and_then(normalize_match_host);
+    // Normalized on first use: only rules whose `to:` entries constrain
+    // `hosts` / `notHosts` read it, and `mesh_authz` evaluates per request.
+    let mut normalized_host: Option<Option<NormalizedHost>> = None;
 
     for policy in policies {
         for rule in &policy.rules {
@@ -259,7 +261,14 @@ where
             if matched_deny.is_some() && (custom_provider_conflict || !is_custom) {
                 continue;
             }
-            if !rule_matches(rule, request, normalized_host.as_ref(), &policy.namespace) {
+            let rule_host = if rule_reads_host(rule) {
+                normalized_host
+                    .get_or_insert_with(|| request.host.as_deref().and_then(normalize_match_host))
+                    .as_ref()
+            } else {
+                None
+            };
+            if !rule_matches(rule, request, rule_host, &policy.namespace) {
                 continue;
             }
             match &rule.action {
@@ -355,11 +364,7 @@ pub fn mesh_rule_request_scope_may_apply(
     if rule.to.is_empty() {
         return true;
     }
-    let needs_host = rule
-        .to
-        .iter()
-        .any(|match_| !match_.hosts.is_empty() || !match_.not_hosts.is_empty());
-    let normalized_host = if needs_host {
+    let normalized_host = if rule_reads_host(rule) {
         host.and_then(normalize_match_host)
     } else {
         None
@@ -439,6 +444,15 @@ fn request_scope_method_path_host_may_apply(
 /// `AuthorizationPolicy`'s own namespace on the Kubernetes path). Istio resolves
 /// a bare `when: source.serviceAccount` value against it, so it has to reach
 /// condition evaluation.
+/// Whether any `to:` entry of `rule` constrains `hosts` / `notHosts`, the only
+/// readers of the normalized request host. A rule that does not read it is
+/// evaluated with `None`, which no other matcher consults.
+fn rule_reads_host(rule: &MeshRule) -> bool {
+    rule.to
+        .iter()
+        .any(|match_| !match_.hosts.is_empty() || !match_.not_hosts.is_empty())
+}
+
 fn rule_matches(
     rule: &MeshRule,
     request: &MeshAuthzRequest,
@@ -599,7 +613,7 @@ fn matches_source_negation(neg: &SourceNegationMatch, request: &MeshAuthzRequest
             return false;
         }
         if !neg.not_namespace_patterns.is_empty()
-            && extract_namespace(source.as_str()).is_some_and(|namespace| {
+            && source.namespace().is_some_and(|namespace| {
                 neg.not_namespace_patterns
                     .iter()
                     .any(|pattern| wildcard_match(pattern, namespace))
@@ -755,7 +769,9 @@ fn principal_match(match_: &PrincipalMatch, source: Option<&SpiffeId>) -> bool {
         return false;
     }
     if let Some(pattern) = match_.namespace_pattern.as_ref()
-        && !extract_namespace(source.as_str()).is_some_and(|ns| wildcard_match(pattern, ns))
+        && !source
+            .namespace()
+            .is_some_and(|ns| wildcard_match(pattern, ns))
     {
         return false;
     }
@@ -1261,16 +1277,6 @@ fn istio_condition_string_match(pattern: &str, value: &str) -> bool {
         return value.starts_with(prefix);
     }
     pattern == value
-}
-
-fn extract_namespace(spiffe_id: &str) -> Option<&str> {
-    let mut segments = spiffe_id.split('/');
-    while let Some(segment) = segments.next() {
-        if segment == "ns" {
-            return segments.next();
-        }
-    }
-    None
 }
 
 /// Returns `true` when `ip` falls inside the CIDR (or bare IP) `cidr`.
@@ -3955,24 +3961,6 @@ mod tests {
         );
     }
 
-    // ── Extract namespace ────────────────────────────────────────────────
-
-    #[test]
-    fn extract_namespace_from_spiffe_id() {
-        assert_eq!(
-            extract_namespace("spiffe://cluster.local/ns/default/sa/client"),
-            Some("default")
-        );
-        assert_eq!(
-            extract_namespace("spiffe://cluster.local/ns/prod/sa/admin"),
-            Some("prod")
-        );
-        // No "/ns/" segment.
-        assert_eq!(extract_namespace("spiffe://cluster.local/sa/client"), None);
-        // "/ns/" at the very end with no following segment.
-        assert_eq!(extract_namespace("spiffe://cluster.local/ns/"), Some(""));
-    }
-
     // ── Istio-style negative-match (notMethods/notPaths/notHosts/notPorts) ─
 
     fn policy_with_request_match(
@@ -4105,6 +4093,59 @@ mod tests {
                 policy: "implicit-deny".to_string()
             }
         );
+    }
+
+    #[test]
+    fn host_normalization_is_lazy_without_changing_decisions() {
+        // #7250: the request host is normalized only for rules that read
+        // `hosts` / `notHosts`. A host-free DENY evaluated before a
+        // host-constrained ALLOW must decide exactly as before, including for
+        // an unparsable host (which only the host rule can reject).
+        let slice = MeshSlice {
+            mesh_policies: vec![
+                deny_policy_with_request_match(
+                    "deny-admin",
+                    RequestMatch {
+                        paths: vec!["/admin".to_string()],
+                        ..RequestMatch::default()
+                    },
+                ),
+                allow_policy_with_request_match(
+                    "allow-web",
+                    RequestMatch {
+                        hosts: vec!["web.example.com".to_string()],
+                        ..RequestMatch::default()
+                    },
+                ),
+            ],
+            ..MeshSlice::default()
+        };
+        let request = |host: &str, path: &str| MeshAuthzRequest {
+            host: Some(host.to_string()),
+            path: Some(path.to_string()),
+            protocol: MeshAuthzProtocol::Http,
+            ..MeshAuthzRequest::default()
+        };
+
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request("WEB.example.com:8080", "/x")),
+            MeshAuthzDecision::Allow
+        );
+        assert_eq!(
+            evaluate_mesh_authorization(&slice, &request("web.example.com", "/admin")),
+            MeshAuthzDecision::Deny {
+                policy: "deny-admin".to_string()
+            }
+        );
+        for host in ["other.example.com", "user@web.example.com", ""] {
+            assert_eq!(
+                evaluate_mesh_authorization(&slice, &request(host, "/x")),
+                MeshAuthzDecision::Deny {
+                    policy: "implicit-deny".to_string()
+                },
+                "{host:?}"
+            );
+        }
     }
 
     #[test]

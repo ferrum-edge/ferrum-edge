@@ -553,9 +553,8 @@ its ClickHouse default rather than written empty. The key is likewise omitted
 when the flag is `true` but the transaction carries no such metadata, so an
 absent column never distinguishes "disabled" from "unavailable".
 
-`request_id` reads the canonical `request_id` metadata first and falls back to
-the older `x-request-id` / `correlation_id` spellings only for custom plugins
-that predate the canonical contract. `trace_id` reads `trace_id` metadata first
+`request_id` reads the canonical `request_id` metadata (written by
+`correlation_id`); no other spelling is consulted. `trace_id` reads `trace_id` metadata first
 and falls back to the transaction's `traceparent` metadata. Disable either
 switch when the destination table has no such column, or when per-request
 identifiers must not be retained in the billing warehouse.

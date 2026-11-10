@@ -2193,7 +2193,7 @@ impl DatabaseStore {
     ) -> anyhow::Error {
         let message = match namespace {
             Some(namespace) => format!(
-                "operation={} resource=proxy_plugins namespace={}: failed to query proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins namespace={:?}: failed to query proxy/plugin associations: {}",
                 operation, namespace, source
             ),
             None => format!(
@@ -2236,7 +2236,7 @@ impl DatabaseStore {
         row.try_get::<String, _>("plugin_config_id").map_err(|e| {
             anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
                 format!(
-                    "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
+                    "operation={} resource=proxy_plugins proxy_id={:?} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
                     operation, proxy_id, e
                 ),
                 e,
@@ -2255,7 +2255,7 @@ impl DatabaseStore {
             .unwrap_or_default();
         anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
             format!(
-                "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
+                "operation={} resource=proxy_plugins namespace={:?}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
                 operation, namespace, column_context, source
             ),
             source,
@@ -2284,7 +2284,7 @@ impl DatabaseStore {
         if let Some(proxy_id) = associations.keys().next() {
             return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
                 format!(
-                    "operation={} resource=proxy_plugins proxy_id={}: association row references a proxy that was not present in the loaded proxy candidate",
+                    "operation={} resource=proxy_plugins proxy_id={:?}: association row references a proxy that was not present in the loaded proxy candidate",
                     operation, proxy_id
                 ),
             )));
@@ -2403,7 +2403,7 @@ impl DatabaseStore {
 
         Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
             format!(
-                "operation={} resource=proxy_plugins proxy_id={} namespace={}: invalid proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins proxy_id={:?} namespace={:?}: invalid proxy/plugin associations: {}",
                 operation,
                 proxy.id,
                 proxy.namespace,
@@ -2437,7 +2437,7 @@ impl DatabaseStore {
 
         Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
             format!(
-                "operation={} resource=proxy_plugins namespace={}: invalid proxy/plugin associations: {}",
+                "operation={} resource=proxy_plugins namespace={:?}: invalid proxy/plugin associations: {}",
                 operation,
                 namespace,
                 errors.join("; ")
@@ -3767,8 +3767,9 @@ impl DatabaseStore {
     //
     //   1. `PROXY_INSERT_SQL` and its `.bind()` chains in `create_proxy` (admin
     //      POST /proxies) and `insert_proxies_in_tx` (bulk import)
-    //   2. the inline proxy INSERT in `restore_api_spec_bundle_inner`
-    //      (spec-owned; adds `api_spec_id` before `created_at`)
+    //   2. `PROXY_INSERT_WITH_API_SPEC_ID_SQL` and its `.bind()` chain in
+    //      `restore_api_spec_bundle_inner` (spec-owned; adds `api_spec_id`
+    //      before `created_at`)
     //   3. the `update_proxy` SET clause + bind chain
     //   4. the proxy UPDATE in `replace_api_spec_bundle_inner`
     //   5. the `proxies` entry of `DEPLOYMENT_KNOWN_COLUMNS`
@@ -3832,6 +3833,34 @@ impl DatabaseStore {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    /// Spec-owned proxy INSERT used by `restore_api_spec_bundle_inner`: the
+    /// `PROXY_INSERT_SQL` columns plus `api_spec_id` before `created_at`.
+    /// Kept as a constant so the placeholder drift test counts the statement
+    /// that actually runs.
+    const PROXY_INSERT_WITH_API_SPEC_ID_SQL: &'static str = "INSERT INTO proxies \
+        (labels, id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
+        backend_port, backend_path, strip_listen_path, preserve_host_header, \
+        backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
+        backend_tls_client_cert_path, backend_tls_client_key_path, \
+        backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
+        dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, upstream_subset, \
+        circuit_breaker, retry, response_body_mode, \
+        pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
+        pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
+        pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
+        pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
+        pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
+        pool_http3_connections_per_backend, pool_max_requests_per_connection, \
+        listen_port, frontend_tls, passthrough, \
+        udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
+        websocket_permessage_deflate, allow_path_parameters, \
+        allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
+        stream_proxy_protocol, backend_proxy_protocol, stream_match, \
+        api_spec_id, created_at, updated_at) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -4344,7 +4373,10 @@ impl DatabaseStore {
         .collect::<Result<_, _>>()?;
 
         for (id, namespace) in &orphaned_configs {
-            info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
+            info!(
+                "Cascade-deleting orphaned proxy_group plugin config {}",
+                crate::startup::sanitize_startup_scalar(id)
+            );
             sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
@@ -4399,7 +4431,10 @@ impl DatabaseStore {
         };
 
         if ref_rows.is_empty() && dispatch_ref.is_none() {
-            info!("Cleaning up orphaned upstream {}", upstream_id);
+            info!(
+                "Cleaning up orphaned upstream {}",
+                crate::startup::sanitize_startup_scalar(upstream_id)
+            );
             sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(upstream_id)
                 .bind(namespace)
@@ -7312,11 +7347,15 @@ impl DatabaseStore {
                         e,
                     )
                 })?;
-                let scope = match scope_raw.as_str() {
-                    "proxy" => PluginScope::Proxy,
-                    "proxy_group" => PluginScope::ProxyGroup,
-                    _ => PluginScope::Global,
-                };
+                // Strict: an unknown stored scope must not widen a proxy-scoped
+                // plugin to global (issue #7192).
+                let scope = parse_plugin_scope(&scope_raw).map_err(|reason| {
+                    anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
+                        "operation={} resource=proxy_plugins namespace={} \
+                         column=plugin_configs.scope: {}",
+                        operation, namespace, reason
+                    )))
+                })?;
                 let proxy_id = row
                     .try_get::<Option<String>, _>("proxy_id")
                     .map_err(|e| {
@@ -7665,7 +7704,13 @@ impl DatabaseStore {
         let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
         for proxy in proxies {
             for assoc in &proxy.plugins {
-                if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
+                // Proxy and plugin-config ids are unique per namespace only, so
+                // the dedupe key carries the namespace like `touched_proxies`.
+                if !seen.insert((
+                    proxy.namespace.as_str(),
+                    proxy.id.as_str(),
+                    assoc.plugin_config_id.as_str(),
+                )) {
                     continue;
                 }
                 let already_attached = sqlx::query(&assoc_exists_sql)
@@ -10307,113 +10352,91 @@ impl DatabaseStore {
             };
             let stream_match_json = serialize_stream_match(p)?;
 
-            sqlx::query(&self.q("INSERT INTO proxies \
-                 (labels, id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
-                  backend_port, backend_path, strip_listen_path, preserve_host_header, \
-                  backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
-                  backend_tls_client_cert_path, backend_tls_client_key_path, \
-                  backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
-                  dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, upstream_subset, \
-                  circuit_breaker, retry, response_body_mode, \
-                  pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
-                  pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
-                  pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
-                  pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
-                  pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-                  pool_http3_connections_per_backend, pool_max_requests_per_connection, \
-                  listen_port, frontend_tls, passthrough, \
-                  udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
-                  websocket_permessage_deflate, allow_path_parameters, \
-                  allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
-                  stream_proxy_protocol, backend_proxy_protocol, stream_match, \
-                  api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
-            .bind(serde_json::to_string(&p.labels)?)
-            .bind(&p.id)
-            .bind(&p.namespace)
-            .bind(&p.name)
-            .bind(&hosts_json)
-            .bind(&p.listen_path)
-            .bind(p.effective_scheme().to_scheme_str())
-            .bind(&p.backend_host)
-            .bind(p.backend_port as i32)
-            .bind(&p.backend_path)
-            .bind(if p.strip_listen_path { 1i32 } else { 0 })
-            .bind(if p.preserve_host_header { 1i32 } else { 0 })
-            .bind(p.backend_connect_timeout_ms as i64)
-            .bind(p.backend_read_timeout_ms as i64)
-            .bind(p.backend_write_timeout_ms as i64)
-            .bind(&p.backend_tls_client_cert_path)
-            .bind(&p.backend_tls_client_key_path)
-            .bind(if p.backend_tls_verify_server_cert {
-                1i32
-            } else {
-                0
-            })
-            .bind(&p.backend_tls_server_ca_cert_path)
-            .bind(&p.dns_override)
-            .bind(p.dns_cache_ttl_seconds.map(|v| v as i64))
-            .bind(match p.auth_mode {
-                AuthMode::Multi => "multi",
-                _ => "single",
-            })
-            .bind(&p.upstream_id)
-            .bind(&p.upstream_subset)
-            .bind(&circuit_breaker_json)
-            .bind(&retry_json)
-            .bind(response_body_mode_str)
-            .bind(p.pool_idle_timeout_seconds.map(|v| v as i64))
-            .bind(
-                p.pool_enable_http_keep_alive
-                    .map(|v| if v { 1i32 } else { 0 }),
-            )
-            .bind(p.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
-            .bind(p.pool_tcp_keepalive_seconds.map(|v| v as i64))
-            .bind(p.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
-            .bind(p.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
-            .bind(p.pool_http2_initial_stream_window_size.map(|v| v as i64))
-            .bind(
-                p.pool_http2_initial_connection_window_size
-                    .map(|v| v as i64),
-            )
-            .bind(
-                p.pool_http2_adaptive_window
-                    .map(|v| if v { 1i32 } else { 0 }),
-            )
-            .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
-            .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
-            .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
-            .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
-            .bind(p.listen_port.map(|v| v as i32))
-            .bind(if p.frontend_tls { 1i32 } else { 0 })
-            .bind(if p.passthrough { 1i32 } else { 0 })
-            .bind(p.udp_idle_timeout_seconds as i64)
-            .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
-            .bind(p.websocket_idle_timeout_seconds.map(|v| v as i64))
-            .bind(p.websocket_permessage_deflate.as_str())
-            .bind(if p.allow_path_parameters { 1i32 } else { 0 })
-            .bind(
-                p.allowed_methods
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?,
-            )
-            .bind(if p.allowed_ws_origins.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&p.allowed_ws_origins)?)
-            })
-            .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
-            .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
-            .bind(p.backend_proxy_protocol.map(|v| v.as_str()))
-            .bind(&stream_match_json)
-            .bind(&spec.id)
-            .bind(p.created_at.to_rfc3339())
-            .bind(p.updated_at.to_rfc3339())
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query(&self.q(Self::PROXY_INSERT_WITH_API_SPEC_ID_SQL))
+                .bind(serde_json::to_string(&p.labels)?)
+                .bind(&p.id)
+                .bind(&p.namespace)
+                .bind(&p.name)
+                .bind(&hosts_json)
+                .bind(&p.listen_path)
+                .bind(p.effective_scheme().to_scheme_str())
+                .bind(&p.backend_host)
+                .bind(p.backend_port as i32)
+                .bind(&p.backend_path)
+                .bind(if p.strip_listen_path { 1i32 } else { 0 })
+                .bind(if p.preserve_host_header { 1i32 } else { 0 })
+                .bind(p.backend_connect_timeout_ms as i64)
+                .bind(p.backend_read_timeout_ms as i64)
+                .bind(p.backend_write_timeout_ms as i64)
+                .bind(&p.backend_tls_client_cert_path)
+                .bind(&p.backend_tls_client_key_path)
+                .bind(if p.backend_tls_verify_server_cert {
+                    1i32
+                } else {
+                    0
+                })
+                .bind(&p.backend_tls_server_ca_cert_path)
+                .bind(&p.dns_override)
+                .bind(p.dns_cache_ttl_seconds.map(|v| v as i64))
+                .bind(match p.auth_mode {
+                    AuthMode::Multi => "multi",
+                    _ => "single",
+                })
+                .bind(&p.upstream_id)
+                .bind(&p.upstream_subset)
+                .bind(&circuit_breaker_json)
+                .bind(&retry_json)
+                .bind(response_body_mode_str)
+                .bind(p.pool_idle_timeout_seconds.map(|v| v as i64))
+                .bind(
+                    p.pool_enable_http_keep_alive
+                        .map(|v| if v { 1i32 } else { 0 }),
+                )
+                .bind(p.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+                .bind(p.pool_tcp_keepalive_seconds.map(|v| v as i64))
+                .bind(p.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
+                .bind(p.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
+                .bind(p.pool_http2_initial_stream_window_size.map(|v| v as i64))
+                .bind(
+                    p.pool_http2_initial_connection_window_size
+                        .map(|v| v as i64),
+                )
+                .bind(
+                    p.pool_http2_adaptive_window
+                        .map(|v| if v { 1i32 } else { 0 }),
+                )
+                .bind(p.pool_http2_max_frame_size.map(|v| v as i64))
+                .bind(p.pool_http2_max_concurrent_streams.map(|v| v as i64))
+                .bind(p.pool_http3_connections_per_backend.map(|v| v as i64))
+                .bind(p.pool_max_requests_per_connection.map(|v| v as i64))
+                .bind(p.listen_port.map(|v| v as i32))
+                .bind(if p.frontend_tls { 1i32 } else { 0 })
+                .bind(if p.passthrough { 1i32 } else { 0 })
+                .bind(p.udp_idle_timeout_seconds as i64)
+                .bind(p.tcp_idle_timeout_seconds.map(|v| v as i64))
+                .bind(p.websocket_idle_timeout_seconds.map(|v| v as i64))
+                .bind(p.websocket_permessage_deflate.as_str())
+                .bind(if p.allow_path_parameters { 1i32 } else { 0 })
+                .bind(
+                    p.allowed_methods
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                )
+                .bind(if p.allowed_ws_origins.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&p.allowed_ws_origins)?)
+                })
+                .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
+                .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
+                .bind(p.backend_proxy_protocol.map(|v| v.as_str()))
+                .bind(&stream_match_json)
+                .bind(&spec.id)
+                .bind(p.created_at.to_rfc3339())
+                .bind(p.updated_at.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
 
             // NOTE: proxy_plugins junction rows are inserted AFTER plugin_configs
             // below (step 3) to satisfy the FK: plugin_config_id REFERENCES
@@ -11460,7 +11483,7 @@ impl DatabaseStore {
             let id = row.try_get::<String, _>("id").map_err(|e| {
                 anyhow::Error::from(e).context(format!(
                     "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
-                     namespace={namespace} api_spec_id={spec_id} column=id: \
+                     namespace={namespace:?} api_spec_id={spec_id:?} column=id: \
                      failed to decode spec-owned upstream id required for external reference checks"
                 ))
             })?;
@@ -13320,6 +13343,18 @@ pub(crate) fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
     }
 }
 
+/// Parse a stored `plugin_configs.scope` value. Exact match on the values the
+/// writers store; anything else is a row-decode failure, never `Global`
+/// (issue #7192). The raw column is not embedded in the error.
+pub(crate) fn parse_plugin_scope(s: &str) -> Result<PluginScope, String> {
+    match s {
+        "global" => Ok(PluginScope::Global),
+        "proxy" => Ok(PluginScope::Proxy),
+        "proxy_group" => Ok(PluginScope::ProxyGroup),
+        _ => Err("unsupported scope (expected one of: global, proxy, proxy_group)".to_string()),
+    }
+}
+
 pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
     match s.to_lowercase().as_str() {
         "multi" => AuthMode::Multi,
@@ -13850,13 +13885,14 @@ fn row_to_plugin_config_inner(
         namespace: row_namespace_or_default(row),
         plugin_name: row.try_get("plugin_name")?,
         config: config_val,
-        scope: match scope_str.as_str() {
-            "proxy" => PluginScope::Proxy,
-            "proxy_group" => PluginScope::ProxyGroup,
-            _ => PluginScope::Global,
-        },
-        proxy_id: row.try_get("proxy_id").ok(),
-        enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,
+        // Strict (issue #7192): an unknown scope used to become `Global`,
+        // widening a proxy-scoped plugin to every proxy in the namespace; a
+        // `proxy_id` decode failure detached it and an `enabled` decode
+        // failure enabled it. MongoDB rejects the same values through serde.
+        scope: parse_plugin_scope(&scope_str)
+            .map_err(|reason| anyhow::anyhow!("PluginConfig {:?}: {}", id_preview, reason))?,
+        proxy_id: optional_utf8_text_column(row, "proxy_id")?,
+        enabled: row.try_get::<i32, _>("enabled")? != 0,
         priority_override: row
             .try_get::<Option<i32>, _>("priority_override")
             .ok()
@@ -14526,24 +14562,17 @@ mod proxy_insert_sql_drift_tests {
         );
     }
 
-    /// The `submit_api_spec_bundle` INSERT is built inline (it carries an
-    /// extra `api_spec_id` column), so we mirror its SQL skeleton here and
-    /// assert the same `?` count contract. If the inline SQL in
-    /// `submit_api_spec_bundle` drifts, edit BOTH this fixture and the
-    /// `PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT` constant.
+    /// The spec-owned proxy INSERT carries an extra `api_spec_id` column;
+    /// count the statement `restore_api_spec_bundle_inner` executes.
     #[test]
     fn submit_api_spec_bundle_proxy_insert_placeholder_count_matches_const() {
-        // VALUES list has one `?` per column; we lifted this row count from
-        // the actual INSERT in submit_api_spec_bundle. Update if columns
-        // change there.
-        let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        let placeholders = values_clause.matches('?').count();
+        let placeholders = DatabaseStore::PROXY_INSERT_WITH_API_SPEC_ID_SQL
+            .matches('?')
+            .count();
         assert_eq!(
             placeholders,
             DatabaseStore::PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT,
-            "submit_api_spec_bundle proxy INSERT placeholder count must match \
+            "spec-owned proxy INSERT placeholder count must match \
              PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT — see drift-prevention contract",
         );
     }

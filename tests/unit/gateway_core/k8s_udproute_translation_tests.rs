@@ -2071,6 +2071,65 @@ fn udp_route_proxy_ids_do_not_collide_with_a_same_named_tcp_route() {
 }
 
 #[test]
+fn tcp_and_tls_route_proxy_ids_do_not_collide_for_the_same_name() {
+    // Every L4 route kind shares the `gwapi-l4` id space in one namespace, so
+    // a TCPRoute and a TLSRoute named `db` must derive distinct ids; one must
+    // not upsert over the other's proxy. Both are parentless, so each keeps
+    // the backend-port listener fallback.
+    let tcp = l4_route(
+        "TCPRoute",
+        "db",
+        json!({"rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]}),
+    );
+    let tls = l4_route(
+        "TLSRoute",
+        "db",
+        json!({
+            "hostnames": ["db.example.com"],
+            "rules": [{"backendRefs": [{"name": "db-tls", "port": 6443}]}]
+        }),
+    );
+
+    for objects in [
+        vec![gateway_class(), tcp.clone(), tls.clone()],
+        vec![gateway_class(), tls, tcp],
+    ] {
+        let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+        let mut ids: Vec<String> = result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.id.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "gwapi-l4-default-db-tcproute-0".to_string(),
+                "gwapi-l4-default-db-tlsroute-0".to_string(),
+            ],
+            "a TLSRoute must not upsert over a same-named TCPRoute"
+        );
+        let tls_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id.ends_with("tlsroute-0"))
+            .expect("the TLS proxy survives");
+        assert!(tls_proxy.passthrough);
+        assert_eq!(tls_proxy.listen_port, Some(6443));
+        let tcp_proxy = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id.ends_with("tcproute-0"))
+            .expect("the TCP proxy survives");
+        assert!(!tcp_proxy.passthrough);
+        assert_eq!(tcp_proxy.listen_port, Some(5432));
+    }
+}
+
+#[test]
 fn deleting_a_weighted_udp_route_prunes_its_generated_upstream_from_live_config() {
     // Translation alone regenerates from the snapshot, but the live gateway
     // config is a *merge* of the K8s translation onto whatever another source

@@ -2021,6 +2021,12 @@ fn connect_udp_precommit_gates_and_header_write_follow_the_captured_plan() {
         abort_log < abort_return,
         "the rejection summary must be the only access-log completion on a stalled 200 expiry"
     );
+    // Issue #7157: the stalled-200 expiry is counted exactly once, as the 401
+    // its access log records, after that log and before the return.
+    let abort_count = squeezed[abort..summary]
+        .find("crate::proxy::record_request(&state,StatusCode::UNAUTHORIZED.as_u16())")
+        .expect("stalled 200 expiry must be counted");
+    assert!(abort_log < abort_count && abort_count < abort_return);
 }
 
 #[test]
@@ -2914,6 +2920,49 @@ mod per_client_tunnel_cap {
                 .expect("a different /56 is an independent client");
         assert!(outside_prefix.is_some());
         drop((held, outside_prefix));
+    }
+
+    /// GHSA-grwg-8jpx-q8p9: a prefix finer than /64 must not be re-masked to
+    /// the /64 by the slot primitive, or every host in that /64 shares one
+    /// budget despite the operator's per-host setting.
+    #[test]
+    fn per_client_cap_uses_configured_slash_128_prefix() {
+        let counts = counts();
+        let held = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1", 128, 1)
+            .expect("first IPv6 tunnel admitted")
+            .expect("cap enabled");
+        assert!(
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1", 128, 1).is_err(),
+            "the same /128 host stays capped"
+        );
+        let neighbour =
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::2", 128, 1)
+                .expect("another host in the same /64 is an independent client at /128");
+        assert!(neighbour.is_some());
+        assert_eq!(live(&counts, "2001:db8:1:2::1"), 1);
+        assert_eq!(live(&counts, "2001:db8:1:2::2"), 1);
+        assert_eq!(live(&counts, "2001:db8:1:2::"), 0);
+        drop((held, neighbour));
+    }
+
+    #[test]
+    fn per_client_cap_uses_configured_slash_96_prefix() {
+        let counts = counts();
+        let held = try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::1:1", 96, 1)
+            .expect("first IPv6 tunnel admitted")
+            .expect("cap enabled");
+        assert!(
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2::ffff", 96, 1)
+                .is_err(),
+            "addresses in one /96 must share a budget when /96 is configured"
+        );
+        let other_slash_96 =
+            try_acquire_connect_udp_client_slot(Some(&counts), "2001:db8:1:2:0:1::1", 96, 1)
+                .expect("a different /96 inside the same /64 is an independent client");
+        assert!(other_slash_96.is_some());
+        assert_eq!(live(&counts, "2001:db8:1:2::"), 1);
+        assert_eq!(live(&counts, "2001:db8:1:2:0:1::"), 1);
+        drop((held, other_slash_96));
     }
 
     #[test]

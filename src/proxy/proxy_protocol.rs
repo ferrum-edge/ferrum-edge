@@ -45,18 +45,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
-use tracing::warn;
+
+use crate::plugins::utils::log_sampling::warn_sampled;
 
 /// Outcome of parsing the PROXY protocol header from an inbound TCP stream.
 #[derive(Debug)]
 pub enum ProxyProtocolResult {
     /// A forwarded source address was parsed and should be used as the
     /// resolved `client_ip`. The socket peer remains the `direct_client_ip`.
-    Forwarded {
-        src: SocketAddr,
-        #[allow(dead_code)]
-        dst: SocketAddr,
-    },
+    Forwarded { src: SocketAddr, dst: SocketAddr },
     /// The header was a v2 LOCAL command or a v1/v2 UNKNOWN/unrecognised
     /// family — treat the socket peer as the client (health checks from the LB
     /// itself; pass-through for connection-level checks).
@@ -675,12 +672,13 @@ pub fn apply_proxy_result(
     }
 }
 
-/// Warn and signal that a connection should be closed due to an untrusted peer
-/// sending a PROXY-protocol-enabled connection.
-///
-/// Returns a structured log record; the caller must drop/close the stream.
+/// Record a connection closed because its socket peer is not in
+/// `FERRUM_TRUSTED_PROXIES` on a PROXY-protocol-enabled stream listener; the
+/// caller must drop/close the stream. Sampled: any host that can open a TCP
+/// connection reaches this before a byte is read, so a connection flood must
+/// not flood the log (the HTTP frontend equivalent is sampled the same way).
 pub fn warn_untrusted_proxy_peer(peer: &std::net::SocketAddr, proxy_id: &str) {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy_id,
         peer = %peer,
         "Closing connection: inbound PROXY protocol enabled but socket peer is not in \
@@ -688,14 +686,15 @@ pub fn warn_untrusted_proxy_peer(peer: &std::net::SocketAddr, proxy_id: &str) {
     );
 }
 
-/// Warn and close a connection when PROXY protocol is enabled but the
-/// initial bytes were not a valid PROXY header.
+/// Record a connection closed because PROXY protocol is enabled but the
+/// initial bytes were not a valid PROXY header. Sampled like
+/// [`warn_untrusted_proxy_peer`].
 pub fn warn_invalid_proxy_header(
     peer: &std::net::SocketAddr,
     proxy_id: &str,
     err: &ProxyProtocolError,
 ) {
-    warn!(
+    warn_sampled!(
         proxy_id = %proxy_id,
         peer = %peer,
         error = %err,

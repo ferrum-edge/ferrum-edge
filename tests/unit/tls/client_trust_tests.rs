@@ -10,7 +10,7 @@
 //! listener consults — so these tests serialize on one lock and reset it
 //! between cases.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 #[path = "../../common/crl_fixtures.rs"]
 mod crl_fixtures;
@@ -28,23 +28,11 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::CertificateRevocationListDer;
 use rustls::pki_types::pem::PemObject;
 
-/// The one lock every test in this binary that touches the process-global trust
-/// registry must hold. `frontend_trust_binding_tests` shares it, because
-/// `reset_for_test` clears every scope: two files with private locks would reset
-/// each other mid-test.
-pub(crate) fn registry_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Take the registry lock and reset every scope. Held for the test body.
-pub(crate) fn isolated_registry() -> MutexGuard<'static, ()> {
-    let guard = registry_lock();
-    client_trust::reset_for_test();
-    guard
-}
+/// Take the registry lock and reset every scope. Held for the test body. The
+/// lock is shared with every other module in this binary that touches the
+/// process-global trust registry (`frontend_trust_binding_tests` and the
+/// stream/DTLS/retirement tests), because `reset_for_test` clears every scope.
+pub(crate) use crate::unit::client_trust_registry_lock::isolated_registry;
 
 // ---------------------------------------------------------------------------
 // Material helpers

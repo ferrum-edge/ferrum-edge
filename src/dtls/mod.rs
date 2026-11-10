@@ -884,7 +884,7 @@ fn apply_scoped_dtls_socket_options(
 // ============================================================================
 
 /// The gateway TLS policy (`FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_MAX_VERSION`,
-/// `FERRUM_TLS_CIPHER_SUITES`, `FERRUM_TLS_CURVES`) expressed in the DTLS
+/// `FERRUM_TLS_CIPHER_SUITES`, `FERRUM_TLS_KEY_EXCHANGE_GROUPS`) expressed in the DTLS
 /// stack's vocabulary.
 ///
 /// `docs/configuration.md` documents those variables as applying "inbound +
@@ -914,7 +914,7 @@ fn apply_scoped_dtls_socket_options(
 ///   observed. But a policy whose ENTIRE TLS 1.2 selection is `ECDHE-RSA-*`
 ///   while TLS 1.2 is enabled WOULD silently lose DTLS 1.2, so that is a
 ///   startup error naming the suites and the surface.
-/// * **Key-exchange groups.** `FERRUM_TLS_CURVES` parses to exactly X25519,
+/// * **Key-exchange groups.** `FERRUM_TLS_KEY_EXCHANGE_GROUPS` parses to exactly X25519,
 ///   secp256r1 and secp384r1, which are exactly the three groups dimpl
 ///   implements, so the mapping is faithful and is applied.
 ///
@@ -1042,7 +1042,7 @@ impl DtlsSuitePolicy {
                 }
                 other => {
                     return Err(anyhow::anyhow!(
-                        "Key-exchange group {:?} selected by FERRUM_TLS_CURVES has no DTLS \
+                        "Key-exchange group {:?} selected by FERRUM_TLS_KEY_EXCHANGE_GROUPS has no DTLS \
                          equivalent, so the {} cannot honour the configured TLS policy.",
                         other,
                         surface
@@ -1401,6 +1401,48 @@ pub(crate) fn dtls_datagram_opens_session_for_test(data: &[u8]) -> bool {
     dtls_datagram_opens_session(data)
 }
 
+/// Whether a `Dtls::handle_packet` error means "drop this datagram" rather
+/// than "end the session" (GHSA-7464-frfx-85p6).
+///
+/// A session's datagrams are matched by UDP source address only, so anyone
+/// who can forge that address can put arbitrary bytes in front of the engine.
+/// RFC 6347 §4.1.2.7 and RFC 9147 §4.5.2 say invalid records are silently
+/// discarded for exactly this reason. dimpl rejects these before they change
+/// any session state (the replay window moves only after a record
+/// authenticates):
+///
+/// * `ParseIncomplete` / `ParseError`: a datagram or record header that is
+///   truncated or malformed;
+/// * `CryptoError`: a DTLS 1.2 record that fails AEAD authentication;
+/// * `TooManyRecords` / `ReceiveQueueFull`: a datagram that would exceed the
+///   engine's per-datagram or receive-queue bounds;
+/// * `RenegotiationAttempt`: a new handshake message after the handshake.
+///   Epoch-0 handshake records are plaintext, so this one is forgeable too,
+///   and ignoring an unsupported renegotiation is a valid response.
+///
+/// Everything else stays fatal: an authenticated fatal alert or a handshake
+/// security/certificate failure (`SecurityError`, `CertificateError`),
+/// `ConnectionClosed`, and any variant this list does not name (dimpl's error
+/// is `#[non_exhaustive]`). A handshake stalled by dropped datagrams is still
+/// bounded by its handshake deadline.
+fn dtls_packet_error_is_droppable(error: &dimpl::Error) -> bool {
+    matches!(
+        error,
+        dimpl::Error::ParseIncomplete
+            | dimpl::Error::ParseError(_)
+            | dimpl::Error::CryptoError(_)
+            | dimpl::Error::TooManyRecords
+            | dimpl::Error::ReceiveQueueFull
+            | dimpl::Error::RenegotiationAttempt
+    )
+}
+
+/// Pin the per-datagram drop classification for external hosted tests.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn dtls_packet_error_is_droppable_for_test(error: &dimpl::Error) -> bool {
+    dtls_packet_error_is_droppable(error)
+}
+
 /// Pin the fairness-boundary decision for external hosted tests without
 /// exposing it as runtime API.
 #[allow(dead_code)] // used through library `_test_support`
@@ -1605,7 +1647,10 @@ impl DtlsConnection {
                 result = socket.recv(&mut recv_buf) => {
                     let len = result.map_err(|e| anyhow::anyhow!("UDP recv during handshake: {}", e))?;
                     if let Err(e) = dtls.handle_packet(&recv_buf[..len]) {
-                        return Err(anyhow::anyhow!("DTLS handshake packet error: {}", e));
+                        if !dtls_packet_error_is_droppable(&e) {
+                            return Err(anyhow::anyhow!("DTLS handshake packet error: {}", e));
+                        }
+                        trace!("DTLS handshake dropped an invalid datagram: {}", e);
                     }
                 }
                 _ = tokio::time::sleep(sleep_dur) => {
@@ -1680,9 +1725,13 @@ impl DtlsConnection {
                         match result {
                             Ok(len) => {
                                 if let Err(e) = dtls.handle_packet(&recv_buf[..len]) {
-                                    trace!("DTLS handle_packet error: {}", e);
-                                    fatal_send_error =
-                                        Some(format!("DTLS handle_packet error: {e}"));
+                                    if dtls_packet_error_is_droppable(&e) {
+                                        trace!("DTLS dropped an invalid datagram: {}", e);
+                                    } else {
+                                        trace!("DTLS handle_packet error: {}", e);
+                                        fatal_send_error =
+                                            Some(format!("DTLS handle_packet error: {e}"));
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -3495,8 +3544,15 @@ impl DtlsServer {
                     // Incoming UDP packet from this client (demuxed by the server)
                     Some(data) = incoming_rx.recv() => {
                         if let Err(e) = dtls.handle_packet(&data) {
-                            trace!(client = %peer_addr, "DTLS handle_packet error: {}", e);
-                            break;
+                            if dtls_packet_error_is_droppable(&e) {
+                                // Forgeable by anyone who can spoof this
+                                // peer's address: drop the datagram, keep the
+                                // session (GHSA-7464-frfx-85p6).
+                                trace!(client = %peer_addr, "DTLS dropped an invalid datagram: {}", e);
+                            } else {
+                                trace!(client = %peer_addr, "DTLS handle_packet error: {}", e);
+                                break;
+                            }
                         }
                     }
                     // DTLS retransmit timer

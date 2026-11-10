@@ -21,6 +21,17 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- end -}}
 {{- end -}}
 
+{{/* Select the eBPF-capable image tag. "-ebpf" and "-ebpf-tools" (a strict
+     superset of "-ebpf") both already satisfy it, so neither is suffixed again;
+     any other tag gains "-ebpf". */}}
+{{- define "ferrum-mesh.ebpfImageTag" -}}
+{{- if or (hasSuffix "-ebpf" .) (hasSuffix "-ebpf-tools" .) -}}
+{{- . -}}
+{{- else -}}
+{{- printf "%s-ebpf" . -}}
+{{- end -}}
+{{- end -}}
+
 {{/* The injector's capture mode comes from its own env, not Ambient's mode. */}}
 {{- define "ferrum-mesh.injectorSidecarImage" -}}
 {{- $env := .Values.injector.env | default dict -}}
@@ -656,6 +667,14 @@ tlsCrlPath.
 {{- $envTlsPair := and (hasKey $env "FERRUM_ADMIN_TLS_CERT_PATH") (hasKey $env "FERRUM_ADMIN_TLS_KEY_PATH") -}}
 {{- if and $tlsMount $envTlsPair -}}
 {{- fail (printf "%s.admin.tls and %s.env.FERRUM_ADMIN_TLS_{CERT,KEY}_PATH both configure the admin certificate; keep one source" $label $label) -}}
+{{- end -}}
+{{- /* The same for the optional client CA and CRL: the chart renders these
+       from the mount, and an env entry would add a second copy of the name. */ -}}
+{{- if and $tlsClientCaKey (hasKey $env "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH") -}}
+{{- fail (printf "%s.admin.tls.clientCaKey and %s.env.FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH both configure the admin client CA; keep one source" $label $label) -}}
+{{- end -}}
+{{- if and $tlsCrlKey (hasKey $env "FERRUM_TLS_CRL_FILE_PATH") -}}
+{{- fail (printf "%s.admin.tls.crlKey and %s.env.FERRUM_TLS_CRL_FILE_PATH both configure the CRL file; keep one source" $label $label) -}}
 {{- end -}}
 {{- $tlsConfigured := "" -}}
 {{- if or $tlsMount $envTlsPair -}}

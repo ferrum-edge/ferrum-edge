@@ -426,15 +426,6 @@ pub struct BpfMetricsSnapshot {
 }
 
 impl BpfMetricsSnapshot {
-    pub fn drop_by_reason(&self, reason: BpfDropReason) -> u64 {
-        match reason {
-            BpfDropReason::BypassUidHit => self.drop_bypass_uid_hit,
-            BpfDropReason::ExcludeCidrHit => self.drop_exclude_cidr_hit,
-            BpfDropReason::NotInIncludeCidr => self.drop_not_in_include_cidr,
-            BpfDropReason::ExcludePortHit => self.drop_exclude_port_hit,
-        }
-    }
-
     pub fn drop_reasons(&self) -> [(BpfDropReason, u64); 4] {
         [
             (BpfDropReason::BypassUidHit, self.drop_bypass_uid_hit),

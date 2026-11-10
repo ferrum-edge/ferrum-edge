@@ -945,11 +945,8 @@ impl CapsuleDecoder {
     /// 9297 §3.3 "closed in the middle of a capsule" predicate, which a skip in
     /// progress also satisfies.
     ///
-    /// `#[allow(dead_code)]` because the binary target compiles this module
-    /// tree separately from the library and only the external test crates read
-    /// this accessor; production asks the same question via
-    /// [`Self::finish_stream`].
-    #[allow(dead_code)]
+    /// Read by the external tests to bound decoder memory; production asks the
+    /// end-of-stream question through [`Self::finish_stream`].
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
     }
@@ -1733,7 +1730,9 @@ pub fn try_acquire_connect_udp_client_slot(
         return Ok(None);
     }
     let key = connect_udp_client_key(client_ip, ipv6_prefix);
-    crate::proxy::try_acquire_per_ip_slot(Some(counts), &key, max)
+    // Keep the configured prefix: the fixed-/64 `try_acquire_per_ip_slot`
+    // would re-mask a finer key (/96, /128) back to its /64.
+    crate::proxy::try_acquire_per_ip_slot_with_prefix(Some(counts), &key, max, ipv6_prefix)
 }
 
 /// Everything the handler needs that is not already an `Arc` on `ProxyState`.
@@ -2458,10 +2457,12 @@ pub(crate) async fn handle_h3_connect_udp(
     match header_write {
         crate::http3::stream_util::H3AuthorizedHeadersWrite::Written => {}
         crate::http3::stream_util::H3AuthorizedHeadersWrite::AuthorizationExpired(termination) => {
-            // The helper already recorded the counter through the request latch.
-            // Latch the class into the summary, abort/reset without attempting
-            // another blocking terminal write, and release permit/socket/guards
-            // on return. A 200 was never committed, so it is not counted.
+            // The helper already recorded the termination counter through the
+            // request latch. Latch the class into the summary, abort/reset
+            // without attempting another blocking terminal write, and release
+            // permit/socket/guards on return. A 200 was never committed, so the
+            // request is counted once as the 401 its access log records, like
+            // every other terminal of this handler.
             ctx.record_authorization_termination_once(
                 termination,
                 crate::proxy::auth_lifetime::StreamAuthProtocolFamily::StreamUdp,
@@ -2483,6 +2484,7 @@ pub(crate) async fn handle_h3_connect_udp(
                 Some(&request_path),
             )
             .await;
+            crate::proxy::record_request(&state, StatusCode::UNAUTHORIZED.as_u16());
             drop(session_permit);
             drop(client_tunnel_guard);
             drop(request_guard);
@@ -3113,7 +3115,7 @@ async fn relay(
     end
 }
 
-/// Log a receive-half teardown join and report whether the task PANICKED.
+/// Log a receive-half teardown join if the task PANICKED.
 ///
 /// This relay owns no send half, so a panic does not change what the client
 /// saw — it is logged, not promoted. A `cancelled` join is the acknowledgement
@@ -3124,19 +3126,16 @@ fn join_panicked(
     joined: Result<SessionEnd, tokio::task::JoinError>,
     relay: RelayDirection,
     proxy_id: &str,
-) -> bool {
-    match joined {
-        Ok(_) => false,
-        Err(error) if error.is_panic() => {
-            warn!(
-                proxy_id = %proxy_id,
-                relay = relay.as_str(),
-                reason = SessionEnd::RelayTaskFailed.as_str(),
-                "H3 CONNECT-UDP relay task panicked during teardown"
-            );
-            true
-        }
-        Err(_) => false,
+) {
+    if let Err(error) = joined
+        && error.is_panic()
+    {
+        warn!(
+            proxy_id = %proxy_id,
+            relay = relay.as_str(),
+            reason = SessionEnd::RelayTaskFailed.as_str(),
+            "H3 CONNECT-UDP relay task panicked during teardown"
+        );
     }
 }
 

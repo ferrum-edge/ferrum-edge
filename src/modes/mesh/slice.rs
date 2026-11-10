@@ -50,8 +50,7 @@ pub struct MeshSliceRequest {
     pub sidecar_egress_dry_run: bool,
     /// When `true`, and only when Sidecar egress narrowing is also enabled and
     /// applicable, the slice builder filters `workloads` to identities
-    /// referenced by admitted services. Defaults to `false` for a one-release
-    /// dry-run window.
+    /// referenced by admitted services. Defaults to `false`.
     pub enforce_sidecar_identity_narrowing: bool,
     /// Keep the namespace-visible AuthorizationPolicy candidate superset needed
     /// for destination-side Ambient UDP per-pod source scoping. The consumer
@@ -150,7 +149,6 @@ impl MeshSliceRequest {
 
     /// Returns `self` bound to a GAMMA Waypoint name. Used by mesh-mode
     /// startup when `topology == ServiceWaypoint`; tests use it directly.
-    #[allow(dead_code)]
     pub fn with_waypoint_name(mut self, name: Option<String>) -> Self {
         self.waypoint_name = name.filter(|value| !value.trim().is_empty());
         self
@@ -1394,7 +1392,9 @@ impl MeshSlice {
                 .filter(|upstream| {
                     upstream.namespace == request.namespace
                         && referenced.contains(upstream.id.as_str())
-                        && upstream.id.starts_with("istio-vs-l4-upstream-")
+                        && upstream
+                            .id
+                            .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX)
                 })
                 .collect()
         };
@@ -1562,17 +1562,32 @@ impl MeshSlice {
         // destination candidates come from the destination-visible workload
         // view and must remain present even when their pod UID was stripped at
         // the CP boundary or never existed (for example, WorkloadEntry).
+        //
+        // Only topologies that authorize traffic for OTHER workloads need this
+        // superset: Ambient / ServiceWaypoint (UDP source scoping) and
+        // NodeWaypoint (per-pod destination scoping). A Sidecar, gateway, or
+        // other single-workload slice keeps only the policies selecting its own
+        // workload (issue #7241): a neighbour's selector policy there is never
+        // enforced, can fail `mesh_authz` construction on a `labels_ambiguous`
+        // slice, and makes every subscriber's slice change when any
+        // namespace workload's policy does.
+        let carries_other_workload_policy_candidates =
+            request.ambient_udp_source_scoping || request.node_waypoint_capture_scoping;
         let ambient_udp_policy_candidates: Vec<(String, BTreeMap<String, String>)> =
-            ambient_udp_source_workloads
-                .iter()
-                .chain(workloads.iter())
-                .map(|workload| {
-                    (
-                        workload.namespace.clone(),
-                        labels_to_btree(&workload.selector.labels),
-                    )
-                })
-                .collect();
+            if carries_other_workload_policy_candidates {
+                ambient_udp_source_workloads
+                    .iter()
+                    .chain(workloads.iter())
+                    .map(|workload| {
+                        (
+                            workload.namespace.clone(),
+                            labels_to_btree(&workload.selector.labels),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
             if candidate_label_sets.is_empty() {
                 vec![&effective_labels]
@@ -2732,9 +2747,12 @@ fn narrow_workload_identities(
         );
     } else if admitted_services.is_empty() {
         debug!(
-            node_id = request.node_id.as_str(),
-            namespace = request.namespace.as_str(),
-            workload_spiffe_id = request.workload_spiffe_id.as_deref().unwrap_or(""),
+            node_id = %sanitize_startup_cause(format!("{:?}", request.node_id.as_str()), &[]),
+            namespace = %sanitize_startup_cause(format!("{:?}", request.namespace.as_str()), &[]),
+            workload_spiffe_id = %sanitize_startup_cause(
+                format!("{:?}", request.workload_spiffe_id.as_deref().unwrap_or("")),
+                &[]
+            ),
             "Sidecar workload identity narrowing found no admitted services; slice workloads will be empty"
         );
     }
@@ -4112,8 +4130,11 @@ fn resolve_applicable_sidecar_outbound_policy(
             && let Some(policy) = selected_policy
         {
             debug!(
-                sidecar = %sidecar.name,
-                namespace = %sidecar.namespace,
+                sidecar = %sanitize_startup_cause(format!("{:?}", sidecar.name.as_str()), &[]),
+                namespace = %sanitize_startup_cause(
+                    format!("{:?}", sidecar.namespace.as_str()),
+                    &[]
+                ),
                 policy = ?policy,
                 "Applying Sidecar-scoped outboundTrafficPolicy to the mesh slice"
             );
@@ -4443,6 +4464,11 @@ fn narrow_service_ports(
 /// Returns the per-host narrowed `ServiceEntry` projections that satisfy the
 /// resolved Sidecar egress scope.
 ///
+/// Every host is judged on its own: a host the Sidecar does not admit is
+/// never carried into the slice because a sibling host of the same entry
+/// matched. A port-less entry keeps only its admitted hosts (and is dropped
+/// when none is admitted).
+///
 /// Hosts that share the same admitted port-set are grouped into a single
 /// returned entry; hosts that admit different port-sets produce separate
 /// entries that all carry the original entry's `name`. As a result the
@@ -4453,18 +4479,30 @@ fn narrow_service_entry_ports(
     entry: &ServiceEntry,
     sidecar: ResolvedSidecarEgress<'_>,
 ) -> Vec<ServiceEntry> {
-    let host_refs: Vec<&str> = entry.hosts.iter().map(String::as_str).collect();
     let resource_ports: Vec<u16> = entry.ports.iter().map(|port| port.port).collect();
     if resource_ports.is_empty() {
-        return sidecar_egress_port_admission(
-            sidecar.namespace,
-            sidecar.egress,
-            entry.namespace.as_str(),
-            &host_refs,
-            Some(&resource_ports),
-        )
-        .map(|_| vec![entry.clone()])
-        .unwrap_or_default();
+        let hosts = entry
+            .hosts
+            .iter()
+            .filter(|host| {
+                sidecar_egress_port_admission(
+                    sidecar.namespace,
+                    sidecar.egress,
+                    entry.namespace.as_str(),
+                    &[host.as_str()],
+                    Some(&resource_ports),
+                )
+                .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if hosts.is_empty() {
+            return Vec::new();
+        }
+        return vec![ServiceEntry {
+            hosts,
+            ..entry.clone()
+        }];
     }
 
     let resource_port_set: BTreeSet<u16> = resource_ports.iter().copied().collect();
@@ -10723,10 +10761,10 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_narrowing_multi_host_service_entry_any_match_admits() {
-        // A ServiceEntry with multiple hosts: as long as ONE host matches the
-        // egress pattern, the whole entry is admitted. Documented at the
-        // sidecar_egress_includes_service rustdoc.
+    fn sidecar_narrowing_multi_host_service_entry_keeps_only_admitted_hosts() {
+        // A ServiceEntry with multiple hosts is narrowed per host: the entry
+        // survives because one host matches the egress pattern, but only that
+        // host is carried into the slice (see `narrow_service_entry_ports`).
         let mesh = MeshConfig {
             sidecars: vec![make_sidecar(
                 "wildcard-sc",
@@ -10755,6 +10793,10 @@ mod tests {
         let config = config_with_mesh(mesh);
         let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
         assert_eq!(slice.service_entries.len(), 1);
+        assert_eq!(
+            slice.service_entries[0].hosts,
+            vec!["api.example.com".to_string()]
+        );
     }
 
     #[test]

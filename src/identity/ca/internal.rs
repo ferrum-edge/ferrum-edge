@@ -24,7 +24,7 @@
 //!
 //! - Intermediate CAs and key escrow.
 //! - CRL / OCSP publication.
-//! - Cross-trust-domain federation (the upstream wrappers handle that).
+//! - Cross-trust-domain federation.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -268,9 +268,10 @@ impl InternalCa {
         params.not_after = now + time::Duration::seconds(ttl_secs as i64);
 
         // Random serial — 64 bits is sufficient for non-CA SVIDs and matches
-        // SPIFFE conventions.
-        let serial: u64 = rand_u64();
-        params.serial_number = Some(SerialNumber::from_slice(&serial.to_be_bytes()));
+        // SPIFFE conventions. An RNG failure fails the issuance rather than
+        // minting a predictable serial.
+        let serial = super::random_positive_serial_bytes()?;
+        params.serial_number = Some(SerialNumber::from_slice(&serial));
 
         Ok(params)
     }
@@ -492,33 +493,6 @@ fn ca_issue_error_marks_unhealthy(error: &CaError) -> bool {
         error,
         CaError::Config(_) | CaError::Upstream(_) | CaError::Internal(_) | CaError::Io(_)
     )
-}
-
-/// Random positive serial from the system random source via
-/// `crate::fips::backend::rand` (ring, or AWS-LC under the `fips` feature).
-///
-/// RFC 5280 §4.1.2.2 requires serial numbers to be positive ASN.1 INTEGERs.
-/// The DER encoding of an INTEGER is sign-bit-sensitive: a high MSB makes
-/// the value negative. We clear the high bit explicitly so the produced
-/// serial round-trips as positive on every parser, regardless of whether
-/// `rcgen` would otherwise add a sign-extension byte. We also avoid the
-/// all-zero serial.
-fn rand_u64() -> u64 {
-    use crate::fips::backend::rand::SecureRandom;
-    let rng = crate::fips::backend::rand::SystemRandom::new();
-    let mut buf = [0u8; 8];
-    if rng.fill(&mut buf).is_ok() {
-        buf[0] &= 0x7f;
-        if buf == [0u8; 8] {
-            buf[7] = 1;
-        }
-        u64::from_be_bytes(buf)
-    } else {
-        // Fallback to a process-counter — astronomically unlikely to fire.
-        // The counter starts at 1 so the all-zero case never appears.
-        static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x7fff_ffff_ffff_ffff
-    }
 }
 
 fn issued_cert_not_after(leaf_der: &[u8]) -> Result<DateTime<Utc>, CaError> {

@@ -712,7 +712,7 @@ impl<'a> ValidationPipeline<'a> {
                             )
                         {
                             errors.push(format!(
-                                "Plugin {:?} (id={:?}): {}",
+                                "Plugin {:?} (`id`={:?}): {}",
                                 plugin_config.plugin_name, plugin_config.id, error
                             ));
                             continue;
@@ -733,7 +733,7 @@ impl<'a> ValidationPipeline<'a> {
                                 backend_allow_ips,
                             ) {
                                 let message = format!(
-                                    "Plugin {:?} (id={:?}): {}",
+                                    "Plugin {:?} (`id`={:?}): {}",
                                     plugin_config.plugin_name, plugin_config.id, err
                                 );
                                 if !matches!(&action, ValidationAction::Collect)
@@ -762,7 +762,7 @@ impl<'a> ValidationPipeline<'a> {
                             )
                         {
                             let message = format!(
-                                "Plugin {:?} (id={:?}): {}",
+                                "Plugin {:?} (`id`={:?}): {}",
                                 plugin_config.plugin_name, plugin_config.id, err
                             );
                             if !matches!(&action, ValidationAction::Collect)

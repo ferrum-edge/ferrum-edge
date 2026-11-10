@@ -37,7 +37,6 @@
 //!   [`canonical_socket_addr`] exists for the capture paths that deliberately
 //!   canonicalize both together, and documents that choice at the call site.
 
-use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -168,27 +167,4 @@ pub fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
 /// configured policy — never as "allow".
 pub fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
     parse_client_ip_literal(client_ip).map(canonical_ip)
-}
-
-/// Canonical text form of a client-identity string, borrowing when the input is
-/// already canonical.
-///
-/// Gateway-produced identities are canonical at ingress, so the common path is
-/// a single `memchr` for `':'` and a borrow — no parse and no allocation.
-/// Non-address identities (consumer usernames) are returned untouched, which
-/// keeps identity-keyed maps stable for authenticated principals.
-pub fn canonical_client_ip_text(client_ip: &str) -> Cow<'_, str> {
-    // Every IPv4-mapped form contains ':'. Native IPv4 — the overwhelmingly
-    // common case on a dual-stack listener after ingress canonicalization —
-    // never does, so it never reaches the parser.
-    if !client_ip.contains(':') {
-        return Cow::Borrowed(client_ip);
-    }
-    match parse_client_ip_literal(client_ip) {
-        Some(IpAddr::V6(ipv6)) => match ipv6.to_ipv4_mapped() {
-            Some(ipv4) => Cow::Owned(ipv4.to_string()),
-            None => Cow::Borrowed(client_ip),
-        },
-        _ => Cow::Borrowed(client_ip),
-    }
 }

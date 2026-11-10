@@ -11138,6 +11138,60 @@ fn typed_mesh_maps_keep_trusted_fields_after_withheld_keys() {
     );
 }
 
+/// Every serde field of a typed mesh adapter is in its scoped diagnostics
+/// table (issue #7146): a type error under `MeshService.allow_path_parameters`
+/// or `RequestMatch.headers` / `port_patterns` names its schema path instead
+/// of a redacted key, and an unknown `to` key lists them as expected fields.
+#[test]
+fn typed_mesh_diagnostics_name_service_and_request_match_fields() {
+    let mut slice = serde_json::to_value(MeshSlice::default()).unwrap();
+    slice["services"] = json!([{
+        "name": "service-marker-7146", "namespace": "default",
+        "allow_path_parameters": "yes-marker-7146"
+    }]);
+    assert_rendered_mesh_diagnostic(
+        MeshAuthz::new(&json!({"mesh_slice": slice})).err().unwrap(),
+        &["services[0].allow_path_parameters", "expected a boolean"],
+        &["<redacted key>", "yes-marker-7146", "service-marker-7146"],
+    );
+
+    let policy_with_to = |to: serde_json::Value| {
+        let mut policy = serde_json::to_value(allow_client_policy(PolicyAction::Allow)).unwrap();
+        policy["rules"][0]["to"] = json!([to]);
+        json!({"mesh_policies": [policy]})
+    };
+    assert_rendered_mesh_diagnostic(
+        MeshAuthz::new(&policy_with_to(json!({"port_patterns": true})))
+            .err()
+            .unwrap(),
+        &["rules[0].to[0].port_patterns", "expected a sequence"],
+        &["<redacted key>", "true"],
+    );
+    assert_rendered_mesh_diagnostic(
+        MeshAuthz::new(&policy_with_to(json!({"headers": {"x-marker-7146": true}})))
+            .err()
+            .unwrap(),
+        &[
+            "rules[0].to[0].headers[<redacted key>]",
+            "expected a string",
+        ],
+        &["x-marker-7146", "true"],
+    );
+    assert_rendered_mesh_diagnostic(
+        MeshAuthz::new(&policy_with_to(json!({"unknown_marker_7146": true})))
+            .err()
+            .unwrap(),
+        &[
+            "rules[0].to[0][<redacted key>]",
+            "unknown field; expected one of",
+            "`headers`",
+            "`port_patterns`",
+            "`not_port_patterns`",
+        ],
+        &["unknown_marker_7146", "true"],
+    );
+}
+
 /// The bare-FQDN `connection.sni` warning logs its operator-supplied fields
 /// with `Debug` escaping: the operator can read which policy to fix (nothing
 /// is redacted), and a newline in a policy name cannot forge a log line.

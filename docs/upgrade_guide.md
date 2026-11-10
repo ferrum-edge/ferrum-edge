@@ -85,6 +85,14 @@ or remove it before upgrading.
   set a gRPC-Web `content-type` on such a route without `grpc_web`, is refused
   at publication. Rename the destination or remove the rule before upgrading.
 
+### `ai_stream_router`: `anthropic_version` only on `anthropic` providers (#7128)
+
+A non-null `anthropic_version` on an `openai`, `openai_compatible`,
+`azure_openai` or `google_gemini` provider is now a configuration error, as
+`default_max_tokens` already was. No other provider type sends the header, so
+the value never had an effect. Remove it from those providers (or set it to
+`null`) before upgrading.
+
 Per-release sections below are written when a release is cut. Changes already
 on `main` but not yet released, including breaking ones, are listed under
 `[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before

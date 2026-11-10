@@ -1882,7 +1882,7 @@ fn assert_store_refusal(error: anyhow::Error) {
     assert_eq!(refusal.unexpected, ["proxy-2"]);
     assert_eq!(
         refusal.to_string(),
-        "plugin config 'plugin-1' is referenced by proxies outside expected_proxy_ids: proxy-2; re-read the namespace and retry with the current referencing set"
+        r#"plugin config "plugin-1" is referenced by proxies outside expected_proxy_ids: ["proxy-2"]; re-read the namespace and retry with the current referencing set"#
     );
 }
 

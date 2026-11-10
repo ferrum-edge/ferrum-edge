@@ -267,10 +267,10 @@ impl IngressRedirectAction {
     }
 }
 
-/// The per-packet facts the redirect decision is made from. Deliberately a
-/// plain value type with no kernel dependencies so the decision table can be
-/// exercised deterministically from host-side unit tests — the kernel program
-/// only parses the packet and looks maps up, it does not re-implement policy.
+/// The per-packet facts the redirect decision is made from, as a plain value
+/// type for the host-side reference model [`ingress_redirect_action`]. The
+/// kernel program (`tc_ingress_redirect.rs`) does not build one: it open-codes
+/// the same gates while parsing the packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IngressRedirectPacket {
     /// `skb->mark` as it arrived.
@@ -340,11 +340,14 @@ pub const fn ipv4_is_fragment(word: u16) -> bool {
     word & MORE_FRAGMENTS != 0 || word & FRAGMENT_OFFSET_MASK != 0
 }
 
-/// The single source of truth for the inbound tc redirect decision.
+/// Host-side reference model of the inbound tc redirect decision.
 ///
-/// Every gate is a conjunction, so the kernel program may evaluate them in any
-/// order (it short-circuits the cheap mark/port guards before spending a map
-/// lookup) without diverging from this table:
+/// The kernel program does NOT call this: `tc_ingress_redirect.rs` shares only
+/// [`BpfCaptureConfig::ingress_redirect_armed`],
+/// [`BpfCaptureConfig::ingress_redirect_bypass`] and [`ipv4_is_fragment`], and
+/// open-codes the TCP / fragment / pod-opt-in / port-declared gates and their
+/// order. The tests over this function pin the intended table; they do not
+/// detect a divergence in the kernel's own gates. Every gate is a conjunction:
 ///
 /// `Steer` ⟺ armed ∧ TCP ∧ ¬fragmented ∧ ¬bypass ∧ pod opted in ∧ port declared.
 pub const fn ingress_redirect_action(
@@ -751,6 +754,12 @@ pub const NODE_WAYPOINT_INGRESS_REDIRECT_TABLE: u32 = 33134;
 /// UDP TPROXY rule it must sort BELOW the kernel `main` rule (priority 32766)
 /// or `main` resolves the marked packet first and the redirect black-holes.
 /// One above the UDP rule (`100`) so the two are independently deletable.
+///
+/// The host-netns UDP capture rule (`TPROXY_HOST_ROUTE_RULE_PRIORITY` in the
+/// gateway's `capture` module) shares this priority in the host netns. Both
+/// rules are added and deleted by priority AND table, never by priority alone,
+/// and their tables differ (`33134` here, `33135` there); the gateway crate
+/// asserts both facts at compile time.
 pub const NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY: u32 = 101;
 
 // The two NodeWaypoint marks must stay distinct from each other and from the

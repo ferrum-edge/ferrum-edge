@@ -3515,7 +3515,14 @@ fn parse_reqwest_method(method: &str) -> Result<reqwest::Method, ()> {
 ///
 /// Request-body plugins require buffering and transformation before forwarding,
 /// which the direct H2 path does not implement. Those requests must stay on the
-/// reqwest path so the final backend body matches the plugin output.
+/// reqwest path so the final backend body matches the plugin output; retry body
+/// replay forces reqwest the same way.
+///
+/// `get_sender()` may dial or probe the backend, so callers must use this
+/// predicate before opening an H2 sender. Body-size limits do not gate it: they
+/// are enforced in-path on the direct-H2 sender / response collectors (413 /
+/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`), including frame by
+/// frame when `Content-Length` is absent.
 pub(crate) fn can_use_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
@@ -3524,38 +3531,12 @@ pub(crate) fn can_use_direct_http2_pool(
     enable_http2 && !retain_request_body && !requires_request_body_buffering
 }
 
-/// Whether HTTPS requests may dispatch over the direct hyper HTTP/2 backend pool.
-///
-/// `get_sender()` may dial or probe the backend, so callers must use this
-/// predicate before opening an H2 sender. Body-size limits are enforced
-/// in-path on the direct-H2 sender / response collectors (413 /
-/// `RequestBodyTooLarge`, 502 / `ResponseBodyTooLarge`) — including
-/// frame-by-frame when `Content-Length` is absent — so nonzero
-/// `FERRUM_MAX_*_BODY_SIZE_BYTES` no longer disqualifies ordinary
-/// (non-SNI) routes from the multiplexed pool. The retained size-limit
-/// parameters keep call-site signatures stable; they do not gate
-/// dispatch. Retry body replay and request-body-buffering plugins still
-/// force the reqwest path via [`can_use_direct_http2_pool`].
-pub(crate) fn can_dispatch_direct_http2_pool(
-    enable_http2: bool,
-    retain_request_body: bool,
-    requires_request_body_buffering: bool,
-    _max_request_body_size_bytes: usize,
-    _max_response_body_size_bytes: usize,
-) -> bool {
-    can_use_direct_http2_pool(
-        enable_http2,
-        retain_request_body,
-        requires_request_body_buffering,
-    )
-}
-
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
 /// folding in the DestinationRule `connectionPool.http.h2UpgradePolicy`
 /// override on top of the capability-registry verdict.
 ///
 /// `can_dispatch` is the body-compat/`enable_http2` gate
-/// ([`can_dispatch_direct_http2_pool`]). `supports` is the registry's
+/// ([`can_use_direct_http2_pool`]). `supports` is the registry's
 /// `h2_tls == Supported`; `known_unsupported` is `h2_tls == Unsupported`
 /// (absence / `Unknown` is neither). `requires_sni` forces direct-H2 because
 /// reqwest cannot apply a per-request backend SNI.
@@ -8177,9 +8158,8 @@ pub struct ProxyState {
     ///
     /// The gateway SVID source watcher publishes to this sender when
     /// `FERRUM_GATEWAY_SVID_*` sources are configured and a validated reload
-    /// succeeds. In-memory producers can also wire in by cloning the
-    /// sender and handing the clone to `RotationConfig.revision_tx`
-    /// ([`crate::identity::rotation::RotationConfig::new`]) or
+    /// succeeds. The internal mesh CA rotation loop sends here directly, and
+    /// the SPIRE fetch loop is wired in through
     /// `SvidFetchHandle::with_revision_tx`. Until at least one producer is
     /// bound, the channel stays at generation 0 — pool keys carry `|svidg=0`
     /// and no rotation drain fires.
@@ -8188,7 +8168,6 @@ pub struct ProxyState {
     /// for the consumer: [`ProxyState::advance_backend_security_generation`]
     /// sends here AND stores into `backend_svid_generation` itself, because the
     /// publication fence lifts before the consumer task can be scheduled.
-    #[allow(dead_code)]
     pub backend_svid_rotation_tx: tokio::sync::watch::Sender<u64>,
     /// Current backend client SVID generation shared by backend pools.
     ///
@@ -8196,7 +8175,6 @@ pub struct ProxyState {
     /// by [`ProxyState::advance_backend_security_generation`]. Both use
     /// `fetch_max`, so the generation is monotonic under any interleaving of
     /// the two writers.
-    #[allow(dead_code)] // Observability/test surface; runtime pools hold their own Arc clone.
     pub backend_svid_generation: BackendSvidGeneration,
     /// Shared SOCK_OPS metrics state populated by the kernel ringbuf
     /// consumer. `Some(_)` only when the gateway runs the SOCK_OPS event
@@ -11437,17 +11415,17 @@ impl ProxyState {
             health_check_restart_rx.clone(),
         ));
 
-        // Parse stream proxy bind address
+        // `EnvConfig::validate` refuses an unparseable stream bind address at
+        // startup. Never fall back to another address here: that would bind
+        // stream listeners an operator meant to restrict on a wider interface.
         let stream_bind_addr: std::net::IpAddr = env_config_arc
             .stream_proxy_bind_address
             .parse()
-            .unwrap_or_else(|_| {
-                // Fall back to the proxy bind address, then to IPv4 unspecified
-                env_config_arc
-                    .proxy_bind_address
-                    .parse()
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-            });
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid FERRUM_STREAM_PROXY_BIND_ADDRESS: expected a valid IP address (e.g., 0.0.0.0 or ::)"
+                )
+            })?;
 
         let adaptive_buffer = Arc::new(crate::adaptive_buffer::AdaptiveBufferTracker::new(
             env_config_arc.adaptive_buffer_enabled,
@@ -11648,6 +11626,7 @@ impl ProxyState {
             Arc::clone(&request_epoch),
             Arc::clone(&mesh_inbound_tls_policy),
             Arc::clone(&mesh_inbound_admission),
+            pool_shard_amount,
         ));
 
         let state = Self {
@@ -11671,7 +11650,7 @@ impl ProxyState {
                 // Pre-populate common HTTP status codes so the hot path uses
                 // DashMap::get() (shared read lock) instead of entry() (write lock).
                 // After warmup, virtually all requests hit the fast read path.
-                let map = dashmap::DashMap::with_capacity(16);
+                let map = dashmap::DashMap::with_capacity_and_shard_amount(16, pool_shard_amount);
                 for code in [
                     200u16, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502,
                     503, 504,
@@ -16288,7 +16267,10 @@ pub fn try_acquire_per_ip_slot(
     try_acquire_per_ip_slot_with_prefix(counts, ip, max, 64)
 }
 
-fn try_acquire_per_ip_slot_with_prefix(
+/// Same as [`try_acquire_per_ip_slot`], but groups IPv6 sources by
+/// `ipv6_prefix` (the configured `FERRUM_PER_IP_IPV6_PREFIX`) instead of the
+/// fixed /64. Masking an already-masked key at the same prefix is a no-op.
+pub fn try_acquire_per_ip_slot_with_prefix(
     counts: Option<&Arc<dashmap::DashMap<String, AtomicU64>>>,
     ip: &str,
     max: u64,
@@ -16547,6 +16529,28 @@ fn build_websocket_error_fallback_response(status: StatusCode) -> Response<Proxy
     response
 }
 
+/// Listen-port label for a WebSocket session's disconnect metadata
+/// (`WsSessionMeta.listen_port`, emitted by `ws_logging` and other
+/// `on_ws_disconnect` consumers): the port the client actually connected to.
+///
+/// `ctx.frontend_listen_port` already carries the accepting listener's port on
+/// every frontend, including a dynamically bound Gateway API or mesh listener,
+/// so per-port dashboards attribute the session to the right listener
+/// (issue #7164). The process-global proxy port for the frontend's scheme is
+/// only the fallback when no listener port was recorded. H1/H2 and H3
+/// (`is_tls = true`) share this one helper.
+pub(crate) fn websocket_session_listen_port(
+    ctx: &RequestContext,
+    is_tls: bool,
+    env_config: &EnvConfig,
+) -> u16 {
+    ctx.frontend_listen_port.unwrap_or(if is_tls {
+        env_config.proxy_https_port
+    } else {
+        env_config.proxy_http_port
+    })
+}
+
 /// Handle WebSocket requests AFTER authentication and authorization plugins have run.
 ///
 /// Supports both HTTP/1.1 Upgrade (101 Switching Protocols) and HTTP/2 Extended CONNECT
@@ -16675,6 +16679,9 @@ async fn handle_websocket_request_authenticated(
     ) {
         Ok(url) => url,
         Err(_) => {
+            // Counted like every sibling reject of this handler (issue #7156).
+            ctx.terminal_record.mark_counted();
+            record_request(&state, 500);
             cb_probe.release_neutral();
             return Ok(build_websocket_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -16693,6 +16700,9 @@ async fn handle_websocket_request_authenticated(
         Some(on_upgrade) => on_upgrade,
         None => {
             error!("Failed to extract OnUpgrade extension from WebSocket request");
+            // Counted like every sibling reject of this handler (issue #7156).
+            ctx.terminal_record.mark_counted();
+            record_request(&state, 500);
             // The caller's CB check may have claimed a HALF_OPEN probe slot —
             // release it (gateway-side reject, not a backend outcome) so the
             // breaker can admit the next probe instead of wedging.
@@ -17276,7 +17286,7 @@ async fn handle_websocket_request_authenticated(
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 https_to_plaintext::maybe_warn_https_to_plaintext_backend(
                     &proxy,
-                    &current_backend_url,
+                    strip_query_params(&current_backend_url),
                     e.as_ref(),
                 );
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
@@ -17536,7 +17546,7 @@ async fn handle_websocket_request_authenticated(
                 // than the misleading hardcoded `connect_failure`.
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %current_backend_url,
+                    backend_url = %strip_query_params(&current_backend_url),
                     error_kind = retry::error_class_log_kind(ws_error_class),
                     error_class = %ws_error_class,
                     error = %e,
@@ -18047,16 +18057,7 @@ async fn handle_websocket_request_authenticated(
     // on_ws_disconnect. Building this here (vs. inside run_websocket_proxy) is
     // effectively free when ws_disconnect_plugins is empty because the strings
     // are moved, not cloned, into an owned struct.
-    // WebSocket upgrades arrive on either the plaintext HTTP proxy listener or
-    // the TLS HTTPS/H2 listener. Choose the matching port so disconnect
-    // metadata, logging plugins, and downstream alerts key on the port the
-    // client actually connected to instead of always reporting the plaintext
-    // port (which is misleading — or `0` — on TLS-only deployments).
-    let listen_port = if is_tls {
-        state.env_config.proxy_https_port
-    } else {
-        state.env_config.proxy_http_port
-    };
+    let listen_port = websocket_session_listen_port(ctx, is_tls, &state.env_config);
     let session_meta = WsSessionMeta {
         namespace: proxy.namespace.clone(),
         proxy_name: proxy.name.clone(),
@@ -18280,7 +18281,8 @@ async fn handle_websocket_request_authenticated(
 
     info!(
         "WebSocket upgrade response sent for authenticated connection: {} -> {}",
-        proxy.id, current_backend_url
+        proxy.id,
+        strip_query_params(&current_backend_url)
     );
 
     Ok(upgrade_response)
@@ -19668,7 +19670,10 @@ pub(crate) async fn connect_websocket_backend(
         }
     };
 
-    debug!("Connected to backend WebSocket server: {}", backend_url);
+    debug!(
+        "Connected to backend WebSocket server: {}",
+        strip_query_params(backend_url)
+    );
     debug!("Backend response status: {}", backend_response.status());
 
     let negotiated_subprotocol = backend_response
@@ -25446,7 +25451,7 @@ async fn handle_tls_connection(
         tls_connection_metadata.record_mesh_mtls_metric,
     )
     .await?;
-    info!("TLS connection established from {}", remote_addr.ip());
+    debug!("TLS connection established from {}", remote_addr.ip());
 
     // Extract peer certificate and chain before wrapping the stream.
     // This is the only point where the ServerConnection is accessible — once
@@ -34771,13 +34776,21 @@ pub async fn run_authentication_phase_with_envelope(
                     Err(()) => {
                         ctx.mark_gateway_deadline_response_selected();
                         let reject = crate::plugins::grpc_deadline_exceeded_plugin_result();
-                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
+                            // The phase removes the staged cookies on every
+                            // exit (issue #7162).
+                            ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
                             return Some((
                                 500,
                                 Bytes::from_static(br#"{"error":"Internal error"}"#),
                                 HashMap::new(),
                             ));
                         };
+                        // The deadline reject is this phase's final rejection,
+                        // exactly as single-mode's deadline reject is: it
+                        // carries (and consumes) cookies an earlier mechanism
+                        // staged (issue #7162).
+                        attach_auth_rejection_set_cookie(ctx, &mut reject.headers);
                         return Some((reject.status_code, reject.body, reject.headers));
                     }
                 };
@@ -37133,6 +37146,12 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        // gRPC-Web carries the status in a body trailer frame, never as
+        // response header fields (issue #7155), exactly like the
+        // `allowed_methods` refusal below.
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, StatusCode::FORBIDDEN.as_u16());
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
@@ -37144,6 +37163,9 @@ async fn handle_proxy_request_inner(
             0,
         )
         .await;
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
         return Ok(build_response_from_normalized_reject(reject));
     }
 
@@ -38870,13 +38892,17 @@ async fn handle_proxy_request_inner(
         ) {
             Ok(value) => value,
             Err(_) => {
-                return Ok(build_pre_plugin_reject_response(
+                // Counted like every other H1/H2 terminal (issue #7156).
+                let response = build_pre_plugin_reject_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Invalid backend path coordinates",
+                    br#"{"error":"Invalid backend path coordinates"}"#,
                     &HashMap::new(),
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
-                ));
+                );
+                ctx.terminal_record.mark_counted();
+                record_request(&state, response.status().as_u16());
+                return Ok(response);
             }
         };
         if let Some(response) = run_backend_path_plugins_or_build_reject(
@@ -39414,19 +39440,8 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                if let Some(mut body_hook_ctx) = body_hook_ctx {
-                    // Typed gateway terminals selected by the representation gate
-                    // inside the hook stage. Adopted BEFORE the metadata move so the
-                    // finalizer on the real context knows it is publishing a
-                    // gateway-authored error payload rather than an application one.
-                    ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-                    ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-                    let request_body = ctx.metadata.remove("request_body");
-                    ctx.metadata = body_hook_ctx.metadata;
-                    if let Some(body) = request_body {
-                        ctx.metadata.insert("request_body".to_string(), body);
-                    }
-                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    ctx.adopt_final_request_body_hook_context(body_hook_ctx);
                 }
                 // Irreversible outbound egress runs here and nowhere earlier:
                 // `transformed` is the backend-visible body and every final
@@ -39651,7 +39666,9 @@ async fn handle_proxy_request_inner(
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
-                let mut reject = finalize_reject_response_with_after_proxy_hooks(
+                // A gRPC-Web reject runs the committed observers once, while
+                // translating to the body-trailer representation (issue #7155).
+                let mut reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -39660,6 +39677,7 @@ async fn handle_proxy_request_inner(
                     ),
                     circuit_breaker_open_reject_headers(),
                     is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
                 )
                 .await;
                 restore_authoritative_gateway_error_header(
@@ -39667,6 +39685,13 @@ async fn handle_proxy_request_inner(
                     X_GATEWAY_ERROR_CIRCUIT_BREAKER_OPEN,
                 );
                 apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = boxed_build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
                 // Use `original_request_path` so the log records the path the
                 // client actually requested, not the VirtualService-rewritten
                 // backend path stored in `ctx.path` after the rewrite above.
@@ -39682,6 +39707,9 @@ async fn handle_proxy_request_inner(
                 .await;
                 ctx.terminal_record.mark_counted();
                 record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
                 return Ok(build_response_from_normalized_reject(reject));
             }
         };
@@ -39936,23 +39964,8 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
-                if let Some(mut body_hook_ctx) = body_hook_ctx {
-                    if body_hook_ctx.gateway_deadline_response_selected() {
-                        ctx.mark_gateway_deadline_response_selected();
-                    }
-                    // Typed gateway terminals selected by the representation gate
-                    // inside the hook stage. Adopted BEFORE the metadata move so the
-                    // finalizer on the real context knows it is publishing a
-                    // gateway-authored error payload rather than an application one.
-                    ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-                    ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-                    let request_body = ctx.metadata.remove("request_body");
-                    ctx.metadata = body_hook_ctx.metadata;
-                    ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
-                    if let Some(body) = request_body {
-                        ctx.metadata.insert("request_body".to_string(), body);
-                    }
-                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    ctx.adopt_final_request_body_hook_context(body_hook_ctx);
                 }
                 // Finalized-request-egress boundary (GHSA-4vr5-4wm3-x5xv): the
                 // backend-visible body has been transformed and accepted by every
@@ -40485,13 +40498,17 @@ async fn handle_proxy_request_inner(
         ) {
             Ok(value) => value,
             Err(_) => {
-                return Ok(build_pre_plugin_reject_response(
+                // Counted like every other H1/H2 terminal (issue #7156).
+                let response = build_pre_plugin_reject_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Invalid backend path coordinates",
+                    br#"{"error":"Invalid backend path coordinates"}"#,
                     &HashMap::new(),
                     request_uses_grpc_content_type,
                     grpc_web_response_content_type,
-                ));
+                );
+                ctx.terminal_record.mark_counted();
+                record_request(&state, response.status().as_u16());
+                return Ok(response);
             }
         };
         let backend_start = Instant::now();
@@ -40831,26 +40848,8 @@ async fn handle_proxy_request_inner(
                 &grpc_req_body,
             )
             .await;
-            if let Some(mut body_hook_ctx) = body_hook_ctx {
-                if body_hook_ctx.gateway_deadline_response_selected() {
-                    ctx.mark_gateway_deadline_response_selected();
-                }
-                // `clone_for_final_request_body_hooks` omits `request_body`; carry
-                // the original across the metadata swap (no on_final hook touches
-                // it). Disjoint field assignments avoid a whole-`ctx` borrow.
-                // Typed gateway terminals selected by the representation gate
-                // inside the hook stage. Adopted BEFORE the metadata move so the
-                // finalizer on the real context knows it is publishing a
-                // gateway-authored error payload rather than an application one.
-                ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-                ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-                let request_body = ctx.metadata.remove("request_body");
-                ctx.metadata = body_hook_ctx.metadata;
-                ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
-                if let Some(body) = request_body {
-                    ctx.metadata.insert("request_body".to_string(), body);
-                }
-                ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+            if let Some(body_hook_ctx) = body_hook_ctx {
+                ctx.adopt_final_request_body_hook_context(body_hook_ctx);
             }
             // Finalized-request-egress boundary for native gRPC
             // (GHSA-4vr5-4wm3-x5xv). `grpc_req_body` is the transformed,
@@ -44313,13 +44312,17 @@ async fn handle_proxy_request_inner(
         Ok(value) => value,
         Err(_) => {
             cb_probe.release_neutral();
-            return Ok(build_pre_plugin_reject_response(
+            // Counted like every other H1/H2 terminal (issue #7156).
+            let response = build_pre_plugin_reject_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                b"Invalid backend path coordinates",
+                br#"{"error":"Invalid backend path coordinates"}"#,
                 &HashMap::new(),
                 request_uses_grpc_content_type,
                 grpc_web_response_content_type,
-            ));
+            );
+            ctx.terminal_record.mark_counted();
+            record_request(&state, response.status().as_u16());
+            return Ok(response);
         }
     };
     let backend_start = Instant::now();
@@ -44617,6 +44620,7 @@ async fn handle_proxy_request_inner(
     let mut last_attempt_recorded = false;
     // `mut`: the pre-commitment authorization terminal below neutralizes the
     // health inputs of a dispatch the gateway itself cancelled (#3815).
+    let mut final_backend_url: Option<String> = None;
     let (mut backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
@@ -44697,26 +44701,8 @@ async fn handle_proxy_request_inner(
                 &mut route_request_timeout_phase,
             ),
         };
-        if let Some(mut body_hook_ctx) = body_hook_ctx.take() {
-            if body_hook_ctx.gateway_deadline_response_selected() {
-                ctx.mark_gateway_deadline_response_selected();
-            }
-            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
-            // original across the metadata swap (no on_final hook touches it).
-            // Disjoint field assignments avoid a whole-`ctx` borrow.
-            // Typed gateway terminals selected by the representation gate
-            // inside the hook stage. Adopted BEFORE the metadata move so the
-            // finalizer on the real context knows it is publishing a
-            // gateway-authored error payload rather than an application one.
-            ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-            ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-            let request_body = ctx.metadata.remove("request_body");
-            ctx.metadata = body_hook_ctx.metadata;
-            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
-            if let Some(body) = request_body {
-                ctx.metadata.insert("request_body".to_string(), body);
-            }
-            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+        if let Some(body_hook_ctx) = body_hook_ctx.take() {
+            ctx.adopt_final_request_body_hook_context(body_hook_ctx);
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -45082,6 +45068,7 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 final_upstream_target = current_target.clone();
+                final_backend_url = Some(current_url.clone());
                 sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
@@ -45154,6 +45141,7 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 final_upstream_target = current_target.clone();
+                final_backend_url = Some(current_url.clone());
                 sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 // No backend attempt was made for the rotated target. Keep the
@@ -45206,6 +45194,7 @@ async fn handle_proxy_request_inner(
                     }
                 };
                 final_upstream_target = current_target.clone();
+                final_backend_url = Some(current_url.clone());
                 sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
@@ -45228,6 +45217,7 @@ async fn handle_proxy_request_inner(
                     retry::ErrorClass::DispatchPolicyRejected,
                 );
                 final_upstream_target = current_target.clone();
+                final_backend_url = Some(current_url.clone());
                 sticky_dispatch_refused = true;
                 backend_admission_started_at = Instant::now();
                 skip_final_cb_record = true;
@@ -45398,7 +45388,7 @@ async fn handle_proxy_request_inner(
                             &method,
                             &retry_attempt_header_map,
                             current_target.as_deref(),
-                            retained_body.as_deref(),
+                            retained_body.as_ref(),
                             should_stream,
                             &plugins,
                             &ctx,
@@ -45423,7 +45413,7 @@ async fn handle_proxy_request_inner(
                             &method,
                             retry_attempt_headers,
                             current_target.as_deref(),
-                            retained_body.as_deref(),
+                            retained_body.as_ref(),
                             should_stream,
                             &plugins,
                             &ctx,
@@ -45489,6 +45479,7 @@ async fn handle_proxy_request_inner(
                 );
             }
             final_upstream_target = current_target.clone();
+            final_backend_url = Some(current_url.clone());
         }
         (result, current_cb_target_key, final_upstream_target)
     } else {
@@ -45559,26 +45550,8 @@ async fn handle_proxy_request_inner(
                 &mut route_request_timeout_phase,
             ),
         };
-        if let Some(mut body_hook_ctx) = body_hook_ctx {
-            if body_hook_ctx.gateway_deadline_response_selected() {
-                ctx.mark_gateway_deadline_response_selected();
-            }
-            // `clone_for_final_request_body_hooks` omits `request_body`; carry the
-            // original across the metadata swap (no on_final hook touches it).
-            // Disjoint field assignments avoid a whole-`ctx` borrow.
-            // Typed gateway terminals selected by the representation gate
-            // inside the hook stage. Adopted BEFORE the metadata move so the
-            // finalizer on the real context knows it is publishing a
-            // gateway-authored error payload rather than an application one.
-            ctx.adopt_final_request_body_hook_terminals(&body_hook_ctx);
-            ctx.adopt_final_request_body_hook_plugin_state(&mut body_hook_ctx);
-            let request_body = ctx.metadata.remove("request_body");
-            ctx.metadata = body_hook_ctx.metadata;
-            ctx.ai_usage_export = body_hook_ctx.ai_usage_export;
-            if let Some(body) = request_body {
-                ctx.metadata.insert("request_body".to_string(), body);
-            }
-            ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+        if let Some(body_hook_ctx) = body_hook_ctx {
+            ctx.adopt_final_request_body_hook_context(body_hook_ctx);
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {
@@ -45629,6 +45602,13 @@ async fn handle_proxy_request_inner(
         };
         (resp, cb_target_key.clone(), upstream_target.clone())
     };
+    // The URL of the target `final_upstream_target` names (the one that served
+    // this response, or a refused rotated candidate), set wherever the retry
+    // loop sets that target; `None` means the initial `backend_url` (issue
+    // #7159). The summary's `backend_target` and the streaming latency labels
+    // read it, so a rotated retry is attributed to the backend that answered,
+    // not the one that failed.
+    let final_backend_url: &str = final_backend_url.as_deref().unwrap_or(&backend_url);
     if let Some(phase) = route_request_timeout_phase {
         ctx.mark_route_request_timeout_exceeded(phase);
         // No backend answered within the rule deadline, so the response below
@@ -46890,7 +46870,7 @@ async fn handle_proxy_request_inner(
                 request_path: original_request_path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),
-                backend_target: Some(strip_query_params(&backend_url).to_string()),
+                backend_target: Some(strip_query_params(final_backend_url).to_string()),
                 backend_resolved_ip,
                 response_status_code: response_status,
                 latency_total_ms: total_ms,
@@ -47494,7 +47474,7 @@ async fn handle_proxy_request_inner(
                         base,
                         backend_start,
                         &proxy,
-                        &backend_url,
+                        final_backend_url,
                         proxy.backend_read_timeout_ms,
                     )
                 } else {
@@ -47722,7 +47702,7 @@ async fn handle_proxy_request_inner(
                         body,
                         backend_start,
                         &proxy,
-                        &backend_url,
+                        final_backend_url,
                         h2_read_timeout_ms,
                     )
                 } else {
@@ -48859,7 +48839,7 @@ pub(crate) async fn proxy_to_backend_retry(
     method: &str,
     headers: RequestHeaders<'_>,
     upstream_target: Option<&UpstreamTarget>,
-    request_body: Option<&[u8]>,
+    request_body: Option<&Bytes>,
     stream_response: bool,
     plugins: &[Arc<dyn Plugin>],
     request_ctx: &RequestContext,
@@ -49228,7 +49208,10 @@ pub(crate) async fn proxy_to_backend_retry(
     if let Some(body) = request_body
         && !body.is_empty()
     {
-        let body_bytes = Bytes::copy_from_slice(body);
+        // The caller's retained body is a charged `Bytes` owner
+        // (`response_buffer_budget`, issue #4231): replay shares it rather
+        // than copying it into an uncharged buffer (issue #7160).
+        let body_bytes = body.clone();
         let (upload_body, pump) = install_buffered_upload_write_watermark(
             body_bytes.clone(),
             proxy.backend_write_timeout_ms,
@@ -52201,12 +52184,10 @@ async fn proxy_to_backend(
         // response collectors (413 / 502), including for ordinary
         // (non-SNI) routes — same semantics as the SNI arm and the
         // reqwest path's ErrorClass / connection_error contracts.
-        let direct_h2_can_dispatch = can_dispatch_direct_http2_pool(
+        let direct_h2_can_dispatch = can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-            effective_max_request_body_size_bytes,
-            effective_max_response_body_size_bytes,
         );
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
         // (projected onto the effective proxy) into the registry verdict. Scope
@@ -53911,11 +53892,11 @@ async fn proxy_to_backend(
                 // No size limit — stream directly. Buffer small bodies eagerly
                 // when Content-Length is known and below the cutoff (cheaper than
                 // async coalescing). Skip buffering for SSE (unbounded streams).
-                let content_length = response
-                    .headers()
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<usize>().ok());
+                // Same canonical parse as the sibling arms: a standards-valid
+                // repeated identical declaration is a known length, an ambiguous
+                // one is not (`GHSA-xrfj-852f-645j`).
+                let content_length = canonical_header_content_length(response.headers())
+                    .and_then(|len| usize::try_from(len).ok());
                 let cutoff = state.response_buffer_cutoff_bytes;
                 if cutoff > 0
                     && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)
@@ -65585,12 +65566,13 @@ async fn proxy_to_backend_http2(
         )
     };
     let map_h2_err = {
-        let resolved_ip = resolved_ip.clone();
         // Borrowed, not cloned: the closure is consumed inside this function,
-        // so a per-request String allocation on the direct-H2 dispatch path
-        // would be pure hot-path waste.
+        // so a per-request String allocation (or `Arc` clone) on the direct-H2
+        // dispatch path would be pure hot-path waste. Only the error arms,
+        // which build an owned response, clone the resolved IP (issue #7166).
+        let resolved_ip = &resolved_ip;
         let proxy_id = proxy.id.as_str();
-        let body_size_exceeded = Arc::clone(&body_size_exceeded);
+        let body_size_exceeded = &body_size_exceeded;
         let passthrough_write_timeout = passthrough_write_timeout.as_ref();
         let write_timeout_ms = proxy.backend_write_timeout_ms;
         move |e: hyper::Error| {
@@ -65606,7 +65588,7 @@ async fn proxy_to_backend_http2(
                         ),
                         headers: HashMap::new(),
                         connection_error: false,
-                        backend_resolved_ip: resolved_ip,
+                        backend_resolved_ip: resolved_ip.clone(),
                         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                         request_on_wire: true,
                         buffered_trailers: None,
@@ -65626,7 +65608,7 @@ async fn proxy_to_backend_http2(
                 return (
                     http_backend_dispatch_error_response(
                         retry::ErrorClass::ReadWriteTimeout,
-                        resolved_ip,
+                        resolved_ip.clone(),
                     ),
                     None,
                 );
@@ -65635,7 +65617,7 @@ async fn proxy_to_backend_http2(
             // connection_error tracks request_reached_wire instead of being
             // hardcoded true with a post-wire ProtocolError class.
             (
-                direct_h2_send_request_error_response(proxy_id, e, resolved_ip),
+                direct_h2_send_request_error_response(proxy_id, e, resolved_ip.clone()),
                 None,
             )
         }
@@ -67753,14 +67735,14 @@ fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::Backe
 /// `Request<Incoming>` body (already consumed) can be replayed. Mirrors the
 /// pattern used by `proxy_to_backend_retry` for HTTP/1.1.
 #[allow(clippy::too_many_arguments)]
-async fn proxy_to_backend_http3_retry(
+pub(crate) async fn proxy_to_backend_http3_retry(
     state: &ProxyState,
     proxy: &Proxy,
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
     upstream_target: Option<&UpstreamTarget>,
-    request_body: Option<&[u8]>,
+    request_body: Option<&Bytes>,
     stream_response: bool,
     plugins: &[Arc<dyn Plugin>],
     request_ctx: &RequestContext,
@@ -67800,11 +67782,17 @@ async fn proxy_to_backend_http3_retry(
     // Re-screen the (possibly LB-rotated) retry target: the native H3 pool
     // self-resolves via the shared DNS cache (canonical `IpAddr` fast
     // path; non-canonical → real DNS + resolved-address screen), so use the
-    // canonical screen, mirroring the first-attempt H3 screen — the
-    // URL-canonicalizing one would wrongly reject a legitimate all-numeric
-    // hostname reached via rotation.
-    if denied_literal_backend_ip_canonical(effective_host, &state.env_config.backend_allow_ips)
-        .is_some()
+    // canonical screen — the URL-canonicalizing one would wrongly reject a
+    // legitimate all-numeric hostname reached via rotation. Like the
+    // first-attempt H3 screen, it also covers the effective `dns_override`,
+    // so a denied override is refused here, before any pool call, rather than
+    // by the DNS layer's later error string (issue #7160).
+    if denied_literal_backend_or_dns_override_canonical(
+        effective_host,
+        proxy,
+        &state.env_config.backend_allow_ips,
+    )
+    .is_some()
     {
         return backend_egress_denied_response(effective_host);
     }
@@ -67820,6 +67808,11 @@ async fn proxy_to_backend_http3_retry(
         .ok()
         .map(|ip| ip.to_string());
 
+    // The replay body is the caller's retained, charged `Bytes`: share it
+    // rather than copying it into an uncharged buffer, and declare its length
+    // exactly as the first attempt declares the buffered length (issue #7160).
+    let body_bytes = request_body.cloned().unwrap_or_default();
+    let request_content_length = (!body_bytes.is_empty()).then(|| body_bytes.len().to_string());
     let http3_headers = build_http3_backend_headers(
         state,
         proxy,
@@ -67831,11 +67824,9 @@ async fn proxy_to_backend_http3_retry(
             effective_port,
             request_is_secure,
             inbound_version,
-            content_length: None,
+            content_length: request_content_length.as_deref(),
         },
     );
-
-    let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
     let may_release_after_headers =
         !stream_response && plugins_may_release_response_body_under_retries(plugins, request_ctx);
     let retry_ctx = may_release_after_headers.then(|| retry_response_decision_context(request_ctx));
@@ -68248,10 +68239,8 @@ mod tests {
             trip_on_connection_errors: true,
         });
         cb.record_failure(500, false, false);
-        assert!(
-            cb.can_execute().unwrap(),
-            "the request claims the probe slot"
-        );
+        let (ticket, _) = cb.admit().expect("the request claims the probe slot");
+        assert!(ticket.is_probe(), "the request claims the probe slot");
         assert_eq!(cb.half_open_in_flight(), 1);
 
         let stalled_upload = std::future::pending::<Result<(), ()>>();
@@ -68261,7 +68250,20 @@ mod tests {
             "a never-ending buffered upload must hit the configured deadline"
         );
 
-        cb.record_neutral(true);
+        // Settle through the production path: the upload-timeout arms return
+        // `request_body_timeout_backend_response`, and the outcome recorder
+        // classifies it with `apply_circuit_breaker_outcome`. A 408 is not in
+        // `failure_status_codes`, so a non-neutral class would record a
+        // success here and close the breaker.
+        let response = super::request_body_timeout_backend_response(None);
+        assert_eq!(response.status_code, 408);
+        super::backend_dispatch::apply_circuit_breaker_outcome(
+            &cb,
+            response.status_code,
+            response.connection_error,
+            response.error_class,
+            ticket,
+        );
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(
             cb.state_name(),
@@ -71613,16 +71615,13 @@ mod tests {
             .ai_semantic_cache_embeddings
             .insert(SEMANTIC_INSTANCE, staged_embedding.clone());
 
-        // Mirror the handler's writeback: take the hook context's metadata + WAF
+        // The handler's writeback: take the hook context's metadata + WAF
         // state, carrying the omitted request_body across the swap.
-        ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
-        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
-        let request_body = ctx.metadata.remove("request_body");
-        ctx.metadata = hook_ctx.metadata;
-        if let Some(body) = request_body {
-            ctx.metadata.insert("request_body".to_string(), body);
-        }
-        ctx.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
+        ctx.adopt_final_request_body_hook_context(hook_ctx);
+        assert!(
+            ctx.waf_metadata_initialized,
+            "the hook context's WAF initialization must reach the live context"
+        );
 
         // The hook's metadata write propagated back to the live context.
         assert_eq!(
@@ -75893,14 +75892,31 @@ mod tests {
     /// fingerprint only asserts the hard-to-drive HBONE-vs-gate source order.
     #[test]
     fn registry_only_route_miss_gate_precedes_generic_not_found() {
-        let src = include_str!("mod.rs");
+        // Production source only: this test's own needles live in the test
+        // module and would otherwise satisfy every lookup below.
+        let full_src = include_str!("mod.rs");
+        let test_module_start = full_src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("proxy test module marker not found");
+        let src = &full_src[..test_module_start];
+        let gate_needle = "enforcement.http_route_miss_reject_status";
+        let not_found_needle = "No route matched for request path";
+        assert_eq!(
+            src.matches(gate_needle).count(),
+            1,
+            "exactly one REGISTRY_ONLY route-miss gate call is expected"
+        );
+        assert_eq!(
+            src.matches(not_found_needle).count(),
+            1,
+            "exactly one generic route-miss log is expected"
+        );
         let gate_pos = src
-            .find("enforcement.http_route_miss_reject_status")
+            .find(gate_needle)
             .expect("REGISTRY_ONLY route-miss gate helper call not found");
-        let not_found_pos = gate_pos
-            + src[gate_pos..]
-                .find("No route matched for request path")
-                .expect("generic route-miss log after the REGISTRY_ONLY gate not found");
+        let not_found_pos = src
+            .find(not_found_needle)
+            .expect("generic route-miss log not found");
         assert!(
             gate_pos < not_found_pos,
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
@@ -81152,14 +81168,26 @@ mod tests {
         // Source-level seam: every backend retry family that can rotate targets
         // must call the shared allocation-free helper with the original route
         // ceiling rather than a permanently lowered initial-port projection.
+        //
+        // Scan only the production part of this file: the test module repeats
+        // every needle below, so a whole-file scan keeps passing after the
+        // production calls are deleted.
         let helper = "retry_attempt_allowed_for_target";
-        let proxy_src = include_str!("mod.rs");
-        assert!(
-            proxy_src.matches(helper).count() >= 4,
-            "H1/H2 WebSocket, gRPC, and HTTP retry loops must call {helper}"
+        let full_src = include_str!("mod.rs");
+        let test_module_start = full_src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("proxy test module marker not found");
+        let proxy_src = &full_src[..test_module_start];
+        let helper_call = format!("{helper}(");
+        let helper_definition = format!("fn {helper}(");
+        assert_eq!(
+            proxy_src.matches(&helper_call).count() - proxy_src.matches(&helper_definition).count(),
+            4,
+            "H1/H2 WebSocket, gRPC, and HTTP retry loops and current_retry_attempt_allowed must \
+             call {helper}; update this guard when adding or removing a rotating retry loop"
         );
         assert!(
-            proxy_src.contains("route_retry_ceiling"),
+            proxy_src.contains("route_retry_ceiling(&proxy)"),
             "H1/H2 path must retain the original route retry ceiling"
         );
         assert!(

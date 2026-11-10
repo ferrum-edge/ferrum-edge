@@ -4374,6 +4374,17 @@ async fn restore_rejects_disabled_plugin_config_with_unknown_name_before_delete(
         status, 400,
         "batch must refuse the unknown disabled plugin: {body:?}"
     );
+    // Issue #7216: the unknown name is reported once, not a second time by
+    // the definition check as an "invalid config".
+    let errors = body["validation_errors"].to_string();
+    assert!(
+        errors.contains("unknown plugin name 'does_not_exist'"),
+        "{body:?}"
+    );
+    assert!(
+        !errors.contains("invalid config: Unknown plugin name"),
+        "unknown plugin name reported twice: {body:?}"
+    );
 
     // A disabled config-graph participant keeps its policy screening on both
     // paths: the definition is admitted or refused identically.
@@ -9607,6 +9618,77 @@ async fn batch_rejects_stream_port_conflict_with_persisted_proxy() {
         reqwest::StatusCode::NOT_FOUND,
         "rejected stream proxy must not be persisted"
     );
+}
+
+/// Issue #7214: `POST /batch` refuses a stream listener on a reserved gateway
+/// port, as `POST /proxies` does, instead of persisting it for the listener
+/// reconcile to fail on.
+#[tokio::test]
+async fn batch_rejects_stream_proxy_on_reserved_gateway_port() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    state.reserved_ports = std::collections::HashSet::from([9000u16]);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let stream_proxy = json!({
+        "id": "batch-reserved-port",
+        "backend_scheme": "tcp",
+        "backend_host": "reserved.internal",
+        "backend_port": 5432,
+        "listen_port": 9000
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &stream_proxy).await;
+    assert_eq!(status, 409, "single write must refuse it: {body:?}");
+
+    let batch = json!({"proxies": [stream_proxy]});
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 400, "batch persisted a reserved port: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .to_string()
+            .contains("listen_port 9000 conflicts with a gateway reserved port"),
+        "expected the reserved-port diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-reserved-port", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+/// Issue #7214: `POST /batch` runs the same OS bind probe as `POST /proxies`
+/// for a new stream port, so a port another process already holds is refused.
+#[tokio::test]
+async fn batch_rejects_stream_proxy_on_unbindable_port() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    // Held for the whole test so the probe on the same interface fails.
+    let held = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let occupied_port = held.local_addr().unwrap().port();
+    state.stream_proxy_bind_address = "127.0.0.1".to_string();
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let batch = json!({
+        "proxies": [{
+            "id": "batch-occupied-port",
+            "backend_scheme": "tcp",
+            "backend_host": "occupied.internal",
+            "backend_port": 5432,
+            "listen_port": occupied_port
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 400, "batch persisted an unbindable port: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .to_string()
+            .contains("is not available on the host"),
+        "expected the bind-probe diagnostic: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/batch-occupied-port", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    drop(held);
 }
 
 /// A batch that joins an existing, valid shared-SNI listener group must be

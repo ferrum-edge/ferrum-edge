@@ -2142,7 +2142,7 @@ fn every_post_admission_buffered_upload_collect_carries_the_authorization_plan()
     assert_buffered_upload_region_stays_bounded(
         "http3",
         "\nasync fn proxy_to_backend_http3(",
-        "\nasync fn proxy_to_backend_http3_retry(",
+        "\npub(crate) async fn proxy_to_backend_http3_retry(",
     );
 }
 
@@ -6091,6 +6091,49 @@ fn balanced_block_after<'a>(haystack: &'a str, marker: &str) -> Option<&'a str> 
         }
     }
     None
+}
+
+/// GHSA-3c72-7f45-wvr2: every gateway-authored `401` (authorization expiry)
+/// and `413` (oversized streamed upload) the H3 plain bridge records against
+/// backend health carries a client-side error class. With `None`, a status
+/// outside `failure_status_codes` is a breaker SUCCESS, so a client could close
+/// a HALF_OPEN breaker (and add least-latency samples) against a backend that
+/// never answered. `client_side_no_backend_signal` settles these neutrally.
+#[test]
+fn cross_protocol_plain_gateway_terminals_record_backend_health_neutrally() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = cross
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+
+    let mut checked = 0;
+    for call in dispatch
+        .split("record_backend_outcome_no_conn_end(")
+        .skip(1)
+    {
+        let args = call.split(");").next().unwrap_or_default();
+        let lines: Vec<&str> = args.lines().map(str::trim).collect();
+        let expected = if lines.contains(&"401,") {
+            "Some(ErrorClass::ClientDisconnect),"
+        } else if lines.contains(&"413,") {
+            "Some(ErrorClass::RequestBodyTooLarge),"
+        } else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            lines.contains(&expected) && !lines.contains(&"None,"),
+            "a gateway-authored terminal must record {expected} for backend health: {args}"
+        );
+    }
+    assert!(
+        checked >= 5,
+        "expected the four authorization-expiry 401 sites and the upload 413 site, found {checked}"
+    );
 }
 
 /// Cross-protocol plain pre-commitment authorization expiry writes the fixed

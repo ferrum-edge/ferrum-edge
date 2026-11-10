@@ -3433,10 +3433,15 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     // A current Ferrum CP cannot reach this branch with an
                     // ENFORCING genuinely-ambiguous slice: it sets
                     // `labels_ambiguous` on divergent shared-SPIFFE candidates
-                    // (slice.rs), and the candidate-any projection only keeps a
-                    // selector policy that matches SOME candidate — a single
-                    // label-less candidate `{}` never matches a non-empty selector,
-                    // so the policy is dropped at slice build and never rides in.
+                    // (slice.rs), and on a Sidecar or gateway slice the
+                    // candidate-any projection only keeps a selector policy that
+                    // matches SOME candidate — a single label-less candidate `{}`
+                    // never matches a non-empty selector, so the policy is
+                    // dropped at slice build and never rides in. (Ambient,
+                    // ServiceWaypoint and NodeWaypoint slices also carry the
+                    // policies of other visible workloads for their UDP and
+                    // per-destination authorization; see
+                    // `MeshSlice::from_gateway_config`.)
                     // The only way an unmarked empty-label slice carries an
                     // unsatisfiable enforcing selector policy is a cross-version
                     // slice from a CP predating the marker (serde defaults
@@ -3945,7 +3950,10 @@ impl Plugin for MeshAuthz {
                         "destination_scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    if self.per_pod_policy_scoping && !asserted_identity_rejected {
+                    if self.per_pod_policy_scoping
+                        && !asserted_identity_rejected
+                        && !live_admission_reevaluation
+                    {
                         crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                             crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
                         );
@@ -4068,7 +4076,7 @@ impl Plugin for MeshAuthz {
                         "scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    if !asserted_identity_rejected {
+                    if !asserted_identity_rejected && !live_admission_reevaluation {
                         crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                             crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::ScopeMissing,
                         );
@@ -4096,7 +4104,7 @@ impl Plugin for MeshAuthz {
                         "destination_scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    if !asserted_identity_rejected {
+                    if !asserted_identity_rejected && !live_admission_reevaluation {
                         crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                             crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
                         );

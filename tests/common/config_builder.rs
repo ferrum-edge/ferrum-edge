@@ -304,22 +304,6 @@ impl UpstreamBuilder {
         self
     }
 
-    pub fn target_with_path(
-        mut self,
-        host: impl Into<String>,
-        port: u16,
-        weight: u32,
-        path: impl Into<String>,
-    ) -> Self {
-        self.targets.push(json!({
-            "host": host.into(),
-            "port": port,
-            "weight": weight,
-            "path": path.into(),
-        }));
-        self
-    }
-
     pub fn field(mut self, key: impl Into<String>, value: Value) -> Self {
         self.inner.insert(key.into(), value);
         self

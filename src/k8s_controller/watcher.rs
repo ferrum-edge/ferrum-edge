@@ -1579,6 +1579,12 @@ pub(crate) async fn start_crd_watchers(
     // serving every optional CRD version Ferrum knows about.
     let mut checked_groups = HashSet::new();
     let mut installed_groups: HashMap<&'static str, discovery::ApiGroup> = HashMap::new();
+    // Group discovery runs at startup and again on every reprobe pass. Only the
+    // startup pass reports group presence at info/warn: repeating it on each
+    // reprobe would warn forever about every optional group a cluster does not
+    // install. A group that appears later is reported by the reprobe loop's
+    // "started additional watchers" event.
+    let reprobe = task_label == REPROBE_WATCHER_LABEL;
 
     for crd in &crd_specs {
         if !checked_groups.insert(crd.group) {
@@ -1587,14 +1593,26 @@ pub(crate) async fn start_crd_watchers(
         match discovery::oneshot::group(&client, crd.group).await {
             Ok(api_group) => {
                 installed_groups.insert(crd.group, api_group);
-                info!(group = crd.group, "CRD group detected");
+                if reprobe {
+                    debug!(group = crd.group, "CRD group detected");
+                } else {
+                    info!(group = crd.group, "CRD group detected");
+                }
+            }
+            Err(e) if reprobe => {
+                debug!(
+                    group = crd.group,
+                    error = %e,
+                    "CRD group still not installed; it will be re-probed"
+                );
             }
             Err(e) => {
                 warn!(
                     group = crd.group,
                     error = %e,
-                    "CRD group not installed, its resources will not be watched. \
-                     Install the CRDs and restart the controller to enable."
+                    "CRD group not installed, its resources will not be watched until it is. \
+                     The controller re-probes CRD groups periodically and starts the watchers \
+                     once the CRDs are installed; no restart is needed."
                 );
             }
         }

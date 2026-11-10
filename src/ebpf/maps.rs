@@ -125,9 +125,10 @@ impl BpfMaps {
         };
 
         // Redirect scope maps. A stale ELF without them is tolerated here and
-        // rejected by `validate_required` when the redirect is actually
-        // enabled, so a node-agent that cannot scope the redirect never arms
-        // it rather than redirecting on pod-IP alone.
+        // refused by `AyaEbpfBackend::attach_ingress_redirect` (through
+        // `supports_inbound_redirect_scope`) when the redirect is enabled, so a
+        // node-agent that cannot scope the redirect fails startup rather than
+        // redirecting on pod-IP alone.
         let pod_inbound_ports = match bpf.take_map(BPF_MAP_POD_INBOUND_PORTS) {
             Some(map) => Some(
                 BpfHashMap::try_from(map)
@@ -135,7 +136,7 @@ impl BpfMaps {
             ),
             None => {
                 tracing::warn!(
-                    "FERRUM_POD_INBOUND_PORTS map not found; the NodeWaypoint inbound tc redirect cannot be scoped and will not be enabled"
+                    "FERRUM_POD_INBOUND_PORTS map not found; the NodeWaypoint inbound tc redirect cannot be scoped and startup will refuse to attach it"
                 );
                 None
             }
@@ -148,7 +149,7 @@ impl BpfMaps {
             ),
             None => {
                 tracing::warn!(
-                    "FERRUM_POD_INBOUND_PORTS6 map not found; the NodeWaypoint inbound tc redirect cannot be scoped and will not be enabled"
+                    "FERRUM_POD_INBOUND_PORTS6 map not found; the NodeWaypoint inbound tc redirect cannot be scoped and startup will refuse to attach it"
                 );
                 None
             }
@@ -322,7 +323,7 @@ impl BpfMaps {
         })
     }
 
-    /// `true` when both redirect scope maps are present. The node-agent
+    /// `true` when both redirect scope maps are present. The aya backend
     /// consults this before arming the inbound tc redirect: without the scope
     /// maps the kernel could only match on pod IP, which would capture every
     /// port of an enrolled pod rather than its declared inbound ports.
@@ -797,20 +798,18 @@ impl BpfMaps {
     }
 
     /// Remove a per-cgroup `includeOutboundPorts` entry, e.g. on pod
-    /// un-enrollment. Absent map (older ELF) is a no-op; absent key is
-    /// silently tolerated because the BPF gate fail-opens on missing
-    /// lookups.
+    /// un-enrollment. Absent map (older ELF) is a no-op; an absent key is
+    /// tolerated because pods that were never annotated legitimately have no
+    /// entry. Any other failure is returned: a stale narrowing keyed by a
+    /// cgroup inode would apply the old port list to a pod that later reuses
+    /// that inode, so the caller must keep retrying the removal.
     pub fn remove_include_ports(&mut self, cgroup_id: u64) -> Result<(), String> {
         let Some(include_ports) = self.include_ports.as_mut() else {
             return Ok(());
         };
-        if let Err(e) = include_ports.remove(&cgroup_id) {
-            // `aya::maps::HashMap::remove` returns Err on ENOENT; demote
-            // that to a debug log because pods that were never annotated
-            // legitimately have no entry.
-            tracing::debug!(cgroup_id, error = %e, "remove_include_ports: entry missing");
-        }
-        Ok(())
+        tolerate_missing_map_remove(include_ports.remove(&cgroup_id), || {
+            format!("the include-ports entry for cgroup {cgroup_id}")
+        })
     }
 
     /// Insert (or replace) a per-cgroup source workload identity (GAP-1b).

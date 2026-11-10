@@ -1070,7 +1070,8 @@ fn k8s_published_mesh_content_matches(left: &GatewayConfig, right: &GatewayConfi
     }
 }
 
-const MESH_SLICE_L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+const MESH_SLICE_L4_UPSTREAM_ID_PREFIX: &str =
+    crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX;
 
 fn is_mesh_slice_l4_proxy(proxy: &crate::config::types::Proxy) -> bool {
     proxy
@@ -1772,11 +1773,10 @@ const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &[
     "gwapi-route-upstream-",
     "gwapi-l4-upstream-",
     "istio-vs-upstream-",
-    "istio-vs-l4-upstream-",
+    crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX,
 ];
 const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
     "istio-vs-cors-",
-    "istio-vs-fi-",
     "istio-vs-mirror-",
     "istio-vs-mrd-",
     "istio-vs-rt-",
@@ -3133,6 +3133,30 @@ mod tests {
     }
 
     #[test]
+    fn merge_k8s_translation_keeps_operator_plugin_ids_no_translator_emits() {
+        // Fault injection moved onto `mesh_route_dispatch`, so no translator
+        // emits `istio-vs-fi-` any more; an operator plugin config with that
+        // id in a managed namespace must not be withdrawn on every reconcile.
+        let mut active = GatewayConfig::default();
+        active.plugin_configs.push(plugin_config(
+            "istio-vs-fi-operator-owned",
+            json!({"abort": {"percentage": 10.0, "status_code": 503}}),
+        ));
+        active.plugin_configs[0].namespace = "ferrum".to_string();
+
+        let k8s = GatewayConfig::default();
+        let managed = BTreeSet::from(["ferrum".to_string()]);
+        let merged = merge_k8s_translation(&active, &k8s, &managed);
+
+        assert!(
+            merged
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "istio-vs-fi-operator-owned")
+        );
+    }
+
+    #[test]
     fn merge_k8s_translation_prunes_k8s_overlay_from_all_namespaces_when_watch_all() {
         let mut active = GatewayConfig::default();
         active
@@ -3154,8 +3178,8 @@ mod tests {
         ));
         active.upstreams[1].namespace = "prod".to_string();
         active.plugin_configs.push(plugin_config(
-            "istio-vs-fi-default-old-0",
-            json!({"abort": {"percentage": 10.0, "status_code": 503}}),
+            "istio-vs-cors-default-old-0",
+            json!({"allowed_origins": ["https://old.example"]}),
         ));
         active.plugin_configs[0].namespace = "default".to_string();
         active.plugin_configs.push(plugin_config(

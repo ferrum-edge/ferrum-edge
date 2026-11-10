@@ -35,10 +35,6 @@
         }
       }
     },
-    "namespace": {
-      "type": "string",
-      "description": "Documented default release namespace hint. Templates render into .Release.Namespace; install with --namespace to select the target namespace."
-    },
     "podDisruptionBudget": {
       "type": "object",
       "additionalProperties": false,

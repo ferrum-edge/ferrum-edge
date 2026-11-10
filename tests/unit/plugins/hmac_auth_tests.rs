@@ -3128,6 +3128,53 @@ async fn hmac_prebuffer_then_matching_rfc9530_body_authenticates() {
 }
 
 #[tokio::test]
+async fn hmac_prebuffer_success_does_not_join_an_already_committed_principal() {
+    // Issue #7139: the pre-buffered success path commits through the shared
+    // `commit_authentication_attempt` boundary, exactly like the ordinary path,
+    // so a request whose principal an earlier mechanism already committed does
+    // not also gain an HMAC Consumer (or HMAC's `auth_method`).
+    let plugin = v2_plugin_named("v2-prebuffer-committed-principal");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"amount":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let date = current_date();
+    let nonce = test_nonce(7139);
+    let signature = sign_v2_with_digest(TEST_SECRET, "POST", "/upload", &date, &digest, &nonce);
+
+    let mut ctx = make_ctx("POST", "/upload");
+    ctx.request_body_sha256 = None;
+    ctx.request_body_sha512 = None;
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    set_content_digest(&mut ctx, digest);
+    assert!(plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+    set_request_body(&mut ctx, body);
+
+    // An earlier mechanism committed an external principal.
+    ctx.authenticated_identity = Some("external-principal".to_string());
+    ctx.auth_method = Some("jwks_auth");
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        staged_prebuffer_records(&ctx),
+        0,
+        "the pre-buffered record was consumed by the pre-buffered path"
+    );
+    assert!(
+        ctx.identified_consumer.is_none(),
+        "a second principal must not be committed beside the first"
+    );
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("external-principal")
+    );
+    assert_eq!(ctx.auth_method, Some("jwks_auth"));
+}
+
+#[tokio::test]
 async fn test_hmac_auth_non_ascii_authorization_returns_invalid_not_missing() {
     let plugin = HmacAuth::new(&v2_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[]);

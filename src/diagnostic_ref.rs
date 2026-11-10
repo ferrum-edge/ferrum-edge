@@ -236,7 +236,6 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     "allowed_methods",
     "max_forwards",
     "backend_max_connections",
-    "circuit_breaker",
     "circuit_breaker_open",
     "finalized_request_egress",
     "websocket_connection_limit",

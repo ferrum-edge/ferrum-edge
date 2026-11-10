@@ -61,8 +61,8 @@
 {{- end }}
 {{- $nodeAgentImageRepository := toString (default .Values.image.repository .Values.nodeAgent.image.repository) -}}
 {{- $nodeAgentImageTag := include "ferrum-mesh.resolveImageTag" (dict "root" . "override" .Values.nodeAgent.image.tag) -}}
-{{- if and (eq (lower (toString .Values.nodeAgent.captureMode)) "ebpf") (not (hasSuffix "-ebpf" $nodeAgentImageTag)) -}}
-{{- $nodeAgentImageTag = printf "%s-ebpf" $nodeAgentImageTag -}}
+{{- if eq (lower (toString .Values.nodeAgent.captureMode)) "ebpf" -}}
+{{- $nodeAgentImageTag = include "ferrum-mesh.ebpfImageTag" $nodeAgentImageTag -}}
 {{- end -}}
 {{- $nodeAgentImage := printf "%s:%s" $nodeAgentImageRepository $nodeAgentImageTag -}}
 {{- $nodeAgentAdminBindAddress := toString .Values.nodeAgent.admin.bindAddress -}}

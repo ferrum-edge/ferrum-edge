@@ -26,8 +26,6 @@ use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 #[cfg(not(test))]
 const EVENT_LOG_FILE_NAME: &str = "tls-events.json";
-#[cfg(not(test))]
-const DEFAULT_EVENT_STORE_DIR: &str = "./ferrum-managed-tls";
 
 static TLS_EVENT_LOG: OnceLock<TlsEventLog> = OnceLock::new();
 
@@ -615,13 +613,7 @@ fn configured_source_scheme(source: &CertSource) -> SourceScheme {
 
 #[cfg(not(test))]
 fn persistent_event_log_path() -> PathBuf {
-    let dir = crate::config::env_config::tls_managed_store_path_from_env();
-    let dir = if dir.is_empty() {
-        PathBuf::from(DEFAULT_EVENT_STORE_DIR)
-    } else {
-        PathBuf::from(dir)
-    };
-    dir.join(EVENT_LOG_FILE_NAME)
+    crate::tls::store_dir::managed_store_dir().join(EVENT_LOG_FILE_NAME)
 }
 
 fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {

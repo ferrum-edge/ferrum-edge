@@ -3455,48 +3455,17 @@ where
     serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(body))
 }
 
+/// The body is the base64 string [`serialize_cached_response_body`] writes; no
+/// other encoding is accepted, so a record in any other shape fails to
+/// deserialize and is refused.
 fn deserialize_cached_response_body<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    struct CachedResponseBodyVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for CachedResponseBodyVisitor {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a base64 response body string or legacy byte array")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            base64::engine::general_purpose::STANDARD
-                .decode(value)
-                .map_err(E::custom)
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            self.visit_str(&value)
-        }
-
-        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::SeqAccess<'de>,
-        {
-            let mut body = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
-            while let Some(byte) = sequence.next_element::<u8>()? {
-                body.push(byte);
-            }
-            Ok(body)
-        }
-    }
-
-    deserializer.deserialize_any(CachedResponseBodyVisitor)
+    let encoded = <String as serde::Deserialize>::deserialize(deserializer)?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(serde::de::Error::custom)
 }
 
 fn hash_framed(hasher: &mut Sha256, label: &str, value: &[u8]) {

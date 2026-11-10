@@ -7965,6 +7965,7 @@ impl PluginCache {
             country_mmdb_instances,
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
+            schema_reload_guard,
         ) = Self::build_cache(
             config,
             http_client,
@@ -7972,13 +7973,45 @@ impl PluginCache {
             current_tcp_throttle_states,
         )?;
         let snapshot = build_protocol_snapshot(config, &proxy_map, &globals);
-        let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
-            build_proxy_lifecycle_generations(
-                previous_lifecycle_generations,
-                previous_lifecycle_generation_high_water,
-                config,
-            )?;
-        let mesh_bpf_metrics_exporter = extract_mesh_bpf_metrics_exporter(&globals)?;
+        // `build_cache` returns with the named-schema reload bracket still
+        // open. Run every remaining fallible step before promoting it, so a
+        // refused build (duplicate mesh exporter, lifecycle generation
+        // overflow, api_chargeback overflow budget) cannot leave the registry
+        // on the rejected generation while the published cache stays on the
+        // old one (issue #7198).
+        let prepared = build_proxy_lifecycle_generations(
+            previous_lifecycle_generations,
+            previous_lifecycle_generation_high_water,
+            config,
+        )
+        .and_then(|lifecycle| {
+            extract_mesh_bpf_metrics_exporter(&globals).map(|exporter| (lifecycle, exporter))
+        })
+        .and_then(|(lifecycle, exporter)| {
+            crate::plugins::api_chargeback::prepare_global_overflow_reservations(config)
+                .map(|overflow| (lifecycle, exporter, overflow))
+        });
+        let (
+            (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water),
+            mesh_bpf_metrics_exporter,
+            overflow_reservations,
+        ) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!("{error}; registry abort also failed: {registry_error}")
+                    },
+                )?;
+                return Err(error);
+            }
+        };
+        // All plugins validated and every fallible step succeeded — promote
+        // the staged named schemas to live. Pairs with the `begin_reload` in
+        // `build_cache`.
+        crate::plugins::utils::log_schema::registry::commit_reload()
+            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
+        drop(schema_reload_guard);
 
         Ok(Arc::new(PluginCacheInner::new(
             proxy_map,
@@ -8000,7 +8033,7 @@ impl PluginCache {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
-            crate::plugins::api_chargeback::prepare_global_overflow_reservations(config)?,
+            overflow_reservations,
         )))
     }
 
@@ -9234,14 +9267,6 @@ impl PluginCache {
             }
         };
 
-        // Delta build succeeded. If a registry reload bracket was opened
-        // above (rebuild_globals == true), promote the staged named
-        // schemas now — pairs with the `begin_reload` at the top.
-        if rebuild_globals {
-            crate::plugins::utils::log_schema::registry::commit_reload()
-                .map_err(|error| format!("Config reload rejected: {error}"))?;
-        }
-
         let lifecycle_advances: HashSet<String> = config
             .proxies
             .iter()
@@ -9259,13 +9284,45 @@ impl PluginCache {
                 proxy_alerts_instances_changed(previous, next).then_some(key)
             })
             .collect();
-        let (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water) =
-            build_proxy_lifecycle_generations_with_advances(
-                &current.proxy_lifecycle_generations,
-                current.proxy_lifecycle_generation_high_water,
-                config,
-                &lifecycle_advances,
-            )?;
+        // The lifecycle generations and the api_chargeback overflow
+        // reservations are the last fallible steps; both run before
+        // `commit_reload` so a refusal (for example an overflow budget that
+        // cannot reserve the new rows) cannot leave the named-schema registry
+        // promoted against a rejected cache (issue #7198).
+        let prepared = build_proxy_lifecycle_generations_with_advances(
+            &current.proxy_lifecycle_generations,
+            current.proxy_lifecycle_generation_high_water,
+            config,
+            &lifecycle_advances,
+        )
+        .and_then(|lifecycle| {
+            crate::plugins::api_chargeback::prepare_global_overflow_reservations(config)
+                .map(|overflow| (lifecycle, overflow))
+        });
+        let (
+            (proxy_lifecycle_generations, proxy_lifecycle_generation_high_water),
+            overflow_reservations,
+        ) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if rebuild_globals {
+                    crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                        |registry_error| {
+                            format!("{error}; registry abort also failed: {registry_error}")
+                        },
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+
+        // Delta build succeeded. If a registry reload bracket was opened
+        // above (rebuild_globals == true), promote the staged named
+        // schemas now — pairs with the `begin_reload` at the top.
+        if rebuild_globals {
+            crate::plugins::utils::log_schema::registry::commit_reload()
+                .map_err(|error| format!("Config reload rejected: {error}"))?;
+        }
 
         // Recomputed against the incoming config and the NEW global TCP entry
         // on every delta, including the `global_plugins_changed == false` reuse
@@ -9300,7 +9357,7 @@ impl PluginCache {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
-            crate::plugins::api_chargeback::prepare_global_overflow_reservations(config)?,
+            overflow_reservations,
         ));
         jwks_rollback.disarm();
         Ok(inner)
@@ -9604,6 +9661,7 @@ impl PluginCache {
             CountryMmdbPluginInstanceMap,
             u64,
             TcpConnectionThrottleInstanceMap,
+            crate::plugins::utils::log_schema::registry::ReloadBracketGuard,
         ),
         String,
     > {
@@ -9646,7 +9704,7 @@ impl PluginCache {
         // registry stays atomically tied to the cache.
         // The guard is an unwind-safety net only: the explicit commit/abort
         // calls below close the bracket on every normal path.
-        let _schema_reload_guard =
+        let schema_reload_guard =
             crate::plugins::utils::log_schema::registry::begin_reload_guarded()
                 .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
@@ -9946,10 +10004,9 @@ impl PluginCache {
             return Err(format!("Gateway startup aborted: {error}"));
         }
 
-        // All plugins validated — promote the staged named schemas to live.
-        // Pairs with the `begin_reload` at the start of this function.
-        crate::plugins::utils::log_schema::registry::commit_reload()
-            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
+        // All plugins validated. The bracket stays open and is returned to
+        // the caller, which commits it only after its own remaining fallible
+        // steps succeed (issue #7198).
 
         let global_needs_buffering = global_plugins
             .iter()
@@ -9979,6 +10036,7 @@ impl PluginCache {
             country_mmdb_instances,
             country_mmdb_snapshot_bytes,
             tcp_connection_throttle_instances,
+            schema_reload_guard,
         ))
     }
 }

@@ -281,7 +281,9 @@ fn is_safe_cni_arg_key(key: &str) -> bool {
 /// Extracted Kubernetes pod identity from CNI_ARGS.
 ///
 /// kubelet always supplies `K8S_POD_NAMESPACE`, `K8S_POD_NAME`,
-/// `K8S_POD_UID`, and `K8S_POD_INFRA_CONTAINER_ID` per CNI conventions.
+/// `K8S_POD_UID`, and `K8S_POD_INFRA_CONTAINER_ID` per CNI conventions; the
+/// infra container id is not read (the CNI container id already names the
+/// sandbox).
 /// `K8S_POD_UID` was added later than the others and is occasionally
 /// missing on older CRIs; the wire surface to the node-agent treats it as
 /// optional so older clusters still get a working ADD/DEL round-trip.
@@ -290,7 +292,6 @@ pub struct K8sPodIdentity {
     pub namespace: String,
     pub name: String,
     pub pod_uid: Option<String>,
-    pub infra_container_id: Option<String>,
 }
 
 impl K8sPodIdentity {
@@ -304,15 +305,10 @@ impl K8sPodIdentity {
             return None;
         }
         let pod_uid = args.get("K8S_POD_UID").cloned().filter(|v| !v.is_empty());
-        let infra_container_id = args
-            .get("K8S_POD_INFRA_CONTAINER_ID")
-            .cloned()
-            .filter(|v| !v.is_empty());
         Some(Self {
             namespace,
             name,
             pod_uid,
-            infra_container_id,
         })
     }
 }
@@ -567,13 +563,18 @@ pub struct CniErrorResult {
     pub cni_version: String,
     pub code: u32,
     pub msg: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<String>,
 }
 
-/// Closed set of CNI errors the binary returns. Codes 1-99 are reserved
-/// for plugin-specific errors per the spec; 1-7 are the common
-/// values we map onto, and 50/51 are the CNI 1.1 STATUS availability codes.
+/// Closed set of CNI errors the binary returns. The CNI spec reserves codes
+/// 0-99 for the well-known errors it defines (1-7, 11 "try again later", and
+/// the CNI 1.1 STATUS availability codes 50/51) and leaves 100 and above for
+/// plugin-specific errors, so a node-agent rejection uses
+/// [`CNI_ERROR_CODE_REJECTED`].
+/// Plugin-specific CNI error code for a node-agent rejection: the first code
+/// the spec leaves to plugins (codes below 100 are reserved for the spec's own
+/// well-known errors).
+pub const CNI_ERROR_CODE_REJECTED: u32 = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CniError {
     #[error("required environment variable {0} is missing or invalid")]
@@ -591,13 +592,6 @@ pub enum CniError {
     /// CNI 1.1 STATUS code 50: plugin cannot service ADD requests.
     #[error("CNI plugin is not available: {0}")]
     NotAvailable(String),
-    /// CNI 1.1 STATUS code 51: unavailable and existing attachments may be
-    /// degraded. Reserved for cases where Ferrum knows capture/connectivity
-    /// for already-enrolled pods may also be limited.
-    #[error(
-        "CNI plugin is not available and existing containers may have limited connectivity: {0}"
-    )]
-    NotAvailableDegraded(String),
 }
 
 impl CniError {
@@ -612,9 +606,8 @@ impl CniError {
             Self::BadConfig(_) => 7,
             Self::UnsupportedVersion => 1,
             Self::IpcFailed(_) => 11,
-            Self::Rejected(_) => 12,
+            Self::Rejected(_) => CNI_ERROR_CODE_REJECTED,
             Self::NotAvailable(_) => 50,
-            Self::NotAvailableDegraded(_) => 51,
         }
     }
 }
@@ -626,7 +619,6 @@ pub fn build_error_result(cni_version: &str, err: &CniError) -> CniErrorResult {
         cni_version: cni_version.to_string(),
         code: err.code(),
         msg: err.to_string(),
-        details: None,
     }
 }
 
@@ -675,7 +667,6 @@ mod tests {
         assert_eq!(id.namespace, "demo");
         assert_eq!(id.name, "alpha");
         assert!(id.pod_uid.is_none());
-        assert!(id.infra_container_id.is_none());
 
         args.insert("K8S_POD_UID".to_string(), "uid-1".to_string());
         args.insert(
@@ -684,7 +675,6 @@ mod tests {
         );
         let id = K8sPodIdentity::from_args(&args).expect("identity should parse with extras");
         assert_eq!(id.pod_uid.as_deref(), Some("uid-1"));
-        assert_eq!(id.infra_container_id.as_deref(), Some("infra-1"));
     }
 
     #[test]
@@ -818,9 +808,9 @@ mod tests {
         assert_eq!(CniError::BadConfig("x".to_string()).code(), 7);
         assert_eq!(CniError::UnsupportedVersion.code(), 1);
         assert_eq!(CniError::IpcFailed("x".to_string()).code(), 11);
-        assert_eq!(CniError::Rejected("x".to_string()).code(), 12);
+        // Plugin-specific: the spec reserves every code below 100.
+        assert_eq!(CniError::Rejected("x".to_string()).code(), 100);
         assert_eq!(CniError::NotAvailable("x".to_string()).code(), 50);
-        assert_eq!(CniError::NotAvailableDegraded("x".to_string()).code(), 51);
     }
 
     #[test]

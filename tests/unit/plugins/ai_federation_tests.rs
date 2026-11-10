@@ -1498,6 +1498,53 @@ async fn streaming_half_open_admits_exactly_one_probe() {
     );
 }
 
+/// The streaming claim publishes the same circuit metadata as the buffered
+/// loop (issue #7125): a skipped open provider counts in
+/// `ai_federation_circuit_open_skips`, and the committed provider, not the
+/// skipped one, is the last circuit seen.
+#[tokio::test]
+async fn streaming_claim_records_skip_and_committed_circuit_metadata() {
+    let breaker = json!({"failure_threshold": 1, "cooldown_seconds": 30, "success_threshold": 1});
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "fallback_enabled": true,
+        "providers": [
+            openai_provider(json!({"name": "first", "circuit_breaker": breaker})),
+            openai_provider(json!({"name": "second", "circuit_breaker": breaker}))
+        ]
+    }));
+    assert!(test_helpers::open_circuit_for_test(&plugin, 0));
+
+    let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let meta = |key: &str| ctx.metadata.get(key).map(String::as_str);
+    assert_eq!(meta("ai_federation_circuit_open_skips"), Some("1"));
+    assert_eq!(meta("ai_federation_circuit_last_provider"), Some("second"));
+    assert_eq!(meta("ai_federation_circuit_last_state"), Some("closed"));
+    assert_eq!(meta("ai_federation_circuit_half_open_probes"), None);
+    drop(ctx);
+
+    // A committed half-open probe is visible too.
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "fallback_enabled": false,
+        "providers": [openai_provider(json!({"circuit_breaker": breaker}))]
+    }));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
+    let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let meta = |key: &str| ctx.metadata.get(key).map(String::as_str);
+    assert_eq!(meta("ai_federation_circuit_last_provider"), Some("openai"));
+    assert_eq!(
+        meta("ai_federation_circuit_last_state"),
+        Some("half_open_probe")
+    );
+    assert_eq!(meta("ai_federation_circuit_half_open_probes"), Some("1"));
+    assert_eq!(meta("ai_federation_circuit_open_skips"), None);
+}
+
 /// Cancelling a half-open probe frees the single slot without scoring it.
 #[tokio::test]
 async fn streaming_cancellation_frees_the_half_open_probe_slot() {
@@ -4224,6 +4271,102 @@ fn test_translate_cohere() {
     assert_eq!(parsed["model"], "command-r-plus");
     // Messages should be preserved (Cohere v2 is OpenAI-compatible for messages)
     assert!(parsed["messages"].as_array().unwrap().len() == 4);
+}
+
+/// Issue #7124: an explicit `null` output bound or sampling number is absent,
+/// so the other bound field still reaches the provider and no `null` is
+/// forwarded; a mistyped value is a translation error.
+#[test]
+fn test_translators_treat_null_bounds_and_sampling_as_absent() {
+    const BEDROCK_MODEL: &str = "anthropic.claude-3-sonnet-20240229-v1:0";
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": null,
+        "max_completion_tokens": 256,
+        "temperature": null,
+        "top_p": null
+    });
+    let providers = [
+        ("anthropic", "claude-3", json!({})),
+        ("google_gemini", "gemini-2", json!({})),
+        (
+            "aws_bedrock",
+            BEDROCK_MODEL,
+            json!({ "aws_region": "us-east-1" }),
+        ),
+        ("cohere", "command-r-plus", json!({})),
+    ];
+    let translate = |provider_type: &str| -> Value {
+        let (_, model, provider_config) = providers
+            .iter()
+            .find(|(name, _, _)| *name == provider_type)
+            .unwrap();
+        let (_, _, bytes) =
+            test_helpers::translate_request_test(provider_type, &body, model, provider_config)
+                .unwrap_or_else(|error| panic!("{provider_type}: {error}"));
+        serde_json::from_slice(&bytes).unwrap()
+    };
+
+    let anthropic = translate("anthropic");
+    assert_eq!(anthropic["max_tokens"], 256);
+    assert!(anthropic.get("temperature").is_none());
+    assert!(anthropic.get("top_p").is_none());
+
+    let gemini = translate("google_gemini");
+    assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 256);
+    assert!(gemini["generationConfig"].get("temperature").is_none());
+    assert!(gemini["generationConfig"].get("topP").is_none());
+
+    let bedrock = translate("aws_bedrock");
+    assert_eq!(bedrock["inferenceConfig"]["maxTokens"], 256);
+    assert!(bedrock["inferenceConfig"].get("temperature").is_none());
+    assert!(bedrock["inferenceConfig"].get("topP").is_none());
+
+    let cohere = translate("cohere");
+    assert_eq!(cohere["max_tokens"], 256);
+    assert!(cohere.get("max_completion_tokens").is_none());
+    assert!(cohere.get("temperature").is_none());
+    assert!(cohere.get("p").is_none());
+
+    // With no bound at all, Anthropic (which requires one) gets the documented
+    // default and the others get none.
+    let unbounded = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+    let (_, _, bytes) =
+        test_helpers::translate_request_test("anthropic", &unbounded, "claude-3", &json!({}))
+            .unwrap();
+    let anthropic: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(anthropic["max_tokens"], 4096);
+
+    for (provider_type, model, provider_config) in &providers {
+        for invalid in [
+            json!({"max_tokens": "256"}),
+            json!({"max_tokens": 0}),
+            json!({"max_completion_tokens": 2.5}),
+            json!({"temperature": "warm"}),
+            json!({"top_p": [0.9]}),
+        ] {
+            let mut request = unbounded.clone();
+            for (key, value) in invalid.as_object().unwrap() {
+                request[key] = value.clone();
+            }
+            let error = test_helpers::translate_request_test(
+                provider_type,
+                &request,
+                model,
+                provider_config,
+            )
+            .expect_err("a mistyped bound or sampling number must be rejected");
+            assert!(
+                error.starts_with("ai_federation: "),
+                "{provider_type}: {error}"
+            );
+            assert!(
+                test_helpers::validate_openai_request_test(&request).is_err(),
+                "{provider_type}: validation must reject {invalid}"
+            );
+        }
+    }
 }
 
 #[test]

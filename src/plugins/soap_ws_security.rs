@@ -368,8 +368,6 @@ use super::{Plugin, PluginResult, RequestContext};
 
 // ── Namespace URIs ──────────────────────────────────────────────────────────
 
-const PASSWORD_DIGEST_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest";
-const PASSWORD_TEXT_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText";
 const XMLDSIG_RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 const XMLDSIG_RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
 const XMLDSIG_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
@@ -1020,7 +1018,8 @@ fn soap_string_array(
 
 /// Enum-valued array with an explicit default. Unknown members are rejected —
 /// dropping them used to be able to empty an allow-list or narrow it in ways
-/// the operator never asked for.
+/// the operator never asked for — and so is an empty array, so the result is
+/// never empty (every caller passes a non-empty default).
 fn soap_enum_array<T: Copy>(
     object: Option<&ConfigObject>,
     path: &str,
@@ -2116,14 +2115,6 @@ impl SoapWsSecurity {
             &[SignatureAlgorithm::RsaSha256],
         )?;
 
-        if x509_enabled && allowed_signature_algorithms.is_empty() {
-            return Err(
-                "soap_ws_security: x509_signature.allowed_algorithms must contain at least one of \
-                 `rsa-sha256` or `rsa-sha1` when x509_signature is enabled"
-                    .to_string(),
-            );
-        }
-
         let allowed_digest_algorithms: Vec<DigestAlgorithm> = soap_enum_array(
             x509_cfg,
             "config.x509_signature",
@@ -2131,14 +2122,6 @@ impl SoapWsSecurity {
             DIGEST_ALGORITHM_VARIANTS,
             &[DigestAlgorithm::Sha256],
         )?;
-
-        if x509_enabled && allowed_digest_algorithms.is_empty() {
-            return Err(
-                "soap_ws_security: x509_signature.allowed_digest_algorithms must contain at least \
-                 one of `sha256` or `sha1` when x509_signature is enabled"
-                    .to_string(),
-            );
-        }
 
         let require_signed_timestamp = soap_bool(
             x509_cfg,
@@ -2348,14 +2331,6 @@ impl SoapWsSecurity {
             &[SignatureAlgorithm::RsaSha256],
         )?;
 
-        if saml_enabled && saml_allowed_signature_algorithms.is_empty() {
-            return Err(
-                "soap_ws_security: saml.allowed_signature_algorithms must contain at least one of \
-                 `rsa-sha256` or `rsa-sha1` when SAML is enabled"
-                    .to_string(),
-            );
-        }
-
         let saml_allowed_digest_algorithms: Vec<DigestAlgorithm> = soap_enum_array(
             saml_cfg,
             "config.saml",
@@ -2363,14 +2338,6 @@ impl SoapWsSecurity {
             DIGEST_ALGORITHM_VARIANTS,
             &[DigestAlgorithm::Sha256],
         )?;
-
-        if saml_enabled && saml_allowed_digest_algorithms.is_empty() {
-            return Err(
-                "soap_ws_security: saml.allowed_digest_algorithms must contain at least one of \
-                 `sha256` or `sha1` when SAML is enabled"
-                    .to_string(),
-            );
-        }
 
         // ── Nonce / replay config ───────────────────────────────────────
         // Zero capacity used to be accepted and made replay detection inert
@@ -2901,16 +2868,15 @@ impl SoapWsSecurity {
         // `Type="...#PasswordText"`. If a recognized `Type` attribute is present
         // it must agree with the configured policy; a mismatch is rejected.
         if let Some(type_attr) = password_element.unqualified_attribute("Type") {
-            let wire_type =
-                if type_attr.contains("PasswordDigest") || type_attr == PASSWORD_DIGEST_TYPE {
-                    Some(PasswordType::PasswordDigest)
-                } else if type_attr.contains("PasswordText") || type_attr == PASSWORD_TEXT_TYPE {
-                    Some(PasswordType::PasswordText)
-                } else {
-                    // Unrecognized Type value — fall through to the configured
-                    // policy rather than guessing a verification mode.
-                    None
-                };
+            let wire_type = if type_attr.contains("PasswordDigest") {
+                Some(PasswordType::PasswordDigest)
+            } else if type_attr.contains("PasswordText") {
+                Some(PasswordType::PasswordText)
+            } else {
+                // Unrecognized Type value — fall through to the configured
+                // policy rather than guessing a verification mode.
+                None
+            };
             if let Some(wire_type) = wire_type
                 && wire_type != self.password_type
             {
@@ -3799,7 +3765,6 @@ impl SoapWsSecurity {
         &self,
         structure: &SoapEnvelopeStructure<'a, 'i>,
         security: Node<'a, 'i>,
-        id_index: &DocumentIdIndex<'a, 'i>,
         envelope: &str,
         now: DateTime<Utc>,
         budget: &mut WorkBudget,
@@ -3900,13 +3865,18 @@ impl SoapWsSecurity {
             .map_err(|_| "WS-Security: signature verification failed".to_string())?;
 
         // ── Authenticated. Only now is Reference work performed ─────────
+        // The id index walks every element and hashes every id attribute, so
+        // it is built here, after trust is settled, and never for an untrusted
+        // or forged signature. It replaces one full-envelope rescan per
+        // Reference.
+        let id_index = DocumentIdIndex::build(security.document());
         let coverage = self.verify_reference_digests(
             signed_info_node,
             security,
             sig_node,
             &ReferenceDigestDocument {
                 structure,
-                id_index,
+                id_index: &id_index,
                 envelope,
             },
             budget,
@@ -5551,19 +5521,11 @@ impl SoapWsSecurity {
             }
         }
 
-        // Validate X.509 signature. The id index is built once here — after the
-        // structure is settled and before the first Reference is resolved —
-        // instead of rescanning the whole envelope per Reference.
+        // Validate X.509 signature. The id index used to resolve References is
+        // built inside, only once the signer is trusted and SignatureValue
+        // verifies.
         if run_x509 {
-            let id_index = DocumentIdIndex::build(&document);
-            match self.validate_x509_signature(
-                &structure,
-                security,
-                &id_index,
-                envelope,
-                now,
-                &mut budget,
-            ) {
+            match self.validate_x509_signature(&structure, security, envelope, now, &mut budget) {
                 Ok(cert_principal) => {
                     principal
                         .principal
@@ -8152,41 +8114,31 @@ fn resolve_soap_request_body<'a>(
     content_type: &str,
     media_class: &SoapMediaClass,
 ) -> Result<Option<Cow<'a, str>>, SoapBodyDecodeError> {
-    if let Some(bytes) = ctx.request_body_bytes.as_ref() {
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let (envelope_bytes, envelope_content_type) = match media_class {
-            // A bare XOP infoset has no package around it, so like plain XML the
-            // whole body is the envelope. It is only classified apart so an
-            // integrity-claiming policy can refuse it.
-            SoapMediaClass::Xml | SoapMediaClass::Xop => (&bytes[..], Cow::Borrowed(content_type)),
-            SoapMediaClass::Mtom { boundary, start } => {
-                let part = extract_mtom_root_part(bytes, boundary, start.as_deref())?;
-                (part.body, Cow::Owned(part.content_type))
-            }
-        };
-        if envelope_bytes.is_empty() {
-            return Ok(None);
-        }
-        return decode_soap_xml_body(envelope_bytes, &envelope_content_type).map(Some);
+    // The plugin opts into raw bytes (`needs_request_body_bytes`), and every
+    // proxy path supplies them for a governed body. Without them there is no
+    // wire representation for the final-body digest binding to cover, so the
+    // plugin-writable `metadata["request_body"]` text is never authenticated in
+    // their place: the request takes the empty-body disposition instead.
+    let Some(bytes) = ctx.request_body_bytes.as_ref() else {
+        return Ok(None);
+    };
+    if bytes.is_empty() {
+        return Ok(None);
     }
-    // Fixture-only fallback: production prefers raw bytes. Still enforce the
-    // UTF-8 XML-declaration contract so encoding validation is not bypassed.
-    // MTOM is never reachable here: the multipart wrapper is binary framing and
-    // the shared UTF-8 metadata copy is not a representation it can be unpacked
-    // from, so it fails closed rather than validating the wrong bytes.
-    if matches!(media_class, SoapMediaClass::Mtom { .. }) {
-        return Err(SoapBodyDecodeError::MalformedEncoding);
-    }
-    match ctx.metadata.get("request_body") {
-        Some(body) if body.is_empty() => Ok(None),
-        Some(body) => {
-            validate_xml_declaration_encoding(body, SoapXmlEncoding::Utf8)?;
-            Ok(Some(Cow::Borrowed(body.as_str())))
+    let (envelope_bytes, envelope_content_type) = match media_class {
+        // A bare XOP infoset has no package around it, so like plain XML the
+        // whole body is the envelope. It is only classified apart so an
+        // integrity-claiming policy can refuse it.
+        SoapMediaClass::Xml | SoapMediaClass::Xop => (&bytes[..], Cow::Borrowed(content_type)),
+        SoapMediaClass::Mtom { boundary, start } => {
+            let part = extract_mtom_root_part(bytes, boundary, start.as_deref())?;
+            (part.body, Cow::Owned(part.content_type))
         }
-        None => Ok(None),
+    };
+    if envelope_bytes.is_empty() {
+        return Ok(None);
     }
+    decode_soap_xml_body(envelope_bytes, &envelope_content_type).map(Some)
 }
 
 /// The SOAP root part of an MTOM/XOP `multipart/related` body.

@@ -890,7 +890,8 @@ impl VersionCompatError {
         match self {
             VersionCompatError::Missing => format!(
                 "{peer_role} did not report its version. {local_role} is running Ferrum Edge v{local_version}. \
-                 Upgrade the {peer_role} to a version that supports version negotiation."
+                 The CP and its data planes must run the same Ferrum Edge build; \
+                 upgrade them together."
             ),
             VersionCompatError::Malformed { peer } => format!(
                 "Unable to parse {peer_role} version for compatibility check \

@@ -247,7 +247,7 @@ impl ResponseTransformer {
             return BoundedResponseBodyConstruction::Unchanged;
         }
         // Framed gRPC is declined explicitly rather than left to fail inside
-        // `apply_body_rules`. Both routes return `Unchanged`, but only the
+        // `apply_body_rules_bounded`. Both routes return `Unchanged`, but only the
         // explicit decline makes the media-type condition here symmetric with
         // `enforces_response_body_policy` by construction, so the claim
         // predicate and the enforcer cannot drift apart on the `+json` gRPC
@@ -1170,7 +1170,7 @@ impl Plugin for ResponseTransformer {
         //
         // So an ABSENT `Content-Type` is claimed, because the transform treats
         // it as JSON (`if let Some(ct) = content_type && !is_json => None`, i.e.
-        // `None` falls through to `apply_body_rules`). Declining it here while
+        // `None` falls through to `apply_body_rules_bounded`). Declining it here while
         // the enforcer accepts it would let an untyped `gzip`/`206`/malformed
         // response carry a protected field straight past a configured redaction.
         // A non-JSON type stays a documented decline, matching the same early
@@ -1408,8 +1408,8 @@ impl Plugin for ResponseTransformer {
     /// direction, and it costs no redaction: the pristine stamped media type (or,
     /// unstamped, a total parse of the bytes as complete length-prefixed frames)
     /// is proof that these bytes are FRAMES, which can never parse as the bare
-    /// document a JSON field rule acts on. `apply_body_rules` would have returned
-    /// `None` for them anyway — the explicit decline only makes that provable at
+    /// document a JSON field rule acts on. `apply_body_rules_bounded` would have
+    /// returned `Unchanged` for them anyway — the explicit decline only makes that provable at
     /// the predicate instead of incidental to the parser. Claiming them instead
     /// would send every valid RPC reply on a mixed HTTP/gRPC proxy into the
     /// gate's `unparseable_document` rejection.
@@ -1446,8 +1446,8 @@ impl Plugin for ResponseTransformer {
         // over the same bytes: an unproven post-hook/translation-added framed
         // gRPC label must not make the enforcer decline what the claim just
         // claimed. Dropping it here restores the untyped branch, so
-        // `apply_body_rules` actually runs — and a body that is not a parseable
-        // document still returns `None` into the gate's fail-closed rejection
+        // `apply_body_rules_bounded` actually runs — and a body that is not a
+        // parseable document still returns `Unchanged` into the gate's fail-closed rejection
         // instead of being forwarded unredacted.
         let content_type = effective_response_media_type(ctx, content_type, body);
         // The rewritten document is serialized through a sink bounded by THIS

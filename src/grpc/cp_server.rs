@@ -121,18 +121,44 @@ fn bounded_log_value(value: &str) -> String {
     output
 }
 
-fn bounded_tenant_rejection_reason(reason: &str) -> &'static str {
-    match reason {
+/// Closed refusal classes recorded by [`CpGrpcServer::audit_tenant_subscription`]
+/// (issue #7202). Callers pass one of these (or another compile-time label
+/// such as [`crate::grpc::admission::CpGrpcAdmissionRejection::metric_reason`])
+/// rather than a `Status` message, so the audit says why a data plane was
+/// refused without echoing request data, and the 60 s limiter keyed by
+/// `(surface, reason)` keeps one bucket per refusal class.
+pub(crate) mod tenant_rejection_reason {
+    /// The request `node_id` is not the authenticated JWT subject.
+    pub(crate) const NODE_ID_MISMATCH: &str = "node_id does not match authenticated subject";
+    /// The ConfigSync build identity differs from this CP's.
+    pub(crate) const BUILD_MISMATCH: &str = "config_sync build identity mismatch";
+    /// The advertised `FERRUM_REAL_IP_HEADER` is missing or differs.
+    pub(crate) const REAL_IP_HEADER_MISMATCH: &str = "real IP header mismatch";
+    /// The namespace is outside the token's `ns` claim or the CP scope.
+    pub(crate) const NAMESPACE_NOT_AUTHORIZED: &str = "namespace not authorized";
+    /// The CP cannot revalidate its verification trust source.
+    pub(crate) const TRUST_STALE: &str = "verification trust stale";
+    /// The token's verification credential was removed after verification.
+    pub(crate) const CREDENTIAL_REVOKED: &str = "verification credential no longer trusted";
+    /// Any other credential verification refusal.
+    pub(crate) const AUTHENTICATION_FAILED: &str = "authentication failed";
+}
+
+/// Classify a credential-verification refusal into a closed reason.
+///
+/// The verifier's fixed messages that operators already search for are kept
+/// verbatim; every other verification refusal maps to a fixed class by its
+/// gRPC code, so no token or claim text can reach the audit record.
+pub(crate) fn tenant_authentication_rejection_reason(status: &Status) -> &'static str {
+    match status.message() {
         "Invalid token: authentication failed" => "Invalid token: authentication failed",
         "Invalid token: malformed JWS header" => "Invalid token: malformed JWS header",
-        "node_id does not match authenticated subject" => {
-            "node_id does not match authenticated subject"
-        }
         "Missing authorization token" => "Missing authorization token",
-        "GetFullConfig node_id does not match authenticated subject" => {
-            "GetFullConfig node_id does not match authenticated subject"
+        "Stream verification credential is no longer trusted" => {
+            tenant_rejection_reason::CREDENTIAL_REVOKED
         }
-        _ => "request refused",
+        _ if status.code() == tonic::Code::Unavailable => tenant_rejection_reason::TRUST_STALE,
+        _ => tenant_rejection_reason::AUTHENTICATION_FAILED,
     }
 }
 
@@ -759,7 +785,7 @@ impl CpGrpcServer {
         node_id: &str,
         namespace: &str,
         result: &'static str,
-        reason: &str,
+        reason: &'static str,
     ) {
         // Record the bounded values as `&str` so the text formatter quotes
         // them and the JSON formatter stores the plain string.
@@ -777,7 +803,6 @@ impl CpGrpcServer {
             _ => {
                 if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
                     let now = elapsed.as_secs();
-                    let reason = bounded_tenant_rejection_reason(reason);
                     let suppressed =
                         TENANT_SUBSCRIPTION_REJECTION_LOGS
                             .lock()
@@ -884,7 +909,7 @@ impl CpGrpcServer {
     ///
     /// Compares the DP's `config_sync_build` with
     /// [`config_sync_build_identity`]. A mismatch, including a missing
-    /// identity, is audited with both identities and refused with
+    /// identity, is audited as a build mismatch and refused with
     /// `FailedPrecondition` before any configuration is streamed. The DP
     /// treats that status as a build mismatch and backs off.
     #[allow(clippy::result_large_err)]
@@ -898,7 +923,13 @@ impl CpGrpcServer {
             return Ok(());
         };
         let message = mismatch.message("CP", "DP");
-        Self::audit_tenant_subscription(surface, node_id, namespace, "failure", &message);
+        Self::audit_tenant_subscription(
+            surface,
+            node_id,
+            namespace,
+            "failure",
+            tenant_rejection_reason::BUILD_MISMATCH,
+        );
         Err(Status::failed_precondition(message))
     }
 
@@ -1915,7 +1946,7 @@ impl CpGrpcServer {
                 return;
             }
         };
-        if Self::broadcast_update_with_trust_json(&tx, &filtered, trust_json, namespace) {
+        if Self::broadcast_update_with_trust_json(&tx, filtered, trust_json, namespace) {
             registry.touch_namespace(namespace);
         }
     }
@@ -2004,7 +2035,7 @@ impl CpGrpcServer {
                 ));
             }
         };
-        match Self::config_json_for_dp(&filtered) {
+        match Self::config_json_for_dp(filtered) {
             Ok(config_json) => Ok(ConfigUpdate {
                 update_type: 0, // FULL_SNAPSHOT
                 config_json,
@@ -2056,7 +2087,12 @@ impl CpGrpcServer {
                 return false;
             }
         };
-        Self::broadcast_update_with_trust_json(tx, config, trust_bundles_json, "unpartitioned")
+        Self::broadcast_update_with_trust_json(
+            tx,
+            config.clone(),
+            trust_bundles_json,
+            "unpartitioned",
+        )
     }
 
     /// Broadcast a full config snapshot with an already-resolved trust side
@@ -2069,10 +2105,11 @@ impl CpGrpcServer {
     /// absent slot would otherwise produce (issue #3727).
     fn broadcast_update_with_trust_json(
         tx: &broadcast::Sender<ConfigUpdate>,
-        config: &GatewayConfig,
+        config: GatewayConfig,
         trust_bundles_json: String,
         namespace: &str,
     ) -> bool {
+        let version = config.loaded_at.to_rfc3339();
         let config_json = match Self::config_json_for_dp(config) {
             Ok(json) => json,
             Err(e) => {
@@ -2089,7 +2126,7 @@ impl CpGrpcServer {
         let update = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
-            version: config.loaded_at.to_rfc3339(),
+            version,
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
@@ -2277,10 +2314,13 @@ impl CpGrpcServer {
     /// individual resources rather than a `GatewayConfig` — but the DP applies
     /// every delta through `ProxyState::update_config`, which runs the same
     /// policy and keeps the last known-good config on rejection.
-    fn config_json_for_dp(config: &GatewayConfig) -> Result<String, String> {
-        crate::fips::policy::check_gateway_config(config)
+    ///
+    /// Takes the snapshot by value: every publication path already owns a
+    /// filtered copy, so clearing the trust slots in place avoids a second
+    /// deep clone of the whole configuration (issue #7208).
+    fn config_json_for_dp(mut snapshot: GatewayConfig) -> Result<String, String> {
+        crate::fips::policy::check_gateway_config(&snapshot)
             .map_err(|error| format!("FIPS policy rejected the configuration: {error}"))?;
-        let mut snapshot = config.clone();
         // Trust material travels exclusively through
         // `ConfigUpdate.trust_bundles_json`. BOTH trust slots are cleared here:
         // the unpartitioned `trust_bundles` set and the authoritative
@@ -2427,7 +2467,7 @@ impl ConfigSync for CpGrpcServer {
                     &req.node_id,
                     &req.namespace,
                     "failure",
-                    status.message(),
+                    tenant_authentication_rejection_reason(&status),
                 );
                 return Err(status);
             }
@@ -2443,7 +2483,7 @@ impl ConfigSync for CpGrpcServer {
                 &identity.subject,
                 &inner.namespace,
                 "failure",
-                "node_id does not match authenticated subject",
+                tenant_rejection_reason::NODE_ID_MISMATCH,
             );
             return Err(Status::permission_denied(
                 "Subscribe node_id must match the authenticated JWT subject",
@@ -2473,7 +2513,7 @@ impl ConfigSync for CpGrpcServer {
                 &node_id,
                 &dp_namespace,
                 "failure",
-                status.message(),
+                tenant_rejection_reason::REAL_IP_HEADER_MISMATCH,
             );
             return Err(status);
         }
@@ -2489,7 +2529,7 @@ impl ConfigSync for CpGrpcServer {
                     &node_id,
                     &dp_namespace,
                     "failure",
-                    status.message(),
+                    tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
                 );
                 return Err(status);
             }
@@ -2511,7 +2551,7 @@ impl ConfigSync for CpGrpcServer {
                         "",
                         &dp_namespace,
                         "failure",
-                        status.message(),
+                        rejection.metric_reason(),
                     );
                     return Err(status);
                 }
@@ -2542,7 +2582,7 @@ impl ConfigSync for CpGrpcServer {
                     );
                     Status::internal("Failed to prepare configuration snapshot")
                 })?;
-        let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
+        let config_json = Self::config_json_for_dp(filtered).map_err(|e| {
             error!(
                 "{}",
                 crate::startup::sanitize_startup_cause(
@@ -2713,7 +2753,7 @@ impl ConfigSync for CpGrpcServer {
                     &rejected_request.node_id,
                     &rejected_request.namespace,
                     "failure",
-                    status.message(),
+                    tenant_authentication_rejection_reason(&status),
                 );
                 return Err(status);
             }
@@ -2728,7 +2768,7 @@ impl ConfigSync for CpGrpcServer {
                 &req.node_id,
                 &req.namespace,
                 "failure",
-                "node_id does not match authenticated subject",
+                tenant_rejection_reason::NODE_ID_MISMATCH,
             );
             return Err(Status::permission_denied(
                 "GetFullConfig node_id must match the authenticated JWT subject",
@@ -2747,7 +2787,7 @@ impl ConfigSync for CpGrpcServer {
                 &req.node_id,
                 &req.namespace,
                 "failure",
-                status.message(),
+                tenant_rejection_reason::REAL_IP_HEADER_MISMATCH,
             );
             return Err(status);
         }
@@ -2759,7 +2799,7 @@ impl ConfigSync for CpGrpcServer {
                 &req.node_id,
                 &req.namespace,
                 "failure",
-                status.message(),
+                tenant_rejection_reason::NAMESPACE_NOT_AUTHORIZED,
             );
             return Err(status);
         }
@@ -2774,7 +2814,7 @@ impl ConfigSync for CpGrpcServer {
                 &req.node_id,
                 &req.namespace,
                 "failure",
-                status.message(),
+                rejection.metric_reason(),
             );
             return Err(status);
         }
@@ -2792,7 +2832,7 @@ impl ConfigSync for CpGrpcServer {
                     &req.node_id,
                     &req.namespace,
                     "failure",
-                    status.message(),
+                    rejection.metric_reason(),
                 );
                 return Err(status);
             }
@@ -2811,7 +2851,7 @@ impl ConfigSync for CpGrpcServer {
                 );
                 Status::internal("Failed to prepare configuration snapshot")
             })?;
-        let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
+        let config_json = Self::config_json_for_dp(filtered).map_err(|e| {
             error!(
                 "{}",
                 crate::startup::sanitize_startup_cause(
@@ -2976,7 +3016,8 @@ mod tests {
             .x509_authorities[0]
             .clone();
 
-        let json = CpGrpcServer::config_json_for_dp(&config).expect("DP config should serialize");
+        let json =
+            CpGrpcServer::config_json_for_dp(config.clone()).expect("DP config should serialize");
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("DP config JSON should parse");
         assert!(value.get("trust_bundles").is_none());

@@ -6731,15 +6731,17 @@ fn test_redis_cached_response_with_malformed_policy_provenance_is_rejected() {
     assert!(!request_deduplication_redis_cached_response_payload_is_valid(half_present));
 }
 
-/// The body field accepts a JSON byte array as well as the base64 string the
-/// current serializer emits, so a peer on a different serializer version stays
-/// readable. Complete provenance is what admits the record; the body encoding
-/// is orthogonal and must not have been narrowed by the provenance guard.
+/// The body field is the base64 string the serializer writes. A JSON byte
+/// array is not a shape any writer produces (issue #7115), so even with
+/// complete provenance such a record is refused; the same record with a base64
+/// body is admitted.
 #[test]
-fn test_redis_cached_response_byte_array_body_with_provenance_is_accepted() {
+fn test_redis_cached_response_body_must_be_base64() {
     let byte_array_body = br#"{"fingerprint":"sha256-test","response_policy":{"gate":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","presentation":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"},"status_code":201,"headers":{},"body":[123,34,111,107,34,58,116,114,117,101,125]}"#;
+    assert!(!request_deduplication_redis_cached_response_payload_is_valid(byte_array_body));
 
-    assert!(request_deduplication_redis_cached_response_payload_is_valid(byte_array_body));
+    let base64_body = br#"{"fingerprint":"sha256-test","response_policy":{"gate":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","presentation":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"},"status_code":201,"headers":{},"body":"eyJvayI6dHJ1ZX0="}"#;
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(base64_body));
 }
 
 /// Current-version operation records have a strict state-dependent shape.

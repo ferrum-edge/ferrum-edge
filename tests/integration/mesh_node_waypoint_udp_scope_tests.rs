@@ -1909,7 +1909,7 @@ fn a_udp_port_already_claimed_by_a_stream_proxy_is_refused() {
 #[test]
 fn preparation_attaches_desired_steering_metadata_without_publishing_the_live_plan() {
     use ferrum_edge::proxy::node_waypoint_udp_steering::{
-        NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering, published_plan,
+        NodeWaypointUdpSteerBackend, NodeWaypointUdpSteering,
     };
 
     struct NoopBackend;
@@ -1929,7 +1929,6 @@ fn preparation_attaches_desired_steering_metadata_without_publishing_the_live_pl
         port: 9999,
     }];
     serving.set_bound_destinations(prior.clone(), Some(&["veth0".to_string()]), true);
-    let before_global = published_plan();
 
     let config = prepare(
         &runtime,
@@ -1949,11 +1948,6 @@ fn preparation_attaches_desired_steering_metadata_without_publishing_the_live_pl
         serving.bound_destinations(),
         prior,
         "a rejected or merely inspected candidate must leave the serving plan untouched"
-    );
-    assert_eq!(
-        published_plan().as_ref(),
-        before_global.as_ref(),
-        "read-only preparation must not mutate the process-global diagnostic plan"
     );
     std::mem::forget(serving);
 }

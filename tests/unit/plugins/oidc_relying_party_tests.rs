@@ -2314,7 +2314,7 @@ async fn none_client_auth_refuses_a_named_discovered_token_endpoint() {
             .expect("loopback discovery URL is admitted at construction");
         (server, plugin)
     }
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
     let wait = std::time::Duration::from_secs(10);
 
@@ -3144,7 +3144,7 @@ async fn oidc_discovered_jwks_store_joins_active_trust_health_after_commit() {
         .mount(&server)
         .await;
 
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let mut config = base_config();
@@ -3222,7 +3222,7 @@ async fn oidc_staged_discovery_store_is_not_exposed_before_commit() {
         .mount(&server)
         .await;
 
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let mut config = base_config();
@@ -3397,7 +3397,7 @@ async fn discovery_config_retains_explicit_optional_endpoints() {
         .mount(&server)
         .await;
 
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let mut config = base_config();
@@ -3570,6 +3570,11 @@ async fn logout_requires_a_sealed_session_and_encodes_the_id_token_hint() {
             } else {
                 assert_eq!(status_code, 200);
                 assert!(body.contains("Logged out"));
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("text/html; charset=utf-8"),
+                    "the local logged-out page is HTML, not the default JSON reject type"
+                );
                 assert!(!headers.contains_key("location"));
             }
         }
@@ -4664,6 +4669,13 @@ fn the_documented_minimal_examples_pass_admission() {
     ] {
         let example = first_oidc_yaml_example(doc)
             .unwrap_or_else(|| panic!("{source} must document an oidc_relying_party example"));
+        // Plugin config is never environment-expanded, and admission does not
+        // screen `client_secret`, so a `${NAME}` value there would be sent to
+        // the provider verbatim (issue #7275).
+        assert!(
+            !example.contains("client_secret: \"${"),
+            "{source} example must not show an environment-style client_secret"
+        );
         let document: serde_json::Value =
             serde_yaml::from_str(&example).unwrap_or_else(|e| panic!("{source} example: {e}"));
         assert_eq!(document["plugin_name"], json!("oidc_relying_party"));
@@ -4676,8 +4688,9 @@ const DEDICATED_DOC: &str = include_str!("../../../docs/oidc_relying_party.md");
 const CATALOG_DOC: &str = include_str!("../../../docs/plugins.md");
 
 /// Extract the first fenced YAML block whose `plugin_name` is this plugin,
-/// substituting the documented `${...}` environment placeholders with fixture
-/// values so admission exercises the shape rather than the operator's secrets.
+/// substituting the documented session-secret placeholder (which admission
+/// rejects as written) with a fixture value so admission exercises the shape
+/// rather than the operator's secrets.
 fn first_oidc_yaml_example(doc: &str) -> Option<String> {
     let mut remaining = doc;
     while let Some(start) = remaining.find("```yaml\n") {
@@ -4688,14 +4701,10 @@ fn first_oidc_yaml_example(doc: &str) -> Option<String> {
         if !block.starts_with("plugin_name: oidc_relying_party") {
             continue;
         }
-        return Some(
-            block
-                .replace("${OIDC_CLIENT_SECRET}", "fixture-client-secret")
-                .replace(
-                    "${OIDC_SESSION_SECRET_32_BYTES_MIN}",
-                    "9f3a7c1e5b2d8406a1c9e7f3b5d20486",
-                ),
-        );
+        return Some(block.replace(
+            "${OIDC_SESSION_SECRET_32_BYTES_MIN}",
+            "9f3a7c1e5b2d8406a1c9e7f3b5d20486",
+        ));
     }
     None
 }

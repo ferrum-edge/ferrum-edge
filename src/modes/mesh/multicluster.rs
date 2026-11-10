@@ -71,16 +71,13 @@ use crate::modes::mesh::config_consumer::common::{
     next_backoff_secs as common_next_backoff_secs,
 };
 use crate::modes::mesh::revision::{
-    DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionContentIdentity, MeshRevisionGate,
-    MeshRevisionPolicy,
+    MeshRevisionContentIdentity, MeshRevisionGate, MeshRevisionPolicy,
 };
 
 /// Backoff bounds shared with [`super::federation`] and
 /// `src/grpc/dp_client.rs`. One cross-cluster backoff curve for operators to
 /// reason about.
 pub(crate) const REMOTE_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
-#[allow(dead_code)]
-pub(crate) const DEFAULT_REMOTE_DISCOVERY_MAX_STALE_SECONDS: u64 = 300;
 
 /// Defense-in-depth cap on the number of workloads / services a single remote
 /// cluster may contribute. A misbehaving (or compromised) remote CP cannot
@@ -1411,25 +1408,7 @@ pub struct RemoteDiscoveryConfig {
 
 impl RemoteDiscoveryConfig {
     /// Returns `None` when discovery should be disabled (interval 0).
-    #[allow(dead_code)]
-    pub fn new(
-        interval_seconds: u64,
-        timeout_seconds: u64,
-        node_id: String,
-        namespace: String,
-        tls_config: RemoteDiscoveryTlsConfig,
-    ) -> Option<Self> {
-        Self::new_with_max_stale(
-            interval_seconds,
-            timeout_seconds,
-            DEFAULT_REMOTE_DISCOVERY_MAX_STALE_SECONDS,
-            DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
-            node_id,
-            namespace,
-            tls_config,
-        )
-    }
-
+    ///
     /// Explicit poll/security knobs are constructor parameters so remote-discovery
     /// cannot silently inherit defaults that weaken revision gating or JWT/TLS
     /// posture.
@@ -1656,6 +1635,15 @@ pub(crate) fn validate_control_plane_url_with_posture(
     }
     let Some(host) = parsed.host() else {
         return Err("control_plane_url has no host".to_string());
+    };
+    // An IPv4-mapped literal (`[::ffff:169.254.169.254]`) is dialed over IPv4,
+    // so it must face the IPv4 screen rather than the IPv6 one.
+    let host = match host {
+        url::Host::Ipv6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => url::Host::Ipv4(v4),
+            None => url::Host::Ipv6(ip),
+        },
+        other => other,
     };
     match host {
         url::Host::Ipv4(ip) => {
@@ -2006,12 +1994,16 @@ fn enforce_remote_trust_domain(
         belongs
     });
 
+    // Key by the namespace of the Service the workload attaches to, not the
+    // workload's own namespace: a WorkloadEntry in namespace `vm` attached to a
+    // Service in `prod` (`service_namespace: prod`) is referenced from the
+    // `prod` service, as everywhere else that matches workloads to services.
     let surviving_workload_refs: HashSet<(String, String)> = endpoints
         .workloads
         .iter()
         .map(|workload| {
             (
-                workload.namespace.clone(),
+                workload.attached_service_namespace().to_string(),
                 workload.spiffe_id.as_str().to_string(),
             )
         })
@@ -2327,6 +2319,7 @@ mod tests {
     use crate::config::types::LocalityPreference;
     use crate::identity::spiffe::SpiffeId;
     use crate::modes::mesh::config::{RemoteCluster, ServicePort, WorkloadRef, WorkloadSelector};
+    use crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
     use std::sync::Mutex;
 
     fn td(raw: &str) -> TrustDomain {
@@ -2803,6 +2796,46 @@ mod tests {
         assert!(service_names.contains(&"payments"));
         assert!(!service_names.contains(&"orphaned"));
         assert_eq!(endpoints.services[0].workloads.len(), 1);
+    }
+
+    #[test]
+    fn enforce_remote_trust_domain_keeps_refs_to_cross_namespace_attached_workloads() {
+        // A remote WorkloadEntry living in namespace `vm` but attached to a
+        // Service in `prod` (`service_namespace: prod`) is in-domain: the
+        // `prod` service's ref to it must survive the trust-domain filter.
+        let declared = td("eu-west-1.example.com");
+        let vm_spiffe = "spiffe://eu-west-1.example.com/ns/vm/sa/legacy";
+        let attached = Workload {
+            namespace: "vm".to_string(),
+            service_namespace: Some("prod".to_string()),
+            ..workload(vm_spiffe, "legacy", "10.9.0.5", None)
+        };
+        let mut prod_service = service("legacy", &[vm_spiffe]);
+        prod_service.namespace = "prod".to_string();
+        // A service in the workload's own namespace does not own the ref: the
+        // workload attaches to `prod`, so this ref is orphaned and dropped.
+        let mut vm_service = service("legacy", &[vm_spiffe]);
+        vm_service.namespace = "vm".to_string();
+
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: vec![attached],
+            services: vec![prod_service, vm_service],
+        };
+
+        enforce_remote_trust_domain(&mut endpoints, &declared, "eu-west-1");
+
+        assert_eq!(endpoints.workloads.len(), 1);
+        assert_eq!(
+            endpoints.services.len(),
+            1,
+            "only the service the workload attaches to keeps it"
+        );
+        assert_eq!(endpoints.services[0].namespace, "prod");
+        assert_eq!(endpoints.services[0].workloads.len(), 1);
+        assert_eq!(
+            endpoints.services[0].workloads[0].spiffe_id.as_str(),
+            vm_spiffe
+        );
     }
 
     #[test]
@@ -4156,6 +4189,19 @@ mod tests {
         assert!(validate_control_plane_url("ftp://cp.example").is_err());
         assert!(validate_control_plane_url("https://169.254.169.254/").is_err());
         assert!(validate_control_plane_url("not a url").is_err());
+    }
+
+    #[test]
+    fn validate_control_plane_url_screens_ipv4_mapped_literals_as_ipv4() {
+        let err = validate_control_plane_url("https://[::ffff:169.254.169.254]/")
+            .expect_err("IPv4-mapped cloud metadata literal must be rejected");
+        assert!(err.contains("link-local"), "{err}");
+        let err = validate_control_plane_url("http://[::ffff:0.0.0.0]:15012")
+            .expect_err("IPv4-mapped unspecified literal must be rejected");
+        assert!(err.contains("non-unicast IPv4"), "{err}");
+        assert!(validate_control_plane_url("grpc://[::ffff:224.0.0.1]:15012").is_err());
+        assert!(validate_control_plane_url("http://[::ffff:127.0.0.1]:15012").is_ok());
+        assert!(validate_control_plane_url("https://[::ffff:203.0.113.10]:15012").is_ok());
     }
 
     #[test]

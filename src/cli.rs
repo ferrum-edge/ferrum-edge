@@ -1265,7 +1265,6 @@ const HEALTH_MAX_INFORMATIONAL_RESPONSES: usize = 8;
 
 struct HealthResponse {
     status_code: u16,
-    status_line: String,
 }
 
 /// A TCP stream that reapplies the remaining absolute deadline before every
@@ -1458,7 +1457,10 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
     if response.status_code == 200 {
         Ok(())
     } else {
-        Err(format!("Unhealthy: {:?}", response.status_line))
+        // Report only the parsed numeric status. The reason phrase is
+        // peer-controlled text that the startup renderer withholds, so
+        // quoting it would leave the operator with no status at all.
+        Err(format!("Unhealthy: HTTP status {}", response.status_code))
     }
 }
 
@@ -1566,10 +1568,7 @@ fn parse_response_head_section(section: &[u8]) -> Result<HealthResponse, String>
         validate_response_header_line(header)?;
     }
 
-    Ok(HealthResponse {
-        status_code,
-        status_line: status_line.to_string(),
-    })
+    Ok(HealthResponse { status_code })
 }
 
 fn parse_response_status_line(status_line: &str) -> Result<u16, String> {

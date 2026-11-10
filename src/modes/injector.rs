@@ -80,7 +80,6 @@ const SIDECAR_ENV_KEYS: &[&str] = &[
     "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
     "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH",
     "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH",
-    "FERRUM_DP_GRPC_TLS_NO_VERIFY",
     "FERRUM_MESH_CONFIG_PROTOCOL",
 ];
 const SIDECAR_CONTAINER_NAME: &str = "ferrum-edge";
@@ -201,9 +200,7 @@ impl InjectorConfig {
         )?;
         let init_resources =
             container_resources_from_runtime("FERRUM_INJECTOR_INIT", default_init_resources())?;
-        let require_annotation = resolve_ferrum_var("FERRUM_INJECTOR_REQUIRE_ANNOTATION")
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(true);
+        let require_annotation = injector_bool_env("FERRUM_INJECTOR_REQUIRE_ANNOTATION", true)?;
         let capture_mode = CaptureMode::parse(
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_MODE")
                 .unwrap_or_else(|| "explicit".to_string()),
@@ -250,9 +247,7 @@ impl InjectorConfig {
             )?;
         let tls_cert_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_CERT_PATH");
         let tls_key_path = resolve_ferrum_var("FERRUM_INJECTOR_TLS_KEY_PATH");
-        let allow_plaintext = resolve_ferrum_var("FERRUM_INJECTOR_ALLOW_PLAINTEXT")
-            .and_then(|value| value.trim().parse::<bool>().ok())
-            .unwrap_or(false);
+        let allow_plaintext = injector_bool_env("FERRUM_INJECTOR_ALLOW_PLAINTEXT", false)?;
         validate_injector_tls_serving(
             tls_cert_path.as_deref(),
             tls_key_path.as_deref(),
@@ -286,6 +281,19 @@ impl InjectorConfig {
             http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
             admission_review_max_body_bytes,
         })
+    }
+}
+
+/// An injector boolean setting: unset or blank keeps `default`; anything else
+/// must be one of the repo-wide boolean spellings (`true`/`false`/`1`/`0`,
+/// case-insensitive, trimmed), so a typo fails startup instead of silently
+/// falling back to the default (issue #7237).
+fn injector_bool_env(key: &str, default: bool) -> Result<bool, String> {
+    use crate::config::env_config::EnvValue;
+    match resolve_ferrum_var(key) {
+        None => Ok(default),
+        Some(raw) if raw.trim().is_empty() => Ok(default),
+        Some(raw) => bool::parse_env(raw.trim(), key),
     }
 }
 
@@ -2349,6 +2357,15 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::task::JoinHandle;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn sidecar_env_keys_skip_rejected_dp_tls_no_verify() {
+        // `EnvConfig` rejects `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` in every
+        // mode, so forwarding it into sidecars could only be a no-op or break
+        // every injected pod (#7252).
+        assert!(!SIDECAR_ENV_KEYS.contains(&"FERRUM_DP_GRPC_TLS_NO_VERIFY"));
+        assert!(SIDECAR_ENV_KEYS.contains(&"FERRUM_DP_GRPC_TLS_CA_CERT_PATH"));
+    }
 
     fn test_resources(
         cpu_request: &str,

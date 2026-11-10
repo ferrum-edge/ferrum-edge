@@ -357,8 +357,8 @@ impl Plugin for CorrelationId {
         // projection only. The first instance in configured lifecycle order
         // also owns the canonical consumer-facing request ID. Gateway-minted
         // (omitted, rejected, or policy-overwritten inbound) values are
-        // recorded as generated so `response_caching` can omit that
-        // header/value from the shared-cache key without trusting a
+        // recorded as generated so `response_caching` and `ai_semantic_cache`
+        // can omit that header/value from their cache keys without trusting a
         // client-spoofable metadata marker.
         ctx.publish_correlation_id(
             &self.instance_metadata_key,

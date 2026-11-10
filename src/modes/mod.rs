@@ -163,7 +163,9 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
 }
 
 /// Handle pending custom-plugin database migrations at startup for the
-/// `database` and `cp` modes.
+/// `database` and `cp` modes, and again when either recovers its database
+/// after an offline or backup bootstrap (the same policy applies: in-place
+/// recovery must not be strictly weaker than a process restart).
 ///
 /// Behavior is controlled by `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS`:
 ///
@@ -187,24 +189,6 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
 /// When auto-apply is off, ordinary probe failures remain warn-only, but any
 /// typed migration-history integrity failure is fatal in every mode.
 pub(crate) async fn handle_startup_plugin_migrations(
-    db: &Arc<dyn DatabaseBackend>,
-    auto_apply: bool,
-    mode: &str,
-) -> Result<(), anyhow::Error> {
-    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
-    handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations).await
-}
-
-/// Recovery variant of [`handle_startup_plugin_migrations`].
-///
-/// Warn-only mode (`auto_apply=false`) matches ordinary startup: a pending-state
-/// non-integrity **probe failure** is logged and does not block recovered config
-/// publication (in-place recovery must not be strictly weaker than a process
-/// restart against the same database). History-integrity failures stay fatal;
-/// auto-apply mode remains fail-closed on every probe/apply error.
-/// A probe that **succeeds** and reports pending migrations still follows the
-/// warn-and-continue / auto-apply policy unchanged.
-pub(crate) async fn handle_recovery_plugin_migrations(
     db: &Arc<dyn DatabaseBackend>,
     auto_apply: bool,
     mode: &str,
@@ -242,7 +226,7 @@ pub(crate) fn start_acme_renewal_scheduler(
             );
             return None;
         };
-        crate::tls::acme::start_renewal_scheduler(
+        let handle = crate::tls::acme::start_renewal_scheduler(
             crate::tls::acme::AcmeRenewalSchedulerConfig {
                 enabled: true,
                 renew_when_remaining_days: env_config.acme_renew_when_remaining_days,
@@ -255,7 +239,14 @@ pub(crate) fn start_acme_renewal_scheduler(
                 dns_cache,
             },
             shutdown_rx,
-        )
+        );
+        if handle.is_some() {
+            info!(
+                challenge_type = challenge_type.as_str(),
+                "ACME renewal scheduler started"
+            );
+        }
+        handle
     }
 }
 
@@ -499,33 +490,10 @@ mod tests {
     use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
     use crate::config::migrations::CustomPluginMigration;
 
-    pub(super) fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
-        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        crate::diagnostic_test_interest::ensure_interest_floor();
-        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let output = bytes.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || Writer(output.clone()))
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, action);
-        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-        (result, logs)
-    }
+    // The shared capture (`tests/common/diagnostic_logs.rs`, mounted once at
+    // the crate root). CI's unit workflow runs this module's capture
+    // regression test by name, so it stays registered here too.
+    pub(super) use crate::diagnostic_test_logs::capture_logs;
 
     crate::diagnostic_test_interest::capture_regression!(capture_logs, tracing::Level::TRACE);
 

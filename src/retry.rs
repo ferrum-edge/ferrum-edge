@@ -338,7 +338,7 @@ pub fn x_gateway_error_token_for_class(class: ErrorClass) -> &'static str {
 #[inline]
 pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
     match phase {
-        "circuit_breaker_open" | "circuit_breaker" => Some(OBS_CIRCUIT_BREAKER_OPEN),
+        "circuit_breaker_open" => Some(OBS_CIRCUIT_BREAKER_OPEN),
         "adaptive_concurrency" => Some(OBS_CONCURRENCY_LIMIT),
         "overload" => Some(OBS_OVERLOAD),
         "config_stale" => Some(OBS_CONFIG_STALE),

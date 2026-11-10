@@ -84,8 +84,8 @@ mod inner {
         Upstream,
     };
     use crate::config::validation_pipeline::{
-        ConfigValidationRejection, ValidationAction, collect_rejecting_runtime_config_errors,
-        validate_plugin_file_dependencies_off_thread,
+        ConfigValidationRejection, ValidationAction, ValidationPipeline,
+        collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
     };
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use anyhow::Context;
@@ -4082,7 +4082,11 @@ mod inner {
             let doc =
                 Self::config_change_doc(sequence, namespace, resource_type, resource_id, operation);
             self.config_changes().insert_one(doc).await?;
-            self.compact_config_changes(namespace).await?;
+            // The change row is durable at this point. Compaction is
+            // housekeeping: a failure must not turn the write into an error
+            // that makes a standalone caller roll back a resource whose change
+            // row already exists (issue #7210). The next write retries it.
+            self.compact_config_changes_best_effort(namespace).await;
             // Checked, never defaulted: a zero sequence is not the monotonic
             // key the revision contract assumes.
             if sequence == 0 {
@@ -4123,9 +4127,11 @@ mod inner {
                 .collect();
             self.config_changes().insert_many(docs).await?;
 
+            // Rows are durable; compaction failures are logged, never
+            // propagated (see `record_config_change_returning_sequence`).
             let namespaces: HashSet<&str> = changes.iter().map(|change| change.namespace).collect();
             for namespace in namespaces {
-                self.compact_config_changes(namespace).await?;
+                self.compact_config_changes_best_effort(namespace).await;
             }
 
             Ok(())
@@ -10570,10 +10576,9 @@ mod inner {
                 );
             }
 
-            // Fail-closed consumer identity collisions (issue #2121): Mongo
-            // `load_full_config` does not run the SQL-side
-            // `ValidationPipeline`, so quarantine colliding consumers here
-            // directly. First-loaded consumer wins; the
+            // Fail-closed consumer identity collisions (issue #2121), parity
+            // with the SQL loader: quarantine colliding consumers before any
+            // validation runs. First-loaded consumer wins; the
             // `consumer_identity_index` collection prevents NEW collisions
             // from being committed, this guard covers pre-existing rows.
             let identity_quarantined = config.quarantine_colliding_consumer_identities();
@@ -10599,6 +10604,19 @@ mod inner {
             let consumer_quarantine_active = !identity_quarantined.is_empty()
                 || !hmac_quarantined.is_empty()
                 || !jwt_quarantined.is_empty();
+
+            // Warn-level field and host validation, parity with the SQL loader
+            // (issue #7211): backend certificate expiry/readability against
+            // `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` and the backend egress
+            // policy. Warnings only; the rejecting contract runs below.
+            ValidationPipeline::new(&mut config)
+                .validate_all_fields_with_ip_policy(
+                    self.cert_expiry_warning_days,
+                    &self.backend_allow_ips,
+                    ValidationAction::Warn,
+                )
+                .validate_hosts(ValidationAction::Warn)
+                .run()?;
 
             // Serving-mode repairability (issue #4526), parity with the SQL
             // loader: quarantine stored plugin rows the shared construction
@@ -10627,8 +10645,7 @@ mod inner {
                 config.quarantined_plugin_configs = quarantined;
             }
 
-            // Mongo does not run the SQL-side `ValidationPipeline`, but full
-            // runtime loads must still fail closed on the same rejecting
+            // Full runtime loads must fail closed on the same rejecting
             // validation contract used by SQL loads and CP updates. This
             // catches malformed routes, stream proxy shapes, dangling upstream
             // references, and invalid plugin associations before startup or
@@ -10655,6 +10672,14 @@ mod inner {
                     .into_anyhow(),
                 );
             }
+
+            // Warn-level uniqueness and plugin-config validation on the
+            // accepted snapshot, parity with the SQL loader (issue #7211).
+            ValidationPipeline::new(&mut config)
+                .validate_unique_consumer_identities(ValidationAction::Warn)
+                .validate_unique_consumer_credentials(ValidationAction::Warn)
+                .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
+                .run()?;
 
             // Match relational database full-load semantics for node-local
             // plugin files. Warning-mode validation keeps an absent MMDB a
@@ -11897,7 +11922,8 @@ mod inner {
                                             let still_referenced = this
                                                 .proxies()
                                                 .count_documents(mongodb::bson::doc! {
-                                                    "upstream_id": uid.as_str()
+                                                    "upstream_id": uid.as_str(),
+                                                    "namespace": namespace.as_str(),
                                                 })
                                                 .session(&mut *s)
                                                 .await?
@@ -13531,9 +13557,10 @@ mod inner {
                                     Box::pin(async move {
                                         let count = this
                                             .proxies()
-                                            .count_documents(
-                                                doc! { "upstream_id": upstream_id.as_str() },
-                                            )
+                                            .count_documents(doc! {
+                                                "upstream_id": upstream_id.as_str(),
+                                                "namespace": namespace.as_str(),
+                                            })
                                             .session(&mut *s)
                                             .await?;
                                         let mut deleted_namespace = None;
@@ -15341,22 +15368,26 @@ mod inner {
                         // Clear api_specs so restore doesn't leave orphaned spec metadata
                         // pointing to proxies that no longer exist.
                         self.api_specs().delete_many(ns_filter).await?;
-                        for id in proxy_ids {
-                            self.record_config_change(namespace, "proxy", &id, "delete")
-                                .await?;
-                        }
-                        for id in consumer_ids {
-                            self.record_config_change(namespace, "consumer", &id, "delete")
-                                .await?;
-                        }
-                        for id in plugin_config_ids {
-                            self.record_config_change(namespace, "plugin_config", &id, "delete")
-                                .await?;
-                        }
-                        for id in upstream_ids {
-                            self.record_config_change(namespace, "upstream", &id, "delete")
-                                .await?;
-                        }
+                        // One sequence reservation, one insert and one
+                        // compaction probe for the whole wipe instead of one
+                        // of each per deleted id (issue #7210).
+                        let changes: Vec<ConfigChangeWrite<'_>> = [
+                            ("proxy", &proxy_ids),
+                            ("consumer", &consumer_ids),
+                            ("plugin_config", &plugin_config_ids),
+                            ("upstream", &upstream_ids),
+                        ]
+                        .into_iter()
+                        .flat_map(|(resource_type, ids)| {
+                            ids.iter().map(move |id| ConfigChangeWrite {
+                                namespace,
+                                resource_type,
+                                resource_id: id.as_str(),
+                                operation: "delete",
+                            })
+                        })
+                        .collect();
+                        self.record_config_changes_batch(&changes).await?;
                     }
                     Ok(mode)
                 })
@@ -19502,36 +19533,6 @@ mod inner {
             assert_eq!(doc.get_str("id").unwrap(), "unique-id-123");
         }
 
-        #[test]
-        fn run_migrations_declares_proxy_plugin_cleanup_indexes() {
-            let source = include_str!("mongo_store.rs");
-            assert!(
-                source.contains(r#""plugins.plugin_config_id": 1"#),
-                "MongoDB must index proxy plugin associations for orphan cleanup"
-            );
-            assert!(
-                source.contains(r#""scope": 1, "_id": 1"#),
-                "MongoDB must have a scope-leading plugin_configs index for proxy_group cleanup"
-            );
-        }
-
-        #[test]
-        fn run_migrations_declares_unique_consumer_credential_indexes() {
-            let source = include_str!("mongo_store.rs");
-            assert!(
-                source.contains(r#""credentials.keyauth.key": 1"#)
-                    && source.contains(r#""credentials.mtls_auth.identity": 1"#)
-                    && source
-                        .contains(r#".keys(doc! { "namespace": 1, HMAC_SECRET_HASHES_FIELD: 1 })"#)
-                    && source.contains(".unique(true)"),
-                "MongoDB must enforce keyauth, mTLS, and HMAC credential uniqueness with indexes"
-            );
-            assert!(
-                !source.contains("drop_index(\"namespace_1_credentials.mtls_auth.identity_1\")"),
-                "mTLS index setup must never drop the exact-match uniqueness backstop"
-            );
-        }
-
         /// Regression guard for optional indexed proxy fields. MongoDB treats
         /// explicit `null` as an indexed value, so two HTTP proxies in the
         /// same namespace would collide on the unique name index when both
@@ -20569,18 +20570,28 @@ mod inner {
             );
         }
 
+        /// This file's production source, without this inline test module, so
+        /// a structural search cannot match the test's own search literals.
+        fn production_mongo_store_source() -> &'static str {
+            let source = include_str!("mongo_store.rs");
+            let tests_start = source
+                .find("    #[cfg(test)]\n    mod tests {")
+                .expect("inline test module");
+            &source[..tests_start]
+        }
+
         #[test]
         fn replace_api_spec_standalone_reinsert_implementation_inserts_plugins_before_proxy() {
-            let source = include_str!("mongo_store.rs");
+            let source = production_mongo_store_source();
             let reinsert_start = source
                 .find("// Re-insert new bundle with manual associations preserved.")
                 .expect("standalone replace_api_spec reinsert marker");
             let reinsert_path = &source[reinsert_start..];
             let plugin_insert = reinsert_path
-                .find("self.plugin_configs().insert_one(doc).await")
+                .find("self.plugin_configs().insert_one(")
                 .expect("standalone replace plugin insert");
             let proxy_insert = reinsert_path
-                .find("self.proxies().insert_one(doc).await")
+                .find("self.proxies().insert_one(")
                 .expect("standalone replace proxy insert");
             assert!(
                 plugin_insert < proxy_insert,
@@ -20605,17 +20616,27 @@ mod inner {
 
         #[test]
         fn compensate_bundle_insert_implementation_deletes_proxy_before_plugins() {
-            let source = include_str!("mongo_store.rs");
+            let source = production_mongo_store_source();
             let compensate_start = source
                 .find("async fn compensate_bundle_insert(")
                 .expect("compensate_bundle_insert function");
             let compensate_path = &source[compensate_start..];
+            // rustfmt splits these calls across lines (`self` / `.proxies()` /
+            // `.delete_one(...)`), so match the collection accessor.
             let proxy_delete = compensate_path
-                .find("self.proxies().delete_one")
+                .find(".proxies()")
                 .expect("compensating proxy delete");
             let plugin_delete = compensate_path
-                .find("self.plugin_configs().delete_one")
+                .find(".plugin_configs()")
                 .expect("compensating plugin delete");
+            for (at, what) in [(proxy_delete, "proxy"), (plugin_delete, "plugin_config")] {
+                assert!(
+                    compensate_path[at..]
+                        .split_once(')')
+                        .is_some_and(|(_, rest)| rest.trim_start().starts_with(".delete_one(")),
+                    "compensating {what} step must be a delete"
+                );
+            }
             assert!(
                 proxy_delete < plugin_delete,
                 "compensating rollback must delete the proxy before plugin_configs"

@@ -125,20 +125,6 @@ impl ResourceStoreSet {
         true
     }
 
-    pub fn remove_store(&mut self, api_version: &str, kind: &str) -> bool {
-        let Some(index) = self
-            .stores
-            .iter()
-            .position(|store| store.api_version == api_version && store.kind == kind)
-        else {
-            return false;
-        };
-
-        self.stores.remove(index);
-        self.notify_change();
-        true
-    }
-
     pub fn remove_store_for_scope(&mut self, api_version: &str, kind: &str, scope: &str) -> bool {
         let Some(index) = self.stores.iter().position(|store| {
             store.api_version == api_version && store.kind == kind && store.scope == scope
@@ -188,12 +174,6 @@ impl ResourceStoreSet {
 
         self.stores[index] = store;
         true
-    }
-
-    pub fn has_store(&self, api_version: &str, kind: &str) -> bool {
-        self.stores
-            .iter()
-            .any(|store| store.api_version == api_version && store.kind == kind)
     }
 
     pub fn has_store_for_scope(&self, api_version: &str, kind: &str, scope: &str) -> bool {
@@ -435,12 +415,12 @@ mod tests {
         let store = test_store("example.com/v1", "Widget");
 
         assert!(set.add_store(store));
-        assert!(set.has_store("example.com/v1", "Widget"));
+        assert!(set.has_store_for_scope("example.com/v1", "Widget", "all"));
         assert_eq!(*rx.borrow(), 1);
 
-        assert!(set.remove_store("example.com/v1", "Widget"));
+        assert!(set.remove_store_for_scope("example.com/v1", "Widget", "all"));
 
-        assert!(!set.has_store("example.com/v1", "Widget"));
+        assert!(!set.has_store_for_scope("example.com/v1", "Widget", "all"));
         assert_eq!(*rx.borrow(), 2);
     }
 
@@ -464,9 +444,10 @@ mod tests {
             "namespace:default",
         )));
 
-        assert!(set.has_store("example.com/v1", "Widget"));
+        assert!(set.has_store_for_scope("example.com/v1", "Widget", "namespace:default",));
         assert!(set.has_store_for_scope("example.com/v1", "Widget", "namespace:prod",));
         assert!(set.remove_store_for_scope("example.com/v1", "Widget", "namespace:default",));
+        assert!(!set.has_store_for_scope("example.com/v1", "Widget", "namespace:default",));
         assert!(set.has_store_for_scope("example.com/v1", "Widget", "namespace:prod",));
     }
 
@@ -511,8 +492,8 @@ mod tests {
             "default",
         )));
 
-        assert!(set.has_store("gateway.networking.k8s.io/v1", "TLSRoute"));
-        assert!(set.has_store("gateway.networking.k8s.io/v1alpha2", "TLSRoute",));
+        assert!(set.has_store_for_scope("gateway.networking.k8s.io/v1", "TLSRoute", "all"));
+        assert!(set.has_store_for_scope("gateway.networking.k8s.io/v1alpha2", "TLSRoute", "all"));
 
         let objects = set.snapshot_all();
 

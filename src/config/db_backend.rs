@@ -1507,9 +1507,8 @@ impl std::fmt::Display for PluginAssociationPreconditionFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "plugin config '{}' is referenced by proxies outside expected_proxy_ids: {}; re-read the namespace and retry with the current referencing set",
-            self.plugin_id,
-            self.unexpected.join(", ")
+            "plugin config {:?} is referenced by proxies outside expected_proxy_ids: {:?}; re-read the namespace and retry with the current referencing set",
+            self.plugin_id, self.unexpected
         )
     }
 }

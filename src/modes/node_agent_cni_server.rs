@@ -18,12 +18,13 @@
 //!   loop can answer back. The server then writes the response on the
 //!   same connection and closes it.
 //!
-//! Fallback semantics: when the CNI plugin is the primary enrollment path,
-//! the kube-rs watcher in `node_agent.rs` still runs and reconciles any
-//! pods the CNI hook missed (CNI install not rolled out yet, CNI plugin
-//! chain rejected, etc.). The CNI hook is an OPTIMIZATION — it gets us
-//! deterministic per-pod enrollment at sandbox-setup time, vs the watcher
-//! which races kubelet to see the pod after it is already starting.
+//! Failure semantics: the kube-rs watcher in `node_agent.rs` still runs and
+//! reconciles pods that already have a sandbox, but it is not a fallback for
+//! this listener. Once the chained conflist is installed the CNI hook is a
+//! node-wide pod-creation dependency: `ferrum-cni` fails ADD closed when this
+//! socket is missing or unreachable, so a listener that never comes up (or
+//! exits) blocks every new pod sandbox on the node until the node-agent is
+//! restarted (see `docs/node_agent.md`).
 //!
 //! Trust model: the UDS lives at a host-path mount that only the node-
 //! agent and the `ferrum-cni` binary (running as root from the kubelet)
@@ -134,7 +135,7 @@ pub fn spawn_cni_listener(
                 socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                 error = %sanitize_startup_cause(err, &[]),
                 reason = "ownership_io_error",
-                "Failed to prepare node-agent CNI socket parent; CNI plugin path will fall back to kube-rs watcher"
+                "Failed to prepare node-agent CNI socket parent; CNI ADD on this node fails closed until a node-agent restart restores the listener"
             );
             metrics.record_cni_socket_lifecycle(
                 crate::ebpf::CniSocketLifecycleReason::OwnershipIoError,
@@ -158,7 +159,7 @@ pub fn spawn_cni_listener(
                         &[]
                     ),
                     reason = "ownership_conflict",
-                    "Another live node-agent owns the CNI socket; refusing to replace it and falling back to the kube-rs watcher"
+                    "Another live node-agent owns the CNI socket; refusing to replace it. This node-agent serves no CNI calls until restarted after the owner exits"
                 );
                 return;
             }
@@ -174,7 +175,7 @@ pub fn spawn_cni_listener(
                     ),
                     error = %sanitize_startup_cause(err, &[]),
                     reason = "ownership_io_error",
-                    "Failed to acquire node-agent CNI socket ownership; falling back to the kube-rs watcher"
+                    "Failed to acquire node-agent CNI socket ownership; CNI ADD on this node fails closed until a node-agent restart restores the listener"
                 );
                 return;
             }
@@ -185,7 +186,7 @@ pub fn spawn_cni_listener(
                 socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                 error = %sanitize_startup_cause(err, &[]),
                 reason = "stale_socket_cleanup_error",
-                "Failed to remove stale node-agent CNI socket after acquiring ownership; CNI plugin path will fall back to kube-rs watcher"
+                "Failed to remove stale node-agent CNI socket after acquiring ownership; CNI ADD on this node fails closed until a node-agent restart restores the listener"
             );
             metrics.record_cni_socket_lifecycle(
                 crate::ebpf::CniSocketLifecycleReason::StaleSocketCleanupError,
@@ -207,7 +208,7 @@ pub fn spawn_cni_listener(
                 error!(
                     socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                     error = %sanitize_startup_cause(err, &[]),
-                    "Failed to create private staging directory for node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
+                    "Failed to create private staging directory for node-agent CNI socket; CNI ADD on this node fails closed until a node-agent restart restores the listener"
                 );
                 return;
             }
@@ -218,7 +219,7 @@ pub fn spawn_cni_listener(
                 error!(
                     socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                     error = %sanitize_startup_cause(err, &[]),
-                    "Failed to bind node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
+                    "Failed to bind node-agent CNI socket; CNI ADD on this node fails closed until a node-agent restart restores the listener"
                 );
                 cleanup_private_socket_stage(&stage);
                 return;
@@ -230,7 +231,7 @@ pub fn spawn_cni_listener(
             error!(
                 socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                 error = %sanitize_startup_cause(err, &[]),
-                "Failed to chmod node-agent CNI socket to 0660 before publish; aborting CNI listener (falling back to kube-rs watcher)"
+                "Failed to chmod node-agent CNI socket to 0660 before publish; aborting CNI listener; CNI ADD on this node fails closed until a node-agent restart restores the listener"
             );
             cleanup_private_socket_stage(&stage);
             return;
@@ -259,7 +260,7 @@ pub fn spawn_cni_listener(
                 socket_path = %sanitize_startup_cause(format!("{socket_path:?}"), &[]),
                 error = %sanitize_startup_cause(err, &[]),
                 reason = "handoff_publication_error",
-                "Failed to publish node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
+                "Failed to publish node-agent CNI socket; CNI ADD on this node fails closed until a node-agent restart restores the listener"
             );
             cleanup_private_socket_stage(&stage);
             return;

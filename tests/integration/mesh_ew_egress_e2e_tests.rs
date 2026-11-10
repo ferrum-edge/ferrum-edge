@@ -26,12 +26,14 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MultiClusterConfig, Resolution, ServiceEntry,
     ServiceEntryLocation, ServicePort, ServiceTargetPort, WorkloadPort,
 };
-use ferrum_edge::modes::mesh::prepare_gateway_config_for_mesh;
 use ferrum_edge::modes::mesh::{MeshTopology, runtime::MeshRuntimeState};
+use ferrum_edge::modes::mesh::{
+    prepare_gateway_config_for_mesh, prepare_gateway_config_from_mesh_slice,
+};
 
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, default_mesh_runtime, gateway_config_with_mesh, mesh_config_with,
-    runtime_for_topology, service_for, workload_for,
+    mesh_slice_with, runtime_for_topology, service_for, workload_for,
 };
 
 // ── East-West gateway materialization ─────────────────────────────────────
@@ -650,9 +652,10 @@ fn k8s_tcp_and_sctp_service_translates_and_routes_in_cluster() {
 /// 9090) and a DISTINCT single-port service literally named `foo-p8080` must NOT
 /// clobber each other in the materializer's id-keyed upsert map. The per-port id
 /// separator is `.` (a character a DNS-1035/1123 k8s service name cannot
-/// contain), so `foo`'s :8080 alias id is `__mesh-ew-svc-default-foo.p8080`
-/// while `foo-p8080`'s :8080 alias id is `__mesh-ew-svc-default-foo-p8080.p8080`
-/// — distinct. A `-p8080` marker would have produced the SAME id for both.
+/// contain, and the name encoder never emits), so `foo`'s :8080 alias id is
+/// `__mesh-ew-svc-default-foo.p8080` while `foo-p8080`'s :8080 alias id is
+/// `__mesh-ew-svc-default-foo_dash_p8080.p8080` — distinct. A `-p8080` marker
+/// would have produced the SAME id for both.
 #[test]
 fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     let foo_wl = workload_for("foo", DEFAULT_NAMESPACE, [("app", "foo")], ["10.0.0.1"]);
@@ -699,14 +702,16 @@ fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     assert!(has_upstream("__mesh-ew-upstream-default-foo.p8080"));
     assert!(has_upstream("__mesh-ew-upstream-default-foo.p9090"));
 
-    // `foo-p8080`'s alias id carries the `-p8080` name literally — a DIFFERENT
-    // string from foo's `.p8080` alias, so neither was overwritten.
+    // `foo-p8080`'s alias id carries the encoded `_dash_p8080` name — a
+    // DIFFERENT string from foo's `.p8080` alias, so neither was overwritten.
     assert!(
-        has_proxy("__mesh-ew-svc-default-foo-p8080.p8080"),
+        has_proxy("__mesh-ew-svc-default-foo_dash_p8080.p8080"),
         "the distinct `foo-p8080` service's proxy must survive (not clobbered), got {:?}",
         prepared.proxies.iter().map(|p| &p.id).collect::<Vec<_>>()
     );
-    assert!(has_upstream("__mesh-ew-upstream-default-foo-p8080.p8080"));
+    assert!(has_upstream(
+        "__mesh-ew-upstream-default-foo_dash_p8080.p8080"
+    ));
 
     // Both services keep their own backend: foo's alias backends 8080/9090,
     // foo-p8080's upstream backends its 8080 workload port — no cross-wiring.
@@ -719,9 +724,62 @@ fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
     let collide_up = prepared
         .upstreams
         .iter()
-        .find(|u| u.id == "__mesh-ew-upstream-default-foo-p8080.p8080")
+        .find(|u| u.id == "__mesh-ew-upstream-default-foo_dash_p8080.p8080")
         .expect("foo-p8080 upstream");
     assert!(collide_up.targets.iter().all(|t| t.host == "10.0.0.2"));
+}
+
+/// Issue #7235: every east-west service proxy/upstream is stamped with the
+/// GATEWAY's namespace, so a slice spanning namespaces puts services from all of
+/// them in one id space. `a`/`b-c` and `a-b`/`c` dash-join to the same string;
+/// the namespace and name are encoded injectively so neither overwrites the
+/// other's SNI passthrough route.
+#[test]
+fn east_west_service_ids_stay_distinct_across_dash_joined_namespaces() {
+    let runtime = east_west_runtime();
+    let first_wl = workload_for("b-c", "a", [("app", "b-c")], ["10.0.0.1"]);
+    let second_wl = workload_for("c", "a-b", [("app", "c")], ["10.0.0.2"]);
+    let first = service_for("b-c", "a", &[&first_wl]);
+    let second = service_for("c", "a-b", &[&second_wl]);
+    let slice = mesh_slice_with(
+        &runtime,
+        vec![first_wl, second_wl],
+        vec![first, second],
+        Vec::new(),
+    );
+
+    let prepared = prepare_gateway_config_from_mesh_slice(&slice, &runtime).expect("prepared");
+
+    let route_for = |sni: &str| {
+        prepared
+            .proxies
+            .iter()
+            .find(|proxy| proxy.hosts.iter().any(|host| host == sni))
+            .unwrap_or_else(|| {
+                panic!(
+                    "east-west route for {sni} must survive, got {:?}",
+                    prepared.proxies.iter().map(|p| &p.id).collect::<Vec<_>>()
+                )
+            })
+    };
+    let first_route = route_for("p8080.b-c.a.svc.cluster.local");
+    let second_route = route_for("p8080.c.a-b.svc.cluster.local");
+    assert_ne!(first_route.id, second_route.id);
+    assert_ne!(first_route.upstream_id, second_route.upstream_id);
+    let targets_of = |proxy: &ferrum_edge::config::types::Proxy| {
+        let upstream_id = proxy.upstream_id.as_deref().expect("upstream-backed");
+        prepared
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.id == upstream_id)
+            .expect("upstream materialized")
+            .targets
+            .iter()
+            .map(|target| target.host.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(targets_of(first_route), vec!["10.0.0.1".to_string()]);
+    assert_eq!(targets_of(second_route), vec!["10.0.0.2".to_string()]);
 }
 
 #[test]
@@ -1112,6 +1170,107 @@ fn egress_gateway_materialises_distinct_proxies_per_external_entry() {
         .find(|p| p.hosts.iter().any(|h| h.contains("b.example.com")))
         .expect("b proxy");
     assert_ne!(a_proxy.id, b_proxy.id, "distinct proxy IDs per entry");
+}
+
+/// A DNS-valid external host (four 60-character labels) whose generated
+/// EgressGateway ids exceed the 254-character resource id bound once the
+/// injective id encoder expands each `.`.
+fn overlong_egress_host() -> String {
+    let label = |c: char| std::iter::repeat_n(c, 60).collect::<String>();
+    format!(
+        "{}.{}.{}.{}.com",
+        label('a'),
+        label('b'),
+        label('c'),
+        label('d')
+    )
+}
+
+fn assert_ids_fit_the_resource_id_bound(prepared: &ferrum_edge::config::types::GatewayConfig) {
+    for id in prepared
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .chain(
+            prepared
+                .upstreams
+                .iter()
+                .map(|upstream| upstream.id.as_str()),
+        )
+    {
+        assert!(id.len() <= 254, "id {id:?} exceeds the resource id bound");
+    }
+}
+
+#[test]
+fn egress_gateway_skips_a_service_entry_whose_ids_would_be_overlong() {
+    // Issue #7234: one ServiceEntry with a long host used to produce ids the
+    // runtime validator rejects, failing the whole slice apply. It is skipped
+    // instead, and the other entries still materialize.
+    let long_host = overlong_egress_host();
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries
+        .push(external_service_entry("long", &long_host, 443));
+    mesh.service_entries.push(external_service_entry(
+        "payments",
+        "payments.example.com",
+        443,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+
+    let prepared = prepare_gateway_config_for_mesh(config, &egress_runtime()).expect("prepared");
+
+    assert_ids_fit_the_resource_id_bound(&prepared);
+    assert!(
+        prepared
+            .proxies
+            .iter()
+            .all(|proxy| !proxy.hosts.contains(&long_host)),
+        "the over-long entry must not materialize"
+    );
+    assert!(
+        prepared.proxies.iter().any(|proxy| proxy
+            .hosts
+            .iter()
+            .any(|host| host == "payments.example.com")),
+        "other ServiceEntries still materialize"
+    );
+}
+
+#[test]
+fn egress_gateway_skips_an_overlong_stream_entry_without_claiming_its_port() {
+    // The skipped stream entry must not consume its listen_port: a valid
+    // ServiceEntry on the same port still gets the listener.
+    let long_host = overlong_egress_host();
+    let mut mesh = mesh_config_with(Vec::new(), Vec::new(), Vec::new());
+    mesh.service_entries.push(external_stream_service_entry(
+        "a-long",
+        &long_host,
+        5432,
+        AppProtocol::Tcp,
+    ));
+    mesh.service_entries.push(external_stream_service_entry(
+        "b-db",
+        "db.example.com",
+        5432,
+        AppProtocol::Tcp,
+    ));
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+
+    let prepared = prepare_gateway_config_for_mesh(config, &egress_runtime()).expect("prepared");
+
+    assert_ids_fit_the_resource_id_bound(&prepared);
+    let stream_proxies: Vec<&str> = prepared
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.listen_port == Some(5432))
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    assert_eq!(stream_proxies.len(), 1, "got {stream_proxies:?}");
+    assert!(
+        stream_proxies[0].contains("db_dot_example_dot_com"),
+        "the valid entry owns the port, got {stream_proxies:?}"
+    );
 }
 
 // ── T5-A: stream-family egress materialization ───────────────────────────

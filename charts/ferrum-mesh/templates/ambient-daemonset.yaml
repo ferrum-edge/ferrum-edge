@@ -318,10 +318,7 @@
 {{- if or $ambientUdpLifecycle $nodeWaypointUdpListeners -}}
 {{- $ambientImageTag = include "ferrum-mesh.toolsImageTag" $ambientImageTag -}}
 {{- else if or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint") -}}
-{{- /* "-ebpf-tools" already satisfies this tier, so never suffix it again. */ -}}
-{{- if not (or (hasSuffix "-ebpf" $ambientImageTag) (hasSuffix "-ebpf-tools" $ambientImageTag)) -}}
-{{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
-{{- end -}}
+{{- $ambientImageTag = include "ferrum-mesh.ebpfImageTag" $ambientImageTag -}}
 {{- end -}}
 {{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}
 apiVersion: apps/v1

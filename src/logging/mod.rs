@@ -250,69 +250,74 @@ pub fn render_prometheus() -> String {
     let Some(sinks) = PROCESS_LOG_SINKS.get() else {
         return String::new();
     };
+    let rows = [
+        (sinks.stdout.snapshot(), &sinks.stdout_errors),
+        (sinks.stderr.snapshot(), &sinks.stderr_errors),
+    ];
+    // The text exposition format expects each family's HELP, TYPE and samples
+    // as one contiguous group, so emit family by family across both sinks.
     let mut output = String::with_capacity(2_048);
     output.push_str(
         "# HELP ferrum_log_sink_healthy Whether the process log sink has recovered from its latest I/O or drain failure.\n\
 # TYPE ferrum_log_sink_healthy gauge\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_healthy{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            u8::from(snapshot.healthy)
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_queued_records Records admitted but not yet completed.\n\
 # TYPE ferrum_log_sink_queued_records gauge\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_queued_records{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            snapshot.queued_records
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_reserved_bytes Byte budget reserved by admitted records.\n\
 # TYPE ferrum_log_sink_reserved_bytes gauge\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_reserved_bytes{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            snapshot.reserved_bytes
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_queued_bytes Serialized bytes admitted but not yet completed.\n\
 # TYPE ferrum_log_sink_queued_bytes gauge\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_queued_bytes{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            snapshot.queued_bytes
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_accepted_records_total Records accepted by the bounded process log sink.\n\
 # TYPE ferrum_log_sink_accepted_records_total counter\n",
     );
+    for (snapshot, _) in &rows {
+        output.push_str(&format!(
+            "ferrum_log_sink_accepted_records_total{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
+            snapshot.accepted_records_total
+        ));
+    }
     output.push_str(
         "# HELP ferrum_log_sink_dropped_records_total Log records dropped by bounded admission.\n\
 # TYPE ferrum_log_sink_dropped_records_total counter\n",
     );
-    output.push_str(
-        "# HELP ferrum_log_sink_shutdown_timeouts_total Bounded process log drain deadlines reached.\n\
-# TYPE ferrum_log_sink_shutdown_timeouts_total counter\n",
-    );
-    output.push_str(
-        "# HELP ferrum_log_sink_shutdown_incomplete_records_total Records still outstanding when a bounded drain deadline was reached.\n\
-# TYPE ferrum_log_sink_shutdown_incomplete_records_total counter\n",
-    );
-    output.push_str(
-        "# HELP ferrum_log_sink_io_failures_total Underlying writer and flush failures.\n\
-# TYPE ferrum_log_sink_io_failures_total counter\n",
-    );
-    for (sink, error_counter) in [
-        (&sinks.stdout, &sinks.stdout_errors),
-        (&sinks.stderr, &sinks.stderr_errors),
-    ] {
-        let snapshot = sink.snapshot();
+    for (snapshot, error_counter) in &rows {
         let name = snapshot.sink.as_str();
-        output.push_str(&format!(
-            "ferrum_log_sink_healthy{{sink=\"{name}\"}} {}\n",
-            u8::from(snapshot.healthy)
-        ));
-        output.push_str(&format!(
-            "ferrum_log_sink_queued_records{{sink=\"{name}\"}} {}\n",
-            snapshot.queued_records
-        ));
-        output.push_str(&format!(
-            "ferrum_log_sink_reserved_bytes{{sink=\"{name}\"}} {}\n",
-            snapshot.reserved_bytes
-        ));
-        output.push_str(&format!(
-            "ferrum_log_sink_queued_bytes{{sink=\"{name}\"}} {}\n",
-            snapshot.queued_bytes
-        ));
-        output.push_str(&format!(
-            "ferrum_log_sink_accepted_records_total{{sink=\"{name}\"}} {}\n",
-            snapshot.accepted_records_total
-        ));
         for (reason, value) in [
             ("saturation", error_counter.saturation_dropped_records()),
             (
@@ -325,14 +330,35 @@ pub fn render_prometheus() -> String {
                 "ferrum_log_sink_dropped_records_total{{sink=\"{name}\",reason=\"{reason}\"}} {value}\n"
             ));
         }
+    }
+    output.push_str(
+        "# HELP ferrum_log_sink_shutdown_timeouts_total Bounded process log drain deadlines reached.\n\
+# TYPE ferrum_log_sink_shutdown_timeouts_total counter\n",
+    );
+    for (snapshot, _) in &rows {
         output.push_str(&format!(
-            "ferrum_log_sink_shutdown_timeouts_total{{sink=\"{name}\"}} {}\n",
+            "ferrum_log_sink_shutdown_timeouts_total{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
             snapshot.shutdown_timeouts_total
         ));
+    }
+    output.push_str(
+        "# HELP ferrum_log_sink_shutdown_incomplete_records_total Records still outstanding when a bounded drain deadline was reached.\n\
+# TYPE ferrum_log_sink_shutdown_incomplete_records_total counter\n",
+    );
+    for (snapshot, _) in &rows {
         output.push_str(&format!(
-            "ferrum_log_sink_shutdown_incomplete_records_total{{sink=\"{name}\"}} {}\n",
+            "ferrum_log_sink_shutdown_incomplete_records_total{{sink=\"{}\"}} {}\n",
+            snapshot.sink.as_str(),
             snapshot.shutdown_incomplete_records_total
         ));
+    }
+    output.push_str(
+        "# HELP ferrum_log_sink_io_failures_total Underlying writer and flush failures.\n\
+# TYPE ferrum_log_sink_io_failures_total counter\n",
+    );
+    for (snapshot, _) in &rows {
+        let name = snapshot.sink.as_str();
         for (operation, value) in [
             ("write", snapshot.writer_failures_total),
             ("flush", snapshot.flush_failures_total),

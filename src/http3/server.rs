@@ -4962,6 +4962,7 @@ async fn handle_h3_request(
                     plugin_execution_ns,
                     authorization_expiry,
                     upload_bound.route_wins(),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -5191,6 +5192,7 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                         authorization_expiry,
                         upload_bound.route_wins(),
+                        None,
                     )
                     .await?;
                     return Ok(());
@@ -5497,6 +5499,7 @@ async fn handle_h3_request(
                     plugin_execution_ns,
                     authorization_expiry,
                     upload_bound.route_wins(),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -6836,6 +6839,7 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                         authorization_expiry,
                         false,
+                        Some(&original_request_path),
                     )
                     .await?;
                     return Ok(());
@@ -7205,13 +7209,14 @@ async fn handle_h3_request(
                 };
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 record_request(&state, log_status_code);
-                log_rejected_request(
+                log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     log_status_code,
                     start_time,
-                    "circuit_breaker",
+                    "circuit_breaker_open",
                     plugin_execution_ns,
+                    Some(&original_request_path),
                 )
                 .await;
                 if deadline_replaced && grpc_web_response_content_type.is_some() {
@@ -7301,6 +7306,7 @@ async fn handle_h3_request(
                 start_time,
                 plugin_execution_ns,
                 &cb_probe,
+                Some(&original_request_path),
             )
             .await?
             {
@@ -7393,6 +7399,7 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                         authorization_expiry,
                         false,
+                        Some(&original_request_path),
                     )
                     .await?;
                     return Ok(());
@@ -8229,6 +8236,7 @@ async fn handle_h3_request(
                                 plugin_execution_ns,
                                 authorization_expiry,
                                 false,
+                                Some(&original_request_path),
                             )
                             .await?;
                             return Ok(());
@@ -8462,6 +8470,7 @@ async fn handle_h3_request(
             start_time,
             plugin_execution_ns,
             &cb_probe,
+            Some(&original_request_path),
         )
         .await?
         {
@@ -8635,17 +8644,19 @@ async fn handle_h3_request(
                         e.request_on_wire(),
                         None,
                     );
-                    record_request(&state, 413);
+                    const UPLOAD_TOO_LARGE_BODY: &str =
+                        r#"{"error":"Request body exceeds maximum size"}"#;
                     // Do NOT propagate a send error: the outcome record below
                     // releases the CB probe slot and the admission outcome, so
                     // a `?` here would skip them when the client disconnects
                     // during the 413 write.
-                    let _ = send_h3_response(
+                    let reject_sent = send_h3_response(
                         &mut stream,
                         StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        UPLOAD_TOO_LARGE_BODY,
                     )
-                    .await;
+                    .await
+                    .is_ok();
                     // Record the outcome for this early return too (the
                     // connection guard above releases the least-connections
                     // count on its own). An oversized client body is
@@ -8689,6 +8700,65 @@ async fn handle_h3_request(
                         Some(crate::retry::ErrorClass::ClientDisconnect),
                         backend_admission_start.elapsed(),
                     );
+                    // The refusal reaches access logs and log-sink plugins like
+                    // the dispatch-failure arm below (issue #7157), and is
+                    // counted once, after its log.
+                    // Heap-pinned: this handler's frame is close to the debug-build
+                    // worker stack budget (see `boxed_proxy_to_backend_h3_streaming`).
+                    Box::pin(async {
+                        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                        let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                        let plugin_external_io_ms = ctx
+                            .plugin_http_call_ns
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as f64
+                            / 1_000_000.0;
+                        let gateway_processing_ms = total_ms - backend_total_ms;
+                        let summary = TransactionSummary {
+                            namespace: proxy.namespace.clone(),
+                            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                            client_ip: ctx.client_ip.clone(),
+                            consumer_username: ctx.effective_identity().map(str::to_owned),
+                            auth_method: ctx.auth_method,
+                            http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
+                            request_path: original_request_path.clone(),
+                            proxy_id: Some(proxy.id.clone()),
+                            proxy_name: proxy.name.clone(),
+                            backend_target: Some(strip_query_params(&backend_url).to_string()),
+                            backend_resolved_ip: backend_resolved_ip.clone(),
+                            response_status_code: 413,
+                            latency_total_ms: total_ms,
+                            latency_gateway_processing_ms: gateway_processing_ms,
+                            latency_backend_ttfb_ms: backend_total_ms,
+                            latency_backend_total_ms: backend_total_ms,
+                            latency_plugin_execution_ms: plugin_execution_ms,
+                            latency_plugin_external_io_ms: plugin_external_io_ms,
+                            latency_gateway_overhead_ms: (gateway_processing_ms
+                                - plugin_execution_ms)
+                                .max(0.0),
+                            request_user_agent: proxy_headers.get("user-agent").cloned(),
+                            error_class: Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+                            body_completed: reject_sent,
+                            client_disconnected: !reject_sent,
+                            // Built after the H3 reject send settled.
+                            response_delivery: crate::plugins::ResponseDelivery::Observed,
+                            bytes_received: if reject_sent {
+                                UPLOAD_TOO_LARGE_BODY.len() as u64
+                            } else {
+                                0
+                            },
+                            bytes_sent: request_body_bytes_seen
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            metadata: crate::proxy::clone_log_metadata(&ctx),
+                            ai_usage_export: ctx.ai_usage_export.clone(),
+                            proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+                            ..TransactionSummary::default()
+                        };
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                    })
+                    .await;
+                    record_request(&state, 413);
                     return Ok(());
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
@@ -8906,7 +8976,7 @@ async fn handle_h3_request(
             // Do NOT propagate a send error: the outcome record below releases
             // the CB probe slot and the admission outcome, so a `?` here would
             // skip them when the client disconnects during the reject write.
-            let _ = send_h3_response_too_large(&mut stream, &ctx).await;
+            let reject_sent = send_h3_response_too_large(&mut stream, &ctx).await.is_ok();
 
             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                 &state,
@@ -8941,6 +9011,58 @@ async fn handle_h3_request(
                 Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
                 backend_admission_response_elapsed,
             );
+            // The refusal reaches access logs and log-sink plugins like the
+            // dispatch-failure arm above and the refined/buffered relays'
+            // oversize terminal (issue #7157). Request bytes were forwarded; no
+            // backend response body was relayed.
+            // Heap-pinned: this handler's frame is close to the debug-build
+            // worker stack budget (see `boxed_proxy_to_backend_h3_streaming`).
+            Box::pin(async {
+                let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                let plugin_external_io_ms =
+                    ctx.plugin_http_call_ns
+                        .load(std::sync::atomic::Ordering::Relaxed) as f64
+                        / 1_000_000.0;
+                let gateway_processing_ms = total_ms - backend_total_ms;
+                let summary = TransactionSummary {
+                    namespace: proxy.namespace.clone(),
+                    timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                    client_ip: ctx.client_ip.clone(),
+                    consumer_username: ctx.effective_identity().map(str::to_owned),
+                    auth_method: ctx.auth_method,
+                    http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
+                    request_path: original_request_path.clone(),
+                    proxy_id: Some(proxy.id.clone()),
+                    proxy_name: proxy.name.clone(),
+                    backend_target: Some(strip_query_params(&backend_url).to_string()),
+                    backend_resolved_ip: backend_resolved_ip.clone(),
+                    response_status_code: 502,
+                    latency_total_ms: total_ms,
+                    latency_gateway_processing_ms: gateway_processing_ms,
+                    latency_backend_ttfb_ms: backend_admission_response_elapsed.as_secs_f64()
+                        * 1000.0,
+                    latency_backend_total_ms: backend_total_ms,
+                    latency_plugin_execution_ms: plugin_execution_ms,
+                    latency_plugin_external_io_ms: plugin_external_io_ms,
+                    latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms)
+                        .max(0.0),
+                    request_user_agent: proxy_headers.get("user-agent").cloned(),
+                    error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+                    body_completed: reject_sent,
+                    client_disconnected: !reject_sent,
+                    // Built after the H3 reject send settled.
+                    response_delivery: crate::plugins::ResponseDelivery::Observed,
+                    bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
+                    metadata: crate::proxy::clone_log_metadata(&ctx),
+                    ai_usage_export: ctx.ai_usage_export.clone(),
+                    proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+                    ..TransactionSummary::default()
+                };
+                crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+            })
+            .await;
             record_request(&state, 502);
             return Ok(());
         }
@@ -9050,7 +9172,7 @@ async fn handle_h3_request(
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 auth_method: ctx.auth_method,
                 http_method: crate::proxy::logged_http_method(&ctx, method.to_string()),
-                request_path: path.clone(),
+                request_path: original_request_path.clone(),
                 proxy_id: Some(proxy.id.clone()),
                 proxy_name: proxy.name.clone(),
                 backend_target: Some(strip_query_params(&backend_url).to_string()),
@@ -10055,6 +10177,7 @@ async fn handle_h3_request(
                     plugin_execution_ns,
                     authorization_expiry,
                     false,
+                    Some(&original_request_path),
                 )
                 .await?;
                 return Ok(());
@@ -10241,13 +10364,14 @@ async fn handle_h3_request(
                 &headers,
             );
             record_request(&state, log_status_code);
-            log_rejected_request(
+            log_rejected_request_with_path(
                 &plugins,
                 &ctx,
                 log_status_code,
                 start_time,
                 "on_final_request_body",
                 plugin_execution_ns,
+                Some(&original_request_path),
             )
             .await;
             send_h3_plugin_reject_flavor_aware(
@@ -10284,6 +10408,7 @@ async fn handle_h3_request(
                 start_time,
                 plugin_execution_ns,
                 &cb_probe,
+                Some(&original_request_path),
             )
             .await?
             {
@@ -10495,17 +10620,11 @@ async fn handle_h3_request(
         //     `recv_response` reports `request_on_wire=true` →
         //     `connection_error=false`, matching the buffered path and
         //     achieving the PR's primary goal.
-        let connection_error = match (h3_error_class, h3_stream_result.body_error_class) {
-            (None, None) => false,
-            (_, Some(crate::retry::ErrorClass::ReadWriteTimeout)) => false,
-            (None, Some(crate::retry::ErrorClass::ClientDisconnect)) => false,
-            (None, Some(_)) => true,
-            (Some(_), Some(_)) => true,
-            (Some(_), None) => h3_connection_error(
-                h3_stream_result.request_on_wire,
-                h3_stream_result.error_class,
-            ),
-        };
+        let connection_error = h3_stream_result_connection_error(
+            h3_error_class,
+            h3_stream_result.body_error_class,
+            h3_stream_result.request_on_wire,
+        );
         // Prefer the body class so a body-only ClientDisconnect is recognized as
         // a client-side (non-backend) signal by passive health / the breaker
         // instead of a phantom success (the terminal `h3_error_class` is None for
@@ -11069,6 +11188,7 @@ async fn handle_h3_request(
                     start_time,
                     plugin_execution_ns,
                     &cb_probe,
+                    Some(&original_request_path),
                 )
                 .await?
                 {
@@ -11185,7 +11305,7 @@ async fn handle_h3_request(
                             attempt_headers,
                         ),
                         current_target.as_deref(),
-                        Some(&body_data[..]),
+                        Some(&body_data),
                         false,
                         &plugins,
                         &ctx,
@@ -12244,6 +12364,9 @@ async fn run_h3_backend_admission_or_send_reject(
     start_time: std::time::Instant,
     plugin_execution_ns: u64,
     cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    // The client's path before any route-override rewrite, recorded as the
+    // summary's `request_path` (issue #7158). `None` only before the rewrite.
+    original_request_path: Option<&str>,
 ) -> Result<Result<Option<BackendAdmissionPermitSet>, ()>, anyhow::Error> {
     match crate::proxy::backend_dispatch::run_backend_admission_plugins(
         state,
@@ -12310,13 +12433,14 @@ async fn run_h3_backend_admission_or_send_reject(
                 &rejection.plugin_name,
                 log_status_code,
             );
-            log_rejected_request(
+            log_rejected_request_with_path(
                 plugins,
                 ctx,
                 log_status_code,
                 start_time,
                 &rejection.plugin_name,
                 plugin_execution_ns,
+                original_request_path,
             )
             .await;
             if deadline_replaced && grpc_web_response_content_type.is_some() {
@@ -12742,6 +12866,27 @@ fn h3_connection_error(
                     | crate::retry::ErrorClass::ClientDisconnect
             )
         )
+}
+
+/// `connection_error` for a native-H3 streaming result
+/// (`H3StreamResult`), keyed on `(error_class, body_error_class)`.
+///
+/// The arms and their reasons are documented at the one production caller in
+/// `handle_h3_request`'s streaming branch; `h3_streaming_outcome_tests` pins
+/// each shape against this function, not against a copy.
+fn h3_stream_result_connection_error(
+    error_class: Option<crate::retry::ErrorClass>,
+    body_error_class: Option<crate::retry::ErrorClass>,
+    request_on_wire: bool,
+) -> bool {
+    match (error_class, body_error_class) {
+        (None, None) => false,
+        (_, Some(crate::retry::ErrorClass::ReadWriteTimeout)) => false,
+        (None, Some(crate::retry::ErrorClass::ClientDisconnect)) => false,
+        (None, Some(_)) => true,
+        (Some(_), Some(_)) => true,
+        (Some(_), None) => h3_connection_error(request_on_wire, error_class),
+    }
 }
 
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
@@ -15813,6 +15958,7 @@ async fn dispatch_grpc_native_h3(
         start_time,
         *plugin_execution_ns,
         cb_probe,
+        Some(original_request_path),
     )
     .await?
     {
@@ -20098,6 +20244,9 @@ async fn finalize_h3_upload_deadline_rejection(
     // #6008). Captured at composition, because the rule is not armed on `ctx`
     // until `before_proxy` selects it.
     early_route_won: bool,
+    // The client's path before any route-override rewrite, recorded as the
+    // summary's `request_path` (issue #7158). `None` only before the rewrite.
+    original_request_path: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     let route = crate::http3::route_deadline::H3RouteDeadlines::from_ctx(ctx);
     let route_timeout =
@@ -20184,13 +20333,14 @@ async fn finalize_h3_upload_deadline_rejection(
     .await;
     let log_status =
         h3_reject_log_status_and_metadata(ctx, flavor, http_status, &reject.body, &reject.headers);
-    log_rejected_request(
+    log_rejected_request_with_path(
         plugins,
         ctx,
         log_status,
         start_time,
         rejection_phase,
         plugin_execution_ns,
+        original_request_path,
     )
     .await;
     record_request(state, log_status);
@@ -21858,26 +22008,28 @@ mod h3_request_body_timeout_tests {
         use crate::circuit_breaker::CircuitBreaker;
         use crate::config::types::CircuitBreakerConfig;
 
-        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+        let cb = std::sync::Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 1,
             success_threshold: 1,
             timeout_seconds: 0,
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
-        });
+        }));
         cb.record_failure(500, false, false);
-        assert!(
-            cb.can_execute().unwrap(),
-            "the H3 request claims the probe slot"
-        );
+        let (ticket, _) = cb.admit().expect("the H3 request claims the probe slot");
+        assert!(ticket.is_probe(), "the H3 request claims the probe slot");
+        let cb_probe = crate::proxy::HalfOpenProbeGuard::new(Some(&cb), ticket);
         assert_eq!(cb.half_open_in_flight(), 1);
 
         let stalled_upload = std::future::pending::<Result<(), ()>>();
         let result = super::collect_h3_request_body_with_timeout(stalled_upload, 10).await;
         assert_eq!(result, Err(super::H3RequestBodyReadError::TimedOut));
 
-        cb.record_neutral(true);
+        // The post-admission buffered-upload timeout arm releases the slot
+        // through the request's probe guard.
+        cb_probe.release_neutral();
+        assert!(!cb_probe.holds_slot());
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");
         assert!(
@@ -22277,22 +22429,10 @@ mod h3_streaming_outcome_tests {
         );
     }
 
-    /// Mirrors the predicate in `handle_h3_request`'s streaming branch.
-    /// Kept as a free function so the test can assert against it
-    /// without setting up the full handler harness.
-    fn streaming_path_connection_error(
-        error_class: Option<ErrorClass>,
-        body_error_class: Option<ErrorClass>,
-        request_on_wire: bool,
-    ) -> bool {
-        match (error_class, body_error_class) {
-            (None, None) => false,
-            (None, Some(ErrorClass::ClientDisconnect)) => false,
-            (None, Some(_)) => true,
-            (Some(_), Some(_)) => true,
-            (Some(_), None) => !request_on_wire,
-        }
-    }
+    // The production predicate `handle_h3_request`'s streaming branch
+    // calls; the tests below exercise it directly (issue #7176: they
+    // previously asserted a drifted private copy).
+    use super::h3_stream_result_connection_error as streaming_path_connection_error;
 
     #[test]
     fn dispatch_graceful_close_is_not_connection_error() {
@@ -22369,36 +22509,77 @@ mod h3_streaming_outcome_tests {
     }
 
     #[test]
-    fn mid_body_abort_is_connection_error_regardless_of_status() {
+    fn mid_body_abort_is_connection_error() {
         // Headers were flushed (status from backend, anywhere from 2xx
         // to 5xx); body then aborted, setting both terminal_error_class
         // AND body_error_class. The body_error_class is the
         // discriminator — covers the case where the BACKEND emitted a
         // 5xx status and then truncated the body, which the previous
         // status-shape predicate mis-classified as a dispatch failure
-        // and let through as connection_error=false.
+        // and let through as connection_error=false. The HTTP status is
+        // not an input to the predicate.
         //
         // Both arms `(Some(_), Some(_))` and `(None, Some(non-ClientDisconnect))`
-        // collapse to true; this test exercises the former.
+        // collapse to true; this test exercises the former. A read
+        // timeout is the exception, pinned separately below.
         for class in [
             ErrorClass::ProtocolError,
-            ErrorClass::ReadWriteTimeout,
             ErrorClass::ConnectionReset,
             ErrorClass::ConnectionClosed,
             ErrorClass::ResponseBodyTooLarge,
         ] {
-            for status in [200u16, 503, 504] {
+            assert!(
+                streaming_path_connection_error(
+                    Some(class),
+                    Some(class),
+                    /* request_on_wire = */ true,
+                ),
+                "{class:?} mid-body abort must report connection_error=true \
+                 (body_error_class set is the discriminator)"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_body_read_timeout_is_not_connection_error() {
+        // The streaming read-deadline arm records `ReadWriteTimeout` on
+        // BOTH the terminal and the body class. Headers were already
+        // delivered, so this is post-wire: a status fault, never a
+        // transport connection failure (matches the H2
+        // `IdleReadTimeoutBody` path and the buffered H3 path).
+        for terminal in [None, Some(ErrorClass::ReadWriteTimeout)] {
+            for request_on_wire in [true, false] {
                 assert!(
-                    streaming_path_connection_error(
-                        Some(class),
-                        Some(class),
-                        /* request_on_wire = */ true,
+                    !streaming_path_connection_error(
+                        terminal,
+                        Some(ErrorClass::ReadWriteTimeout),
+                        request_on_wire,
                     ),
-                    "{class:?} mid-body abort at status={status} must report \
-                     connection_error=true (body_error_class set is the \
-                     discriminator regardless of HTTP status)"
+                    "mid-body ReadWriteTimeout (terminal={terminal:?}, \
+                     request_on_wire={request_on_wire}) must report \
+                     connection_error=false"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn dispatch_policy_and_client_lifetime_failures_stay_neutral() {
+        // The `(Some(_), None)` arm delegates to `h3_connection_error`,
+        // which exempts gateway policy refusals and client-lifetime
+        // terminals even before the request reached the wire.
+        for class in [
+            ErrorClass::DispatchPolicyRejected,
+            ErrorClass::ClientDisconnect,
+        ] {
+            assert!(
+                !streaming_path_connection_error(
+                    Some(class),
+                    /* body_error_class = */ None,
+                    /* request_on_wire = */ false,
+                ),
+                "{class:?} pre-wire must not report connection_error=true"
+            );
         }
     }
 
@@ -22461,23 +22642,13 @@ mod h3_streaming_outcome_tests {
 
     #[test]
     fn clean_streaming_response_is_not_connection_error() {
+        // Also covers a backend-emitted 5xx STATUS with both classes None:
+        // the status is not an input, CB sees the 5xx via its
+        // `failure_status_codes` config, not via `connection_error`.
         assert!(
             !streaming_path_connection_error(None, None, /* request_on_wire = */ true,),
             "successful streaming response (both classes None) must record \
              connection_error=false so latency is sampled and CB sees a success"
-        );
-        // Even a 5xx STATUS from the backend with both classes None is a
-        // legitimate response that the backend chose to send. Not a
-        // transport-level failure; CB sees the 5xx via its
-        // `failure_status_codes` config, not via `connection_error`.
-        // Note this case wouldn't actually arise in practice — a 5xx
-        // status comes back via the success path in
-        // `proxy_to_backend_h3_streaming` only when no body issue
-        // surfaced — but the predicate handles it cleanly.
-        assert!(
-            !streaming_path_connection_error(None, None, /* request_on_wire = */ true,),
-            "backend-emitted 5xx without any error class is a status failure, \
-             not a connection failure"
         );
     }
 

@@ -760,6 +760,45 @@ async fn test_dns_custom_hosts_file() {
     assert_eq!(result2.unwrap().to_string(), "10.99.99.2");
 }
 
+/// Issue #7204: a hosts file that fails part-way through reading must not
+/// install the partial table it produced. The valid first line would resolve
+/// if the truncated table were applied.
+#[tokio::test]
+async fn test_dns_custom_hosts_file_read_error_is_not_applied() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let hosts_path = dir.path().join("broken_hosts");
+    {
+        let mut f = std::fs::File::create(&hosts_path).unwrap();
+        writeln!(f, "10.99.98.1  partial-hosts-entry.test").unwrap();
+        // Invalid UTF-8 makes the line reader fail after the first entry.
+        f.write_all(b"10.99.98.2  \xff\xfe-broken.test\n").unwrap();
+    }
+
+    let cache = DnsCache::new(DnsConfig {
+        hosts_file_path: Some(hosts_path.to_str().unwrap().to_string()),
+        ..DnsConfig::default()
+    });
+
+    // Without the partial table the name falls through to real resolution,
+    // which cannot answer a `.test` name with this address. Bound the wait so
+    // an unreachable nameserver cannot stall the test; a timeout also proves
+    // the partial entry was not served.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        cache.resolve("partial-hosts-entry.test", None, None),
+    )
+    .await;
+    if let Ok(Ok(addr)) = outcome {
+        assert_ne!(
+            addr.to_string(),
+            "10.99.98.1",
+            "a hosts file that failed to read must not be applied partially"
+        );
+    }
+}
+
 // ============================================================================
 // DnsConfig defaults tests
 // ============================================================================

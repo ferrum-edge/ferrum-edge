@@ -95,7 +95,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
 - Multi-authentication mode with first-match consumer identification
 - Multi-credential rotation — consumers can have multiple active credentials of the same type (e.g., two API keys, two JWT secrets) for zero-downtime key rotation, configurable via `FERRUM_MAX_CREDENTIALS_PER_TYPE`
-- Custom plugin database migrations — plugins declare migrations via `plugin_migrations()`, auto-discovered at build time, tracked separately in `_ferrum_plugin_migrations` with per-plugin version scoping. Supports cross-database SQL (PostgreSQL/MySQL/SQLite overrides). MongoDB uses idempotent index creation instead of SQL migrations
+- Custom plugin database migrations — plugins declare migrations via `plugin_migrations()`, auto-discovered at build time, tracked separately in `_ferrum_plugin_migrations` with per-plugin version scoping. Supports cross-database SQL (PostgreSQL/MySQL/SQLite overrides). MongoDB plugins create their indexes idempotently from their committed background worker instead of SQL migrations
 - MySQL identity-collation startup probe — after core migrations in `database` / `cp` / `migrate`, warns (never refuses startup) when Ferrum identity-bearing columns are not `utf8mb4_0900_bin`, with exact `ALTER TABLE ... CONVERT TO` remediation for upgraded deployments; no-op on PostgreSQL, SQLite, and MongoDB
 
 ### Authentication Plugins

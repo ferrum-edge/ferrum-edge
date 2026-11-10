@@ -472,9 +472,26 @@ impl AuditSpool {
         }
         let id = record.id().to_string();
         let target = record_path(&self.pending_dir(), &id)?;
+        let prepared = record_path(&self.prepared_dir(), &id)?;
+        // A finalize that replaces its prepared twin keeps the record count
+        // unchanged. One without a twin (its prepare was refused, for example
+        // saturated under `fail_open`, or the event never prepared) adds a new
+        // durable record, so it is admitted against the same ceiling, under
+        // the same lock, as `prepare` (issue #7200).
+        let _admission = if prepared.exists() {
+            None
+        } else {
+            let admission = self
+                .prepare_admission
+                .lock()
+                .map_err(|_| SpoolError::new(SpoolErrorKind::Unavailable))?;
+            if self.capacity_exhausted() {
+                return Err(SpoolError::new(SpoolErrorKind::Saturated));
+            }
+            Some(admission)
+        };
         self.publish(record, &target, &self.pending_dir())?;
         self.pending_count.fetch_add(1, Ordering::Relaxed);
-        let prepared = record_path(&self.prepared_dir(), &id)?;
         match fs::remove_file(&prepared) {
             Ok(()) => {
                 sync_dir(&self.prepared_dir())?;

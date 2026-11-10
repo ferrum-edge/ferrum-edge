@@ -5,8 +5,8 @@
 //! the SPIFFE peer-cert verifier, and the outbound client config for
 //! `FERRUM_MESH_CA_BACKEND`-issued (and file-gateway) SVIDs. They consume the
 //! `Arc<ArcSwap<Option<SvidBundle>>>` slot produced by
-//! [`crate::identity::workload_api::fetch_loop`] /
-//! [`crate::identity::rotation`] so cert rotation is lock-free and atomic
+//! [`crate::identity::workload_api::fetch_loop`] or the internal mesh CA
+//! rotation loop in [`crate::modes::mesh`], so cert rotation is lock-free and atomic
 //! from the rustls resolver's perspective — no listener restart, no per-
 //! request cloning of the bundle.
 //!
@@ -426,6 +426,9 @@ struct SpiffeClientCertVerifier {
     /// `peer_verifier_cache` below is only the startup fallback for a listener
     /// whose fence has never published.
     admission: SharedInboundAdmissionArtifact,
+    /// Signature algorithms from the base provider, resolved once at
+    /// construction instead of rebuilding a provider per handshake.
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
     schemes: Vec<rustls::SignatureScheme>,
     /// The verifier's OWN compile of the SVID slot, with last-known-good
     /// retention. Used only while [`Self::admission`] has nothing in force.
@@ -438,13 +441,13 @@ impl SpiffeClientCertVerifier {
         peer_required: bool,
         admission: SharedInboundAdmissionArtifact,
     ) -> Self {
+        let algorithms = crate::fips::base_crypto_provider().signature_verification_algorithms;
         Self {
             slot,
             peer_required,
             admission,
-            schemes: crate::fips::base_crypto_provider()
-                .signature_verification_algorithms
-                .supported_schemes(),
+            algorithms,
+            schemes: algorithms.supported_schemes(),
             peer_verifier_cache: ArcSwap::new(Arc::new(None)),
         }
     }
@@ -514,12 +517,7 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &crate::fips::base_crypto_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
@@ -528,12 +526,7 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &crate::fips::base_crypto_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -568,6 +561,9 @@ struct SpiffeServerCertVerifier {
     /// inbound session is never re-handshaked. Wrapped in the shared type only
     /// so both sides share one verifier-cache implementation.
     crls: SharedEnforcedCrlSet,
+    /// Signature algorithms from the base provider, resolved once at
+    /// construction instead of rebuilding a provider per handshake.
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
     schemes: Vec<rustls::SignatureScheme>,
     peer_verifier_cache: ArcSwap<Option<SpiffePeerVerifierCache>>,
 }
@@ -579,14 +575,14 @@ impl SpiffeServerCertVerifier {
         expected_trust_domain: Option<TrustDomain>,
         crls: CrlList,
     ) -> Self {
+        let algorithms = crate::fips::base_crypto_provider().signature_verification_algorithms;
         Self {
             slot,
             expected_peer,
             expected_trust_domain,
             crls: enforced_crl_set(crls),
-            schemes: crate::fips::base_crypto_provider()
-                .signature_verification_algorithms
-                .supported_schemes(),
+            algorithms,
+            schemes: algorithms.supported_schemes(),
             peer_verifier_cache: ArcSwap::new(Arc::new(None)),
         }
     }
@@ -630,12 +626,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &crate::fips::base_crypto_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
@@ -644,12 +635,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &crate::fips::base_crypto_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -680,7 +666,11 @@ fn certified_key_from_bundle(bundle: &SvidBundle) -> Result<rustls::sign::Certif
 
 struct SpiffeCertifiedKeyCache {
     source: Arc<Option<SvidBundle>>,
-    key: Arc<rustls::sign::CertifiedKey>,
+    /// `None` records that this snapshot's key did not materialise, so a
+    /// broken rotation warns once instead of rebuilding and warning on every
+    /// handshake until the next snapshot (the `SvidServerCertResolver`
+    /// contract in `.claude/rules/tls-security.md`).
+    key: Option<Arc<rustls::sign::CertifiedKey>>,
 }
 
 fn cached_certified_key(
@@ -692,19 +682,12 @@ fn cached_certified_key(
     if let Some(cache) = cached.as_ref()
         && Arc::ptr_eq(&cache.source, &source)
     {
-        return Some(cache.key.clone());
+        return cache.key.clone();
     }
 
     let bundle = source.as_ref().as_ref()?;
-    match certified_key_from_bundle(bundle) {
-        Ok(key) => {
-            let key = Arc::new(key);
-            cache_slot.store(Arc::new(Some(SpiffeCertifiedKeyCache {
-                source,
-                key: key.clone(),
-            })));
-            Some(key)
-        }
+    let key = match certified_key_from_bundle(bundle) {
+        Ok(key) => Some(Arc::new(key)),
         Err(error) => {
             warn!(
                 resolver = resolver_kind,
@@ -713,7 +696,12 @@ fn cached_certified_key(
             );
             None
         }
-    }
+    };
+    cache_slot.store(Arc::new(Some(SpiffeCertifiedKeyCache {
+        source,
+        key: key.clone(),
+    })));
+    key
 }
 
 struct SpiffePeerVerifierCache {
@@ -1436,6 +1424,33 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &third),
             "a new SVID snapshot pointer must rebuild CertifiedKey material"
+        );
+    }
+
+    #[test]
+    fn certified_key_cache_records_a_failed_snapshot_once() {
+        let td = TrustDomain::new("cluster.local").unwrap();
+        let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+        let id = SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap();
+        let trust_bundles = bundle_for(td, root_der);
+        let (leaf, _key) = issue_leaf_with_key(&id, &root_pem, &root_key_pem);
+        // An empty private key cannot materialise a CertifiedKey.
+        let source = Arc::new(Some(svid_bundle_for(id, trust_bundles, leaf)));
+        let cache = ArcSwap::new(Arc::new(None));
+
+        assert!(cached_certified_key(&cache, source.clone(), "test").is_none());
+        let recorded = cache.load_full();
+        let entry = recorded
+            .as_ref()
+            .as_ref()
+            .expect("the failed snapshot is recorded");
+        assert!(Arc::ptr_eq(&entry.source, &source));
+        assert!(entry.key.is_none());
+
+        assert!(cached_certified_key(&cache, source.clone(), "test").is_none());
+        assert!(
+            Arc::ptr_eq(&cache.load_full(), &recorded),
+            "a recorded failure must not rebuild (and re-warn) for the same snapshot"
         );
     }
 

@@ -1554,3 +1554,78 @@ fn se_udp_egress_refuses_every_wildcard_host_including_static() {
         );
     }
 }
+
+/// Sidecar `egress.hosts` narrowing judges each ServiceEntry host on its own,
+/// for port-less entries as for port-carrying ones: a host the Sidecar does
+/// not list must not enter the slice (and the REGISTRY_ONLY registry built
+/// from it) because a sibling host matched (GHSA-h592-fvhh-cm3h).
+#[test]
+fn sidecar_egress_narrowing_keeps_only_admitted_hosts_of_a_portless_service_entry() {
+    use ferrum_edge::modes::mesh::config::{MeshSidecar, MeshSidecarEgress};
+    use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+
+    register_feature!(
+        category = CATEGORY,
+        feature = "Sidecar egress.hosts narrows a port-less multi-host ServiceEntry per host",
+        status = Status::Supported,
+        notes = "Only the hosts the Sidecar admits are kept; an entry with no admitted host is \
+                 dropped. Port-carrying entries already narrowed per host.",
+    );
+    let portless_entry = |name: &str, hosts: &[&str]| ServiceEntry {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+        endpoints: Vec::new(),
+        resolution: Resolution::None,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: Vec::new(),
+        export_to: vec!["*".to_string()],
+        workload_selector: None,
+    };
+    let mesh = MeshConfig {
+        sidecars: vec![MeshSidecar {
+            name: "default".to_string(),
+            namespace: "default".to_string(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: vec![MeshSidecarEgress {
+                hosts: vec!["*/a.example.com".to_string()],
+                port: None,
+            }],
+            ingress_declared: false,
+            ingress: Vec::new(),
+            outbound_traffic_policy: None,
+        }],
+        service_entries: vec![
+            portless_entry("two-hosts", &["a.example.com", "b.example.com"]),
+            portless_entry("unlisted", &["c.example.com"]),
+        ],
+        ..MeshConfig::default()
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        ..GatewayConfig::default()
+    };
+    let slice = MeshSlice::from_gateway_config(
+        &config,
+        MeshSliceRequest {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            enforce_sidecar_egress: true,
+            ..MeshSliceRequest::default()
+        },
+    );
+
+    assert_eq!(
+        slice.service_entries.len(),
+        1,
+        "the entry with no admitted host must be dropped: {:?}",
+        slice.service_entries
+    );
+    assert_eq!(slice.service_entries[0].name, "two-hosts");
+    assert_eq!(
+        slice.service_entries[0].hosts,
+        vec!["a.example.com".to_string()],
+        "b.example.com is not listed by the Sidecar and must not be admitted"
+    );
+}

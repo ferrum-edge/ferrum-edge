@@ -1708,7 +1708,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         let root_store = if self.uses_system_trust_roots() {
             build_root_cert_store(None, None)?
         } else {
-            build_root_cert_store(self.custom_ca_path(), self.global_ca)?
+            build_root_cert_store(self.proxy_ca_path(), self.global_ca)?
         };
         let inner = build_server_verifier_with_crls(root_store, self.crls)
             .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))?;
@@ -1736,7 +1736,9 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             || (self.global_no_verify && self.proxy.resolved_tls.allows_global_no_verify())
     }
 
-    fn custom_ca_path(&self) -> Option<&Path> {
+    /// The proxy's own CA bundle. The global-CA fallback is applied once, by
+    /// [`build_root_cert_store`].
+    fn proxy_ca_path(&self) -> Option<&Path> {
         if self.uses_system_trust_roots() {
             return None;
         }
@@ -1745,7 +1747,6 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             .server_ca_cert_path
             .as_deref()
             .map(Path::new)
-            .or(self.global_ca)
     }
 
     fn load_client_auth(&self) -> Result<BackendClientAuth, TlsError> {

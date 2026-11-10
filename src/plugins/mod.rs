@@ -3450,11 +3450,12 @@ pub struct RequestContext {
     /// Populated at four points in the request path:
     /// 1. Buffered-collect sites (`Incoming::collect().await`): written once
     ///    with the final `body_bytes.len()` after collection completes.
-    /// 2. Streaming forward with size limit (`SizeLimitedIncoming`): written
-    ///    once after the backend request completes, from the cloned counter
-    ///    handle obtained via `SizeLimitedIncoming::bytes_seen_handle()`.
+    /// 2. Streaming forward with size limit (`SizeLimitedIncoming`): updated
+    ///    per polled frame through the counter shared at construction
+    ///    (`SizeLimitedIncoming::new_with_counter`).
     /// 3. Streaming forward without size limit (`CountingIncoming` wrapping
-    ///    the `Incoming` body): same handle-capture pattern.
+    ///    the `Incoming` body): same shared-counter pattern
+    ///    (`CountingIncoming::new_with_counter`).
     /// 4. Prebuffered bodies (populated earlier by plugins like
     ///    `request_mirror`): copied from the buffered `Bytes::len()`.
     ///
@@ -4603,6 +4604,33 @@ impl RequestContext {
                 .ai_semantic_firewall_decision_records
                 .extend(ai_semantic_firewall_decision_records);
         }
+    }
+
+    /// Hand a final-request-body hook context's state back to this live
+    /// context once the `on_final_request_body` hooks have run on it.
+    ///
+    /// Adopts the gateway deadline selection and the gateway terminals first,
+    /// so the finalizer on the live context knows it is publishing a
+    /// gateway-authored error payload, then the transferred plugin state, then
+    /// swaps in the hook context's `metadata` while keeping the live
+    /// `request_body` (the clone omits it and no final hook touches it), and
+    /// finally `ai_usage_export` and `waf_metadata_initialized`. Every proxy
+    /// dispatch path (the terminal-body arm included) and the `_test_support`
+    /// round-trip seam call this one function so the hand-back cannot diverge
+    /// between them (issues #7161, #7223).
+    pub(crate) fn adopt_final_request_body_hook_context(&mut self, mut hook_ctx: RequestContext) {
+        if hook_ctx.gateway_deadline_response_selected() {
+            self.mark_gateway_deadline_response_selected();
+        }
+        self.adopt_final_request_body_hook_terminals(&hook_ctx);
+        self.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
+        let request_body = self.metadata.remove("request_body");
+        self.metadata = hook_ctx.metadata;
+        if let Some(body) = request_body {
+            self.metadata.insert("request_body".to_string(), body);
+        }
+        self.ai_usage_export = hook_ctx.ai_usage_export;
+        self.waf_metadata_initialized = hook_ctx.waf_metadata_initialized;
     }
 
     /// Release the request-scoped leases a deferred terminal never owned.
@@ -9881,8 +9909,8 @@ pub struct TransactionSummary {
     /// Accuracy by request type:
     /// * **Buffered requests** (plugins required the body, or retries were
     ///   configured): exact — populated from the collected body length after
-    ///   `Incoming::collect().await` (optionally via `SizeLimitedIncoming::bytes_seen()`
-    ///   when a size limit is in force).
+    ///   `Incoming::collect().await` (or through the counter shared with
+    ///   `SizeLimitedIncoming` when a size limit is in force).
     /// * **Streaming requests** (body forwarded frame-by-frame without
     ///   collection): exact — populated via `CountingIncoming`, which shares
     ///   an `Arc<AtomicU64>` between the forwarded body and the summary

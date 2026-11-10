@@ -8,11 +8,12 @@
 //!   over Unix domain sockets.
 //! - [`attestation`] — pluggable workload attestors (K8s PSAT, Unix peer
 //!   creds, JWT-SVID federation, dev-only static identity).
-//! - [`ca`] — `CertificateAuthority` trait + Ferrum's internal CA + wrappers
-//!   for delegating to Vault PKI / cert-manager / SPIRE.
+//! - [`ca`] — `CertificateAuthority` trait, Ferrum's internal CA, and the
+//!   SPIRE agent adapter.
 //! - [`jwt_svid`] — SPIFFE JWT-SVID mint / validate / JWKS bundles for the
 //!   Workload API's three JWT RPCs.
-//! - [`rotation`] — background task that renews SVIDs and hot-swaps via
+//! - [`rotation`] — timing helpers for the internal mesh CA's SVID rotation
+//!   loop (`src/modes/mesh/mod.rs`), which hot-swaps the gateway SVID slot via
 //!   `ArcSwap` for the lock-free TLS-resolver path.
 //! - [`svid_source_watch`] — polls the configured gateway SVID material
 //!   sources (files and external providers) and republishes the bundle when

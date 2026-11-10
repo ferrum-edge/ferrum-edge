@@ -4731,8 +4731,8 @@ async fn delete_api_spec_rolls_back_when_spec_owned_upstream_id_fails_to_decode(
     assert!(
         message.contains("resource=upstreams")
             && message.contains("column=id")
-            && message.contains(&format!("namespace={ns}"))
-            && message.contains(&format!("api_spec_id={spec_id}")),
+            && message.contains(&format!("namespace={ns:?}"))
+            && message.contains(&format!("api_spec_id={spec_id:?}")),
         "error should include namespace/spec/column context without relying on later selects, got: {message}"
     );
     assert!(

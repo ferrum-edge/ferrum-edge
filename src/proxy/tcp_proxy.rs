@@ -2331,7 +2331,9 @@ struct TcpAcceptLoopState {
     tcp_half_close_max_wait_seconds: u64,
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
-    sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
+    /// Shared so the per-connection clone in the accept loop is a refcount
+    /// bump, not a copy of every candidate id.
+    sni_proxy_ids: Option<Arc<[NamespacedResourceId]>>,
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     tcp_fastopen_enabled: bool,
     overload: Arc<crate::overload::OverloadState>,
@@ -2673,7 +2675,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         tcp_half_close_max_wait_seconds,
         frontend_tls_handshake_timeout_seconds,
         circuit_breaker_cache,
-        sni_proxy_ids,
+        sni_proxy_ids: sni_proxy_ids.map(Arc::from),
         adaptive_buffer,
         tcp_fastopen_enabled,
         overload,
@@ -5047,10 +5049,11 @@ async fn handle_tcp_connection_inner(
                 peer_chain_der.as_deref(),
             )
         {
-            return Err(anyhow::anyhow!(
-                "{}",
-                crate::tls::client_trust::TRUST_WITHDRAWN_REASON
-            ));
+            // The typed client-side `ClientTrustWithdrawn` refusal every later
+            // withdrawal fence returns, so disconnect metrics and logs never
+            // read it as a TLS error. No session is registered yet, so there
+            // is no fence counter to settle.
+            return Err(settle_stream_trust_withdrawal(None, &client_trust_settled));
         }
         let peer_cert_der = peer_chain_der
             .as_ref()
@@ -5820,6 +5823,13 @@ async fn handle_tcp_connection_inner(
                     ));
                 }
                 Err(PrefixForwardReject::Io(error)) => {
+                    // Genuine backend evidence (the fence did not fire): the
+                    // dial succeeded and the backend then failed the first
+                    // write, exactly like a failed outbound PROXY header write
+                    // or a relay `BackendFailure`. Settle the admitted breaker
+                    // ticket as a failure instead of letting the probe guard
+                    // release it neutrally on drop.
+                    record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                     return Err(anyhow::anyhow!(
                         "failed forwarding inspected first bytes to backend: {error}"
                     ));

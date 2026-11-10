@@ -2190,6 +2190,142 @@ async fn test_vary_wildcard_not_cached() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
+/// A plugin-written response header map is not guaranteed to carry canonical
+/// lowercase keys (issue #7148): `Vary`, `ETag` and `Last-Modified` are read
+/// case-insensitively like every other header the store path consults.
+#[tokio::test]
+async fn test_mixed_case_vary_wildcard_not_cached() {
+    let plugin = default_plugin();
+    let mut response_headers = HashMap::new();
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/control",
+        200,
+        &response_headers,
+        b"ok",
+    )
+    .await;
+    response_headers.insert("Vary".to_string(), "*".to_string());
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/data",
+        200,
+        &response_headers,
+        b"volatile",
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/control");
+    let mut headers = HashMap::new();
+    assert!(
+        is_reject(&plugin.before_proxy(&mut ctx, &mut headers).await),
+        "the same response without Vary is stored"
+    );
+    let mut ctx = make_ctx("GET", "/api/data");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_mixed_case_vary_keys_variants_and_replaces_the_original_key() {
+    let plugin = default_plugin();
+    let path = "/api/mixed-case-vary";
+
+    let mut gzip_ctx = make_ctx("GET", path);
+    gzip_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut gzip_headers = HashMap::new();
+    gzip_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut gzip_ctx, &mut gzip_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = HashMap::new();
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    response_headers.insert("Vary".to_string(), "Accept-Encoding".to_string());
+    plugin
+        .after_proxy(&mut gzip_ctx, 200, &mut response_headers)
+        .await;
+    let vary_keys: Vec<&String> = response_headers
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case("vary"))
+        .collect();
+    assert_eq!(vary_keys, vec!["vary"], "one merged Vary on the miss");
+    assert!(
+        response_headers["vary"].contains("accept-encoding"),
+        "the origin dimension is kept: {}",
+        response_headers["vary"]
+    );
+    plugin
+        .on_final_response_body(&mut gzip_ctx, 200, &response_headers, b"gzip")
+        .await;
+
+    let mut plain_ctx = make_ctx("GET", path);
+    let mut plain_headers = HashMap::new();
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut plain_ctx, &mut plain_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "a request without the varied header must not reuse the gzip variant"
+    );
+
+    let mut hit_ctx = make_ctx("GET", path);
+    hit_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut hit_headers = HashMap::new();
+    hit_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    let (status_code, body, headers) =
+        expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(status_code, 200);
+    assert_eq!(body, b"gzip");
+    let vary_keys: Vec<&String> = headers
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case("vary"))
+        .collect();
+    assert_eq!(vary_keys, vec!["vary"], "one merged Vary on the hit");
+}
+
+#[tokio::test]
+async fn test_mixed_case_etag_answers_conditional_hit() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+    let mut response_headers = HashMap::new();
+    response_headers.insert("ETag".to_string(), r#""mixed-7148""#.to_string());
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/etag",
+        200,
+        &response_headers,
+        b"cached-body",
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/etag");
+    ctx.headers
+        .insert("if-none-match".to_string(), r#""mixed-7148""#.to_string());
+    let mut headers = HashMap::new();
+    headers.insert("if-none-match".to_string(), r#""mixed-7148""#.to_string());
+    let (status_code, body, headers) =
+        expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status_code, 304);
+    assert!(body.is_empty());
+    assert_eq!(
+        headers.get("etag").map(String::as_str),
+        Some(r#""mixed-7148""#)
+    );
+}
+
 #[tokio::test]
 async fn test_stale_on_arrival_does_not_evict_other_vary_variants() {
     let plugin = default_plugin();

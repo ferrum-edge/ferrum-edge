@@ -1050,8 +1050,9 @@ fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str)
 /// Set to `true` as soon as `send_request().await` succeeds (the QUIC
 /// stream is opened and request headers are committed) — regardless of
 /// whether `send_data` / `finish` / `recv_response` succeeds afterwards.
-/// The pool's internal retry chain promotes the flag forward so a later
-/// failed-connect attempt cannot mask the earlier wire commitment.
+/// A post-wire failure is returned immediately rather than retried on another
+/// connection inside the pool, so a later failed-connect attempt can never
+/// mask an earlier wire commitment.
 ///
 /// Also carries `graceful_close`, set when the underlying error is a
 /// graceful remote close (`H3_NO_ERROR` `ApplicationClose` or
@@ -1070,12 +1071,6 @@ fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str)
 ///   backend closed gracefully before a usable response could be parsed.
 ///   Post-wire by construction; suppresses `mark_h3_unsupported` at
 ///   gateway dispatch sites.
-/// - [`H3PoolError::promote_on_wire_if`] — conditionally promote a stored
-///   error to `request_on_wire=true` (no-op when the condition is false).
-///   Used by the pool's internal retry chain to surface the "any attempt
-///   committed" semantics: each fresh-connect setup `?` exit threads
-///   `any_request_on_wire` through this method so a previous post-wire
-///   attempt's commitment is preserved across the final error.
 /// - [`H3PoolError::route_deadline`] — a matched route rule's deadline, not
 ///   the backend transport, ended the attempt (#5646).
 ///
@@ -1124,16 +1119,6 @@ impl H3AttemptHandoff {
             Self::OnWire
         } else {
             Self::PreWire
-        }
-    }
-
-    /// The single transition. Once an attempt covered by this outcome is
-    /// observed committing the request, the outcome is on the wire, whatever
-    /// stage it was raised at. It never demotes.
-    pub(crate) const fn promote_if(self, committed: bool) -> Self {
-        match (self, committed) {
-            (Self::NotDialed | Self::PreWire | Self::OnWire, true) => Self::OnWire,
-            (stage, false) => stage,
         }
     }
 
@@ -1471,37 +1456,6 @@ impl H3PoolError {
     /// timeouts do not trigger `mark_h3_unsupported`.
     pub fn is_read_timeout(&self) -> bool {
         self.read_timeout
-    }
-
-    /// Conditionally promote the sticky `request_on_wire` flag.
-    ///
-    /// - When `condition` is `true`, the flag is set to `true` (no-op if
-    ///   already `true`).
-    /// - When `condition` is `false`, this is a NO-OP — the existing flag
-    ///   is preserved, never demoted from `true` back to `false`.
-    ///
-    /// A `false` value just means "no earlier attempt committed the body" — it
-    /// must NOT clobber a `true` flag that an earlier
-    /// `H3PoolError::post_wire(...)` constructor set. `graceful_close` is
-    /// preserved verbatim — promotion only affects the body-on-wire signal.
-    ///
-    /// The pool's `request*` methods no longer thread this flag across internal
-    /// attempts. A POST-WIRE failure is returned immediately (it must never be
-    /// replayed on another connection), so the cached/fallback/fresh chain is
-    /// only driven by PRE-WIRE failures and the fresh-connect setup errors are
-    /// genuinely pre-wire. This method is retained as a utility for combining a
-    /// prior on-wire observation with a later pre-wire error.
-    #[allow(dead_code)] // Retained public utility for combining a prior on-wire observation with a later pre-wire error.
-    pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
-        self.handoff = self.handoff.promote_if(condition);
-        self
-    }
-
-    /// Consume and return the underlying error, dropping the body-on-wire
-    /// signal. Used by callers that have already extracted the signal.
-    #[allow(dead_code)] // Public escape hatch for callers that need owned anyhow::Error.
-    pub fn into_error(self) -> anyhow::Error {
-        self.inner
     }
 }
 
@@ -2644,8 +2598,7 @@ impl Http3ConnectionPool {
         h3_config: super::config::Http3ServerConfig,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let create = async {
-            boxed_h3_future(|| self.create_connection(proxy, &tls_config, Some(&h3_config), None))
-                .await
+            boxed_h3_future(|| self.create_connection(proxy, &tls_config, &h3_config, None)).await
         };
         self.create_or_get_sender_as(key, None, PoolCreateCaller::CapabilityProbe, create)
             .await
@@ -2662,10 +2615,8 @@ impl Http3ConnectionPool {
         // H3 is the one pool that needs extra creation context beyond the
         // `Proxy`, so it uses the shared shell's explicit creation closure.
         let create = async {
-            boxed_h3_future(|| {
-                self.create_connection(proxy, &tls_config, Some(&h3_config), connect_at)
-            })
-            .await
+            boxed_h3_future(|| self.create_connection(proxy, &tls_config, &h3_config, connect_at))
+                .await
         };
         self.create_or_get_sender(key, connect_at, create).await
     }
@@ -2706,7 +2657,7 @@ impl Http3ConnectionPool {
                     target.port,
                     target.policy_port,
                     &tls_config,
-                    Some(&h3_config),
+                    &h3_config,
                     connect_at,
                 )
             })
@@ -3201,7 +3152,7 @@ impl Http3ConnectionPool {
         &self,
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
-        h3_config: Option<&super::config::Http3ServerConfig>,
+        h3_config: &super::config::Http3ServerConfig,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
@@ -3211,14 +3162,11 @@ impl Http3ConnectionPool {
             )
         })?;
 
-        let default_cfg = super::config::Http3ServerConfig::default();
-        let cfg = h3_config.unwrap_or(&default_cfg);
-
         // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
         // documented backend flow-control windows and the configured
         // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
         // untrusted-client budgets and never quinn's 30 s idle default.
-        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
+        let transport_config = crate::http3::config::build_backend_transport_config(h3_config)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -3367,7 +3315,7 @@ impl Http3ConnectionPool {
         port: u16,
         policy_port: u16,
         tls_config: &Arc<rustls::ClientConfig>,
-        h3_config: Option<&super::config::Http3ServerConfig>,
+        h3_config: &super::config::Http3ServerConfig,
         connect_at: Option<&OnceLock<tokio::time::Instant>>,
     ) -> Result<H3PooledConnection, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
@@ -3377,14 +3325,11 @@ impl Http3ConnectionPool {
             )
         })?;
 
-        let default_cfg = super::config::Http3ServerConfig::default();
-        let cfg = h3_config.unwrap_or(&default_cfg);
-
         // Backend-plane QUIC transport tuning (issues #4755 and #4756): the
         // documented backend flow-control windows and the configured
         // `FERRUM_HTTP3_IDLE_TIMEOUT`, never the hardened frontend listener's
         // untrusted-client budgets and never quinn's 30 s idle default.
-        let transport_config = crate::http3::config::build_backend_transport_config(cfg)?;
+        let transport_config = crate::http3::config::build_backend_transport_config(h3_config)?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
@@ -5535,7 +5480,7 @@ impl Http3ConnectionPool {
                 )
             }),
             measure(|pool, proxy, tls, cfg, _, at| {
-                pool.create_connection(proxy, tls, Some(cfg), Some(at))
+                pool.create_connection(proxy, tls, cfg, Some(at))
             }),
             measure(|pool, proxy, tls, cfg, _, at| {
                 pool.create_connection_to_target(
@@ -5544,7 +5489,7 @@ impl Http3ConnectionPool {
                     proxy.backend_port,
                     proxy.backend_port,
                     tls,
-                    Some(cfg),
+                    cfg,
                     Some(at),
                 )
             }),
@@ -5941,27 +5886,6 @@ mod h3_pool_error_tests {
     }
 
     #[test]
-    fn promote_on_wire_if_only_promotes_false_to_true() {
-        // The pool's retry chain calls `e.promote_on_wire_if(any_request_on_wire)`
-        // on each fresh-connect setup `?` exit. The contract is asymmetric:
-        // `condition=true` flips false → true; `condition=false` is a no-op.
-        let pre = H3PoolError::pre_wire(anyhow::anyhow!("connect refused"));
-        let promoted = pre.promote_on_wire_if(true);
-        assert!(promoted.request_on_wire());
-
-        // `condition=false` must NOT demote an already-true flag — that's
-        // exactly the case where an earlier post-wire attempt set the
-        // flag and a later pre-wire setup failure would otherwise clobber
-        // it. Verify both directions: `true → true` is idempotent and
-        // `false on an already-true` is a no-op.
-        let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
-        assert!(post.promote_on_wire_if(false).request_on_wire());
-
-        let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
-        assert!(post.promote_on_wire_if(true).request_on_wire());
-    }
-
-    #[test]
     fn fast_path_pre_wire_failure_skips_selected_slow_cache_probe() {
         assert!(
             should_probe_selected_h3_cache_after_fast_path(false),
@@ -6069,71 +5993,6 @@ mod h3_pool_error_tests {
         );
     }
 
-    /// Codex P1 regression: when an earlier internal attempt set
-    /// `any_request_on_wire = true` (post-wire) and then `tls_config_fn()`
-    /// or `create_or_get_proxy_sender()` fails on the fresh-connect
-    /// fallback, the pool MUST promote the sticky flag onto the resulting
-    /// `H3PoolError::pre_wire`. Without that promotion, the gateway sees
-    /// `request_on_wire=false`, treats the call as pre-wire, and replays
-    /// a non-idempotent request via `retry_on_connect_failure` even
-    /// though the FIRST internal attempt may already have been processed
-    /// by the backend.
-    ///
-    /// **Coverage scope.** This test is unit-level and only verifies the
-    /// closure shape — `H3PoolError::pre_wire(e).promote_on_wire_if(true)`
-    /// returns `request_on_wire=true`. It does NOT exercise the live
-    /// `Http3ConnectionPool::request*` retry chain (cached attempt's
-    /// post-wire failure → fresh-connect setup failure) end-to-end,
-    /// because doing that requires a scripted QUIC backend that:
-    /// (a) accepts the QUIC handshake, (b) accepts the stream open, (c)
-    /// fails the body / response so the cached attempt is post-wire,
-    /// then (d) refuses subsequent connect attempts so the fresh-connect
-    /// setup also fails. The functional test
-    /// `retry_on_connect_failure_fires_with_empty_methods_and_statuses`
-    /// covers the gateway-level retry contract end-to-end via ECONNREFUSED
-    /// but does not tickle this specific cached-success → fresh-connect
-    /// setup-failure ordering. Tracked as a follow-up coverage gap; the
-    /// closure-shape assertion below is the regression guard for the
-    /// fix that this PR introduces.
-    #[test]
-    fn pre_wire_setup_failure_after_post_wire_attempt_preserves_sticky_flag() {
-        // Simulate: any_request_on_wire = true (an earlier internal attempt
-        // sent the request body). Now tls_config_fn() fails.
-        let any_request_on_wire = true;
-        let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
-
-        let propagated: H3PoolError =
-            H3PoolError::pre_wire(synthetic_setup_failure).promote_on_wire_if(any_request_on_wire);
-
-        assert!(
-            propagated.request_on_wire(),
-            "TLS / sender-creation failure path must propagate sticky \
-             request_on_wire=true so the gateway respects retry_on_methods \
-             instead of replaying via retry_on_connect_failure. If this \
-             assertion fails, a future refactor likely reverted to the \
-             bare `map_err(pre_wire)?` shape — restore the closure form: \
-             `|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)`"
-        );
-    }
-
-    #[test]
-    fn pre_wire_setup_failure_with_no_prior_post_wire_attempt_stays_pre_wire() {
-        // Counterpart: if NO earlier internal attempt sent the body
-        // (any_request_on_wire = false), the same closure must NOT
-        // mistakenly mark the error as post-wire.
-        let any_request_on_wire = false;
-        let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
-
-        let propagated: H3PoolError =
-            H3PoolError::pre_wire(synthetic_setup_failure).promote_on_wire_if(any_request_on_wire);
-
-        assert!(
-            !propagated.request_on_wire(),
-            "Setup failure with no prior post-wire attempt must remain \
-             request_on_wire=false so retry_on_connect_failure can fire"
-        );
-    }
-
     #[test]
     fn graceful_close_constructor_marks_post_wire_and_graceful() {
         // The graceful-close constructor is used at the four `recv_response`
@@ -6168,29 +6027,6 @@ mod h3_pool_error_tests {
 
         let post = H3PoolError::post_wire(anyhow::anyhow!("send_data failed"));
         assert!(!post.is_graceful_close());
-    }
-
-    #[test]
-    fn promote_on_wire_if_preserves_graceful_close_flag() {
-        // The pool's internal retry chain pipes errors through
-        // `.promote_on_wire_if(any_request_on_wire)` on every fresh-connect
-        // setup `?` exit. That helper only modifies `request_on_wire` —
-        // a graceful-close error that flows through the chain MUST keep
-        // `is_graceful_close()=true` so the gateway suppression still fires.
-        let e = H3PoolError::graceful_close(anyhow::anyhow!(
-            "recv_response after graceful remote close"
-        ));
-        let promoted_true = e.promote_on_wire_if(true);
-        assert!(promoted_true.is_graceful_close());
-        assert!(promoted_true.request_on_wire());
-
-        let e = H3PoolError::graceful_close(anyhow::anyhow!(
-            "recv_response after graceful remote close"
-        ));
-        let promoted_false = e.promote_on_wire_if(false);
-        assert!(promoted_false.is_graceful_close());
-        // request_on_wire stays true (graceful_close constructor sets it true)
-        assert!(promoted_false.request_on_wire());
     }
 }
 

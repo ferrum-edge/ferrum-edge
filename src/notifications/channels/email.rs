@@ -820,6 +820,12 @@ impl EmailChannel {
     /// `spawn_blocking`; the resulting `Arc<ClientConfig>` is cached in a
     /// `OnceCell` and shared by every later dispatch.
     async fn tls_connector(&self, http: &PluginHttpClient) -> Result<TlsConnector, SmtpFailure> {
+        // Fast path: the config is built once per channel, so later sends must
+        // not clone the CA path, the CRL list and the HTTP client just to
+        // discard them.
+        if let Some(config) = self.tls_config.get() {
+            return Ok(TlsConnector::from(Arc::clone(config)));
+        }
         let ca_bundle_path = http.tls_ca_bundle_path().map(str::to_string);
         let crls: Vec<CertificateRevocationListDer<'static>> = http.tls_crls().to_vec();
         let live_source = http.clone();

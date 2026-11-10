@@ -292,6 +292,10 @@ docker compose --profile mongodb up -d mongodb ferrum-mongodb
 docker compose ps   # STATUS column shows healthy/unhealthy
 ```
 
+**Environment**:
+- HTTP: http://localhost:8004 (HTTPS 8447, admin 9446 when served; these do not collide with the CP/DP profile, so both profiles can run together)
+- Admin API: bound to loopback inside the container and **not published** by default (see the admin-exposure note at the top of `docker-compose.yml` to enable host access)
+
 Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. The Mongo container refuses to start with a missing, short, or non-URL-safe `MONGO_PASSWORD`, and port `27017` is not published to the host. `MONGO_PASSWORD` only seeds a new volume; to change the password of an existing volume (including one created with the old `dev-password-change-in-production` default), follow [the upgrade guide](upgrade_guide.md#development-compose-fixtures). See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, primary-consistent reads, and managed service configuration.
 
 **Key differences from SQL**:

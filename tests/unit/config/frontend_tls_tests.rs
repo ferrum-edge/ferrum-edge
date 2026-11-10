@@ -145,3 +145,60 @@ fn acme_renewal_reachability_rejects_an_unserviceable_admin_source() {
         "the admin surface shares the frontend live-reload flag: {error}"
     );
 }
+
+// ===========================================================================
+// Issue #7194: an unparseable ACME renewal challenge type is refused
+// ===========================================================================
+
+fn acme_challenge(auto_renew: bool, challenge_type: &str) -> EnvConfig {
+    EnvConfig {
+        acme_auto_renew_enabled: auto_renew,
+        acme_renew_challenge_type: challenge_type.to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn acme_renewal_challenge_type_accepts_every_supported_spelling() {
+    for value in [
+        "http01",
+        "http-01",
+        "tls_alpn01",
+        "tls-alpn-01",
+        "tls-alpn01",
+        "dns01",
+        "DNS-01",
+    ] {
+        acme_challenge(true, value)
+            .validate_acme_renewal_challenge_type()
+            .unwrap_or_else(|error| panic!("{value:?} must be accepted: {error}"));
+    }
+}
+
+#[test]
+fn acme_renewal_challenge_type_rejects_a_typo_when_auto_renew_is_enabled() {
+    for value in ["http", "tls-alpn", "dns", ""] {
+        let error = acme_challenge(true, value)
+            .validate_acme_renewal_challenge_type()
+            .expect_err("the scheduler would refuse to start and renewal would stop silently");
+        assert!(
+            error.contains("FERRUM_ACME_RENEW_CHALLENGE_TYPE")
+                && error.contains("FERRUM_ACME_AUTO_RENEW_ENABLED"),
+            "the diagnostic must name both settings: {error}"
+        );
+    }
+    let error = acme_challenge(true, "secret-looking-typo")
+        .validate_acme_renewal_challenge_type()
+        .expect_err("an unknown value is refused");
+    assert!(
+        !error.contains("secret-looking-typo"),
+        "the configured value must be withheld: {error}"
+    );
+}
+
+#[test]
+fn acme_renewal_challenge_type_is_ignored_when_auto_renew_is_disabled() {
+    acme_challenge(false, "http")
+        .validate_acme_renewal_challenge_type()
+        .expect("the scheduler does not start, so the value is never parsed");
+}

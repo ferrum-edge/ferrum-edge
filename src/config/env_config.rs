@@ -2142,6 +2142,10 @@ pub struct EnvConfig {
     /// Namespace this gateway instance loads and manages. Resources from other
     /// namespaces are ignored. Default: "ferrum".
     pub namespace: String,
+    /// `FERRUM_LOG_LEVEL` as admitted by configuration parsing. Default:
+    /// "warn". Runtime tracing is initialised from the same variable before
+    /// `EnvConfig` is parsed (`gateway_entry.rs`), so this copy only records
+    /// the setting.
     pub log_level: String,
     /// Per-sink admitted record limit for process logging. Stdout/access logs
     /// share one sink and stderr owns another. Default: 4096.
@@ -4443,7 +4447,7 @@ impl Default for EnvConfig {
         Self {
             mode: OperatingMode::File,
             namespace: "ferrum".into(),
-            log_level: "error".into(),
+            log_level: "warn".into(),
             log_buffer_capacity: crate::logging::LOG_BUFFER_CAPACITY_DEFAULT,
             log_buffer_bytes: crate::logging::LOG_BUFFER_BYTES_DEFAULT,
             log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,
@@ -8361,6 +8365,22 @@ impl EnvConfig {
                 )
             ));
         }
+        // Stream listeners must never fall back to another bind address: a
+        // typo meant to keep TCP/UDP/DTLS listeners on loopback would
+        // otherwise expose them on the proxy bind address (0.0.0.0).
+        if self
+            .stream_proxy_bind_address
+            .parse::<std::net::IpAddr>()
+            .is_err()
+        {
+            return Err(format!(
+                "Invalid FERRUM_STREAM_PROXY_BIND_ADDRESS {}. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                crate::startup::quoted_config_value(
+                    "FERRUM_STREAM_PROXY_BIND_ADDRESS",
+                    &self.stream_proxy_bind_address
+                )
+            ));
+        }
 
         self.validate_gateway_listener_bindings()?;
 
@@ -8712,6 +8732,33 @@ impl EnvConfig {
         // ACME auto-renewal that can never reach the listener (issue #4506).
         self.validate_acme_renewal_reachability()?;
 
+        // ACME auto-renewal with a challenge type it cannot prepare (#7194).
+        self.validate_acme_renewal_challenge_type()?;
+
+        Ok(())
+    }
+
+    /// Reject `FERRUM_ACME_RENEW_CHALLENGE_TYPE` values the renewal scheduler
+    /// cannot parse while `FERRUM_ACME_AUTO_RENEW_ENABLED=true` (issue #7194).
+    ///
+    /// The scheduler used to log one warning and not start, so a typo passed
+    /// `ferrum-edge validate` and renewal silently stopped until the
+    /// certificate expired. Like [`Self::validate_acme_renewal_reachability`],
+    /// automation that cannot renew must not start silently. The configured
+    /// value is withheld from the message.
+    pub fn validate_acme_renewal_challenge_type(&self) -> Result<(), String> {
+        if !self.acme_auto_renew_enabled {
+            return Ok(());
+        }
+        if crate::tls::acme::AcmeRenewalChallengeType::parse(&self.acme_renew_challenge_type)
+            .is_none()
+        {
+            return Err(
+                "FERRUM_ACME_RENEW_CHALLENGE_TYPE must be one of `http01`, `tls_alpn01`, or \
+                 `dns01` when FERRUM_ACME_AUTO_RENEW_ENABLED=true"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 

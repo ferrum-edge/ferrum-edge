@@ -1874,7 +1874,11 @@ impl GatewayListenerManager {
                 "Gateway API HTTP/3 bind is waiting for the previous owner to release its UDP \
                  socket: {error}"
             );
+            // The classification above is redone after every failed attempt,
+            // so the budget it selects is the one this wait is bounded by; the
+            // pacing carries over between attempts.
             let backoff = backoff.get_or_insert_with(|| UdpPortHandoffBackoff::new(deadline));
+            backoff.set_deadline(deadline);
             if !backoff.wait().await {
                 return Some(failure.report());
             }

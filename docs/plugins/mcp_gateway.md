@@ -81,7 +81,7 @@ config:
 | `discovery.aggregate_prompts` | bool | `true` | Aggregate-router only. |
 | `discovery.namespace_separator` | string | `"."` | Aggregate-router only; must not be empty. |
 | `discovery.cache_ttl_seconds` | uint | `300` | Aggregate-router only; must be greater than 0. Also bounds negative-cache recovery (see *Discovery*). |
-| `discovery.hide_denied_items` | bool | `true` | Aggregate-router only. |
+| `discovery.hide_denied_items` | bool | `true` | Aggregate-router only. Applies to tools only (denied prompts and resources are never listed). A tool denied by `policy.tools` / `policy.default_action` stays out of `tools/list` while either this or `policy.hide_denied_tools` is `true`: both must be `false` to list denied tools. |
 | `discovery.on_new_tool` | enum | `hide_until_configured` | Aggregate-router only. `allow`, `allow_immediately`, `expose`, or `hide_until_configured`. |
 | `discovery.on_schema_change` | enum | `hide_until_configured` | Aggregate-router only. Same value set. |
 | `sessions.downstream_session_header` | string | `mcp-session-id` | Valid HTTP header name; protocol-managed hop-by-hop / framing names and names in the gateway-owned `x-consumer-*` namespace are rejected. |
@@ -112,7 +112,7 @@ config:
 | `policy.default_resource_action` | enum | `policy.default_action` | Aggregate-router only. `allow` or `deny`; the action for a resource or resource template with no `policy.resources` entry. |
 | `policy.prompts` | map | `{}` | Aggregate-router only. Public namespaced prompt name → `{action: allow \| deny}`. |
 | `policy.resources` | map | `{}` | Aggregate-router only. Public resource URI (`mcp://{server_id}/...`) or public resource-template URI → `{action: allow \| deny}`. |
-| `policy.hide_denied_tools` | bool | `true` | Aggregate-router only. |
+| `policy.hide_denied_tools` | bool | `true` | Aggregate-router only. Denied tools stay out of `tools/list` while either this or `discovery.hide_denied_items` is `true`: both must be `false` to list denied tools. A tool a per-consumer grant refuses is never listed. |
 | `policy.tools` | map | `{}` | Aggregate-router only. Public namespaced tool name → `{action: allow \| deny \| hide_from_discovery, allowed_groups?, denied_groups?}`; `action` is required. |
 | `policy.tools.<name>.allowed_groups` | string[] | — | Aggregate-router only; requires `action: allow`. The request Consumer must hold at least one of these `acl_groups`. Omitting it (or `null`) drops only this requirement: with `denied_groups` present a mapped Consumer is still required. An empty list is rejected. See *Per-consumer tool grants*. |
 | `policy.tools.<name>.denied_groups` | string[] | — | Aggregate-router only; requires `action: allow`. A Consumer holding any of these `acl_groups` is not granted the tool, even when it also holds an allowed group. An empty list is rejected. |

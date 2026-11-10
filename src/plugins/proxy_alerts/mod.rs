@@ -85,7 +85,7 @@
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -186,7 +186,8 @@ struct AlertCore {
     dispatch_generation: Arc<DispatchGeneration>,
     delivery_retry: DeliveryRetryPolicy,
     http_client: PluginHttpClient,
-    enabled: AtomicBool,
+    /// Fixed at construction: a config change builds a new instance.
+    enabled: bool,
     quiet_hours: Vec<QuietHourWindow>,
     lifecycle_keep_ms: u64,
     /// Stable plugin-config resource id of this instance (or
@@ -233,7 +234,7 @@ impl std::fmt::Debug for ProxyAlerts {
         f.debug_struct("ProxyAlerts")
             .field("rules", &self.core.rules.len())
             .field("channels", &self.core.channel_by_id.len())
-            .field("enabled", &self.core.enabled.load(Ordering::Acquire))
+            .field("enabled", &self.core.enabled)
             .field("quiet_hours", &self.core.quiet_hours.len())
             .finish()
     }
@@ -301,7 +302,7 @@ impl ProxyAlerts {
             dispatch_generation,
             delivery_retry: parsed.delivery_retry,
             http_client,
-            enabled: AtomicBool::new(parsed.enabled),
+            enabled: parsed.enabled,
             quiet_hours: parsed.quiet_hours,
             lifecycle_keep_ms,
             policy_id: Arc::from(policy_id),
@@ -729,7 +730,7 @@ impl AlertCore {
     }
 
     fn handle(&self, sample: SampleInput<'_>) {
-        if !self.enabled.load(Ordering::Acquire) {
+        if !self.enabled {
             return;
         }
         // Nothing to observe without a proxy identity (HTTP summaries may omit
@@ -808,7 +809,7 @@ impl AlertCore {
     /// admission is limited to Resolve here: a breach never sends a Trigger or
     /// reminder from the timer (`advance_channel` with `time_driven`).
     fn reevaluate_idle_incidents(&self, now_ms: u64, now: DateTime<Utc>) {
-        if !self.enabled.load(Ordering::Acquire) {
+        if !self.enabled {
             return;
         }
         let in_quiet = self.in_quiet_hours(now);
@@ -1038,6 +1039,22 @@ impl AlertCore {
             return None;
         };
         if event_action != EventAction::Resolve && (in_quiet || time_driven) {
+            return None;
+        }
+        // A Trigger or reminder the cooldown would suppress is not owed, so it
+        // must not take (or be counted as dropped for want of) a dispatch
+        // permit: an Active incident maps every breaching sample to a Trigger.
+        // `try_acquire` below stays the authoritative, atomic decision.
+        if event_action != EventAction::Resolve
+            && self.cooldowns.is_cooling(
+                rule_id,
+                owner_key,
+                channel_id,
+                rule.common().cooldown_ms,
+                now_ms,
+                ownership_generation,
+            )
+        {
             return None;
         }
         // Backpressure: nothing is committed, so this channel keeps owing the

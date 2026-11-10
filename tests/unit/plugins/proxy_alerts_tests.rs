@@ -1067,6 +1067,46 @@ async fn accepts_all_rule_types() {
 }
 
 #[tokio::test]
+async fn stream_disconnect_cause_rules_accept_every_serialized_cause() {
+    // `causes` is read through `DisconnectCause`'s serde contract (#7141), so
+    // every cause a stream summary can serialize is a valid rule cause.
+    use ferrum_edge::plugins::DisconnectCause;
+    for cause in [
+        DisconnectCause::IdleTimeout,
+        DisconnectCause::RecvError,
+        DisconnectCause::BackendError,
+        DisconnectCause::GracefulShutdown,
+        DisconnectCause::GatewayPolicy,
+    ] {
+        let name = serde_json::to_value(cause).unwrap();
+        let cfg = json!({
+            "channels": {
+                "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+            },
+            "rules": [
+                { "name": "r", "type": "stream_disconnect_cause", "causes": [name],
+                  "threshold_count": 5, "channels": ["c"] }
+            ]
+        });
+        assert!(
+            ProxyAlerts::new(&cfg, http_client()).is_ok(),
+            "cause {name} must be accepted"
+        );
+    }
+    let cfg = json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [
+            { "name": "r", "type": "stream_disconnect_cause", "causes": ["IdleTimeout"],
+              "threshold_count": 5, "channels": ["c"] }
+        ]
+    });
+    let error = ProxyAlerts::new(&cfg, http_client()).err().unwrap();
+    assert!(error.contains("unknown disconnect cause"), "{error}");
+}
+
+#[tokio::test]
 async fn websocket_disconnect_rules_opt_into_disconnect_hook() {
     let cfg = json!({
         "channels": {
@@ -1593,6 +1633,33 @@ fn cooldown_gate_per_proxy_independent() {
     let gate = CooldownGate::new();
     assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
     assert!(gate.try_acquire(1, "p2", 10, 60_000, 100 + 1, 0));
+}
+
+#[test]
+fn cooldown_gate_peek_agrees_with_acquire_and_mutates_nothing() {
+    // Issue #7141: `advance_channel` asks `is_cooling` before taking a
+    // dispatch permit, so a suppressed reminder of an Active incident is never
+    // counted as a backpressure drop. The peek must refuse exactly when
+    // `try_acquire` would, and must never arm or create a seat itself.
+    let gate = CooldownGate::new();
+    // Unarmed: not cooling, and peeking does not create a row.
+    assert!(!gate.is_cooling(1, "p1", 10, 60_000, 100, 0));
+    assert!(!gate.contains_proxy("p1"));
+
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 100, 0));
+    // Inside the window: cooling, matching a refused acquire.
+    assert!(gate.is_cooling(1, "p1", 10, 60_000, 30_100, 0));
+    assert!(!gate.try_acquire(1, "p1", 10, 60_000, 30_100, 0));
+    // Other generation, channel, rule, or proxy: independent seats.
+    assert!(!gate.is_cooling(1, "p1", 10, 60_000, 30_100, 1));
+    assert!(!gate.is_cooling(1, "p1", 11, 60_000, 30_100, 0));
+    assert!(!gate.is_cooling(2, "p1", 10, 60_000, 30_100, 0));
+    assert!(!gate.is_cooling(1, "p2", 10, 60_000, 30_100, 0));
+    // A backward clock step rebases in `try_acquire`, so it is not cooling.
+    assert!(!gate.is_cooling(1, "p1", 10, 60_000, 50, 0));
+    // Elapsed: not cooling, and the peek did not rearm the seat.
+    assert!(!gate.is_cooling(1, "p1", 10, 60_000, 60_100, 0));
+    assert!(gate.try_acquire(1, "p1", 10, 60_000, 60_100, 0));
 }
 
 // -------------------------------------------------------------- RecoveryGate

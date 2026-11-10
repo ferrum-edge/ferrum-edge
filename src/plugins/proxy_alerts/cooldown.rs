@@ -130,6 +130,38 @@ impl CooldownGate {
         }
     }
 
+    /// Whether [`Self::try_acquire`] with the same arguments would refuse
+    /// because the cooldown window has not elapsed. Read-only: it never
+    /// creates a row or rearms the gate, so callers can ask it before
+    /// reserving anything else and still go through `try_acquire` for the
+    /// authoritative, atomic decision.
+    pub fn is_cooling(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        channel_id: u32,
+        cooldown_ms: u64,
+        now_ms: u64,
+        ownership_generation: u64,
+    ) -> bool {
+        let Some(per_proxy) = self.last_sent.get(&(rule_id, channel_id)) else {
+            return false;
+        };
+        let Some(per_generation) = per_proxy.get(proxy_id) else {
+            return false;
+        };
+        let Some(atomic) = per_generation.get_cloned(&ownership_generation) else {
+            return false;
+        };
+        let last = atomic.load(Ordering::Acquire);
+        // Mirrors `try_acquire`: unarmed (0) and a backward clock step are
+        // never cooling.
+        last != 0
+            && now_ms
+                .checked_sub(last)
+                .is_some_and(|elapsed| elapsed < cooldown_ms)
+    }
+
     /// Clear a previously acquired cooldown so a failed delivery does not
     /// silently consume the window.
     ///

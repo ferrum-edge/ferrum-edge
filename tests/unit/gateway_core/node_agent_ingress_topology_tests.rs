@@ -10,7 +10,6 @@ use ferrum_edge::_test_support::{
     NodeAgentPodWatcherEventForTest, apply_bounded_node_topology_sequence_for_test,
     apply_node_agent_ingress_topology_outcome_for_test,
     node_agent_cni_capture_readiness_rejection_for_test,
-    node_agent_cni_topology_readiness_rejection_for_test,
     run_with_node_agent_topology_outcome_stream_for_test,
     set_node_agent_startup_readiness_for_test, spawn_node_agent_ingress_topology_monitor_for_test,
 };
@@ -1233,26 +1232,30 @@ fn projected_node_cache_rejects_oversized_topology_strings() {
 
 #[test]
 fn cni_add_check_and_status_withhold_capture_ready_during_topology_loss() {
+    // The UDP migration proof is held satisfied so only topology decides.
+    let topology_gate = |verb, initial_sync_complete, topology_ready| {
+        node_agent_cni_capture_readiness_rejection_for_test(
+            verb,
+            initial_sync_complete,
+            topology_ready,
+            true,
+        )
+    };
     for verb in [RpcVerb::Add, RpcVerb::Check, RpcVerb::Status] {
         assert!(
-            node_agent_cni_topology_readiness_rejection_for_test(verb, true, false).is_some(),
+            topology_gate(verb, true, false).is_some(),
             "{verb:?} must be rejected while topology is quarantined",
         );
-        assert_eq!(
-            node_agent_cni_topology_readiness_rejection_for_test(verb, true, true),
-            None,
-        );
+        assert_eq!(topology_gate(verb, true, true), None);
     }
     assert_eq!(
-        node_agent_cni_topology_readiness_rejection_for_test(RpcVerb::Del, true, false),
+        topology_gate(RpcVerb::Del, true, false),
         None,
         "cleanup must remain available while capture is quarantined",
     );
-    assert!(
-        node_agent_cni_topology_readiness_rejection_for_test(RpcVerb::Gc, false, false).is_some()
-    );
+    assert!(topology_gate(RpcVerb::Gc, false, false).is_some());
     assert_eq!(
-        node_agent_cni_topology_readiness_rejection_for_test(RpcVerb::Gc, true, false),
+        topology_gate(RpcVerb::Gc, true, false),
         None,
         "post-sync GC must remain available while capture is quarantined",
     );

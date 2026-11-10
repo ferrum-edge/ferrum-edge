@@ -457,3 +457,64 @@ fn url_rewrite_keeps_refusing_an_empty_replace_full_path() {
         "{message}"
     );
 }
+
+fn target_redirect_rule(redirect: Value) -> Value {
+    json!([{
+        "matches": [{"path": {"type": "PathPrefix", "value": "/old"}}],
+        "filters": [{"type": "RequestRedirect", "requestRedirect": redirect}]
+    }])
+}
+
+#[test]
+fn request_redirect_refuses_a_scheme_or_hostname_the_dispatch_plugin_cannot_load() {
+    // `scheme` and `hostname` are copied into the `mesh_route_dispatch`
+    // redirect. A value the plugin refuses must refuse this one route
+    // (`Invalid`) instead of reaching the plugin cache, where it would fail
+    // the whole build.
+    let cases = [
+        (json!({"scheme": "ftp"}), "scheme must be `http` or `https`"),
+        (
+            json!({"scheme": "HTTPS"}),
+            "scheme must be `http` or `https`",
+        ),
+        (json!({"scheme": ""}), "scheme must be `http` or `https`"),
+        (json!({"scheme": 443}), "scheme must be `http` or `https`"),
+        (
+            json!({"hostname": ""}),
+            "hostname must be a non-empty string",
+        ),
+        (
+            json!({"hostname": 7}),
+            "hostname must be a non-empty string",
+        ),
+        (json!({"hostname": "*.example.org"}), "precise hostname"),
+        (json!({"hostname": "example.org:8443"}), "precise hostname"),
+        (json!({"hostname": "Example.org"}), "precise hostname"),
+        (json!({"hostname": "evil.example/path"}), "precise hostname"),
+    ];
+    for (redirect, fragment) in cases {
+        let message = translate_route_error(target_redirect_rule(redirect.clone()));
+        assert!(
+            message.contains("requestRedirect") && message.contains(fragment),
+            "{redirect}: expected a requestRedirect {fragment:?} diagnostic, got {message}"
+        );
+        assert!(
+            !message.contains(INCOMPATIBLE_FILTERS_MARKER)
+                && !message.contains(UNSUPPORTED_SHAPE_MARKER),
+            "{redirect}: a bad redirect value is `Invalid`, got {message}"
+        );
+    }
+}
+
+#[test]
+fn request_redirect_admits_a_valid_scheme_and_hostname() {
+    let plugins = translate_route_plugins(target_redirect_rule(
+        json!({"scheme": "https", "hostname": "example.org", "statusCode": 301}),
+    ));
+    let (config, _plugin) = emitted_dispatch(&plugins);
+    let rendered = config.to_string();
+    assert!(
+        rendered.contains("\"scheme\":\"https\"") && rendered.contains("example.org"),
+        "{rendered}"
+    );
+}

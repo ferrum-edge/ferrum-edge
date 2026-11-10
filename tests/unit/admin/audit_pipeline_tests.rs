@@ -690,6 +690,60 @@ fn fail_open_accounts_for_a_mutation_that_proceeded_unaudited() {
     assert_eq!(status.metrics.dropped_durable_handoff_failed_total, 1);
 }
 
+/// Issue #7200: under `fail_open` a saturated `prepare` lets the mutation run,
+/// and its later finalize has no prepared twin to replace. That finalize adds
+/// a new durable record, so it must respect the same ceiling instead of
+/// growing `pending/` without bound; a finalize that replaces its prepared
+/// twin is still admitted at the ceiling.
+#[test]
+fn finalize_without_a_prepared_twin_respects_the_ceiling() {
+    let dir = TempDir::new().expect("temp dir");
+    let spool = AuditSpool::open(
+        dir.path().to_path_buf(),
+        Uuid::new_v4().to_string(),
+        TEST_DESTINATION.to_string(),
+        1,
+        8,
+    )
+    .expect("spool opens");
+    let record = |id: &str, finalized: bool| {
+        SpooledAuditRecord::with_bounded_diff(
+            event_with(id, json!({"finalized": finalized})),
+            TEST_DESTINATION,
+            spool.generation(),
+            finalized,
+            1024 * 1024,
+        )
+    };
+    let admitted = Uuid::new_v4().to_string();
+    spool
+        .prepare(&record(&admitted, false))
+        .expect("the first intent fits the ceiling");
+
+    let unaudited = Uuid::new_v4().to_string();
+    assert_eq!(
+        spool
+            .prepare(&record(&unaudited, false))
+            .expect_err("the ceiling refuses a second intent")
+            .kind,
+        SpoolErrorKind::Saturated
+    );
+    assert_eq!(
+        spool
+            .finalize(&record(&unaudited, true))
+            .expect_err("a finalize without a twin is a new record")
+            .kind,
+        SpoolErrorKind::Saturated
+    );
+
+    spool
+        .finalize(&record(&admitted, true))
+        .expect("replacing the prepared twin is admitted at the ceiling");
+    let stats = spool.stats();
+    assert_eq!(stats.prepared_records, 0);
+    assert_eq!(stats.pending_records, 1);
+}
+
 #[test]
 fn memory_only_mode_never_claims_durable_coverage() {
     let pipeline = pipeline(config(None));

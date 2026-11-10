@@ -92,7 +92,8 @@ paths:
   when every meaningful member is such a refresh and only when
   `respect_no_cache` is enabled), and zero-length `Content-Length`
   framing — and a gateway-minted `correlation_id` header whose live value still
-  matches private request provenance (issue #3929). Client-supplied correlation
+  matches private request provenance (issue #3929; `ai_semantic_cache` omits
+  it under the same rule, issue #7130). Client-supplied correlation
   values remain origin-visible dimensions; do not globally ignore `x-request-id`
   or trust a client-spoofable metadata/header marker. The `x-ratelimit-*` values
   `rate_limiting` (`expose_headers: true`, priority 2900) forwards are the other
@@ -884,8 +885,9 @@ on a native-gRPC request.
   `RedisLimiter::new_with_config_id` picks the constructor from
   `RateLimitAlgorithm::REQUIRES_SERVER_CLOCK` — a REQUIRED associated const, so
   a new algorithm must state its contract rather than inherit one. True for
-  `HttpRateLimitAlgorithm` / `DynamicHttpRateLimitAlgorithm` (`rate_limiting`,
-  `graphql`, `grpc_method_router`); false for the `ai_rate_limiter`,
+  `DynamicHttpRateLimitAlgorithm` (`rate_limiting`, `graphql`,
+  `grpc_method_router`; `HttpRateLimitAlgorithm` / `RequestUnit` are
+  `#[cfg(test)]` inline-test fixtures, not a production path); false for the `ai_rate_limiter`,
   `ws_rate_limiting` and `udp_rate_limiting` algorithms, for
   `request_deduplication`, `soap_ws_security`'s shared replay authority,
   `jwks_auth` / `hmac_auth` replay clients, and `ai_semantic_cache`. Those
@@ -953,9 +955,10 @@ on a native-gRPC request.
   "fail-closed relative to an exact trailing window" guarantee across local and
   Redis modes.
 - `weighted_window_count` in `src/plugins/utils/rate_limit.rs` is the ONLY place
-  the two-window weighted estimate is written down. `FixedWindow`, all three
-  `ai_rate_limiter` `INCRBY` arms, and the `ws_rate_limiting` frame budget route
-  through it; do not re-inline the formula, or a test on one path stops proving
+  the two-window weighted estimate is written down. All three
+  `ai_rate_limiter` `INCRBY` arms and the `ws_rate_limiting` frame budget route
+  through it (as does the test-only `FixedWindow` helper, which no plugin
+  constructs); do not re-inline the formula, or a test on one path stops proving
   anything about the others
   (`token_accounting_paths_share_the_one_weighted_formula`).
 - Request-quota key format is
@@ -1131,7 +1134,7 @@ on a native-gRPC request.
 - SQL plugin migrations are tracked in `_ferrum_plugin_migrations` by `(plugin_name, version)`.
 - `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=false` warns on pending plugin migrations at database/cp startup; it does not mutate schema.
 - `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true` applies pending plugin migrations before `load_full_config`; failure is fatal.
-- Standalone SQL migrate `up` with `FERRUM_MIGRATE_DRY_RUN=false` applies pending plugin migrations independently of the startup auto-apply flag; SQL dry-run only reports pending plugin migrations without applying them, and `status`/config-file migration do not apply SQL plugin migrations. MongoDB custom plugin migration support is constructor-created collections/indexes only.
+- Standalone SQL migrate `up` with `FERRUM_MIGRATE_DRY_RUN=false` applies pending plugin migrations independently of the startup auto-apply flag; SQL dry-run only reports pending plugin migrations without applying them, and `status`/config-file migration do not apply SQL plugin migrations. MongoDB has no custom plugin migrations: a plugin creates its collections/indexes idempotently from its committed background worker (staged in `start_background_tasks()`, released by `commit_background_tasks()`), never in the side-effect-free constructor.
 
 ## Notifications
 

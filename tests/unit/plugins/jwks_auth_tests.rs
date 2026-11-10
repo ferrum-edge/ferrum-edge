@@ -527,6 +527,61 @@ fn dpop_replay_lane_uses_published_default_capacity() {
     assert_eq!(plugin.dpop_replay_modes(), vec![Some("process")]);
 }
 
+/// `sync_mode` and `dpop_replay_scope` admit exactly the published enum
+/// spellings (issue #7151). The shared parsers trim and lowercase, so without
+/// the wire-form screen `"REDIS"` or `" Shared "` would pass the constructor
+/// while the `JwksAuthConfig` schema rejects them.
+#[test]
+fn sync_mode_and_dpop_replay_scope_admit_only_the_published_spellings() {
+    let with_sync_mode = |mode: serde_json::Value| {
+        JwksAuth::new(
+            &json!({
+                "providers": [{"jwks": {"keys": []}, "issuer": "https://idp.example.com"}],
+                "sync_mode": mode
+            }),
+            default_client(),
+        )
+    };
+    assert!(with_sync_mode(json!("local")).is_ok());
+    for mode in [json!("REDIS"), json!(" redis"), json!("Local")] {
+        let err = with_sync_mode(mode.clone())
+            .err()
+            .unwrap_or_else(|| panic!("sync_mode {mode} must be rejected"));
+        assert!(
+            err.contains("`sync_mode` must be exactly `local` or `redis`"),
+            "{err}"
+        );
+    }
+    let err = with_sync_mode(json!(1))
+        .err()
+        .expect("non-string sync_mode");
+    assert!(err.contains("`sync_mode` must be a string"), "{err}");
+
+    let with_scope = |scope: &str| {
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks": {"keys": []},
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": scope
+                }]
+            }),
+            default_client(),
+        )
+    };
+    assert!(with_scope("process").is_ok());
+    for scope in ["PROCESS", " process ", " Shared ", "SHARED"] {
+        let err = with_scope(scope)
+            .err()
+            .unwrap_or_else(|| panic!("dpop_replay_scope {scope:?} must be rejected"));
+        assert!(
+            err.contains("`provider[0].dpop_replay_scope` must be exactly `process` or `shared`"),
+            "{err}"
+        );
+    }
+}
+
 #[test]
 fn unknown_security_control_fields_are_rejected() {
     for config in [
@@ -807,7 +862,7 @@ async fn oversized_discovery_document_is_rejected_before_deserialization() {
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() {
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
@@ -879,7 +934,7 @@ async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() 
 async fn failed_discovery_replacement_retires_unpublished_candidate_store() {
     use ferrum_edge::plugins::utils::jwks_cache::cached_refresh_state;
 
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
     let original_path = unique_jwks_path("original-jwks");
@@ -3611,7 +3666,7 @@ async fn discovery_resolved_after_publication_becomes_active_without_another_rel
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
     let (discovery_url, jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let plugin = JwksAuth::new(
@@ -3668,7 +3723,7 @@ async fn staged_discovery_is_withheld_until_commit_and_a_rejected_generation_lea
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
     let (discovery_url, _jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let build = || {
@@ -3752,7 +3807,7 @@ async fn shared_discovery_uri_relaxes_only_after_the_stricter_generation_retires
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let server = wiremock::MockServer::start().await;
     let (discovery_url, jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
-    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let build = |max_stale_secs: u64| {
@@ -5182,7 +5237,7 @@ fn bearer_ctx(token: &str) -> RequestContext {
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn rotated_signing_key_verifies_without_waiting_out_the_refresh_interval() {
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let (server, jwks_uri) = rotating_jwks_endpoint().await;
     let plugin = JwksAuth::new(
         &json!({
@@ -5236,7 +5291,7 @@ async fn rotated_signing_key_verifies_without_waiting_out_the_refresh_interval()
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn tokens_without_a_kid_never_trigger_an_on_demand_refetch() {
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let (server, jwks_uri) = rotating_jwks_endpoint().await;
     let plugin = JwksAuth::new(
         &json!({
@@ -6426,7 +6481,7 @@ fn clock_skew_seconds_is_bounded_at_admission() {
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn discovery_follows_a_jwks_uri_migration_without_reload() {
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     let original_public = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
     let migrated_private = include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem");
     let migrated_public = include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem");
@@ -6685,7 +6740,7 @@ async fn wait_for_active_uri(plugin: &JwksAuth, uri: &str) {
 async fn rediscovery_retires_a_superseded_uri_captured_by_publication() {
     use ferrum_edge::plugins::utils::jwks_cache::{cached_refresh_state, clear_jwks_cache};
 
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
     let server = wiremock::MockServer::start().await;
     let (discovery_url, first_uri, second_uri) = mount_migrating_discovery(&server).await;
@@ -6730,7 +6785,7 @@ async fn rediscovery_retires_a_superseded_uri_captured_by_publication() {
 async fn rediscovery_keeps_a_superseded_uri_a_co_tenant_still_uses() {
     use ferrum_edge::plugins::utils::jwks_cache::{cached_refresh_state, clear_jwks_cache};
 
-    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let _cache_guard = super::jwks_auth_support::cache_test_lock().lock().await;
     clear_jwks_cache();
     let server = wiremock::MockServer::start().await;
     let (discovery_url, first_uri, second_uri) = mount_migrating_discovery(&server).await;

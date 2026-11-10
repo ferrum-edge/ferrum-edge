@@ -966,12 +966,8 @@ async fn test_no_content_type_passes_through_on_a_mixed_route() {
 async fn test_application_soap_xml_is_processed() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let body = wrap_soap(&fresh_timestamp());
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/ws".to_string(),
-    );
-    ctx.metadata.insert("request_body".to_string(), body);
+    let mut ctx =
+        make_ctx_with_soap_bytes(body.into_bytes(), "application/soap+xml; charset=utf-8");
     let mut headers = HashMap::new();
     headers.insert(
         "content-type".to_string(),
@@ -3306,7 +3302,7 @@ async fn empty_request_body_bytes_still_reports_empty() {
 }
 
 #[tokio::test]
-async fn metadata_text_fallback_validates_utf8_xml_declaration() {
+async fn utf8_bytes_with_utf16_xml_declaration_reject_415() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let body = r#"<?xml version="1.0" encoding="UTF-16"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -3320,14 +3316,7 @@ async fn metadata_text_fallback_validates_utf8_xml_declaration() {
   </soap:Header>
   <soap:Body><GetPrice/></soap:Body>
 </soap:Envelope>"#;
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/ws".to_string(),
-    );
-    // Fixture-only path: metadata text without raw bytes.
-    ctx.metadata
-        .insert("request_body".to_string(), body.to_string());
+    let mut ctx = make_ctx_with_soap_bytes(body.as_bytes().to_vec(), "text/xml; charset=utf-8");
     let mut headers = HashMap::new();
     headers.insert(
         "content-type".to_string(),
@@ -3338,13 +3327,17 @@ async fn metadata_text_fallback_validates_utf8_xml_declaration() {
     assert_eq!(reject_status(&result), 415);
     assert!(
         reject_body(&result).contains("conflicting or ambiguous"),
-        "metadata fallback must still validate the XML declaration: {}",
+        "the XML declaration must agree with the charset: {}",
         reject_body(&result)
     );
 }
 
+/// Issue #7120: `metadata["request_body"]` is plugin-writable and not covered
+/// by the final-body digest binding, so a valid envelope that exists only
+/// there is never authenticated; without raw bytes the request takes the
+/// empty-body disposition.
 #[tokio::test]
-async fn metadata_text_fallback_accepts_matching_utf8_declaration() {
+async fn metadata_text_without_raw_bytes_is_not_authenticated() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let body = wrap_soap(&fresh_timestamp());
     let mut ctx = RequestContext::new(
@@ -3352,13 +3345,19 @@ async fn metadata_text_fallback_accepts_matching_utf8_declaration() {
         "POST".to_string(),
         "/ws".to_string(),
     );
+    ctx.headers
+        .insert("content-type".to_string(), "text/xml".to_string());
     ctx.metadata.insert("request_body".to_string(), body);
+    assert!(ctx.request_body_bytes.is_none());
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/xml".to_string());
     let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(is_reject(&result), "{result:?}");
+    assert_eq!(reject_status(&result), 400);
     assert!(
-        matches!(result, PluginResult::Continue),
-        "UTF-8 metadata fallback with a compatible declaration must still validate: {result:?}"
+        reject_body(&result).contains("SOAP request body is empty"),
+        "{}",
+        reject_body(&result)
     );
 }
 

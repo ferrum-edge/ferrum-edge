@@ -62,6 +62,8 @@ use super::utils::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, LoggerHooks, PluginHttpClient, RetryPolicy,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use crate::socket_opts::monotonic_now_ms;
+use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Hard ceiling for Ferrum's userspace admission channel (record count).
@@ -123,8 +125,12 @@ const QUEUE_FULL_RETRY_BUDGET: Duration = Duration::from_secs(5);
 
 /// Fixed `plugin` label for this sink's process-wide loss accounting.
 const KAFKA_PLUGIN_NAME: &str = "kafka_logging";
-const DELIVERY_WARN_INTERVAL: Duration = Duration::from_secs(60);
-const SATURATION_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// At most one delivery-failure / saturation warning per window. The gates are
+/// lock-free: once the channel is full every request's `log` hook reaches
+/// [`KafkaDeliveryMetrics::warn_saturation`], so a mutex here would serialize
+/// every worker on the drop path.
+const DELIVERY_WARN_INTERVAL_MS: u64 = 60_000;
+const SATURATION_WARN_INTERVAL_MS: u64 = 60_000;
 const ADMISSION_DRAIN_POLL: Duration = Duration::from_millis(1);
 const ADMISSION_DRAIN_BOUND: Duration = Duration::from_secs(5);
 
@@ -921,8 +927,8 @@ struct KafkaDeliveryMetrics {
     healthy: AtomicBool,
     accepting: AtomicBool,
     last_failure: Mutex<Option<KafkaSinkFailure>>,
-    last_delivery_warn: Mutex<Option<Instant>>,
-    last_saturation_warn: Mutex<Option<Instant>>,
+    delivery_warn: AtomicLogRateLimiter,
+    saturation_warn: AtomicLogRateLimiter,
 }
 
 impl KafkaDeliveryMetrics {
@@ -942,8 +948,8 @@ impl KafkaDeliveryMetrics {
             healthy: AtomicBool::new(true),
             accepting: AtomicBool::new(true),
             last_failure: Mutex::new(None),
-            last_delivery_warn: Mutex::new(None),
-            last_saturation_warn: Mutex::new(None),
+            delivery_warn: AtomicLogRateLimiter::with_window_ms(DELIVERY_WARN_INTERVAL_MS),
+            saturation_warn: AtomicLogRateLimiter::with_window_ms(SATURATION_WARN_INTERVAL_MS),
         }
     }
 
@@ -1083,42 +1089,26 @@ impl KafkaDeliveryMetrics {
     }
 
     fn warn_delivery(&self, error_kind: &str) {
-        let mut last = match self.last_delivery_warn.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let now = Instant::now();
-        let should_warn = last
-            .map(|previous| now.saturating_duration_since(previous) >= DELIVERY_WARN_INTERVAL)
-            .unwrap_or(true);
-        if should_warn {
-            *last = Some(now);
+        if let Some(suppressed) = self.delivery_warn.on_event(monotonic_now_ms()) {
             warn!(
                 plugin = "kafka_logging",
                 generation_id = self.generation_id,
                 error_kind,
                 failed = self.delivery_failed.load(Ordering::Relaxed),
+                suppressed_events = suppressed,
                 "kafka_logging: terminal broker delivery failure"
             );
         }
     }
 
     fn warn_saturation(&self, reason: &str, error_kind: &str) {
-        let mut last = match self.last_saturation_warn.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let now = Instant::now();
-        let should_warn = last
-            .map(|previous| now.saturating_duration_since(previous) >= SATURATION_WARN_INTERVAL)
-            .unwrap_or(true);
-        if should_warn {
-            *last = Some(now);
+        if let Some(suppressed) = self.saturation_warn.on_event(monotonic_now_ms()) {
             warn!(
                 plugin = "kafka_logging",
                 generation_id = self.generation_id,
                 reason,
                 error_kind,
+                suppressed_events = suppressed,
                 "kafka_logging: admission saturation"
             );
         }
@@ -2242,26 +2232,14 @@ impl KafkaLogging {
             finalized: AtomicBool::new(false),
             queue_full_saturated: AtomicBool::new(false),
         });
-        let metrics_for_hooks = Arc::clone(&metrics);
-        let hooks = LoggerHooks {
-            on_failed_batch: None,
-            // Intentional overflow shedding: Ferrum records the drop and accepts
-            // ownership of the shed decision so high-water / full-buffer paths
-            // report DiversionAccepted rather than leaving the item unowned.
-            on_overflow: Some(Arc::new(move |_item, reason| {
-                // Shedding takes ownership, so the batching layer reports
-                // DiversionAccepted and records no loss. Count it here or the
-                // shed record disappears from the published family.
-                sink_loss::record_dropped(KAFKA_PLUGIN_NAME, SinkLossReason::QueueFull, 1);
-                metrics_for_hooks.record_channel_saturated(reason);
-                true
-            })),
-            on_high_water: None,
-            high_watermark_percent: 80,
-        };
+        // No logger hooks: admission reserves a channel slot
+        // (`KafkaAdmission::admit_*` -> `try_reserve` + `permit.send`) and
+        // accounts a full channel itself through `record_channel_saturated`.
+        // The batching layer's `on_overflow` / high-water hooks are consulted
+        // only by `try_send`, which production admission never calls.
         let mut logger = BatchingLogger::spawn_with_hooks(
             kafka_worker_batch_config(pending.buffer_capacity),
-            hooks,
+            LoggerHooks::default(),
             {
                 let state = Arc::clone(&state);
                 let topic: Arc<str> = Arc::from(pending.topic.as_str());

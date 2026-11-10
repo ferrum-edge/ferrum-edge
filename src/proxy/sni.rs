@@ -1408,6 +1408,12 @@ fn parse_dtls_client_hello_body(body: &[u8], fragmented: bool) -> Result<Option<
         return if fragmented { Ok(None) } else { Err(()) };
     }
     let cipher_suites_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    // Same vector shape the TLS classifier enforces: two-byte CipherSuite
+    // values, never empty (RFC 6347 §4.2.2 / RFC 9147 §5.3). The declared
+    // length is in hand even when a fragment ends inside the vector.
+    if cipher_suites_len < 2 || !cipher_suites_len.is_multiple_of(2) {
+        return Err(());
+    }
     pos = pos.checked_add(2 + cipher_suites_len).ok_or(())?;
     if body.len() < pos {
         return if fragmented { Ok(None) } else { Err(()) };
@@ -1418,6 +1424,10 @@ fn parse_dtls_client_hello_body(body: &[u8], fragmented: bool) -> Result<Option<
         return if fragmented { Ok(None) } else { Err(()) };
     };
     let compression_len = compression_len as usize;
+    // The legacy compression vector must contain at least the null method.
+    if compression_len == 0 {
+        return Err(());
+    }
     pos = pos.checked_add(1 + compression_len).ok_or(())?;
     if body.len() < pos {
         return if fragmented { Ok(None) } else { Err(()) };
@@ -1449,6 +1459,10 @@ fn parse_sni_from_dtls_extensions(
     allow_incomplete_tail: bool,
 ) -> Result<Option<String>, ()> {
     let mut hostname = None;
+    // Any repeated extension type is malformed, exactly as in the TLS
+    // classifier's `scan_client_hello_extensions` (RFC 8446 §4.2, RFC 5246
+    // §7.4.1.4), not only a repeated `server_name`.
+    let mut seen_extension_types = SeenCodePoints::<EXTENSION_TYPE_BITSET_WORDS>::empty();
     while !ext.is_empty() {
         if ext.len() < 4 {
             return if allow_incomplete_tail {
@@ -1466,10 +1480,10 @@ fn parse_sni_from_dtls_extensions(
                 Err(())
             };
         };
+        if seen_extension_types.insert_is_duplicate(ext_type as usize) {
+            return Err(());
+        }
         if ext_type == 0x0000 {
-            if hostname.is_some() {
-                return Err(());
-            }
             hostname = parse_sni_hostname_strict(data)?;
         }
         ext = &ext[4 + ext_len..];
@@ -1490,6 +1504,9 @@ fn parse_sni_hostname_strict(data: &[u8]) -> Result<Option<String>, ()> {
         return Err(());
     }
     let mut hostname = None;
+    // RFC 6066 §3: no two names of the same `name_type`, for every type — the
+    // same rule `server_name_extension_is_well_formed` applies on TLS.
+    let mut seen_name_types = SeenCodePoints::<NAME_TYPE_BITSET_WORDS>::empty();
     while !names.is_empty() {
         if names.len() < 3 {
             return Err(());
@@ -1498,8 +1515,11 @@ fn parse_sni_hostname_strict(data: &[u8]) -> Result<Option<String>, ()> {
         let name_len = u16::from_be_bytes([names[1], names[2]]) as usize;
         let name_end = 3usize.checked_add(name_len).ok_or(())?;
         let name = names.get(3..name_end).ok_or(())?;
+        if seen_name_types.insert_is_duplicate(name_type as usize) {
+            return Err(());
+        }
         if name_type == 0x00 {
-            if hostname.is_some() || !is_valid_sni_dns_hostname(name) {
+            if !is_valid_sni_dns_hostname(name) {
                 return Err(());
             }
             hostname = Some(

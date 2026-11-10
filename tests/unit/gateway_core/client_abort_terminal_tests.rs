@@ -457,11 +457,11 @@ fn the_499_is_defined_once_and_minted_only_from_client_evidence() {
     // The H3 read-error evidence is the classifier every path shares.
     assert!(CLIENT_ABORT.contains("h3_request_read_error_is_client_abort(error)"));
     // gRPC's 499 <-> CANCELLED mapping reads the same constant.
-    let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let grpc = compact(include_str!("../../../src/proxy/grpc_proxy.rs"));
+    assert!(grpc.contains("usecrate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;"));
     assert!(
-        compact(grpc).contains(
-            "constCLIENT_CLOSED_REQUEST_STATUS:u16=crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;"
-        )
+        !grpc.contains("constCLIENT_CLOSED_REQUEST_STATUS"),
+        "grpc_proxy must not re-declare the client-abort status"
     );
     // No error class is blanket-remapped to the client-abort status.
     for (name, src) in [
@@ -519,8 +519,7 @@ fn the_relayed_upload_dispatcher_terminal_shares_the_one_definition() {
         r#"{"error":"Malformed request body"}"#
     );
 
-    // One definition: the dispatcher's constants and the gRPC mapping's
-    // `grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS` path alias `client_abort`.
+    // One definition: the dispatcher's constants alias `client_abort`.
     let proxy = compact(PROXY);
     for alias in [
         "constGRPC_CLIENT_DISCONNECT_MESSAGE:&str=client_abort::CLIENT_ABORT_MESSAGE;",
@@ -539,10 +538,6 @@ fn the_relayed_upload_dispatcher_terminal_shares_the_one_definition() {
     ));
     assert!(terminal.contains("client_abort::CLIENT_ABORT_HTTP_BODY.as_bytes(),"));
     assert!(!terminal.contains("Clientdisconnected"));
-    let grpc_source = compact(include_str!("../../../src/proxy/grpc_proxy.rs"));
-    assert!(grpc_source.contains(
-        "pub(crate)constCLIENT_CLOSED_REQUEST_STATUS:u16=crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;"
-    ));
 }
 
 // ── H1/H2 buffered intake ───────────────────────────────────────────────────

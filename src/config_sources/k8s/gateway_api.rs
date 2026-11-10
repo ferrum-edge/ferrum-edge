@@ -25,11 +25,10 @@ use super::{
     RouteBackend, RouteProxySpec, SourceKind, UNSUPPORTED_SHAPE_MARKER,
     attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
     mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
-    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
-    resource_id, route_backends_require_node_waypoint_authz,
-    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
-    service_dns_name, string_array, string_field, upstream_for_route,
-    upstream_for_route_with_session,
+    optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
+    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
+    route_response_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    upstream_for_route, upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
@@ -392,14 +391,18 @@ pub(super) fn translate(
 /// (Gateway API marks the field implementation-specific).
 const DEFAULT_SESSION_NAME: &str = "ferrum-session";
 
-/// Accepted/rejected BackendLB / XBackendTraffic policy attachment for a Service.
+/// Accepted BackendLB / XBackendTraffic policy attachment for a Service.
+///
+/// Only an accepted policy is recorded: an invalid one is refused by
+/// [`collect_backend_lb_policy`] and never reaches the accumulator, so a route
+/// whose backend Service carries only an invalid policy gets no Service-level
+/// session persistence.
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayBackendSessionPolicy {
     pub resource: K8sResourceKey,
     pub creation_timestamp: Option<DateTime<Utc>>,
-    /// `Ok(None)` = policy accepted but carries no `sessionPersistence`.
-    /// `Err` = field-specific rejection reason.
-    pub session: Result<Option<GatewaySessionPersistence>, String>,
+    /// `None` = policy accepted but carries no `sessionPersistence`.
+    pub session: Option<GatewaySessionPersistence>,
 }
 
 fn backend_lb_policy_kinds(kind: &str) -> bool {
@@ -514,7 +517,7 @@ pub(super) fn collect_backend_lb_policy(
             .creation_timestamp
             .as_deref()
             .and_then(parse_k8s_timestamp),
-        session: Ok(session),
+        session,
     };
 
     // Remember the policy's FULL Service target set. Precedence below is
@@ -804,13 +807,9 @@ fn parse_gateway_api_duration_secs(
 ) -> Result<u64, K8sTranslateError> {
     // Diagnostics name the field and system cap only — never echo the operator
     // duration string (which may carry hostile/control content into status).
-    if !is_gateway_api_duration(raw) {
-        return Err(invalid_resource(
-            object,
-            format!("sessionPersistence.{field} is not a valid Gateway API duration"),
-        ));
-    }
-    let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
+    // The CRD admits compound GEP-2257 durations such as `1h30m`, so use the
+    // multi-component parser shared with `timeouts` and `retry.backoff`.
+    let ms = parse_gateway_api_duration_ms(raw).ok_or_else(|| {
         invalid_resource(
             object,
             format!("sessionPersistence.{field} is not a valid Gateway API duration"),
@@ -833,40 +832,6 @@ fn parse_gateway_api_duration_secs(
         ));
     }
     Ok(secs)
-}
-
-/// Gateway API Duration is one to four integer+unit groups, each integer at
-/// most five digits, with units h/m/s/ms. This intentionally rejects the wider
-/// duration grammar accepted by the Istio parser (for example decimals).
-fn is_gateway_api_duration(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    let mut offset = 0;
-    let mut groups = 0;
-    while offset < bytes.len() && groups < 4 {
-        let digits_start = offset;
-        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
-            offset += 1;
-        }
-        let digits = offset - digits_start;
-        if !(1..=5).contains(&digits) {
-            return false;
-        }
-        if bytes
-            .get(offset..)
-            .is_some_and(|remainder| remainder.starts_with(b"ms"))
-        {
-            offset += 2;
-        } else if bytes
-            .get(offset)
-            .is_some_and(|unit| matches!(*unit, b'h' | b'm' | b's'))
-        {
-            offset += 1;
-        } else {
-            return false;
-        }
-        groups += 1;
-    }
-    offset == bytes.len() && groups > 0
 }
 
 fn resolve_rule_session_persistence(
@@ -902,35 +867,23 @@ fn resolve_rule_session_persistence(
         let Some(policy) = acc.gateway_api_backend_session_policies.get(key) else {
             continue;
         };
-        match &policy.session {
-            Ok(Some(session)) => {
-                if let Some((ref prior_key, ref existing)) = resolved {
-                    if existing != session {
-                        return Err(invalid_resource(
-                            object,
-                            format!(
-                                "backendRefs target Services with conflicting \
-                                 BackendLB/XBackendTraffic sessionPersistence \
-                                 (Service {:?}/{:?} vs Service {:?}/{:?})",
-                                prior_key.0, prior_key.1, key.0, key.1
-                            ),
-                        ));
-                    }
-                } else {
-                    resolved = Some((key.clone(), session.clone()));
-                }
-            }
-            Ok(None) => {}
-            Err(message) => {
+        let Some(session) = &policy.session else {
+            continue;
+        };
+        if let Some((ref prior_key, ref existing)) = resolved {
+            if existing != session {
                 return Err(invalid_resource(
                     object,
                     format!(
-                        "backend Service {:?}/{:?} has rejected session policy \
-                         {:?}/{:?}: {message}",
-                        key.0, key.1, policy.resource.namespace, policy.resource.name
+                        "backendRefs target Services with conflicting \
+                         BackendLB/XBackendTraffic sessionPersistence \
+                         (Service {:?}/{:?} vs Service {:?}/{:?})",
+                        prior_key.0, prior_key.1, key.0, key.1
                     ),
                 ));
             }
+        } else {
+            resolved = Some((key.clone(), session.clone()));
         }
     }
     Ok(resolved.map(|(_, session)| scope_cookie_session_to_route(object, rule_index, session)))
@@ -1021,7 +974,7 @@ pub(crate) fn backend_lb_policy_conflict_losers<'a>(
                     .creation_timestamp
                     .as_deref()
                     .and_then(parse_k8s_timestamp),
-                session: Ok(None),
+                session: None,
             },
             targets,
         ));
@@ -5751,6 +5704,7 @@ fn ensure_http_route_features(object: &K8sObject) -> Result<(), K8sTranslateErro
                     ensure_url_rewrite_filter(object, rule, rule_index, &location, payload_object)?;
                 }
                 Some("RequestRedirect") => {
+                    ensure_request_redirect_target(object, &location, payload_object)?;
                     if let Some(path) = payload_object.get("path") {
                         let modifier = PathModifierFilter::RequestRedirect;
                         ensure_path_modifier(object, rule, rule_index, &location, modifier, path)?;
@@ -6237,6 +6191,49 @@ fn ensure_url_rewrite_filter(
     };
     let modifier = PathModifierFilter::UrlRewrite;
     ensure_path_modifier(object, rule, rule_index, location, modifier, path)
+}
+
+/// Validate the `scheme` and `hostname` of one admitted `RequestRedirect`
+/// before any rule materializes.
+///
+/// Upstream's CRD restricts `scheme` to the `http` / `https` enum and
+/// `hostname` to a `PreciseHostname`; both are copied into the route's
+/// `mesh_route_dispatch` redirect. The plugin rejects a bad value only at
+/// construction, where it would fail the whole plugin-cache build rather than
+/// this one route, so Ferrum refuses the route here (`Invalid`), exactly as
+/// `ensure_url_rewrite_filter` does for `urlRewrite.hostname`. A file/CP-delivered
+/// object never passed through the API server's validation.
+fn ensure_request_redirect_target(
+    object: &K8sObject,
+    location: &str,
+    redirect: &serde_json::Map<String, Value>,
+) -> Result<(), K8sTranslateError> {
+    if let Some(scheme) = redirect.get("scheme")
+        && !matches!(scheme.as_str(), Some("http" | "https"))
+    {
+        return Err(invalid_resource(
+            object,
+            format!("{location}.requestRedirect.scheme must be `http` or `https`"),
+        ));
+    }
+    if let Some(hostname) = redirect.get("hostname") {
+        let hostname = hostname.as_str().filter(|value| !value.is_empty());
+        let Some(hostname) = hostname else {
+            return Err(invalid_resource(
+                object,
+                format!("{location}.requestRedirect.hostname must be a non-empty string"),
+            ));
+        };
+        if !is_precise_gateway_hostname(hostname) {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "{location}.requestRedirect.hostname must be a precise hostname without a wildcard or port"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The filter carrying an `HTTPPathModifier`: `URLRewrite` rebases the path
@@ -8509,7 +8506,7 @@ fn l4_route_proxies_for_namespace(
         } else {
             materialized_listener_bindings.clone()
         };
-        let rule_suffix = l4_rule_suffix(scheme, rule_index);
+        let rule_suffix = l4_rule_suffix(&object.kind, rule_index);
 
         // One leg dispatches directly; a set of legs becomes one namespaced
         // upstream whose weighted targets preserve the declared relative
@@ -8529,6 +8526,28 @@ fn l4_route_proxies_for_namespace(
                 &object.metadata.name,
                 &rule_suffix,
             );
+            // A second route object deriving this key must not replace the
+            // owner's weighted backend set.
+            if let Some(key) =
+                namespaced_resource_key(&object.metadata.namespace, upstream_id.as_str())
+                && !acc.claim_gateway_api_route_upstream(&key, object)
+            {
+                acc.warnings.push(format!(
+                    "{} {:?}/{:?} rule {rule_index} is refused: another route object already \
+                     derived upstream id {:?} in namespace {:?}",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    upstream_id,
+                    object.metadata.namespace
+                ));
+                acc.record_gateway_api_refused_route_claims(
+                    object,
+                    &materialized_parent_refs,
+                    None,
+                );
+                continue;
+            }
             acc.upsert_upstream(upstream_for_route(
                 upstream_id.clone(),
                 object.metadata.namespace.clone(),
@@ -8564,6 +8583,27 @@ fn l4_route_proxies_for_namespace(
                     &suffix,
                 )
             };
+            // A second route object deriving this key must not replace the
+            // owner's proxy (`upsert_proxy` would, silently).
+            if let Some(key) = namespaced_resource_key(config_namespace, id.as_str())
+                && !acc.claim_gateway_api_route_proxy(&key, object)
+            {
+                acc.warnings.push(format!(
+                    "{} {:?}/{:?} is refused on this listener: another route object already \
+                     derived proxy id {:?} in namespace {:?}",
+                    object.kind,
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    id,
+                    config_namespace
+                ));
+                acc.record_gateway_api_refused_route_claims(
+                    object,
+                    &materialized_parent_refs,
+                    None,
+                );
+                continue;
+            }
             proxies.push({
                 let mut proxy = proxy_for_route(RouteProxySpec {
                     id,
@@ -8740,18 +8780,15 @@ fn l4_route_declares_parent_ref(object: &K8sObject) -> bool {
     object.spec.get("parentRefs").is_some()
 }
 
-/// Proxy/upstream id suffix for one L4 rule.
+/// Proxy/upstream id suffix for one L4 rule: `{kind}-{rule index}`
+/// (`tcproute-0`, `tlsroute-0`, `udproute-0`).
 ///
-/// `UDPRoute` ids are kind-scoped. The historical L4 id encodes only
-/// `(namespace, route name, rule index)`, so a `UDPRoute` and a same-named
-/// `TCPRoute` in one namespace would upsert over each other's proxy. Existing
-/// `TCPRoute`/`TLSRoute` ids stay byte-identical.
-fn l4_rule_suffix(scheme: BackendScheme, rule_index: usize) -> String {
-    if scheme.is_udp() {
-        format!("udproute-{rule_index}")
-    } else {
-        rule_index.to_string()
-    }
+/// Every L4 route kind shares the `gwapi-l4` id space and one namespace's
+/// proxy/upstream keyspace, so the suffix carries the route kind: a
+/// `TCPRoute`, `TLSRoute` and `UDPRoute` with the same name in one namespace
+/// must derive distinct ids, or one would upsert over another's proxy.
+fn l4_rule_suffix(route_kind: &str, rule_index: usize) -> String {
+    format!("{}-{rule_index}", route_kind.to_ascii_lowercase())
 }
 
 /// Gateway API v1.5.1 bounds `UDPRouteSpec.rules` and `UDPRouteRule.backendRefs`
@@ -17132,12 +17169,36 @@ mod tests {
 
     #[test]
     fn gateway_api_duration_parser_rejects_wider_istio_grammar() {
-        assert!(is_gateway_api_duration("1h2m3s4ms"));
-        assert!(is_gateway_api_duration("0s"));
-        assert!(!is_gateway_api_duration("1.5s"));
-        assert!(!is_gateway_api_duration("123456s"));
-        assert!(!is_gateway_api_duration("1s2s3s4s5s"));
-        assert!(!is_gateway_api_duration(""));
+        assert_eq!(parse_gateway_api_duration_ms("1h2m3s4ms"), Some(3_723_004));
+        assert_eq!(parse_gateway_api_duration_ms("0s"), Some(0));
+        assert_eq!(parse_gateway_api_duration_ms("1.5s"), None);
+        assert_eq!(parse_gateway_api_duration_ms("123456s"), None);
+        assert_eq!(parse_gateway_api_duration_ms("1s2s3s4s5s"), None);
+        assert_eq!(parse_gateway_api_duration_ms(""), None);
+    }
+
+    #[test]
+    fn permanent_cookie_accepts_compound_absolute_timeout() {
+        let policy = x_backend_traffic_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "perm",
+                    "type": "Cookie",
+                    "absoluteTimeout": "1h30m",
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+        let result = translate_k8s_objects(&[policy, http_route_to_service("api")], options())
+            .expect("a CRD-valid compound absoluteTimeout should translate");
+        let cookie = result.config.upstreams[0]
+            .hash_on_cookie_config
+            .as_ref()
+            .expect("cookie config");
+        assert!(!cookie.session_cookie);
+        assert_eq!(cookie.ttl_seconds, 5400);
     }
 
     #[test]

@@ -942,11 +942,11 @@ fn test_no_match() {
 
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
-    apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    direct_h2_uses_limit_adapter, extract_grpc_reject_message,
-    finalize_plugin_rejection_parts_for_test, finalized_upload_deadline_response_for_test,
-    insert_grpc_error_metadata, map_http_reject_status_to_grpc_status, normalize_reject_response,
-    request_may_have_body, set_grpc_deadline_budget_for_test,
+    apply_request_body_plugins, can_use_direct_http2_pool, direct_h2_uses_limit_adapter,
+    extract_grpc_reject_message, finalize_plugin_rejection_parts_for_test,
+    finalized_upload_deadline_response_for_test, insert_grpc_error_metadata,
+    map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
+    set_grpc_deadline_budget_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -2777,6 +2777,71 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
     );
 }
 
+/// Never completes: the multi-auth deadline exit is the only way out.
+struct HangingAuth;
+
+#[async_trait]
+impl Plugin for HangingAuth {
+    fn name(&self) -> &str {
+        "hanging_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        std::future::pending().await
+    }
+}
+
+/// Issue #7162: the multi-auth deadline exit is a final rejection like every
+/// other exit, so it consumes the cookies an earlier mechanism staged and
+/// carries them, as single-mode's deadline reject does. They must never stay
+/// behind in request metadata.
+#[tokio::test]
+async fn test_multi_auth_deadline_exit_consumes_staged_rejection_cookie() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "session=staged; Path=/",
+    });
+    let hanging: Arc<dyn Plugin> = Arc::new(HangingAuth);
+    let auth_plugins = [staged, hanging];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/svc.Echo/Call".to_string(),
+    );
+    ctx.request_authority = Some("127.0.0.1".to_string());
+    ferrum_edge::_test_support::set_grpc_deadline_budget_for_test(&mut ctx, Some(50));
+
+    let (status, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("the RPC deadline must end authentication with a rejection");
+
+    assert_eq!(status, 200, "the deadline reject is gRPC Trailers-Only");
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("4"),
+        "the deadline exit must still answer DEADLINE_EXCEEDED"
+    );
+    assert!(ferrum_edge::_test_support::gateway_deadline_response_selected_for_test(&ctx));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("session=staged; Path=/"),
+        "the deadline reject must deliver the staged requester-owned cookie"
+    );
+    assert!(
+        !ctx.metadata.contains_key("auth.rejection_set_cookie"),
+        "the staged cookie must not stay in request metadata after the phase"
+    );
+}
+
 #[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_treats_matching_ip_domain_as_host_only() {
     for (authority, selected_cookie) in [
@@ -4026,24 +4091,6 @@ fn test_direct_http2_pool_requires_http2_without_retries_or_request_buffering() 
     assert!(!can_use_direct_http2_pool(true, false, true));
 }
 
-#[test]
-fn test_direct_http2_pool_dispatch_allows_nonzero_body_limits() {
-    // Issue #3622: nonzero body limits are enforced in-path on direct-H2
-    // (413 / 502), so they must not disqualify ordinary dispatch.
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 0));
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 1, 0));
-    assert!(can_dispatch_direct_http2_pool(true, false, false, 0, 1));
-    assert!(can_dispatch_direct_http2_pool(
-        true, false, false, 10_485_760, 10_485_760
-    ));
-    // Retry body replay / request-body buffering still force reqwest.
-    assert!(!can_dispatch_direct_http2_pool(true, true, false, 0, 0));
-    assert!(!can_dispatch_direct_http2_pool(
-        true, false, true, 10_485_760, 10_485_760
-    ));
-    assert!(!can_dispatch_direct_http2_pool(false, false, false, 0, 0));
-}
-
 /// Issue #3942: operator `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0` is unlimited
 /// and must skip `SizeLimitedIncoming` on ordinary unauthenticated direct-H2.
 /// A real cap, an upload-completion gate, or gRPC message counting still
@@ -4542,24 +4589,6 @@ async fn masked_h2_client_reset_collects_without_end_stream() {
     let (collected, ended) = buffered_h2_upload_outcome(false).await;
     assert!(collected, "a complete upload collects");
     assert!(ended, "a complete upload ends with END_STREAM");
-}
-
-#[test]
-fn test_direct_http2_dispatch_gate_matches_body_compat_gate() {
-    // Ordinary and SNI routes share the same body-compat gate; body-size
-    // limits no longer fork the predicate.
-    assert_eq!(
-        can_use_direct_http2_pool(true, false, false),
-        can_dispatch_direct_http2_pool(true, false, false, 10_485_760, 10_485_760)
-    );
-    assert_eq!(
-        can_use_direct_http2_pool(true, true, false),
-        can_dispatch_direct_http2_pool(true, true, false, 0, 0)
-    );
-    assert_eq!(
-        can_use_direct_http2_pool(true, false, true),
-        can_dispatch_direct_http2_pool(true, false, true, 0, 0)
-    );
 }
 
 #[test]
@@ -6081,4 +6110,75 @@ fn route_rebase_invalidates_offsets_but_preserves_base_path_semantics() {
             );
         }
     }
+}
+
+/// Issue #7155: the H1/H2 route-protocol admission `403` and circuit-breaker
+/// open `503` answer a gRPC-Web client in its own framing (status in a body
+/// trailer frame), like their `allowed_methods` and gRPC deadline siblings,
+/// not as a native-gRPC Trailers-Only header block it cannot read.
+#[test]
+fn route_admission_and_open_breaker_rejects_are_grpc_web_aware() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    let admission = source
+        .split("if omitted_policy_exemption == Some(false) {")
+        .nth(1)
+        .expect("route-protocol admission refusal")
+        .split("// Per-proxy HTTP method filtering")
+        .next()
+        .expect("bounded route-protocol admission refusal");
+    assert!(admission.contains("build_grpc_web_reject_response("));
+    assert!(admission.contains("grpc_web_response_content_type"));
+    assert!(admission.contains("if let Some(response) = grpc_web_response {"));
+
+    let breaker = source
+        .split("match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {")
+        .nth(1)
+        .expect("H1/H2 circuit-breaker admission")
+        .split("// GHSA-4cq4-3f3f-mq76")
+        .next()
+        .expect("bounded circuit-breaker open refusal");
+    assert!(breaker.contains("finalize_reject_response_with_after_proxy_hooks_and_commit_policy("));
+    assert!(breaker.contains("grpc_web_response_content_type.is_none()"));
+    assert!(breaker.contains("build_grpc_web_reject_response("));
+    assert!(breaker.contains("if let Some(response) = grpc_web_response {"));
+}
+
+/// Issue #7164: WebSocket disconnect metadata reports the listener the client
+/// connected to (a Gateway API / mesh listener included), not the
+/// process-global proxy port. H1/H2 and H3 share this helper.
+#[test]
+fn websocket_session_listen_port_reports_the_accepting_listener() {
+    use ferrum_edge::_test_support::websocket_session_listen_port_for_test;
+
+    let env = ferrum_edge::config::EnvConfig {
+        proxy_http_port: 8000,
+        proxy_https_port: 8443,
+        ..ferrum_edge::config::EnvConfig::default()
+    };
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/ws".to_string(),
+    );
+
+    ctx.frontend_listen_port = Some(18080);
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, false, &env),
+        18080
+    );
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, true, &env),
+        18080
+    );
+
+    ctx.frontend_listen_port = None;
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, false, &env),
+        8000
+    );
+    assert_eq!(
+        websocket_session_listen_port_for_test(&ctx, true, &env),
+        8443
+    );
 }

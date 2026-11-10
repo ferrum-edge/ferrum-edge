@@ -73,6 +73,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error};
 
+use super::utils::ai_providers::{IntegerControl, parse_integer_control};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
@@ -360,60 +361,6 @@ const NESTED_CHOICE_FIELDS: &[(&str, &str, &str)] = &[
     ),
     ("parameters", "best_of", "parameters.best_of"),
 ];
-
-/// The reading of one request-supplied integer control (an output-token cap or
-/// a completion count).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IntegerControl {
-    /// Absent or JSON `null` (the provider default applies).
-    Absent,
-    /// A non-negative integral value. Values above `u64::MAX` saturate, which
-    /// only ever makes an over-limit request look larger.
-    Value(u64),
-    /// Present but not a non-negative integer the guard can evaluate.
-    Invalid,
-}
-
-/// Parses an integer control the way the governed providers do, so a value a
-/// backend honors can never be read as "no value" by the guard. JSON integers,
-/// integral floats and exponents (`8192.0`, `5e5`), and quoted spellings of
-/// those (ProtoJSON's quoted int64 form, which lax Python/pydantic servers also
-/// coerce) are numeric; negative, fractional, non-finite, boolean, array,
-/// object, and unparseable string values are `Invalid` so the caller fails
-/// closed rather than treating them as absent.
-fn parse_integer_control(value: Option<&Value>) -> IntegerControl {
-    match value {
-        None | Some(Value::Null) => IntegerControl::Absent,
-        Some(Value::Number(number)) => {
-            if let Some(value) = number.as_u64() {
-                IntegerControl::Value(value)
-            } else if number.is_i64() {
-                // A negative integer is never a valid count.
-                IntegerControl::Invalid
-            } else {
-                number
-                    .as_f64()
-                    .map_or(IntegerControl::Invalid, integral_float_control)
-            }
-        }
-        Some(Value::String(text)) => match text.parse::<u64>() {
-            Ok(value) => IntegerControl::Value(value),
-            Err(_) => text
-                .parse::<f64>()
-                .map_or(IntegerControl::Invalid, integral_float_control),
-        },
-        Some(_) => IntegerControl::Invalid,
-    }
-}
-
-fn integral_float_control(value: f64) -> IntegerControl {
-    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 {
-        // `as` saturates finite out-of-range values at `u64::MAX`.
-        IntegerControl::Value(value as u64)
-    } else {
-        IntegerControl::Invalid
-    }
-}
 
 fn is_valid_integer_control(value: Option<&Value>) -> bool {
     matches!(parse_integer_control(value), IntegerControl::Value(_))

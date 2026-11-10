@@ -64,11 +64,17 @@ every committed `Cargo.lock` against these floors with
 
 The same script also checks every committed lockfile that builds `ferrum-edge`
 (today the root, `fuzz/`, and `tests/performance/mesh/` lockfiles). Each must
-resolve `hyper`, `reqwest`, `h2`, and `hyper-util` to exactly one copy: the
-`[patch.crates-io]` path crate under `vendor/`, at the version its directory
-names, with no `source` or `checksum`. A second, registry copy would ship that
-crate without Ferrum's patches. The expected versions come from the `vendor/`
-directories, so moving a vendored crate needs no change to the checker.
+resolve `hyper`, `reqwest`, `h2`, `hyper-util`, `sqlx-core`, `h3`, and
+`h3-quinn` to exactly one copy: the `[patch.crates-io]` path crate under
+`vendor/`, at the version its directory names, with no `source` or `checksum`.
+A second, registry copy would ship that crate without Ferrum's patches. The
+expected versions come from the `vendor/` directories, so moving a vendored
+crate needs no change to the checker. Three vendored crates are deliberately
+not single-copy: `tungstenite` / `tokio-tungstenite` (kube-client's `ws`
+feature resolves the 0.30 line from the registry, while Ferrum's own WebSocket
+code depends on the vendored 0.29 copy) and `dimpl` (the `strict_dimpl`
+dev-dependency alias pins registry `=0.8.0` as an independent DTLS test peer,
+issue #7000).
 
 Every committed lockfile must also resolve `aws-smithy-json` to a single copy.
 The direct `aws-smithy-json` requirement only constrains the AWS SDK while it
@@ -177,16 +183,18 @@ advisories against 0.4.20 manually.
 
 ### Deliberate fork policy and SLA
 
-As of 2026-10-04, seven patches ride an **open upstream PR** (reqwest #3017,
-h3 #339, tungstenite #556 / tokio-tungstenite #380, hyper #4210, and h2 #903 /
-#965); the weekly
-`scripts/check_vendored_patch_status.sh` (backed by
-`docs/vendored-patch-lifecycle.json`) polls those and goes red when one
-merges. Every other row in the inventory table is marked **Deliberate fork**
-(`upstream.filing: deliberate_fork_unfiled` in the lifecycle JSON), including
-sqlx-core, reqwest 002–004, h3 002–005, both h3-quinn patches, the tungstenite /
-tokio-tungstenite extensions other than lossless takeover, dimpl,
-Hyper 002/003/004, h2 003, and hyper-util (which has upstream issue
+As of 2026-11-10, seven patches are `filed` in the lifecycle JSON. Six ride an
+**open upstream PR** (reqwest #3017, h3 #339, tungstenite #556 /
+tokio-tungstenite #380, hyper #4210, and h2 #903); the seventh, sqlx-core 002,
+rides sqlx #4359, which is merged but not yet in a release and carries a dated
+`merged_release_hold`. The weekly `scripts/check_vendored_patch_status.sh`
+(backed by `docs/vendored-patch-lifecycle.json`) polls those and goes red when
+one merges without a recorded hold. Every other row in the inventory table is
+marked **Deliberate fork** (`upstream.filing: deliberate_fork_unfiled` in the
+lifecycle JSON): sqlx-core 001, reqwest 002–004, h3 002–005, both h3-quinn
+patches, the tungstenite / tokio-tungstenite extensions other than lossless
+takeover (tungstenite 002–005, tokio-tungstenite 004), dimpl, Hyper 002–008,
+h2 003–004, and hyper-util 001–002 (001 has upstream issue
 [hyperium/hyper#4202](https://github.com/hyperium/hyper/issues/4202) but no
 upstream PR). These are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
@@ -198,8 +206,7 @@ patch 004 after an equivalent progress-preserving timeout implementation is
 adopted and tested, or the HTTP/2 client moves off Hyper. No replacement
 release or dated owner reaffirmation is recorded for either patch; the owner
 must file a current equivalent proposal or record matching dated reaffirmations
-before the stable-release checkpoint below. h2 #965 remains an independent
-open proposal with its own release-adoption trigger.
+before the stable-release checkpoint below.
 
 - **Owner.** The dependency-governance owner in
   [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`) — the same

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Removed
+- **Plugin readers for metadata and record shapes no built-in writes**
+  (#7115). `ai_transcript_audit` no longer exports the pre-namespace
+  `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity` keys in a
+  record's `cache` section (only `ai_semantic_cache.<id>.*` and
+  `request_deduplication.replayed`), and those keys are no longer on the
+  built-in safe log-metadata allowlist. `api_chargeback_sink` reads
+  `request_id` only from the canonical `request_id` metadata, not the
+  `x-request-id` / `correlation_id` spellings. `request_deduplication`
+  refuses a Redis replay record whose body is a JSON byte array instead of
+  the base64 string it writes, and `oidc_relying_party` no longer defaults a
+  session payload's `context_id` / `claims_expires_at_unix`.
 - **`ferrum_xds_warming_partial_applies_total` is no longer exported**
   (#7027). The xDS data plane only builds a mesh slice once every required
   type (CDS/EDS/LDS/RDS/ECDS) reports the same `version_info`, so a slice is
@@ -17,6 +28,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Changed
+- **ferrum-mesh chart: values now reach the workload they name, once**
+  (#7297, #7299).
+  - `controlPlane.grpcPort` now renders
+    `FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:<grpcPort>` (unless `controlPlane.env`
+    sets it). Before, a non-default port changed only the container and
+    Service ports while the control plane kept listening on 50051.
+  - Node-agent and CNI-uninstall images keep an `image.tag` that already ends
+    in `-ebpf-tools` instead of rendering the unpublished `<tag>-ebpf-tools-ebpf`.
+  - `helm template` / `helm upgrade` now fail when a workload env map sets a
+    name the chart renders from a first-class value:
+    `injector.env.FERRUM_INJECTOR_{LISTEN_ADDR,REQUIRE_ANNOTATION,TLS_CERT_PATH,TLS_KEY_PATH}`,
+    `ambient.env.FERRUM_MESH_CAPTURE_MODE` (use `ambient.captureMode`), and
+    `<component>.env.FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` /
+    `FERRUM_TLS_CRL_FILE_PATH` together with `admin.tls.clientCaKey` /
+    `crlKey`. These previously rendered the name twice.
+  - The unused top-level `namespace` value is removed; `--set namespace=...`
+    now fails schema validation. Install with `helm install --namespace`.
+- **Compose `ferrum-mongodb` publishes host ports 8004/8447/9446** (#7296),
+  so the `mongodb` and `cp-dp` profiles can run together. It previously
+  reused 8002/8445 (ferrum-dp-1) and 9445 (ferrum-cp).
+- **Core cleanups** (issue #7227). `/metrics` now emits each
+  `ferrum_log_sink_*` family as one HELP/TYPE/sample group instead of all
+  headers first and the samples interleaved per sink; series names, labels and
+  values are unchanged. `EnvConfig::default().log_level` is now `warn`,
+  matching the parse default and the docs.
+- **Operator diagnostics name the right setting and keep their useful detail**
+  (issue #7229). `ferrum-edge health` now reports the numeric HTTP status
+  (`Unhealthy: HTTP status 503`) instead of a quoted status line the startup
+  renderer withheld. TLS and DTLS key-exchange group errors and the TLS policy
+  log line name `FERRUM_TLS_KEY_EXCHANGE_GROUPS` instead of the
+  `FERRUM_TLS_CURVES` alias. Unreadable Gateway multi-certificate material
+  reports the field label and failure class only, like the single-certificate
+  loader. A MeshSubscribe peer that omits its version is told CP and data
+  planes must run the same build.
+- **V001 baseline: namespace-scoped credential index and structured MySQL
+  duplicate-index check** (issue #7228). `idx_consumer_credential_index_consumer_id`
+  now covers `(namespace, consumer_id)`, matching its foreign key and the
+  namespace-scoped delete, so MySQL no longer creates a second implicit FK
+  index. On MySQL, V001 now tolerates only the structured server error 1061
+  when an index already exists; any other failure (even one whose text
+  contains "1061") fails the migration. The V001 checksum changes: recreate
+  development databases.
+- **Request-path logging in `ldap_auth`, `kafka_logging` and `otel_tracing`
+  no longer scales with traffic** (#7140).
+  - `ldap_auth` logs request-path refusals (wrong password, unknown user,
+    non-membership, saturated failure tracker or concurrency limit,
+    deadlines, directory failover) through the sampled warning gate: at most
+    one WARN per site per 10 seconds with a `suppressed_events` count, the
+    detail at DEBUG. Non-membership warnings no longer name the user; the
+    identity is logged at DEBUG only.
+  - `kafka_logging` rate-limits its delivery-failure and admission-saturation
+    warnings with a lock-free gate instead of a mutex every request's `log`
+    hook took once the channel was full. The warnings now carry
+    `suppressed_events`.
+  - `otel_tracing`'s per-transaction `request trace` / `stream trace` /
+    `websocket session trace` records (target `otel`) are DEBUG instead of
+    INFO: they were emitted for every traced transaction before the sampling
+    decision and carried the client address.
 - **Mesh HTTP/2 backend connections use the same builder settings as the
   direct-H2 and gRPC pools** (issue #7071).
   - Sidecar mesh-mTLS connections and the nested HTTP/2 connection a native
@@ -57,6 +126,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and incremented with a compare-exchange that refuses a stale cycle, so an
     increment racing a reopen can no longer close the next cycle one success
     early or extend its failure streak.
+- **The mesh injector no longer copies `FERRUM_DP_GRPC_TLS_NO_VERIFY` into
+  sidecars** (#7252). Every mode rejects `FERRUM_DP_GRPC_TLS_NO_VERIFY=true`
+  at startup, so forwarding the injector's value could only be a no-op or
+  stop every injected sidecar from starting. Pin the CP CA with
+  `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` instead, which is still forwarded.
 
 ### Fixed
 - **`body_validator` response-side rejections no longer describe the upstream
@@ -95,6 +169,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`api_chargeback` validates its config before claiming the process-global
   registry** (#7109). A config with a bad currency, tunable, or pricing block
   no longer creates the `/charges` registry singleton.
+- **CP `GET /admin/metrics` reports `database_polling`** (#7215). The
+  Control Plane has no proxy state, and the builder's no-proxy-state branch
+  dropped the delta-poll block, so CP operators never saw it although
+  `docs/admin_metrics.md` documents it for `cp`. It is now attached in both
+  `database` and `cp` modes.
+- **MongoDB full loads run the SQL loader's warn-level validation** (#7211).
+  On MongoDB, `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` and the backend egress
+  policy had no effect at config load: no near-expiry or unreadable backend
+  certificate warnings, and no host, consumer-uniqueness, egress-policy or
+  plugin-config warnings. The MongoDB full load now runs the same warning
+  passes, in the same order, as the SQL full load. Nothing new is rejected.
+- **macOS FD count reports open descriptors** (#7212). The overload
+  monitor's macOS sampler divided the size hint from a NULL-buffer
+  `proc_pidinfo(PROC_PIDLISTFDS)` call (fd-table capacity plus slack) by the
+  entry size, so `fd_current` in `/overload` and the FD-pressure tier were
+  inflated and never shrank after a burst. It now counts the entries the call
+  writes, and a failed count fails closed (critical) as on Linux instead of
+  reporting `0`. Linux is unchanged.
+- **`POST /batch` refuses stream listeners that single writes refuse**
+  (#7214). A batch could persist a stream proxy on a reserved gateway port
+  (proxy, admin or gRPC listener), on a port another process already holds,
+  or an HTTP proxy on a process-global frontend it can never be served on;
+  the conflict then surfaced only at listener reconcile (fatal at startup in
+  database mode). The batch now runs the same reserved-port, process-global
+  frontend and OS bind-probe checks as `POST /proxies` (skipped on a CP, as
+  for single writes) and reports them as `400` batch validation errors.
+- **Admin API parity fixes** (#7216).
+  - `POST /admin/tls/rotate/proxy` is now `400`: `proxy` was an undocumented
+    alias missing from `openapi.yaml` and `docs/admin_api.md`. Use
+    `proxy_https` (or the documented `frontend` alias).
+  - `POST /admin/tls/rotate` and the other TLS mutations now write their
+    typed audit event in file, DP and mesh modes; the event was skipped
+    whenever there was no config database.
+  - `GET /config/export` answers `500` if the document cannot be serialized,
+    instead of `200` with `{}`, which read as an empty namespace.
+  - A batch or restore with an unknown plugin name reports it once instead of
+    twice.
+  - `/health` no longer builds the FIPS and listener-failure blocks for
+    callers that do not get the detailed tier.
+- **Config diagnostics quote stored identifiers** (#7217). Proxy/plugin
+  association load errors, the `expected_proxy_ids` precondition refusal
+  (`412`), the spec-owned upstream decode error and two orphan-cleanup INFO
+  logs now render namespaces and ids Debug-quoted (or sanitized), per the
+  validation-diagnostics rule. Plugin rejection messages use one spelling,
+  ``Plugin "<name>" (`id`="<id>")``, everywhere. A consumer credential
+  type that fails the path-safe name rule is reported once and no longer
+  also appears bare in per-entry `credentials.<type>[<n>]` errors. Update
+  any log matcher keyed on the old `(id=…)` or `proxy_id=<bare>` spellings.
+- **The Unix-socket backend pool's idle sweep honours per-proxy
+  `pool_idle_timeout_seconds`** (#7182). Checkout already applied the
+  per-proxy override, but the periodic sweep evicted every pooled HTTP/1.1
+  and h2c carrier with the global `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`, so a
+  longer per-proxy timeout (or `0`, never) was cut to the global value. Each
+  pooled carrier now records the effective timeout it was pooled under and
+  the sweep uses it.
+- **A pipelined conflicting-`Content-Length` request no longer fails the
+  valid HTTP/1 requests queued ahead of it when the TCP read splits its head**
+  (#7179). The frontend framing guard decided whether to stop observing
+  without poisoning earlier heads from a hint it clears at the end of every
+  read, so a read boundary between the second `Content-Length` line and the
+  blank line made earlier pipelined requests fail with the fail-closed `400
+  "HTTP/1 request framing could not be verified"`. The head scanner now
+  carries that fact itself; the result no longer depends on segmentation.
+- **Gateway API HTTP/3 rebinds wait on the budget of the latest collision
+  classification** (#7178). A QUIC bind that hit `EADDRINUSE` re-classified
+  the collision after every attempt (in-process UDP handoff vs. this pass's
+  own retirement) but kept waiting on the deadline of its first
+  classification, so a port that moved to the handoff budget could give up
+  early and publish a spurious `BindFailed`. Each wait is now bounded by the
+  budget the current classification selects, as documented.
+- **AI translators no longer forward `null` sampling values or drop the
+  client's output bound** (#7124). `ai_federation`'s Gemini, Bedrock, and
+  Cohere adapters read `max_tokens` with a plain field lookup, so
+  `{"max_tokens": null, "max_completion_tokens": 256}` forwarded a `null`
+  bound and lost the 256; the Anthropic adapter replaced a string, float,
+  zero, or negative bound with 4096. Both AI translation plugins now share one
+  rule: a `null` `max_tokens`, `max_completion_tokens`, `temperature`, or
+  `top_p` is absent, a present output bound must be a positive integer, and a
+  present `temperature` / `top_p` must be a number; anything else is an
+  OpenAI-shaped `400` on buffered and streaming routes alike. On
+  `ai_stream_router`, a `stop` that is not a string or an array of strings is
+  now a `400` instead of being forwarded as an empty list. Anthropic's 4096
+  default for an unbounded `ai_federation` request is now documented.
+- **WAF `FE-ENCODING-002` no longer flags URL-encoded emoji and Indic/Thai
+  text** (#7142). Its URL regex `(?i)%(?:c0|e0|f0)%` matched every valid
+  `%E0..` and `%F0..` UTF-8 sequence, so `?q=%F0%9F%98%80` recorded a Medium
+  hit (3 of the default anomaly threshold 7) and was blocked once the rule was
+  promoted to `enforce`. The regex now matches exactly the overlong pairs the
+  rule's special checks (`%c0%ae`, `%c0%af`, `%e0%80`, `%f0%80`). On URLs an
+  overlong marker is also no longer reported under `FE-ENCODING-001` as well:
+  it belongs to `FE-ENCODING-002` only, as it already did for bodies, so one
+  marker scores once and disabling `FE-ENCODING-002` stops it.
+- **`proxy_alerts` no longer counts cooled-down reminders as dropped alerts**
+  (#7141). An `Active` incident maps every breaching sample to a Trigger, and
+  the dispatch permit was taken before the cooldown was consulted, so with the
+  dispatch semaphore full (a hung channel retrying) every breaching request
+  incremented `ferrum_notification_delivery_backpressure_dropped_total` and
+  the "dropping alert" warning although the cooldown would have suppressed the
+  reminder anyway. The cooldown is now checked first; only alerts actually
+  owed are counted. `stream_disconnect_cause` rules also read `causes`
+  through `DisconnectCause`'s serialized names, so a new cause is accepted
+  without a second table.
+- **`hmac_auth`'s pre-buffered success path commits through the shared
+  authentication boundary** (#7139). A signed request whose body was buffered
+  before `authenticate` set `identified_consumer` / `auth_method` by hand
+  instead of calling `commit_authentication_attempt`, so it added an HMAC
+  Consumer beside an external identity an earlier mechanism had already
+  committed and skipped the shared identity/realm, credential-deadline,
+  principal-state and cleanup steps. Both paths now share one commit tail.
+- **`ai_rate_limiter` reserves every output cap `ai_request_guard`
+  evaluates** (#7135). The limiter read caps only as JSON unsigned integers
+  and only as `generationConfig.maxOutputTokens` /
+  `generation_config.max_output_tokens`, while the guard also accepts
+  integral floats and exponents (`4096.0`, `1e5`), quoted integers, and the
+  mixed Gemini spellings. A request such as `{"max_tokens": 1e5}` was judged
+  as a 100000-token completion by the guard but reserved nothing in
+  `count_mode: completion_tokens`. Both plugins now share one integer parser,
+  the limiter reads all four Gemini spellings, and the prompt estimate
+  excludes caps at exactly the same paths and values.
+- **Proxy transaction logs and retries agree across frontends** (#7158,
+  #7159, #7160, #7161, #7162, #7164).
+  - HTTP/3 now logs an open-breaker `503` as
+    `rejection_phase=circuit_breaker_open`, as HTTP/1.1 and HTTP/2 always did;
+    the H3-only `circuit_breaker` spelling is gone from the metrics-token and
+    diagnostic-reference phase sets. Update any log query or alert that
+    matched `circuit_breaker`.
+  - After an Istio `rewrite.uri` or `mesh_route_dispatch` path override,
+    HTTP/3 rejections (circuit breaker, backend admission, upload deadline,
+    final request-body policy, streaming `after_proxy`) log the client's
+    original `request_path`, not the rewritten backend path.
+  - An HTTP/1.1 or HTTP/2 request whose retry rotated to another upstream
+    target logs that target as `backend_target` (and in streaming-latency
+    records), not the target that failed.
+  - WebSocket disconnect records (`ws_logging` and other `on_ws_disconnect`
+    consumers) report the port of the listener the client connected to,
+    including Gateway API and mesh listeners, instead of the global proxy port.
+  - Retries share the retained request body instead of copying it outside the
+    request-buffer budget. A native HTTP/3 retry declares the replayed body's
+    `Content-Length` like the first attempt and refuses a `dns_override`
+    denied by the backend egress policy before dialing.
+  - Multi-mode authentication's RPC-deadline rejection now carries the
+    session cookies an earlier mechanism staged, as single mode does, and
+    no longer leaves them in request metadata. The final request-body hook
+    hand-back on the terminal dispatch path now keeps the hook's deadline
+    selection and AI usage snapshot.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then
@@ -633,8 +852,483 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **MongoDB standalone writes are no longer rolled back by a change-log
+  compaction failure** (#7210). Without `FERRUM_MONGO_REPLICA_SET`, a create,
+  update or batch inserted its `config_changes` row and then propagated any
+  error from the compaction that follows, so the caller deleted the resource
+  while its change row stayed durable. Compaction failures are now logged and
+  retried by the next write, as on replica sets. A standalone namespace wipe
+  (restore clear) records its delete rows in one batch instead of one row and
+  one compaction probe per deleted id.
+- **A custom DNS hosts file that fails to read is no longer applied** (#7204).
+  A read error (for example a non-UTF-8 line) in
+  `FERRUM_DNS_RESOLVER_HOSTS_FILE` used to install the partial table read so
+  far in place of the default hosts set and log that the file was loaded. It
+  now logs a warning and keeps the resolver's default hosts.
+- **CP tenant-subscription audit records name the refusal class** (#7202).
+  Failed `tenant_subscription` audit events for ConfigSync, MeshSubscribe and
+  xDS recorded most refusals as `reason="request refused"`. They now record a
+  fixed class: `config_sync build identity mismatch`, `real IP header
+  mismatch`, `namespace not authorized`, the admission limit
+  (`total_streams`, `full_config_rate_limit`, ...), the audience reason
+  (`missing`, `mismatch`, ...), `verification trust stale`, `verification
+  credential no longer trusted`, or `authentication failed`; the three fixed
+  verifier messages are kept. Each class has its own 60 s log limiter, so one
+  refusal looping no longer hides the first record of another.
+- **Active health-check lifecycle fixes** (#7206). The per-upstream probe
+  generation map is pruned on reload instead of growing with every upstream
+  id that ever had an active check; a full reload racing a service-discovery
+  probe restart no longer leaves a second, unabortable probe set running for
+  that upstream; and probe verifier, CRL or client build failures report
+  `backend TLS health-check client could not be built` instead of blaming the
+  SAN allow-list.
+- **WebSocket backend URLs are logged without the client's query string**
+  (GHSA-pwwg-8543-q37r). The H1/H2 and HTTP/3 WebSocket backend-failure
+  `ERROR`, the upgrade `INFO`/`DEBUG` lines and the HTTPS-to-plaintext `WARN`
+  logged the full backend URL, so a `?access_token=` a browser WebSocket client
+  sends in the query reached the gateway log. The query is now stripped, as
+  every other backend-URL log already did.
+- **The CONNECT-UDP per-client tunnel cap honours `FERRUM_PER_IP_IPV6_PREFIX`
+  above `/64`** (GHSA-grwg-8jpx-q8p9). With a `/96` or `/128` prefix every
+  client in one `/64` still shared a single
+  `FERRUM_HTTP3_CONNECT_UDP_MAX_SESSIONS_PER_IP` budget.
+- **An invalid `FERRUM_STREAM_PROXY_BIND_ADDRESS` refuses startup**
+  (GHSA-9gqf-79hq-v2v2). A value that is not an IP address used to fall back
+  silently to `FERRUM_PROXY_BIND_ADDRESS` (`0.0.0.0` by default), exposing
+  TCP/UDP/DTLS stream listeners meant for loopback or an internal interface.
+  It is now validated like the proxy and admin bind addresses; only a
+  deployment that was already misconfigured is affected, and it must set a
+  literal IP address.
+- **Stream refusals from untrusted sources no longer log one `WARN` each**
+  (GHSA-wfg6-vhp9-hj45). TCP stream PROXY-protocol refusals and DTLS accept
+  refusals are sampled, and a plain-UDP per-source session refusal is logged at
+  `DEBUG` (it stays counted by the rate-limited per-source rejection warning).
+- **HTTP/3 plain-bridge client terminals no longer move backend health**
+  (GHSA-3c72-7f45-wvr2). A gateway `401` (authorization expiry) or `413`
+  (oversized streamed upload) on the H3 to HTTP/1.1/HTTP/2 bridge was recorded
+  as a breaker success, so a client could close a `HALF_OPEN` circuit breaker
+  against a backend that never answered; a route-deadline cut of a parked
+  response head also charged `ai_federation`'s provider circuit. Both are now
+  neutral.
+- **A plain-UDP session whose authorization expires while queued datagrams
+  drain no longer leaks its pending entry** (GHSA-4wqw-qq7v-pwhp). The leak
+  blackholed that client tuple and held a pending slot against
+  `FERRUM_UDP_MAX_SESSIONS` until the listener restarted.
+- **HTTP/3 and H1/H2 terminals that skipped the access log or the request
+  counter are recorded** (#7156, #7157). The native-H3 oversized-upload `413`
+  and oversized declared-response `502` now emit a transaction summary, the
+  CONNECT-UDP stalled-`200` authorization expiry is counted as its `401`, and
+  the H1/H2 "Invalid backend path coordinates" and WebSocket missing-upgrade
+  `500`s are counted (the H1/H2 body is now JSON).
+- **gRPC-Web clients get gRPC-Web framing on the H1/H2 route-admission `403`
+  and circuit-breaker-open `503`** (#7155), instead of a native-gRPC
+  header-only status they cannot read.
+- **HBONE admission-fence sweeps no longer count as scope-missing rejections**
+  (#7146). `ferrum_mesh_node_waypoint_destination_policy_rejections_total`
+  with `reason="scope_missing"` or `"destination_scope_missing"` counted once
+  per live tunnel per sweep when a tunnel's per-pod scope had gone, so a
+  routine policy apply looked like many denied requests. Like the other
+  reasons, these now count only real requests; the tunnel is still refused.
+- **Typed mesh diagnostics name every field** (#7146). A type error under
+  `MeshService.allow_path_parameters` or a policy rule `to[].headers` /
+  `to[].port_patterns` now names its schema path instead of a redacted key, and
+  an unknown `to` key lists those fields as expected.
+- **The `oidc_relying_party` logged-out page is served as HTML** (#7147). The
+  local logout response now carries `Content-Type: text/html; charset=utf-8`
+  instead of the default `application/json`, so browsers render the page.
+- **`response_caching` reads `Vary`, `ETag` and `Last-Modified`
+  case-insensitively** (#7148), like the other headers it consults. A
+  mixed-case `Vary: *` is no longer stored, mixed-case `Vary` dimensions are
+  keyed, the merged `vary` list replaces the original key instead of being
+  added beside it, and a mixed-case `ETag` or `Last-Modified` answers a
+  conditional request with `304`.
+- **`jwks_auth` admits only the published `sync_mode` and `dpop_replay_scope`
+  spellings** (#7151). Values such as `"REDIS"` or `" Shared "` were accepted by
+  file mode and database rows although the `JwksAuthConfig` schema rejects them;
+  they now fail admission, as in `hmac_auth`.
+- **Mesh freshness families are contiguous in `/metrics`** (#7145). The
+  federation and remote-discovery last-success and age gauges were written as
+  interleaved samples under two headers, which strict OpenMetrics parsers
+  reject. Each family is now emitted as one group.
+- **Batch log sinks no longer burst flushes after a slow flush** (#7150). After
+  a flush (with retries) that outlasted several `flush_interval_ms` periods,
+  the flush timer fired the missed ticks back to back and sent the recovering
+  collector a run of tiny batches. It now resumes one interval later.
+- **UDP capture teardown no longer spins when a jump cannot be deleted**
+  (#7265). The loop that removes every `mangle` jump into a UDP guard or
+  capture chain exited only when the rule check failed. When the check kept
+  matching and the delete kept failing (for example an xtables lock held past
+  `-w`), the best-effort teardown scripts and the node-agent cleanup runner,
+  which run without `set -e`, never returned. The delete failure now exits
+  with its own status and an error message.
+- **The node-agent surfaces failed `includeOutboundPorts` removals and refuses
+  an unscoped inbound redirect** (#7266). Removing a pod's include-ports entry
+  from the eBPF map now tolerates only a missing entry and returns any other
+  map error, so the node-agent keeps retrying instead of leaving a narrowing
+  keyed by a cgroup inode that a later pod can reuse. The NodeWaypoint inbound
+  tc redirect now refuses to attach (failing startup) when the loaded BPF ELF
+  lacks the `FERRUM_POD_INBOUND_PORTS*` scope maps, as its comments and
+  warning already described, instead of arming a classifier that every pod
+  enrollment then fails to scope.
+- **The internal mesh CA fails an SVID issuance when the system RNG fails**
+  (#7268) instead of falling back to a process counter for the certificate
+  serial, which produced predictable serials that repeated across restarts.
+  The dev root bootstrap already failed this way; both now share one helper.
+- **Mesh security fixes from the 2026-11-10 audit** (advisories
+  GHSA-pwf8-cvp7-cm5w, GHSA-r5gx-h67m-fccv, GHSA-ccmw-4j34-w5vm,
+  GHSA-h592-fvhh-cm3h, GHSA-pr43-4rj8-h494, GHSA-qw5p-g8jx-pmv8).
+  - The control plane bounds the peer-supplied `response_nonce` and
+    `version_info` it logs for an ignored xDS ACK, as it already did for NACK
+    messages, so one authenticated data plane can no longer write
+    megabyte-long warn lines.
+  - The federation endpoint and remote control-plane URL screens treat an
+    IPv4-mapped IPv6 literal (`[::ffff:169.254.169.254]`, `[::ffff:0.0.0.0]`)
+    as the IPv4 address it dials, so it gets the same link-local, metadata,
+    unspecified, broadcast and multicast refusals.
+  - `mesh_authz` `from.source.namespaces` / `notNamespaces` read the namespace
+    from the SPIFFE path only. A peer whose trust domain is literally `ns`
+    (`spiffe://ns/ns/prod/sa/x`) was judged to be in namespace `ns`.
+  - Sidecar `egress.hosts` narrowing keeps only the admitted hosts of a
+    port-less multi-host ServiceEntry, as it already did for entries with
+    ports. Before, one matching host admitted every host of the entry into
+    the slice and the `REGISTRY_ONLY` registry.
+  - `GET /mesh/federation` reports only the origin (`scheme://host[:port]`) of
+    each federation endpoint. The configured URL, which may carry credentials
+    in its userinfo, path, query or fragment, is still used for polling but is
+    no longer stored in the served snapshot.
+  - Two VirtualServices in one namespace whose names derive the same route
+    proxy id (for example `my.app` and `my-app`) no longer publish two plugin
+    configs with one id. The refused route's plugins are dropped with it, so
+    the controller's duplicate-id check no longer rejects every later
+    Kubernetes reconcile. The second VirtualService's route is still dropped
+    without a status condition.
+- **Kubernetes translator and status writers refuse or report what they used
+  to drop silently** (issues #7256, #7257, #7258, #7260, #7261).
+  - An HTTPRoute `RequestRedirect` whose `scheme` is not `http`/`https` or
+    whose `hostname` is not a precise hostname is now refused
+    (`Accepted=False`/`Invalid`). It used to reach `mesh_route_dispatch`,
+    whose constructor rejected it and failed the whole plugin-cache build
+    instead of this one route.
+  - An Istio DestinationRule `connectionPool.tcp.connectTimeout` that does
+    not parse, is `0s`, or exceeds 24 h, and a VirtualService `http[].timeout`
+    that does not parse, now refuse the resource (`FerrumAccepted=False`).
+    The connect timeout used to fall back to the default, and the route
+    timeout used to become disabled, while the resource reported Accepted.
+  - The controller no longer deletes operator plugin configs whose id starts
+    with `istio-vs-fi-` in managed namespaces; no translator emits that
+    prefix since fault injection moved onto `mesh_route_dispatch`.
+  - CRD reprobe passes no longer repeat the "CRD group not installed" warning
+    (and "CRD group detected" info) every 5 minutes; the startup warning now
+    says the group is re-probed and no restart is needed.
+  - After a rejected Istio resource is fixed, `status.ferrum.translation` no
+    longer keeps the stale `error` beside `FerrumAccepted=True` (and the
+    object is no longer re-patched on every reconcile). A policy's Ferrum
+    `status.ancestors` are never written partially when third-party entries
+    fill the 16-entry list. Listener `ResolvedRefs`/`Programmed` on a Gateway
+    that failed translation report `TranslationFailed` instead of
+    `UnsupportedProtocol`.
+- **CNI rejections use a plugin-specific error code** (issue #7263). A
+  node-agent rejection returned CNI error code `12`, inside the `0`–`99`
+  range the CNI spec reserves for its own well-known errors; it now returns
+  `100`.
+- **NodeWaypoint orig-dst bridge no longer spins on a dropped shutdown
+  sender** (issue #7264), and a failing SOCK_OPS dropped-events counter read
+  warns once instead of on every ringbuf wakeup.
+- **Remote-cluster endpoints attached to a Service in another namespace
+  survive the trust-domain filter** (#7247). The multi-cluster
+  cross-trust-domain guard matched each service's workload refs against
+  surviving workloads in the workload's own namespace instead of the
+  namespace of the Service it attaches to (`service_namespace`), so an
+  in-domain remote `WorkloadEntry` in `vm` attached to a Service in `prod` had
+  its ref dropped with a misleading trust-domain warning, and a service whose
+  refs were all of that kind was dropped from cross-cluster failover. Refs now
+  match on the attached Service namespace, as service discovery does.
+- **Gateway API `sessionPersistence.absoluteTimeout` accepts compound
+  durations** (#7255). A Permanent-cookie session policy whose
+  `absoluteTimeout` used more than one GEP-2257 component (for example
+  `1h30m`), which the CRD admits, was rejected as "not a valid Gateway API
+  duration" and failed the whole HTTPRoute rule, `BackendLBPolicy` or
+  `XBackendTrafficPolicy`. It is now parsed with the same multi-component
+  parser as `timeouts` and `retry.backoff` (`1h30m` → `Max-Age=5400`).
+- **Data planes run the ACME renewal scheduler** (#7251). With
+  `FERRUM_ACME_AUTO_RENEW_ENABLED=true`, only file and database mode started
+  the scheduler; a DP accepted the setting, armed the frontend/admin
+  live-reload watchers for its `acme://` sources and then never renewed, so
+  the certificate expired without warning. DP mode now starts the scheduler
+  and joins it at shutdown like the other serving modes.
+- **Mesh inbound fail-closed errors name the missing identity** (#7238). A mesh
+  inbound listener with no server identity under the default PERMISSIVE mode
+  was reported as "PERMISSIVE … would accept unauthenticated plaintext
+  alongside TLS", although no TLS was served. The warning and the
+  `FERRUM_MESH_PRODUCTION_MODE=true` startup refusal now say the listener has
+  no usable TLS server identity and list the remedies (gateway SVID files,
+  `FERRUM_MESH_CA_BACKEND`, or the frontend TLS cert and key). The STRICT
+  error lists the same three sources instead of only the frontend cert.
+- **Rewritten mesh `httpGet` probes send one `Host` header** (#7242). When a
+  pod's probe set `Host` in `httpHeaders`, the sidecar's app-probe server sent
+  both its default `Host` and the recorded one, a request RFC 9112 servers
+  reject with 400, so the readiness or liveness probe failed after injection.
+  The recorded `Host` now replaces the default (the first one wins, as for
+  kubelet).
+- **Sidecar mesh slices no longer carry neighbours' selector policies**
+  (#7241). Every slice had been carrying each same-namespace
+  AuthorizationPolicy that selected any visible workload, a superset only the
+  Ambient, ServiceWaypoint and NodeWaypoint topologies use. On a Sidecar or
+  gateway slice an unrelated neighbour's enforcing selector policy could fail
+  `mesh_authz` construction on a shared-SPIFFE (`labels_ambiguous`) slice,
+  label-less subscribers logged a warning per neighbour policy, and every
+  subscriber's slice changed whenever any workload's policy did. Those slices
+  now keep only the policies that apply to their own workload.
+- **Native mesh config: empty ServiceEntry namespace rejected, native field
+  paths in DestinationRule pool errors** (#7243). A `ServiceEntry` with an
+  empty `namespace` was accepted although no workload could see it; it is now
+  rejected like every other namespaced mesh resource. Native/file
+  DestinationRule connection-pool errors now name the native field
+  (`traffic_policy.connection_pool_http.http1_max_pending_requests`,
+  `max_connections`, `tcp_idle_timeout_seconds`, …) with the Istio name in
+  parentheses, instead of Istio paths that do not exist in the native schema.
+- **Quieter mesh DNS overload and headless-service logs** (#7245). The mesh
+  DNS proxy's per-query overload warnings (query and TCP session limits, full
+  forward queue, upstream forward limit and transaction-ID exhaustion,
+  upstream timeouts) are now sampled to one warning per site per 10 seconds
+  with a suppressed count, so log volume no longer grows with query rate under
+  saturation. A headless service with TCP-family ports no longer warns on
+  every slice apply that it "cannot be egress-routed": its direct pod-IP dials
+  are routed, so the message is now a debug event; the UDP equivalent stays a
+  warning but is sampled.
+- **Egress baggage stripping filters every spelling of the `baggage` header**
+  (GHSA-hq2p-8cgc-cg4v). On the HTTP/1.1, HTTP/2, native HTTP/3 and WebSocket
+  egress sites, the map-shaped strip filtered only one `baggage` key. When a
+  request-transforming plugin added a mixed-case `Baggage` header beside the
+  lowercase one, the second copy was forwarded with its reserved identity
+  members (`source.principal` and the other reserved prefixes) and any
+  configured-prefix members intact, and the next hop merges every baggage
+  field line. Every case-insensitive match is now filtered, as the
+  ordered-list sibling already did.
+- **A TCPRoute and a TLSRoute with the same name no longer share one L4 proxy
+  id** (GHSA-4mjg-c4c6-vhw2). Only UDPRoute ids carried the route kind, so
+  TCPRoute `ns/db` and TLSRoute `ns/db` both derived
+  `gwapi-l4-ns-db-<rule>` and one silently replaced the other depending on
+  informer order, while both could report Programmed. Every L4 rule suffix is
+  now kind-scoped (`tcproute-<rule>`, `tlsroute-<rule>`, `udproute-<rule>`),
+  and the L4 path claims its proxy and upstream ids like the HTTPRoute path:
+  a second route object deriving an owned id is refused with a warning and a
+  refused-claim status instead of overwriting. **Operator note:** generated
+  TCPRoute/TLSRoute proxy ids change (`gwapi-l4-<ns>-<name>-0` becomes
+  `gwapi-l4-<ns>-<name>-tcproute-0` or `-tlsroute-0`); anything keyed on those
+  ids (dashboards, plugin `proxy_id` references) needs the new spelling.
+- **A Sidecar `ingress[]` stream listener with a dedicated `bind` no longer
+  removes every mesh outbound HTTP route** (issue #7231). The mesh stream
+  proxy builders (dedicated-bind and inbound raw-TCP relay, east-west gateway
+  and service, stream EgressGateway, NodeWaypoint UDP/DTLS listener) left the
+  dispatch kind at its HTTP default until the final normalization, so the
+  outbound materializer read the host-less bind proxy as an HTTP catch-all and
+  skipped every `__mesh-outbound-*` route (logged at debug only), cutting all
+  HTTP-family mesh egress for that workload. They now set the dispatch kind
+  from their scheme, as the outbound raw-TCP relay already did; the
+  NodeWaypoint UDP listener port reservation and the non-Linux scoped-policy
+  UDP fail-closed strip now also see these proxies as stream proxies.
+- **DestinationRule top-level `connectTimeout` now reaches mesh raw-TCP
+  egress, and a non-hash `loadBalancer` clears a stale hash key** (issue
+  #7232). A top-level `connectionPool.tcp.connectTimeout` was applied only to
+  proxies that reference the upstream, plus the in-mesh UDP egress upstreams;
+  the raw-TCP egress upstreams (by Service VIP and by workload address) and
+  the external UDP egress upstreams are dialed only by synthesized relays, so
+  their tunnel dials kept the relay's 5 s default unless the value was
+  repeated under `portLevelSettings`. It is now seeded onto every target
+  policy port of those upstreams that has no per-port value. Separately, a
+  winning rule with a `simple` load balancer set the upstream algorithm but
+  left an earlier rule's (or the operator's) `hash_on` in place, which still
+  produced a per-request hash strategy; the upstream-level projection now
+  clears it, as the per-port projection already did.
+- **One ServiceEntry with a long host no longer fails every EgressGateway
+  slice apply** (issue #7234). The EgressGateway proxy/upstream ids embed the
+  ServiceEntry namespace, name and host through an expanding encoder and had
+  no length check, so a long but valid host produced an id over the 254-byte
+  resource id limit and the whole slice was rejected (last-good retained, or
+  no start). That host/port is now skipped with a warning, without claiming
+  its stream listen port, and the other entries still materialize.
+- **East-west gateway service routes no longer collide across namespaces**
+  (issue #7235). Every per-service east-west proxy/upstream is stamped with
+  the gateway's namespace, but its id joined the service namespace and name
+  with `-`, so services `a/b-c` and `a-b/c` on one port derived the same id
+  and one lost its SNI passthrough route on a slice spanning namespaces. The
+  namespace and name are now encoded injectively (as the Sidecar ingress bind
+  ids already were): ids change only for names containing `-` or `.`, for
+  example `__mesh-ew-svc-<ns>-foo-bar.p8080` becomes
+  `__mesh-ew-svc-<ns>-foo_dash_bar.p8080`.
+- **Mesh, node-agent and injector settings that silently fell back now fail
+  startup on an invalid value** (issue #7237). **Operator action:** a value
+  that was previously ignored now aborts startup.
+  - `FERRUM_MESH_DNS_PROXY_ENABLED`, `FERRUM_INJECTOR_REQUIRE_ANNOTATION` and
+    `FERRUM_INJECTOR_ALLOW_PLAINTEXT` accept `true`/`false`/`1`/`0`
+    (case-insensitive, trimmed; blank keeps the default) like every other
+    mesh boolean. Before, `yes` or `True ` silently disabled the DNS proxy,
+    and `0`, `False` or a padded value made the injector fall back to its
+    default.
+  - The node-agent parses `FERRUM_MESH_TOPOLOGY` with the mesh proxy's
+    parser, so an unknown topology is refused instead of being treated as
+    "not ambient" (which disabled the Ambient pod registry and UDP readiness
+    guard).
+  - `FERRUM_NODE_AGENT_FALLBACK_MODE` is trimmed before parsing.
+- **Replica-set MongoDB orphan-upstream cleanup is namespace-scoped**
+  (#7193). Deleting a proxy, or running the explicit orphan cleanup, on a
+  replica-set MongoDB store counted proxies that reference the upstream id in
+  every namespace. Upstream ids are unique only per namespace, so another
+  namespace's proxy with the same upstream id kept the deleting namespace's
+  orphaned upstream alive and suppressed its delete change record. The check
+  now counts proxies in the deleting namespace only, as standalone MongoDB
+  and the SQL backends already did.
+- **Managed TLS and ACME deletes no longer collide on id prefixes** (#7199).
+  `DELETE /admin/tls/certificates/{id}` (and the other managed collections and
+  ACME certificates) decided whether a record was still referenced by
+  substring-matching the id against every source reference, so deleting an
+  unused `prod` was refused with `409` naming the users of `prod-2`, and an id
+  such as `cert` or `ca` matched every reference. The guard now compares the
+  record id exactly against the last path segment of each reference.
+- **An unknown `FERRUM_ACME_RENEW_CHALLENGE_TYPE` is refused at startup**
+  (#7194). With `FERRUM_ACME_AUTO_RENEW_ENABLED=true`, a value the renewal
+  scheduler cannot parse (for example `http` or `tls-alpn`) used to pass
+  `ferrum-edge validate`, log one warning, and leave the scheduler off, so
+  certificates silently stopped renewing. Startup and `ferrum-edge validate`
+  now reject it. The value is still ignored while auto-renewal is disabled.
+- **TLS live-reload watchers retry a failed rebuild** (#7196). The frontend
+  proxy HTTPS/H2/H3, admin HTTPS and CP/DP gRPC TLS watchers, and the backend
+  TLS watcher for ordinary source rotations, recorded a failed rebuild as the
+  accepted source state, so a transient failure (a source deadline, a provider
+  blip, or a rotated-in certificate whose `notBefore` was still ahead) left the
+  listener on the old certificate until the source bytes changed again or the
+  process restarted. They now retry the candidate on every poll, as the
+  frontend DTLS watcher already did. The TLS event and warning are still
+  recorded once per distinct failing candidate.
+- **`FERRUM_OVERLOAD_LOOP_CRITICAL_US` is honoured by the event-loop probe**
+  (#7197). The probe waited a fixed 250 ms and reported a fixed 500 ms on
+  timeout, so a critical threshold above 500 ms never tripped, and with the
+  default a 250 ms stall was reported as 500 ms and rejected new connections.
+  The probe now waits up to the configured critical threshold, bounded by
+  `FERRUM_OVERLOAD_CHECK_INTERVAL_MS`, and reports at least that budget on
+  timeout. A critical threshold above the check interval still cannot be
+  reached; the docs now say so.
+- **SQL plugin-config rows with an unknown scope are rejected, not made
+  global** (#7192). The SQL loaders mapped any `plugin_configs.scope` other
+  than `proxy` or `proxy_group` to `global`, so a corrupted or out-of-band
+  value such as `Proxy` widened a proxy-scoped plugin to every proxy in the
+  namespace (MongoDB already rejected it). The scope is now matched exactly
+  and an unknown value fails the row like any other decode error, keeping the
+  last good config. A `proxy_id` or `enabled` value that cannot be decoded
+  also fails the row instead of detaching or enabling the plugin.
+- **A refused plugin-cache reload no longer promotes its named log schemas**
+  (#7198). Full and incremental plugin-cache builds promoted the
+  process-global `transaction_log_schema` registry before their last fallible
+  steps (proxy lifecycle generations, the mesh BPF metrics exporter on full
+  builds, and the `api_chargeback` overflow reservations). A reload refused at
+  one of those steps, for example by the chargeback `max_retained_bytes`
+  budget, left the registry on the rejected definitions while the published
+  cache stayed on the old ones, so later incremental builds constructed
+  loggers against schemas that were never accepted. The registry is now
+  promoted only after every step succeeds.
+- **Completing an ACME order skips authorizations that are already valid**
+  (#7195). Driving a persisted order to `ready` looked up the configured
+  challenge type on every authorization, so an authorization that had become
+  valid elsewhere (CAs reuse valid authorizations across orders, and a reused
+  one may list only the challenge that validated it) failed the order on every
+  scan. Valid authorizations are now skipped, pending ones are driven as
+  before, and invalid, revoked, expired or deactivated ones fail closed with a
+  fixed diagnostic. Preparing a new order still requires the configured
+  challenge on every authorization.
+- **The admin audit spool ceiling also bounds finalized records without an
+  intent** (#7200). Under `FERRUM_ADMIN_AUDIT_UNAVAILABLE_POLICY=fail_open`, a
+  mutation whose pre-mutation intent was refused because the spool was full
+  still ran, and its finalized record was then written to the spool with no
+  ceiling check, so a long audit-database outage grew the spool by one fsynced
+  file per mutation. A finalized record that does not replace a prepared
+  intent is now admitted against `FERRUM_ADMIN_AUDIT_SPOOL_MAX_RECORDS` like an
+  intent; when the spool is full it is refused and counted as a failed durable
+  handoff. Finalizing an admitted intent is unaffected.
+- **One malformed datagram no longer ends a DTLS session**
+  (GHSA-7464-frfx-85p6). Frontend DTLS listeners match datagrams to sessions
+  by UDP source address only, and a session ended on any record-processing
+  error, so an off-path attacker who could forge a client's address ended its
+  established session (or in-progress handshake) with a single 1-byte
+  datagram. Backend DTLS connections, including the `udp_logging` DTLS sink,
+  had the same handling. Truncated or malformed records, DTLS 1.2 records
+  that fail authentication, datagrams over the per-datagram record or
+  receive-queue bounds, and post-handshake renegotiation attempts are now
+  dropped as RFC 6347 §4.1.2.7 and RFC 9147 §4.5.2 require; authenticated
+  fatal alerts and handshake certificate or security failures still end the
+  session, and handshake deadlines still bound a stalled handshake.
+- **`ai_stream_router` Anthropic chunks carry the committed model**
+  (issue #7127). The Anthropic stream normalizer replaced the model it stamps
+  into every `chat.completion.chunk` with the provider's
+  `message_start.message.model`, so Anthropic routes echoed whatever the
+  endpoint reported while Gemini routes echoed the routed model. Both now
+  stamp the claim-committed model; the provider's report is ignored.
+- **`ai_semantic_cache` can hit behind a generating `correlation_id`**
+  (issue #7130). The cache's request-context partition bound the fresh UUID a
+  `correlation_id` instance mints when the client sends no request id, so
+  every request got its own key and the cache stored an entry per request
+  without ever serving one. It now omits that header under the private
+  provenance rule `response_caching` already uses (issue #3929); a
+  client-supplied id is still a key dimension. A gateway-injected
+  `traceparent` from `otel_tracing` is still bound.
+- **`ai_transcript_audit` reads MCP event-stream outcomes in every SSE
+  framing** (issue #7134). The MCP outcome parser split the response with
+  `str::lines` and matched a bare `data:` prefix, so a CR-terminated or
+  BOM-prefixed event stream yielded no JSON-RPC responses: a failed tool call
+  was not seen as failed, `always_capture_on_error` could drop it, and
+  `mcp.calls[].result` was absent. It now splits lines and strips BOMs like
+  the plugin's other SSE paths. The docs now state that `ai_transcript_audit`
+  and `ai_tool_governor` read `ai_token_metrics` output only under its
+  default `ai` metadata prefix.
+- **`ai_stream_router` refuses malformed `tools` on Anthropic routes**
+  (issue #7126). Tool declarations were validated only when `tool_choice`
+  (or extended thinking) was present; otherwise a non-array `tools` produced
+  no tools, entries without a string name were skipped, invalid names were
+  forwarded, and non-`function` entries were sent as functions, so the
+  request succeeded with tools missing. Anthropic routes now apply the same
+  closed `{type:"function", function:{name}}` check as Gemini routes and
+  `ai_federation`, on every request. The claim-time `400` for a malformed
+  `tools` list on Anthropic and Gemini routes now reports `param: "tools"`
+  (`code: "invalid_tools"`) instead of `tool_choice`.
+- **`ai_stream_router` refuses `anthropic_version` on non-Anthropic
+  providers** (issue #7128). The field was parsed and validated for every
+  provider type but only ever sent to `anthropic` providers, so a value on
+  any other provider was silently inert. A non-null value there now fails
+  admission (and the OpenAPI schema), like `default_max_tokens`. Remove it
+  from such providers before upgrading.
+- **`ai_semantic_cache` rebuild throttle and Redis envelope** (issue #7131).
+  The HNSW vector-index rebuild throttle measured its 30-second interval on
+  the wall clock, so after a backward clock step of N seconds no new entry
+  became semantically searchable for N + 30 seconds. It now uses the same
+  monotonic clock as the expired-entry cleanup throttle. The Redis envelope
+  drops its `semantic_scope_key` and `embedding` fields, which were never
+  written (Redis holds exact entries only) and were only fed back into the
+  MAC on read; the envelope version is now 5. Entries written by an earlier
+  build fail the version check and are quarantined like any other
+  cross-version envelope, so a Redis-backed cache starts cold after upgrade.
+- **`ai_semantic_firewall` type errors name the full field path**
+  (issue #7132). A wrong-typed nested field was reported by its leaf name
+  only: `builtins: {jailbreak: {enabled: "yes"}}` said `` `enabled` must be a
+  boolean`` (which reads as the root switch) and `custom_rules[i]` errors had
+  no index. They now name the qualified path, for example
+  `` `builtins.jailbreak.enabled` `` or `` `custom_rules[0].action` ``.
+- **`ai_federation` streaming claims publish complete circuit metadata**
+  (issue #7125). A claimed stream wrote only `ai_federation_circuit_last_provider`
+  / `_last_state = "open"` for a provider skipped on an open circuit and
+  nothing for the provider it committed, so after skipping A and committing B
+  the transaction log said "A / open" and a committed half-open probe was
+  invisible. The streaming claim now records the same keys as the buffered
+  loop: `ai_federation_circuit_open_skips` per skip, and the committed
+  provider's `_last_provider`, `_last_state` and
+  `ai_federation_circuit_half_open_probes`.
 
 ### Performance
+- **`ai_tool_governor` drains its live SSE buffer once per chunk**
+  (issue #7133). The streaming tool-call inspector removed each complete
+  event from the front of its carry buffer, moving the rest of the chunk
+  every time, so a chunk of N events of total size S cost O(N·S) byte moves.
+  Events are now read in place and the consumed prefix is drained once per
+  chunk (O(S)). Output and policy decisions are unchanged.
 - **Multi-namespace control planes load their namespaces concurrently.** With
   `FERRUM_CP_NAMESPACES` set to a list or `*`, each incremental poll, each
   set of pre-load change-sequence boundary reads and each full reload used to
@@ -698,6 +1392,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it cannot crowd out Gateway API status on the shared Kubernetes client.
   Each writer's own batch behaves as before, and clusters that watch only one
   of the two are unchanged.
+- **Fewer allocations and shared writes on request and CP publication paths**
+  (#7207, #7208). Counting a tracing event takes the counter map's shard read
+  lock instead of its write lock; a request path with only non-slash percent
+  escapes is no longer copied by the encoded-slash fold; the consistent-hash
+  fallback for upstreams with more than 128 targets no longer builds a
+  `HashSet` of candidates per selection; and every CP full-snapshot
+  publication (Subscribe, GetFullConfig, namespace broadcast, lag recovery)
+  serializes its filtered config without a second deep clone.
+- **Less per-record and per-request work in plugin hot paths** (#7145, #7146,
+  #7150, #7152). Log serialization binary-searches the built-in safe metadata
+  name list instead of scanning all 414 names per key, and no longer allocates
+  a key per metadata entry when flattening without a prefix. The HBONE inner
+  pool and mesh TCP egress recorders increment an existing series under a
+  shared read lock. The mesh destination-workload label fallback is interned
+  instead of allocated per request, and `grpc_web` copies `Content-Type` only
+  for gRPC-Web requests.
+- **Mesh authorization normalizes the request host only when a rule reads
+  it** (#7250). `mesh_authz` evaluation used to lower-case and split the
+  request authority (two or three allocations) on every HTTP request before
+  the policy loop, even when no rule constrains `hosts` / `notHosts`. It is
+  now normalized on the first rule that does. Decisions are unchanged.
 
 ## [0.9.20] - 2026-11-02
 

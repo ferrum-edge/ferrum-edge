@@ -737,3 +737,118 @@ fn inbound_connect_relay_synthesis_refusals_log_and_count_by_terminal() {
     assert_eq!(status_count(403), Some(4));
     assert_eq!(status_count(503), Some(1));
 }
+
+/// A fence sweep re-judging a live tunnel whose per-pod scope is gone is not a
+/// request (issue #7146). The fail-closed `scope_missing` refusal still applies
+/// to it, but the destination-policy rejection counter describes REQUESTS and
+/// must not move once per live tunnel per sweep; the same refusal for a real
+/// request still counts.
+///
+/// Other suites in this binary can drive per-pod `MeshAuthz` while the
+/// producers are enabled, so the assertions are bounds over `ATTEMPTS`
+/// evaluations rather than exact deltas: a sweep that counted would add at
+/// least `ATTEMPTS` on its own.
+#[test]
+fn scope_missing_rejections_count_requests_not_live_tunnel_reevaluations() {
+    use ferrum_edge::modes::mesh::config::{MeshPolicy, MeshRule, PolicyAction, PolicyScope};
+    use ferrum_edge::plugins::PluginResult;
+    use ferrum_edge::plugins::mesh::authz::{MESH_AUTHZ_REEVALUATION_METADATA_KEY, MeshAuthz};
+
+    const ATTEMPTS: u64 = 64;
+
+    let policy = |name: &str, scope: PolicyScope, action: PolicyAction| MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action,
+        }],
+    };
+    let plugin = MeshAuthz::new(&serde_json::json!({
+        "mesh_policies": [
+            policy(
+                "team-a-deny",
+                PolicyScope::Namespace { namespace: "team-a".to_string() },
+                PolicyAction::Deny,
+            ),
+            policy("mesh-wide-allow", PolicyScope::MeshWide, PolicyAction::Allow),
+        ],
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    // No `node_waypoint_policy_scope`: the workload left the live slice.
+    let context = |reevaluation: bool| {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.peer_spiffe_id = Some(
+            ferrum_edge::identity::SpiffeId::new("spiffe://cluster.local/ns/default/sa/client")
+                .expect("spiffe id"),
+        );
+        if reevaluation {
+            ctx.metadata.insert(
+                MESH_AUTHZ_REEVALUATION_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        }
+        ctx
+    };
+
+    let _guard = observability_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    node_waypoint_observability::set_enabled(true);
+    let evaluate = |reevaluation: bool| {
+        runtime.block_on(async {
+            for _ in 0..ATTEMPTS {
+                let mut ctx = context(reevaluation);
+                let result = plugin.authorize(&mut ctx).await;
+                assert!(
+                    matches!(
+                        result,
+                        PluginResult::Reject {
+                            status_code: 403,
+                            ..
+                        }
+                    ),
+                    "a missing per-pod scope must still fail closed, got {result:?}"
+                );
+                assert_eq!(
+                    ctx.metadata
+                        .get("mesh_authz.deny_policy")
+                        .map(String::as_str),
+                    Some("scope_missing")
+                );
+            }
+        });
+    };
+
+    let before_sweep = node_waypoint_observability::snapshot();
+    evaluate(true);
+    let after_sweep = node_waypoint_observability::snapshot();
+    evaluate(false);
+    let after_requests = node_waypoint_observability::snapshot();
+    node_waypoint_observability::set_enabled(false);
+
+    let sweep_delta = after_sweep.destination_policy_rejections.scope_missing
+        - before_sweep.destination_policy_rejections.scope_missing;
+    let request_delta = after_requests.destination_policy_rejections.scope_missing
+        - after_sweep.destination_policy_rejections.scope_missing;
+    assert!(
+        sweep_delta < ATTEMPTS,
+        "live-tunnel re-evaluations must not count as scope_missing rejections \
+         ({sweep_delta} increments over {ATTEMPTS} sweeps)"
+    );
+    assert!(
+        request_delta >= ATTEMPTS,
+        "real requests must still count ({request_delta} increments over {ATTEMPTS} requests)"
+    );
+}

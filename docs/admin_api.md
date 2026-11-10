@@ -3541,7 +3541,7 @@ Returns `404 Not Found` outside mesh mode (when the mesh runtime state is not wi
 
 ## Mesh Federation (mesh mode)
 
-`GET /mesh/federation` is JWT-authenticated and mesh-only. It returns the currently cached cross-cluster SPIFFE trust bundles fetched by the federation poller — the poller hits each `MultiClusterConfig.remote_clusters[].federation_endpoint` at `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the validated bundle on `TrustBundleSet.federated`. Each entry reports the originating cluster name, trust domain, endpoint URL, fetch timestamp, derived bundle age, and X.509/JWT authority counts. Returns `404` outside mesh mode or before any federation bundle has been cached. Raw workload addresses and bundle contents are never exposed.
+`GET /mesh/federation` is JWT-authenticated and mesh-only. It returns the currently cached cross-cluster SPIFFE trust bundles fetched by the federation poller — the poller hits each `MultiClusterConfig.remote_clusters[].federation_endpoint` at `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the validated bundle on `TrustBundleSet.federated`. Each entry reports the originating cluster name, trust domain, endpoint origin (`scheme://host[:port]` only — userinfo, path, query, and fragment of the configured `federation_endpoint` are never returned, since they may carry credentials), fetch timestamp, derived bundle age, and X.509/JWT authority counts. Returns `404` outside mesh mode or before any federation bundle has been cached. Raw workload addresses and bundle contents are never exposed.
 
 ## Mesh Runtime Overlay (mesh mode)
 

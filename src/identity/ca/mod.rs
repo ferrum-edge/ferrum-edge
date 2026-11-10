@@ -1,19 +1,17 @@
 //! Certificate Authority abstraction for the mesh identity subsystem.
 //!
 //! `CertificateAuthority` is the seam between an "identity issuer" (Ferrum's
-//! own internal CA, a Vault PKI mount, cert-manager, or a SPIRE server) and
-//! the rest of the codebase. The Workload API server uses one of these to
+//! own internal CA or a SPIRE agent) and the rest of the codebase. The Workload API server uses one of these to
 //! mint SVIDs in response to attested workloads; the rotation task uses the
 //! same trait when refreshing Ferrum's own SVID.
 //!
-//! The trait is `async` because most real implementations talk to a remote
-//! service (Vault, K8s certificates.k8s.io, SPIRE). The internal CA
+//! The trait is `async` because a real implementation can talk to a remote
+//! service (the SPIRE agent's Workload API). The internal CA
 //! ([`internal::InternalCa`]) is the synchronous reference implementation.
 
 pub mod bootstrap;
 pub mod internal;
 pub mod spire;
-pub mod upstream;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -231,5 +229,53 @@ impl std::fmt::Display for CaBackend {
             Self::SpireAgent => f.write_str("spire"),
             Self::None => f.write_str("none"),
         }
+    }
+}
+
+/// Random positive 64-bit certificate serial from the system random source
+/// (`crate::fips::backend::rand`: ring, or AWS-LC under the `fips` feature).
+///
+/// RFC 5280 §4.1.2.2 requires a positive INTEGER: the high bit is cleared so
+/// every parser reads it as positive, and the all-zero serial is avoided. An
+/// RNG failure is returned, never replaced by a predictable fallback.
+pub(crate) fn random_positive_serial_bytes() -> Result<[u8; 8], CaError> {
+    use crate::fips::backend::rand::SecureRandom;
+
+    let rng = crate::fips::backend::rand::SystemRandom::new();
+    let mut serial_bytes = [0u8; 8];
+    rng.fill(&mut serial_bytes)
+        .map_err(|e| CaError::Internal(format!("rng failed: {e}")))?;
+    normalize_positive_serial_bytes(&mut serial_bytes);
+    Ok(serial_bytes)
+}
+
+fn normalize_positive_serial_bytes(serial_bytes: &mut [u8; 8]) {
+    serial_bytes[0] &= 0x7f;
+    if *serial_bytes == [0u8; 8] {
+        serial_bytes[7] = 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_positive_serial_bytes;
+
+    #[test]
+    fn serial_normalization_clears_sign_bit() {
+        let mut serial = [0xff, 0, 0, 0, 0, 0, 0, 1];
+
+        normalize_positive_serial_bytes(&mut serial);
+
+        assert_eq!(serial[0] & 0x80, 0);
+        assert_eq!(serial, [0x7f, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn serial_normalization_avoids_zero() {
+        let mut serial = [0x80, 0, 0, 0, 0, 0, 0, 0];
+
+        normalize_positive_serial_bytes(&mut serial);
+
+        assert_eq!(serial, [0, 0, 0, 0, 0, 0, 0, 1]);
     }
 }

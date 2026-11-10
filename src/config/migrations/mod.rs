@@ -280,6 +280,26 @@ pub fn mysql_drop_index_missing_is_benign(statement: &str, error_number: Option<
     is_drop_index && error_number == Some(1091)
 }
 
+/// Whether a MySQL `CREATE INDEX` failure means the index already exists.
+///
+/// Only the structured server error 1061 (`ER_DUP_KEYNAME`) qualifies. The
+/// V001 baseline strips `IF NOT EXISTS` for MySQL and tolerates exactly this
+/// code; matching the rendered error text instead would also accept unrelated
+/// failures whose message happens to contain the digits.
+pub fn mysql_create_index_exists_is_benign(error_number: Option<u16>) -> bool {
+    error_number == Some(1061)
+}
+
+/// The structured MySQL server error number of a sqlx error, if it is one.
+pub(crate) fn mysql_error_number(error: &sqlx::Error) -> Option<u16> {
+    error
+        .as_database_error()
+        .and_then(|database_error| {
+            database_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+        })
+        .map(sqlx::mysql::MySqlDatabaseError::number)
+}
+
 fn map_plugin_statement_result<T>(
     db_type: &str,
     statement: &str,
@@ -288,15 +308,8 @@ fn map_plugin_statement_result<T>(
     match result {
         Ok(_) => Ok(()),
         Err(e) => {
-            let missing_index_is_benign = {
-                let error_number = e
-                    .as_database_error()
-                    .and_then(|database_error| {
-                        database_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
-                    })
-                    .map(sqlx::mysql::MySqlDatabaseError::number);
-                db_type == "mysql" && mysql_drop_index_missing_is_benign(statement, error_number)
-            };
+            let missing_index_is_benign = db_type == "mysql"
+                && mysql_drop_index_missing_is_benign(statement, mysql_error_number(&e));
             if missing_index_is_benign {
                 Ok(())
             } else {

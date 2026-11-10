@@ -549,6 +549,19 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn attach_ingress_redirect(&mut self, iface: &str) -> Result<(), String> {
+        // Without both scope maps the classifier could only match on pod IP and
+        // would capture every port of an enrolled pod, and every enrollment
+        // would then fail to scope it. Refuse to arm it instead.
+        if !self
+            .maps
+            .as_ref()
+            .is_some_and(BpfMaps::supports_inbound_redirect_scope)
+        {
+            return Err(format!(
+                "Refusing to attach '{INGRESS_REDIRECT_PROGRAM}': the loaded ELF lacks the \
+                 inbound redirect scope maps"
+            ));
+        }
         let bpf = self.bpf_mut()?;
         let prog: &mut SchedClassifier = bpf
             .program_mut(INGRESS_REDIRECT_PROGRAM)
@@ -1397,6 +1410,20 @@ mod live_kernel_tests {
         backend
             .clear_pod_inbound_ports(Ipv4Addr::new(10, 244, 9, 9))
             .expect("clearing an unscoped pod address must be a no-op, not an error");
+
+        // Removing an include-ports narrowing must succeed for an entry that
+        // exists and for one that is already gone (ENOENT is tolerated; any
+        // other map error is returned to the caller, issue #7266).
+        {
+            let maps = backend.maps.as_mut().expect("maps loaded");
+            let cgroup_id = 0x7f00_0000_0000_0001;
+            maps.insert_include_ports(cgroup_id, &ferrum_ebpf_common::IncludePortsPolicy::all())
+                .expect("insert an include-ports narrowing");
+            maps.remove_include_ports(cgroup_id)
+                .expect("remove an existing include-ports narrowing");
+            maps.remove_include_ports(cgroup_id)
+                .expect("removing an absent include-ports narrowing must be a no-op");
+        }
 
         // Detaching again must be a clean no-op: shutdown and startup rollback
         // can both run it.

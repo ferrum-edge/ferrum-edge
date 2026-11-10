@@ -76,6 +76,44 @@ fn remove_runtime_metrics_env_vars() {
     }
 }
 
+/// GHSA-9gqf-79hq-v2v2: an unparseable stream bind address refuses startup
+/// instead of silently binding stream listeners on the proxy bind address.
+#[test]
+fn stream_proxy_bind_address_must_be_an_ip_address() {
+    use ferrum_edge::config::conf_file::ConfFile;
+
+    for invalid in ["127.0.0.l", "localhost", "127.0.0.1:9000"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+                ("FERRUM_STREAM_PROXY_BIND_ADDRESS", invalid),
+            ],
+            || {
+                let error = EnvConfig::from_env_with_conf(&ConfFile::default()).unwrap_err();
+                assert!(
+                    error.contains("Invalid FERRUM_STREAM_PROXY_BIND_ADDRESS"),
+                    "unexpected error for {invalid:?}: {error}"
+                );
+            },
+        );
+    }
+
+    for valid in ["127.0.0.1", "::1", "0.0.0.0", "::"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+                ("FERRUM_STREAM_PROXY_BIND_ADDRESS", valid),
+            ],
+            || {
+                let env = EnvConfig::from_env_with_conf(&ConfFile::default()).unwrap();
+                assert_eq!(env.stream_proxy_bind_address, valid);
+            },
+        );
+    }
+}
+
 #[test]
 fn metrics_token_admission_trims_and_preserves_disabled_defaults() {
     use ferrum_edge::admin::MetricsAuthPolicy;

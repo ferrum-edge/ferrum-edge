@@ -1419,6 +1419,15 @@ async fn rejection_log_funnel_records_the_rejecting_phase_and_plugin() {
     assert_eq!(rejection.phase, "circuit_breaker_open");
     assert_eq!(rejection.plugin, None);
 
+    // Issue #7158: every frontend names the open-breaker rejection
+    // `circuit_breaker_open`; the former H3-only `circuit_breaker` spelling is
+    // no longer a gateway phase and records as any unlisted label does.
+    let retired_slot = DiagnosticSlot::shared();
+    let retired_ctx = context_with_slot(&retired_slot);
+    log_rejection(&retired_ctx, 503, "circuit_breaker").await;
+    let rejection = retired_slot.rejection().expect("rejection recorded");
+    assert_eq!(rejection.phase, "other");
+
     // The recorded phase is a compiled-in label, whatever the caller passed.
     let unlisted_slot = DiagnosticSlot::shared();
     let unlisted_ctx = context_with_slot(&unlisted_slot);

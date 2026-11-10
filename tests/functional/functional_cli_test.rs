@@ -3543,6 +3543,56 @@ async fn functional_cli_pool_shard_one_validates_and_starts_file_database_cp_and
     cp.shutdown();
 }
 
+/// Issue #7251: DP mode starts the ACME renewal scheduler, as file and
+/// database mode do. The scheduler entry point warns on a build without the
+/// `acme` feature and, with the feature, logs that it started. Either line in
+/// the DP's own output proves DP mode reached it, whichever feature set CI
+/// built. The challenge type must be valid: an unparseable one is refused at
+/// startup while auto-renew is enabled (issue #7194).
+#[ignore]
+#[tokio::test]
+async fn functional_dp_starts_acme_renewal_scheduler() {
+    const NO_FEATURE: &str =
+        "FERRUM_ACME_AUTO_RENEW_ENABLED=true but this binary was built without";
+    const STARTED: &str = "ACME renewal scheduler started";
+    let (mut cp, address) = start_gateway_with_one_pool_shard("cp", None).await;
+    let cp_address = address.expect("cp fixture returns its gRPC listen address");
+    let attempts = crate::scaffolding::ports::BIND_DROP_SPAWN_ATTEMPTS;
+    let mut dp = None;
+    for attempt in 1..=attempts {
+        let builder = crate::common::TestGateway::builder()
+            .skip_auto_build()
+            .clear_env()
+            .capture_output()
+            .env("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true")
+            .env("FERRUM_ACME_AUTO_RENEW_ENABLED", "true")
+            .env("FERRUM_ACME_RENEW_CHALLENGE_TYPE", "http01")
+            .mode_dp(vec![format!("http://{cp_address}")]);
+        match builder.spawn_classified().await {
+            Ok(gateway) => {
+                dp = Some(gateway);
+                break;
+            }
+            Err(error) if error.is_retryable_port_race(attempt, attempts) => {}
+            Err(error) => panic!("dp with ACME auto-renew enabled: {error}"),
+        }
+    }
+    let mut dp = dp.expect("the final failed attempt panics");
+    let output = dp
+        .wait_for_captured_output(
+            |output| output.contains(NO_FEATURE) || output.contains(STARTED),
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("read dp captured output");
+    assert!(
+        output.contains(NO_FEATURE) || output.contains(STARTED),
+        "DP mode must start the ACME renewal scheduler: {output}"
+    );
+    dp.shutdown();
+    cp.shutdown();
+}
+
 // These regressions execute an installed copy of the actual CLI in isolated
 // working directories. CI builds the binary before the functional shards run.
 fn installed_cli_command(directory: &TempDir, args: &[&str]) -> Command {

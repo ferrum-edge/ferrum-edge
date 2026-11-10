@@ -1004,7 +1004,7 @@ async fn unauthenticated_delivery_does_not_poll_a_retirement_future() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // isolated_registry() must span awaits to serialize process-global registry state
 async fn already_retired_session_wins_an_exact_ready_tie_without_delivering() {
-    let _registry = crate::unit::tls::isolated_registry();
+    let _registry = crate::unit::client_trust_registry_lock::isolated_registry();
     let guard = registered_frontend_dtls_session();
     let session = guard.session().clone();
     session.cancellation_token().cancel();
@@ -1031,7 +1031,7 @@ async fn already_retired_session_wins_an_exact_ready_tie_without_delivering() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // isolated_registry() must span awaits to serialize process-global registry state
 async fn a_full_channel_delivery_is_released_by_trust_withdrawal_without_delivering() {
-    let _registry = crate::unit::tls::isolated_registry();
+    let _registry = crate::unit::client_trust_registry_lock::isolated_registry();
     let guard = registered_frontend_dtls_session();
     let session = guard.session().clone();
     let session_for_task = session.clone();

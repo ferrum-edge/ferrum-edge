@@ -1037,6 +1037,10 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
 {
     let mut buffer = Vec::with_capacity(cfg.batch_size);
     let mut timer = tokio::time::interval(cfg.flush_interval);
+    // A flush (with its retries) can outlast several intervals. Resume the
+    // period from the next tick instead of firing the missed ticks back to
+    // back, which would send a recovering sink a run of tiny batches.
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut closing = *close_rx.borrow();
     if closing {
         worker.wait_for_admissions().await;
