@@ -2663,22 +2663,19 @@ fn validate_resource_name_shape(type_url: &str, name: &str) -> Result<(), String
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ServicePortResourceName {
-    namespace: String,
-    service: String,
-    port: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceResourceName {
     namespace: String,
     service: String,
 }
 
+/// Validate a Ferrum `{prefix}/{namespace}/{service}/{port}` name and return
+/// the service it names. The port is validated but not returned: slice
+/// services come from the Services carrier, so only the service identity is
+/// needed (RDS resource warming).
 fn parse_service_port_resource_name(
     name: &str,
     expected_prefix: &str,
-) -> Result<ServicePortResourceName, String> {
+) -> Result<ServiceResourceName, String> {
     let parts: Vec<&str> = name.split('/').collect();
     if parts.len() != 4 || parts[0] != expected_prefix {
         return Err(format!(
@@ -2700,10 +2697,9 @@ fn parse_service_port_resource_name(
     if port == 0 {
         return Err("resource name <redacted scalar> must use a non-zero port".to_string());
     }
-    Ok(ServicePortResourceName {
+    Ok(ServiceResourceName {
         namespace: namespace.to_string(),
         service: service.to_string(),
-        port,
     })
 }
 
