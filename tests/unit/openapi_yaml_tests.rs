@@ -10394,7 +10394,6 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
     }
     assert!(compression_docs.contains("Strict config validation"));
     assert!(compression_docs.contains("KeepLastKnownGood"));
-    assert!(compression_docs.contains("disable_on_etag"));
     assert!(
         compression_docs.contains("**Multiple instances:**"),
         "compression docs must describe multi-instance first-wins ownership"

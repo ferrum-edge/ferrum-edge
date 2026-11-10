@@ -406,25 +406,6 @@ const PROVIDER_FIELDS: &[&str] = &[
     "clock_skew_seconds",
 ];
 
-/// Provider fields removed by the shared replay-authority migration, with the
-/// replacement named explicitly. Rejected rather than ignored: a config that
-/// still carries `dpop_jti_ttl_secs` was written believing it controls how long
-/// a proof stays single-use, and silently dropping it would leave that operator
-/// with an unexamined retention contract.
-const REMOVED_PROVIDER_FIELDS: &[(&str, &str)] = &[
-    (
-        "dpop_jti_ttl_secs",
-        "replay retention is no longer configurable — every marker is retained for a fixed \
-         horizon that dominates the widest admissible clock skew, so no reload can shorten the \
-         protection of an already-admitted proof",
-    ),
-    (
-        "dpop_jti_cache_max_entries",
-        "renamed to `dpop_replay_max_entries`; it now bounds a process replay lane that never \
-         evicts an unexpired marker (at capacity the request is refused instead)",
-    ),
-];
-
 impl Drop for JwksAuth {
     fn drop(&mut self) {
         let _publication = match self.discovery_publication_gate.lock() {
@@ -669,7 +650,6 @@ impl JwksAuth {
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
-            reject_removed_provider_fields(prov_obj, idx)?;
             reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
 
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
@@ -2726,19 +2706,6 @@ fn default_dpop_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> Str
     prefix.push_str(":jwks_auth:");
     prefix.push_str(plugin_config_id);
     prefix
-}
-
-/// Reject provider fields the shared replay authority removed, naming the
-/// replacement. See [`REMOVED_PROVIDER_FIELDS`].
-fn reject_removed_provider_fields(config: &Map<String, Value>, idx: usize) -> Result<(), String> {
-    for (removed, guidance) in REMOVED_PROVIDER_FIELDS {
-        if config.contains_key(*removed) {
-            return Err(format!(
-                "jwks_auth: `provider[{idx}].{removed}` was removed — {guidance}"
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn reject_unknown_fields(

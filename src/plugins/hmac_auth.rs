@@ -1411,12 +1411,6 @@ impl HmacAuth {
                 config = config.to_string()
             )
         })?;
-        if config_obj.get("require_digest").is_some() {
-            return Err(
-                "hmac_auth: `require_digest` was removed; request digests are always required"
-                    .to_string(),
-            );
-        }
         // Closed root key set: a misspelled `replay_scope` or `signing_profile`
         // must fail admission rather than silently leave a policy on a weaker
         // posture than the operator wrote.
