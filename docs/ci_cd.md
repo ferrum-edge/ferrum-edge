@@ -1776,6 +1776,9 @@ A cache miss builds cold; an export failure fails the writer. The dedicated
 package must be public before anonymous imports can reuse it. Existing GHA
 entries expire under LRU. See the registry migration section below.
 
+The Fuzz lanes keep their own cache contract, not the Ambient registry cache:
+PR #3918 first split the Fuzz Smoke lane's main-only save, and the 2026-11-09
+property/sanitizer split that replaced it is described below.
 The ordinary NodeWaypoint image uses its dedicated GHCR registry cache; the eBPF
 image shares Ambient's registry cache. FIPS handoff is unchanged.
 
