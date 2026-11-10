@@ -43476,10 +43476,12 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "ferrum:dedup"
           description: >-
             Key prefix for all Redis keys. Must be non-empty when supplied.
-            Defaults to `{FERRUM_NAMESPACE}:dedup` (for example `ferrum:dedup`).
+            When omitted, the runtime derives `{FERRUM_NAMESPACE}:dedup` (for
+            example `ferrum:dedup` when the namespace is `ferrum`). No static
+            OpenAPI default is advertised because the value depends on the
+            gateway namespace.
             Sibling request_deduplication instances remain isolated under a
             shared default or explicit prefix because logical keys include the
             stable plugin-config id. Matched proxy namespaces also remain

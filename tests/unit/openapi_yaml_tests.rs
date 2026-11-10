@@ -4356,6 +4356,23 @@ fn request_deduplication_schema_matches_runtime_validation() {
         .pointer("/components/schemas/RequestDeduplicationConfig")
         .expect("RequestDeduplicationConfig component exists");
 
+    // The omitted prefix is `{FERRUM_NAMESPACE}:dedup`, which no static
+    // default can express: a schema-driven client that materialized
+    // `ferrum:dedup` would pin other namespaces to the `ferrum` prefix.
+    let prefix = &schema["properties"]["redis_key_prefix"];
+    assert!(
+        prefix.get("default").is_none(),
+        "redis_key_prefix must not advertise a static OpenAPI default; got {:?}",
+        prefix.get("default")
+    );
+    assert!(
+        prefix["description"]
+            .as_str()
+            .expect("redis_key_prefix description")
+            .contains("{FERRUM_NAMESPACE}:dedup"),
+        "OpenAPI must document the namespace-derived runtime default"
+    );
+
     // Issue #2604: the published schema must reject the same malformed
     // configurations the runtime constructor rejects.
     assert_eq!(schema["properties"]["header_name"]["minLength"], json!(1));
