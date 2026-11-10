@@ -463,7 +463,10 @@ async fn ferrum_cni_binary_check_rejection_exits_nonzero() {
     );
     let payload: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
-    assert_eq!(payload["code"], 12);
+    assert_eq!(
+        payload["code"],
+        ferrum_edge::cni::spec::CNI_ERROR_CODE_REJECTED
+    );
     assert!(
         payload["msg"]
             .as_str()
