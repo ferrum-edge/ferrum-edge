@@ -4,8 +4,6 @@
 //! between Rust types and the `#[repr(C)]` shared types from
 //! `ferrum-ebpf-common`. Only available on Linux with `--features ebpf`.
 
-#![allow(dead_code)]
-
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -26,9 +24,11 @@ use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
-    BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS,
-    BPF_MAP_NODE_PROBE_PORTS6, BPF_MAP_POD_INBOUND_PORTS, BPF_MAP_POD_INBOUND_PORTS6,
-    BPF_MAP_POD_IPS6, BPF_MAP_UDP_RELAY_CGROUPS, BPF_MAP_UDP_REPLY_SOURCE_GATE,
+    BPF_MAP_BYPASS_UIDS, BPF_MAP_CAPTURE_CONFIG, BPF_MAP_CIDR_EXCLUDE4, BPF_MAP_CIDR_EXCLUDE6,
+    BPF_MAP_CIDR_INCLUDE4, BPF_MAP_CIDR_INCLUDE6, BPF_MAP_INCLUDE_PORTS, BPF_MAP_NODE_IPS,
+    BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS, BPF_MAP_NODE_PROBE_PORTS6,
+    BPF_MAP_POD_INBOUND_PORTS, BPF_MAP_POD_INBOUND_PORTS6, BPF_MAP_POD_IPS, BPF_MAP_POD_IPS6,
+    BPF_MAP_PORT_EXCLUDE, BPF_MAP_UDP_RELAY_CGROUPS, BPF_MAP_UDP_REPLY_SOURCE_GATE,
     BPF_MAP_UDP_REPLY_SOURCES, BPF_MAP_UDP_REPLY_SOURCES6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
 };
 
@@ -61,7 +61,7 @@ pub struct BpfMaps {
 impl BpfMaps {
     pub fn from_ebpf(bpf: &mut Ebpf) -> Result<Self, String> {
         let pod_ips = BpfHashMap::try_from(
-            bpf.take_map("FERRUM_POD_IPS")
+            bpf.take_map(BPF_MAP_POD_IPS)
                 .ok_or("FERRUM_POD_IPS map not found")?,
         )
         .map_err(|e| format!("FERRUM_POD_IPS type mismatch: {e}"))?;
@@ -214,42 +214,42 @@ impl BpfMaps {
         };
 
         let bypass_uids = BpfHashMap::try_from(
-            bpf.take_map("FERRUM_BYPASS_UIDS")
+            bpf.take_map(BPF_MAP_BYPASS_UIDS)
                 .ok_or("FERRUM_BYPASS_UIDS map not found")?,
         )
         .map_err(|e| format!("FERRUM_BYPASS_UIDS type mismatch: {e}"))?;
 
         let cidr_exclude4 = LpmTrie::try_from(
-            bpf.take_map("FERRUM_CIDR_EXCLUDE4")
+            bpf.take_map(BPF_MAP_CIDR_EXCLUDE4)
                 .ok_or("FERRUM_CIDR_EXCLUDE4 map not found")?,
         )
         .map_err(|e| format!("FERRUM_CIDR_EXCLUDE4 type mismatch: {e}"))?;
 
         let cidr_exclude6 = LpmTrie::try_from(
-            bpf.take_map("FERRUM_CIDR_EXCLUDE6")
+            bpf.take_map(BPF_MAP_CIDR_EXCLUDE6)
                 .ok_or("FERRUM_CIDR_EXCLUDE6 map not found")?,
         )
         .map_err(|e| format!("FERRUM_CIDR_EXCLUDE6 type mismatch: {e}"))?;
 
         let cidr_include4 = LpmTrie::try_from(
-            bpf.take_map("FERRUM_CIDR_INCLUDE4")
+            bpf.take_map(BPF_MAP_CIDR_INCLUDE4)
                 .ok_or("FERRUM_CIDR_INCLUDE4 map not found")?,
         )
         .map_err(|e| format!("FERRUM_CIDR_INCLUDE4 type mismatch: {e}"))?;
 
         let cidr_include6 = LpmTrie::try_from(
-            bpf.take_map("FERRUM_CIDR_INCLUDE6")
+            bpf.take_map(BPF_MAP_CIDR_INCLUDE6)
                 .ok_or("FERRUM_CIDR_INCLUDE6 map not found")?,
         )
         .map_err(|e| format!("FERRUM_CIDR_INCLUDE6 type mismatch: {e}"))?;
 
         let port_exclude = BpfHashMap::try_from(
-            bpf.take_map("FERRUM_PORT_EXCLUDE")
+            bpf.take_map(BPF_MAP_PORT_EXCLUDE)
                 .ok_or("FERRUM_PORT_EXCLUDE map not found")?,
         )
         .map_err(|e| format!("FERRUM_PORT_EXCLUDE type mismatch: {e}"))?;
 
-        let capture_config = match bpf.take_map("FERRUM_CAPTURE_CONFIG") {
+        let capture_config = match bpf.take_map(BPF_MAP_CAPTURE_CONFIG) {
             Some(map) => Some(
                 BpfHashMap::try_from(map)
                     .map_err(|e| format!("FERRUM_CAPTURE_CONFIG type mismatch: {e}"))?,
@@ -268,7 +268,7 @@ impl BpfMaps {
         // lookups, so capture stays correct for unannotated pods. Pods
         // that DO carry `includeOutboundPorts` will be over-captured (no
         // narrowing), which is the prior GAP-2K behavior.
-        let include_ports = match bpf.take_map("FERRUM_INCLUDE_PORTS") {
+        let include_ports = match bpf.take_map(BPF_MAP_INCLUDE_PORTS) {
             Some(map) => Some(
                 BpfHashMap::try_from(map)
                     .map_err(|e| format!("FERRUM_INCLUDE_PORTS type mismatch: {e}"))?,

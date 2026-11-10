@@ -424,7 +424,6 @@ impl NodeAgentConfig {
             env_config.node_agent_proxy_mode,
             capture_config.outbound_port,
             env_config.node_agent_hbone_redirect_port,
-            DEFAULT_NODE_AGENT_SOCKET_PATH,
         )?;
 
         // In-netns capture is the default for NodeWaypoint: publish the per-pod
