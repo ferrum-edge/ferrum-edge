@@ -26,4 +26,3 @@
 mod common;
 mod functional;
 mod scaffolding;
-mod scenarios;

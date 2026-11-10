@@ -1,16 +1,12 @@
 //! Network-simulation stream wrappers for scripted-backend tests.
 //!
-//! Phase 5 introduces three drop-in adapters that wrap any
-//! `AsyncRead + AsyncWrite` stream and alter its timing or length
-//! behaviour:
+//! Phase 5 introduces two drop-in adapters that wrap any
+//! `AsyncRead + AsyncWrite` stream and alter its timing:
 //!
 //! - [`latency::DelayedStream`] — inject a per-call `Duration` delay
 //!   before every read and write. Models backend-side RTT.
 //! - [`bandwidth::BandwidthLimitedStream`] — enforce a bytes-per-second
 //!   ceiling on reads and writes using a token-bucket.
-//! - [`truncate::TruncatedStream`] — close the stream (EOF on read, error
-//!   on write) after N bytes, optionally with a pre-close delay. Models
-//!   backend mid-stream disconnection.
 //!
 //! ## Architecture choice — middleman proxy, not backend hook
 //!
@@ -57,9 +53,7 @@
 pub mod bandwidth;
 pub mod latency;
 pub mod proxy;
-pub mod truncate;
 
 pub use bandwidth::BandwidthLimitedStream;
 pub use latency::DelayedStream;
 pub use proxy::{NetworkProfile, NetworkSimProxy, NetworkSimProxyBuilder};
-pub use truncate::TruncatedStream;
