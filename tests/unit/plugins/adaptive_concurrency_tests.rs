@@ -788,7 +788,7 @@ fn adaptive_concurrency_rejects_every_unknown_policy_key() {
             "unexpected validation error: {error}"
         );
         assert!(
-            error.contains("allowed keys"),
+            error.contains("unknown configuration key(s)"),
             "unexpected validation error: {error}"
         );
     }

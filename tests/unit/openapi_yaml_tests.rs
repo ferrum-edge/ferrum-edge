@@ -9955,7 +9955,7 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         Err(err) => err,
     };
     assert!(err.contains("mirror_protcol"), "got: {err}");
-    assert!(err.contains("allowed keys"), "got: {err}");
+    assert!(err.contains("unknown configuration key(s)"), "got: {err}");
     validate_plugin_config("request_mirror", &typo).expect_err("shared admission must reject typo");
 
     // Issue #5152: the component schema is compared against ACTUAL constructor

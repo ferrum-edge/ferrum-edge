@@ -2334,7 +2334,7 @@ fn provider_singular_audience_is_an_unknown_field() {
     .map(|_| ())
     .expect_err("singular audience must be rejected");
     assert!(
-        error.contains("unknown field") && error.contains("audience"),
+        error.contains("unknown configuration key") && error.contains("audience"),
         "{error}"
     );
 }
