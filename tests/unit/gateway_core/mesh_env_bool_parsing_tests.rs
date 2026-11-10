@@ -142,3 +142,64 @@ fn node_agent_fallback_mode_is_trimmed() {
         Ok(FallbackMode::Iptables)
     );
 }
+
+#[test]
+fn k8s_node_name_is_read_trimmed_from_the_environment() {
+    use ferrum_edge::modes::mesh::k8s_node_name_from_env;
+    let guard = EnvGuard::new(&["FERRUM_K8S_NODE_NAME"]);
+    guard.unset("FERRUM_K8S_NODE_NAME");
+    assert_eq!(k8s_node_name_from_env(), None);
+    guard.set("FERRUM_K8S_NODE_NAME", "   ");
+    assert_eq!(k8s_node_name_from_env(), None);
+    guard.set("FERRUM_K8S_NODE_NAME", " node-a ");
+    assert_eq!(k8s_node_name_from_env().as_deref(), Some("node-a"));
+}
+
+/// `FERRUM_K8S_NODE_NAME` names the machine the process runs on, so it is
+/// environment-only (never `ferrum.conf`), and the NodeWaypoint UDP listeners
+/// and `ambient-udp-preflight` share one reader instead of two different
+/// sources (issue #7237).
+#[test]
+fn k8s_node_name_has_one_environment_only_reader() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut stack = vec![root.join("src")];
+    let mut readers = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src is readable") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).expect("source is readable");
+                let reads = text.matches("\"FERRUM_K8S_NODE_NAME\")").count();
+                if reads > 0 {
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("under the repository")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    readers.push((relative, reads));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        readers,
+        vec![("src/modes/mesh/mod.rs".to_string(), 1)],
+        "read FERRUM_K8S_NODE_NAME only through modes::mesh::k8s_node_name_from_env"
+    );
+    let mesh = std::fs::read_to_string(root.join("src/modes/mesh/mod.rs")).expect("mesh source");
+    let start = mesh
+        .find("pub fn k8s_node_name_from_env(")
+        .expect("shared reader exists");
+    let body = &mesh[start..start + mesh[start..].find("\n}").expect("body ends")];
+    assert!(
+        body.contains("std::env::var(\"FERRUM_K8S_NODE_NAME\")"),
+        "the shared reader must read the process environment only"
+    );
+    let cli = std::fs::read_to_string(root.join("src/cli.rs")).expect("cli source");
+    assert!(
+        cli.contains("crate::modes::mesh::k8s_node_name_from_env()"),
+        "ambient-udp-preflight must use the shared reader"
+    );
+}

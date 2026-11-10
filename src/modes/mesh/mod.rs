@@ -1400,9 +1400,7 @@ impl MeshRuntimeConfig {
         if self.topology != MeshTopology::NodeWaypoint {
             return Ok(());
         }
-        if node_waypoint_udp_listeners_enabled_from_env()?
-            && node_waypoint_udp_local_node_name_from_env().is_none()
-        {
+        if node_waypoint_udp_listeners_enabled_from_env()? && k8s_node_name_from_env().is_none() {
             return Err(
                 "FERRUM_K8S_NODE_NAME must be set to the current Kubernetes node when \
                  FERRUM_MESH_NODE_WAYPOINT_UDP_LISTENERS_ENABLED=true"
@@ -2280,15 +2278,21 @@ pub(crate) fn node_waypoint_udp_listeners_enabled_from_env() -> Result<bool, Str
     }
 }
 
-/// Exact Kubernetes node whose local workloads this NodeWaypoint may reach.
+/// This process's Kubernetes node name (`FERRUM_K8S_NODE_NAME`, downward API
+/// `spec.nodeName`), trimmed; `None` when unset or blank.
 ///
-/// The UDP relay's eBPF authorization mark is socket-local metadata and does
-/// not cross a node boundary. A listener must therefore never select a backing
-/// workload owned by another node, even when that workload is in the same
-/// cluster. The serving path rejects an enabled listener surface when this
-/// downward-API value is absent; read-only materialization remains infallible
-/// and emits no listeners in that state.
-fn node_waypoint_udp_local_node_name_from_env() -> Option<String> {
+/// Read from the process environment only, never `ferrum.conf`: the value
+/// names the machine the process runs on, so a settings-file copy could name
+/// another node. It is the one reader for both consumers (issue #7237):
+///
+/// - NodeWaypoint UDP/DTLS listeners, which must never select a backing
+///   workload owned by another node (the UDP relay's eBPF authorization mark
+///   is socket-local and does not cross a node boundary). The serving path
+///   rejects an enabled listener surface when this is absent; read-only
+///   materialization remains infallible and emits no listeners in that state.
+/// - `ferrum-edge ambient-udp-preflight`, which binds its `get nodes` lookup
+///   to this node.
+pub fn k8s_node_name_from_env() -> Option<String> {
     std::env::var("FERRUM_K8S_NODE_NAME")
         .ok()
         .map(|value| value.trim().to_string())
@@ -2492,7 +2496,7 @@ fn materialize_node_waypoint_udp_listeners(
         config.node_waypoint_udp_destination_routes.clear();
         return;
     }
-    let Some(local_node_name) = node_waypoint_udp_local_node_name_from_env() else {
+    let Some(local_node_name) = k8s_node_name_from_env() else {
         config.node_waypoint_udp_steer_destinations.clear();
         config.node_waypoint_udp_destination_routes.clear();
         warn!(
