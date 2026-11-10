@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and incremented with a compare-exchange that refuses a stale cycle, so an
     increment racing a reopen can no longer close the next cycle one success
     early or extend its failure streak.
+- **The mesh injector no longer copies `FERRUM_DP_GRPC_TLS_NO_VERIFY` into
+  sidecars** (#7252). Every mode rejects `FERRUM_DP_GRPC_TLS_NO_VERIFY=true`
+  at startup, so forwarding the injector's value could only be a no-op or
+  stop every injected sidecar from starting. Pin the CP CA with
+  `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` instead, which is still forwarded.
 
 ### Fixed
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
