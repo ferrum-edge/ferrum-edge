@@ -597,6 +597,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **Replica-set MongoDB orphan-upstream cleanup is namespace-scoped**
+  (#7193). Deleting a proxy, or running the explicit orphan cleanup, on a
+  replica-set MongoDB store counted proxies that reference the upstream id in
+  every namespace. Upstream ids are unique only per namespace, so another
+  namespace's proxy with the same upstream id kept the deleting namespace's
+  orphaned upstream alive and suppressed its delete change record. The check
+  now counts proxies in the deleting namespace only, as standalone MongoDB
+  and the SQL backends already did.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
