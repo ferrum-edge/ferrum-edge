@@ -900,6 +900,70 @@ fn test_env_config_dp_mode_missing_jwt_secret() {
     );
 }
 
+/// Issue #7273: a stock DP sends a random per-process `node_id`, and
+/// `ConfigSync.Subscribe` requires the token's `sub` to equal it, so an
+/// externally issued token can never authenticate a DP. The token file wins
+/// over a configured secret when both are set, so `dp` mode must refuse the
+/// token file whether or not the secret is present, instead of starting a DP
+/// that loops on `PERMISSION_DENIED`.
+#[test]
+fn test_env_config_dp_mode_refuses_cp_token_file() {
+    for with_secret in [false, true] {
+        let mut vars = vec![
+            ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "dp-admin-secret-padding-at-least-32-bytes",
+            ),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_DP_CP_GRPC_TOKEN_FILE",
+                "/var/run/secrets/ferrum/cp-dp-token",
+            ),
+        ];
+        if with_secret {
+            vars.push((
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ));
+        }
+        with_env_vars(&vars, || {
+            let error = EnvConfig::from_env()
+                .expect_err("dp mode must refuse FERRUM_DP_CP_GRPC_TOKEN_FILE");
+            assert!(
+                error.contains("FERRUM_DP_CP_GRPC_TOKEN_FILE is not supported in dp mode"),
+                "unexpected error (with_secret={with_secret}): {error}"
+            );
+        });
+    }
+}
+
+/// The same token file stays valid on a mesh node, which presents a stable
+/// identity and needs no signing secret alongside it.
+#[test]
+fn test_env_config_mesh_mode_accepts_cp_token_file_without_secret() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_DP_CP_GRPC_TOKEN_FILE",
+                "/var/run/secrets/ferrum/cp-dp-token",
+            ),
+            ("FERRUM_MESH_ALLOW_NO_CA", "true"),
+        ],
+        || {
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
+            let config = EnvConfig::from_env().expect("mesh accepts a token file without a secret");
+            assert_eq!(config.mode, OperatingMode::Mesh);
+            assert_eq!(
+                config.dp_cp_grpc_token_file.as_deref(),
+                Some("/var/run/secrets/ferrum/cp-dp-token")
+            );
+        },
+    );
+}
+
 #[test]
 fn test_env_config_mesh_mode_valid() {
     with_env_vars(

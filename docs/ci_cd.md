@@ -763,8 +763,8 @@ preserve a fast `Tests` aggregate without starting the Rust/build matrix.
 Exceptions that always select full mode: anything under `vendor/` or
 `charts/`, `docs/prometheus_metrics.md` / `docs/prometheus_metric_contract.json`,
 and the dependency-governance docs (`docs/dependency-policy.md`,
-`docs/vendored-patch-lifecycle.json`, `docs/upstream-*`,
-`PRODUCTION_READINESS.md`); see `pr_ci_plan.py` `is_lightweight_path`.
+`docs/vendored-patch-lifecycle.json`, `docs/upstream-*`); see `pr_ci_plan.py`
+`is_lightweight_path`.
 Documentation-only changes never schedule a live datapath suite on a pull
 request.
 
@@ -3063,7 +3063,7 @@ policy already exists.
 
 Dev, test, and `pr-build` keep `panic = "unwind"` so the suite can observe
 `JoinError::is_panic()`. Those panic-recovery tests do not represent shipping
-behavior. See PRODUCTION_READINESS.md (*Deliberate decisions*) and
+behavior. See [docs/deliberate_decisions.md](deliberate_decisions.md) and
 `tests/unit/gateway_core/build_profile_panic_strategy_tests.rs`.
 
 ## How Releases Work
@@ -3421,80 +3421,12 @@ The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto
 
 ## Image Signatures, SBOMs, and Provenance
 
-**Release verification follow-up ([#4856](https://github.com/ferrum-edge/ferrum-edge/issues/4856), closed on 2026-09-09):**
-[release run 33984483575, job 101372033947](https://github.com/ferrum-edge/ferrum-edge/actions/runs/33984483575/job/101372033947)
-failed on 2026-09-05 after pulling the pinned Syft image. Its combined scan/jq
-step returned 1 without identifying the failed operation; signing and
-verification were skipped and no SPDX artifact survived. The contract below
-describes the required release behavior, not proof that this release met it.
-
-The failed source `af1bfcccc1c9eefc1aa118e8eff8fd218e9e6c4a` required a nonempty
-`documentDescribes` array. That is **not the current predicate**:
+`release-sbom-smoke.yml` (see the workflow inventory) re-checks the release SPDX
+predicates anonymously against recorded Docker Hub digests. It was built to
+diagnose the closed #4856 release failure, whose predicate mismatch
 [commit c27e5e55e](https://github.com/ferrum-edge/ferrum-edge/commit/c27e5e55eda97047a35af0bb0fd87fea760dcb82)
-already corrected the production check and its trusted policy to also accept
-`SPDXRef-DOCUMENT` / `DESCRIBES` relationships. The existing fix is also recorded
-in [release retry PR #4666](https://github.com/ferrum-edge/ferrum-edge/pull/4666).
-Do not duplicate that fix or rebaseline the trusted policy.
-
-[Hosted diagnostic run 34162011344](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34162011344)
-retained all six Docker Hub inventories. Every manifest inspection, manifest
-predicate, Syft scan, and current SPDX predicate exited 0; each SPDX validation
-printed `true`. The inventories use SPDX-2.3, omit `documentDescribes`, and each
-contain one document `DESCRIBES` relationship. The retained summaries report:
-
-| Family | amd64 job / packages | arm64 job / packages |
-| --- | --- | --- |
-| standard | 101865584659 / 15 | 101865584550 / 15 |
-| ebpf | 101865584752 / 16 | 101865584707 / 16 |
-| ebpftools | 101865584704 / 102 | 101865584749 / 102 |
-
-These actual inventories expose the historical predicate mismatch and support
-the already merged correction. The failed release's original inventory is
-unavailable, so they do not prove that no other operation failed in that run.
-The smoke checks each newly generated inventory against both predicates:
-current validation must succeed, and the historical predicate copied from the
-failed source must reject it with exactly jq exit 1. A launch, parse, or missing
-file error is not accepted as historical rejection.
-
-`release-sbom-smoke.yml` provides a read-only hosted diagnostic path on PRs and
-main pushes that change the release workflow or smoke harness. It scans the
-three immutable manifest digests recorded in that run on Docker Hub, on both
-`linux/amd64` and `linux/arm64` (six independent matrix entries). All six GHCR
-entries in run 34162011344 stopped at manifest discovery with HTTP 401 from
-`https://ghcr.io/token?scope=repository%3Aferrum-edge%2Fferrum-edge%3Apull&service=ghcr.io`.
-Their `manifest.stderr.txt` and `status.json` artifacts preserve that separate
-anonymous-access limitation; no Syft scan ran. This is why the anonymous smoke
-uses the demonstrated public Docker Hub path. It does not explain the
-authenticated release failure or remove per-registry release verification.
-
-The harness extracts manifest/SPDX jq predicates from `release.yml` and checks
-its literal Syft command against the extracted production command before
-scanning. Executable commands remain statically inspectable by trusted policy;
-extracted workflow shell text is only compared and retained as data. It does
-not execute Ferrum images. Hosted regressions exercise both SPDX description
-encodings, historical rejection, missing/empty content, command drift, scanner
-failure with partial output, launch failure, and timeout evidence. No registry
-login, signing, publication, or OIDC permission is used.
-
-For each entry, the `release-sbom-*` artifact is retained for 14 days, including
-on failure: `status.json` identifies the immutable subject, platform descriptor,
-and each operation's exit/timeout status; separate stdout/stderr files distinguish
-manifest inspection, Syft failure, and jq rejection; `spdx-summary.json` reports
-field shapes/counts; and any generated SPDX file plus the exact predicate and
-scan command and historical predicate are retained. Historical validation has
-its own stdout/stderr and actual/expected exit status. Only anonymous scans of
-these public images supply the evidence. Do not add credentials or authenticated
-debug dumps to this lane.
-
-This diagnostic lane leaves the frozen privileged release job and its inputs
-unchanged. It does not repair existing attestations or retain evidence from
-future release jobs themselves. Root must inspect the repaired harness's hosted
-historical/current results, reconcile #4856 with the already merged correction
-and release retry, arrange nonsecret future release failure artifacts through
-the authorized trusted-policy process, and verify signatures, provenance,
-immutable subjects, and both platform inventories for all three image families
-in **both registries**. A green smoke run alone is insufficient for issue closure
-or downstream reliance on the release's attestation claim.
+fixed. It uses no credentials and does not change the release job described
+below.
 
 Every version-tag release signs and attests the final standard, `-ebpf`, and
 `-ebpf-tools` multi-architecture image digests in both Docker Hub and GHCR. The
@@ -4390,87 +4322,6 @@ discarded unsaved warm caches. Three options were evaluated:
 
 Further decisions belong to maintainers, informed by a post-change week from
 the report above measured with the same joins as the baseline.
-
-### Sanitizer smoke on the main critical path (#4694)
-
-**Status: superseded (2026-11-09 test sweep).** The sanitizer budget left the
-required `CI` run for `.github/workflows/fuzz-smoke-main.yml` through the
-`fuzz-smoke` generation transition described in
-[Admitted `fuzz-smoke` generations](#admitted-fuzz-smoke-generations), with
-every target and bound unchanged. The analysis below is kept as the record of
-the profile and cache options considered before that move.
-
-**Original status: not changeable by a pull request.** The `fuzz-smoke` job in `ci.yml`
-is byte-frozen by the trusted policy (`CI_FUZZ_SMOKE_JOB_GENERATIONS` in
-`.github/scripts/verify_cross_build_policy.py`), and so is its wiring into the
-required `test` aggregate (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`). Every
-command, toolchain pin, target name, and libFuzzer bound in that job is part of
-the contract. Adding a `--profile` argument to `cargo fuzz run`, adding a step,
-or moving the job out of the `test` aggregate all change bytes no pull request
-may change, and `verify_cross_build_policy.py` is itself unmodifiable by a pull
-request. Both options in
-[#4694](https://github.com/ferrum-edge/ferrum-edge/issues/4694) are therefore
-direct-to-`main` changes, applied as a new admitted generation pair.
-
-Half of the "off the critical path" option is already done. Issues #3902 and
-#4238 narrowed the sanitizer step to `push: main` and `workflow_dispatch`
-only, so pull requests and merge groups pay the deterministic property smoke
-alone. What remains on the critical path is `main`'s own `Tests` aggregate.
-
-#### Expected saving from the recorded timing evidence
-
-The measurements collected on #4694 and in
-[ci_throughput_2026-09-08.md](ci_throughput_2026-09-08.md) do not support the
-bounded-profile experiment, and they do support the cache path instead:
-
-| Variant | Cold first-target sanitizer compile | Whole sanitizer step | Executed iterations |
-|---|---:|---:|---|
-| Shipping optimized (cold, run 34018271780) | 37m22s | 41m35s | 512 per target |
-| Shipping optimized (cold control, run 34028933678) | — | 36m05s | 512 per target |
-| `dev` opt-level 0 (run 34026677585) | — | 19m46s | **45** on `config_decode`, 512 on the other six |
-| `dev` opt-level 1 (run 34028543883) | — | 40m21s | 512 per target |
-| Exact fuzz-cache hit (run 34087106670) | **1m09s** | **5m19s** | 512 per target |
-| Exact fuzz-cache hit (run 34165057380) | — | 29m40s | 512 per target |
-
-Read honestly: the only reduced-optimization variant that saved meaningful
-compile time was opt-level 0, at roughly **22 minutes (≈52%) off the cold
-sanitizer step** — and it is inadmissible, because it lost 467 of the 512
-required `config_decode` iterations inside the unchanged time bound, which is
-exactly the coverage #4694 forbids trading away. Opt-level 1 kept the
-iterations and showed **no repeatable benefit**: its apparent 3% gain against
-an earlier cold run did not survive comparison with a concurrent control on
-which it was slower. Different hosted runners and commits make these
-descriptive observations, not causal estimates.
-
-An exact fuzz-cache hit, by contrast, removed roughly **38 minutes** from the
-first-target compile (1m09s versus 38m56s on the immediately preceding cold
-producer) with no profile, target-inventory, or bound change at all. The
-29m40s reading on run 34165057380 is a warm restore of a lane that no longer
-archives the compiler store, with 0 compiler hits and 16 misses — which is why
-the next experiment worth running is a same-input compiler-store comparison
-under [#4643](https://github.com/ferrum-edge/ferrum-edge/issues/4643), not
-another optimization-profile guess.
-
-#### If the bounded profile is attempted anyway
-
-It is a direct-to-`main` change with these parts, applied atomically:
-
-1. a `[profile.fuzz-smoke]` section in `fuzz/Cargo.toml` inheriting `release`,
-   with reduced `opt-level` and `debug`, AddressSanitizer untouched;
-2. `--profile fuzz-smoke` added to the six-target loop **and** to the
-   `datagram_client_address` invocation in `ci.yml`'s `fuzz-smoke` job, leaving
-   `-runs`, `-max_total_time`, `-max_len`, `-timeout` and `-rss_limit_mb`
-   byte-identical, and leaving `fuzz.yml`'s scheduled discovery lane optimized;
-3. a new `CI_FUZZ_SMOKE_JOB_GENERATIONS` entry in
-   `verify_cross_build_policy.py` whose adopted text is the edited job, with
-   `CI_FUZZ_SMOKE_BOUNDED_BUDGET` and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` still
-   appearing verbatim exactly once so the budget cannot move with the profile;
-4. a `main` run that reports the **actual** per-target iteration counts, not
-   just a pass, because opt-level 0 already passed while silently losing 91%
-   of one target's executions.
-
-Nothing here has been adopted. AddressSanitizer, the seven-target inventory,
-every input-size limit, and every execution bound remain as they are.
 
 ### Release build tail: timings, budgets, and the profile experiment (#4674)
 

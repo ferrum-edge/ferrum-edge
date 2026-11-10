@@ -25268,6 +25268,9 @@ components:
                   client_secret:
                     type: string
                     format: password
+                    description: >-
+                      Literal client secret. Plugin config is never environment-expanded;
+                      a value containing a `${NAME}` placeholder is refused at admission.
                   private_key_pem:
                     type: string
                     format: password
@@ -25645,6 +25648,9 @@ components:
                     type: string
                     minLength: 1
                     format: password
+                    description: >-
+                      Literal client secret. Plugin config is never environment-expanded;
+                      a value containing a `${NAME}` placeholder is refused at admission.
                   private_key_pem:
                     type: string
                     minLength: 1

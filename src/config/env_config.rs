@@ -2549,7 +2549,9 @@ pub struct EnvConfig {
     /// contents instead of minting its own token, so the signing key never
     /// exists on the data plane at all. The file is re-read on every connection
     /// attempt, so a rotating projected token is picked up without a restart.
-    /// DP / mesh / xDS client side.
+    /// Mesh (native / xDS) client side only: `validate()` refuses it in `dp`
+    /// mode, whose random per-process `node_id` can never match the token's
+    /// `sub` (issue #7273).
     pub dp_cp_grpc_token_file: Option<String>,
     /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
     /// The DP connects to the first URL and fails over to subsequent URLs when
@@ -7703,8 +7705,13 @@ impl EnvConfig {
         //
         // - CP with `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`: the bundle carries
         //   the verification credentials, so the shared secret is optional.
-        // - DP/mesh with `FERRUM_DP_CP_GRPC_TOKEN_FILE`: the node presents an
+        // - Mesh with `FERRUM_DP_CP_GRPC_TOKEN_FILE`: the node presents an
         //   externally issued token and never mints one, so it needs no secret.
+        // - A stock DP cannot use a token file at all (issue #7273): it sends a
+        //   random per-process `node_id`, and `ConfigSync.Subscribe` requires
+        //   the token's `sub` to equal it, so the CP refuses every subscription.
+        //   Refuse the setting here instead of starting a DP that loops on
+        //   `PERMISSION_DENIED` and never receives config.
         //
         // Whenever a secret *is* configured it still has to clear the minimum
         // length, on every mode — the macro used to enforce that only where it
@@ -7735,14 +7742,20 @@ impl EnvConfig {
                     );
                 }
             }
-            OperatingMode::DataPlane
-                if !has_cp_dp_secret && self.dp_cp_grpc_token_file.is_none() =>
-            {
-                return Err(
-                    "FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
-                            FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
-                        .into(),
-                );
+            OperatingMode::DataPlane => {
+                if self.dp_cp_grpc_token_file.is_some() {
+                    return Err(
+                        "FERRUM_DP_CP_GRPC_TOKEN_FILE is not supported in dp mode: a DP \
+                         sends a random per-process node_id and ConfigSync.Subscribe requires \
+                         the token's sub to equal it, so the CP would refuse the token. Use \
+                         FERRUM_CP_DP_GRPC_JWT_SECRET (plus FERRUM_CP_DP_GRPC_JWT_KEY_ID \
+                         against a trust-bundle CP) instead"
+                            .into(),
+                    );
+                }
+                if !has_cp_dp_secret {
+                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode".into());
+                }
             }
             _ => {}
         }

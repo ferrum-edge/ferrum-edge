@@ -443,8 +443,7 @@ are listed at the end of this section.
   `nextUpdate` — rolling deploy, node drain, OOM kill — does not come back, and
   a forgotten CRL refresh job is therefore a fleet-wide outage rather than a
   single-pod incident. This is deliberate (see
-  [PRODUCTION_READINESS.md](../PRODUCTION_READINESS.md) → "Deliberate
-  decisions"): booting with an expired CRL would serve without revocation
+  [deliberate_decisions.md](deliberate_decisions.md)): booting with an expired CRL would serve without revocation
   enforcement for that issuer, which is fail-open. Refresh the CRL before
   `nextUpdate`, and set `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true` (backend
   surfaces use `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED`, which defaults to

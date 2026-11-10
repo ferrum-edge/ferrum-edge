@@ -44,6 +44,7 @@ use super::utils::introspection_cache::{
 use super::utils::oauth_client_auth::{self, BasicCredentialsError, PrivateKeyDecodeError};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
+use super::utils::session_cookie::contains_unresolved_env_placeholder;
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
     extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
@@ -1915,11 +1916,7 @@ fn parse_client_auth(
                     "oauth2_introspection: `provider[{provider_idx}].client_auth.client_id` is required"
                 )
             })?;
-            let client_secret = required_auth_string(
-                &auth,
-                "client_secret",
-                provider_idx,
-            )?;
+            let client_secret = required_client_secret(&auth, provider_idx)?;
             Ok(ClientAuth::Basic {
                 authorization: oauth_basic_authorization_header(&client_id, &client_secret)?,
             })
@@ -1930,11 +1927,7 @@ fn parse_client_auth(
                     "oauth2_introspection: `provider[{provider_idx}].client_auth.client_id` is required"
                 )
             })?,
-            client_secret: SecretString(required_auth_string(
-                &auth,
-                "client_secret",
-                provider_idx,
-            )?),
+            client_secret: SecretString(required_client_secret(&auth, provider_idx)?),
         }),
         "private_key_jwt" => {
         let client_id = client_id.ok_or_else(|| {
@@ -2026,6 +2019,24 @@ fn required_auth_string(
         ));
     }
     Ok(raw.to_string())
+}
+
+/// `client_auth.client_secret`, refused when it holds a `${NAME}` placeholder.
+/// Plugin config is never environment-expanded, so such a value would be sent
+/// to the provider verbatim and every introspection call would fail with no
+/// admission error pointing at the cause (issue #7275).
+fn required_client_secret(
+    auth: &Map<String, Value>,
+    provider_idx: usize,
+) -> Result<String, String> {
+    let secret = required_auth_string(auth, "client_secret", provider_idx)?;
+    if contains_unresolved_env_placeholder(&secret) {
+        return Err(format!(
+            "oauth2_introspection: `provider[{provider_idx}].client_auth.client_secret` contains \
+             an unresolved `${{NAME}}` placeholder; plugin config values are literal"
+        ));
+    }
+    Ok(secret)
 }
 
 fn oauth_basic_authorization_header(

@@ -2744,7 +2744,7 @@ config:
         sub: X-Authenticated-Subject
 ```
 
-Plugin config values are literal: `client_auth.client_secret` does not read an environment variable, so a `${NAME}` value is sent to the provider as written. Substitute the real secret (for example with your deployment tooling) before applying the config.
+Plugin config values are literal: `client_auth.client_secret` does not read an environment variable, and admission refuses a value containing an unresolved `${NAME}` placeholder (a `${` followed by a name and `}`) without echoing it. Substitute the real secret (for example with your deployment tooling) before applying the config.
 
 ### `oidc_relying_party`
 
@@ -2853,7 +2853,7 @@ config:
     post_login_default_path: "/"
 ```
 
-As with `oauth2_introspection`, these values are literal: neither `client_auth.client_secret` nor `session.encryption_secret` reads an environment variable. Substitute real secrets before applying the config.
+As with `oauth2_introspection`, these values are literal: neither `client_auth.client_secret` nor `session.encryption_secret` reads an environment variable, and admission refuses an unresolved `${NAME}` placeholder in either. Substitute real secrets before applying the config.
 
 OIDC relying-party JWKS uses the same shared bounded-trust store as
 `jwks_auth`, with the secure one-hour maximum-stale default. Discovery success

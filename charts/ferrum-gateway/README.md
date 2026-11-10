@@ -15,7 +15,7 @@ Job and gateway pins on the same build.
 | Database | `database` | yes | read/write | `database.*`, `admin.jwtSecret` (>=32) |
 | File | `file` | yes | read-only | `file.inlineConfig` or `file.existingConfigMap` |
 | Control plane | `cp` | no | read/write | `database.*`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `cp.trustBundlePath` |
-| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32, plus `grpc.jwtKeyId` against a trust-bundle CP); `dp.cpGrpcTokenFile` is not usable by stock DPs yet (see `docs/cp_namespace_tenancy.md`); optional `dp.configMaxStaleSeconds` / `dp.configStaleAction` |
+| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32, plus `grpc.jwtKeyId` against a trust-bundle CP); optional `dp.configMaxStaleSeconds` / `dp.configStaleAction` |
 
 ### Multi-tenant control planes
 
@@ -25,8 +25,8 @@ read another tenant's configuration (advisory GHSA-3f2j-wwqw-grmg). A control
 plane serving more than one namespace therefore requires
 `cp.trustBundlePath` — a mounted JSON bundle of namespace-bound verification
 credentials — and the chart fails render without it. Data planes then present
-either an externally issued token (`dp.cpGrpcTokenFile`, no signing key on the
-node) or a per-tenant secret selected by `grpc.jwtKeyId`. See
+a per-tenant secret selected by `grpc.jwtKeyId` (a stock DP cannot present an
+externally issued token; the binary refuses one in dp mode). See
 [docs/cp_namespace_tenancy.md](../../docs/cp_namespace_tenancy.md).
 
 Tenancy enforcement spans both planes: set **`cp.requireNamespaceClaim: true`**

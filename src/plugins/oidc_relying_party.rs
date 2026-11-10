@@ -44,7 +44,9 @@ use super::utils::log_helpers::redacted_endpoint_url_str;
 use super::utils::oauth_client_auth::{self, PrivateKeyDecodeError};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
-use super::utils::session_cookie::reject_published_session_secret;
+use super::utils::session_cookie::{
+    contains_unresolved_env_placeholder, reject_published_session_secret,
+};
 use super::utils::socket_host::is_loopback_ip_literal_host;
 use super::{PluginResult, RequestContext};
 
@@ -3912,10 +3914,10 @@ fn parse_client_auth(
     let kid_field = optional_client_auth_string(&auth, "private_key_jwt_kid")?;
     match method {
         "client_secret_basic" => Ok(OidcClientAuth::Basic {
-            client_secret: SecretString(required_string(&auth, "client_secret", "client_auth")?),
+            client_secret: SecretString(required_client_secret(&auth)?),
         }),
         "client_secret_post" => Ok(OidcClientAuth::Post {
-            client_secret: SecretString(required_string(&auth, "client_secret", "client_auth")?),
+            client_secret: SecretString(required_client_secret(&auth)?),
         }),
         "private_key_jwt" => {
             let pem = required_string(&auth, "private_key_pem", "client_auth")?;
@@ -4210,6 +4212,23 @@ fn behavior_usize(
         ));
     }
     usize::try_from(raw).map_err(|_| format!("oidc_relying_party: `behavior.{field}` is too large"))
+}
+
+/// `client_auth.client_secret`, refused when it holds a `${NAME}` placeholder.
+/// Plugin config is never environment-expanded, so such a value would be sent
+/// to the provider verbatim and every token exchange would fail with no
+/// admission error pointing at the cause (issue #7275). The session secrets
+/// already refuse the same shape in `reject_published_session_secret`.
+fn required_client_secret(auth: &Map<String, Value>) -> Result<String, String> {
+    let secret = required_string(auth, "client_secret", "client_auth")?;
+    if contains_unresolved_env_placeholder(&secret) {
+        return Err(
+            "oidc_relying_party: `client_auth.client_secret` contains an unresolved `${NAME}` \
+             placeholder; plugin config values are literal"
+                .to_string(),
+        );
+    }
+    Ok(secret)
 }
 
 fn required_string(
