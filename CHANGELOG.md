@@ -597,6 +597,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+- **MongoDB standalone writes are no longer rolled back by a change-log
+  compaction failure** (#7210). Without `FERRUM_MONGO_REPLICA_SET`, a create,
+  update or batch inserted its `config_changes` row and then propagated any
+  error from the compaction that follows, so the caller deleted the resource
+  while its change row stayed durable. Compaction failures are now logged and
+  retried by the next write, as on replica sets. A standalone namespace wipe
+  (restore clear) records its delete rows in one batch instead of one row and
+  one compaction probe per deleted id.
+- **A custom DNS hosts file that fails to read is no longer applied** (#7204).
+  A read error (for example a non-UTF-8 line) in
+  `FERRUM_DNS_RESOLVER_HOSTS_FILE` used to install the partial table read so
+  far in place of the default hosts set and log that the file was loaded. It
+  now logs a warning and keeps the resolver's default hosts.
+- **CP tenant-subscription audit records name the refusal class** (#7202).
+  Failed `tenant_subscription` audit events for ConfigSync, MeshSubscribe and
+  xDS recorded most refusals as `reason="request refused"`. They now record a
+  fixed class: `config_sync build identity mismatch`, `real IP header
+  mismatch`, `namespace not authorized`, the admission limit
+  (`total_streams`, `full_config_rate_limit`, ...), the audience reason
+  (`missing`, `mismatch`, ...), `verification trust stale`, `verification
+  credential no longer trusted`, or `authentication failed`; the three fixed
+  verifier messages are kept. Each class has its own 60 s log limiter, so one
+  refusal looping no longer hides the first record of another.
+- **Active health-check lifecycle fixes** (#7206). The per-upstream probe
+  generation map is pruned on reload instead of growing with every upstream
+  id that ever had an active check; a full reload racing a service-discovery
+  probe restart no longer leaves a second, unabortable probe set running for
+  that upstream; and probe verifier, CRL or client build failures report
+  `backend TLS health-check client could not be built` instead of blaming the
+  SAN allow-list.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
@@ -662,6 +692,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it cannot crowd out Gateway API status on the shared Kubernetes client.
   Each writer's own batch behaves as before, and clusters that watch only one
   of the two are unchanged.
+- **Fewer allocations and shared writes on request and CP publication paths**
+  (#7207, #7208). Counting a tracing event takes the counter map's shard read
+  lock instead of its write lock; a request path with only non-slash percent
+  escapes is no longer copied by the encoded-slash fold; the consistent-hash
+  fallback for upstreams with more than 128 targets no longer builds a
+  `HashSet` of candidates per selection; and every CP full-snapshot
+  publication (Subscribe, GetFullConfig, namespace broadcast, lag recovery)
+  serializes its filtered config without a second deep clone.
 
 ## [0.9.20] - 2026-11-02
 
