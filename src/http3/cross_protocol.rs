@@ -14979,9 +14979,8 @@ mod tests {
         apply_h3_grpc_reject_metadata, build_h3_grpc_backend_headers, build_plain_request_builder,
         cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
         normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
-        record_cross_protocol_connection_start,
-        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
-        should_skip_cross_protocol_backend_header,
+        record_cross_protocol_connection_start, sanitize_h3_grpc_message_for_header,
+        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
     use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy, UpstreamTarget};
