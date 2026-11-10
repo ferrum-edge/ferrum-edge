@@ -750,7 +750,10 @@ async fn drive_guard(
 ) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     for chunk in chunks {
-        match guard.on_chunk(chunk.as_bytes()).await {
+        match guard
+            .on_chunk(&Bytes::copy_from_slice(chunk.as_bytes()))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
             ResponseStreamAction::Terminate(bytes) => {
                 if let Some(bytes) = bytes {
@@ -884,7 +887,10 @@ async fn sse_guard_holds_partial_events_until_complete() {
     let (default_bytes, _, _, _) = test_helpers::streaming_bounds_for_test();
     let mut guard = test_helpers::sse_guard_for_test(default_bytes);
 
-    match guard.on_chunk(b"data: {\"choices\":[{\"del").await {
+    match guard
+        .on_chunk(&Bytes::from_static(b"data: {\"choices\":[{\"del"))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => {
             assert!(bytes.is_empty(), "a partial event must not be released")
         }
@@ -1027,7 +1033,10 @@ async fn sse_guard_fails_closed_on_any_provider_bytes_after_the_terminal() {
 
     // Undecidable bytes after the marker: still refused with the terminal held.
     let mut guard = test_helpers::sse_guard_for_test(default_bytes);
-    let ResponseStreamAction::Forward(held) = guard.on_chunk(b"data: [DONE]\n\n").await else {
+    let ResponseStreamAction::Forward(held) = guard
+        .on_chunk(&Bytes::from_static(b"data: [DONE]\n\n"))
+        .await
+    else {
         panic!("a valid terminal event must be held, not terminate the stream");
     };
     assert!(
@@ -1037,7 +1046,7 @@ async fn sse_guard_fails_closed_on_any_provider_bytes_after_the_terminal() {
     let mut hostile = b"data: ".to_vec();
     hostile.extend_from_slice(&[0xff, 0xfe, 0xfd]);
     hostile.extend_from_slice(b"\n\n");
-    let action = guard.on_chunk(&hostile).await;
+    let action = guard.on_chunk(&Bytes::copy_from_slice(&hostile)).await;
     let ResponseStreamAction::Terminate(Some(bytes)) = action else {
         panic!("post-terminal undecidable bytes must terminate the stream, got {action:?}");
     };
@@ -1129,7 +1138,7 @@ async fn sse_guard_fails_closed_on_non_utf8_event() {
     let mut chunk = b"data: ".to_vec();
     chunk.extend_from_slice(&[0xff, 0xfe, 0xfd]);
     chunk.extend_from_slice(b"\n\n");
-    let action = guard.on_chunk(&chunk).await;
+    let action = guard.on_chunk(&Bytes::copy_from_slice(&chunk)).await;
     let ResponseStreamAction::Terminate(Some(bytes)) = action else {
         panic!("a non-UTF-8 event must terminate the stream, got {action:?}");
     };
@@ -10564,7 +10573,10 @@ async fn streaming_mid_body_provider_fault_scores_a_circuit_failure() {
         let mut inspector = plugin
             .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
             .expect("guard");
-        match inspector.on_chunk(b"data: {\"a\":1}\n\n").await {
+        match inspector
+            .on_chunk(&Bytes::from_static(b"data: {\"a\":1}\n\n"))
+            .await
+        {
             ResponseStreamAction::Forward(_) => {}
             ResponseStreamAction::Terminate(_) => panic!("a valid event must be forwarded"),
         }

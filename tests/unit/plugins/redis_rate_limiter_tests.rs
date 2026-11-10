@@ -2355,7 +2355,10 @@ fn shared_consumers_use_same_window_progress_helper() {
     // window's first sub-bucket.
     let live = redis_window_progress(1);
     assert!(live.elapsed_fraction >= 0.0 && live.elapsed_fraction < 1.0);
-    let live_bucket = RedisRateLimitClient::sub_bucket(1);
+    let live_bucket = RedisRateLimitClient::sub_bucket_at(
+        ferrum_edge::plugins::utils::redis_rate_limiter::redis_epoch_now(),
+        1,
+    );
     assert_eq!(live_bucket.window_seconds, 1);
     assert!(live_bucket.index >= live.index * REDIS_WINDOW_SUB_BUCKETS as u64);
 }

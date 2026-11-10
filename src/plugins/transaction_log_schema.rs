@@ -112,7 +112,6 @@ impl TransactionLogSchema {
         }
 
         let mut entries = Vec::with_capacity(obj.len());
-        let mut seen_names = BTreeSet::new();
         for (name, schema_value) in obj {
             if name.is_empty() {
                 return Err("transaction_log_schema: schema names must be non-empty".to_string());
@@ -120,11 +119,6 @@ impl TransactionLogSchema {
             if name.len() > MAX_SCHEMA_NAME_BYTES {
                 return Err(format!(
                     "transaction_log_schema: schema names must be at most {MAX_SCHEMA_NAME_BYTES} bytes"
-                ));
-            }
-            if !seen_names.insert(name.clone()) {
-                return Err(format!(
-                    "transaction_log_schema: duplicate schema name {name:?} within the same plugin config"
                 ));
             }
             // Compile (validates everything). Plugin name uses the schema

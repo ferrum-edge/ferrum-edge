@@ -7508,7 +7508,7 @@ impl ResponseStreamInspector for FederationSseGuard {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -7663,7 +7663,7 @@ impl ResponseStreamInspector for FederationImmediateStreamError {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &Bytes) -> ResponseStreamAction {
         self.take()
     }
 
@@ -10113,7 +10113,7 @@ pub mod test_helpers {
         }
 
         pub async fn on_chunk(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
-            match self.guard.on_chunk(chunk).await {
+            match self.guard.on_chunk(&Bytes::copy_from_slice(chunk)).await {
                 ResponseStreamAction::Forward(bytes) => (bytes.to_vec(), false),
                 ResponseStreamAction::Terminate(bytes) => {
                     (bytes.map(|b| b.to_vec()).unwrap_or_default(), true)

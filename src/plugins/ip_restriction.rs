@@ -135,13 +135,6 @@ struct ParsedRule {
     end: u128,
 }
 
-impl ParsedRule {
-    fn matches(self, client_ip: IpAddr) -> bool {
-        let (family, value) = ip_key(client_ip);
-        self.family == family && self.start <= value && value <= self.end
-    }
-}
-
 /// Immutable lookup index built at plugin construction/reload.
 ///
 /// Overlapping, duplicate, and adjacent ranges are merged. A request performs
@@ -524,17 +517,4 @@ fn is_canonical_ipv4_literal(literal: &str, ipv4: std::net::Ipv4Addr) -> bool {
         }
     }
     parts.next().is_none()
-}
-
-/// Check if an IP address matches one exact-IP/CIDR rule.
-///
-/// This string-based API is preserved for external callers and tests. Runtime
-/// plugin hooks use the context-cached typed client IP and compiled range set.
-#[allow(dead_code)]
-pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
-    let client_ip = crate::util::client_identity::parse_canonical_client_ip(client_ip);
-    match (client_ip, parse_rule(rule)) {
-        (Some(client_ip), Some(rule)) => rule.matches(client_ip),
-        _ => false,
-    }
 }

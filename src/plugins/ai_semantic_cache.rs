@@ -1459,8 +1459,10 @@ impl AiSemanticCache {
         body: &[u8],
     ) -> Option<(u16, HashMap<String, String>)> {
         let entry = self.seal_redis_entry(redis_key, status_code, headers, body)?;
-        let hit = self.admit_redis_hit(entry, redis_key)?;
-        Some((hit.status_code, hit.headers))
+        match self.classify_redis_hit(entry, redis_key) {
+            RedisHitVerdict::Admit(hit) => Some((hit.status_code, hit.headers)),
+            RedisHitVerdict::NotFresh | RedisHitVerdict::Invalid => None,
+        }
     }
 
     /// Seal an authenticated JSON envelope as a writer whose clock is
@@ -1933,7 +1935,7 @@ impl AiSemanticCache {
     /// to [`MAX_REDIS_VALUE_BYTES_HARD_CAP`] so checked Redis index conversion
     /// never sees a saturating `usize::MAX` cap. The exact per-entry limit is
     /// re-checked against `max_entry_size_bytes` on the decoded body in
-    /// [`Self::admit_redis_hit`].
+    /// [`Self::classify_redis_hit`].
     fn redis_value_byte_cap(&self) -> usize {
         let expanded = self
             .max_entry_size_bytes
@@ -1943,18 +1945,9 @@ impl AiSemanticCache {
         expanded.min(MAX_REDIS_VALUE_BYTES_HARD_CAP)
     }
 
-    /// Re-apply the full store-side admission contract to a Redis hit before
-    /// replaying it.
-    ///
-    /// Redis is untrusted storage shared across gateway versions and other
-    /// writers. Successful deserialization is not proof of a value this gateway
-    /// wrote: a tampered, stale, foreign, or cross-version entry must not let
-    /// the gateway emit an oversized, non-JSON, wrong-status, or unsanitized
-    /// (cookie/auth-bearing) response. Authenticity is verified with an HMAC
-    /// bound to the full cached status/header/body envelope and the Redis
-    /// namespace/key context before any other admission check. Returns the
-    /// sanitized response to serve, or `None` when any invariant fails (see
-    /// [`Self::classify_redis_hit`] for which refusals quarantine).
+    /// Inline-test view of [`Self::classify_redis_hit`]: the sanitized
+    /// response to serve, or `None` for any refusal.
+    #[cfg(test)]
     fn admit_redis_hit(
         &self,
         entry: SerializableCacheEntry,
@@ -1966,7 +1959,16 @@ impl AiSemanticCache {
         }
     }
 
-    /// Classify a Redis envelope for replay.
+    /// Re-apply the full store-side admission contract to a Redis hit before
+    /// replaying it, and classify the envelope.
+    ///
+    /// Redis is untrusted storage shared across gateway versions and other
+    /// writers. Successful deserialization is not proof of a value this gateway
+    /// wrote: a tampered, stale, foreign, or cross-version entry must not let
+    /// the gateway emit an oversized, non-JSON, wrong-status, or unsanitized
+    /// (cookie/auth-bearing) response. Authenticity is verified with an HMAC
+    /// bound to the full cached status/header/body envelope and the Redis
+    /// namespace/key context before any other admission check.
     ///
     /// Authenticity is decided first. Only an inauthentic, cross-version, or
     /// store-inadmissible envelope is [`RedisHitVerdict::Invalid`] (and
@@ -2441,11 +2443,17 @@ impl AiSemanticCache {
         }
     }
 
-    /// Bypass the cleanup throttle and run `cleanup_expired` immediately.
+    /// Bypass the cleanup throttle and run one cleanup sweep synchronously,
+    /// so the sweep has completed by the time this returns (the production
+    /// hot path schedules it through [`Self::signal_cleanup_if_due`]).
     #[allow(dead_code)]
     pub(crate) fn force_cleanup_for_tests(&self) {
         self.last_cleanup.store(u64::MAX, Ordering::Relaxed);
-        self.cleanup_expired();
+        if self.try_claim_cleanup_interval()
+            && Self::run_cleanup(&self.cache, self.ttl, self.max_entries)
+        {
+            self.mark_vector_index_dirty();
+        }
     }
 
     /// Install (or clear) a callback that runs after byte-budget admission and
@@ -2601,18 +2609,6 @@ impl AiSemanticCache {
         cache
             .remove_if(key, |_, entry| entry.generation == observed_generation)
             .map(|(_, removed)| removed)
-    }
-
-    /// Synchronous cleanup used only by the external test crate's
-    /// `force_cleanup_for_tests`, which wants the sweep to have completed by the
-    /// time it returns (the production hot path uses [`Self::signal_cleanup_if_due`]).
-    fn cleanup_expired(&self) {
-        if !self.try_claim_cleanup_interval() {
-            return;
-        }
-        if Self::run_cleanup(&self.cache, self.ttl, self.max_entries) {
-            self.mark_vector_index_dirty();
-        }
     }
 
     /// Retain an admitted response locally and, when configured, in Redis,
@@ -6447,8 +6443,7 @@ mod tests {
     /// Force cleanup to run regardless of the cooldown gate by resetting the
     /// gate to the "never cleaned" sentinel before the call.
     fn force_cleanup(plugin: &AiSemanticCache) {
-        plugin.last_cleanup.store(u64::MAX, Ordering::Relaxed);
-        plugin.cleanup_expired();
+        plugin.force_cleanup_for_tests();
     }
 
     #[test]

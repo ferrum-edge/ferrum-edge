@@ -511,9 +511,9 @@ impl SseRetryPrefixInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for SseRetryPrefixInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         let Some(held) = self.pending.as_mut() else {
-            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+            return ResponseStreamAction::Forward(chunk.clone());
         };
         held.extend_from_slice(chunk);
         if held.len() < UTF8_BOM.len() && UTF8_BOM.starts_with(held.as_slice()) {

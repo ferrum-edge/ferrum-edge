@@ -130,7 +130,7 @@ struct RejectProviderNative {
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for RejectProviderNative {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &bytes::Bytes) -> ResponseStreamAction {
         if chunk
             .windows(b"chat.completion.chunk".len())
             .any(|window| window == b"chat.completion.chunk")
@@ -143,7 +143,7 @@ impl ResponseStreamInspector for RejectProviderNative {
         {
             ResponseStreamAction::Terminate(None)
         } else {
-            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+            ResponseStreamAction::Forward(chunk.clone())
         }
     }
 }
@@ -1604,7 +1604,12 @@ async fn test_normalizer_fails_closed_when_provider_emits_tool_use_under_none() 
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut collected = Vec::new();
-    match inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(
+            ANTHROPIC_TOOL_USE_SSE.as_bytes(),
+        ))
+        .await
+    {
         ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
             collected.extend_from_slice(&b)
         }
@@ -1674,7 +1679,12 @@ async fn test_normalizer_still_emits_tool_calls_when_tool_choice_allows() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut collected = Vec::new();
-    match inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(
+            ANTHROPIC_TOOL_USE_SSE.as_bytes(),
+        ))
+        .await
+    {
         ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
             collected.extend_from_slice(&b)
         }
@@ -1767,7 +1777,12 @@ async fn test_inspector_gating() {
     let mut non_sse = plugin
         .response_stream_inspector(&ctx, 200, Some("application/json"))
         .expect("a claimed Anthropic 2xx non-SSE response must fail closed");
-    let out = String::from_utf8(forwarded(non_sse.on_chunk(b"{\"id\":\"msg\"}").await)).unwrap();
+    let out = String::from_utf8(forwarded(
+        non_sse
+            .on_chunk(&bytes::Bytes::from_static(b"{\"id\":\"msg\"}"))
+            .await,
+    ))
+    .unwrap();
     assert!(out.contains("upstream_error"), "{out}");
     assert!(!out.contains("msg"), "{out}");
 
@@ -1807,7 +1822,10 @@ async fn test_stream_normalizer_stage_precedes_policy_inspection() {
         normalizer,
     ])
     .expect("chained inspectors");
-    let output = match chain.on_chunk(ANTHROPIC_SSE.as_bytes()).await {
+    let output = match chain
+        .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(output) | ResponseStreamAction::Terminate(Some(output)) => {
             output
         }
@@ -1855,7 +1873,11 @@ async fn run_normalizer(chunk_size: usize) -> String {
 
     let mut collected = Vec::new();
     for chunk in ANTHROPIC_SSE.as_bytes().chunks(chunk_size) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     String::from_utf8(collected).unwrap()
@@ -2419,7 +2441,10 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
     let mut terminated = None;
     // 1 MiB cap / 64 KiB chunks → must terminate well within 20 chunks.
     for i in 0..20 {
-        match inspector.on_chunk(&filler).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&filler))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => {
                 assert!(
                     bytes.is_empty(),
@@ -2440,7 +2465,9 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
 
     // After termination the inspector keeps the stream closed without
     // emitting the terminal payload a second time.
-    let after = inspector.on_chunk(b"data: {}\n\n").await;
+    let after = inspector
+        .on_chunk(&bytes::Bytes::from_static(b"data: {}\n\n"))
+        .await;
     match after {
         ResponseStreamAction::Terminate(None) => {}
         ResponseStreamAction::Terminate(Some(_)) => panic!("must not emit terminal bytes twice"),
@@ -2452,7 +2479,9 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
 async fn test_normalizer_rejects_complete_event_at_exact_boundary_plus_one() {
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
     let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
-    let action = inspector.on_chunk(&event).await;
+    let action = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+        .await;
     match action {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -2468,7 +2497,9 @@ async fn test_normalizer_accepts_complete_event_at_exact_per_event_boundary() {
     // Exact-cap frame that is not valid Anthropic JSON: the size gate must
     // admit it so malformed-JSON rejection (not oversized) is what fires.
     let event = oversized_complete_event(MAX_SSE_EVENT_BYTES);
-    let action = inspector.on_chunk(&event).await;
+    let action = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+        .await;
     match action {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -2496,12 +2527,18 @@ async fn test_normalizer_rejects_split_oversized_event_before_boundary() {
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
     let half = MAX_SSE_EVENT_BYTES / 2 + 1;
     let first = vec![b'x'; half];
-    match inspector.on_chunk(&first).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&first))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
         other => panic!("first half under the cap must not terminate: {other:?}"),
     }
     let second = vec![b'y'; half];
-    match inspector.on_chunk(&second).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&second))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
@@ -2516,11 +2553,17 @@ async fn test_normalizer_rejects_when_boundary_arrives_with_final_oversized_byte
     // Fill exactly to the cap with no delimiter, then deliver the blank line
     // that would complete an oversized frame.
     let prefix = vec![b'z'; MAX_SSE_EVENT_BYTES];
-    match inspector.on_chunk(&prefix).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&prefix))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
         other => panic!("exact-cap partial must wait for more bytes: {other:?}"),
     }
-    match inspector.on_chunk(b"\n\n").await {
+    match inspector
+        .on_chunk(&bytes::Bytes::from_static(b"\n\n"))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
@@ -2540,7 +2583,10 @@ async fn test_normalizer_many_small_events_stream_without_quadratic_growth() {
     for _ in 0..count {
         body.extend_from_slice(event);
     }
-    match inspector.on_chunk(&body).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&body))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => {
             assert!(
                 bytes.is_empty(),
@@ -2568,7 +2614,10 @@ async fn test_normalizer_rejects_excessive_normalized_output() {
         "event: message_start\n\
          data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
     );
-    match inspector.on_chunk(start.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(start.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(_) => {}
         other => panic!("message_start must forward: {other:?}"),
     }
@@ -2595,7 +2644,10 @@ async fn test_normalizer_rejects_excessive_normalized_output() {
     let max_batches = MAX_SSE_EVENTS / batch_events;
 
     for index in 0..max_batches {
-        match inspector.on_chunk(&batch).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&batch))
+            .await
+        {
             ResponseStreamAction::Forward(_) => {}
             ResponseStreamAction::Terminate(Some(bytes)) => {
                 let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -2623,7 +2675,10 @@ async fn test_normalizer_terminal_provider_error_cannot_bypass_output_cap() {
         "event: message_start\n\
          data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
     );
-    let mut forwarded = match inspector.on_chunk(start.as_bytes()).await {
+    let mut forwarded = match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(start.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => bytes.len(),
         other => panic!("message_start must forward: {other:?}"),
     };
@@ -2640,7 +2695,10 @@ async fn test_normalizer_terminal_provider_error_cannot_bypass_output_cap() {
     const PROVIDER_MESSAGE_BYTES: usize = 900 * 1024;
     let target = MAX_SSE_NORMALIZED_OUTPUT_BYTES - PROVIDER_MESSAGE_BYTES;
     while forwarded < target {
-        match inspector.on_chunk(&batch).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&batch))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => forwarded += bytes.len(),
             other => panic!("in-budget text deltas must forward: {other:?}"),
         }
@@ -2660,7 +2718,10 @@ async fn test_normalizer_terminal_provider_error_cannot_bypass_output_cap() {
         "terminal fixture must remain within the per-event cap"
     );
 
-    let terminal = match inspector.on_chunk(provider_error.as_bytes()).await {
+    let terminal = match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(provider_error.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => bytes,
         other => panic!("oversized normalized terminal output must terminate: {other:?}"),
     };
@@ -2695,7 +2756,10 @@ async fn test_normalizer_cumulative_body_exhaustion() {
     // The seventeenth must trip that budget specifically, well before either
     // the per-event or event-count limits.
     for index in 0..16 {
-        match inspector.on_chunk(&event).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => assert!(
                 bytes.is_empty(),
                 "valid ping frame {index} should produce no normalized output"
@@ -2703,7 +2767,10 @@ async fn test_normalizer_cumulative_body_exhaustion() {
             other => panic!("in-budget valid frame {index} must continue: {other:?}"),
         }
     }
-    match inspector.on_chunk(&event).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "cumulative size limit");
@@ -2732,7 +2799,10 @@ async fn test_normalizer_event_count_exhaustion() {
         for _ in 0..n {
             chunk.extend_from_slice(event);
         }
-        match inspector.on_chunk(&chunk).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&chunk))
+            .await
+        {
             ResponseStreamAction::Forward(_) => seen += n,
             ResponseStreamAction::Terminate(bytes) => {
                 terminated = Some(bytes);
@@ -2761,7 +2831,10 @@ async fn test_normalizer_rejects_excessive_json_depth() {
         payload.push('}');
     }
     let frame = format!("data: {payload}\n\n");
-    match inspector.on_chunk(frame.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(frame.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "excessive JSON nesting");
@@ -2778,7 +2851,10 @@ async fn test_normalizer_trailing_incomplete_event_is_malformed() {
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tr\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
         "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"",
     );
-    match inspector.on_chunk(body.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(body.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(_) => {}
         other => panic!("incomplete trailing frame must wait for EOF: {other:?}"),
     }
@@ -2810,7 +2886,10 @@ async fn test_normalizer_sse_comment_frames_are_ignored() {
         "event: message_stop\n",
         "data: {\"type\":\"message_stop\"}\n\n",
     );
-    match inspector.on_chunk(body.as_bytes()).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(body.as_bytes()))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) | ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(text.contains("\"content\":\"ok\""), "{text}");
@@ -2848,7 +2927,10 @@ async fn test_normalizer_streamed_path_enforces_complete_event_size_single_chunk
     // boundary — the original advisory reproduction.
     let mut chunk = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
     chunk.extend_from_slice(b"data: {\"type\":\"ping\"}\n\n");
-    match inspector.on_chunk(&chunk).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&chunk))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
@@ -2861,7 +2943,10 @@ async fn test_normalizer_streamed_path_enforces_complete_event_size_single_chunk
 async fn test_normalizer_malformed_utf8_fails_closed() {
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
     let frame = b"data: \xff\xfe not utf8\n\n";
-    match inspector.on_chunk(frame).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(frame))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(text.contains("upstream_error"), "{text}");
@@ -2889,7 +2974,7 @@ async fn test_concurrent_independent_normalizers() {
                 .expect("inspector");
             if i % 2 == 0 {
                 let bad = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
-                match inspector.on_chunk(&bad).await {
+                match inspector.on_chunk(&bytes::Bytes::copy_from_slice(&bad)).await {
                     ResponseStreamAction::Terminate(Some(bytes)) => {
                         let text = String::from_utf8(bytes.to_vec()).unwrap();
                         assert!(text.contains("oversized"), "{text}");
@@ -2908,7 +2993,7 @@ async fn test_concurrent_independent_normalizers() {
                     "data: {\"type\":\"message_stop\"}\n\n",
                 );
                 let mut out = Vec::new();
-                match inspector.on_chunk(ok.as_bytes()).await {
+                match inspector.on_chunk(&bytes::Bytes::copy_from_slice(ok.as_bytes())).await {
                     ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
                         out.extend_from_slice(&b);
                     }
@@ -3396,7 +3481,10 @@ async fn run_sse_bytes(body: &[u8]) -> (String, bool) {
         .expect("inspector");
     let mut collected = Vec::new();
     let mut terminated = false;
-    match inspector.on_chunk(body).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(body))
+        .await
+    {
         ResponseStreamAction::Forward(bytes) => collected.extend_from_slice(&bytes),
         ResponseStreamAction::Terminate(bytes) => {
             terminated = true;
@@ -3550,7 +3638,9 @@ async fn test_message_stop_terminates_without_waiting_for_extra_eof_bytes() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
-    let first = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    let first = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+        .await;
     match first {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let out = String::from_utf8(bytes.to_vec()).unwrap();
@@ -3648,7 +3738,11 @@ async fn test_gzip_encoded_streamed_anthropic_sse_is_normalized() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("decoding inspector");
     let encoded = gzip_bytes(ANTHROPIC_SSE.as_bytes());
-    let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+    let mut collected = forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+            .await,
+    );
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
     assert!(out.contains("\"content\":\"Hello\""));
@@ -3682,7 +3776,11 @@ async fn test_gzip_streaming_decode_rejects_expansion_over_limit() {
         *byte = (i % 251) as u8;
     }
     let encoded = gzip_bytes(&oversized);
-    let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+    let mut collected = forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+            .await,
+    );
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
     assert!(out.contains("upstream_error"));
@@ -3727,7 +3825,11 @@ async fn test_gzip_streaming_decode_rejects_amplification_bomb() {
         "fixture must exceed the 1024:1 amplification ratio (compressed={})",
         encoded.len()
     );
-    let mid = forwarded(inspector.on_chunk(&encoded).await);
+    let mid = forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+            .await,
+    );
     assert!(
         mid.is_empty(),
         "encoded frames must not be forwarded before decode completes"
@@ -3867,7 +3969,9 @@ async fn test_hostile_content_encoding_diagnostics_never_echo_raw_members() {
             .response_stream_inspector(&forged, 200, Some("text/event-stream"))
             .expect("fail-closed inspector");
         let frame = String::from_utf8(forwarded(
-            inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await,
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+                .await,
         ))
         .unwrap();
         assert!(frame.contains("upstream_error"), "{frame}");
@@ -3917,7 +4021,11 @@ async fn test_layered_gzip_br_chain_is_decoded_in_reverse_order() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("chain decoding inspector");
-    let held = forwarded(inspector.on_chunk(&layered).await);
+    let held = forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(&layered))
+            .await,
+    );
     assert!(held.is_empty(), "must not forward encoded chain frames");
     let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
     assert!(out.contains("\"content\":\"Hello\""));
@@ -3988,7 +4096,14 @@ async fn test_malformed_middle_layer_in_chain_fails_closed() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("chain decoding inspector");
-    assert!(forwarded(inspector.on_chunk(&truncated_chain).await).is_empty());
+    assert!(
+        forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(&truncated_chain))
+                .await
+        )
+        .is_empty()
+    );
     let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
     assert!(out.contains("upstream_error"));
     assert!(!out.contains("\"content\":\"Hello\""));
@@ -4070,7 +4185,9 @@ async fn test_forged_provider_encoding_metadata_fails_closed_without_forwarding(
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("fail-closed inspector");
     let out = String::from_utf8(forwarded(
-        inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await,
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+            .await,
     ))
     .unwrap();
     assert!(out.contains("upstream_error"));
@@ -4098,7 +4215,14 @@ async fn test_truncated_encoded_stream_fails_closed_without_partial_plaintext() 
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("chain decoding inspector");
-    assert!(forwarded(inspector.on_chunk(truncated).await).is_empty());
+    assert!(
+        forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(truncated))
+                .await
+        )
+        .is_empty()
+    );
     // Client/provider cancellation mid-stream: on_end sees a truncated coding
     // and must fail closed rather than normalize a partial decode.
     let out = String::from_utf8(forwarded(inspector.on_end().await)).unwrap();
@@ -5125,7 +5249,11 @@ async fn test_buffered_normalizer_matches_streaming_across_slice_boundaries() {
         .expect("inspector should be created");
     let mut collected = Vec::new();
     for chunk in body.as_bytes().chunks(4096) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let streamed = String::from_utf8(collected).unwrap();
@@ -7197,7 +7325,9 @@ async fn streaming_normalizer_identity_comes_from_the_private_claim() {
         .expect("the owning instance must still install its normalizer");
     let mut collected = Vec::new();
     let sse = anthropic_sse_reporting_a_different_model();
-    let chunk = inspector.on_chunk(sse.as_bytes()).await;
+    let chunk = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(sse.as_bytes()))
+        .await;
     collected.extend_from_slice(&forwarded(chunk));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -7252,7 +7382,11 @@ async fn the_tool_use_guard_cannot_be_disarmed_through_metadata() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut collected = Vec::new();
-    let chunk = inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await;
+    let chunk = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(
+            ANTHROPIC_TOOL_USE_SSE.as_bytes(),
+        ))
+        .await;
     collected.extend_from_slice(&forwarded(chunk));
     let streamed = String::from_utf8(collected).unwrap();
     assert!(streamed.contains("upstream_error"), "{streamed}");
@@ -7354,7 +7488,9 @@ async fn only_the_owner_enforces_and_normalizes_under_a_forged_model_key() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("the owning instance normalizes");
     let mut collected = Vec::new();
-    let chunk = inspector.on_chunk(ANTHROPIC_SSE.as_bytes()).await;
+    let chunk = inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(ANTHROPIC_SSE.as_bytes()))
+        .await;
     collected.extend_from_slice(&forwarded(chunk));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -7454,7 +7590,11 @@ async fn run_gemini_normalizer(chunk_size: usize, body: &str, content_type: &str
     let (_plugin, _ctx, mut inspector) = claimed_gemini_inspector(content_type).await;
     let mut collected = Vec::new();
     for chunk in body.as_bytes().chunks(chunk_size.max(1)) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     String::from_utf8(collected).unwrap()
@@ -8068,7 +8208,11 @@ async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
         let mut inspector = plugin
             .response_stream_inspector(&ctx, 200, None)
             .expect("missing Content-Type must install fail-closed inspector");
-        let mut collected = forwarded(inspector.on_chunk(b"raw-provider-bytes").await);
+        let mut collected = forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::from_static(b"raw-provider-bytes"))
+                .await,
+        );
         collected.extend_from_slice(&forwarded(inspector.on_end().await));
         let out = String::from_utf8(collected).unwrap();
         assert!(out.contains("upstream_error"), "{out}");
@@ -8106,7 +8250,11 @@ async fn test_gemini_2xx_content_type_lifecycle_fail_closed() {
         let mut inspector = plugin
             .response_stream_inspector(&ctx, 200, Some("text/plain"))
             .expect("unexpected Content-Type must install fail-closed inspector");
-        let mut collected = forwarded(inspector.on_chunk(b"not-normalized").await);
+        let mut collected = forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::from_static(b"not-normalized"))
+                .await,
+        );
         collected.extend_from_slice(&forwarded(inspector.on_end().await));
         let out = String::from_utf8(collected).unwrap();
         assert!(out.contains("unexpected Content-Type"), "{out}");
@@ -8418,7 +8566,11 @@ async fn test_gemini_function_call_and_tool_choice_none_fail_closed() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
     let mut collected = Vec::new();
-    collected.extend_from_slice(&forwarded(inspector.on_chunk(tools.as_bytes()).await));
+    collected.extend_from_slice(&forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(tools.as_bytes()))
+            .await,
+    ));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let text = String::from_utf8(collected).unwrap();
     assert!(text.contains("upstream_error"), "{text}");
@@ -8466,7 +8618,10 @@ async fn test_gemini_malformed_and_oversized_events_fail_closed() {
 
     let (_plugin, _ctx, mut inspector) = claimed_gemini_inspector("text/event-stream").await;
     let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
-    match inspector.on_chunk(&event).await {
+    match inspector
+        .on_chunk(&bytes::Bytes::copy_from_slice(&event))
+        .await
+    {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert_bound_termination(&text, "oversized");
@@ -9141,7 +9296,11 @@ async fn test_provider_usage_u64_overflow_fails_closed_without_wrapped_total() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("anthropic normalizer");
     let mut collected = Vec::new();
-    collected.extend_from_slice(&forwarded(inspector.on_chunk(anthropic.as_bytes()).await));
+    collected.extend_from_slice(&forwarded(
+        inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(anthropic.as_bytes()))
+            .await,
+    ));
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let anthropic_out = String::from_utf8(collected).unwrap();
     assert!(anthropic_out.contains("upstream_error"), "{anthropic_out}");
@@ -9934,7 +10093,11 @@ async fn test_gemini_gzip_brotli_and_buffered_normalization() {
             .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
             .expect("gzip gemini inspector");
         let encoded = gzip_bytes(GEMINI_SSE.as_bytes());
-        let mut collected = forwarded(inspector.on_chunk(&encoded).await);
+        let mut collected = forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(&encoded))
+                .await,
+        );
         collected.extend_from_slice(&forwarded(inspector.on_end().await));
         let out = String::from_utf8(collected).unwrap();
         assert!(out.contains("\"content\":\"Hello\""), "{out}");
@@ -10362,7 +10525,11 @@ async fn run_anthropic_normalizer_body(chunk_size: usize, body: &str) -> String 
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
     let mut collected = Vec::new();
     for chunk in body.as_bytes().chunks(chunk_size.max(1)) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     String::from_utf8(collected).unwrap()
@@ -10684,7 +10851,11 @@ async fn test_anthropic_normalized_usage_includes_prompt_cache_tokens() {
         .expect("inspector should be created");
     let mut collected = Vec::new();
     for chunk in sse.as_bytes().chunks(4096) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -10717,7 +10888,11 @@ async fn test_anthropic_normalized_usage_keeps_cache_categories_across_partial_d
         .expect("inspector should be created");
     let mut collected = Vec::new();
     for chunk in sse.as_bytes().chunks(4096) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -10744,7 +10919,11 @@ async fn test_anthropic_normalizer_fails_closed_on_malformed_usage() {
         .expect("inspector should be created");
     let mut collected = Vec::new();
     for chunk in sse.as_bytes().chunks(4096) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -10787,7 +10966,11 @@ async fn test_anthropic_normalizer_ignores_the_start_output_placeholder() {
         .expect("inspector should be created");
     let mut collected = Vec::new();
     for chunk in sse.as_bytes().chunks(4096) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     let out = String::from_utf8(collected).unwrap();
@@ -10818,7 +11001,11 @@ async fn run_anthropic_normalizer_on(sse: &str) -> String {
         .expect("inspector should be created");
     let mut collected = Vec::new();
     for chunk in sse.as_bytes().chunks(4096) {
-        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+        collected.extend_from_slice(&forwarded(
+            inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await,
+        ));
     }
     collected.extend_from_slice(&forwarded(inspector.on_end().await));
     String::from_utf8(collected).unwrap()
@@ -10897,7 +11084,10 @@ async fn drive_review_inspector(
 ) -> String {
     let mut collected = Vec::new();
     for piece in body.chunks(chunk) {
-        match inspector.on_chunk(piece).await {
+        match inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(piece))
+            .await
+        {
             ResponseStreamAction::Forward(bytes) => collected.extend_from_slice(&bytes),
             ResponseStreamAction::Terminate(bytes) => {
                 if let Some(bytes) = bytes {

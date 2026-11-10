@@ -1429,10 +1429,7 @@ fn disk_owned_bytes(root: &Path) -> u64 {
                 continue;
             }
             let is_temp = name.ends_with(".tmp")
-                && (name.contains(".write-")
-                    || name.ends_with(".ndjson.tmp")
-                    || name.ends_with(".ndjson.zst.tmp")
-                    || name.ends_with(".rejected.meta.tmp"));
+                && (name.contains(".write-") || name.ends_with(".rejected.meta.tmp"));
             let owned = name.ends_with(".inflight")
                 || is_temp
                 || name.ends_with(".ndjson.corrupt")
@@ -1442,7 +1439,6 @@ fn disk_owned_bytes(root: &Path) -> u64 {
                 || ((name.ends_with(".ndjson.zst") || name.ends_with(".ndjson"))
                     && !name.ends_with(".tmp")
                     && !name.ends_with(".corrupt")
-                    && !name.ends_with(".rejected")
                     && !name.ends_with(".meta")
                     && !name.ends_with(".inflight"));
             if owned {
@@ -1655,12 +1651,17 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
     assert_eq!(stats.bytes, encoded_len);
 }
 
+/// A record-write temp another process left behind:
+/// `<data-name>.write-<process_tag>-<generation>.tmp`.
+const FOREIGN_PROCESS_STALE_TEMP: &str =
+    "00000000000000000000000001.ndjson.write-foreignprocess-1.tmp";
+
 #[test]
 fn spool_reconciles_stale_tmp_files_at_startup() {
     let temp = tempfile::tempdir().unwrap();
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; 4096]).unwrap();
 
     let settings = SpoolSettings {
@@ -1692,7 +1693,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let encoded_len = encoded_event_len(&event, SpoolCompression::None);
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
 
     // Construct without going through for_tests' reconcile by using a second
@@ -2720,7 +2721,7 @@ fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
     let temp = tempfile::tempdir().unwrap();
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; 128]).unwrap();
 
     // Remove directory write bits so unlink of the planted temp fails. Startup
@@ -6401,42 +6402,41 @@ fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
     assert_eq!(replayable, vec![record]);
 }
 
+/// Issue #7115: only the full owner tag binds a record. A record whose name
+/// carries a truncated (16-character) tag is not this identity's record.
 #[test]
-fn version_one_spool_replays_legacy_owner_tags() {
+fn truncated_owner_tag_records_are_not_replayed() {
     let temp = tempfile::tempdir().unwrap();
     let settings = spool_settings(temp.path(), 1024 * 1024);
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let current_record = spool
-        .write_events(&[sample_event("evt-legacy-owner-tag")])
+        .write_events(&[sample_event("evt-truncated-owner-tag")])
         .unwrap();
     let current_tag = spool.owner_tag_for_tests();
-    let legacy_tag = &current_tag[..16];
+    let truncated_tag = &current_tag[..16];
 
-    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
-    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
-    assert_eq!(meta["version"], json!(1));
-    meta["owner_tag"] = json!(legacy_tag);
-    fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
-
-    let legacy_name = current_record
+    let truncated_name = current_record
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .replace(current_tag, legacy_tag);
-    let legacy_record = current_record.with_file_name(legacy_name);
-    fs::rename(&current_record, &legacy_record).unwrap();
+        .replace(current_tag, truncated_tag);
+    let truncated_record = current_record.with_file_name(truncated_name);
+    fs::rename(&current_record, &truncated_record).unwrap();
 
-    assert_eq!(
-        spool.list_replayable_spool_files_for_tests().unwrap(),
-        vec![legacy_record.clone()],
-        "version-1 records with the original 16-character tag remain replayable"
+    assert!(
+        spool
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "a truncated owner tag must not make a record replayable"
     );
-    let claim = spool
-        .claim_replay_file_for_tests(&legacy_record)
-        .unwrap()
-        .expect("a legacy-tagged record remains claimable by its digest owner");
-    assert!(claim.exists());
-    assert!(!legacy_record.exists());
+    assert!(
+        spool
+            .claim_replay_file_for_tests(&truncated_record)
+            .is_err(),
+        "a truncated owner tag must not make a record claimable"
+    );
+    assert!(truncated_record.exists());
 }
 
 #[test]
@@ -7690,18 +7690,19 @@ async fn replay_outcomes_delivered_permanent_and_claim_cleanup() {
 }
 
 #[test]
-fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
+fn orphaned_namespaces_are_reported_but_never_replayed() {
     let temp = tempfile::tempdir().unwrap();
     let spec = test_owner_spec("node-a");
     let root = SpoolManager::namespace_root_path_for_tests(temp.path(), &spec).unwrap();
     let plugin_dir = root.parent().unwrap().to_path_buf();
     let node_dir = plugin_dir.parent().unwrap().to_path_buf();
 
-    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/<ULID>.ndjson`.
-    let legacy_day = node_dir.join("20260101");
-    fs::create_dir_all(&legacy_day).unwrap();
-    let legacy = legacy_day.join("00000000000000000000000000.ndjson");
-    fs::write(&legacy, b"{\"event_id\":\"legacy\"}\n").unwrap();
+    // A day directory directly under the node (no owner namespace) is not a
+    // layout this format writes; it is neither reported nor touched.
+    let stray_day = node_dir.join("20260101");
+    fs::create_dir_all(&stray_day).unwrap();
+    let stray = stray_day.join("00000000000000000000000000.ndjson");
+    fs::write(&stray, b"{\"event_id\":\"stray\"}\n").unwrap();
 
     // A namespace orphaned by a destination change.
     let orphan_ns = plugin_dir.join("o00000000000000000000000000000000");
@@ -7713,7 +7714,7 @@ fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
     let settings = spool_settings(temp.path(), 1024 * 1024);
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let (files, namespaces) = spool.unbound_record_counts_for_tests();
-    assert_eq!(files, 2, "both unbound records must be reported");
+    assert_eq!(files, 1, "only the orphaned namespace's record is reported");
     assert_eq!(namespaces, 1, "the orphaned namespace must be reported");
     let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
     assert!(
@@ -7723,7 +7724,10 @@ fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
 
     // Writing under the new identity leaves the unbound records untouched.
     spool.write_events(&[sample_event("evt-new")]).unwrap();
-    assert!(legacy.exists(), "legacy records must never be deleted");
+    assert!(
+        stray.exists(),
+        "records outside the namespace are never deleted"
+    );
     assert!(orphan.exists(), "orphaned records must never be deleted");
 }
 

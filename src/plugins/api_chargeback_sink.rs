@@ -113,8 +113,6 @@ const SPOOL_OWNER_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/api_chargeback_sink/spool
 const SPOOL_OWNER_DIGEST_LEN: usize = 32;
 /// Hex characters of the ownership digest embedded in every managed filename.
 const SPOOL_OWNER_TAG_LEN: usize = 32;
-/// Owner-tag length written by the original version-1 spool format.
-const SPOOL_LEGACY_OWNER_TAG_LEN: usize = 16;
 const SPOOL_INFLIGHT_SUFFIX: &str = ".inflight";
 const SPOOL_CLAIM_MARKER: &str = ".claim-";
 const SPOOL_WRITE_MARKER: &str = ".write-";
@@ -122,7 +120,7 @@ const SPOOL_TMP_SUFFIX: &str = ".tmp";
 /// Bound recursive spool walks (day dirs + namespace depth headroom).
 const MAX_SPOOL_TRAVERSAL_DEPTH: u32 = 8;
 /// Hard cap on directory entries visited by one bounded tree walk, and on the
-/// aggregate legacy/sibling-namespace portion of the unbound-record scan.
+/// aggregate sibling-namespace portion of the unbound-record scan.
 /// Counting directories and symlinks as well as regular files prevents an
 /// attacker-controlled tree of empty directories from escaping the bound.
 const MAX_SPOOL_TRAVERSAL_ENTRIES: usize = 100_000;
@@ -2688,8 +2686,8 @@ struct SinkMetrics {
     spool_replay_attempts_total: SinkCounter,
     /// Rejected rows durably handed to the private dead-letter payload store.
     spool_dead_letter_rows_total: SinkCounter,
-    /// Retained spool records this identity does not own: pre-namespace layouts
-    /// and namespaces orphaned by a destination/configuration change. Never
+    /// Retained spool records this identity does not own: namespaces orphaned
+    /// by a destination/configuration change. Never
     /// replayed, never deleted; reported so operators can reconcile them.
     spool_unbound_files: AtomicU64,
     spool_unbound_namespaces: AtomicU64,
@@ -6330,7 +6328,6 @@ impl SpoolOwner {
 
     fn matches_tag(&self, tag: &str) -> bool {
         tag == self.tag.as_ref()
-            || (tag.len() == SPOOL_LEGACY_OWNER_TAG_LEN && self.tag.starts_with(tag))
     }
 }
 
@@ -8833,8 +8830,8 @@ impl SpoolManager {
             return false;
         }
         match spool_file_owner_tag(path) {
-            // Untagged retained artifacts (legacy temps, dead-letter metadata for
-            // pre-tag files) belong to this namespace and stay evictable.
+            // Untagged retained artifacts inside this namespace belong to it
+            // and stay evictable.
             None => true,
             Some(tag) => self.owner.matches_tag(tag),
         }
@@ -9411,15 +9408,15 @@ impl SpoolManager {
     }
 
     /// Count records under this node/plugin subtree that no accepted generation
-    /// owns: pre-namespace layouts and sibling namespaces left behind by a
-    /// destination/schema/Ferrum-namespace change. A node-id or plugin-config-id
+    /// owns: sibling namespaces left behind by a destination/schema/
+    /// Ferrum-namespace change. A node-id or plugin-config-id
     /// change moves to a different parent subtree and requires explicit operator
     /// discovery. Unbound records are never replayed, deleted, or rerouted.
     fn scan_unbound_records(&self) {
         let _ = self.scan_unbound_records_with_entry_limit(MAX_SPOOL_TRAVERSAL_ENTRIES);
     }
 
-    /// Scan legacy and sibling namespaces under one aggregate entry budget.
+    /// Scan sibling namespaces under one aggregate entry budget.
     ///
     /// Giving every sibling subtree a fresh [`MAX_SPOOL_TRAVERSAL_ENTRIES`]
     /// allowance would make a shared-volume maintenance tick unbounded in the
@@ -9746,9 +9743,7 @@ fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
         .strip_suffix(".ndjson.zst")
         .or_else(|| rest.strip_suffix(".ndjson"))?;
     let (_, tag) = stem.rsplit_once('.')?;
-    if matches!(tag.len(), SPOOL_LEGACY_OWNER_TAG_LEN | SPOOL_OWNER_TAG_LEN)
-        && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if tag.len() == SPOOL_OWNER_TAG_LEN && tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Some(tag)
     } else {
         None
@@ -9756,12 +9751,9 @@ fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
 }
 
 /// Count spool records under this node/plugin subtree that no accepted
-/// generation owns.
-///
-/// Two shapes matter: the pre-namespace layout that wrote directly under
-/// `<spool.dir>/<node>/<day>/`, and sibling owner namespaces left behind when
-/// the ClickHouse destination, database, table, or Ferrum namespace changed.
-/// A plugin-config-id or node-id change moves to another parent subtree and is
+/// generation owns: sibling owner namespaces left behind when the ClickHouse
+/// destination, database, table, or Ferrum namespace changed. A
+/// plugin-config-id or node-id change moves to another parent subtree and is
 /// intentionally not attributed to this live instance. Discoverable records are
 /// reported, never replayed and never deleted, so an operator decides whether
 /// they still belong to the new destination.
@@ -9771,58 +9763,34 @@ fn count_unbound_spool_records(
     namespace_root: &Path,
     max_entries: usize,
 ) -> (u64, u64, bool) {
-    let node_dir = spool_dir.join(&components.node);
-    let plugin_dir = node_dir.join(&components.plugin);
+    let plugin_dir = spool_dir.join(&components.node).join(&components.plugin);
     let mut files = 0u64;
     let mut namespaces = 0u64;
     let mut remaining = max_entries;
     let mut truncated = false;
 
-    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/*.ndjson[.zst]`.
-    // Only day-shaped directories are inspected so a sibling plugin config's own
-    // managed subtree is never counted against this instance.
-    for day_dir in child_dirs_bounded(
-        &node_dir,
-        is_spool_day_component,
+    // Sibling owner namespaces under this node/plugin: what a destination,
+    // database, table, ledger, or plugin-id change leaves behind.
+    for owner_dir in child_dirs_bounded(
+        &plugin_dir,
+        |name| name.starts_with('o'),
         &mut remaining,
         &mut truncated,
     ) {
-        let (records, complete) = count_records_in_bounded(&day_dir, &mut remaining);
-        files = files.saturating_add(records);
+        if owner_dir == namespace_root {
+            continue;
+        }
+        let (records, complete) = count_records_in_bounded(&owner_dir, &mut remaining);
+        if records > 0 {
+            namespaces = namespaces.saturating_add(1);
+            files = files.saturating_add(records);
+        }
         if !complete {
             truncated = true;
             break;
         }
     }
-
-    // Sibling owner namespaces under this node/plugin: what a destination,
-    // database, table, ledger, or plugin-id change leaves behind.
-    if !truncated {
-        for owner_dir in child_dirs_bounded(
-            &plugin_dir,
-            |name| name.starts_with('o'),
-            &mut remaining,
-            &mut truncated,
-        ) {
-            if owner_dir == namespace_root {
-                continue;
-            }
-            let (records, complete) = count_records_in_bounded(&owner_dir, &mut remaining);
-            if records > 0 {
-                namespaces = namespaces.saturating_add(1);
-                files = files.saturating_add(records);
-            }
-            if !complete {
-                truncated = true;
-                break;
-            }
-        }
-    }
     (files, namespaces, truncated)
-}
-
-fn is_spool_day_component(name: &str) -> bool {
-    name.len() == 8 && name.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Non-symlink child directories of `dir` whose name passes `accept`, charged
@@ -11035,7 +11003,6 @@ fn is_spool_data_file(path: &Path) -> bool {
     if name.ends_with(SPOOL_INFLIGHT_SUFFIX)
         || name.ends_with(SPOOL_TMP_SUFFIX)
         || name.ends_with(".corrupt")
-        || name.ends_with(".rejected")
         || name.ends_with(".rejected.ndjson")
         || name.ends_with(".meta")
     {
@@ -11051,13 +11018,9 @@ fn is_spool_temp_file(path: &Path) -> bool {
     if !name.ends_with(SPOOL_TMP_SUFFIX) {
         return false;
     }
-    // Generation/process-attributed temps written by this format, plus the
-    // pre-attribution shapes and dead-letter metadata temps that a prior
-    // release could have left behind.
-    parse_spool_write_temp(name).is_some()
-        || name.ends_with(".ndjson.tmp")
-        || name.ends_with(".ndjson.zst.tmp")
-        || name.ends_with(".rejected.meta.tmp")
+    // Generation/process-attributed record temps and dead-letter metadata
+    // temps, the two temp shapes this format writes.
+    parse_spool_write_temp(name).is_some() || name.ends_with(".rejected.meta.tmp")
 }
 
 fn is_spool_inflight_file(path: &Path) -> bool {

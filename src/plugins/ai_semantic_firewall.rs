@@ -6614,7 +6614,7 @@ impl StreamInspector {
         }
     }
 
-    async fn inspect_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn inspect_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -6711,7 +6711,7 @@ impl StreamInspector {
             // Release immediately; incrementally drain every ready internal
             // window so detect-mode structured state stays bounded too.
             StreamEnforcement::Detect => {
-                let out = Bytes::copy_from_slice(chunk);
+                let out = chunk.clone();
                 let mut consumed = 0usize;
                 loop {
                     let step = self.window.ingest_step(&chunk[consumed..]);
@@ -6798,7 +6798,7 @@ impl StreamInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for StreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         let action = self.inspect_chunk(chunk).await;
         self.note_forwarded(&action);
         action

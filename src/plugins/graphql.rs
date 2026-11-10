@@ -140,7 +140,6 @@ pub struct GraphqlPlugin {
     request_counter: AtomicU64,
     epoch_base: Instant,
     last_periodic_sweep_secs: AtomicU64,
-    has_any_config: bool,
     /// Process-unique identity for this constructed instance, used to scope the
     /// per-request "already evaluated this envelope" marker so multiple
     /// configured `graphql` instances cannot consume each other's decision.
@@ -302,7 +301,6 @@ impl GraphqlPlugin {
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
-            has_any_config,
             instance_id: NEXT_GRAPHQL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -1587,7 +1585,8 @@ impl Plugin for GraphqlPlugin {
     /// pair it with a plugin that egresses the request before finalization, the
     /// same rule `waf` and `body_validator` carry (GHSA-4vr5-4wm3-x5xv).
     fn enforces_finalized_request_policy(&self) -> bool {
-        self.has_any_config
+        // The constructor refuses an instance without a protection rule.
+        true
     }
 
     /// Depth, complexity, alias, introspection, and rate-limit rules refuse
@@ -1595,7 +1594,7 @@ impl Plugin for GraphqlPlugin {
     /// `Grpc` view, which this plugin does not run on, so the route must refuse
     /// it instead of forwarding the body unchecked.
     fn gates_request_admission(&self) -> bool {
-        self.has_any_config
+        true
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
@@ -1607,12 +1606,11 @@ impl Plugin for GraphqlPlugin {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.has_any_config
+        true
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.has_any_config
-            && ctx.method == "POST"
+        ctx.method == "POST"
             && ctx
                 .headers
                 .get("content-type")
@@ -1687,9 +1685,6 @@ impl Plugin for GraphqlPlugin {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.has_any_config {
-            return PluginResult::Continue;
-        }
         // Only a request this instance already admitted has a recorded digest.
         // Its absence means `before_proxy` never ran or already rejected, so
         // there is nothing to re-decide here.
@@ -1745,7 +1740,7 @@ impl Plugin for GraphqlPlugin {
     }
 
     fn needs_final_request_body_context(&self) -> bool {
-        self.has_any_config
+        true
     }
 
     /// Claim the finalized envelope so the shared request representation gate
@@ -1757,15 +1752,13 @@ impl Plugin for GraphqlPlugin {
         headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> bool {
-        self.has_any_config
-            && ctx.plugin_state().is_some_and(|state| {
-                state
-                    .graphql_request_envelope_hashes
-                    .contains_key(&self.instance_id)
-            })
-            && headers
-                .get("content-type")
-                .is_some_and(|ct| is_graphql_json_content_type(ct))
+        ctx.plugin_state().is_some_and(|state| {
+            state
+                .graphql_request_envelope_hashes
+                .contains_key(&self.instance_id)
+        }) && headers
+            .get("content-type")
+            .is_some_and(|ct| is_graphql_json_content_type(ct))
     }
 }
 

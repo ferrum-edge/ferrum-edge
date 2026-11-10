@@ -295,10 +295,7 @@ fn builtin_challenges_are_header_valid_and_name_the_applicable_scheme() {
             http::HeaderValue::from_str(challenge).is_ok(),
             "{challenge}"
         );
-        assert_eq!(
-            auth_flow::authentication_challenge_scheme(challenge),
-            scheme
-        );
+        assert_eq!(challenge.split([' ', ',']).next(), Some(scheme));
     }
 }
 

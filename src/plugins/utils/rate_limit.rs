@@ -1949,11 +1949,11 @@ pub fn apply_rate_limit_cleanup<K, A>(
     }
 }
 
-/// Test-only view of [`weighted_window_count`] over one configured limit.
+/// Inline-test view of [`weighted_window_count`] over one configured limit.
 ///
-/// No plugin constructs it; the external decay tests use it to exercise the
-/// shared formula. Production paths call [`weighted_window_count`] directly.
-#[cfg_attr(not(test), allow(dead_code))]
+/// No plugin constructs it; the decay tests in this module use it to exercise
+/// the shared formula. Production paths call [`weighted_window_count`] directly.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct FixedWindow {
     limit: u64,
@@ -1966,8 +1966,8 @@ pub struct FixedWindow {
 /// This is the TOKEN-ACCOUNTING estimate, and it is the ONLY place the formula
 /// is written down. Every production caller reasons in it through this
 /// function — the three `ai_rate_limiter` `INCRBY` arms (`Check`, `Reserve`,
-/// `AdjustUsage`) and the `ws_rate_limiting` frame budget, plus the test-only
-/// [`FixedWindow`] helper — so a change to the formula cannot leave one path on
+/// `AdjustUsage`) and the `ws_rate_limiting` frame budget, plus the inline-test
+/// `FixedWindow` helper — so a change to the formula cannot leave one path on
 /// the old shape and a test green on another. Those paths reserve an estimate under one
 /// window index and reconcile it against that same index after the response,
 /// so the count has to be a continuous function of one `(previous, current)`
@@ -1988,7 +1988,7 @@ pub(crate) fn weighted_window_count(previous: i64, current: i64, elapsed_fractio
     previous as f64 * (1.0 - elapsed_fraction.clamp(0.0, 1.0)) + current as f64
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl FixedWindow {
     pub fn new(limit: u64, window_seconds: u64) -> Self {
         Self {

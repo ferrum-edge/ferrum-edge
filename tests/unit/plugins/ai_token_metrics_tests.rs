@@ -2126,7 +2126,10 @@ async fn drive_token_stream(
     {
         let mut per_chunk = Vec::new();
         for chunk in chunks {
-            match inspector.on_chunk(chunk).await {
+            match inspector
+                .on_chunk(&bytes::Bytes::copy_from_slice(chunk))
+                .await
+            {
                 ResponseStreamAction::Forward(bytes) => per_chunk.push(bytes.to_vec()),
                 ResponseStreamAction::Terminate(_) => {
                     panic!("ai_token_metrics must never truncate a response stream")

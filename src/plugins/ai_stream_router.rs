@@ -2140,19 +2140,11 @@ fn validate_anthropic_translation(
         if role != "assistant" {
             continue;
         }
-        let tool_calls = if role == "assistant" {
-            parse_openai_tool_calls(message, message_index)?
-        } else {
-            Vec::new()
-        };
-        let legacy_call = if role == "assistant" {
-            parse_openai_function_call(message, message_index)?
-        } else {
-            None
-        };
+        let tool_calls = parse_openai_tool_calls(message, message_index)?;
+        let legacy_call = parse_openai_function_call(message, message_index)?;
         let has_tool_representation = !tool_calls.is_empty() || legacy_call.is_some();
         let text = if message["content"].is_null() {
-            if role == "assistant" && has_tool_representation {
+            if has_tool_representation {
                 String::new()
             } else {
                 return Err(format!(
@@ -2163,7 +2155,7 @@ fn validate_anthropic_translation(
             anthropic_message_content_text(&message["content"])
                 .map_err(|error| format!("messages[{message_index}] {error}"))?
         };
-        if role == "assistant" && text.is_empty() && !has_tool_representation {
+        if text.is_empty() && !has_tool_representation {
             return Err(format!(
                 "messages[{message_index}] has no Anthropic-representable content"
             ));
@@ -2803,7 +2795,7 @@ fn translate_to_anthropic(
                 .map_err(|error| format!("messages[{message_index}] {error}"))?
         };
         let content = if tool_calls.is_empty() && legacy_call.is_none() {
-            if text.is_empty() && role == "assistant" {
+            if text.is_empty() {
                 return Err(format!(
                     "messages[{message_index}] has no Anthropic-representable content"
                 ));
@@ -3010,10 +3002,10 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
             message_index += 1;
             continue;
         }
-        // Null is fail-closed for system/developer/user. Assistant null/empty is
-        // intentional only when a valid modern or legacy tool representation exists.
+        // Only `assistant` reaches here. Null/empty content is intentional
+        // only when a valid modern or legacy tool representation exists.
         let text = if message["content"].is_null() {
-            if role == "assistant" && has_tool_representation {
+            if has_tool_representation {
                 String::new()
             } else {
                 return Err(format!(
@@ -3024,12 +3016,7 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
             gemini_message_content_text(&message["content"])
                 .map_err(|error| format!("messages[{message_index}] {error}"))?
         };
-        if role == "assistant" && text.is_empty() && !has_tool_representation {
-            return Err(format!(
-                "messages[{message_index}] has no Gemini-representable content"
-            ));
-        }
-        if role == "user" && text.is_empty() {
+        if text.is_empty() && !has_tool_representation {
             return Err(format!(
                 "messages[{message_index}] has no Gemini-representable content"
             ));
@@ -6255,7 +6242,7 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
@@ -7448,7 +7435,7 @@ impl ResponseStreamInspector for GeminiStreamNormalizer {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
@@ -7863,7 +7850,7 @@ impl NormalizeEngine {
         }
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         match self {
             Self::Anthropic(inner) => inner.on_chunk(chunk).await,
             Self::Gemini(inner) => inner.on_chunk(chunk).await,
@@ -7903,7 +7890,7 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.inner.done_emitted() {
             return ResponseStreamAction::Terminate(None);
         }
@@ -7946,7 +7933,7 @@ impl ResponseStreamInspector for ContentDecodingNormalizer {
         drop(std::mem::take(&mut self.encoded));
         let mut out = Vec::new();
         if !decoded.is_empty() {
-            match self.inner.on_chunk(&decoded).await {
+            match self.inner.on_chunk(&Bytes::from(decoded)).await {
                 ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
                 ResponseStreamAction::Terminate(bytes) => {
                     if let Some(bytes) = bytes {
@@ -7997,7 +7984,7 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &Bytes) -> ResponseStreamAction {
         if self.emitted {
             return ResponseStreamAction::Terminate(None);
         }

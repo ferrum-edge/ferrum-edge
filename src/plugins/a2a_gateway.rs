@@ -9,7 +9,6 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use dashmap::DashMap;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +19,7 @@ use super::utils::policy_digest;
 use super::{
     A2aGatewayClaim, A2aGrpcCardRewriteState, A2aGrpcCardSchema, HTTP_GRPC_PROTOCOLS, Plugin,
     PluginResult, RequestContext, ResponseStreamAction, ResponseStreamInspector,
+    allocate_response_stream_handoff_id,
 };
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -386,10 +386,14 @@ pub struct A2aGateway {
     /// an enumeration that could silently fall behind a new field. Only the
     /// digest is ever exposed; the source config is not retained.
     static_policy_digest: [u8; 32],
-    pending_stream_observations: Arc<DashMap<u64, A2aStreamObservationSlot>>,
+    /// This instance's key in the request-owned response-stream handoff, where
+    /// the SSE inspector leaves its observation for
+    /// `on_response_stream_terminated`.
+    stream_handoff_key: u64,
 }
 
-type A2aStreamObservationSlot = Arc<Mutex<Option<A2aStreamObservation>>>;
+type A2aStreamObservationCell = Mutex<Option<A2aStreamObservation>>;
+type A2aStreamObservationSlot = Arc<A2aStreamObservationCell>;
 
 struct A2aStreamObservation {
     stream_events: u64,
@@ -627,9 +631,9 @@ pub(crate) fn sse_inspector_retained_semantic_bytes(
 
 #[async_trait]
 impl ResponseStreamInspector for A2aSseStreamInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         self.ingest(chunk);
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+        ResponseStreamAction::Forward(chunk.clone())
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
@@ -637,19 +641,18 @@ impl ResponseStreamInspector for A2aSseStreamInspector {
         self.publish_observation();
         ResponseStreamAction::Forward(Bytes::new())
     }
+
+    /// A stream that ends without `on_end` (client disconnect, a later
+    /// inspector's cut) still reports what it observed: the events completed
+    /// so far and the latest task id, context id and task state. An event cut
+    /// off mid-way is not counted. A no-op after `on_end` published.
+    fn on_before_drop(&mut self) {
+        self.publish_observation();
+    }
 }
 
 impl A2aGateway {
-    /// Build with the auto-sized shard count (`FERRUM_POOL_SHARD_AMOUNT=0`).
-    /// The registry uses [`Self::new_with_shard_amount`] so the operator
-    /// override reaches the per-instance stream-observation map.
     pub fn new(config: &Value) -> Result<Self, String> {
-        Self::new_with_shard_amount(config, crate::util::sharding::pool_shard_amount(0))
-    }
-
-    /// `shard_amount` must already be normalized (a power of two >= 2), as
-    /// `PluginHttpClient::pool_shard_amount()` returns it.
-    pub fn new_with_shard_amount(config: &Value, shard_amount: usize) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "a2a_gateway: `config` must be an object".to_string())?;
@@ -684,7 +687,7 @@ impl A2aGateway {
             observability,
             policy,
             static_policy_digest,
-            pending_stream_observations: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            stream_handoff_key: allocate_response_stream_handoff_id(),
         })
     }
 
@@ -1778,10 +1781,9 @@ impl Plugin for A2aGateway {
             return None;
         }
         let binding = claim.binding;
-        let stream_id = ctx.response_stream_id()?;
-        let observation = Arc::new(Mutex::new(None));
-        self.pending_stream_observations
-            .insert(stream_id, Arc::clone(&observation));
+        let handoff = ctx.response_stream_handoff()?;
+        let observation: A2aStreamObservationSlot = Arc::new(Mutex::new(None));
+        handoff.publish(self.stream_handoff_key, Arc::clone(&observation));
         Some(Box::new(A2aSseStreamInspector::new(
             Some(binding),
             observation,
@@ -1798,10 +1800,10 @@ impl Plugin for A2aGateway {
         if !self.observability.emit_metadata {
             return;
         }
-        let Some(stream_id) = ctx.response_stream_id() else {
-            return;
-        };
-        let Some((_, slot)) = self.pending_stream_observations.remove(&stream_id) else {
+        let Some(slot) = ctx
+            .response_stream_handoff()
+            .and_then(|handoff| handoff.take::<A2aStreamObservationCell>(self.stream_handoff_key))
+        else {
             return;
         };
         let observation = match slot.lock() {

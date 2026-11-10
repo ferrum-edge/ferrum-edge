@@ -736,10 +736,6 @@ impl CompressionPlugin {
         })
     }
 
-    fn has_response_codec(&self) -> bool {
-        !self.config.algorithms.is_empty()
-    }
-
     fn request_decode_limits(&self, route_limit: Option<usize>) -> DecodeLimits {
         // The construction-time ceiling is already folded with the active
         // process-wide request-body limit. Narrow it once more for the matched
@@ -1228,9 +1224,7 @@ impl CompressionPlugin {
     /// identity is prohibited) rather than buffering for a compression it cannot
     /// run; `after_proxy` must not reacquire on that path.
     fn reserve_response_compression_admission(&self, ctx: &mut RequestContext) {
-        if !self.has_response_codec()
-            || ctx.method.eq_ignore_ascii_case("HEAD")
-            || ctx.has_compression_response_admission_owner()
+        if ctx.method.eq_ignore_ascii_case("HEAD") || ctx.has_compression_response_admission_owner()
         {
             return;
         }
@@ -1431,14 +1425,9 @@ impl CompressionPlugin {
         !on_rejection || Self::is_response_cache_hit(ctx)
     }
 
-    /// Settle this instance's share of the chain-wide negotiation decision.
-    ///
-    /// Instances with no response codec never registered in `before_proxy`, so
-    /// they must not consume a sibling's slot either.
+    /// Settle this instance's share of the chain-wide negotiation decision,
+    /// registered in `before_proxy`.
     fn settles_last_response_decision(&self, ctx: &mut RequestContext) -> bool {
-        if !self.has_response_codec() {
-            return false;
-        }
         ctx.settle_compression_response_decision()
     }
 
@@ -2178,8 +2167,7 @@ impl Plugin for CompressionPlugin {
     }
 
     fn modifies_request_headers(&self) -> bool {
-        (self.config.remove_accept_encoding && self.has_response_codec())
-            || self.config.decompress_request
+        self.config.remove_accept_encoding || self.config.decompress_request
     }
 
     /// `Accept-Encoding` removal and the `Cache-Control: no-transform` merge in
@@ -2279,7 +2267,8 @@ impl Plugin for CompressionPlugin {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        !self.config.algorithms.is_empty()
+        // The constructor refuses an instance without a usable algorithm.
+        true
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
@@ -2311,9 +2300,8 @@ impl Plugin for CompressionPlugin {
         // instance can actually select a supported nonzero coding. Identity,
         // unsupported-only, and `gzip;q=0, br;q=0` requests have nothing to
         // compress, so they stream instead of forcing a full-body collection.
-        self.has_response_codec()
-            && Self::negotiated_accept_encoding(ctx)
-                .is_some_and(|ae| matches!(self.select_algorithm(ae), CodingSelection::Compress(_)))
+        Self::negotiated_accept_encoding(ctx)
+            .is_some_and(|ae| matches!(self.select_algorithm(ae), CodingSelection::Compress(_)))
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -2485,9 +2473,7 @@ impl Plugin for CompressionPlugin {
         // once every eligible instance has declined (issue #5092). Registered
         // unconditionally — including under request `no-transform`, which makes
         // an instance decline rather than disappear.
-        if self.has_response_codec() {
-            ctx.register_compression_response_decision();
-        }
+        ctx.register_compression_response_decision();
 
         // Strip client-spoofed values of the gateway-internal marker only
         // before any compression instance has claimed request-decode ownership.
@@ -2524,8 +2510,7 @@ impl Plugin for CompressionPlugin {
 
             // Strip Accept-Encoding from the backend request so the backend
             // sends an uncompressed response (we'll compress it ourselves).
-            // Only mutate when this instance still has a usable response codec.
-            if self.config.remove_accept_encoding && self.has_response_codec() {
+            if self.config.remove_accept_encoding {
                 headers.remove("accept-encoding");
             }
 

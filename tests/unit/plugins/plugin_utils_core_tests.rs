@@ -13,7 +13,7 @@ use ferrum_edge::plugins::utils::jwt_verifier::{
 };
 use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
-    has_conflicting_duplicate_query_key, semicolon_sub_pair_names,
+    has_conflicting_duplicate_among, semicolon_sub_pair_names,
 };
 use ferrum_edge::plugins::utils::scope_role_check::{ScopeRoleRequirements, check};
 use ferrum_edge::plugins::utils::socket_host::parse_socket_host;
@@ -275,34 +275,39 @@ fn json_escape_output_can_be_interpolated_into_json_string() {
     assert_eq!(parsed["message"], raw);
 }
 
+/// The WAF parameter-pollution predicate over `&`-separated pairs.
+fn conflicting_under_ampersand(query: &str) -> bool {
+    has_conflicting_duplicate_among(query.split('&'))
+}
+
 #[test]
 fn query_duplicate_check_detects_conflicting_duplicate_values() {
-    assert!(has_conflicting_duplicate_query_key("a=1&a=2"));
+    assert!(conflicting_under_ampersand("a=1&a=2"));
 }
 
 #[test]
 fn query_duplicate_check_allows_identical_duplicate_values() {
-    assert!(!has_conflicting_duplicate_query_key("a=1&a=1"));
+    assert!(!conflicting_under_ampersand("a=1&a=1"));
 }
 
 #[test]
 fn query_duplicate_check_detects_percent_encoded_key_collision() {
-    assert!(has_conflicting_duplicate_query_key("a%20b=1&a%20b=2"));
+    assert!(conflicting_under_ampersand("a%20b=1&a%20b=2"));
 }
 
 #[test]
 fn query_duplicate_check_detects_plus_and_percent_space_key_collision() {
-    assert!(has_conflicting_duplicate_query_key("a+b=1&a%20b=2"));
+    assert!(conflicting_under_ampersand("a+b=1&a%20b=2"));
 }
 
 #[test]
 fn query_duplicate_check_allows_percent_encoded_keys_with_same_value() {
-    assert!(!has_conflicting_duplicate_query_key("a%20b=1&a%20b=1"));
+    assert!(!conflicting_under_ampersand("a%20b=1&a%20b=1"));
 }
 
 #[test]
 fn query_duplicate_check_normalizes_plus_in_values() {
-    assert!(!has_conflicting_duplicate_query_key(
+    assert!(!conflicting_under_ampersand(
         "a=hello+world&a=hello%20world"
     ));
 }
@@ -310,39 +315,39 @@ fn query_duplicate_check_normalizes_plus_in_values() {
 #[test]
 fn query_duplicate_check_detects_encoded_plus_vs_raw_plus_value_conflict() {
     // `%2B` decodes to literal plus; raw `+` is form-urlencoded space.
-    assert!(has_conflicting_duplicate_query_key("a=%2B&a=+"));
+    assert!(conflicting_under_ampersand("a=%2B&a=+"));
 }
 
 #[test]
 fn query_duplicate_check_preserves_encoded_plus_as_literal_plus() {
-    assert!(!has_conflicting_duplicate_query_key("a=%2B&a=%2B"));
+    assert!(!conflicting_under_ampersand("a=%2B&a=%2B"));
 }
 
 #[test]
 fn query_duplicate_check_does_not_collapse_encoded_plus_and_raw_plus_keys() {
     // `a%2Bb` decodes to `a+b`; raw `a+b` is the distinct key `a b`.
-    assert!(!has_conflicting_duplicate_query_key("a%2Bb=1&a+b=2"));
+    assert!(!conflicting_under_ampersand("a%2Bb=1&a+b=2"));
 }
 
 #[test]
 fn query_duplicate_check_normalizes_raw_plus_and_percent_space_key_aliases() {
-    assert!(!has_conflicting_duplicate_query_key("a+b=1&a%20b=1"));
+    assert!(!conflicting_under_ampersand("a+b=1&a%20b=1"));
 }
 
 #[test]
 fn query_duplicate_check_detects_keys_without_equals() {
-    assert!(has_conflicting_duplicate_query_key("flag&flag=1"));
+    assert!(conflicting_under_ampersand("flag&flag=1"));
 }
 
 #[test]
 fn query_duplicate_check_allows_distinct_keys_without_equals() {
-    assert!(!has_conflicting_duplicate_query_key("flag&other"));
+    assert!(!conflicting_under_ampersand("flag&other"));
 }
 
 #[test]
 fn query_duplicate_check_ignores_empty_pairs() {
-    assert!(has_conflicting_duplicate_query_key("a=1&&a=2"));
-    assert!(!has_conflicting_duplicate_query_key("a=1&&a=1"));
+    assert!(conflicting_under_ampersand("a=1&&a=2"));
+    assert!(!conflicting_under_ampersand("a=1&&a=1"));
 }
 
 // --- CanonicalQuery: the shared representation every query-sensitive
@@ -518,14 +523,18 @@ fn canonical_query_flags_a_duplicate_smuggled_behind_a_semicolon() {
 #[test]
 fn hpp_predicate_judges_the_semicolon_separator_convention() {
     // Issue #6579: conflicting under `&`+`;`, not under `&` alone.
-    assert!(has_conflicting_duplicate_query_key(
+    let ampersand_and_semicolon =
+        |query: &'static str| has_conflicting_duplicate_among(query.split(['&', ';']));
+    assert!(!conflicting_under_ampersand(
         "tenant=admin&x=;tenant=victim"
     ));
-    assert!(has_conflicting_duplicate_query_key("a=1;a=2"));
+    assert!(ampersand_and_semicolon("tenant=admin&x=;tenant=victim"));
+    assert!(ampersand_and_semicolon("a=1;a=2"));
     // Identical values are still not a conflict, under either convention.
-    assert!(!has_conflicting_duplicate_query_key("a=1&x=;a=1"));
+    assert!(!conflicting_under_ampersand("a=1&x=;a=1"));
+    assert!(!ampersand_and_semicolon("a=1&x=;a=1"));
     // `%3B` is a literal semicolon.
-    assert!(!has_conflicting_duplicate_query_key("a=1&x=%3Ba%3D2"));
+    assert!(!ampersand_and_semicolon("a=1&x=%3Ba%3D2"));
 }
 
 #[test]

@@ -1562,6 +1562,9 @@ impl Plugin for PluginInstanceWrapper {
     fn metric_tag_override_plans_are_conditional(&self) -> bool {
         self.trigger.is_some() || self.inner.metric_tag_override_plans_are_conditional()
     }
+    fn uses_mesh_request_key(&self) -> bool {
+        self.inner.uses_mesh_request_key()
+    }
     fn records_mesh_service_graph(&self, summary: &TransactionSummary) -> bool {
         self.inner.records_mesh_service_graph(summary)
             && self

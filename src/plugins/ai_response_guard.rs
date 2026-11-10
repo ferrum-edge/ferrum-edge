@@ -676,10 +676,6 @@ pub struct AiResponseGuard {
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_response_body.
     needs_body_transform: bool,
-    /// True when the plugin has any active validation rule (patterns, phrases,
-    /// `require_json`, `required_fields`, or `max_completion_length`). Drives
-    /// response-body buffering — when no rule applies, the plugin is a no-op.
-    has_validation_rules: bool,
     /// Optional: require response to be valid JSON.
     require_json: bool,
     /// Optional: required top-level JSON fields.
@@ -1088,7 +1084,6 @@ impl AiResponseGuard {
             scan_mode,
             max_scan_bytes,
             needs_body_transform,
-            has_validation_rules,
             require_json,
             required_fields,
             max_completion_length,
@@ -2313,7 +2308,8 @@ impl AiResponseGuard {
                 // address — cannot silently become "unchanged" and forward the
                 // original detected body (GHSA-pwcm-6rh8-f2gh). The instance
                 // discharges its own entry when it installs bytes;
-                // `on_final_response_body` rejects anything still outstanding.
+                // `finalize_client_visible_response_body` rejects anything
+                // still outstanding.
                 let replay = ctx.finalized_response_replay;
                 let state = ctx.plugin_state_mut();
                 state
@@ -4380,7 +4376,8 @@ impl Plugin for AiResponseGuard {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        self.has_validation_rules
+        // The constructor refuses an instance without a validation rule.
+        true
     }
 
     /// A `grpc`-enrolled instance joins the backend-path boundary so the proxy
@@ -4417,11 +4414,11 @@ impl Plugin for AiResponseGuard {
         // enrolled: an un-enrolled method has no decodable contract, so pinning
         // it to the buffered path would cost streaming for no enforcement.
         if ctx.is_native_grpc_request() {
-            return self.has_validation_rules && self.grpc_inspection_applies(ctx);
+            return self.grpc_inspection_applies(ctx);
         }
         // Client-controlled streaming intent is not response evidence. Buffer
         // conservatively until the pristine backend Content-Type is known.
-        self.has_validation_rules
+        true
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -4587,25 +4584,6 @@ impl Plugin for AiResponseGuard {
         self.discharge_pending_redaction(ctx, replacement)
     }
 
-    /// Context-free entry point. Without a request context there is no
-    /// route-effective ceiling, so it falls back to the process fail-closed
-    /// retained ceiling — still finite, just looser than the per-response one
-    /// production uses through the hook above.
-    async fn transform_response_body(
-        &self,
-        body: &[u8],
-        content_type: Option<&str>,
-        _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
-        self.redacted_response_body(
-            body,
-            content_type,
-            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
-            &mut Vec::new(),
-            &mut false,
-        )
-    }
-
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
         ctx.plugin_state().is_some_and(|state| {
             state
@@ -4635,8 +4613,7 @@ impl Plugin for AiResponseGuard {
         response_content_type: Option<&str>,
         _response_body: &[u8],
     ) -> bool {
-        self.has_validation_rules
-            && self.has_enforcing_disposition()
+        self.has_enforcing_disposition()
             && !ctx.is_native_grpc_request()
             && !response_content_type
                 .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
@@ -4648,9 +4625,7 @@ impl Plugin for AiResponseGuard {
     /// Configuration- and request-only over-approximation, consulted before the
     /// response `Content-Type` is known.
     fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
-        self.has_validation_rules
-            && self.has_enforcing_disposition()
-            && !ctx.is_native_grpc_request()
+        self.has_enforcing_disposition() && !ctx.is_native_grpc_request()
     }
 
     fn enforces_final_client_visible_response_body(&self, ctx: &RequestContext) -> bool {
@@ -4754,20 +4729,6 @@ impl Plugin for AiResponseGuard {
             detected
         );
         self.undelivered_redaction_reject(ctx, detected)
-    }
-
-    /// Preserve the established final-body hook contract for direct callers.
-    /// The proxy skips this compatibility hook after it has invoked the
-    /// authoritative client-visible phase, so production performs one decision.
-    async fn on_final_response_body(
-        &self,
-        ctx: &mut RequestContext,
-        response_status: u16,
-        response_headers: &HashMap<String, String>,
-        body: &[u8],
-    ) -> PluginResult {
-        self.finalize_client_visible_response_body(ctx, response_status, response_headers, body)
-            .await
     }
 
     fn on_response_body_transformed(
@@ -5375,8 +5336,8 @@ impl AiResponseGuard {
     /// Clear this instance's promised-redaction marker when — and only when — a
     /// replacement was actually produced.
     ///
-    /// `None` leaves the marker outstanding, so `on_final_response_body` turns
-    /// it into a rejection instead of letting the original detected body be
+    /// `None` leaves the marker outstanding, so
+    /// `finalize_client_visible_response_body` turns it into a rejection instead of letting the original detected body be
     /// forwarded as "unchanged".
     fn discharge_pending_redaction(
         &self,
