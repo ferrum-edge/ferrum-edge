@@ -182,3 +182,25 @@ async fn an_expired_deadline_allows_no_further_attempt() {
         "no pause without a next attempt"
     );
 }
+
+/// Issue #7178: a caller that re-classifies a collision after a failed attempt
+/// moves the wait onto the newly selected budget, in both directions.
+#[tokio::test(start_paused = true)]
+async fn a_replaced_deadline_bounds_the_next_wait() {
+    let start = tokio::time::Instant::now();
+    let mut backoff = UdpPortHandoffBackoff::new(start + UDP_PORT_HANDOFF_INITIAL_BACKOFF);
+    backoff.set_deadline(start + Duration::from_millis(500));
+    assert!(
+        backoff.wait().await,
+        "a later deadline admits an attempt the first one did not"
+    );
+    assert_eq!(start.elapsed(), UDP_PORT_HANDOFF_INITIAL_BACKOFF);
+
+    backoff.set_deadline(tokio::time::Instant::now());
+    let before = tokio::time::Instant::now();
+    assert!(
+        !backoff.wait().await,
+        "an already-spent deadline admits no further attempt"
+    );
+    assert_eq!(before.elapsed(), Duration::ZERO, "and no pause");
+}

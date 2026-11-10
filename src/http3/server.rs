@@ -10608,17 +10608,11 @@ async fn handle_h3_request(
         //     `recv_response` reports `request_on_wire=true` →
         //     `connection_error=false`, matching the buffered path and
         //     achieving the PR's primary goal.
-        let connection_error = match (h3_error_class, h3_stream_result.body_error_class) {
-            (None, None) => false,
-            (_, Some(crate::retry::ErrorClass::ReadWriteTimeout)) => false,
-            (None, Some(crate::retry::ErrorClass::ClientDisconnect)) => false,
-            (None, Some(_)) => true,
-            (Some(_), Some(_)) => true,
-            (Some(_), None) => h3_connection_error(
-                h3_stream_result.request_on_wire,
-                h3_stream_result.error_class,
-            ),
-        };
+        let connection_error = h3_stream_result_connection_error(
+            h3_error_class,
+            h3_stream_result.body_error_class,
+            h3_stream_result.request_on_wire,
+        );
         // Prefer the body class so a body-only ClientDisconnect is recognized as
         // a client-side (non-backend) signal by passive health / the breaker
         // instead of a phantom success (the terminal `h3_error_class` is None for
@@ -12855,6 +12849,27 @@ fn h3_connection_error(
                     | crate::retry::ErrorClass::ClientDisconnect
             )
         )
+}
+
+/// `connection_error` for a native-H3 streaming result
+/// (`H3StreamResult`), keyed on `(error_class, body_error_class)`.
+///
+/// The arms and their reasons are documented at the one production caller in
+/// `handle_h3_request`'s streaming branch; `h3_streaming_outcome_tests` pins
+/// each shape against this function, not against a copy.
+fn h3_stream_result_connection_error(
+    error_class: Option<crate::retry::ErrorClass>,
+    body_error_class: Option<crate::retry::ErrorClass>,
+    request_on_wire: bool,
+) -> bool {
+    match (error_class, body_error_class) {
+        (None, None) => false,
+        (_, Some(crate::retry::ErrorClass::ReadWriteTimeout)) => false,
+        (None, Some(crate::retry::ErrorClass::ClientDisconnect)) => false,
+        (None, Some(_)) => true,
+        (Some(_), Some(_)) => true,
+        (Some(_), None) => h3_connection_error(request_on_wire, error_class),
+    }
 }
 
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
@@ -22390,22 +22405,10 @@ mod h3_streaming_outcome_tests {
         );
     }
 
-    /// Mirrors the predicate in `handle_h3_request`'s streaming branch.
-    /// Kept as a free function so the test can assert against it
-    /// without setting up the full handler harness.
-    fn streaming_path_connection_error(
-        error_class: Option<ErrorClass>,
-        body_error_class: Option<ErrorClass>,
-        request_on_wire: bool,
-    ) -> bool {
-        match (error_class, body_error_class) {
-            (None, None) => false,
-            (None, Some(ErrorClass::ClientDisconnect)) => false,
-            (None, Some(_)) => true,
-            (Some(_), Some(_)) => true,
-            (Some(_), None) => !request_on_wire,
-        }
-    }
+    // The production predicate `handle_h3_request`'s streaming branch
+    // calls; the tests below exercise it directly (issue #7176: they
+    // previously asserted a drifted private copy).
+    use super::h3_stream_result_connection_error as streaming_path_connection_error;
 
     #[test]
     fn dispatch_graceful_close_is_not_connection_error() {
@@ -22482,36 +22485,77 @@ mod h3_streaming_outcome_tests {
     }
 
     #[test]
-    fn mid_body_abort_is_connection_error_regardless_of_status() {
+    fn mid_body_abort_is_connection_error() {
         // Headers were flushed (status from backend, anywhere from 2xx
         // to 5xx); body then aborted, setting both terminal_error_class
         // AND body_error_class. The body_error_class is the
         // discriminator — covers the case where the BACKEND emitted a
         // 5xx status and then truncated the body, which the previous
         // status-shape predicate mis-classified as a dispatch failure
-        // and let through as connection_error=false.
+        // and let through as connection_error=false. The HTTP status is
+        // not an input to the predicate.
         //
         // Both arms `(Some(_), Some(_))` and `(None, Some(non-ClientDisconnect))`
-        // collapse to true; this test exercises the former.
+        // collapse to true; this test exercises the former. A read
+        // timeout is the exception, pinned separately below.
         for class in [
             ErrorClass::ProtocolError,
-            ErrorClass::ReadWriteTimeout,
             ErrorClass::ConnectionReset,
             ErrorClass::ConnectionClosed,
             ErrorClass::ResponseBodyTooLarge,
         ] {
-            for status in [200u16, 503, 504] {
+            assert!(
+                streaming_path_connection_error(
+                    Some(class),
+                    Some(class),
+                    /* request_on_wire = */ true,
+                ),
+                "{class:?} mid-body abort must report connection_error=true \
+                 (body_error_class set is the discriminator)"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_body_read_timeout_is_not_connection_error() {
+        // The streaming read-deadline arm records `ReadWriteTimeout` on
+        // BOTH the terminal and the body class. Headers were already
+        // delivered, so this is post-wire: a status fault, never a
+        // transport connection failure (matches the H2
+        // `IdleReadTimeoutBody` path and the buffered H3 path).
+        for terminal in [None, Some(ErrorClass::ReadWriteTimeout)] {
+            for request_on_wire in [true, false] {
                 assert!(
-                    streaming_path_connection_error(
-                        Some(class),
-                        Some(class),
-                        /* request_on_wire = */ true,
+                    !streaming_path_connection_error(
+                        terminal,
+                        Some(ErrorClass::ReadWriteTimeout),
+                        request_on_wire,
                     ),
-                    "{class:?} mid-body abort at status={status} must report \
-                     connection_error=true (body_error_class set is the \
-                     discriminator regardless of HTTP status)"
+                    "mid-body ReadWriteTimeout (terminal={terminal:?}, \
+                     request_on_wire={request_on_wire}) must report \
+                     connection_error=false"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn dispatch_policy_and_client_lifetime_failures_stay_neutral() {
+        // The `(Some(_), None)` arm delegates to `h3_connection_error`,
+        // which exempts gateway policy refusals and client-lifetime
+        // terminals even before the request reached the wire.
+        for class in [
+            ErrorClass::DispatchPolicyRejected,
+            ErrorClass::ClientDisconnect,
+        ] {
+            assert!(
+                !streaming_path_connection_error(
+                    Some(class),
+                    /* body_error_class = */ None,
+                    /* request_on_wire = */ false,
+                ),
+                "{class:?} pre-wire must not report connection_error=true"
+            );
         }
     }
 
@@ -22574,23 +22618,13 @@ mod h3_streaming_outcome_tests {
 
     #[test]
     fn clean_streaming_response_is_not_connection_error() {
+        // Also covers a backend-emitted 5xx STATUS with both classes None:
+        // the status is not an input, CB sees the 5xx via its
+        // `failure_status_codes` config, not via `connection_error`.
         assert!(
             !streaming_path_connection_error(None, None, /* request_on_wire = */ true,),
             "successful streaming response (both classes None) must record \
              connection_error=false so latency is sampled and CB sees a success"
-        );
-        // Even a 5xx STATUS from the backend with both classes None is a
-        // legitimate response that the backend chose to send. Not a
-        // transport-level failure; CB sees the 5xx via its
-        // `failure_status_codes` config, not via `connection_error`.
-        // Note this case wouldn't actually arise in practice — a 5xx
-        // status comes back via the success path in
-        // `proxy_to_backend_h3_streaming` only when no body issue
-        // surfaced — but the predicate handles it cleanly.
-        assert!(
-            !streaming_path_connection_error(None, None, /* request_on_wire = */ true,),
-            "backend-emitted 5xx without any error class is a status failure, \
-             not a connection failure"
         );
     }
 

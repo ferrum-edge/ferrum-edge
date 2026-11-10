@@ -143,6 +143,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   type that fails the path-safe name rule is reported once and no longer
   also appears bare in per-entry `credentials.<type>[<n>]` errors. Update
   any log matcher keyed on the old `(id=…)` or `proxy_id=<bare>` spellings.
+- **The Unix-socket backend pool's idle sweep honours per-proxy
+  `pool_idle_timeout_seconds`** (#7182). Checkout already applied the
+  per-proxy override, but the periodic sweep evicted every pooled HTTP/1.1
+  and h2c carrier with the global `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`, so a
+  longer per-proxy timeout (or `0`, never) was cut to the global value. Each
+  pooled carrier now records the effective timeout it was pooled under and
+  the sweep uses it.
+- **A pipelined conflicting-`Content-Length` request no longer fails the
+  valid HTTP/1 requests queued ahead of it when the TCP read splits its head**
+  (#7179). The frontend framing guard decided whether to stop observing
+  without poisoning earlier heads from a hint it clears at the end of every
+  read, so a read boundary between the second `Content-Length` line and the
+  blank line made earlier pipelined requests fail with the fail-closed `400
+  "HTTP/1 request framing could not be verified"`. The head scanner now
+  carries that fact itself; the result no longer depends on segmentation.
+- **Gateway API HTTP/3 rebinds wait on the budget of the latest collision
+  classification** (#7178). A QUIC bind that hit `EADDRINUSE` re-classified
+  the collision after every attempt (in-process UDP handoff vs. this pass's
+  own retirement) but kept waiting on the deadline of its first
+  classification, so a port that moved to the handoff budget could give up
+  early and publish a spurious `BindFailed`. Each wait is now bounded by the
+  budget the current classification selects, as documented.
 - **Admin restore keeps its mTLS DNS fence across lost-lease recovery**
   (#7062). When namespace admission was lost during the restore clear or
   import, recovery released the restore's durable guard and only then
