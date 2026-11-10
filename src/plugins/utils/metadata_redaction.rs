@@ -133,6 +133,9 @@ pub const REDACTED_FRAGMENT_PLACEHOLDER: &str = "[REDACTED_FRAGMENT]";
 /// a built-in prefix stay redacted. Per-instance key families with a fixed
 /// grammar are matched by [`is_builtin_metadata_key_family`]. Values under
 /// these names are emitted unless the deny layer matches the key.
+///
+/// Kept sorted in byte order with no duplicates: every serialized log record
+/// looks each metadata key up here, so lookups binary-search the list.
 pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "a2a.binding",
     "a2a.context_id",
@@ -713,7 +716,8 @@ pub fn parse_safe_metadata_keys(resolved: Option<String>) -> ParsedSafeMetadataK
 /// or a member of a fixed-grammar per-instance family. Payload keys never are.
 pub fn is_builtin_safe_metadata_name(key: &str) -> bool {
     !is_payload_metadata_key(key)
-        && (BUILTIN_SAFE_METADATA_KEYS.contains(&key) || is_builtin_metadata_key_family(key))
+        && (BUILTIN_SAFE_METADATA_KEYS.binary_search(&key).is_ok()
+            || is_builtin_metadata_key_family(key))
 }
 
 /// Whether `key` is a metadata name the gateway itself publishes: a reviewed
@@ -725,7 +729,7 @@ pub fn is_builtin_safe_metadata_name(key: &str) -> bool {
 /// allowlist: payload names stay unloggable.
 pub fn is_gateway_published_metadata_name(key: &str) -> bool {
     is_payload_metadata_key(key)
-        || BUILTIN_SAFE_METADATA_KEYS.contains(&key)
+        || BUILTIN_SAFE_METADATA_KEYS.binary_search(&key).is_ok()
         || is_builtin_metadata_key_family(key)
         || GATEWAY_METADATA_NAMESPACES
             .iter()

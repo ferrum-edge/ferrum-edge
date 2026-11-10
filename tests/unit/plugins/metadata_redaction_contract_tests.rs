@@ -983,3 +983,27 @@ fn unlisted_metadata_names_are_redacted_by_default_on_every_projection() {
     );
     assert!(attributes.contains(&("mesh.source.workload".to_string(), "frontend".to_string())));
 }
+
+/// `BUILTIN_SAFE_METADATA_KEYS` is binary-searched on every serialized log
+/// record (issue #7150), so it must stay sorted in byte order and unique, and
+/// every listed non-payload name must be found by the lookup.
+#[test]
+fn builtin_safe_metadata_keys_stay_sorted_unique_and_found() {
+    use ferrum_edge::plugins::utils::metadata_redaction::{
+        BUILTIN_SAFE_METADATA_KEYS, is_builtin_safe_metadata_name,
+        is_gateway_published_metadata_name,
+    };
+    for pair in BUILTIN_SAFE_METADATA_KEYS.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "BUILTIN_SAFE_METADATA_KEYS must be sorted and unique: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    for key in BUILTIN_SAFE_METADATA_KEYS {
+        assert!(is_builtin_safe_metadata_name(key), "{key:?}");
+        assert!(is_gateway_published_metadata_name(key), "{key:?}");
+    }
+    assert!(!is_builtin_safe_metadata_name("a2a.unlisted_7150"));
+}
