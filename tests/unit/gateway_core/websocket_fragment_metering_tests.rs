@@ -19,7 +19,10 @@ use async_trait::async_trait;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::ws_rate_limiting::WsRateLimiting;
 use ferrum_edge::plugins::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use futures_util::StreamExt;
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -482,4 +485,54 @@ fn interleaved_control_frames_carry_no_fragment_charge() {
         Message::Text("hi!".into())
     );
     assert_eq!(meter.take_reassembly_frames(), 0);
+}
+
+/// The async delegator (`tokio-tungstenite` patch 004): accounting installed
+/// on a `WebSocketStream` before `split()` keeps metering through the
+/// `SplitStream` that hides the codec — the shape the relay uses.
+#[tokio::test]
+async fn async_delegator_meters_fragments_through_split_stream() {
+    let (client, mut peer) = tokio::io::duplex(4096);
+    let mut ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let meter = Arc::new(FragmentMeter::new());
+    ws.set_fragment_accounting(Some(Arc::clone(&meter)), None, None);
+    let (_sink, mut stream) = ws.split();
+
+    peer.write_all(&zero_length_fragment_chain(50))
+        .await
+        .expect("write fragment chain");
+
+    let message = stream
+        .next()
+        .await
+        .expect("stream yields a message")
+        .expect("message reassembles");
+    assert_eq!(message, Message::Text("".into()));
+    assert_eq!(meter.take_reassembly_frames(), 50);
+    assert_eq!(meter.take_reassembly_frames(), 0);
+}
+
+/// The delegator forwards the incomplete-message frame bound too, so an async
+/// read fails closed while the message is still incomplete.
+#[tokio::test]
+async fn async_delegator_forwards_incomplete_message_frame_bound() {
+    let (client, mut peer) = tokio::io::duplex(4096);
+    let mut ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    ws.set_fragment_accounting(None, Some(8), None);
+
+    let mut bytes = vec![0x01, 0x00];
+    for _ in 0..64 {
+        bytes.extend_from_slice(&[0x00, 0x00]);
+    }
+    peer.write_all(&bytes).await.expect("write fragment flood");
+
+    let error = ws
+        .next()
+        .await
+        .expect("stream yields a result")
+        .expect_err("frame bound must fail the read");
+    assert!(matches!(
+        error,
+        WsError::Protocol(ProtocolError::IncompleteMessageFrameLimitExceeded)
+    ));
 }

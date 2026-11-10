@@ -131,4 +131,7 @@ dependency-policy SLA.
 - External unit: `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`
   (metering, no-double-charge, both directions, observer exclusion, parser
   bound → policy Close mapping, duration bound on final continuation and
-  interleaved Ping/Pong, peer Close exemption).
+  interleaved Ping/Pong, peer Close exemption). Its `async_delegator_*` tests
+  cover the `tokio-tungstenite` `WebSocketStream::set_fragment_accounting`
+  delegator: metering through a `split()` `SplitStream` and the forwarded
+  incomplete-message frame bound.
