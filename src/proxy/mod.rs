@@ -68249,10 +68249,8 @@ mod tests {
             trip_on_connection_errors: true,
         });
         cb.record_failure(500, false, false);
-        assert!(
-            cb.can_execute().unwrap(),
-            "the request claims the probe slot"
-        );
+        let (ticket, _) = cb.admit().expect("the request claims the probe slot");
+        assert!(ticket.is_probe(), "the request claims the probe slot");
         assert_eq!(cb.half_open_in_flight(), 1);
 
         let stalled_upload = std::future::pending::<Result<(), ()>>();
@@ -68262,7 +68260,20 @@ mod tests {
             "a never-ending buffered upload must hit the configured deadline"
         );
 
-        cb.record_neutral(true);
+        // Settle through the production path: the upload-timeout arms return
+        // `request_body_timeout_backend_response`, and the outcome recorder
+        // classifies it with `apply_circuit_breaker_outcome`. A 408 is not in
+        // `failure_status_codes`, so a non-neutral class would record a
+        // success here and close the breaker.
+        let response = super::request_body_timeout_backend_response(None);
+        assert_eq!(response.status_code, 408);
+        super::backend_dispatch::apply_circuit_breaker_outcome(
+            &cb,
+            response.status_code,
+            response.connection_error,
+            response.error_class,
+            ticket,
+        );
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(
             cb.state_name(),
@@ -75894,14 +75905,31 @@ mod tests {
     /// fingerprint only asserts the hard-to-drive HBONE-vs-gate source order.
     #[test]
     fn registry_only_route_miss_gate_precedes_generic_not_found() {
-        let src = include_str!("mod.rs");
+        // Production source only: this test's own needles live in the test
+        // module and would otherwise satisfy every lookup below.
+        let full_src = include_str!("mod.rs");
+        let test_module_start = full_src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("proxy test module marker not found");
+        let src = &full_src[..test_module_start];
+        let gate_needle = "enforcement.http_route_miss_reject_status";
+        let not_found_needle = "No route matched for request path";
+        assert_eq!(
+            src.matches(gate_needle).count(),
+            1,
+            "exactly one REGISTRY_ONLY route-miss gate call is expected"
+        );
+        assert_eq!(
+            src.matches(not_found_needle).count(),
+            1,
+            "exactly one generic route-miss log is expected"
+        );
         let gate_pos = src
-            .find("enforcement.http_route_miss_reject_status")
+            .find(gate_needle)
             .expect("REGISTRY_ONLY route-miss gate helper call not found");
-        let not_found_pos = gate_pos
-            + src[gate_pos..]
-                .find("No route matched for request path")
-                .expect("generic route-miss log after the REGISTRY_ONLY gate not found");
+        let not_found_pos = src
+            .find(not_found_needle)
+            .expect("generic route-miss log not found");
         assert!(
             gate_pos < not_found_pos,
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
@@ -81153,14 +81181,26 @@ mod tests {
         // Source-level seam: every backend retry family that can rotate targets
         // must call the shared allocation-free helper with the original route
         // ceiling rather than a permanently lowered initial-port projection.
+        //
+        // Scan only the production part of this file: the test module repeats
+        // every needle below, so a whole-file scan keeps passing after the
+        // production calls are deleted.
         let helper = "retry_attempt_allowed_for_target";
-        let proxy_src = include_str!("mod.rs");
-        assert!(
-            proxy_src.matches(helper).count() >= 4,
-            "H1/H2 WebSocket, gRPC, and HTTP retry loops must call {helper}"
+        let full_src = include_str!("mod.rs");
+        let test_module_start = full_src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("proxy test module marker not found");
+        let proxy_src = &full_src[..test_module_start];
+        let helper_call = format!("{helper}(");
+        let helper_definition = format!("fn {helper}(");
+        assert_eq!(
+            proxy_src.matches(&helper_call).count() - proxy_src.matches(&helper_definition).count(),
+            4,
+            "H1/H2 WebSocket, gRPC, and HTTP retry loops and current_retry_attempt_allowed must \
+             call {helper}; update this guard when adding or removing a rotating retry loop"
         );
         assert!(
-            proxy_src.contains("route_retry_ceiling"),
+            proxy_src.contains("route_retry_ceiling(&proxy)"),
             "H1/H2 path must retain the original route retry ceiling"
         );
         assert!(

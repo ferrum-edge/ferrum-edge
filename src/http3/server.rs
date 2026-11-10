@@ -21858,26 +21858,28 @@ mod h3_request_body_timeout_tests {
         use crate::circuit_breaker::CircuitBreaker;
         use crate::config::types::CircuitBreakerConfig;
 
-        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+        let cb = std::sync::Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 1,
             success_threshold: 1,
             timeout_seconds: 0,
             failure_status_codes: vec![500],
             half_open_max_requests: 1,
             trip_on_connection_errors: true,
-        });
+        }));
         cb.record_failure(500, false, false);
-        assert!(
-            cb.can_execute().unwrap(),
-            "the H3 request claims the probe slot"
-        );
+        let (ticket, _) = cb.admit().expect("the H3 request claims the probe slot");
+        assert!(ticket.is_probe(), "the H3 request claims the probe slot");
+        let cb_probe = crate::proxy::HalfOpenProbeGuard::new(Some(&cb), ticket);
         assert_eq!(cb.half_open_in_flight(), 1);
 
         let stalled_upload = std::future::pending::<Result<(), ()>>();
         let result = super::collect_h3_request_body_with_timeout(stalled_upload, 10).await;
         assert_eq!(result, Err(super::H3RequestBodyReadError::TimedOut));
 
-        cb.record_neutral(true);
+        // The post-admission buffered-upload timeout arm releases the slot
+        // through the request's probe guard.
+        cb_probe.release_neutral();
+        assert!(!cb_probe.holds_slot());
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");
         assert!(
