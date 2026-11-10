@@ -34800,13 +34800,21 @@ pub async fn run_authentication_phase_with_envelope(
                     Err(()) => {
                         ctx.mark_gateway_deadline_response_selected();
                         let reject = crate::plugins::grpc_deadline_exceeded_plugin_result();
-                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                        let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
+                            // The phase removes the staged cookies on every
+                            // exit (issue #7162).
+                            ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
                             return Some((
                                 500,
                                 Bytes::from_static(br#"{"error":"Internal error"}"#),
                                 HashMap::new(),
                             ));
                         };
+                        // The deadline reject is this phase's final rejection,
+                        // exactly as single-mode's deadline reject is: it
+                        // carries (and consumes) cookies an earlier mechanism
+                        // staged (issue #7162).
+                        attach_auth_rejection_set_cookie(ctx, &mut reject.headers);
                         return Some((reject.status_code, reject.body, reject.headers));
                     }
                 };

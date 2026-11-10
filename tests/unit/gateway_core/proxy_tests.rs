@@ -2777,6 +2777,71 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
     );
 }
 
+/// Never completes: the multi-auth deadline exit is the only way out.
+struct HangingAuth;
+
+#[async_trait]
+impl Plugin for HangingAuth {
+    fn name(&self) -> &str {
+        "hanging_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        std::future::pending().await
+    }
+}
+
+/// Issue #7162: the multi-auth deadline exit is a final rejection like every
+/// other exit, so it consumes the cookies an earlier mechanism staged and
+/// carries them, as single-mode's deadline reject does. They must never stay
+/// behind in request metadata.
+#[tokio::test]
+async fn test_multi_auth_deadline_exit_consumes_staged_rejection_cookie() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "session=staged; Path=/",
+    });
+    let hanging: Arc<dyn Plugin> = Arc::new(HangingAuth);
+    let auth_plugins = [staged, hanging];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/svc.Echo/Call".to_string(),
+    );
+    ctx.request_authority = Some("127.0.0.1".to_string());
+    ferrum_edge::_test_support::set_grpc_deadline_budget_for_test(&mut ctx, Some(50));
+
+    let (status, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("the RPC deadline must end authentication with a rejection");
+
+    assert_eq!(status, 200, "the deadline reject is gRPC Trailers-Only");
+    assert_eq!(
+        headers.get("grpc-status").map(String::as_str),
+        Some("4"),
+        "the deadline exit must still answer DEADLINE_EXCEEDED"
+    );
+    assert!(ferrum_edge::_test_support::gateway_deadline_response_selected_for_test(&ctx));
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("session=staged; Path=/"),
+        "the deadline reject must deliver the staged requester-owned cookie"
+    );
+    assert!(
+        !ctx.metadata.contains_key("auth.rejection_set_cookie"),
+        "the staged cookie must not stay in request metadata after the phase"
+    );
+}
+
 #[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_treats_matching_ip_domain_as_host_only() {
     for (authority, selected_cookie) in [
