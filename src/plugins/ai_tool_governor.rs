@@ -374,9 +374,10 @@ const OBSERVATIONS_OMITTED_KEY: &str = "ai_tool_governor.observations_omitted";
 /// simply not cached (costing an extra webhook call later, never memory).
 const MAX_APPROVAL_CACHE_ENTRIES: usize = 4096;
 /// Request-path metadata marker: this plugin detected `"stream": true` in the
-/// request body (or could not rule it out for an uninspectable body), so the
-/// response must stay on the reqwest dispatch path where the SSE stream
-/// inspector is wired.
+/// request body (or could not rule it out for an uninspectable body). It feeds
+/// `request_is_streaming` (SSE vs buffered response routing) and the scoped
+/// `forces_reqwest_dispatch` preference; the SSE stream inspector itself runs
+/// on every dispatch arm (reqwest, direct HTTP/2, native HTTP/3).
 pub(crate) const STREAM_REQUESTED_KEY: &str = "ai_tool_governor.stream_requested";
 pub(crate) const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
 // Internal correlation state (the governed-body hashes and the per-call
@@ -1976,8 +1977,6 @@ pub struct AiToolGovernor {
     /// True when any tool policy uses `redact_args` — enables the response body
     /// transform on the buffered path.
     needs_response_transform: bool,
-    /// Cached copy of the redaction placeholder template for the transform path.
-    redaction_placeholder: String,
     /// Inspector-completed observability batches waiting for the mutable
     /// response-stream terminal hook. Entries exist only for concrete streams
     /// that attached this plugin's inspector with metadata emission enabled.
@@ -2036,7 +2035,6 @@ impl AiToolGovernor {
                 },
                 engine: Arc::new(engine),
                 needs_response_transform: false,
-                redaction_placeholder: DEFAULT_REDACTION_PLACEHOLDER.to_string(),
                 pending_stream_metadata: Arc::new(DashMap::with_shard_amount(
                     approval_cache_shard_amount,
                 )),
@@ -2191,7 +2189,6 @@ impl AiToolGovernor {
         }
 
         let response = parse_response(config)?;
-        let redaction_placeholder = response.redaction_placeholder.clone();
         let observability = parse_observability(config)?;
 
         let engine = GovernorEngine {
@@ -2215,7 +2212,6 @@ impl AiToolGovernor {
             inspect,
             engine: Arc::new(engine),
             needs_response_transform,
-            redaction_placeholder,
             pending_stream_metadata: Arc::new(DashMap::with_shard_amount(
                 approval_cache_shard_amount,
             )),
@@ -3185,7 +3181,7 @@ impl AiToolGovernor {
                 let Ok(result) = redact_arguments(
                     &args,
                     &policy.blocked_arg_patterns,
-                    &self.redaction_placeholder,
+                    &self.engine.response.redaction_placeholder,
                 ) else {
                     return RedactTransform::AmplificationFailed;
                 };
@@ -3474,8 +3470,8 @@ impl Plugin for AiToolGovernor {
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
         // Streaming inspection also needs the request body in `before_proxy`
-        // to detect `"stream": true` and pin the response onto the reqwest
-        // dispatch path where the SSE inspector is wired.
+        // to detect `"stream": true` and set the stream marker that routes the
+        // response as SSE (see `STREAM_REQUESTED_KEY`).
         self.enabled && (self.inspect.any_request() || self.inspect.streaming_response_tool_calls)
     }
 
@@ -3634,8 +3630,8 @@ impl Plugin for AiToolGovernor {
         // detection) is gated by this flag in the proxy, so it must also be true
         // when only streaming inspection is enabled — otherwise a `stream: true`
         // JSON POST without an `Accept: text/event-stream` header is never
-        // buffered, `before_proxy` cannot set the reqwest-pinning marker, and the
-        // SSE tool-call inspector is bypassed.
+        // buffered and `before_proxy` cannot set the stream marker the response
+        // routing reads (`STREAM_REQUESTED_KEY`).
         self.enabled && (self.inspect.any_request() || self.inspect.streaming_response_tool_calls)
     }
 
@@ -3643,8 +3639,8 @@ impl Plugin for AiToolGovernor {
         // `govern_request` needs the real request context (consumer/proxy
         // correlation, `plugin_http_call_ns` for approval webhooks, metadata
         // writes), and streaming-only configs need it too so the final-body
-        // `stream: true` re-detection can set the reqwest-pinning marker back on
-        // the live request.
+        // `stream: true` re-detection can set the stream marker back on the
+        // live request.
         self.enabled && (self.inspect.any_request() || self.inspect.streaming_response_tool_calls)
     }
 
@@ -3714,7 +3710,8 @@ impl Plugin for AiToolGovernor {
         // `request_transformer` body rule may have added OR removed `stream:
         // true` after `before_proxy` ran. `forces_reqwest_dispatch` /
         // `request_is_streaming` (consulted after this hook) read the marker to
-        // pin the reqwest path and — in a streaming-only config
+        // prefer the reqwest path (a scoped optimization; the inspector runs on
+        // every dispatch arm) and — in a streaming-only config
         // (`response_tool_calls: false`) — to route the response as an SSE
         // fallback vs. ordinary buffered JSON. The backend-visible request
         // governs the response mode, so the marker must track it in BOTH
@@ -6139,22 +6136,33 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         }
         let mut out: Vec<u8> = Vec::new();
 
+        // Complete events are read in place from `carry[consumed..]` and the
+        // consumed prefix is drained once after the loop, so a chunk carrying
+        // N events of total size S costs O(S) byte moves, not O(N·S). Positions
+        // (`end`, `event_scan_from`) are relative to `carry[consumed..]`, which
+        // becomes the start of `carry` after that drain.
+        let mut consumed = 0usize;
         loop {
-            let (found, resume) = next_event_end_from(&self.carry, self.event_scan_from);
+            let (found, resume) =
+                next_event_end_from(&self.carry[consumed..], self.event_scan_from);
             let Some(end) = found else {
                 self.event_scan_from = resume;
                 break;
             };
             // The bytes after `end` have not been scanned yet.
             self.event_scan_from = 0;
-            // Enforce the retained-byte bound BEFORE draining and classifying
+            // Enforce the retained-byte bound BEFORE copying and classifying
             // the event. Otherwise one complete >4 MiB `data:` frame is copied
             // and JSON-parsed before the cap below runs (and a non-JSON event
             // can be forwarded without ever tripping that retained-byte check).
             if self.held.len().saturating_add(end) > MAX_STREAM_HOLD_BYTES {
+                // The overflow path releases or clears `carry` as a whole, so
+                // it must not still hold the events this call already handled.
+                self.carry.drain(..consumed);
                 return self.handle_hold_overflow(out);
             }
-            let event: Vec<u8> = self.carry.drain(..end).collect();
+            let event: Vec<u8> = self.carry[consumed..consumed + end].to_vec();
+            consumed += end;
             match classify_event(&event) {
                 SseEvent::Frame(frame) => {
                     self.record_frame_context(&frame);
@@ -6281,6 +6289,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 }
             }
         }
+        self.carry.drain(..consumed);
 
         // Cap retained bytes (held tool-call frames + partial-event carry): an
         // upstream streaming never-finishing tool-call deltas (or an
@@ -8480,14 +8489,7 @@ fn parse_inspect(config: &Value) -> Result<InspectConfig, String> {
     {
         return Err("ai_tool_governor: `inspect` must be an object".to_string());
     }
-    if let Some(object) = inspect.and_then(Value::as_object) {
-        reject_unknown_keys(
-            object,
-            "config.inspect",
-            AI_TOOL_GOVERNOR_INSPECT_KEYS,
-            "ai_tool_governor: `config.inspect`: ",
-        )?;
-    }
+    // Unknown keys were already refused by `validate_config_keys`.
     let get = |key: &'static str, default: bool| -> Result<bool, String> {
         match inspect.and_then(|i| i.get(key)) {
             None => Ok(default),
@@ -8509,13 +8511,8 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
     let obj = spec
         .as_object()
         .ok_or_else(|| format!("ai_tool_governor: tool {name:?} policy must be an object"))?;
-    let tool_path = format!("config.tools.{name}");
-    reject_unknown_keys(
-        obj,
-        &tool_path,
-        AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS,
-        "ai_tool_governor: `config.tools`: ",
-    )?;
+    // Unknown keys (here and in `blocked_arg_patterns[]`) were already refused
+    // by `validate_config_keys`.
 
     // A present-but-non-string `action` is a wrong TYPE, not an omission
     // (issue #5395). Reporting it as missing sends an operator hunting for a
@@ -8621,12 +8618,6 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                     "ai_tool_governor: tool {name:?} `blocked_arg_patterns[{idx}]` must be an object"
                 )
             })?;
-            reject_unknown_keys(
-                entry_obj,
-                &format!("{tool_path}.blocked_arg_patterns[{idx}]"),
-                AI_TOOL_GOVERNOR_BLOCKED_PATTERN_KEYS,
-                &format!("ai_tool_governor: `config.tools.*.blocked_arg_patterns[{idx}]`: "),
-            )?;
             let pattern_name = entry_obj
                 .get("name")
                 .and_then(Value::as_str)
@@ -8754,12 +8745,7 @@ fn parse_approval(
     let obj = approval
         .as_object()
         .ok_or_else(|| "ai_tool_governor: `approval` must be an object".to_string())?;
-    reject_unknown_keys(
-        obj,
-        "config.approval",
-        AI_TOOL_GOVERNOR_APPROVAL_KEYS,
-        "ai_tool_governor: `config.approval`: ",
-    )?;
+    // Unknown keys were already refused by `validate_config_keys`.
 
     // As with `tools.<name>.action`, distinguish an absent key from a present
     // wrong-typed or empty one (issue #5395): all three used to report the key
@@ -8978,14 +8964,7 @@ fn parse_response(config: &Value) -> Result<ResponseConfig, String> {
     {
         return Err("ai_tool_governor: `response` must be an object".to_string());
     }
-    if let Some(object) = response.and_then(Value::as_object) {
-        reject_unknown_keys(
-            object,
-            "config.response",
-            AI_TOOL_GOVERNOR_RESPONSE_KEYS,
-            "ai_tool_governor: `config.response`: ",
-        )?;
-    }
+    // Unknown keys were already refused by `validate_config_keys`.
 
     let deny_status_code = match response.and_then(|r| r.get("deny_status_code")) {
         None => DEFAULT_DENY_STATUS,
@@ -9039,14 +9018,7 @@ fn parse_observability(config: &Value) -> Result<ObservabilityConfig, String> {
     {
         return Err("ai_tool_governor: `observability` must be an object".to_string());
     }
-    if let Some(object) = obs.and_then(Value::as_object) {
-        reject_unknown_keys(
-            object,
-            "config.observability",
-            AI_TOOL_GOVERNOR_OBSERVABILITY_KEYS,
-            "ai_tool_governor: `config.observability`: ",
-        )?;
-    }
+    // Unknown keys were already refused by `validate_config_keys`.
 
     let emit_metadata = match obs.and_then(|o| o.get("emit_metadata")) {
         None => true,

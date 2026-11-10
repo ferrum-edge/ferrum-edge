@@ -638,6 +638,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from such providers before upgrading.
 
 ### Performance
+- **`ai_tool_governor` drains its live SSE buffer once per chunk**
+  (issue #7133). The streaming tool-call inspector removed each complete
+  event from the front of its carry buffer, moving the rest of the chunk
+  every time, so a chunk of N events of total size S cost O(N·S) byte moves.
+  Events are now read in place and the consumed prefix is drained once per
+  chunk (O(S)). Output and policy decisions are unchanged.
 - **Multi-namespace control planes load their namespaces concurrently.** With
   `FERRUM_CP_NAMESPACES` set to a list or `*`, each incremental poll, each
   set of pre-load change-sequence boundary reads and each full reload used to
