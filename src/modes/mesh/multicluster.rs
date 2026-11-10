@@ -71,16 +71,13 @@ use crate::modes::mesh::config_consumer::common::{
     next_backoff_secs as common_next_backoff_secs,
 };
 use crate::modes::mesh::revision::{
-    DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionContentIdentity, MeshRevisionGate,
-    MeshRevisionPolicy,
+    MeshRevisionContentIdentity, MeshRevisionGate, MeshRevisionPolicy,
 };
 
 /// Backoff bounds shared with [`super::federation`] and
 /// `src/grpc/dp_client.rs`. One cross-cluster backoff curve for operators to
 /// reason about.
 pub(crate) const REMOTE_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
-#[allow(dead_code)]
-pub(crate) const DEFAULT_REMOTE_DISCOVERY_MAX_STALE_SECONDS: u64 = 300;
 
 /// Defense-in-depth cap on the number of workloads / services a single remote
 /// cluster may contribute. A misbehaving (or compromised) remote CP cannot
@@ -1411,25 +1408,7 @@ pub struct RemoteDiscoveryConfig {
 
 impl RemoteDiscoveryConfig {
     /// Returns `None` when discovery should be disabled (interval 0).
-    #[allow(dead_code)]
-    pub fn new(
-        interval_seconds: u64,
-        timeout_seconds: u64,
-        node_id: String,
-        namespace: String,
-        tls_config: RemoteDiscoveryTlsConfig,
-    ) -> Option<Self> {
-        Self::new_with_max_stale(
-            interval_seconds,
-            timeout_seconds,
-            DEFAULT_REMOTE_DISCOVERY_MAX_STALE_SECONDS,
-            DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
-            node_id,
-            namespace,
-            tls_config,
-        )
-    }
-
+    ///
     /// Explicit poll/security knobs are constructor parameters so remote-discovery
     /// cannot silently inherit defaults that weaken revision gating or JWT/TLS
     /// posture.
@@ -2331,6 +2310,7 @@ mod tests {
     use crate::config::types::LocalityPreference;
     use crate::identity::spiffe::SpiffeId;
     use crate::modes::mesh::config::{RemoteCluster, ServicePort, WorkloadRef, WorkloadSelector};
+    use crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
     use std::sync::Mutex;
 
     fn td(raw: &str) -> TrustDomain {
