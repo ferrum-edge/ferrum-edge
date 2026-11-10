@@ -1946,7 +1946,7 @@ impl CpGrpcServer {
                 return;
             }
         };
-        if Self::broadcast_update_with_trust_json(&tx, &filtered, trust_json, namespace) {
+        if Self::broadcast_update_with_trust_json(&tx, filtered, trust_json, namespace) {
             registry.touch_namespace(namespace);
         }
     }
@@ -2035,7 +2035,7 @@ impl CpGrpcServer {
                 ));
             }
         };
-        match Self::config_json_for_dp(&filtered) {
+        match Self::config_json_for_dp(filtered) {
             Ok(config_json) => Ok(ConfigUpdate {
                 update_type: 0, // FULL_SNAPSHOT
                 config_json,
@@ -2087,7 +2087,12 @@ impl CpGrpcServer {
                 return false;
             }
         };
-        Self::broadcast_update_with_trust_json(tx, config, trust_bundles_json, "unpartitioned")
+        Self::broadcast_update_with_trust_json(
+            tx,
+            config.clone(),
+            trust_bundles_json,
+            "unpartitioned",
+        )
     }
 
     /// Broadcast a full config snapshot with an already-resolved trust side
@@ -2100,10 +2105,11 @@ impl CpGrpcServer {
     /// absent slot would otherwise produce (issue #3727).
     fn broadcast_update_with_trust_json(
         tx: &broadcast::Sender<ConfigUpdate>,
-        config: &GatewayConfig,
+        config: GatewayConfig,
         trust_bundles_json: String,
         namespace: &str,
     ) -> bool {
+        let version = config.loaded_at.to_rfc3339();
         let config_json = match Self::config_json_for_dp(config) {
             Ok(json) => json,
             Err(e) => {
@@ -2120,7 +2126,7 @@ impl CpGrpcServer {
         let update = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
-            version: config.loaded_at.to_rfc3339(),
+            version,
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
@@ -2308,10 +2314,13 @@ impl CpGrpcServer {
     /// individual resources rather than a `GatewayConfig` — but the DP applies
     /// every delta through `ProxyState::update_config`, which runs the same
     /// policy and keeps the last known-good config on rejection.
-    fn config_json_for_dp(config: &GatewayConfig) -> Result<String, String> {
-        crate::fips::policy::check_gateway_config(config)
+    ///
+    /// Takes the snapshot by value: every publication path already owns a
+    /// filtered copy, so clearing the trust slots in place avoids a second
+    /// deep clone of the whole configuration (issue #7208).
+    fn config_json_for_dp(mut snapshot: GatewayConfig) -> Result<String, String> {
+        crate::fips::policy::check_gateway_config(&snapshot)
             .map_err(|error| format!("FIPS policy rejected the configuration: {error}"))?;
-        let mut snapshot = config.clone();
         // Trust material travels exclusively through
         // `ConfigUpdate.trust_bundles_json`. BOTH trust slots are cleared here:
         // the unpartitioned `trust_bundles` set and the authoritative
@@ -2573,7 +2582,7 @@ impl ConfigSync for CpGrpcServer {
                     );
                     Status::internal("Failed to prepare configuration snapshot")
                 })?;
-        let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
+        let config_json = Self::config_json_for_dp(filtered).map_err(|e| {
             error!(
                 "{}",
                 crate::startup::sanitize_startup_cause(
@@ -2842,7 +2851,7 @@ impl ConfigSync for CpGrpcServer {
                 );
                 Status::internal("Failed to prepare configuration snapshot")
             })?;
-        let config_json = Self::config_json_for_dp(&filtered).map_err(|e| {
+        let config_json = Self::config_json_for_dp(filtered).map_err(|e| {
             error!(
                 "{}",
                 crate::startup::sanitize_startup_cause(
@@ -3007,7 +3016,8 @@ mod tests {
             .x509_authorities[0]
             .clone();
 
-        let json = CpGrpcServer::config_json_for_dp(&config).expect("DP config should serialize");
+        let json =
+            CpGrpcServer::config_json_for_dp(config.clone()).expect("DP config should serialize");
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("DP config JSON should parse");
         assert!(value.get("trust_bundles").is_none());
