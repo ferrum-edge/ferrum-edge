@@ -514,6 +514,29 @@ pub fn is_system_trust_roots_source(value: &str) -> bool {
     CertSource::parse(value, MaterialKind::CaBundle).is_system_trust_roots()
 }
 
+/// Append a decoded option key or value so [`parse_options`]
+/// (`application/x-www-form-urlencoded`) decodes it back unchanged.
+///
+/// Only the characters form-urlencoding gives meaning to (`%`, `&`, `=`, `+`
+/// and space), plus `#`, are escaped. Ordinary values (`60s`, ARNs, paths with
+/// `/` and `:`) keep their configured spelling, so exports, admin output and
+/// pool keys are unchanged for them, while a value containing a delimiter
+/// round-trips and two different option maps can no longer render to one
+/// string.
+fn push_option_component(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '&' => out.push_str("%26"),
+            '=' => out.push_str("%3D"),
+            '+' => out.push_str("%2B"),
+            '#' => out.push_str("%23"),
+            ' ' => out.push_str("%20"),
+            other => out.push(other),
+        }
+    }
+}
+
 fn parse_options(query: &str) -> BTreeMap<String, String> {
     url::form_urlencoded::parse(query.as_bytes())
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -612,11 +635,16 @@ impl CertSource {
                             .extend_pairs(&uri.options)
                             .finish()
                     } else {
-                        uri.options
-                            .iter()
-                            .map(|(key, value)| format!("{key}={value}"))
-                            .collect::<Vec<_>>()
-                            .join("&")
+                        let mut query = String::new();
+                        for (key, value) in &uri.options {
+                            if !query.is_empty() {
+                                query.push('&');
+                            }
+                            push_option_component(&mut query, key);
+                            query.push('=');
+                            push_option_component(&mut query, value);
+                        }
+                        query
                     };
                     format!("{}://{}?{}", uri.scheme.as_str(), uri.identifier, query)
                 }

@@ -32,6 +32,7 @@ mod renewal_lease_tests;
 mod san_allow_list_verifier_tests;
 mod san_summary_tests;
 mod scoped_material_reference_tests;
+mod source_config_value_tests;
 mod source_field_kind_tests;
 mod source_redaction_tests;
 mod store_dir_permissions_tests;
