@@ -376,6 +376,74 @@ async fn handle_startup_plugin_migrations_with_list(
 /// a connectivity/driver failure. Both markers are downcast-discoverable through
 /// the `anyhow` source chain so poll loops keep `db_available=true` (after the
 /// migration gate) and raise `config_rejected` (issues #2158 / #2997).
+/// Why a database or CP poll loop scheduled an authoritative full config
+/// reload (issue #7252).
+///
+/// One pending flag used to stand for three causes while every log line, the
+/// change-log `trigger`, the `config_rejected` clear line and the reload
+/// failure `error!` said "DB DNS reconnect". The reason now travels with the
+/// pending reload, so those fixed labels name the cause that scheduled it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FullReloadReason {
+    /// The database hostname resolved to new addresses and the pool reconnected.
+    DnsReconnect,
+    /// The stored gateway trust identity no longer matches the running config
+    /// (issue #3727).
+    GatewayTrustDrift,
+    /// CP only: a standing `config_rejected` can clear only after a clean
+    /// authoritative full snapshot (issue #2158).
+    StandingRejection,
+}
+
+impl FullReloadReason {
+    /// Closed-set label for structured log fields.
+    pub(crate) const fn as_label(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "dns_reconnect",
+            Self::GatewayTrustDrift => "gateway_trust_drift",
+            Self::StandingRejection => "standing_rejection",
+        }
+    }
+
+    /// Context for the full reload's publication, rejection and settle logs.
+    pub(crate) const fn reload_context(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "full reload after DB DNS reconnect",
+            Self::GatewayTrustDrift => "full reload after gateway trust drift",
+            Self::StandingRejection => "full reload to clear a standing config rejection",
+        }
+    }
+
+    /// The change-log `trigger` written when the full reload publishes.
+    pub(crate) const fn trigger(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "after DB DNS reconnect",
+            Self::GatewayTrustDrift => "after gateway trust drift",
+            Self::StandingRejection => "after a standing config rejection",
+        }
+    }
+
+    /// CP plugin-migration gate context for a full load that succeeded.
+    pub(crate) const fn migration_gate_context(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "DB DNS reconnect",
+            Self::GatewayTrustDrift => "gateway trust drift",
+            Self::StandingRejection => "standing config rejection",
+        }
+    }
+
+    /// CP plugin-migration gate context for a validation-rejected full load.
+    pub(crate) const fn rejected_load_context(self) -> &'static str {
+        match self {
+            Self::DnsReconnect => "validation-rejected full load after DB DNS reconnect",
+            Self::GatewayTrustDrift => "validation-rejected full load after gateway trust drift",
+            Self::StandingRejection => {
+                "validation-rejected full load for a standing config rejection"
+            }
+        }
+    }
+}
+
 pub(crate) fn is_poll_validation_rejection(err: &anyhow::Error) -> bool {
     crate::config::validation_pipeline::is_config_validation_rejection(err)
         || crate::config::db_loader::is_row_decode_rejection(err)
@@ -888,5 +956,48 @@ mod tests {
             "a migrated reachable store must re-enable writes on a validation rejection"
         );
         assert!(config_rejected.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod full_reload_reason_tests {
+    use super::FullReloadReason;
+
+    /// Only a DNS reconnect may say "DB DNS reconnect" (issue #7252): trust
+    /// drift and a standing rejection used to be reported under that label.
+    #[test]
+    fn every_full_reload_label_names_its_own_cause() {
+        let reasons = [
+            FullReloadReason::DnsReconnect,
+            FullReloadReason::GatewayTrustDrift,
+            FullReloadReason::StandingRejection,
+        ];
+        for reason in reasons {
+            let texts = [
+                reason.reload_context(),
+                reason.trigger(),
+                reason.migration_gate_context(),
+                reason.rejected_load_context(),
+            ];
+            let mentions_dns = texts.iter().any(|text| text.contains("DNS"));
+            assert_eq!(
+                mentions_dns,
+                reason == FullReloadReason::DnsReconnect,
+                "{reason:?}: {texts:?}"
+            );
+        }
+        let labels: std::collections::BTreeSet<_> =
+            reasons.iter().map(|reason| reason.as_label()).collect();
+        assert_eq!(labels.len(), reasons.len());
+        assert!(
+            FullReloadReason::GatewayTrustDrift
+                .trigger()
+                .contains("trust")
+        );
+        assert!(
+            FullReloadReason::StandingRejection
+                .reload_context()
+                .contains("rejection")
+        );
     }
 }

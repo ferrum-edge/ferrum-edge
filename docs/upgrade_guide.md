@@ -186,6 +186,16 @@ on `main` but not yet released, including breaking ones, are listed under
 `[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
 deploying a build from `main`.
 
+### ACME auto-renew is refused outside database, file and dp modes (#7251)
+
+`FERRUM_ACME_AUTO_RENEW_ENABLED=true` is now refused at startup and by
+`ferrum-edge validate` in `mesh`, `cp`, `injector`, `node_agent` and `migrate`
+modes. None of them runs the ACME renewal scheduler, so the flag used to be
+accepted and certificates silently stopped renewing. Remove the flag from those
+processes' configuration (a configuration shared with a dp or file process
+must set it per process) and renew their `acme://` material out of band, or
+serve it from a database, file or dp process that runs the scheduler.
+
 ## Upgrading to 0.9.20
 
 0.9.20 was published on 2026-11-03 UTC from commit

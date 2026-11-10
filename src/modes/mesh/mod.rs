@@ -37858,7 +37858,7 @@ mod tests {
         let mut clusters = HashMap::new();
         clusters.insert(
             "east".to_string(),
-            multicluster::RemoteClusterEntry::new(
+            Arc::new(multicluster::RemoteClusterEntry::new(
                 "east".to_string(),
                 remote_td,
                 Some("net-b".to_string()),
@@ -37869,7 +37869,7 @@ mod tests {
                     services: vec![svc_remote],
                 },
                 1,
-            ),
+            )),
         );
         let snapshot = multicluster::RemoteEndpointSnapshot { clusters };
 

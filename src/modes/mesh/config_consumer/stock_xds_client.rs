@@ -781,7 +781,7 @@ pub async fn start_stock_xds_client_with_shutdown(
     state: MeshRuntimeState,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     mut tls_config: Option<DpGrpcTlsConfig>,
-    mut tls_reload: Option<DpGrpcTlsReload>,
+    tls_reload: Option<DpGrpcTlsReload>,
     policy_rx: tokio::sync::watch::Receiver<StockPolicySnapshot>,
     recovery: Arc<MeshLocalSourceRecovery>,
     credential_watch: StockCredentialWatch,
@@ -1003,19 +1003,10 @@ pub async fn start_stock_xds_client_with_shutdown(
             reset_discovery_state,
             delivered_usable_state,
         } = outcome;
-        // A TLS revision that was already published is applied at the top of
-        // the next loop via `refresh_dp_grpc_tls_config_if_changed`. Mark it
-        // seen here so a credential retirement that won the simultaneous
-        // select does not get immediately cancelled by the same TLS event.
-        if (reset_discovery_state
-            || matches!(
-                attempt,
-                MeshStreamAttempt::LocalRetirement(MeshStreamRetirement::TlsReload)
-            ))
-            && let Some(reload) = tls_reload.as_mut()
-        {
-            let _ = reload.revision_rx.borrow_and_update();
-        }
+        // A TLS revision published while this attempt ran is applied at the
+        // top of the next loop: `refresh_dp_grpc_tls_config_if_changed`
+        // advances `last_tls_revision`, the value every TLS-reload wait compares
+        // against, so the next attempt is never cancelled by the same event.
         // Endpoint identity stays out of these lines: the configured URL is
         // operator-authored but unbounded, so the index plus the closed-set
         // outcome and reason are what the operator gets here and on `/metrics`.

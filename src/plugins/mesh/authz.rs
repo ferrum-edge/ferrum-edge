@@ -16,7 +16,7 @@
 //! In normal mesh topologies, the plugin pre-filters `slice.mesh_policies` at
 //! construction time using
 //! [`crate::modes::mesh::config::policy_scope_applies_to_workload`]. The hot
-//! path ([`evaluate_mesh_authorization`]) then sees only the policies that
+//! path ([`evaluate_mesh_authorization_policies`]) then sees only the policies that
 //! apply to **this** proxy's workload, so the per-request cost stays at the same
 //! O(policies × rules) it was before — minus any policies the scope filter
 //! discarded. Filtering is keyed on `(proxy_namespace, proxy_labels)` supplied

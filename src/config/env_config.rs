@@ -8742,6 +8742,9 @@ impl EnvConfig {
         // A TLS source must not select material of another kind (issue #5959).
         self.validate_tls_source_field_kinds()?;
 
+        // ACME auto-renewal in a mode that never runs the scheduler (#7251).
+        self.validate_acme_renewal_mode()?;
+
         // ACME auto-renewal that can never reach the listener (issue #4506).
         self.validate_acme_renewal_reachability()?;
 
@@ -8749,6 +8752,33 @@ impl EnvConfig {
         self.validate_acme_renewal_challenge_type()?;
 
         Ok(())
+    }
+
+    /// Refuse `FERRUM_ACME_AUTO_RENEW_ENABLED=true` in a mode that never runs
+    /// the ACME renewal scheduler (issue #7251).
+    ///
+    /// Only database, file and dp modes start the scheduler. Everywhere else the
+    /// flag used to validate clean and then never renew, so an `acme://`
+    /// certificate expired with no warning. Mesh mode in particular treats
+    /// operator frontend TLS (`FERRUM_FRONTEND_TLS_CERT_PATH` / `KEY_PATH`) as
+    /// static input with no live reload, so a renewal there could never reach
+    /// its listener even if a scheduler ran. The mode itself is not echoed:
+    /// `FERRUM_MODE` may be an externally resolved secret.
+    pub fn validate_acme_renewal_mode(&self) -> Result<(), String> {
+        if !self.acme_auto_renew_enabled
+            || matches!(
+                self.mode,
+                OperatingMode::Database | OperatingMode::File | OperatingMode::DataPlane
+            )
+        {
+            return Ok(());
+        }
+        Err(
+            "FERRUM_ACME_AUTO_RENEW_ENABLED=true is supported only in `database`, `file`, and \
+             `dp` modes; this mode never runs the ACME renewal scheduler, so certificates would \
+             silently stop renewing"
+                .to_string(),
+        )
     }
 
     /// Reject `FERRUM_ACME_RENEW_CHALLENGE_TYPE` values the renewal scheduler

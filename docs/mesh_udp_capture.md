@@ -533,7 +533,7 @@ per-datagram recoverable original address, and there is no UDP equivalent of
 
 ## Cleanup
 
-Cleanup (`IptablesPlan::cleanup_commands(udp_capture_enabled)`) removes all four
+The UDP teardown (`IptablesPlan::udp_teardown_split` / `udp_teardown_v6_split`) removes all four
 `mangle` chains (`FERRUM_MESH_UDP_INBOUND` / `FERRUM_MESH_UDP_OUTBOUND` /
 `FERRUM_MESH_UDP_OUTPUT_MARK` / `FERRUM_MESH_UDP_REINJECT`), deletes their
 PREROUTING jumps **and the `mangle OUTPUT -j FERRUM_MESH_UDP_OUTPUT_MARK` jump**,

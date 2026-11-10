@@ -499,36 +499,6 @@ fn expr_uses_http_only(expr: &MetricTagCelExpr) -> bool {
     }
 }
 
-/// Evaluate a compiled expression into a sanitized label value.
-///
-/// Missing attributes yield an empty string (Istio/Envoy empty-dimension
-/// behavior) rather than inventing placeholder traffic data. Output is
-/// truncated and sanitized to printable ASCII suitable for Prometheus labels.
-// A public library helper exercised by the external unit-test target; the live
-// hot path evaluates the compact plan instead.
-pub fn evaluate_metric_tag_cel(expr: &MetricTagCelExpr, ctx: MetricTagCelContext<'_>) -> String {
-    let raw = match expr {
-        MetricTagCelExpr::Literal { value } => value.clone(),
-        MetricTagCelExpr::Attribute { name } => ctx.string_attr(*name).unwrap_or("").to_string(),
-        MetricTagCelExpr::StringOfInt { attribute } => ctx
-            .int_attr(*attribute)
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        MetricTagCelExpr::HasThenElse {
-            attribute,
-            then_expr,
-            else_expr,
-        } => {
-            if ctx.string_attr(*attribute).is_some() {
-                evaluate_metric_tag_cel(then_expr, ctx)
-            } else {
-                evaluate_metric_tag_cel(else_expr, ctx)
-            }
-        }
-    };
-    sanitize_metric_tag_value(&raw)
-}
-
 /// Bound and sanitize a metric label value for Prometheus emission.
 pub fn sanitize_metric_tag_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len().min(MAX_METRIC_TAG_CEL_OUTPUT_BYTES));

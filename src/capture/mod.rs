@@ -1630,40 +1630,34 @@ impl IptablesPlan {
     /// Each command uses `2>/dev/null || true` so partial cleanup (e.g.
     /// chains already removed by a previous run) does not fail the overall
     /// teardown.
+    /// Flat IPv4 cleanup for an install that may have emitted UDP rules: the
     /// TCP-chain teardown plus, when `udp_capture_enabled`, the UDP TPROXY
-    /// `mangle` chains and the Ferrum-owned routing rule/route. The UDP teardown
-    /// is gated so a non-UDP install never touches routing state it never
-    /// created (codex r1); pass the install's `udp_capture_enabled` flag.
-    /// Flat IPv4 cleanup (iptables-table teardown then raw routing teardown).
-    /// Test-only convenience; production node-agent code uses [`Self::cleanup_split`]
-    /// so it can guard only the table portion behind the `ip6tables` probe.
+    /// teardown (iptables-table teardown, then raw routing teardown). The UDP
+    /// half is gated so a non-UDP install never touches routing state it never
+    /// created (codex r1). Test-only: it backs [`Self::cleanup_script`].
     #[cfg(test)]
     pub fn cleanup_commands(udp_capture_enabled: bool) -> Vec<String> {
-        cleanup_commands_for("iptables", udp_capture_enabled).into_flat()
+        with_udp_teardown("iptables", udp_capture_enabled).into_flat()
     }
 
-    /// Flat IPv6 cleanup. Test-only; see [`Self::cleanup_v6_split`].
+    /// Flat IPv6 cleanup. Test-only; see [`Self::cleanup_commands`].
     #[cfg(test)]
     pub fn cleanup_v6_commands(udp_capture_enabled: bool) -> Vec<String> {
-        cleanup_commands_for("ip6tables", udp_capture_enabled).into_flat()
+        with_udp_teardown("ip6tables", udp_capture_enabled).into_flat()
     }
 
-    /// The IPv4 cleanup split into the iptables-table teardown vs. the raw `ip`
-    /// routing teardown. The node-agent emits the routing teardown UNCONDITIONALLY
-    /// (it is `ip`, not `iptables`/`ip6tables`); see [`Self::cleanup_v6_split`].
-    pub fn cleanup_split(udp_capture_enabled: bool) -> CleanupCommands {
-        cleanup_commands_for("iptables", udp_capture_enabled)
+    /// The IPv4 TCP-capture cleanup for the node-agent's host-netns iptables
+    /// fallback, which never installs UDP capture (only the Ambient topology
+    /// enables it, and Ambient refuses the fallback). Stale UDP state from an
+    /// earlier run is reaped by the unconditional [`Self::udp_teardown_split`].
+    pub fn cleanup_split() -> CleanupCommands {
+        cleanup_commands_for("iptables")
     }
 
-    /// The IPv6 cleanup split into the **ip6tables-table** teardown (`iptables`,
-    /// which the node-agent guards behind an `ip6tables` availability probe) and
-    /// the **raw `ip -6` routing** teardown (`ip_routing`, the fwmark rule + local
-    /// route). The routing teardown MUST be emitted UNCONDITIONALLY — `ip -6` can
-    /// remove the rule/route even when `ip6tables` is missing, so wrapping it in
-    /// the ip6tables guard would leak the fwmark rule + local route and keep
-    /// diverting marked UDP after shutdown (codex r3).
-    pub fn cleanup_v6_split(udp_capture_enabled: bool) -> CleanupCommands {
-        cleanup_commands_for("ip6tables", udp_capture_enabled)
+    /// The IPv6 counterpart of [`Self::cleanup_split`]; the node-agent guards
+    /// it behind an `ip6tables` availability probe.
+    pub fn cleanup_v6_split() -> CleanupCommands {
+        cleanup_commands_for("ip6tables")
     }
 
     /// The EXACT Ferrum-owned **IPv4** UDP TPROXY teardown (mangle chains +
@@ -3148,7 +3142,8 @@ fn udp_only_commands_for_family(config: &CaptureConfig, family: CidrFamily) -> V
     )
 }
 
-fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> CleanupCommands {
+/// TCP nat-chain teardown for one `iptables`/`ip6tables` family.
+fn cleanup_commands_for(binary: &str) -> CleanupCommands {
     let iptables = vec![
         // Step 1: remove jump rules from built-in chains
         idempotent_delete(binary, "nat", "OUTPUT", "-p tcp -j FERRUM_MESH_OUTBOUND"),
@@ -3161,22 +3156,23 @@ fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> CleanupComma
         delete_chain(binary, "nat", "FERRUM_MESH_OUTBOUND"),
     ];
 
-    let mut combined = CleanupCommands {
+    CleanupCommands {
         iptables,
         ip_routing: Vec::new(),
-    };
+    }
+}
 
-    // UDP TPROXY teardown is GATED on `udp_capture_enabled` HERE: when this
-    // install never emitted UDP rules, the normal shutdown/setup-failure cleanup
-    // must not touch routing state it never created. (The node-agent runs a
-    // SEPARATE UNCONDITIONAL pre-setup teardown via [`udp_teardown_for`] to reap
-    // stale state from a prior UDP-enabled-then-crashed run — codex r4.)
+/// [`cleanup_commands_for`] plus, when the install emitted UDP rules, the UDP
+/// TPROXY teardown. Gated so a non-UDP install never touches routing state it
+/// never created (codex r1).
+#[cfg(test)]
+fn with_udp_teardown(binary: &str, udp_capture_enabled: bool) -> CleanupCommands {
+    let mut combined = cleanup_commands_for(binary);
     if udp_capture_enabled {
         let udp = udp_teardown_for(binary);
         combined.iptables.extend(udp.iptables);
         combined.ip_routing.extend(udp.ip_routing);
     }
-
     combined
 }
 
@@ -6376,13 +6372,13 @@ iptables() {{
     }
 
     #[test]
-    fn cleanup_v6_split_separates_raw_ip_routing_from_ip6tables_tables() {
+    fn udp_teardown_v6_split_separates_raw_ip_routing_from_ip6tables_tables() {
         // codex r3: the raw `ip -6 rule/route del` teardown must be in `ip_routing`
         // (emitted unconditionally by the node-agent) and NOT in `iptables` (which
         // the node-agent guards behind an `ip6tables` availability probe). Wrapping
         // the `ip -6` teardown in that probe would leak the fwmark rule + local
         // route when `ip6tables` is missing.
-        let split = IptablesPlan::cleanup_v6_split(true);
+        let split = IptablesPlan::udp_teardown_v6_split();
 
         // The raw `ip -6` rule/route teardown lives in `ip_routing`.
         assert!(
@@ -6420,11 +6416,11 @@ iptables() {{
     }
 
     #[test]
-    fn cleanup_v6_split_routing_empty_when_udp_disabled() {
-        // When UDP capture was never enabled, there is no routing state to tear
-        // down (gated like the v4 path); both halves carry only the TCP nat-chain
-        // teardown and no `ip -6` routing.
-        let split = IptablesPlan::cleanup_v6_split(false);
+    fn cleanup_v6_split_carries_no_udp_routing_teardown() {
+        // The fallback's TCP-capture cleanup never installed UDP state, so it
+        // carries only the TCP nat-chain teardown and no `ip -6` routing; the
+        // unconditional `udp_teardown_v6_split` reaps stale UDP state instead.
+        let split = IptablesPlan::cleanup_v6_split();
         assert!(
             split.ip_routing.is_empty(),
             "UDP-disabled v6 cleanup must emit no routing teardown: {:?}",

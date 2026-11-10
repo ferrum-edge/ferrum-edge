@@ -566,13 +566,6 @@ impl WorkloadIdentity {
 pub struct BpfCaptureConfig {
     pub outbound_capture_port: u32,
     pub hbone_redirect_port: u32,
-    /// Non-zero → captured IPv6 outbound connections are DENIED (the `connect6`
-    /// hook returns `EPERM`) instead of redirected. This is an explicit safety
-    /// valve for deployments that cannot provide an IPv6 pod-loopback listener;
-    /// the normal NodeWaypoint path leaves it clear and redirects to `[::1]`.
-    /// Excluded v6 (bypass UID / port / CIDR excludes) is decided before the deny
-    /// and still flows.
-    pub ipv6_outbound_deny: u32,
     /// `SO_MARK` value trusted by the pod-veth tc guard for destination
     /// NodeWaypoint relay backend dials. Packets to enrolled pod IPs without
     /// this mark are direct pod traffic and are dropped fail-closed.
@@ -1065,7 +1058,6 @@ impl BpfCaptureConfig {
         Self {
             outbound_capture_port: outbound_capture_port as u32,
             hbone_redirect_port: hbone_redirect_port as u32,
-            ipv6_outbound_deny: 0,
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
             // Fail closed to "no redirect": the inbound tc redirect only
             // engages once an operator opts the node in AND the node-agent has
@@ -1075,13 +1067,6 @@ impl BpfCaptureConfig {
             // nothing to steer into, so the redirect stays disarmed.
             node_waypoint_ingress_capture_port: 0,
         }
-    }
-
-    /// Set whether captured IPv6 outbound connections fail closed (denied) —
-    /// see [`Self::ipv6_outbound_deny`].
-    pub const fn with_ipv6_outbound_deny(mut self, deny: bool) -> Self {
-        self.ipv6_outbound_deny = deny as u32;
-        self
     }
 
     pub const fn with_node_waypoint_inbound_auth_mark(mut self, mark: u32) -> Self {
@@ -1256,10 +1241,10 @@ mod tests {
         // 8-byte aligned for the BPF verifier.
         assert_eq!(mem::size_of::<WorkloadIdentity>(), 32);
         assert_eq!(mem::align_of::<WorkloadIdentity>(), 8);
-        // BpfCaptureConfig: six u32 = 24 bytes, 4-byte aligned. The fifth and
-        // sixth words are the tc-ingress-redirect mark and the transparent
+        // BpfCaptureConfig: five u32 = 20 bytes, 4-byte aligned. The fourth and
+        // fifth words are the tc-ingress-redirect mark and the transparent
         // inbound capture listener port.
-        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 24);
+        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 20);
         assert_eq!(mem::align_of::<BpfCaptureConfig>(), 4);
         // InboundRedirectKey4: u32 + two u16 = 8 bytes; the v6 key is
         // [u32;4] + two u16 = 20 bytes. Both are fully defined (explicit pad).
@@ -1509,34 +1494,9 @@ mod tests {
         assert_eq!(config.outbound_capture_port, OUTBOUND_CAPTURE_PORT as u32);
         assert_eq!(config.hbone_redirect_port, INBOUND_HBONE_PORT as u32);
         assert_eq!(FERRUM_CAPTURE_CONFIG_KEY, 0);
-        // IPv6 egress is redirected (not denied) by default; the deny remains an
-        // explicit safety valve for deployments without an IPv6 capture listener.
-        assert_eq!(config.ipv6_outbound_deny, 0);
         assert_eq!(
             config.node_waypoint_inbound_auth_mark,
             NODE_WAYPOINT_INBOUND_AUTH_MARK
-        );
-    }
-
-    #[test]
-    fn ipv6_outbound_deny_flag_round_trips() {
-        assert_eq!(
-            BpfCaptureConfig::new(15001, 15008).ipv6_outbound_deny,
-            0,
-            "v6 deny is off unless explicitly set"
-        );
-        assert_ne!(
-            BpfCaptureConfig::new(15001, 15008)
-                .with_ipv6_outbound_deny(true)
-                .ipv6_outbound_deny,
-            0,
-            "with_ipv6_outbound_deny(true) must set the fail-closed flag the connect6 hook reads"
-        );
-        assert_eq!(
-            BpfCaptureConfig::new(15001, 15008)
-                .with_ipv6_outbound_deny(false)
-                .ipv6_outbound_deny,
-            0
         );
     }
 

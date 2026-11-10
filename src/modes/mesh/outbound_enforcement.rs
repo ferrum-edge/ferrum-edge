@@ -170,8 +170,8 @@ impl MeshOutboundEnforcement {
         }
     }
 
-    /// The normalised outbound listener ports this enforcement gates.
-    pub fn outbound_listen_ports(&self) -> &[u16] {
+    #[cfg(test)]
+    fn outbound_listen_ports(&self) -> &[u16] {
         &self.outbound_listen_ports
     }
 
@@ -250,11 +250,6 @@ impl MeshOutboundEnforcement {
         crate::plugins::prometheus_metrics::global_registry()
             .record_mesh_outbound_registry_decision(&self.namespace, DENIED_HOST_BUCKET, "deny");
         Some(self.reject_status)
-    }
-
-    /// Borrow the inner registry.
-    pub fn registry(&self) -> &OutboundRegistry {
-        &self.registry
     }
 }
 

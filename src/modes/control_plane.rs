@@ -51,6 +51,7 @@ use crate::grpc::mesh_server::MeshGrpcServer;
 use crate::k8s_controller::{
     CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
 };
+use crate::modes::FullReloadReason;
 use crate::modes::file::ListenerJoinHandle;
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::startup_security;
@@ -3329,7 +3330,7 @@ pub async fn run(
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
         let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
             Arc::new(tokio::sync::Mutex::new(None));
-        let mut force_full_reload = false;
+        let mut force_full_reload: Option<FullReloadReason> = None;
         let mut last_polled_namespaces = initial_polled_namespaces;
         let mut rejected_delta_tracker =
             CpRejectedDeltaTracker::new(rejected_delta_full_reload_threshold);
@@ -3366,7 +3367,8 @@ pub async fn run(
                             match db_poll.reconnect(&db_url_for_reconnect).await {
                                 Ok(_) => {
                                     last_db_ips = Some(ips);
-                                    force_full_reload = true;
+                                    force_full_reload =
+                                        Some(FullReloadReason::DnsReconnect);
                                     plugin_migrations_need_reconcile = true;
                                     db_available_poll.store(false, Ordering::Relaxed);
                                 }
@@ -3429,7 +3431,7 @@ pub async fn run(
                     // path in THIS tick rather than the next, and it is skipped
                     // when a full reload is already pending because that reload
                     // republishes trust anyway.
-                    if !force_full_reload {
+                    if force_full_reload.is_none() {
                         let trust_drifted = detect_gateway_trust_drift(
                             db_poll.as_ref(),
                             &nslist,
@@ -3437,11 +3439,12 @@ pub async fn run(
                         )
                         .await;
                         if !trust_drifted.is_empty() {
-                            force_full_reload = true;
+                            force_full_reload =
+                                Some(FullReloadReason::GatewayTrustDrift);
                         }
                     }
 
-                    if force_full_reload {
+                    if let Some(full_reload_reason) = force_full_reload {
                         match load_full_config_multi_with_sequence(
                             db_poll.as_ref(),
                             &nslist,
@@ -3459,7 +3462,7 @@ pub async fn run(
                                     &db_available_poll,
                                     poll_auto_apply_plugin_migrations,
                                     &mut plugin_migrations_need_reconcile,
-                                    "DB DNS reconnect",
+                                    full_reload_reason.migration_gate_context(),
                                 )
                                 .await
                                 {
@@ -3471,7 +3474,7 @@ pub async fn run(
                                     sequences,
                                 );
                                 last_polled_namespaces = nslist.clone();
-                                force_full_reload = false;
+                                force_full_reload = None;
                                 rejected_delta_tracker.record_accepted();
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 publish_cp_full_reload(
@@ -3497,10 +3500,13 @@ pub async fn run(
                                     &config_rejected_poll,
                                     &outcome.rejected_namespaces,
                                     &outcome.failed_namespaces,
-                                    "full reload after DB DNS reconnect",
+                                    full_reload_reason.reload_context(),
                                 )
                                 .await;
-                                debug!("Full config reload complete after DB DNS reconnect");
+                                debug!(
+                                    reason = full_reload_reason.as_label(),
+                                    "Full config reload complete"
+                                );
                             }
                             Err(e) => {
                                 if crate::modes::is_poll_validation_rejection(&e) {
@@ -3509,7 +3515,7 @@ pub async fn run(
                                         &db_available_poll,
                                         poll_auto_apply_plugin_migrations,
                                         &mut plugin_migrations_need_reconcile,
-                                        "validation-rejected full load after DB DNS reconnect",
+                                        full_reload_reason.rejected_load_context(),
                                     )
                                     .await
                                     {
@@ -3525,7 +3531,7 @@ pub async fn run(
                                         &db_available_poll,
                                         &config_rejected_poll,
                                         &e,
-                                        "full reload after DB DNS reconnect",
+                                        full_reload_reason.reload_context(),
                                     )
                                     .await;
                                     database_delta_poll_metrics_for_poll.record_poll_failure(
@@ -3533,7 +3539,8 @@ pub async fn run(
                                     );
                                 } else {
                                     error!(
-                                        "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying"
+                                        reason = full_reload_reason.as_label(),
+                                        "Authoritative primary full config reload failed; keeping existing config and retrying"
                                     );
                                     database_delta_poll_metrics_for_poll
                                         .record_config_source_unavailable(
@@ -3618,7 +3625,7 @@ pub async fn run(
                                     // `config_rejected` stuck with the tracker
                                     // reset and no escalation path.
                                     if config_rejected_poll.load(Ordering::Relaxed) {
-                                        force_full_reload = true;
+                                        force_full_reload = Some(FullReloadReason::StandingRejection);
                                     }
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
@@ -3886,7 +3893,7 @@ pub async fn run(
                                     // full reload the standing signal would
                                     // never clear.
                                     if config_rejected_poll.load(Ordering::Relaxed) {
-                                        force_full_reload = true;
+                                        force_full_reload = Some(FullReloadReason::StandingRejection);
                                     }
                                 }
                             }
@@ -5050,8 +5057,8 @@ mod tests {
             "both DNS pool reconnect and failover must reset the migration gate"
         );
         for context in [
-            "DB DNS reconnect",
-            "validation-rejected full load after DB DNS reconnect",
+            "full_reload_reason.migration_gate_context()",
+            "full_reload_reason.rejected_load_context()",
             "incremental load after pool reconnect",
             "full fallback load after pool reconnect",
             "validation-rejected full fallback load after pool reconnect",
@@ -5150,7 +5157,7 @@ mod tests {
         // reload rather than clearing the rejection tracker and leaving the
         // standing signal permanently stuck.
         let source = include_str!("control_plane.rs");
-        let marker = "if config_rejected_poll.load(Ordering::Relaxed) {\n                                        force_full_reload = true;";
+        let marker = "if config_rejected_poll.load(Ordering::Relaxed) {\n                                        force_full_reload = Some(FullReloadReason::StandingRejection);";
         assert!(
             source.matches(marker).count() >= 2,
             "empty-result and all-accepted incremental paths must force a full \

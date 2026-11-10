@@ -233,7 +233,8 @@ impl PolicyDenyRecorder {
     }
 
     /// Number of events currently retained in the ring (post-eviction).
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
@@ -242,12 +243,14 @@ impl PolicyDenyRecorder {
     }
 
     /// Whether the ring currently holds zero events.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Live capacity (post-`with_capacity` / `reset_capacity_for_tests` cap).
-    pub fn capacity(&self) -> usize {
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
         let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),

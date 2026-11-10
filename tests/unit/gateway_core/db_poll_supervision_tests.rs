@@ -616,7 +616,7 @@ fn gateway_trust_drift_escalates_into_the_same_tick_full_reload() {
             .find("detect_gateway_trust_drift(")
             .unwrap_or_else(|| panic!("{label}: poll tick must run the trust drift check"));
         let decision_at = tick[drift_at..]
-            .find("if force_full_reload {")
+            .find("if let Some(full_reload_reason) = force_full_reload {")
             .map(|offset| offset + drift_at)
             .unwrap_or_else(|| {
                 panic!("{label}: the drift check must precede the full-reload decision")
@@ -626,12 +626,13 @@ fn gateway_trust_drift_escalates_into_the_same_tick_full_reload() {
         // does not pay for a second authoritative read, and that guard must be
         // the negated one — not the reload branch itself.
         let guard_at = tick[..drift_at]
-            .rfind("if !force_full_reload {")
+            .rfind("if force_full_reload.is_none() {")
             .unwrap_or_else(|| {
                 panic!("{label}: the drift check must be skipped when a reload is already pending")
             });
         assert!(
-            !tick[guard_at..drift_at].contains("if force_full_reload {"),
+            !tick[guard_at..drift_at]
+                .contains("if let Some(full_reload_reason) = force_full_reload {"),
             "{label}: the drift check must run outside the full-reload branch"
         );
 

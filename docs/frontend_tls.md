@@ -1498,8 +1498,12 @@ Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/
 ## ACME Auto-Renewal Requires Frontend TLS Live Reload
 
 `FERRUM_ACME_AUTO_RENEW_ENABLED=true` renews certificates **into the ACME
-certificate store**. Getting the renewed leaf in front of clients is a separate
-step, and it is not automatic:
+certificate store**. Only `database`, `file`, and `dp` modes run the renewal
+scheduler; every other mode (`mesh`, `cp`, `injector`, `node_agent`, `migrate`)
+refuses the flag at startup and in `ferrum-edge validate` rather than accepting
+it and never renewing. Mesh mode treats operator frontend TLS as static input
+with no live reload, so it renews out of band. Getting the renewed leaf in
+front of clients is a separate step, and it is not automatic:
 
 1. A successful renewal commits the new material under the lease fence and then
    asks every TLS surface that registered a *force-reload sender* to rebuild.

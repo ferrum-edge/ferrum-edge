@@ -9939,7 +9939,6 @@ fn mesh_outbound_registry_invalid_slice_keeps_stream_and_route_miss_enforcement(
         404,
     )
     .expect("an invalid registry must keep the gate installed");
-    assert_eq!(enforcement.registry().registry_size(), 0);
     assert_eq!(
         enforcement.check_destination(15001, "known.test", 443),
         Decision::Deny

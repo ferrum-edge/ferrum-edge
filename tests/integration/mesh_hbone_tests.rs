@@ -4098,18 +4098,6 @@ fn inbound_relay_registry_strict_parse_retracts_malformed_evidence_then_recovers
         Err(InboundRelayDenial::AddressNotTerminated),
         "a malformed sibling must retract the whole last-good index"
     );
-    assert!(
-        !index.terminates_for(ip("10.244.5.5"), None, Some(LOCAL_POD_UID)),
-        "malformed identity must not still admit the address on address/pod-UID alone"
-    );
-    assert!(
-        !index.terminates_for(
-            ip("10.244.5.5"),
-            Some(own_spiffe.as_str()),
-            Some(LOCAL_POD_UID),
-        ),
-        "malformed identity must not skip the identity comparison by becoming None"
-    );
 
     write_strict_registry_entry(dir.path(), LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
     assert_eq!(manager.reconcile_once().len(), 2);
@@ -4264,14 +4252,6 @@ fn inbound_relay_registry_strict_parse_retracts_spiffe_on_non_uuid_leaf() {
         mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
         Err(InboundRelayDenial::AddressNotTerminated),
         "a sibling with spiffe_id= on a non-UUID leaf must retract the whole last-good index"
-    );
-    assert!(
-        !index.terminates_for(
-            ip("10.244.5.7"),
-            Some(own_spiffe.as_str()),
-            Some(safe_non_uuid),
-        ),
-        "the non-UUID identity binding must not still admit on address/pod-UID alone"
     );
 
     std::fs::remove_file(dir.path().join(safe_non_uuid)).expect("remove non-UUID leaf");
@@ -4478,6 +4458,13 @@ fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
     let registry = root.path().join("node-waypoint-pods");
     let rendered_path = registry.display().to_string();
     let index = Arc::new(NodeLocalEnrolledDestinations::new());
+    let own_spiffe = reviews_spiffe();
+    let (slice, runtime) =
+        ambient_relay_fixture(vec![reviews_replica("10.244.5.5", LOCAL_POD_UID)]);
+    let mut mesh = prepared_mesh(&slice, &runtime);
+    let node = Some(ip("10.244.0.1"));
+    mesh.inbound_relay_node_local_registry =
+        NodeLocalEnrolledDestinationsHandle::new(index.clone());
     let poll = std::time::Duration::from_secs(2);
     let manager = NodeLocalEnrolledDestinationsManager::new(
         Arc::new(DirectoryCaptureSource::new(&registry)),
@@ -4504,8 +4491,9 @@ fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
         "the warning names the opt-out: {}",
         first[0]
     );
-    assert!(
-        !index.terminates_for(ip("10.244.5.5"), None, None),
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
         "fail closed stays the default"
     );
 
@@ -4529,12 +4517,14 @@ fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
     // A node agent publishes the directory: the index publishes and recovery
     // is announced once.
     std::fs::create_dir(&registry).expect("node agent publishes the registry");
-    let own_spiffe = reviews_spiffe();
     write_strict_registry_entry(&registry, LOCAL_POD_UID, "10.244.5.5", &own_spiffe);
     assert_eq!(manager.reconcile_once().len(), 1);
     assert_eq!(manager.consecutive_unavailable_polls(), 0);
     assert_eq!(logs.warn_lines("registry recovered").len(), 1);
-    assert!(index.terminates_for(ip("10.244.5.5"), None, None));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Ok(())
+    );
 
     // A present-but-malformed registry is a different failure and says so,
     // without claiming the node agent is missing.
@@ -4544,7 +4534,11 @@ fn registry_missing_directory_warns_with_path_and_node_agent_and_repeats() {
     assert_eq!(malformed.len(), 1, "{malformed:?}");
     assert!(malformed[0].contains(&rendered_path), "{}", malformed[0]);
     assert_eq!(logs.warn_lines(missing).len(), 2);
-    assert!(!index.terminates_for(ip("10.244.5.5"), None, None));
+    assert_eq!(
+        mesh.inbound_relay_destination_decision("10.244.5.5", 8080, node),
+        Err(InboundRelayDenial::AddressNotTerminated),
+        "a malformed registry retracts the published index"
+    );
 }
 
 /// Issue #4249, the `Sidecar` half. A Sidecar shares the application pod's

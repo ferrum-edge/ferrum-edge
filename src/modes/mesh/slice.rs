@@ -2151,6 +2151,14 @@ impl MeshSlice {
             build_sidecar_egress_scope_snapshot(EgressScopeBuildContext {
                 mesh,
                 sidecar,
+                // Outside dry-run this Sidecar IS `applicable_sidecar`, so the
+                // slice's own narrowed services, ServiceEntries and
+                // DestinationRules are exactly the set the snapshot reports.
+                admitted: (!sidecar_dry_run).then_some(AdmittedEgressScope {
+                    services: &services,
+                    service_entries: &service_entries,
+                    destination_rules: &destination_rules,
+                }),
                 workload_namespace: effective_namespace,
                 workload_labels: &effective_labels,
                 cluster_domain: &cluster_domain,
@@ -2947,9 +2955,20 @@ fn insert_known_destination<'a>(
     }
 }
 
+/// The egress-narrowed resources the slice build already admitted for the
+/// same Sidecar, reused by the scope snapshot instead of a second pass.
+struct AdmittedEgressScope<'a> {
+    services: &'a [MeshService],
+    service_entries: &'a [ServiceEntry],
+    destination_rules: &'a [MeshDestinationRule],
+}
+
 struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
     mesh: &'a MeshConfig,
     sidecar: ResolvedSidecarEgress<'a>,
+    /// `Some` when `sidecar` is the slice's applied Sidecar (not dry-run):
+    /// the snapshot then reports the slice's own admitted set verbatim.
+    admitted: Option<AdmittedEgressScope<'a>>,
     workload_namespace: &'a str,
     workload_labels: &'a L,
     cluster_domain: &'a str,
@@ -2965,6 +2984,7 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
     let EgressScopeBuildContext {
         mesh,
         sidecar,
+        admitted,
         workload_namespace,
         workload_labels,
         cluster_domain,
@@ -2973,50 +2993,61 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         sidecar_enforced,
         dry_run,
     } = ctx;
-    let scoped_services: Vec<MeshService> = mesh
-        .services
-        .iter()
-        .filter_map(|service| narrow_service_ports(service, sidecar, cluster_domain))
-        .collect();
-    let scoped_service_entries: Vec<ServiceEntry> = mesh
-        .service_entries
-        .iter()
-        .filter(|entry| {
-            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
-        })
-        .flat_map(|entry| narrow_service_entry_ports(entry, sidecar))
-        .collect();
+    let (scoped_services, scoped_service_entries, scoped_destination_rules) = match admitted {
+        Some(admitted) => (
+            admitted.services.to_vec(),
+            admitted.service_entries.to_vec(),
+            admitted.destination_rules.to_vec(),
+        ),
+        None => {
+            let services: Vec<MeshService> = mesh
+                .services
+                .iter()
+                .filter_map(|service| narrow_service_ports(service, sidecar, cluster_domain))
+                .collect();
+            let service_entries: Vec<ServiceEntry> = mesh
+                .service_entries
+                .iter()
+                .filter(|entry| {
+                    service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
+                })
+                .flat_map(|entry| narrow_service_entry_ports(entry, sidecar))
+                .collect();
+            // The operator-facing egress-scope snapshot must report the SAME
+            // admitted set the live slice serves, so it runs the one shared
+            // admission pass (`exportTo` visibility → lookup tier → egress
+            // scope → tier resolution) rather than its own copy of the
+            // namespace rule (issues #2465, #2469).
+            let destination_rule_scope = DestinationRuleScope {
+                client_namespace: workload_namespace,
+                root_namespace: mesh.istio_root_namespace.as_str(),
+                cluster_domain,
+                mesh_service_identities,
+                service_entry_hosts,
+            };
+            let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
+                mesh.destination_rules.iter(),
+                &destination_rule_scope,
+                |_dr, resource_namespace, host_candidates| {
+                    let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                    sidecar_egress_includes_service(
+                        sidecar.namespace,
+                        sidecar.egress,
+                        resource_namespace,
+                        &host_refs,
+                        None,
+                    )
+                },
+            );
+            (services, service_entries, destination_rules)
+        }
+    };
     let scoped_workloads: Vec<Workload> = mesh
         .workloads
         .iter()
         .filter(|workload| workload.namespace == workload_namespace)
         .cloned()
         .collect();
-    // The operator-facing egress-scope snapshot must report the SAME admitted
-    // set the live slice serves, so it runs the one shared admission pass
-    // (`exportTo` visibility → lookup tier → egress scope → tier resolution)
-    // rather than its own copy of the namespace rule (issues #2465, #2469).
-    let destination_rule_scope = DestinationRuleScope {
-        client_namespace: workload_namespace,
-        root_namespace: mesh.istio_root_namespace.as_str(),
-        cluster_domain,
-        mesh_service_identities,
-        service_entry_hosts,
-    };
-    let scoped_destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
-        mesh.destination_rules.iter(),
-        &destination_rule_scope,
-        |_dr, resource_namespace, host_candidates| {
-            let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
-            sidecar_egress_includes_service(
-                sidecar.namespace,
-                sidecar.egress,
-                resource_namespace,
-                &host_refs,
-                None,
-            )
-        },
-    );
 
     let baseline_local_services = mesh
         .services
@@ -3040,11 +3071,19 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         .iter()
         .map(destination_rule_scope_resource)
         .collect();
+    let service_resources: Vec<MeshEgressScopeResource> = scoped_services
+        .iter()
+        .map(|service| mesh_service_scope_resource(service, cluster_domain))
+        .collect();
+    let service_entry_resources: Vec<MeshEgressScopeResource> = scoped_service_entries
+        .iter()
+        .map(service_entry_scope_resource)
+        .collect();
     let scope_slice = MeshSlice {
         namespace: workload_namespace.to_string(),
         workloads: scoped_workloads,
-        services: scoped_services.clone(),
-        service_entries: scoped_service_entries.clone(),
+        services: scoped_services,
+        service_entries: scoped_service_entries,
         destination_rules: scoped_destination_rules,
         outbound_traffic_policy: mesh.outbound_traffic_policy,
         ..MeshSlice::default()
@@ -3060,14 +3099,8 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         sidecar_denied_destination_rules: baseline_local_destination_rules
             .saturating_sub(admitted_local_destination_rules),
         destination_rules: destination_rule_resources,
-        services: scoped_services
-            .iter()
-            .map(|service| mesh_service_scope_resource(service, cluster_domain))
-            .collect(),
-        service_entries: scoped_service_entries
-            .iter()
-            .map(service_entry_scope_resource)
-            .collect(),
+        services: service_resources,
+        service_entries: service_entry_resources,
         known_destinations: scope_slice.build_known_destinations(cluster_domain),
     }
 }

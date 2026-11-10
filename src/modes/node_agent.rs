@@ -65,7 +65,7 @@ use crate::ebpf::{
     NodeAgentProxyMode, PodAttachmentState, PodInfo, TcAttachDirection,
 };
 use crate::modes::node_agent_cni_server::{
-    self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
+    self, CniListenerExit, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
 };
 use crate::proxy::node_waypoint_udp_reply_source::ReplySourceGeneration;
 
@@ -434,13 +434,6 @@ impl NodeAgentConfig {
         let node_waypoint_in_netns = env_config.node_agent_proxy_mode
             == NodeAgentProxyMode::NodeWaypoint
             && capture_config.outbound_capture_enabled;
-        // NodeWaypoint in-netns capture now binds both pod-loopback families.
-        // Keep the global IPv6 include so dual-stack destinations are captured
-        // instead of bypassing `mesh_authz`; if a pod's IPv6 listener is not
-        // ready yet, connect6 redirects to `[::1]:<port>` and fails closed by
-        // connection refusal until the proxy publishes `.ready6`.
-        capture_contract.ipv6_outbound_deny = false;
-
         // Inbound tc ingress redirect (issue #3287). Off unless the operator
         // names at least one node capture interface: the redirect replaces the
         // node-global iptables REDIRECT for enrolled workloads and needs an
@@ -515,7 +508,7 @@ impl NodeAgentConfig {
         // is a generic per-pod map; publishing it does NOT change eBPF/redirect
         // behavior — that stays gated on `node_waypoint_in_netns` via the capture
         // contract, so a plain Ambient (LocalPod) deployment gets the registry for
-        // the UDP producer WITHOUT the NodeWaypoint ipv6-deny / connect4-deferral
+        // the UDP producer WITHOUT the NodeWaypoint `::/0` include / connect4-deferral
         // posture. The UDP gate is `udp_capture_enabled && topology == ambient`,
         // but is NOT anded with `outbound_capture_enabled`: the producer binds its own
         // `FERRUM_MESH_CAPTURE_UDP_PORT` inside each pod netns and does not use the
@@ -1753,11 +1746,14 @@ fn create_backend(
 /// Explicit shutdown remains a clean `Ok` exit. Unexpected end-of-stream from
 /// the Kubernetes watcher still runs the same BPF/CNI cleanup, then returns
 /// `Err` so supervisors that restart only on nonzero exit will relaunch the
-/// agent (#2369).
+/// agent (#2369). A CNI listener that stops serving outside shutdown is fatal
+/// the same way (#7253): with the chained conflist installed every pod
+/// creation on the node fails until a listener serves the socket again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PodWatcherLoopExit {
     ShutdownRequested,
     WatcherExhausted,
+    CniListenerStopped(CniListenerExit),
 }
 
 /// Timer for the pod/CNI select loop's maintenance arms. `Delay` keeps a loop
@@ -2365,7 +2361,7 @@ where
     // channel stays empty and the receiver in the select! arm parks
     // forever — the kube-rs watcher remains the sole enrollment driver.
     let (cni_work_tx, mut cni_work_rx): (_, CniWorkReceiver) = cni_work_channel();
-    let cni_listener_handle = if cni_config.enabled {
+    let mut cni_listener_handle = if cni_config.enabled {
         // Durable ownership rides beside the configured CNI socket. Rehydrate
         // before the listener accepts GC so crash recovery can identify
         // Ferrum-owned attachments. Rejected durable state fails closed for GC
@@ -2419,6 +2415,15 @@ where
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = maintenance_interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
+    // The Node GET behind node-identity revalidation is bounded only by
+    // NODE_UID_LOOKUP_TIMEOUT (10 s), longer than the CNI server gives this
+    // loop to answer an RPC. It runs as a background task started on the
+    // retry cadence; this loop applies its result when it lands, so pod
+    // events, CNI calls and the other timers never wait on the API (#7254).
+    let mut node_uid_lookup: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
+    // The last applied refresh left identity fenced; the capture retry pass
+    // stays deferred while its registry-proof retraction is outstanding.
+    let mut node_identity_fenced = false;
     let mut topology_monitor_open = topology_monitor.is_some();
     let mut last_topology_outcome = topology_monitor
         .as_ref()
@@ -2713,18 +2718,40 @@ where
                     }
                     None => {
                         // Channel closed — listener task exited. Disable this
-                        // select arm so the watcher keeps running instead of
-                        // spinning on an immediately-ready closed receiver.
+                        // select arm so the loop never spins on an
+                        // immediately-ready closed receiver.
                         cni_work_open = false;
                         if *shutdown_rx.borrow() {
                             debug!("CNI work queue closed during shutdown");
-                        } else {
-                            // With the chained conflist installed, ADD fails
-                            // closed while no listener serves the socket, so
-                            // this is a node-wide pod-creation outage (#7253).
-                            error!(
-                                "Node-agent CNI listener is not serving; CNI ADD on this node fails closed until the node-agent is restarted"
-                            );
+                            continue;
+                        }
+                        // Every sender is gone, so the listener task has
+                        // returned (or is returning) its exit reason.
+                        let listener_exit = match cni_listener_handle.take() {
+                            Some(handle) => handle.await.unwrap_or(CniListenerExit::Failed),
+                            None => CniListenerExit::Failed,
+                        };
+                        match listener_exit {
+                            CniListenerExit::Unsupported => {
+                                warn!(
+                                    "Node-agent CNI listener is unavailable on this target; the kube-rs watcher is the sole enrollment path"
+                                );
+                            }
+                            CniListenerExit::Shutdown => {
+                                break PodWatcherLoopExit::ShutdownRequested;
+                            }
+                            CniListenerExit::Failed | CniListenerExit::ReplacedByAnotherOwner => {
+                                // With the chained conflist installed, ADD
+                                // fails closed while no listener serves the
+                                // socket: a node-wide pod-creation outage.
+                                // Exit nonzero so the supervisor restarts the
+                                // agent and with it the listener (#7253).
+                                error!(
+                                    listener_exit = ?listener_exit,
+                                    "Node-agent CNI listener stopped serving; exiting so a restart restores CNI ADD on this node"
+                                );
+                                break PodWatcherLoopExit::CniListenerStopped(listener_exit);
+                            }
                         }
                     }
                 }
@@ -2756,73 +2783,111 @@ where
                     );
                 }
             }
-            _ = retry_interval.tick() => {
-                // Revalidate / retry this node's Kubernetes UID on the existing
-                // enrollment-retry cadence (issue #3809). A transient API, RBAC,
-                // or publication failure must not leave identity unresolved
-                // forever, and a same-name Node recreation must not keep using
-                // the predecessor UID. Registry-sync is retracted before any
-                // identity lookup/change; capture mutations stay fenced while
-                // that retraction is outstanding.
-                if let (Some(registry_dir), Some(client)) = (
-                    config.node_waypoint_pod_registry_dir.as_deref(),
-                    kube_client.as_ref(),
-                ) {
-                    let refresh = refresh_node_identity_binding(
-                        udp_node_uid.as_deref(),
-                        &mut shutdown_rx,
-                        || resolve_this_node_uid(client, config.node_name.as_str()),
-                        || {
-                            match crate::proxy::udp_placement_migration::clear_registry_sync_marker(
-                                registry_dir,
-                            ) {
-                                Ok(()) => {
-                                    readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
-                                    Ok(())
-                                }
-                                Err(error) => {
-                                    readiness.record_udp_proof(
-                                        UdpRegistryProofEvent::RetractionFailed,
-                                    );
-                                    Err(error)
-                                }
+            node_uid = async {
+                match node_uid_lookup.as_mut() {
+                    Some(lookup) => lookup.await,
+                    None => std::future::pending().await,
+                }
+            }, if node_uid_lookup.is_some() => {
+                node_uid_lookup = None;
+                let node_uid = node_uid.unwrap_or_else(|_| {
+                    Err("the node UID lookup task did not complete".to_string())
+                });
+                // Background lookups are started only when both are present.
+                let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
+                    continue;
+                };
+                // Revalidate / retry this node's Kubernetes UID (issue #3809).
+                // A transient API, RBAC, or publication failure must not leave
+                // identity unresolved forever, and a same-name Node recreation
+                // must not keep using the predecessor UID. Registry-sync is
+                // retracted before any identity change is applied; capture
+                // mutations stay fenced while that retraction is outstanding.
+                // The lookup already ran in the background, so this applies its
+                // result without awaiting the API.
+                let refresh = refresh_node_identity_binding(
+                    udp_node_uid.as_deref(),
+                    &mut shutdown_rx,
+                    || std::future::ready(node_uid),
+                    || {
+                        match crate::proxy::udp_placement_migration::clear_registry_sync_marker(
+                            registry_dir,
+                        ) {
+                            Ok(()) => {
+                                readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
+                                Ok(())
                             }
-                        },
-                        || {
-                            crate::proxy::udp_placement_migration::retract_node_identity(
-                                registry_dir,
-                            )
-                        },
-                        |uid| {
-                            crate::proxy::udp_placement_migration::publish_node_identity(
-                                registry_dir,
-                                uid,
-                            )
-                        },
-                    )
-                    .await;
-                    match refresh {
-                        NodeIdentityRefresh::Interrupted { uid } => {
-                            udp_node_uid = uid;
-                            if *shutdown_rx.borrow() {
-                                break PodWatcherLoopExit::ShutdownRequested;
+                            Err(error) => {
+                                readiness.record_udp_proof(
+                                    UdpRegistryProofEvent::RetractionFailed,
+                                );
+                                Err(error)
                             }
                         }
-                        refresh => {
-                            // A retraction during the refresh already moved
-                            // the proof (and therefore readiness) through
-                            // the closure above.
-                            udp_node_uid = refresh.uid().map(str::to_string);
-                            if matches!(refresh, NodeIdentityRefresh::Fenced { .. })
-                                && readiness.udp_proof.retraction_pending()
-                            {
-                                warn!(
-                                    "Deferring capture retry tick until node identity and Ambient UDP registry proof retraction recover"
-                                );
-                                continue;
-                            }
+                    },
+                    || {
+                        crate::proxy::udp_placement_migration::retract_node_identity(
+                            registry_dir,
+                        )
+                    },
+                    |uid| {
+                        crate::proxy::udp_placement_migration::publish_node_identity(
+                            registry_dir,
+                            uid,
+                        )
+                    },
+                )
+                .await;
+                match refresh {
+                    NodeIdentityRefresh::Interrupted { uid } => {
+                        udp_node_uid = uid;
+                        if *shutdown_rx.borrow() {
+                            break PodWatcherLoopExit::ShutdownRequested;
                         }
                     }
+                    refresh => {
+                        // A retraction during the refresh already moved the
+                        // proof (and therefore readiness) through the closure
+                        // above.
+                        udp_node_uid = refresh.uid().map(str::to_string);
+                        node_identity_fenced =
+                            matches!(refresh, NodeIdentityRefresh::Fenced { .. });
+                    }
+                }
+                // Republish a registry-sync marker bound to the refreshed
+                // identity now rather than on the next retry tick.
+                if !node_identity_fenced
+                    && readiness.pod_sync.is_synced()
+                    && readiness.udp_proof != UdpRegistryProof::Published
+                    && let Some(generation) = udp_migration_generation.as_deref()
+                {
+                    publish_udp_migration_registry_sync_with_recovery(
+                        generation,
+                        &pod_states,
+                        config,
+                        udp_node_uid.as_deref(),
+                        &mut readiness,
+                    );
+                }
+            }
+            _ = retry_interval.tick() => {
+                // Start the next node-identity revalidation in the background
+                // (see `node_uid_lookup`); at most one is in flight.
+                if node_uid_lookup.is_none()
+                    && config.node_waypoint_pod_registry_dir.is_some()
+                    && let Some(client) = kube_client.as_ref()
+                {
+                    let client = client.clone();
+                    let node_name = config.node_name.clone();
+                    node_uid_lookup = Some(tokio::spawn(async move {
+                        resolve_this_node_uid(&client, &node_name).await
+                    }));
+                }
+                if node_identity_fenced && readiness.udp_proof.retraction_pending() {
+                    warn!(
+                        "Deferring capture retry tick until node identity and Ambient UDP registry proof retraction recover"
+                    );
+                    continue;
                 }
                 // Re-drive any pod whose transient enrollment failure has aged
                 // past the backoff window, and retry stale detach/map cleanup
@@ -2983,6 +3048,10 @@ where
             }
         }
     };
+    // A revalidation still in flight has nothing left to apply it to.
+    if let Some(lookup) = node_uid_lookup.take() {
+        lookup.abort();
+    }
 
     // Same finally-style path for both exit reasons: stop background CNI work,
     // detach BPF / maps, then await the listener. Watcher exhaustion must not
@@ -3001,22 +3070,35 @@ where
         attached_pods = pod_states.len(),
         "Node agent shutting down, detaching BPF programs"
     );
-    let registry_proof_retracted = match retract_udp_migration_registry_sync_for_mutation(
-        udp_migration_generation.is_some(),
-        config,
-        &mut readiness,
-        UdpRegistryMutationLane::Shutdown,
-    ) {
-        Ok(_) => true,
-        Err(error) => {
-            warn!(
-                error = %crate::startup::sanitize_startup_scalar(&error),
-                "Ambient UDP registry proof could not be retracted during shutdown; preserving registry entries and refusing ordered pod detach mutation"
-            );
-            false
+    // Another live generation published over this agent's CNI socket: its
+    // capture state and registry proof may be what that owner serves, so this
+    // agent leaves both untouched (the same latch as a failed retraction).
+    let another_owner_is_live = matches!(
+        exit_reason,
+        PodWatcherLoopExit::CniListenerStopped(CniListenerExit::ReplacedByAnotherOwner)
+    );
+    let registry_proof_retracted = if another_owner_is_live {
+        false
+    } else {
+        match retract_udp_migration_registry_sync_for_mutation(
+            udp_migration_generation.is_some(),
+            config,
+            &mut readiness,
+            UdpRegistryMutationLane::Shutdown,
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Ambient UDP registry proof could not be retracted during shutdown; preserving registry entries and refusing ordered pod detach mutation"
+                );
+                false
+            }
         }
     };
-    if registry_proof_retracted {
+    if another_owner_is_live {
+        owner.preserve_fail_closed_state("CNI socket replaced by another live node-agent");
+    } else if registry_proof_retracted {
         owner.shutdown_pods(&pod_states, config);
     } else {
         // The marker is still a live proof consumed by the mesh cleanup
@@ -3046,6 +3128,9 @@ where
         PodWatcherLoopExit::WatcherExhausted => {
             Err(anyhow::anyhow!("Pod watcher ended unexpectedly"))
         }
+        PodWatcherLoopExit::CniListenerStopped(_) => Err(anyhow::anyhow!(
+            "Node-agent CNI listener stopped serving the CNI socket"
+        )),
     }
 }
 
@@ -9488,27 +9573,59 @@ async fn handle_fallback(
         None
     };
 
-    let result = handle_fallback_with(
+    let fallback = handle_fallback_with(
         config,
         probe,
         metrics.as_ref(),
         shutdown_tx,
         |cmds, phase| async move { execute_iptables_commands(&cmds, phase).await },
         startup_ready,
-    )
-    .await;
+    );
 
-    if let Some((listener, worker)) = cni_handles {
-        shutdown_tx.shutdown();
-        if let Err(err) = listener.await {
-            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough listener task panicked");
+    let Some((mut listener, worker)) = cni_handles else {
+        return fallback.await;
+    };
+    // A passthrough listener that stops serving outside shutdown is the same
+    // node-wide pod-creation outage as on the eBPF path (#7253): shut the
+    // fallback down through its normal cleanup and exit nonzero.
+    tokio::pin!(fallback);
+    let mut listener_failure = None;
+    let mut listener_joined = false;
+    let result = tokio::select! {
+        result = &mut fallback => result,
+        exit = &mut listener => {
+            listener_joined = true;
+            let exit = exit.unwrap_or(CniListenerExit::Failed);
+            if matches!(
+                exit,
+                CniListenerExit::Failed | CniListenerExit::ReplacedByAnotherOwner
+            ) && !*shutdown_tx.borrow()
+            {
+                error!(
+                    listener_exit = ?exit,
+                    "Node-agent CNI passthrough listener stopped serving; exiting so a restart restores CNI ADD on this node"
+                );
+                listener_failure = Some(exit);
+                shutdown_tx.shutdown();
+            }
+            fallback.await
         }
-        if let Err(err) = worker.await {
-            warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough worker task panicked");
-        }
+    };
+
+    shutdown_tx.shutdown();
+    if !listener_joined && let Err(err) = listener.await {
+        warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough listener task panicked");
+    }
+    if let Err(err) = worker.await {
+        warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough worker task panicked");
     }
 
-    result
+    match (result, listener_failure) {
+        (Ok(()), Some(_)) => Err(anyhow::anyhow!(
+            "Node-agent CNI passthrough listener stopped serving the CNI socket"
+        )),
+        (result, _) => result,
+    }
 }
 
 fn spawn_cni_passthrough_listener(
@@ -9517,7 +9634,10 @@ fn spawn_cni_passthrough_listener(
     shutdown: tokio::sync::watch::Receiver<bool>,
     startup_ready: Arc<AtomicBool>,
     ownership_store_path: Option<std::path::PathBuf>,
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+) -> (
+    tokio::task::JoinHandle<CniListenerExit>,
+    tokio::task::JoinHandle<()>,
+) {
     let (cni_work_tx, mut cni_work_rx) = cni_work_channel();
     let listener = spawn_cni_listener(socket_path, cni_work_tx.clone(), metrics, shutdown);
     drop(cni_work_tx);
@@ -9638,31 +9758,10 @@ where
             // Always try IPv6 cleanup: an earlier process/config may have
             // created ip6tables chains even when the current plan has none.
             let include_v6_cleanup = true;
-            let udp_capture_enabled = config.capture_config.udp_capture_enabled;
 
-            // The node-agent runs in the HOST netns, where the UDP TPROXY
-            // `addrtype --dst-type LOCAL` direction split is wrong (pod IPs are
-            // FORWARDED, not LOCAL), so `udp_tproxy_commands_for_family` emits NO
-            // UDP TPROXY rules for `host_netns`. Surface that explicitly so an
-            // operator who set FERRUM_MESH_CAPTURE_UDP_ENABLED=true on the
-            // node-agent is not silently left thinking UDP is captured: node-agent
-            // host-netns UDP capture is unsupported in this stage and eBPF does NOT
-            // cover UDP either (the connect()-cgroup hooks are TCP-only). UDP
-            // capture lives in the injector's pod-netns path; node-agent /
-            // node-waypoint UDP capture is a future stage.
-            if udp_capture_enabled && config.capture_config.host_netns {
-                warn!(
-                    "FERRUM_MESH_CAPTURE_UDP_ENABLED=true, but the node-agent installs no UDP \
-                     TPROXY rules: it has no UDP listener, and capture rules without a socket \
-                     are a black hole. This is expected — UDP capture is owned by the mesh \
-                     proxy. For Ambient, set FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
-                     on the ambient proxy to use the host-network capture path (per-pod \
-                     ingress-interface scoping), or leave it unset to use the per-pod-netns \
-                     producer; for Sidecar, the injector's init container installs the \
-                     pod-netns rules. eBPF capture does NOT cover UDP either (the \
-                     connect()-cgroup hooks are TCP-only). TCP capture is unaffected."
-                );
-            }
+            // The fallback never captures UDP: only the Ambient topology enables
+            // it, and `run` refuses this fallback for Ambient (#7254). Host-netns
+            // UDP TPROXY is unsupported anyway (pod IPs are FORWARDED, not LOCAL).
 
             // UNCONDITIONAL pre-setup teardown of the EXACT Ferrum-owned UDP TPROXY
             // state, regardless of the CURRENT `udp_capture_enabled` flag (codex
@@ -9693,7 +9792,7 @@ where
 
             let setup = setup_commands_for_plan(&plan);
             if let Err(setup_err) = execute(setup, "setup").await {
-                let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
+                let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
                 if let Err(cleanup_err) = execute(cleanup, "cleanup").await {
                     warn!(
                         error = %crate::startup::sanitize_startup_scalar(&cleanup_err),
@@ -9710,7 +9809,7 @@ where
             wait_for_shutdown(shutdown_tx).await;
 
             info!("Shutdown signal received, cleaning up iptables rules");
-            let cleanup = cleanup_commands_for_plan(include_v6_cleanup, udp_capture_enabled);
+            let cleanup = cleanup_commands_for_plan(include_v6_cleanup);
             if let Err(e) = execute(cleanup, "cleanup").await {
                 warn!(error = %crate::startup::sanitize_startup_scalar(&e), "Failed to clean up iptables fallback rules");
             }
@@ -9768,20 +9867,17 @@ fn setup_commands_for_plan(plan: &IptablesPlan) -> Vec<String> {
     commands
 }
 
-fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec<String> {
-    // `udp_capture_enabled` gates the UDP TPROXY teardown (mangle chains + the
-    // Ferrum-owned `ip rule`/`ip route`): when this node never installs UDP
-    // capture, cleanup must not touch routing state it never created (codex r1).
-    //
-    // The cleanup is split into the iptables-TABLE teardown and the RAW `ip`
-    // routing teardown. The IPv4 routing teardown is already emitted
-    // unconditionally (raw `ip`, no iptables dependency).
-    let v4 = IptablesPlan::cleanup_split(udp_capture_enabled);
+/// TCP-capture teardown for the iptables fallback. The fallback never installs
+/// UDP capture: `NodeAgentConfig::from_env_config` enables it only for the
+/// Ambient topology, and `run` refuses the fallback for Ambient (#7254). Stale
+/// UDP state from an earlier run is reaped by [`udp_pre_setup_teardown_commands`].
+fn cleanup_commands_for_plan(include_v6: bool) -> Vec<String> {
+    let v4 = IptablesPlan::cleanup_split();
     let mut commands = v4.iptables;
     commands.extend(v4.ip_routing);
     if include_v6 {
-        let v6 = IptablesPlan::cleanup_v6_split(udp_capture_enabled);
-        // Only the ip6tables-TABLE teardown is guarded behind an `ip6tables`
+        let v6 = IptablesPlan::cleanup_v6_split();
+        // The ip6tables-TABLE teardown is guarded behind an `ip6tables`
         // availability probe — stale v6 chains from an earlier config should not
         // make node-agent fallback cleanup fail when `ip6tables` is absent.
         commands.extend(
@@ -9789,11 +9885,6 @@ fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec
                 .iter()
                 .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
         );
-        // The RAW `ip -6` routing teardown (fwmark rule + local route) is emitted
-        // UNCONDITIONALLY — `ip -6` does not depend on `ip6tables`, so gating it on
-        // the probe would leak the rule/route and keep diverting marked UDP after
-        // shutdown when `ip6tables` is missing (codex r3). It carries its own
-        // best-effort `|| true`.
         commands.extend(v6.ip_routing);
     }
     commands
@@ -11111,9 +11202,9 @@ mod tests {
     #[test]
     fn from_env_config_captures_ipv6_only_in_node_waypoint_mode() {
         // NodeWaypoint in-netns capture binds both pod-loopback families, so the
-        // node-agent must include IPv6 destinations but must not set the old
-        // global deny flag. Other proxy modes leave the normal IPv4-only default
-        // include shape alone.
+        // node-agent must include IPv6 destinations (connect6 redirects them to
+        // `[::1]`). Other proxy modes leave the normal IPv4-only default include
+        // shape alone.
         let waypoint = EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
             ..EnvConfig::default()
@@ -11121,18 +11212,6 @@ mod tests {
         with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-a")], || {
             let config = NodeAgentConfig::from_env_config(&waypoint)
                 .expect("node-agent config should parse");
-            assert!(
-                !config.capture_contract.ipv6_outbound_deny,
-                "NodeWaypoint in-netns mode must redirect captured IPv6 egress to the IPv6 pod-loopback listener"
-            );
-            assert_eq!(
-                config
-                    .capture_contract
-                    .bpf_capture_config()
-                    .ipv6_outbound_deny,
-                0,
-                "the old deny flag must remain clear so connect6 redirects to [::1]"
-            );
             assert!(
                 config
                     .capture_config
@@ -11155,10 +11234,6 @@ mod tests {
             let config = NodeAgentConfig::from_env_config(&local_pod)
                 .expect("node-agent config should parse");
             assert!(
-                !config.capture_contract.ipv6_outbound_deny,
-                "non-NodeWaypoint modes do not fail-close IPv6 egress"
-            );
-            assert!(
                 !config
                     .capture_config
                     .include_cidrs
@@ -11174,7 +11249,7 @@ mod tests {
         // #2013: a plain Ambient (LocalPod) node-agent with UDP capture enabled
         // must publish the per-pod registry so the mesh proxy's per-pod-netns UDP
         // producer can discover enrolled pods — WITHOUT taking on the NodeWaypoint
-        // ipv6-deny / connect4-deferral posture (which stays gated on
+        // `::/0` include / connect4-deferral posture (which stays gated on
         // `node_waypoint_in_netns`).
         let local_pod = EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
@@ -11192,10 +11267,6 @@ mod tests {
                 assert!(
                     config.node_waypoint_pod_registry_dir.is_some(),
                     "Ambient/LocalPod + UDP capture must publish the per-pod registry (#2013)"
-                );
-                assert!(
-                    !config.capture_contract.ipv6_outbound_deny,
-                    "the UDP producer must not flip the NodeWaypoint ipv6-deny posture"
                 );
                 assert!(
                     !config
@@ -14276,7 +14347,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_try_ipv6_teardown_when_ip6tables_disabled() {
-        let commands = cleanup_commands_for_plan(true, false);
+        let commands = cleanup_commands_for_plan(true);
 
         assert!(
             commands.iter().any(|cmd| cmd.contains("ip6tables")),
@@ -14292,7 +14363,7 @@ mod tests {
 
     #[test]
     fn cleanup_commands_wrap_required_ipv6_teardown_best_effort() {
-        let commands = cleanup_commands_for_plan(true, false);
+        let commands = cleanup_commands_for_plan(true);
 
         assert!(
             commands
@@ -14309,13 +14380,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_emits_v6_ip_routing_unconditionally_not_ip6tables_gated() {
+    fn udp_teardown_emits_v6_ip_routing_unconditionally_not_ip6tables_gated() {
         // codex r3: the raw `ip -6 rule/route del` UDP routing teardown must be
         // emitted UNCONDITIONALLY (NOT wrapped in the `ip6tables` availability
         // probe) — `ip -6` can remove the fwmark rule + local route even when
         // `ip6tables` is missing, so gating it would leak routing state and keep
-        // marked UDP diverting after shutdown.
-        let commands = cleanup_commands_for_plan(true, true);
+        // marked UDP diverting after shutdown. The fallback's shutdown cleanup
+        // carries no UDP state (#7254); the pre-setup teardown owns it.
+        let commands = udp_pre_setup_teardown_commands(true);
 
         // The v6 `ip -6 rule del`/`ip -6 route del` must appear as standalone
         // commands, NOT embedded inside an `if command -v ip6tables` wrapper.

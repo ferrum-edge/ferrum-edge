@@ -303,8 +303,8 @@ impl OutboundRegistry {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn registry_size(&self) -> usize {
+    #[cfg(test)]
+    fn registry_size(&self) -> usize {
         self.hosts.len()
             + self.host_ports.len()
             + self.any_port_hosts.len()

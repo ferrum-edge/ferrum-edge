@@ -69,6 +69,50 @@ fn acme_frontend(auto_renew: bool, live_reload: bool) -> EnvConfig {
     }
 }
 
+/// Issue #7251: only database, file and dp modes run the ACME renewal
+/// scheduler, so every other mode refuses the flag instead of accepting it and
+/// never renewing.
+#[test]
+fn acme_auto_renew_is_refused_in_modes_without_the_renewal_scheduler() {
+    use ferrum_edge::config::env_config::OperatingMode;
+
+    for (mode, runs_scheduler) in [
+        (OperatingMode::Database, true),
+        (OperatingMode::File, true),
+        (OperatingMode::DataPlane, true),
+        (OperatingMode::Mesh, false),
+        (OperatingMode::ControlPlane, false),
+        (OperatingMode::Injector, false),
+        (OperatingMode::NodeAgent, false),
+        (OperatingMode::Migrate, false),
+    ] {
+        let enabled = EnvConfig {
+            mode: mode.clone(),
+            acme_auto_renew_enabled: true,
+            ..Default::default()
+        };
+        let result = enabled.validate_acme_renewal_mode();
+        if runs_scheduler {
+            result.unwrap_or_else(|error| panic!("{mode:?} runs the scheduler: {error}"));
+        } else {
+            let error = result.expect_err("a mode without the scheduler must refuse the flag");
+            assert!(
+                error.contains("FERRUM_ACME_AUTO_RENEW_ENABLED"),
+                "the diagnostic must name the flag: {error}"
+            );
+        }
+
+        let disabled = EnvConfig {
+            mode,
+            acme_auto_renew_enabled: false,
+            ..Default::default()
+        };
+        disabled
+            .validate_acme_renewal_mode()
+            .expect("auto-renew off is valid in every mode");
+    }
+}
+
 #[test]
 fn acme_renewal_reachability_accepts_auto_renew_disabled() {
     acme_frontend(false, false)

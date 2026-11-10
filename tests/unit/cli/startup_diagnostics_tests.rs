@@ -327,9 +327,11 @@ fn cidr_reasons_withhold_prefix_values_and_keep_bounds() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn cni_startup_failures_withhold_paths_and_keep_watcher_fallback() {
+async fn cni_startup_failures_withhold_paths_and_report_the_outage() {
     use ferrum_edge::ebpf::NodeAgentMetrics;
-    use ferrum_edge::modes::node_agent_cni_server::{cni_work_channel, spawn_cni_listener};
+    use ferrum_edge::modes::node_agent_cni_server::{
+        CniListenerExit, cni_work_channel, spawn_cni_listener,
+    };
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
     use std::time::Duration;
@@ -367,17 +369,40 @@ async fn cni_startup_failures_withhold_paths_and_keep_watcher_fallback() {
         crate::diagnostic_test_interest::ensure_interest_floor();
         let _guard = tracing::subscriber::set_default(subscriber);
         let (sender, mut receiver) = cni_work_channel();
-        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = spawn_cni_listener(
             socket.to_str().unwrap().to_string(),
             sender,
             Arc::new(NodeAgentMetrics::default()),
             shutdown_rx,
         );
-        tokio::time::timeout(Duration::from_secs(5), task)
+        if failure == "owner" {
+            // A live owner is waited out, not a failure (#7253): the listener
+            // reports the conflict and keeps retrying until shutdown.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !String::from_utf8(logs.0.lock().unwrap().clone())
+                .unwrap()
+                .contains("ownership_conflict")
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the waiting listener never reported the conflict"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!task.is_finished(), "a live owner must be waited out");
+            shutdown.send(true).unwrap();
+        }
+        let exit = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .unwrap()
             .unwrap();
+        let expected_exit = if failure == "owner" {
+            CniListenerExit::Shutdown
+        } else {
+            CniListenerExit::Failed
+        };
+        assert_eq!(exit, expected_exit);
         assert!(
             receiver.recv().await.is_none(),
             "failed listener must release its queue"
@@ -400,7 +425,7 @@ async fn cni_startup_failures_withhold_paths_and_keep_watcher_fallback() {
         assert!(!output.contains("kube-rs watcher"), "{output}");
         assert!(
             output.contains("CNI ADD on this node fails closed")
-                || output.contains("serves no CNI calls until restarted"),
+                || output.contains("waiting to take over when it exits"),
             "{output}"
         );
         let reason = if failure == "owner" {

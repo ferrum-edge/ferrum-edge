@@ -1103,6 +1103,18 @@ fn jwt_expiration_hint_is_bounded_and_refuses_non_jws_shapes() {
     // An oversized payload segment is not parsed at all.
     let oversized = "A".repeat(9 * 1024);
     assert!(jwt_expiration_hint(&format!("a.{oversized}.c")).is_none());
+    // The segment cap alone bounds the decoded payload: an exactly 8 KiB
+    // segment (6 KiB of JSON) is still parsed, one byte more is not.
+    let mut padded = br#"{"exp":2000000000,"pad":""#.to_vec();
+    padded.resize(6 * 1024 - 2, b'p');
+    padded.extend_from_slice(br#""}"#);
+    let at_cap = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&padded);
+    assert_eq!(at_cap.len(), 8 * 1024);
+    assert_eq!(
+        jwt_expiration_hint(&format!("a.{at_cap}.c")),
+        Some(2_000_000_000)
+    );
+    assert!(jwt_expiration_hint(&format!("a.{at_cap}A.c")).is_none());
 }
 
 /// Unix epoch zero and negative NumericDate values are plainly expired. They

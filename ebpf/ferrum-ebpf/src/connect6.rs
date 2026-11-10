@@ -83,15 +83,9 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         return Ok(1);
     }
 
-    // Optional fail-closed valve: when configured, DENY a captured IPv6
-    // connection — return 0 so the kernel fails the `connect()` with EPERM —
-    // instead of redirecting it. NodeWaypoint keeps this flag clear now that the
-    // proxy opens an IPv6 pod-loopback listener; if that listener is not ready,
-    // the redirect to [::1]:<port> fails closed by connection refusal.
-    if ipv6_outbound_deny() {
-        return Ok(0);
-    }
-
+    // A captured connection is redirected to [::1]:<port>; if the pod's IPv6
+    // capture listener is not ready yet, the redirect fails closed by
+    // connection refusal.
     let cookie = unsafe { aya_ebpf::helpers::bpf_get_socket_cookie(ctx.as_ptr()) };
     let key = OrigDstKey { cookie };
     // Stamp the source pod's identity onto the orig-dst record (see connect4
@@ -135,18 +129,6 @@ fn outbound_capture_port() -> u32 {
     match unsafe { FERRUM_CAPTURE_CONFIG.get(&key) } {
         Some(config) if config.outbound_capture_port != 0 => config.outbound_capture_port & 0xffff,
         _ => OUTBOUND_CAPTURE_PORT as u32,
-    }
-}
-
-/// Whether captured IPv6 egress should fail closed before redirect. Absent
-/// config → `false` (redirect as normal), so non-NodeWaypoint capture is
-/// unaffected.
-#[inline(always)]
-fn ipv6_outbound_deny() -> bool {
-    let key = FERRUM_CAPTURE_CONFIG_KEY;
-    match unsafe { FERRUM_CAPTURE_CONFIG.get(&key) } {
-        Some(config) => config.ipv6_outbound_deny != 0,
-        None => false,
     }
 }
 
