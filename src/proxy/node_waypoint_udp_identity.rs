@@ -1037,10 +1037,25 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
         );
         let mut ticker = tokio::time::interval(self.poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A pass reads sysfs per enrolled pod and reconciles Service steering
+        // through `sh -c` iptables scripts that block until the child exits,
+        // so it runs on the blocking pool rather than a runtime worker (issue
+        // #7170). Passes stay sequential: each is awaited before the next tick.
+        let manager = Arc::new(self);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.reconcile_once();
+                    let pass = Arc::clone(&manager);
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
+                        pass.reconcile_once();
+                    })
+                    .await
+                    {
+                        warn!(
+                            %error,
+                            "NodeWaypoint UDP source-identity reconcile pass did not complete"
+                        );
+                    }
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {

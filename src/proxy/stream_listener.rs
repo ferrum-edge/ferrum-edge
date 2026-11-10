@@ -4230,7 +4230,8 @@ impl StreamListenerManager {
             self.node_waypoint_udp_source_index.load_full().as_ref(),
             &listeners,
             exclude,
-        );
+        )
+        .await;
     }
 
     /// Build-validate the cached backend TLS `ClientConfig` for a TCP+TLS
@@ -4515,8 +4516,8 @@ fn node_waypoint_udp_published_ifaces(
         .unwrap_or_default()
 }
 
-fn publish_bound_node_waypoint_udp_destinations(
-    steering: &crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering,
+async fn publish_bound_node_waypoint_udp_destinations(
+    steering: &Arc<crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering>,
     desired: &[crate::capture::NodeWaypointUdpSteerDestination],
     source_index: &Option<
         Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
@@ -4549,7 +4550,18 @@ fn publish_bound_node_waypoint_udp_destinations(
         Vec::new()
     };
     let ifaces = node_waypoint_udp_published_ifaces(source_index);
-    steering.set_bound_destinations(destinations, Some(&ifaces), serving);
+    // The steering apply runs `sh -c` iptables scripts that block until the
+    // child exits, so it runs on the blocking pool rather than a runtime worker
+    // (issue #7170). Callers hold the listener map lock across this await, so
+    // publications stay serialized exactly as before.
+    let steering = Arc::clone(steering);
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        steering.set_bound_destinations(destinations, Some(&ifaces), serving)
+    })
+    .await
+    {
+        warn!(%error, "NodeWaypoint UDP steering publication did not complete");
+    }
 }
 
 /// Mark this exact listener generation non-serving and republish the
@@ -4558,7 +4570,7 @@ fn publish_bound_node_waypoint_udp_destinations(
 async fn retract_owned_node_waypoint_udp_listener(
     listeners: &tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>,
     steering_open: &AtomicBool,
-    steering: &crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering,
+    steering: &Arc<crate::proxy::node_waypoint_udp_steering::NodeWaypointUdpSteering>,
     config: &arc_swap::ArcSwap<GatewayConfig>,
     source_index: &Option<
         Arc<crate::proxy::node_waypoint_udp_identity::NodeWaypointUdpSourceIndex>,
@@ -4582,7 +4594,8 @@ async fn retract_owned_node_waypoint_udp_listener(
         source_index,
         &guard,
         &std::collections::HashSet::new(),
-    );
+    )
+    .await;
 }
 
 /// Wait until this NodeWaypoint UDP/DTLS listener actually binds, then publish
@@ -4648,7 +4661,8 @@ fn spawn_node_waypoint_udp_steer_bind_watch(
             source_index.as_ref(),
             &guard,
             &std::collections::HashSet::new(),
-        );
+        )
+        .await;
     });
 }
 
