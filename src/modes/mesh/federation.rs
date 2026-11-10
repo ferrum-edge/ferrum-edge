@@ -97,6 +97,11 @@ pub struct FederationSnapshot {
 pub struct FederatedBundle {
     pub bundle: TrustBundle,
     pub fetched_at_unix_seconds: u64,
+    /// Origin (`scheme://host[:port]`) of the federation endpoint the bundle
+    /// was fetched from, as reduced by `sanitize_endpoint_for_logging`. The
+    /// configured URL may carry credentials in its userinfo, path, query or
+    /// fragment, and this value is served by `GET /mesh/federation`, so the
+    /// full URL is never stored here.
     pub endpoint: String,
     pub cluster_name: String,
 }
@@ -1101,7 +1106,7 @@ async fn fetch_and_install_bundle(
     let federated = FederatedBundle {
         bundle,
         fetched_at_unix_seconds: now,
-        endpoint: endpoint.to_string(),
+        endpoint: endpoint_for_logs.clone(),
         cluster_name: cluster_name.to_string(),
     };
     let installed = store.install(
