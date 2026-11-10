@@ -47189,31 +47189,10 @@ async fn handle_proxy_request_inner(
     // `draining` uses Acquire to synchronize-with the Release-ordered store
     // in `overload::begin_drain` so the close hint is observed promptly on
     // weakly-ordered architectures (mirrors the PR #569 startup_ready pattern).
-    //
-    // We OR `disable_keepalive` (the binary pressure-mode flag) with
-    // `should_disable_keepalive_red()` (RED probabilistic shedding). Both
-    // signals must be honored: the binary flag is the authoritative
-    // "pressure-mode active" signal, while RED probability is a separate
-    // adaptive smoothing mechanism. They are independent `Relaxed` writes
-    // in the monitor loop, so a reader can transiently observe
-    // `disable_keepalive = true` while `red_drop_probability` still holds
-    // the prior cycle's value of 0 — and at the exact pressure threshold
-    // the linear ramp produces probability 0 even though `disable_keepalive`
-    // is set. Without the OR, those windows would skip Connection: close
-    // and defeat the purpose of the binary pressure-mode signal.
-    // Cost: draining check is one AtomicBool::load(Acquire) ~1ns (no-op on x86);
-    // disable_keepalive check is one AtomicBool::load(Relaxed) ~1ns;
-    // RED check is one AtomicU32::load + one AtomicU64::load + one multiply ~3ns.
-    if state
-        .overload
-        .draining
-        .load(std::sync::atomic::Ordering::Acquire)
-        || state
-            .overload
-            .disable_keepalive
-            .load(std::sync::atomic::Ordering::Relaxed)
-        || state.overload.should_disable_keepalive_red()
-    {
+    // `OverloadState::should_close_keepalive` ORs drain, the binary
+    // pressure-mode flag and RED shedding; see its doc for why each signal
+    // must be honored on its own.
+    if state.overload.should_close_keepalive() {
         resp_builder = resp_builder.header("connection", "close");
     }
 
