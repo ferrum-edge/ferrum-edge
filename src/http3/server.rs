@@ -7665,14 +7665,24 @@ async fn handle_h3_request(
         Ok(url) => url,
         Err(_) => {
             cb_probe.release_neutral();
-            record_request(
-                &state,
-                if matches!(http_flavor, HttpFlavor::Grpc) {
-                    200
-                } else {
-                    500
-                },
-            );
+            let log_status_code = if matches!(http_flavor, HttpFlavor::Grpc) {
+                200
+            } else {
+                500
+            };
+            // Logged under the H1/H2 sibling's phase before the count (issue
+            // #7156); boxed out of line for this handler's stack budget.
+            crate::proxy::boxed_log_rejected_request_with_path(
+                &plugins,
+                &ctx,
+                log_status_code,
+                start_time,
+                crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+                plugin_execution_ns,
+                Some(&original_request_path),
+            )
+            .await;
+            record_request(&state, log_status_code);
             send_h3_error_flavor_aware_with_policy(
                 &mut stream,
                 http_flavor,
@@ -7847,6 +7857,18 @@ async fn handle_h3_request(
             MESH_DISPATCH_REQUIRED_REJECT_BODY,
             &reason_headers,
         );
+        // Logged before the count like every sibling reject (issue #7157);
+        // boxed out of line for this handler's stack budget.
+        crate::proxy::boxed_log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            reject_metric_status,
+            start_time,
+            crate::diagnostic_ref::MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
         record_request(&state, reject_metric_status);
         send_h3_plugin_reject_flavor_aware(
             &mut stream,
@@ -10807,6 +10829,8 @@ async fn handle_h3_request(
             h3_handoff,
             final_cb_target_key,
             final_target,
+            // The URL of `final_target`, set only by a retry loop (issue #7159).
+            final_url,
         ) = if let Some(retry_config) = &proxy.retry {
             let mut attempt = 0u32;
             let mut current_target = upstream_target.clone();
@@ -11067,11 +11091,12 @@ async fn handle_h3_request(
                 // produced the result being served.
                 let pre_rotation_target = current_target.clone();
                 let pre_rotation_cb_target_key = current_cb_target_key.clone();
+                let mut pre_rotation_url = None;
                 if let Some((next, next_url)) = next_retry_target {
                     let target_changed = current_target.as_ref().is_some_and(|prev_target| {
                         next.host != prev_target.host || next.port != prev_target.port
                     });
-                    current_url = next_url;
+                    pre_rotation_url = Some(std::mem::replace(&mut current_url, next_url));
                     current_cb_target_key =
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     current_target = Some(next);
@@ -11172,6 +11197,9 @@ async fn handle_h3_request(
                 ) {
                     current_target = pre_rotation_target;
                     current_cb_target_key = pre_rotation_cb_target_key;
+                    if let Some(url) = pre_rotation_url {
+                        current_url = url;
+                    }
                     break;
                 }
 
@@ -11342,6 +11370,7 @@ async fn handle_h3_request(
                 result.handoff,
                 current_cb_target_key,
                 current_target,
+                Some(current_url),
             )
         } else if let Some(result) = refined_buffered_response {
             (
@@ -11353,6 +11382,7 @@ async fn handle_h3_request(
                 result.handoff,
                 cb_target_key,
                 upstream_target.clone(),
+                None,
             )
         } else {
             // No retry configured — single attempt, under the matched route
@@ -11403,6 +11433,7 @@ async fn handle_h3_request(
                 result.handoff,
                 cb_target_key,
                 upstream_target.clone(),
+                None,
             )
         };
 
@@ -12099,6 +12130,26 @@ async fn handle_h3_request(
             / 1_000_000.0;
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+        // After a retry rotated targets, attribute the summary to the target
+        // that answered, as H1/H2 does (issue #7159). Boxed out of line for
+        // this handler's stack budget.
+        let final_backend_url = final_url.unwrap_or(backend_url);
+        let backend_resolved_ip = match final_target.as_deref() {
+            Some(target)
+                if upstream_target
+                    .as_deref()
+                    .is_some_and(|first| first.host != target.host) =>
+            {
+                crate::proxy::boxed_resolve_summary_backend_ip(
+                    &state,
+                    &proxy,
+                    Some(target),
+                    ctx.grpc_deadline_at(),
+                )
+                .await
+            }
+            _ => backend_resolved_ip,
+        };
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -12109,7 +12160,7 @@ async fn handle_h3_request(
             request_path: original_request_path.clone(),
             proxy_id: Some(proxy.id.clone()),
             proxy_name: proxy.name.clone(),
-            backend_target: Some(strip_query_params(&backend_url).to_string()),
+            backend_target: Some(strip_query_params(&final_backend_url).to_string()),
             backend_resolved_ip,
             response_status_code: response_status,
             latency_total_ms: total_ms,

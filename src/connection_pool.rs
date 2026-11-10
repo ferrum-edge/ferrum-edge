@@ -32,9 +32,9 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// Boxed H3 backend TLS config lookup returned by
-/// [`ConnectionPool::backend_h3_tls_config_owned`].
-pub type BackendH3TlsConfigFuture =
-    futures_util::future::BoxFuture<'static, Result<Arc<rustls::ClientConfig>, anyhow::Error>>;
+/// [`ConnectionPool::backend_h3_tls_config`].
+pub type BackendH3TlsConfigFuture<'a> =
+    futures_util::future::BoxFuture<'a, Result<Arc<rustls::ClientConfig>, anyhow::Error>>;
 
 #[derive(Clone)]
 struct ReqwestPoolManager {
@@ -739,14 +739,15 @@ impl ConnectionPool {
         &self.pool.manager().backend_ws_tls_configs
     }
 
-    /// Owned, boxed form of [`Self::get_tls_config_for_backend`] for H3
-    /// dispatch closures that cannot borrow the request's `Proxy`.
+    /// Boxed form of [`Self::get_tls_config_for_backend`] for the native-H3
+    /// backend dispatch closures.
     ///
     /// The H3 pools invoke these closures only on a connection miss, so the
     /// box is allocated only then, and every pooled H3 call's future stores a
-    /// pointer instead of an owned `Proxy` plus the lookup state inline.
-    pub fn backend_h3_tls_config_owned(self: Arc<Self>, proxy: Proxy) -> BackendH3TlsConfigFuture {
-        Box::pin(async move { self.get_tls_config_for_backend(&proxy).await })
+    /// pointer instead of the lookup state inline. It borrows the request's
+    /// `Proxy` and this pool, so a pooled request clones neither (issue #7166).
+    pub fn backend_h3_tls_config<'a>(&'a self, proxy: &'a Proxy) -> BackendH3TlsConfigFuture<'a> {
+        Box::pin(self.get_tls_config_for_backend(proxy))
     }
 
     pub fn drain_backend_tls_config_cache_svid_generation(&self, generation: u64) {

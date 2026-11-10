@@ -3017,3 +3017,32 @@ async fn a_publication_that_retires_nothing_does_not_fence_outstanding_leases() 
          lease and force a reconnect storm"
     );
 }
+
+/// Issue #7166: the gateway leaf's credential deadline is derived once per
+/// SVID snapshot with the identity and fingerprint, not re-parsed (and
+/// re-anchored on the wall clock) per request. Two resolutions of the same
+/// snapshot report the same monotonic instant, and that instant is a real,
+/// future `notAfter` bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_source_credential_deadline_is_derived_once_per_svid_snapshot() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ids = identities();
+    let pool = source_pool(ids.gateway);
+    let first = pool
+        .source_credential_identity()
+        .expect("the gateway SVID resolves a source credential identity");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = pool
+        .source_credential_identity()
+        .expect("the same snapshot resolves again");
+    assert_eq!(first.fingerprint, second.fingerprint);
+    let deadline = first
+        .leaf_deadline
+        .expect("a freshly issued leaf has a representable notAfter");
+    assert!(deadline > tokio::time::Instant::now());
+    assert_eq!(
+        second.leaf_deadline,
+        Some(deadline),
+        "the cached deadline must not be re-derived from the wall clock per request"
+    );
+}

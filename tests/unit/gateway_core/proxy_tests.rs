@@ -6146,6 +6146,79 @@ fn route_admission_and_open_breaker_rejects_are_grpc_web_aware() {
     assert!(breaker.contains("if let Some(response) = grpc_web_response {"));
 }
 
+/// Issue #7155: every gateway-authored gRPC error in the H1/H2 handler is
+/// framed for a gRPC-Web client too. Each native Trailers-Only builder call
+/// sits behind a gRPC-Web check, the native-gRPC branch's size, egress and
+/// response-build refusals go through the gRPC-Web-aware helper, and the two
+/// shared reject helpers take the negotiated gRPC-Web content type and defer
+/// the committed observers to the translation.
+#[test]
+fn h1_h2_grpc_rejects_are_grpc_web_aware() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .split("async fn handle_proxy_request_inner(")
+        .nth(1)
+        .expect("H1/H2 request handler");
+    let handler = &handler[..handler
+        .find("\n}\n")
+        .expect("bounded H1/H2 request handler")];
+
+    const NATIVE: &str = "grpc_proxy::build_grpc_error_response_with_policy(";
+    for (index, _) in handler.match_indices(NATIVE) {
+        let before = &handler[..index];
+        let start = before.char_indices().rev().nth(1500).map_or(0, |(i, _)| i);
+        let window = &before[start..];
+        assert!(
+            window.contains("grpc_web_response_content_type")
+                || window.contains("grpc_request_is_web_translated"),
+            "a native gRPC reject without a gRPC-Web check: {window}"
+        );
+    }
+    assert!(
+        handler
+            .matches("build_native_grpc_branch_error_response(")
+            .count()
+            >= 8,
+        "the native-gRPC branch refusals use the gRPC-Web-aware helper"
+    );
+
+    let helper = source
+        .split("fn build_native_grpc_branch_error_response(")
+        .nth(1)
+        .expect("gRPC-Web-aware native-gRPC error helper")
+        .split("\n}\n")
+        .next()
+        .expect("bounded helper");
+    let web = helper
+        .find("build_grpc_web_error_response(")
+        .expect("negotiated gRPC-Web");
+    let translated = helper
+        .find("build_translated_grpc_web_error_response(")
+        .expect("plugin-translated gRPC-Web");
+    let native = helper.find(NATIVE).expect("native gRPC");
+    assert!(web < translated && translated < native);
+
+    for shared in [
+        "async fn reject_mesh_inbound_peer_auth_transport_mismatch(",
+        "async fn finalize_terminal_request_body_read_rejection(",
+    ] {
+        let body = source
+            .split(shared)
+            .nth(1)
+            .expect("shared reject helper")
+            .split("\n}\n")
+            .next()
+            .expect("bounded shared reject helper");
+        assert!(
+            body.contains("grpc_web_response_content_type: Option<&str>,")
+                && body.contains("grpc_web_response_content_type.is_none(),")
+                && body.contains("boxed_build_grpc_web_reject_response(")
+                && body.contains("if let Some(response) = grpc_web_response {"),
+            "{shared} must answer a gRPC-Web client in gRPC-Web framing"
+        );
+    }
+}
+
 /// Issue #7164: WebSocket disconnect metadata reports the listener the client
 /// connected to (a Gateway API / mesh listener included), not the
 /// process-global proxy port. H1/H2 and H3 share this helper.
@@ -6183,4 +6256,55 @@ fn websocket_session_listen_port_reports_the_accepting_listener() {
         websocket_session_listen_port_for_test(&ctx, true, &env),
         8443
     );
+}
+
+/// Issue #7166: per-request work the hot paths no longer repeat. The native-H3
+/// backend TLS closures borrow the request's `Proxy` and the pool (a lookup only
+/// on a connection miss) instead of deep-cloning both per request; each mesh
+/// dispatch derives its authorization-lifetime plan once and hands it down;
+/// and the inbound HBONE relay reads the startup-resolved topology instead of
+/// re-reading and re-parsing `FERRUM_MESH_TOPOLOGY` per CONNECT.
+#[test]
+fn hot_path_dispatch_work_is_done_once() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(!proxy.contains("backend_h3_tls_config_owned("));
+    assert_eq!(
+        proxy
+            .matches("|| state.connection_pool.backend_h3_tls_config(proxy)")
+            .count(),
+        10,
+        "every native-H3 dispatch closure borrows"
+    );
+    assert!(!proxy.contains("let proxy_clone = proxy.clone();"));
+
+    for after_ready in [
+        "async fn proxy_to_backend_hbone_after_ready(",
+        "async fn proxy_to_backend_mesh_mtls_after_ready(",
+    ] {
+        let body = proxy
+            .split(after_ready)
+            .nth(1)
+            .expect("mesh dispatch after_ready")
+            .split("\n}\n")
+            .next()
+            .expect("bounded after_ready");
+        assert!(
+            body.contains("upload_auth: Option<RequestAuthLifetimePlan>,")
+                && body.contains("let send_auth_deadline = upload_auth;")
+                && !body.contains("request_upload_auth_deadline("),
+            "{after_ready} must reuse the plan its dispatcher derived"
+        );
+    }
+    let unix = proxy
+        .split("#[cfg(unix)]\nasync fn proxy_to_backend_unix(")
+        .nth(1)
+        .expect("Unix dispatcher")
+        .split("\n}\n")
+        .next()
+        .expect("bounded Unix dispatcher");
+    assert_eq!(unix.matches("request_upload_auth_deadline(").count(), 1);
+
+    let hbone = include_str!("../../../src/proxy/hbone_proxy.rs");
+    assert!(!hbone.contains("FERRUM_MESH_TOPOLOGY"));
+    assert!(hbone.contains("&& state.node_waypoint_identity_resolver.is_some())"));
 }

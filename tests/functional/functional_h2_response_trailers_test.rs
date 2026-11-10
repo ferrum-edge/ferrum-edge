@@ -448,3 +448,55 @@ async fn gateway_replaced_buffered_body_drops_backend_trailers() {
         }
     }
 }
+
+/// Issue #7165: the request `Via` received-protocol names the CLIENT's hop
+/// (RFC 9110 §7.6.3), not the backend pool's protocol. Once the capability
+/// registry proves `h2_tls`, an HTTP/1.1 client and an HTTP/2 client ride the
+/// direct HTTP/2 pool to the same backend, which must observe `1.1` and `2.0`
+/// respectively.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_request_via_names_the_client_protocol() {
+    let (backend, backend_port) =
+        spawn_h2_trailer_backend("via-version", BODY, "text/plain", false).await;
+    let yaml = file_mode_yaml_for_backend_with(backend_port, h2_backend_overrides());
+    let harness = spawn_gateway(yaml, true).await;
+    wait_for_h2_tls_supported(&harness, Duration::from_secs(15)).await;
+
+    let h1 = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("http1 client");
+    let h2 = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    for (client, version, path, expected) in [
+        (&h1, reqwest::Version::HTTP_11, "via-h1", "1.1 ferrum-edge"),
+        (
+            h2.as_reqwest(),
+            reqwest::Version::HTTP_2,
+            "via-h2",
+            "2.0 ferrum-edge",
+        ),
+    ] {
+        let response = client
+            .get(format!("{}/api/{path}", harness.proxy_base_url()))
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(response.version(), version, "{path}");
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        let _ = response.bytes().await.expect("response body");
+
+        let streams = backend.received_streams().await;
+        let stream = streams
+            .iter()
+            .rev()
+            .find(|stream| stream.path.ends_with(path))
+            .unwrap_or_else(|| panic!("{path}: backend never saw the request: {streams:?}"));
+        assert_eq!(
+            stream.header("via"),
+            Some(expected),
+            "{path}: the backend-visible Via names the client's protocol"
+        );
+    }
+}

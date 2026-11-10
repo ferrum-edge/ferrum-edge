@@ -6261,6 +6261,61 @@ fn h3_native_streaming_oversize_exits_log_a_transaction_summary() {
     assert!(response.contains("error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge)"));
 }
 
+/// Issues #7156 / #7157: the H3 invalid-backend-path exit and the native-H3
+/// "mesh transport dispatch required" `502` write a rejection log under their
+/// own compiled-in phase (the same phase H1/H2 uses for the invalid path), with
+/// the client's original path, before the request is counted.
+#[test]
+fn h3_internal_reject_exits_log_their_phase_before_counting() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let handler = server
+        .split("async fn handle_h3_request(")
+        .nth(1)
+        .expect("H3 request handler")
+        .split("\nfn h3_grpc_intended_refusal_exempts(")
+        .next()
+        .expect("bounded H3 request handler");
+
+    let invalid_path = handler
+        .split("let backend_url = match build_h3_backend_url_for_flavor(")
+        .nth(1)
+        .expect("H3 backend URL build")
+        .split("return Ok(());")
+        .next()
+        .expect("bounded invalid backend path arm");
+    let mesh_dispatch = handler
+        .split(
+            "\"native H3 dispatch: refusing direct dial to a target requiring another transport\"",
+        )
+        .nth(1)
+        .expect("native-H3 mesh dispatch refusal")
+        .split("return Ok(());")
+        .next()
+        .expect("bounded mesh dispatch refusal");
+
+    for (arm, phase) in [
+        (
+            invalid_path,
+            "crate::diagnostic_ref::INVALID_BACKEND_PATH_PHASE",
+        ),
+        (
+            mesh_dispatch,
+            "crate::diagnostic_ref::MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE",
+        ),
+    ] {
+        let log = arm
+            .find("crate::proxy::boxed_log_rejected_request_with_path(")
+            .expect("the exit is logged out of line");
+        let logged_phase = arm.find(phase).expect("the exit logs its own phase");
+        let original_path = arm
+            .find("Some(&original_request_path)")
+            .expect("the exit logs the client's original path");
+        let count = arm.find("record_request(").expect("the exit is counted");
+        assert!(log < logged_phase && logged_phase < original_path && original_path < count);
+        assert_eq!(arm.matches("record_request(").count(), 1);
+    }
+}
+
 /// Issue #7158: once `handle_h3_request` rebases `path` for an Istio
 /// `rewrite.uri` / `mesh_route_dispatch` override, every rejection and
 /// transaction summary records the client's original path, as H1/H2 does. The
