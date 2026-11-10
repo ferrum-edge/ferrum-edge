@@ -1743,7 +1743,23 @@ impl GrpcConnectionPool {
         });
         match acquired {
             Ok(sender) => Ok(sender),
-            Err(err) => {
+            // Only a `maxConnections` refusal (the creator's, or a coalesced
+            // waiter's rebuilt from `SharedPoolCreateKind::MaxConnections`)
+            // reuses an already-established shard, so a cap below the shard
+            // count converges on `cap` connections. Any other create failure
+            // (TLS, ALPN, refused connect, ...) surfaces, rather than being
+            // masked by a still-open sibling for as long as one lives — which
+            // would also answer a capability probe `Ok` for a target whose
+            // new connections fail (issue #7181).
+            Err(err)
+                if matches!(
+                    err,
+                    GrpcProxyError::BackendUnavailable {
+                        kind: GrpcBackendUnavailableKind::MaxConnections,
+                        ..
+                    }
+                ) =>
+            {
                 // Phase 2 (synchronous re-borrow): rebuild the pool key in
                 // the same thread-local buffer and probe alternative shards.
                 // The proxy outlives this future and is read-only, so the
@@ -1769,6 +1785,7 @@ impl GrpcConnectionPool {
                     None => Err(err),
                 }
             }
+            Err(err) => Err(err),
         }
     }
 }
@@ -4545,16 +4562,26 @@ impl<'a> GrpcDispatchTransport<'a> {
     }
 
     /// Drop a stale pooled sender after a provably pre-wire cancellation or
-    /// protocol NACK. Only the direct pool is invalidated here. The mesh-mTLS
-    /// cached-sender scans skip `is_closed()` senders. The HBONE gRPC transport
-    /// can reuse a shared nested HTTP/2 carrier from
-    /// [`crate::proxy::hbone_inner_pool`] (issue #5042 step 2), whose checkout
-    /// also tests only `!is_closed()`; that pool has no per-entry eviction, so
-    /// a retry after one of these signals can check out the same carrier until
-    /// it reports closed (issue #7180).
-    fn invalidate_on_pre_wire_cancel(&self, proxy: &Proxy) {
-        if let Self::Direct(pool) = self {
-            pool.invalidate_shards_for_proxy(proxy);
+    /// protocol NACK. The direct pool invalidates the proxy's shards. The
+    /// HBONE gRPC transport retires the shared nested HTTP/2 carrier the
+    /// failed dispatch rode, when it came from
+    /// [`crate::proxy::hbone_inner_pool`] (`inner_carrier`, from
+    /// [`GrpcDispatchSender::hbone_inner_carrier`]), so a retry cannot check
+    /// out the same dying carrier while it still reports open (issue #7180).
+    /// The mesh-mTLS cached-sender scans skip `is_closed()` senders.
+    fn invalidate_on_pre_wire_cancel(
+        &self,
+        proxy: &Proxy,
+        inner_carrier: Option<&HboneInnerCarrier>,
+    ) {
+        match self {
+            Self::Direct(pool) => pool.invalidate_shards_for_proxy(proxy),
+            Self::Hbone(_) => {
+                if let Some(carrier) = inner_carrier {
+                    carrier.retire_carrier();
+                }
+            }
+            Self::MeshMtls(_) => {}
         }
     }
 }
@@ -4873,8 +4900,8 @@ pub struct GrpcPooledSender {
     /// which is what lets the inner pool see a carrier at its nested peer's
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` and open a sibling rather than queue
     /// every RPC to one destination behind one connection. `None` for the
-    /// direct-dial gRPC pool, which is bounded by its own pool.
-    #[allow(dead_code)] // Held for its `Drop`; the accounting IS the read.
+    /// direct-dial gRPC pool, which is bounded by its own pool. Also the
+    /// handle a pre-wire failure retires the carrier through (issue #7180).
     inner_lease: Option<Arc<crate::proxy::hbone_inner_pool::HboneInnerH2StreamLease>>,
 }
 
@@ -4937,6 +4964,10 @@ impl std::ops::DerefMut for GrpcPooledSender {
     }
 }
 
+/// The source-side HBONE inner-pool carrier hold of one dispatch; see
+/// [`GrpcPooledSender::inner_lease`].
+type HboneInnerCarrier = Arc<crate::proxy::hbone_inner_pool::HboneInnerH2StreamLease>;
+
 /// An acquired HTTP/2 sender for one gRPC dispatch attempt.
 pub(crate) enum GrpcDispatchSender {
     /// A hyper h2 sender carrying [`GrpcBody`] directly. Used by the direct-dial
@@ -4965,6 +4996,17 @@ impl std::fmt::Display for GrpcDispatchSendError {
 }
 
 impl GrpcDispatchSender {
+    /// The pooled nested-HBONE carrier this sender rides, when it was taken
+    /// from or published to [`crate::proxy::hbone_inner_pool`]. Captured
+    /// before the send so a pre-wire failure can retire exactly that carrier
+    /// (issue #7180); sharing the `Arc` adds no second load hold.
+    fn hbone_inner_carrier(&self) -> Option<HboneInnerCarrier> {
+        match self {
+            Self::H2(sender) => sender.inner_lease.clone(),
+            Self::MeshMtls(_) => None,
+        }
+    }
+
     /// Send the outbound gRPC request. The mesh-mTLS arm wraps the SHARED
     /// [`GrpcBody`] rather than re-encoding it, so request framing (DATA plus a
     /// terminal TRAILERS frame), inline receive-limit accounting, upload
@@ -5913,6 +5955,9 @@ async fn proxy_grpc_streaming_dispatch(
             return Err(e);
         }
     };
+    // The nested-HBONE carrier this attempt rides, if pooled, so a pre-wire
+    // failure can retire exactly it (issue #7180).
+    let inner_carrier = sender.hbone_inner_carrier();
 
     // Remaining-budget rewrite AFTER acquisition, for the same reason as the
     // buffered path: a cold dial must not be re-added to the client's budget.
@@ -6027,7 +6072,7 @@ async fn proxy_grpc_streaming_dispatch(
                 // classification even when hyper reports `is_canceled`, but still
                 // drop the stale pooled sender so the next RPC dials fresh.
                 if e.is_canceled() {
-                    transport.invalidate_on_pre_wire_cancel(proxy);
+                    transport.invalidate_on_pre_wire_cancel(proxy, inner_carrier.as_ref());
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
@@ -6443,6 +6488,9 @@ pub(crate) async fn proxy_grpc_request_core(
     let mut sender = dispatch_bounds
         .acquire(auth, transport.get_sender(proxy))
         .await??;
+    // The nested-HBONE carrier this attempt rides, if pooled, so a pre-wire
+    // failure can retire exactly it (issue #7180).
+    let inner_carrier = sender.hbone_inner_carrier();
 
     // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
     // acquisition. Computing it before the dial would forward a value that
@@ -6514,7 +6562,7 @@ pub(crate) async fn proxy_grpc_request_core(
             // `proxy_grpc_request_streaming`.
             let protocol_nack = crate::retry::error_chain_is_protocol_nack(&e);
             if e.is_canceled() || protocol_nack {
-                transport.invalidate_on_pre_wire_cancel(proxy);
+                transport.invalidate_on_pre_wire_cancel(proxy, inner_carrier.as_ref());
             }
             // A failure at/after the shared response deadline is that deadline,
             // settled exactly as its `timeout_at` arm below, whichever of hyper

@@ -1563,6 +1563,50 @@ async fn a_nested_h2_sender_that_received_goaway_is_retired_and_never_reissued()
     assert_eq!(fx.app.accepts(), 2);
 }
 
+/// Issue #7180: a dispatch that saw a pre-wire cancel or protocol NACK on a
+/// pooled carrier retires it through its lease, so a retry is never handed the
+/// same carrier while it still reports open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_h2_carrier_retired_by_its_lease_is_never_reissued() {
+    let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, true).await;
+    let parts = fx.identity.parts(HboneInnerProtocol::H2);
+
+    let mut nested = open_fresh_h2(&fx).await;
+    let first_lease = publish_fresh_h2(&fx, &parts, &nested);
+    assert_eq!(
+        send_rpc(&mut nested.sender).await.expect("first rpc"),
+        StatusCode::OK
+    );
+    drop(first_lease);
+    let reused = fx
+        .pool
+        .inner_pool()
+        .checkout_h2(&parts)
+        .expect("the published carrier is shared");
+    assert!(
+        !reused.sender.is_closed(),
+        "the carrier is still open when the dispatch retires it"
+    );
+    let evictions_before = fx.pool.inner_pool().stats().evictions;
+
+    reused.lease.retire_carrier();
+
+    assert!(
+        fx.pool.inner_pool().checkout_h2(&parts).is_none(),
+        "a retired carrier must not be handed to the retry"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "the retired carrier leaves the pool"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().stats().evictions,
+        evictions_before + 1,
+        "retirement is accounted as one eviction"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_nested_h2_sender_is_never_published_for_a_peer_without_the_capability() {
     let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, false).await;

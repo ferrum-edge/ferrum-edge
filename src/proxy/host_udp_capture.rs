@@ -437,6 +437,15 @@ impl HostUdpIdentityIndex {
         self.by_ifindex.load().len()
     }
 
+    /// Whether every published binding is one of `allowed`, so a listener
+    /// reading this index attributes nothing outside that set.
+    fn publishes_only(&self, allowed: &[HostUdpPodBinding]) -> bool {
+        self.by_ifindex
+            .load()
+            .values()
+            .all(|binding| allowed.contains(binding))
+    }
+
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -1184,6 +1193,18 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         let ifaces = desired.ifaces();
         let now_bound = desired.bound_uids();
 
+        // 0. Retire the pods leaving capture BEFORE the whole generation is
+        //    guarded, so an outstanding node-agent acknowledgement holds closed
+        //    only the interfaces that still owe a transition (issue #7184); see
+        //    `retire_leaving_pods`. Nothing to retire leaves this a no-op.
+        self.cancel_gate_close_for_returning(&now_bound);
+        if !self
+            .retire_leaving_pods(&desired, &ifaces, &now_bound)
+            .await
+        {
+            return;
+        }
+
         // 1. Guard first, scoped to the UNION of what this generation captures
         //    and what still owes a transition (pods whose readiness this process
         //    published, pods awaiting a gate-close acknowledgement, and the scope
@@ -1214,10 +1235,10 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         //    admitted sessions still carry the previous evidence, and a removed
         //    pod's session still holds a transparent reply socket. Stop the loop
         //    (which drains and cancels its sessions) before republishing.
-        let restart_required = self
-            .applied
-            .as_ref()
-            .is_some_and(|applied| desired.requires_listener_restart_from(applied));
+        //    The running loop's evidence is what its index publishes: the
+        //    applied generation, or the settled subset step 0 restarted it with
+        //    (which then needs no second restart).
+        let restart_required = !self.index.publishes_only(&desired.bindings);
         if restart_required && let Some(listener) = self.listener.take() {
             info!(
                 "Host UDP capture: a captured pod's attribution changed or was withdrawn; \
@@ -1228,21 +1249,11 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
             self.index.clear();
         }
 
-        // 3. Retire the pods this generation drops through the DURABLE node-agent
-        //    handshake before any rule of theirs can disappear. Removing a
-        //    readiness marker does not synchronously close the node-agent's BPF
-        //    gate, so an unacknowledged close plus a rebuilt chain is exactly the
-        //    window in which a removed pod's UDP egress leaves the node in
-        //    plaintext. Their interfaces stay inside the guard installed above
-        //    until the acknowledgement lands, so waiting costs availability for
-        //    the pods being retired, never confidentiality.
-        self.cancel_gate_close_for_returning(&now_bound);
-        let leaving: Vec<(String, String)> = self
-            .published_ready
-            .iter()
-            .filter(|(uid, _)| !now_bound.contains(*uid))
-            .map(|(uid, iface)| (uid.clone(), iface.clone()))
-            .collect();
+        // 3. Every pod leaving capture was retired in step 0, so this only
+        //    re-checks the handshake under the full guard: a pod that left
+        //    after step 0's snapshot (none can, the desired state is fixed for
+        //    the pass) would still be retired before its rule disappears.
+        let leaving = self.leaving_pods(&now_bound);
         let requested = self.begin_gate_close(&leaving);
         let budget = self.gate_close_timeout.min(RECONCILE_GATE_CLOSE_ACK_WAIT);
         let acknowledged = self.await_gate_close(budget).await;
@@ -1425,6 +1436,138 @@ impl<B: HostUdpCaptureBackend> HostUdpCaptureManager<B> {
         scope.sort();
         scope.dedup();
         scope
+    }
+
+    /// Pods whose readiness this process published and that `now_bound` no
+    /// longer captures, with the interface their capture rule is scoped to.
+    fn leaving_pods(&self, now_bound: &HashSet<String>) -> Vec<(String, String)> {
+        self.published_ready
+            .iter()
+            .filter(|(uid, _)| !now_bound.contains(*uid))
+            .map(|(uid, iface)| (uid.clone(), iface.clone()))
+            .collect()
+    }
+
+    /// Retire the pods this generation drops through the DURABLE node-agent
+    /// handshake before any rule of theirs can disappear. `true` when nothing
+    /// is owed any more and the apply may rebuild the ruleset.
+    ///
+    /// Removing a readiness marker does not synchronously close the
+    /// node-agent's BPF gate, so an unacknowledged close plus a rebuilt chain
+    /// is exactly the window in which a removed pod's UDP egress leaves the
+    /// node in plaintext. The ruleset is therefore left alone until every close
+    /// is acknowledged, and the interfaces that still owe a transition (the
+    /// departing pods', and any not yet captured) stay inside the DROP guard,
+    /// so waiting costs availability for the pods being retired, never
+    /// confidentiality.
+    ///
+    /// Pods whose capture is already live and unchanged ("settled": the
+    /// identical binding is applied and still desired, and no departing pod
+    /// shares its interface) keep their egress while the node-agent is slow or
+    /// restarting (issue #7184): they are left out of the guard, and the
+    /// capture listener is restarted with only their evidence, so no session
+    /// admitted under a departing or changed pod's evidence outlives this pass.
+    /// A failure to restart that listener guards them too.
+    async fn retire_leaving_pods(
+        &mut self,
+        desired: &HostUdpDesiredState,
+        ifaces: &[String],
+        now_bound: &HashSet<String>,
+    ) -> bool {
+        let leaving = self.leaving_pods(now_bound);
+        if leaving.is_empty() && self.awaiting_gate_close.is_empty() {
+            return true;
+        }
+        if self.ready_dir.is_none() {
+            // No handshake directory: nothing gates a pod's UDP egress on our
+            // readiness marker, so there is nothing to wait for and step 3
+            // retires these pods without a handshake.
+            return true;
+        }
+        let settled = self.settled_bindings(desired, &leaving);
+        let guard_ifaces: Vec<String> = self
+            .guard_scope_for(ifaces)
+            .into_iter()
+            .filter(|iface| !settled.iter().any(|binding| binding.iface == *iface))
+            .collect();
+        if !guard_ifaces.is_empty() {
+            if let Err(error) = self.backend.install_guard(&guard_ifaces) {
+                warn!(
+                    %error,
+                    interfaces = guard_ifaces.len(),
+                    "Host UDP capture: fail-closed guard install failed; keeping the previous \
+                     ruleset and retrying"
+                );
+                return false;
+            }
+            self.guard_active = true;
+            self.guard_scope = guard_ifaces;
+        }
+
+        // The running loop may still hold sessions admitted under a departing
+        // or changed pod's evidence: restart it with the settled evidence only.
+        if self.listener.is_some() && !self.index.publishes_only(&settled) {
+            if let Some(listener) = self.listener.take() {
+                listener.stop().await;
+            }
+            self.index.clear();
+        }
+        if !settled.is_empty() && self.listener.is_none() {
+            self.index.publish(&settled);
+            match self.backend.start_listener(self.index.clone()) {
+                Ok(handle) => self.listener = Some(handle),
+                Err(error) => {
+                    self.index.clear();
+                    // Settled rules without a socket drop their traffic; guard
+                    // them as well rather than look like live capture.
+                    let full_scope = self.guard_scope_for(ifaces);
+                    let guarded = self.backend.install_guard(&full_scope).is_ok();
+                    if guarded {
+                        self.guard_scope = full_scope;
+                    }
+                    warn!(
+                        %error,
+                        guarded,
+                        "Host UDP capture: could not restart the capture listener for the pods \
+                         that stay captured while a departing pod's gate close is outstanding; \
+                         guarding them too"
+                    );
+                }
+            }
+        }
+
+        let requested = self.begin_gate_close(&leaving);
+        let budget = self.gate_close_timeout.min(RECONCILE_GATE_CLOSE_ACK_WAIT);
+        let acknowledged = self.await_gate_close(budget).await;
+        requested && acknowledged
+    }
+
+    /// The desired bindings whose capture is already live and unchanged: the
+    /// identical binding is in the applied generation (whose ruleset is still
+    /// installed) and no pod leaving capture or awaiting a gate-close
+    /// acknowledgement is scoped to its interface. Empty when nothing has been
+    /// applied, so a failed generation is always fully guarded.
+    fn settled_bindings(
+        &self,
+        desired: &HostUdpDesiredState,
+        leaving: &[(String, String)],
+    ) -> Vec<HostUdpPodBinding> {
+        let Some(applied) = self.applied.as_ref() else {
+            return Vec::new();
+        };
+        desired
+            .bindings
+            .iter()
+            .filter(|binding| {
+                applied.bindings.contains(binding)
+                    && !leaving.iter().any(|(_, iface)| *iface == binding.iface)
+                    && !self
+                        .awaiting_gate_close
+                        .values()
+                        .any(|iface| *iface == binding.iface)
+            })
+            .cloned()
+            .collect()
     }
 
     /// A pod that re-entered capture is owned by the ordinary apply path again:

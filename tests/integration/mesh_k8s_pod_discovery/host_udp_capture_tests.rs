@@ -827,31 +827,39 @@ async fn a_removed_pods_capture_rule_survives_until_its_gate_close_is_acknowledg
 
     manager.reconcile_once().await;
     assert!(ready_dir.join(POD_A_UID).is_file());
+    assert_eq!(backend.listeners(), 1);
     backend.reset_calls();
 
     // Pod A leaves and the node-agent never acknowledges closing its gate. Its
     // rule must NOT be rebuilt away: the old rule plus an open BPF gate is
-    // capture, while no rule plus an open BPF gate is plaintext egress.
+    // capture, while no rule plus an open BPF gate is plaintext egress. Pod B's
+    // capture is live and unchanged, so it keeps its egress (issue #7184): only
+    // A's interface is guarded, and the listener is restarted with B's
+    // evidence alone so no session admitted under A's evidence survives.
     source.set(vec![b.clone()]);
     let state = manager.reconcile_once().await;
     assert_eq!(state.ifaces(), vec!["vethb".to_string()]);
     let calls = backend.calls();
     assert_eq!(
         calls,
-        vec!["guard:vetha,vethb".to_string()],
-        "an unacknowledged gate close installs the union guard and touches nothing else: \
-         {calls:?}"
+        vec!["guard:vetha".to_string(), "start_listener".to_string()],
+        "an unacknowledged gate close guards only the departing pod and leaves the ruleset \
+         alone: {calls:?}"
     );
+    assert_eq!(backend.listeners(), 2);
+    assert_eq!(backend.listener_stops(), 1);
 
     // Retrying keeps the same posture and must not re-issue the request, which
-    // would delete an acknowledgement that has since landed.
+    // would delete an acknowledgement that has since landed, nor restart the
+    // listener the settled pod is using.
     backend.reset_calls();
     manager.reconcile_once().await;
     assert_eq!(
         backend.calls(),
-        vec!["guard:vetha,vethb".to_string()],
+        vec!["guard:vetha".to_string()],
         "a retry stays fail-closed rather than removing the departing pod's rule"
     );
+    assert_eq!(backend.listeners(), 2);
 
     std::fs::create_dir_all(&ack_dir).expect("ack dir");
     std::fs::write(ack_dir.join(POD_A_UID), b"").expect("ack marker");
@@ -867,6 +875,15 @@ async fn a_removed_pods_capture_rule_survives_until_its_gate_close_is_acknowledg
         calls.last().map(String::as_str),
         Some("release_guard"),
         "and only then does the guard come down: {calls:?}"
+    );
+    assert!(
+        calls.contains(&"guard:vetha,vethb".to_string()),
+        "the rebuild itself runs under the full guard: {calls:?}"
+    );
+    assert_eq!(
+        backend.listeners(),
+        2,
+        "the listener already restarted with the settled evidence is not restarted again"
     );
 }
 

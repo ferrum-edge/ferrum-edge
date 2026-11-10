@@ -337,6 +337,39 @@ impl HboneUdpRelayEnd {
 /// refusal is not evidence about the backend. Real DNS and connection failures
 /// record a failure with their `status`. This is the ONE settlement site for a
 /// failed connect; callers invoke it exactly once per connect attempt.
+/// Report the inbound byte-stream relay's backend connect outcome to passive
+/// health for the selected upstream target: success once the relay socket is
+/// connected, and a connection failure when the dial failed (issue #7183), so
+/// DestinationRule `outlierDetection` can eject a dead target through this
+/// path. No-op for a relay with no upstream target.
+fn report_hbone_backend_connect_to_passive_health(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    target: Option<&UpstreamTarget>,
+    status: StatusCode,
+    connection_error: bool,
+) {
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, target)
+        && let Some(upstream) = LoadBalancerCache::get_upstream_from(
+            &epoch.load_balancer,
+            &proxy.namespace,
+            upstream_id,
+        )
+    {
+        let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
+        state.health_checker.report_response(
+            &proxy.namespace,
+            &proxy.id,
+            upstream_id,
+            target,
+            status.as_u16(),
+            connection_error,
+            passive,
+        );
+    }
+}
+
 pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(
     cb: &crate::circuit_breaker::CircuitBreaker,
     status: StatusCode,
@@ -1416,6 +1449,20 @@ pub(super) async fn handle_hbone_request(
                     cb_probe.take_slot(),
                 );
             }
+            // Passive health / DestinationRule `outlierDetection` sees the
+            // backend connect failure, symmetric with the success report below
+            // (issue #7183). A relay-destination refusal never dialed, and a
+            // gateway-side class says nothing about the target.
+            if !policy_refusal && !backend_dispatch::client_side_no_backend_signal(Some(class)) {
+                report_hbone_backend_connect_to_passive_health(
+                    state,
+                    epoch,
+                    proxy,
+                    upstream_target.as_deref(),
+                    status,
+                    true,
+                );
+            }
             ctx.metadata
                 .insert("error_class".to_string(), class.to_string());
             let reject = finalize_reject_response_with_after_proxy_hooks(
@@ -1453,24 +1500,14 @@ pub(super) async fn handle_hbone_request(
             crate::circuit_breaker::BreakerOutcome::Success,
         );
     }
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
-        && let Some(upstream) = LoadBalancerCache::get_upstream_from(
-            &epoch.load_balancer,
-            &proxy.namespace,
-            upstream_id,
-        )
-    {
-        let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
-        state.health_checker.report_response(
-            &proxy.namespace,
-            &proxy.id,
-            upstream_id,
-            target,
-            StatusCode::OK.as_u16(),
-            false,
-            passive,
-        );
-    }
+    report_hbone_backend_connect_to_passive_health(
+        state,
+        epoch,
+        proxy,
+        upstream_target.as_deref(),
+        StatusCode::OK,
+        false,
+    );
 
     let backend_target = backend.target_url.clone();
     let backend_resolved_ip = backend.resolved_ip.clone();

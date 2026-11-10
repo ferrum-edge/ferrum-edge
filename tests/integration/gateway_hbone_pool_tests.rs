@@ -685,6 +685,81 @@ async fn hbone_fast_path_hit_refreshes_recency_and_keeps_busy_connection_alive()
     );
 }
 
+/// Issue #7182: an idle HBONE connection to a destination that receives no
+/// further lookups is evicted once `idleTimeout` passes. The cold-create prune
+/// never runs for such a destination, so only the periodic sweep reaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_untouched_idle_connection_is_swept_after_the_idle_timeout() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let server_id = SpiffeId::from_parts(&td, "ns/default/sa/orders").unwrap();
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (server_leaf, server_key) = issue_svid(&server_id, &root_pem, &root_key_pem);
+    let gateway_slot = svid_slot(bundle_for(
+        gateway_id,
+        gateway_leaf,
+        gateway_key,
+        root_der.clone(),
+    ));
+    let server_slot = svid_slot(bundle_for(server_id, server_leaf, server_key, root_der));
+    let (server_addr, connection_count) = start_hbone_counting_echo_server(server_slot).await;
+
+    let pool = HboneConnectionPool::new(
+        PoolConfig {
+            idle_timeout_seconds: 1,
+            ..PoolConfig::default()
+        },
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot,
+        4,
+    );
+    let proxy = proxy_for_test();
+    {
+        let mut tunnel = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.get_tunnel_via(
+                &proxy,
+                "127.0.0.1",
+                "127.0.0.1",
+                8080,
+                8080,
+                server_addr.port(),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("timely hbone tunnel open")
+        .expect("open hbone tunnel");
+        tunnel.write_all(b"ping").await.expect("write tunnel");
+        let mut echoed = [0_u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut echoed))
+            .await
+            .expect("timely echo")
+            .expect("read echo");
+        let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
+    }
+    assert_eq!(pool.pool_size(), 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while pool.pool_size() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the idle HBONE connection was never swept"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "the sweep itself dials nothing"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn hbone_warmup_requires_connect_acceptance() {
     let _ = rustls::crypto::ring::default_provider().install_default();

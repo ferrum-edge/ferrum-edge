@@ -327,6 +327,29 @@ impl RuntimeMetrics {
         }
     }
 
+    /// The stream-error and TCP RST counters for one ended raw-TCP stream
+    /// that builds no `StreamTransactionSummary` (a relay with no stream
+    /// plugin chain). Counts exactly what [`Self::record_stream_transaction`]
+    /// plus the caller-side RST record count for a summary with the same
+    /// class and direction, so the counters do not depend on whether a stream
+    /// plugin is configured (issue #7183).
+    pub fn record_stream_end(
+        &self,
+        proxy_id: &str,
+        error_class: Option<ErrorClass>,
+        direction: Option<Direction>,
+    ) {
+        let Some(class) = error_class else {
+            return;
+        };
+        self.increment_error_map(&self.stream_errors_by_class, proxy_id, class.as_str());
+        if class == ErrorClass::ConnectionReset
+            && let Some(direction) = direction
+        {
+            self.record_tcp_rst(proxy_id, direction);
+        }
+    }
+
     pub fn record_dns_hit(&self) {
         self.dns_lookups_total.fetch_add(1, Ordering::Relaxed);
         self.dns_cache_hits.fetch_add(1, Ordering::Relaxed);

@@ -173,9 +173,14 @@ struct HboneConnectionLoadInner {
     /// CONNECT streams sent on this connection whose tunnel is still alive
     /// (including ones whose CONNECT response is still pending).
     active_streams: AtomicUsize,
-    /// Peer's `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT
-    /// response; `usize::MAX` until sampled or when the peer advertises none.
+    /// The connection's effective CONNECT stream cap: the peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` as of the last CONNECT response,
+    /// bounded by `configured_max_streams`. Before the first sample it is
+    /// `configured_max_streams`.
     peer_max_streams: AtomicUsize,
+    /// The DestinationRule `maxConcurrentStreams` / global pool stream cap
+    /// this connection was dialed (and keyed) under; `usize::MAX` when none.
+    configured_max_streams: usize,
 }
 
 impl Default for HboneConnectionLoadInner {
@@ -183,11 +188,31 @@ impl Default for HboneConnectionLoadInner {
         Self {
             active_streams: AtomicUsize::new(0),
             peer_max_streams: AtomicUsize::new(usize::MAX),
+            configured_max_streams: usize::MAX,
         }
     }
 }
 
 impl HboneConnectionLoad {
+    /// A load bounded by the configured `maxConcurrentStreams` (issue #7181).
+    ///
+    /// The cap is part of the outer pool key, and `h2` cannot hold it on its
+    /// own: the dial seeds it as `initial_max_send_streams`, but the peer's
+    /// initial SETTINGS replace that (with "unlimited" when the peer
+    /// advertises nothing). The width decision therefore takes the smaller of
+    /// the peer's cap and this one, so a carrier at the operator's cap is
+    /// skipped and a sibling dialed while the key has room. `None` keeps the
+    /// peer's cap alone.
+    fn with_configured_stream_cap(cap: Option<u32>) -> Self {
+        let configured_max_streams =
+            cap.map_or(usize::MAX, |cap| usize::try_from(cap).unwrap_or(usize::MAX));
+        Self(Arc::new(HboneConnectionLoadInner {
+            active_streams: AtomicUsize::new(0),
+            peer_max_streams: AtomicUsize::new(configured_max_streams),
+            configured_max_streams,
+        }))
+    }
+
     #[inline]
     fn active_streams(&self) -> usize {
         self.0.active_streams.load(Ordering::Relaxed)
@@ -217,9 +242,10 @@ impl HboneConnectionLoad {
     /// lookup takes the connection's internal lock, which is why it runs here
     /// (outside every pool lock) rather than on the checkout scan.
     fn record_peer_max_streams(&self, sender: &SendRequest<Bytes>) {
-        self.0
-            .peer_max_streams
-            .store(sender.current_max_send_streams(), Ordering::Relaxed);
+        let effective = sender
+            .current_max_send_streams()
+            .min(self.0.configured_max_streams);
+        self.0.peer_max_streams.store(effective, Ordering::Relaxed);
     }
 }
 
@@ -981,8 +1007,10 @@ impl HboneConnectionPool {
         shard_amount: usize,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
+        let entries = Arc::new(DashMap::with_shard_amount(shard_amount));
+        spawn_idle_entry_sweeper(&entries, &pool_config);
         Self {
-            entries: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            entries,
             creation_locks: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
             gateway_svid,
@@ -2445,11 +2473,7 @@ impl HboneConnectionPool {
 
     fn maybe_prune_idle_entries(&self) {
         let now = unix_secs();
-        let interval = if self.pool_config.idle_timeout_seconds == 0 {
-            60
-        } else {
-            self.pool_config.idle_timeout_seconds.clamp(1, 60)
-        };
+        let interval = idle_prune_interval_secs(&self.pool_config);
         let last = self.last_idle_prune_unix_secs.load(Ordering::Relaxed);
         if now.saturating_sub(last) < interval {
             return;
@@ -2935,8 +2959,18 @@ pub(crate) async fn dial_h2_connect_sender(
                 .max_frame_size(pool_config.http2_max_frame_size)
                 .max_header_list_size(max_header_list_size)
                 .max_concurrent_reset_streams(4096);
+            // The DestinationRule `maxConcurrentStreams` / global stream cap,
+            // exactly as `pool::hyper_h2_client_builder` applies it (issue
+            // #7181): advertised to the peer as our own inbound cap, and our
+            // own outbound CONNECT bound until the peer's SETTINGS replace it.
+            // `max_concurrent_streams` alone caps only peer-initiated streams
+            // on a client, so the keyed cap bounded nothing. After SETTINGS
+            // the transport's `HboneConnectionLoad` keeps holding the cap
+            // for carrier selection.
             if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-                builder.max_concurrent_streams(max_streams);
+                builder
+                    .max_concurrent_streams(max_streams)
+                    .initial_max_send_streams(max_streams as usize);
             }
 
             let (sender, mut connection) =
@@ -3017,7 +3051,9 @@ pub(crate) async fn dial_h2_connect_sender(
             Ok(MeshH2Transport {
                 sender,
                 gate,
-                load: HboneConnectionLoad::default(),
+                load: HboneConnectionLoad::with_configured_stream_cap(
+                    pool_config.http2_max_concurrent_streams,
+                ),
             })
         }
     })
@@ -3729,6 +3765,50 @@ fn prune_pool_entries(entries: &mut Vec<HbonePoolEntry>) -> usize {
 fn record_hbone_evictions(count: usize) {
     crate::runtime_metrics::global_ref()
         .record_pool_evictions(crate::runtime_metrics::PoolKind::Hbone, count as u64);
+}
+
+/// Seconds between idle sweeps: the global idle timeout clamped to `1..=60`,
+/// or 60 when idle expiry is off globally (a per-proxy timeout may still
+/// apply to individual entries).
+fn idle_prune_interval_secs(pool_config: &PoolConfig) -> u64 {
+    if pool_config.idle_timeout_seconds == 0 {
+        60
+    } else {
+        pool_config.idle_timeout_seconds.clamp(1, 60)
+    }
+}
+
+/// Periodic idle sweep for the HBONE / mesh CONNECT pool (issue #7182).
+///
+/// The rate-limited prune also runs on the cold create path, but a
+/// destination that stops receiving lookups never reaches it, so without this
+/// task its connections — sockets, DestinationRule `maxConnections` slots,
+/// trust-registry registrations — would outlive `idleTimeout` indefinitely.
+/// Holds only a `Weak` reference to the entry map, so the task ends with the
+/// pool, exactly like the direct pools' sweepers. Spawned only inside a Tokio
+/// runtime.
+fn spawn_idle_entry_sweeper(
+    entries: &Arc<DashMap<String, Vec<HbonePoolEntry>>>,
+    pool_config: &PoolConfig,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(entries);
+    let interval = Duration::from_secs(idle_prune_interval_secs(pool_config));
+    handle.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(entries) = weak.upgrade() else { break };
+            entries.retain(|_, entries| {
+                record_hbone_evictions(prune_pool_entries(entries));
+                !entries.is_empty()
+            });
+        }
+    });
 }
 
 /// Remove the pool entry whose gate is `gate`. Identity match (not key-only)

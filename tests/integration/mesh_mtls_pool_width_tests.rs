@@ -328,6 +328,20 @@ struct Fixture {
 }
 
 async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
+    fixture_with_pool_config(
+        PoolConfig {
+            http2_connections_per_host: width,
+            ..PoolConfig::default()
+        },
+        max_connections,
+    )
+    .await
+}
+
+async fn fixture_with_pool_config(
+    pool_config: PoolConfig,
+    max_connections: Option<u32>,
+) -> Fixture {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let td = TrustDomain::new("cluster.local").unwrap();
     let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
@@ -344,10 +358,6 @@ async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
     let peer_slot = svid_slot(bundle_for(peer_id.clone(), peer_leaf, peer_key, root_der));
     let peer = start_holding_peer(peer_slot).await;
 
-    let pool_config = PoolConfig {
-        http2_connections_per_host: width,
-        ..PoolConfig::default()
-    };
     let pool = MeshMtlsConnectionPool::new(
         pool_config,
         DnsCache::new(DnsConfig::default()),
@@ -453,6 +463,36 @@ async fn sequential_traffic_stays_on_one_connection() {
         1,
         "requests that never overlap must not widen the pool"
     );
+}
+
+/// Issue #7182: an idle connection to a destination that receives no further
+/// lookups is still evicted once `idleTimeout` passes. The cold-create prune
+/// never runs for such a destination, so only the periodic sweep can reach it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untouched_idle_connection_is_swept_after_the_idle_timeout() {
+    let fixture = fixture_with_pool_config(
+        PoolConfig {
+            idle_timeout_seconds: 1,
+            ..PoolConfig::default()
+        },
+        None,
+    )
+    .await;
+    {
+        let (_sender, future) = dispatch(&fixture).await;
+        expect_ok(future).await;
+    }
+    assert_eq!(fixture.pool.pool_size(), 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while fixture.pool.pool_size() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the idle connection was never swept"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(fixture.peer.accepted(), 1, "the sweep itself dials nothing");
 }
 
 #[tokio::test(flavor = "multi_thread")]
