@@ -3053,14 +3053,6 @@ fn cni_capture_readiness_rejection(
     }
 }
 
-fn cni_topology_readiness_rejection(
-    verb: RpcVerb,
-    initial_sync_complete: bool,
-    topology_ready: bool,
-) -> Option<&'static str> {
-    cni_capture_readiness_rejection(verb, initial_sync_complete, topology_ready, true)
-}
-
 #[allow(dead_code)] // External unit tests cover the combined proof gate.
 pub(crate) fn cni_capture_readiness_rejection_for_test(
     verb: RpcVerb,
@@ -3074,15 +3066,6 @@ pub(crate) fn cni_capture_readiness_rejection_for_test(
         topology_ready,
         udp_migration_ready,
     )
-}
-
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
-pub(crate) fn cni_topology_readiness_rejection_for_test(
-    verb: RpcVerb,
-    initial_sync_complete: bool,
-    startup_ready: bool,
-) -> Option<&'static str> {
-    cni_topology_readiness_rejection(verb, initial_sync_complete, startup_ready)
 }
 
 fn watcher_init_stale_uids(
