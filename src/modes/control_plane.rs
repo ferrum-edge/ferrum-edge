@@ -187,7 +187,7 @@ async fn reconcile_plugin_migrations_after_cp_reconnect(
     if !*needs_reconcile {
         return true;
     }
-    match crate::modes::handle_recovery_plugin_migrations(db, auto_apply, "cp-recovery").await {
+    match crate::modes::handle_startup_plugin_migrations(db, auto_apply, "cp-recovery").await {
         Ok(()) => {
             *needs_reconcile = false;
             true
@@ -3662,30 +3662,10 @@ pub async fn run(
                                     }
                                 }
 
-                                // Publication now flows THROUGH the partitions,
-                                // so a non-empty delta that partitions to
-                                // nothing (deletions for ids already absent
-                                // from the CP snapshot, so their namespace
-                                // cannot be resolved) has nothing to publish.
-                                // The cursor must still advance or the same
-                                // rows are re-read on every tick forever.
-                                if partitions.is_empty() {
-                                    warn!(
-                                        "CP incremental delta contained no namespace-attributable \
-                                         changes; advancing cursors for the namespaces that loaded"
-                                    );
-                                    merge_refreshed_change_sequences(
-                                        &mut last_change_sequences,
-                                        next_sequences,
-                                    );
-                                    rejected_delta_tracker.record_accepted();
-                                    if config_rejected_poll.load(Ordering::Relaxed) {
-                                        force_full_reload = true;
-                                    }
-                                    database_delta_poll_metrics_for_poll.record_poll_completed();
-                                    continue;
-                                }
-
+                                // `result` is non-empty and every change is
+                                // bucketed by its own namespace (removals carry
+                                // a NamespacedResourceId), so `partitions` is
+                                // non-empty here.
                                 // Commit + DP/mesh emission are one publication
                                 // section, so a concurrent K8s reconcile full
                                 // snapshot can never be emitted after these
@@ -5073,7 +5053,8 @@ mod tests {
         let source = &source[..test_module];
         assert!(
             source.contains("async fn reconcile_plugin_migrations_after_cp_reconnect(")
-                && source.contains("handle_recovery_plugin_migrations("),
+                && source
+                    .contains("handle_startup_plugin_migrations(db, auto_apply, \"cp-recovery\")"),
             "CP recovery must share the startup custom-plugin migration policy"
         );
         assert!(
@@ -5186,9 +5167,9 @@ mod tests {
         let source = include_str!("control_plane.rs");
         let marker = "if config_rejected_poll.load(Ordering::Relaxed) {\n                                        force_full_reload = true;";
         assert!(
-            source.matches(marker).count() >= 3,
-            "empty-result, empty-partition, and all-accepted incremental paths \
-             must force a full reload while config_rejected is set"
+            source.matches(marker).count() >= 2,
+            "empty-result and all-accepted incremental paths must force a full \
+             reload while config_rejected is set"
         );
     }
 

@@ -376,3 +376,147 @@ async fn file_mode_apply_rejection_raises_config_rejected_and_keeps_last_good() 
     shutdown_tx.shutdown();
     let _ = handles.join().await;
 }
+
+#[derive(Clone, Default)]
+struct ReloadLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for ReloadLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ReloadLogs {
+    type Writer = ReloadLogs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Issue #7252: the `access_control` rename-guard rejection is a reload error
+/// that bypasses the startup renderer, so each conflict is sanitized before it
+/// is logged (`.claude/rules/validation-diagnostics.md`): the quoted ids are
+/// withheld while the fixed reason survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_mode_rename_conflict_rejection_log_is_sanitized() {
+    use ferrum_edge::config::types::{Consumer, PluginConfig, PluginScope, default_namespace};
+
+    const CONSUMER_ID: &str = "rename-guard-subject-7252";
+    const PLUGIN_ID: &str = "rename-guard-deny-7252";
+    let namespace = default_namespace();
+    let consumer = Consumer {
+        labels: Default::default(),
+        id: CONSUMER_ID.to_string(),
+        namespace: namespace.clone(),
+        username: "mallory".to_string(),
+        custom_id: None,
+        credentials: std::collections::HashMap::new(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let deny = PluginConfig {
+        labels: Default::default(),
+        id: PLUGIN_ID.to_string(),
+        plugin_name: "access_control".to_string(),
+        namespace: namespace.clone(),
+        config: json!({"disallowed_consumers": ["mallory"]}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let mut initial = parse_gateway_yaml(&good_config_yaml("proxy-good"));
+    initial.consumers.push(consumer.clone());
+    initial.plugin_configs.push(deny);
+
+    let proxy_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let admin_listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind admin");
+    let proxy_port = proxy_listener.local_addr().unwrap().port();
+    let admin_port = admin_listener.local_addr().unwrap().port();
+    let jwt_manager = JwtManager::new(JwtConfig {
+        secret: ADMIN_JWT_SECRET.to_string(),
+        issuer: ADMIN_JWT_ISSUER.to_string(),
+        audience: None,
+        max_ttl_seconds: 3600,
+        algorithm: jsonwebtoken::Algorithm::HS256,
+    });
+    let opts = ServeOptions {
+        proxy_http: Some(proxy_listener),
+        admin_http: Some(admin_listener),
+        admin_jwt_manager: Some(jwt_manager),
+        skip_initial_capability_refresh: true,
+        background_drain_timeout: Some(Duration::from_millis(200)),
+        ..ServeOptions::default()
+    };
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
+    let handles = file::serve(
+        file_env(proxy_port, admin_port),
+        initial.clone(),
+        opts,
+        shutdown_tx.clone(),
+    )
+    .await
+    .expect("file::serve");
+
+    // Rename the referenced consumer without updating the deny list.
+    let mut candidate = initial;
+    candidate.consumers[0].username = "m.reyes".to_string();
+
+    let logs = ReloadLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(logs.clone())
+        .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
+    tracing::subscriber::with_default(subscriber, || {
+        apply_file_config_candidate(
+            &handles.proxy_state,
+            &handles.config_rejected,
+            Ok(candidate),
+        );
+    });
+
+    assert!(
+        handles.config_rejected.load(Ordering::Relaxed),
+        "a rename conflict must raise config_rejected"
+    );
+    let output = String::from_utf8(
+        logs.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    )
+    .expect("utf8 logs");
+    assert!(
+        output.contains("Configuration reload rejected, keeping previous config")
+            && output.contains("cannot be renamed while access_control"),
+        "{output}"
+    );
+    assert!(
+        !output.contains(CONSUMER_ID) && !output.contains(PLUGIN_ID),
+        "rename-conflict ids must be withheld by the diagnostic sanitizer: {output}"
+    );
+
+    shutdown_tx.shutdown();
+    let _ = handles.join().await;
+}

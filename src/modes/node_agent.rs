@@ -1239,16 +1239,22 @@ pub async fn run(
         )
         .await
     } else {
-        let backend = create_backend(&config, &metrics)?;
-        run_with_backend(
-            backend,
-            &config,
-            metrics,
-            &shutdown_tx,
-            startup_ready,
-            cni_config,
-        )
-        .await
+        // A backend failure takes the common tail below like every other exit,
+        // so the admin listeners are shut down and joined (#2372, #3704).
+        match create_backend(&config, &metrics) {
+            Ok(backend) => {
+                run_with_backend(
+                    backend,
+                    &config,
+                    metrics,
+                    &shutdown_tx,
+                    startup_ready,
+                    cni_config,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
     };
 
     shutdown_tx.shutdown();
@@ -1743,6 +1749,15 @@ fn create_backend(
 enum PodWatcherLoopExit {
     ShutdownRequested,
     WatcherExhausted,
+}
+
+/// Timer for the pod/CNI select loop's maintenance arms. `Delay` keeps a loop
+/// that was stalled (for example by an awaited Kubernetes call) from replaying
+/// every missed tick back to back once it resumes (#7254).
+fn maintenance_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 async fn run_with_backend(
@@ -2397,24 +2412,24 @@ where
     // `retry_backed_off_pod_enrollments` is a cheap no-op when no failures are
     // pending. Consume the immediate first tick that `interval` fires so the
     // first real pass waits a full backoff window rather than firing instantly.
-    let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
+    let mut retry_interval = maintenance_interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
     let mut topology_monitor_open = topology_monitor.is_some();
     let mut last_topology_outcome = topology_monitor
         .as_ref()
         .map(|monitor| monitor.outcomes.borrow().clone());
-    let mut topology_datapath_retry = tokio::time::interval(INGRESS_TOPOLOGY_DATAPATH_RETRY);
+    let mut topology_datapath_retry = maintenance_interval(INGRESS_TOPOLOGY_DATAPATH_RETRY);
     topology_datapath_retry.tick().await;
-    let mut udp_registry_retraction_retry = tokio::time::interval(UDP_REGISTRY_RETRACTION_RETRY);
+    let mut udp_registry_retraction_retry = maintenance_interval(UDP_REGISTRY_RETRACTION_RETRY);
     udp_registry_retraction_retry.tick().await;
-    let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
+    let mut udp_readiness_interval = maintenance_interval(UDP_CAPTURE_READINESS_POLL);
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
     // NodeWaypoint UDP/DTLS reply-source authorization (issue #3286). Shares
     // the readiness cadence: the proxy withdraws a claim before its listener's
     // socket goes away, so this is the bound on how long a revoked ClusterIP
     // can stay authorized, and it must stay short.
-    let mut udp_reply_source_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
+    let mut udp_reply_source_interval = maintenance_interval(UDP_CAPTURE_READINESS_POLL);
     udp_reply_source_interval.tick().await;
     let mut udp_reply_source_state = NodeWaypointUdpReplySourceState::default();
 
@@ -2696,7 +2711,16 @@ where
                         // select arm so the watcher keeps running instead of
                         // spinning on an immediately-ready closed receiver.
                         cni_work_open = false;
-                        debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
+                        if *shutdown_rx.borrow() {
+                            debug!("CNI work queue closed during shutdown");
+                        } else {
+                            // With the chained conflist installed, ADD fails
+                            // closed while no listener serves the socket, so
+                            // this is a node-wide pod-creation outage (#7253).
+                            error!(
+                                "Node-agent CNI listener is not serving; CNI ADD on this node fails closed until the node-agent is restarted"
+                            );
+                        }
                     }
                 }
             }
@@ -3043,14 +3067,6 @@ fn cni_capture_readiness_rejection(
     }
 }
 
-fn cni_topology_readiness_rejection(
-    verb: RpcVerb,
-    initial_sync_complete: bool,
-    topology_ready: bool,
-) -> Option<&'static str> {
-    cni_capture_readiness_rejection(verb, initial_sync_complete, topology_ready, true)
-}
-
 #[allow(dead_code)] // External unit tests cover the combined proof gate.
 pub(crate) fn cni_capture_readiness_rejection_for_test(
     verb: RpcVerb,
@@ -3064,15 +3080,6 @@ pub(crate) fn cni_capture_readiness_rejection_for_test(
         topology_ready,
         udp_migration_ready,
     )
-}
-
-#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
-pub(crate) fn cni_topology_readiness_rejection_for_test(
-    verb: RpcVerb,
-    initial_sync_complete: bool,
-    startup_ready: bool,
-) -> Option<&'static str> {
-    cni_topology_readiness_rejection(verb, initial_sync_complete, startup_ready)
 }
 
 fn watcher_init_stale_uids(
@@ -10817,6 +10824,25 @@ mod capture_boundary_tests;
 mod tests {
     use super::*;
     use crate::capture::{CaptureMode, Ip6TablesMode};
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_interval_does_not_burst_after_a_stall() {
+        let period = Duration::from_millis(250);
+        let mut interval = maintenance_interval(period);
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
+        interval.tick().await;
+        // Stall the loop for many periods, then resume: only one tick is
+        // ready immediately, and the next waits a full period after it.
+        tokio::time::advance(period * 40).await;
+        let resumed = tokio::time::Instant::now();
+        interval.tick().await;
+        assert_eq!(tokio::time::Instant::now(), resumed);
+        interval.tick().await;
+        assert_eq!(tokio::time::Instant::now(), resumed + period);
+    }
     use crate::ebpf::MockEbpfBackend;
 
     #[test]

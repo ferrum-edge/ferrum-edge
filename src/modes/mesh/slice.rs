@@ -1393,7 +1393,9 @@ impl MeshSlice {
                 .filter(|upstream| {
                     upstream.namespace == request.namespace
                         && referenced.contains(upstream.id.as_str())
-                        && upstream.id.starts_with("istio-vs-l4-upstream-")
+                        && upstream
+                            .id
+                            .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX)
                 })
                 .collect()
         };

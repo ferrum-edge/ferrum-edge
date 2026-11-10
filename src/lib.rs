@@ -19646,18 +19646,6 @@ pub mod _test_support {
         .await
     }
 
-    pub fn node_agent_cni_topology_readiness_rejection_for_test(
-        verb: crate::cni::rpc::RpcVerb,
-        initial_sync_complete: bool,
-        startup_ready: bool,
-    ) -> Option<&'static str> {
-        crate::modes::node_agent::cni_topology_readiness_rejection_for_test(
-            verb,
-            initial_sync_complete,
-            startup_ready,
-        )
-    }
-
     pub fn node_agent_cni_capture_readiness_rejection_for_test(
         verb: crate::cni::rpc::RpcVerb,
         initial_sync_complete: bool,

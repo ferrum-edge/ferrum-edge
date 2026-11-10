@@ -4173,7 +4173,9 @@ fn decode_virtual_service_l4_upstreams(
                         )
                     })?;
             if upstream.namespace != slice.namespace
-                || !upstream.id.starts_with("istio-vs-l4-upstream-")
+                || !upstream
+                    .id
+                    .starts_with(crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX)
                 || !referenced.contains(upstream.id.as_str())
                 || upstream.targets.is_empty()
             {
@@ -16836,6 +16838,7 @@ async fn arm_mesh_runtime_startup(
             runtime.dns_max_concurrent_queries,
             runtime.dns_response_cache_max_entries,
             runtime.cluster_domain.clone(),
+            env_config.pool_shard_amount,
         ));
         // Build initial resolution table from the applied slice
         if let Some(ref slice) = initial_applied_mesh_slice {

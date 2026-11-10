@@ -80,7 +80,6 @@ const SIDECAR_ENV_KEYS: &[&str] = &[
     "FERRUM_DP_GRPC_TLS_CA_CERT_PATH",
     "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH",
     "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH",
-    "FERRUM_DP_GRPC_TLS_NO_VERIFY",
     "FERRUM_MESH_CONFIG_PROTOCOL",
 ];
 const SIDECAR_CONTAINER_NAME: &str = "ferrum-edge";
@@ -2349,6 +2348,15 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::task::JoinHandle;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn sidecar_env_keys_skip_rejected_dp_tls_no_verify() {
+        // `EnvConfig` rejects `FERRUM_DP_GRPC_TLS_NO_VERIFY=true` in every
+        // mode, so forwarding it into sidecars could only be a no-op or break
+        // every injected pod (#7252).
+        assert!(!SIDECAR_ENV_KEYS.contains(&"FERRUM_DP_GRPC_TLS_NO_VERIFY"));
+        assert!(SIDECAR_ENV_KEYS.contains(&"FERRUM_DP_GRPC_TLS_CA_CERT_PATH"));
+    }
 
     fn test_resources(
         cpu_request: &str,

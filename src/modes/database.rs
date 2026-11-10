@@ -3740,7 +3740,7 @@ async fn mark_db_available_after_successful_poll_load(
         Ordering::Acquire,
     ) {
         Ok(_) => {
-            match crate::modes::handle_recovery_plugin_migrations(
+            match crate::modes::handle_startup_plugin_migrations(
                 db,
                 auto_apply_plugin_migrations,
                 "database-recovery",
@@ -3965,7 +3965,7 @@ pub(super) mod tests {
             .map_or(source.len(), |offset| helper_start + offset);
         let helper = &source[helper_start..helper_end];
         assert!(
-            helper.contains("handle_recovery_plugin_migrations"),
+            helper.contains("handle_startup_plugin_migrations("),
             "recovery path must reconcile custom-plugin migrations"
         );
         assert!(

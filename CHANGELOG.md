@@ -110,6 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and incremented with a compare-exchange that refuses a stale cycle, so an
     increment racing a reopen can no longer close the next cycle one success
     early or extend its failure streak.
+- **The mesh injector no longer copies `FERRUM_DP_GRPC_TLS_NO_VERIFY` into
+  sidecars** (#7252). Every mode rejects `FERRUM_DP_GRPC_TLS_NO_VERIFY=true`
+  at startup, so forwarding the injector's value could only be a no-op or
+  stop every injected sidecar from starting. Pin the CP CA with
+  `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` instead, which is still forwarded.
 
 ### Fixed
 - **`body_validator` response-side rejections no longer describe the upstream
@@ -949,6 +954,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **NodeWaypoint orig-dst bridge no longer spins on a dropped shutdown
   sender** (issue #7264), and a failing SOCK_OPS dropped-events counter read
   warns once instead of on every ringbuf wakeup.
+- **Remote-cluster endpoints attached to a Service in another namespace
+  survive the trust-domain filter** (#7247). The multi-cluster
+  cross-trust-domain guard matched each service's workload refs against
+  surviving workloads in the workload's own namespace instead of the
+  namespace of the Service it attaches to (`service_namespace`), so an
+  in-domain remote `WorkloadEntry` in `vm` attached to a Service in `prod` had
+  its ref dropped with a misleading trust-domain warning, and a service whose
+  refs were all of that kind was dropped from cross-cluster failover. Refs now
+  match on the attached Service namespace, as service discovery does.
+- **Gateway API `sessionPersistence.absoluteTimeout` accepts compound
+  durations** (#7255). A Permanent-cookie session policy whose
+  `absoluteTimeout` used more than one GEP-2257 component (for example
+  `1h30m`), which the CRD admits, was rejected as "not a valid Gateway API
+  duration" and failed the whole HTTPRoute rule, `BackendLBPolicy` or
+  `XBackendTrafficPolicy`. It is now parsed with the same multi-component
+  parser as `timeouts` and `retry.backoff` (`1h30m` → `Max-Age=5400`).
+- **Data planes run the ACME renewal scheduler** (#7251). With
+  `FERRUM_ACME_AUTO_RENEW_ENABLED=true`, only file and database mode started
+  the scheduler; a DP accepted the setting, armed the frontend/admin
+  live-reload watchers for its `acme://` sources and then never renewed, so
+  the certificate expired without warning. DP mode now starts the scheduler
+  and joins it at shutdown like the other serving modes.
 
 ### Performance
 - **Multi-namespace control planes load their namespaces concurrently.** With
@@ -1030,6 +1057,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared read lock. The mesh destination-workload label fallback is interned
   instead of allocated per request, and `grpc_web` copies `Content-Type` only
   for gRPC-Web requests.
+- **Mesh authorization normalizes the request host only when a rule reads
+  it** (#7250). `mesh_authz` evaluation used to lower-case and split the
+  request authority (two or three allocations) on every HTTP request before
+  the policy loop, even when no rule constrains `hosts` / `notHosts`. It is
+  now normalized on the first rule that does. Decisions are unchanged.
 
 ## [0.9.20] - 2026-11-02
 

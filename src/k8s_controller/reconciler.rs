@@ -1070,7 +1070,8 @@ fn k8s_published_mesh_content_matches(left: &GatewayConfig, right: &GatewayConfi
     }
 }
 
-const MESH_SLICE_L4_UPSTREAM_ID_PREFIX: &str = "istio-vs-l4-upstream-";
+const MESH_SLICE_L4_UPSTREAM_ID_PREFIX: &str =
+    crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX;
 
 fn is_mesh_slice_l4_proxy(proxy: &crate::config::types::Proxy) -> bool {
     proxy
@@ -1772,7 +1773,7 @@ const K8S_MANAGED_UPSTREAM_ID_PREFIXES: &[&str] = &[
     "gwapi-route-upstream-",
     "gwapi-l4-upstream-",
     "istio-vs-upstream-",
-    "istio-vs-l4-upstream-",
+    crate::proxy::stream_match::ISTIO_VS_L4_UPSTREAM_ID_PREFIX,
 ];
 const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
     "istio-vs-cors-",

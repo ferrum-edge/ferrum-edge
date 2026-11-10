@@ -158,9 +158,15 @@ pub fn apply_file_config_candidate(
                 &new_config,
             );
             if !rename_conflicts.is_empty() {
+                // Sanitize each conflict on its own before joining, like every
+                // other reload diagnostic that bypasses the startup renderer.
+                let rendered: Vec<String> = rename_conflicts
+                    .iter()
+                    .map(|conflict| crate::startup::sanitize_startup_cause(conflict, &[]))
+                    .collect();
                 error!(
                     "Configuration reload rejected, keeping previous config: {}",
-                    rename_conflicts.join("; ")
+                    rendered.join("; ")
                 );
                 config_rejected.store(true, Ordering::Relaxed);
                 return;

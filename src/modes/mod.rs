@@ -163,7 +163,9 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
 }
 
 /// Handle pending custom-plugin database migrations at startup for the
-/// `database` and `cp` modes.
+/// `database` and `cp` modes, and again when either recovers its database
+/// after an offline or backup bootstrap (the same policy applies: in-place
+/// recovery must not be strictly weaker than a process restart).
 ///
 /// Behavior is controlled by `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS`:
 ///
@@ -187,24 +189,6 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
 /// When auto-apply is off, ordinary probe failures remain warn-only, but any
 /// typed migration-history integrity failure is fatal in every mode.
 pub(crate) async fn handle_startup_plugin_migrations(
-    db: &Arc<dyn DatabaseBackend>,
-    auto_apply: bool,
-    mode: &str,
-) -> Result<(), anyhow::Error> {
-    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
-    handle_startup_plugin_migrations_with_list(db, auto_apply, mode, &plugin_migrations).await
-}
-
-/// Recovery variant of [`handle_startup_plugin_migrations`].
-///
-/// Warn-only mode (`auto_apply=false`) matches ordinary startup: a pending-state
-/// non-integrity **probe failure** is logged and does not block recovered config
-/// publication (in-place recovery must not be strictly weaker than a process
-/// restart against the same database). History-integrity failures stay fatal;
-/// auto-apply mode remains fail-closed on every probe/apply error.
-/// A probe that **succeeds** and reports pending migrations still follows the
-/// warn-and-continue / auto-apply policy unchanged.
-pub(crate) async fn handle_recovery_plugin_migrations(
     db: &Arc<dyn DatabaseBackend>,
     auto_apply: bool,
     mode: &str,

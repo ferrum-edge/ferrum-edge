@@ -25,11 +25,10 @@ use super::{
     RouteBackend, RouteProxySpec, SourceKind, UNSUPPORTED_SHAPE_MARKER,
     attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
     mesh_route_dispatch_plugin_from_rules, namespaced_resource_key, optional_port_field,
-    optional_target_weight_field, parse_istio_duration_ms, port_from_u64, proxy_for_route,
-    resource_id, route_backends_require_node_waypoint_authz,
-    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
-    service_dns_name, string_array, string_field, upstream_for_route,
-    upstream_for_route_with_session,
+    optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
+    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
+    route_response_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
+    upstream_for_route, upstream_for_route_with_session,
 };
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{HashOnCookieConfig, PluginConfig, Proxy};
@@ -808,13 +807,9 @@ fn parse_gateway_api_duration_secs(
 ) -> Result<u64, K8sTranslateError> {
     // Diagnostics name the field and system cap only — never echo the operator
     // duration string (which may carry hostile/control content into status).
-    if !is_gateway_api_duration(raw) {
-        return Err(invalid_resource(
-            object,
-            format!("sessionPersistence.{field} is not a valid Gateway API duration"),
-        ));
-    }
-    let ms = parse_istio_duration_ms(raw).ok_or_else(|| {
+    // The CRD admits compound GEP-2257 durations such as `1h30m`, so use the
+    // multi-component parser shared with `timeouts` and `retry.backoff`.
+    let ms = parse_gateway_api_duration_ms(raw).ok_or_else(|| {
         invalid_resource(
             object,
             format!("sessionPersistence.{field} is not a valid Gateway API duration"),
@@ -837,40 +832,6 @@ fn parse_gateway_api_duration_secs(
         ));
     }
     Ok(secs)
-}
-
-/// Gateway API Duration is one to four integer+unit groups, each integer at
-/// most five digits, with units h/m/s/ms. This intentionally rejects the wider
-/// duration grammar accepted by the Istio parser (for example decimals).
-fn is_gateway_api_duration(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    let mut offset = 0;
-    let mut groups = 0;
-    while offset < bytes.len() && groups < 4 {
-        let digits_start = offset;
-        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
-            offset += 1;
-        }
-        let digits = offset - digits_start;
-        if !(1..=5).contains(&digits) {
-            return false;
-        }
-        if bytes
-            .get(offset..)
-            .is_some_and(|remainder| remainder.starts_with(b"ms"))
-        {
-            offset += 2;
-        } else if bytes
-            .get(offset)
-            .is_some_and(|unit| matches!(*unit, b'h' | b'm' | b's'))
-        {
-            offset += 1;
-        } else {
-            return false;
-        }
-        groups += 1;
-    }
-    offset == bytes.len() && groups > 0
 }
 
 fn resolve_rule_session_persistence(
@@ -17168,12 +17129,36 @@ mod tests {
 
     #[test]
     fn gateway_api_duration_parser_rejects_wider_istio_grammar() {
-        assert!(is_gateway_api_duration("1h2m3s4ms"));
-        assert!(is_gateway_api_duration("0s"));
-        assert!(!is_gateway_api_duration("1.5s"));
-        assert!(!is_gateway_api_duration("123456s"));
-        assert!(!is_gateway_api_duration("1s2s3s4s5s"));
-        assert!(!is_gateway_api_duration(""));
+        assert_eq!(parse_gateway_api_duration_ms("1h2m3s4ms"), Some(3_723_004));
+        assert_eq!(parse_gateway_api_duration_ms("0s"), Some(0));
+        assert_eq!(parse_gateway_api_duration_ms("1.5s"), None);
+        assert_eq!(parse_gateway_api_duration_ms("123456s"), None);
+        assert_eq!(parse_gateway_api_duration_ms("1s2s3s4s5s"), None);
+        assert_eq!(parse_gateway_api_duration_ms(""), None);
+    }
+
+    #[test]
+    fn permanent_cookie_accepts_compound_absolute_timeout() {
+        let policy = x_backend_traffic_policy(
+            "sticky",
+            serde_json::json!({
+                "targetRefs": [{"group": "", "kind": "Service", "name": "api"}],
+                "sessionPersistence": {
+                    "sessionName": "perm",
+                    "type": "Cookie",
+                    "absoluteTimeout": "1h30m",
+                    "cookieConfig": {"lifetimeType": "Permanent"}
+                }
+            }),
+        );
+        let result = translate_k8s_objects(&[policy, http_route_to_service("api")], options())
+            .expect("a CRD-valid compound absoluteTimeout should translate");
+        let cookie = result.config.upstreams[0]
+            .hash_on_cookie_config
+            .as_ref()
+            .expect("cookie config");
+        assert!(!cookie.session_cookie);
+        assert_eq!(cookie.ttl_seconds, 5400);
     }
 
     #[test]
