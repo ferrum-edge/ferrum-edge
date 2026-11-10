@@ -160,3 +160,114 @@ fn the_dp_config_families_are_appended_live_and_never_memoized() {
         "the live append must be composed by both `render()` and `render_uncached()`"
     );
 }
+
+/// The memoized `render_cacheable_body` source, from its signature to the next
+/// item in the impl block.
+fn cacheable_body_source() -> &'static str {
+    let cacheable_start = PROMETHEUS_METRICS_SRC
+        .find("fn render_cacheable_body(&self)")
+        .expect("render_cacheable_body");
+    let tail = &PROMETHEUS_METRICS_SRC[cacheable_start + 1..];
+    let cacheable_end = [
+        "\n    fn ",
+        "\n    pub fn ",
+        "\n    pub(crate) fn ",
+        "\n}\n",
+    ]
+    .iter()
+    .filter_map(|marker| tail.find(marker))
+    .min()
+    .map_or(PROMETHEUS_METRICS_SRC.len(), |offset| {
+        cacheable_start + 1 + offset
+    });
+    &PROMETHEUS_METRICS_SRC[cacheable_start..cacheable_end]
+}
+
+/// Issue #7145: families whose producers live outside the registry and never
+/// invalidate `render_cache` are appended live from both render entry points,
+/// never memoized.
+#[test]
+fn externally_sourced_process_families_are_appended_live_and_never_memoized() {
+    let cacheable_body = cacheable_body_source();
+    for family in [
+        "ferrum_service_discovery_tasks",
+        "ferrum_service_discovery_last_success_age_seconds_max",
+        "ferrum_compression_codec_admitted_total",
+        "ferrum_admin_audit_events_accepted_total",
+        "ferrum_admin_audit_events_dropped_total",
+        "ferrum_admin_audit_queue_depth",
+        "ferrum_admin_audit_evidence_lost",
+        "ferrum_udp_amplification_responses_dropped_total",
+        "ferrum_gateway_trust_bundle_published_generations_total",
+        "ferrum_admin_active_connections",
+        "ferrum_cp_grpc_rejected_connections_total",
+        "ferrum_node_agent_pods_enrolled_total",
+        "ferrum_mesh_node_topology_degraded",
+    ] {
+        // Match the family name exactly (quoted, or as a HELP line), not as a
+        // prefix of a registry-owned sibling such as
+        // `ferrum_service_discovery_tasks_started_total`.
+        let names_family = |text: &str| {
+            text.contains(&format!("\"{family}\"")) || text.contains(&format!("HELP {family} "))
+        };
+        assert!(
+            !names_family(cacheable_body),
+            "{family} must not be rendered inside the memoized body"
+        );
+        assert!(
+            names_family(PROMETHEUS_METRICS_SRC),
+            "{family} must still be rendered"
+        );
+    }
+    for source in [
+        "crate::service_discovery::health::aggregate()",
+        "crate::plugins::compression::compression_codec_metrics()",
+        "crate::admin::audit::pipeline_metrics_snapshot()",
+        "crate::admin::audit::pipeline_status()",
+        "crate::udp_amplification::metrics_snapshot()",
+        "crate::config::gateway_trust::observability_snapshot()",
+        "self.admin_conn_metrics.load_full()",
+        "self.cp_grpc_conn_metrics.load_full()",
+        "self.node_agent_metrics.load_full()",
+    ] {
+        assert!(
+            !cacheable_body.contains(source),
+            "{source} must not be read inside the memoized body"
+        );
+    }
+    assert_eq!(
+        PROMETHEUS_METRICS_SRC
+            .matches("self.append_external_process_prometheus(&mut output);")
+            .count(),
+        2,
+        "the live append must be composed by both `render()` and `render_uncached()`"
+    );
+}
+
+/// Issue #7145: a scrape inside the render-cache TTL still observes an
+/// externally sourced counter that moved since the previous scrape.
+#[test]
+fn externally_sourced_counters_move_between_scrapes_inside_the_cache_ttl() {
+    fn dropped_total(exposition: &str) -> u64 {
+        exposition
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("ferrum_udp_amplification_responses_dropped_total")
+                    .and_then(|rest| rest.rsplit(' ').next())
+                    .and_then(|value| value.parse().ok())
+            })
+            .expect("udp amplification drop counter is always rendered")
+    }
+
+    let registry = MetricsRegistry::new();
+    // A long TTL: without the live append, the second scrape would replay the
+    // first body verbatim.
+    registry.configure(3600, 3600, 0, 10_000, "edge");
+    let before = dropped_total(&registry.render());
+    ferrum_edge::udp_amplification::record_response_dropped();
+    let after = dropped_total(&registry.render());
+    assert!(
+        after > before,
+        "the drop counter must move inside the cache TTL ({before} -> {after})"
+    );
+}
