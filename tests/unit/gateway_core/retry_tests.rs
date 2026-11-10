@@ -3378,3 +3378,17 @@ async fn native_h3_retry_screens_a_denied_dns_override_before_dialing() {
         r#"{"error":"backend address blocked by egress policy"}"#
     );
 }
+
+/// Issue #7158: the open-breaker rejection phase has one spelling on every
+/// frontend (`circuit_breaker_open`, as `docs/error_classification.md`
+/// documents), so the metrics token interner accepts only that spelling.
+#[test]
+fn open_breaker_rejection_phase_has_one_spelling() {
+    use ferrum_edge::retry::{OBS_CIRCUIT_BREAKER_OPEN, token_for_rejection_phase};
+
+    assert_eq!(
+        token_for_rejection_phase("circuit_breaker_open"),
+        Some(OBS_CIRCUIT_BREAKER_OPEN)
+    );
+    assert_eq!(token_for_rejection_phase("circuit_breaker"), None);
+}

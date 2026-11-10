@@ -2246,7 +2246,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .expect("bounded H3 upload-deadline finalizer");
     assert!(helper.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
     assert!(helper.contains("run_h3_reject_response_committed_hooks("));
-    assert!(helper.contains("log_rejected_request("));
+    assert!(helper.contains("log_rejected_request_with_path("));
     assert!(helper.contains("send_h3_plugin_reject_flavor_aware_with_recv_halt("));
     // Upload-deadline rejection is already selected; the terminal write must use
     // the shared post-deadline grace (via the plugin reject writer) rather than
@@ -2265,7 +2265,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
             .count(),
         1
     );
-    assert_eq!(helper.matches("log_rejected_request(").count(), 1);
+    assert_eq!(helper.matches("log_rejected_request_with_path(").count(), 1);
     assert_eq!(helper.matches("record_request(state,").count(), 1);
     assert_eq!(
         helper
@@ -2280,7 +2280,7 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
         .find("run_h3_reject_response_committed_hooks(")
         .expect("upload deadline commit");
     let log = helper
-        .find("log_rejected_request(")
+        .find("log_rejected_request_with_path(")
         .expect("upload deadline log");
     let metric = helper
         .find("record_request(state,")
@@ -6188,4 +6188,88 @@ fn h3_plain_authorization_failure_write_is_bounded_before_guard_settlement() {
         .expect("actual summary");
     assert!(latch < write && write < permits && permits < connections && connections < summary);
     assert!(branch.contains("body_completed: reject_sent"));
+}
+
+/// Issue #7158: once `handle_h3_request` rebases `path` for an Istio
+/// `rewrite.uri` / `mesh_route_dispatch` override, every rejection and
+/// transaction summary records the client's original path, as H1/H2 does. The
+/// rejection-log funnel falls back to the rewritten `ctx.path` when no path is
+/// passed, so no post-rewrite site may use the path-less entry points, and the
+/// two shared reject helpers carry the original path into their log.
+#[test]
+fn h3_post_rewrite_rejections_log_the_original_request_path() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let handler = server
+        .split("async fn handle_h3_request(")
+        .nth(1)
+        .expect("H3 request handler")
+        .split("\nfn h3_grpc_intended_refusal_exempts(")
+        .next()
+        .expect("bounded H3 request handler");
+    let after_rewrite = handler
+        .split("let original_request_path = path.clone();")
+        .nth(1)
+        .expect("the handler captures the original path before the rewrite");
+    assert!(
+        after_rewrite.contains("crate::proxy::rebase_route_override_path("),
+        "the capture must precede the route-override rebase"
+    );
+    for path_less in [
+        "log_rejected_request(",
+        "log_pre_backend_rejected_request(",
+        "request_path: path.clone()",
+    ] {
+        assert!(
+            !after_rewrite.contains(path_less),
+            "a post-rewrite H3 rejection must not record the rewritten path via `{path_less}`"
+        );
+    }
+    assert_eq!(
+        after_rewrite
+            .matches("run_h3_backend_admission_or_send_reject(")
+            .count(),
+        after_rewrite
+            .split("run_h3_backend_admission_or_send_reject(")
+            .skip(1)
+            .filter(|call| {
+                call.split(".await?")
+                    .next()
+                    .is_some_and(|args| args.contains("Some(&original_request_path)"))
+            })
+            .count(),
+        "every post-rewrite backend-admission reject must pass the original path"
+    );
+    assert_eq!(
+        after_rewrite
+            .matches("finalize_h3_upload_deadline_rejection(")
+            .count(),
+        after_rewrite
+            .split("finalize_h3_upload_deadline_rejection(")
+            .skip(1)
+            .filter(|call| {
+                call.split(".await?")
+                    .next()
+                    .is_some_and(|args| args.contains("Some(&original_request_path)"))
+            })
+            .count(),
+        "every post-rewrite upload-deadline reject must pass the original path"
+    );
+    for helper in [
+        "async fn run_h3_backend_admission_or_send_reject(",
+        "async fn finalize_h3_upload_deadline_rejection(",
+    ] {
+        let body = server
+            .split(helper)
+            .nth(1)
+            .expect("shared H3 reject helper")
+            .split("\n}\n")
+            .next()
+            .expect("bounded helper");
+        assert!(
+            body.contains("original_request_path: Option<&str>,")
+                && body.contains("log_rejected_request_with_path(")
+                && !body.contains("log_rejected_request("),
+            "{helper} must log the caller's original path"
+        );
+    }
 }
