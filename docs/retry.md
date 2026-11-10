@@ -172,7 +172,7 @@ backoff: !fixed
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `delay_ms` | integer | `100` | Milliseconds to wait between retries |
+| `delay_ms` | integer | — | Milliseconds to wait between retries (required) |
 
 ### Exponential Backoff with Jitter
 

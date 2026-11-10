@@ -74,7 +74,7 @@ proxies:
   - id: "my-api"
     listen_path: "/api"
     backend_scheme: http
-    backend_host: "10.0.1.1"   # fallback if upstream not found
+    backend_host: "10.0.1.1"
     backend_port: 8080
     strip_listen_path: true
     upstream_id: "api-servers"  # links to the upstream below
@@ -92,7 +92,7 @@ upstreams:
         port: 8080
 ```
 
-When `upstream_id` is set on a proxy, the gateway selects a target from the upstream instead of using `backend_host`/`backend_port` directly. If the upstream is not found, the proxy falls back to `backend_host`/`backend_port`.
+When `upstream_id` is set on a proxy, the gateway selects a target from the upstream instead of using `backend_host`/`backend_port` directly. A proxy whose `upstream_id` names no upstream in its namespace is rejected at config load and by the Admin API.
 
 ## Upstreams
 
