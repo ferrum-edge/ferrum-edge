@@ -689,6 +689,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so it cannot crowd out Gateway API status on the shared Kubernetes client.
   Each writer's own batch behaves as before, and clusters that watch only one
   of the two are unchanged.
+- **Mesh authorization normalizes the request host only when a rule reads
+  it** (#7250). `mesh_authz` evaluation used to lower-case and split the
+  request authority (two or three allocations) on every HTTP request before
+  the policy loop, even when no rule constrains `hosts` / `notHosts`. It is
+  now normalized on the first rule that does. Decisions are unchanged.
 
 ## [0.9.20] - 2026-11-02
 
