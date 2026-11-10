@@ -4408,9 +4408,10 @@ impl SoapWsSecurity {
         // Claimed after every semantic check so a rejected assertion cannot
         // burn a legitimate one's id, and before the identity is returned so no
         // caller can act on an assertion whose claim was refused.
+        // Only SAML 2.0 assertions are accepted, and SAML 2.0 identifies an
+        // assertion by `ID`; the SAML 1.x `AssertionID` is not an alias.
         let assertion_id = assertion_node
             .unqualified_attribute("ID")
-            .or_else(|| assertion_node.unqualified_attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         self.claim_saml_assertion(&issuer, assertion_id, &name_id)
             .await?;
@@ -4723,7 +4724,6 @@ impl SoapWsSecurity {
     ) -> Result<(), String> {
         let assertion_id = assertion
             .unqualified_attribute("ID")
-            .or_else(|| assertion.unqualified_attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         let expected_uri = format!("#{}", assertion_id);
 

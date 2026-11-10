@@ -1953,6 +1953,9 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
         /// Raw statements (e.g. an `AttributeStatement`) appended after
         /// `Conditions`, in both the emitted and the signed view.
         pub extra_statements: Option<String>,
+        /// Name of the assertion identifier attribute, in both views. SAML
+        /// 2.0 uses `ID`; SAML 1.x used `AssertionID`.
+        pub id_attribute: &'a str,
     }
 
     impl<'a> AssertionBuilder<'a> {
@@ -1983,6 +1986,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 extra_conditions: None,
                 subject_confirmations: None,
                 extra_statements: None,
+                id_attribute: "ID",
             }
         }
 
@@ -2076,8 +2080,13 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
             // declared on the Assertion element itself so the digested view and
             // the in-envelope view canonicalize identically.
             let assertion_no_sig = format!(
-                "<saml:Assertion xmlns:saml=\"{}\" xmlns:ds=\"{}\" ID=\"{}\"><saml:Issuer>{}</saml:Issuer>{}</saml:Assertion>",
-                SAML_NS, DSIG_NS, self.assertion_id, self.issuer, signed_body_after_issuer
+                "<saml:Assertion xmlns:saml=\"{}\" xmlns:ds=\"{}\" {}=\"{}\"><saml:Issuer>{}</saml:Issuer>{}</saml:Assertion>",
+                SAML_NS,
+                DSIG_NS,
+                self.id_attribute,
+                self.assertion_id,
+                self.issuer,
+                signed_body_after_issuer
             );
             let canonical_assertion = super::soap_exclusive_canonicalize_element_for_test(
                 &assertion_no_sig,
@@ -2169,8 +2178,14 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
             // verification time removes the first <Signature> element, so
             // the digested view matches `assertion_no_sig`.
             format!(
-                "<saml:Assertion xmlns:saml=\"{}\" xmlns:ds=\"{}\" ID=\"{}\"><saml:Issuer>{}</saml:Issuer>{}{}</saml:Assertion>",
-                SAML_NS, DSIG_NS, self.assertion_id, self.issuer, signature, body_after_issuer
+                "<saml:Assertion xmlns:saml=\"{}\" xmlns:ds=\"{}\" {}=\"{}\"><saml:Issuer>{}</saml:Issuer>{}{}</saml:Assertion>",
+                SAML_NS,
+                DSIG_NS,
+                self.id_attribute,
+                self.assertion_id,
+                self.issuer,
+                signature,
+                body_after_issuer
             )
         }
     }
@@ -2240,6 +2255,32 @@ async fn test_saml_valid_signed_assertion_accepted() {
         Some("alice@example.com"),
         "Subject NameID must be exported as metadata"
     );
+}
+
+/// Issue #7114: only SAML 2.0 assertions are accepted, so the SAML 1.x
+/// `AssertionID` attribute does not identify one — even when the IdP signed
+/// the assertion under that attribute.
+#[tokio::test]
+async fn test_saml_assertion_id_attribute_is_not_an_id() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-saml1-id",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    );
+    builder.id_attribute = "AssertionID";
+    let body = wrap_saml_assertion(&builder.build());
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        !matches!(result, PluginResult::Continue),
+        "an assertion identified only by AssertionID must be rejected, got {:?}",
+        result
+    );
+    assert!(!ctx.metadata.contains_key("soap_ws_saml_subject"));
 }
 
 /// A pinned IdP signing certificate outside its validity window no longer
