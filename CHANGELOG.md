@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **Ambiguous workload labels no longer skip a workload-selector Sidecar's
+  egress scope** (GHSA-mhm9-gp97-237q). When several workloads share one
+  SPIFFE id with divergent labels and no explicit workload labels are set, the
+  slice's labels are only their intersection, so a `workloadSelector` Sidecar
+  that narrowed one of them could miss it and egress fell back to the wider
+  namespace default. The egress scope now folds every candidate like the
+  `outboundTrafficPolicy` fold of #3262: a destination rides the slice only
+  when every candidate's scope admits it. Such workloads may see fewer
+  destinations; set `FERRUM_MESH_WORKLOAD_LABELS` (or distinct service
+  accounts) to resolve the scope exactly.
 - **`request_mirror` no longer mirrors to a remote host over cleartext by
   default** (GHSA-gcwp-xp94-4pcv). The mirror replays the backend-visible
   request (body included by default, plus any allowlisted credentials).
