@@ -1435,9 +1435,17 @@ async fn test_all_mode_detection_skips_root_structural_scalars() {
                 ),
                 _ => {
                     assert!(matches!(result, PluginResult::Continue), "{content_type}");
+                    // warn records the finding; redact records the rewrite
+                    // it promised.
+                    let key = if action == "warn" {
+                        "ai_response_guard_detected"
+                    } else {
+                        "ai_response_guard_redacted"
+                    };
                     assert!(
-                        ctx.metadata.contains_key("ai_response_guard_detected"),
-                        "{content_type} {action}: content PII must still be detected"
+                        ctx.metadata.contains_key(key),
+                        "{content_type} {action}: content PII must still be detected: {:?}",
+                        ctx.metadata
                     );
                 }
             }
