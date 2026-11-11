@@ -3046,11 +3046,12 @@ self-description, not a cryptographic attestation of its host. The set is a
 point-in-time view of connected Subscribe streams: a DP that is partitioned
 from the CP keeps serving its cached config but is not listed, and a DP using
 another control plane is never seen. Consumers should require
-`all_connected_public_only_guaranteed=true` **and** compare
-`connected_data_planes` (live streams) against their expected data-plane
-inventory. When replicas share one node id, compare the stream count, not the
-distinct `node_id`s. A transient reconnect overlap can briefly count one DP
-twice; that only weakens or over-counts the set, never hides a stream.
+`all_connected_public_only_guaranteed=true` **and** require a count of distinct
+`node_id` values in `data_planes` that reaches the number of data-plane
+processes they expect for the namespace. Each Edge DP process subscribes under
+its own random `node_id`; `connected_data_planes` counts streams, so a
+reconnect overlap can count one process twice. Replicas that share one node id
+(externally minted DP JWTs) count once, so the check fails closed for them.
 `GET /cluster` shows the same per-stream reports for every namespace.
 
 Authorization: this endpoint is open to `viewer` tokens and viewer-key

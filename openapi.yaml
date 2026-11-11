@@ -2700,8 +2700,10 @@ paths:
         all_connected_public_only_guaranteed. A DP that sent no recognised
         report is unknown and makes weakest_policy_complete and
         all_connected_public_only_guaranteed false; so does an empty set.
-        Disconnected DPs that still serve cached config are not listed, so
-        compare connected_data_planes against the expected DP inventory.
+        Disconnected DPs that still serve cached config are not listed,
+        so compare the number of distinct node_id values in data_planes
+        with the expected number of DP processes; connected_data_planes
+        counts streams, and a reconnect overlap can count one DP twice.
         The object is additive within schema_version 2 and is absent on
         non-CP responses.
 
