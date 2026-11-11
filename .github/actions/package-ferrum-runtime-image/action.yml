@@ -13,10 +13,12 @@ inputs:
     required: true
   base-image:
     description: >-
-      Runtime base image. The supplied binary must be built against a glibc
-      version no newer than this image provides.
+      Digest-pinned runtime base image. When empty, the action uses the
+      `ARG RUNTIME_BASE=` pin in the repository Dockerfile, the base the
+      published images use. The packaging step fails when a supplied binary
+      needs a newer glibc than this image provides.
     required: false
-    default: gcr.io/distroless/cc-debian13:nonroot
+    default: ""
   strip-binary:
     description: Strip debug symbols from the copied binary before packaging.
     required: false
@@ -70,8 +72,46 @@ runs:
           exit 1
         fi
 
+        if [ -z "$base_image" ]; then
+          base_image="$(sed -n 's/^ARG RUNTIME_BASE=//p' "$GITHUB_WORKSPACE/Dockerfile")"
+        fi
+        if [[ ! "$base_image" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error title=Unpinned runtime base::base image must be one digest-pinned reference (got '${base_image}')"
+          exit 1
+        fi
+        echo "Runtime base: $base_image"
+
         image_context="$(mktemp -d)"
-        trap 'rm -rf "$image_context"' EXIT
+        base_rootfs="$(mktemp -d)"
+        base_container=""
+        trap 'rm -rf "$image_context" "$base_rootfs"; if [ -n "$base_container" ]; then docker rm -f "$base_container" >/dev/null 2>&1 || true; fi' EXIT
+
+        # Fail here, not at container start, when a binary was linked against a
+        # newer glibc than the runtime base ships: compare the highest GLIBC_
+        # symbol version each binary needs with the highest one the base's
+        # libc.so.6 defines. A binary with no GLIBC_ requirement is not checked.
+        docker pull --quiet "$base_image" >/dev/null
+        base_container="$(docker create "$base_image")"
+        docker export "$base_container" \
+          | tar -x -C "$base_rootfs" --wildcards --no-anchored 'libc.so.6' 2>/dev/null || true
+        base_libc="$(find "$base_rootfs" -name libc.so.6 -type f -print -quit)"
+        if [ -z "$base_libc" ]; then
+          echo "::error title=Runtime base glibc::no libc.so.6 found in $base_image"
+          exit 1
+        fi
+        base_glibc="$(objdump -T "$base_libc" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -n 1)"
+        echo "Runtime base provides up to ${base_glibc}"
+        for binary in "$binary_path" ${cni_binary_path:+"$cni_binary_path"}; do
+          need="$(objdump -T "$binary" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -n 1 || true)"
+          if [ -z "$need" ]; then
+            continue
+          fi
+          if [ "$(printf '%s\n%s\n' "$need" "$base_glibc" | sort -V | tail -n 1)" != "$base_glibc" ]; then
+            echo "::error title=glibc mismatch::$binary needs $need but $base_image provides only up to $base_glibc; build it on an older host or move the runtime base"
+            exit 1
+          fi
+          echo "$binary needs up to $need"
+        done
 
         install -m 0755 "$binary_path" "$image_context/ferrum-edge"
         if [ "$STRIP_BINARY" = "true" ] && command -v strip >/dev/null 2>&1; then

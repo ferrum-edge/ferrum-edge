@@ -222,9 +222,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-26.04
-    # The host-built binary is packaged into a distroless Debian 13 image.
-    # Pin the build host above so its glibc stays no newer than the runtime
-    # image.
+    # The host-built binary is packaged into the Dockerfile's distroless
+    # Debian 13 runtime base; package-ferrum-runtime-image fails when it needs
+    # a newer glibc than that image provides.
     timeout-minutes: 90
     env:
       KIND_CLUSTER_NAME: ferrum-gwapi
