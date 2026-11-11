@@ -165,7 +165,6 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "sql
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
 
 # gRPC
 # TLS arm (`tls-ring` / `tls-aws-lc`) comes from `crypto-ring` / `fips`.
