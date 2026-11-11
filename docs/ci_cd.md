@@ -2592,7 +2592,7 @@ pins `CARGO_BUILD_JOBS=2`, `timeout-minutes: 120`, and the combined `--lib` /
 `--test unit_tests` invocation so those knobs cannot drift without failing
 Coverage Plan.
 
-##### Admitted CI job SHA-256 generation transitions (temporary)
+##### Admitted CI job SHA-256 generation transitions
 
 `ci.yml` is a protected workflow. The ARM64 job stays digest-frozen; every other
 job the pull-request scan reads as Cross-sensitive is compared by its whole-job
@@ -2710,7 +2710,7 @@ drives both halves with fixtures: a producer missing the pins or the
 credential-free checkout, and a contract file with a substituted digest,
 registry, repository, protoc host, or smoke image.
 
-##### Admitted workflow-directory job SHA-256 generation transitions (temporary)
+##### Admitted workflow-directory job SHA-256 generation transitions
 
 The `CI_JOB_GENERATION_TRANSITIONS` table above only reaches `ci.yml`, which
 has its own dedicated comparison. Every other workflow is compared by the
@@ -2733,7 +2733,7 @@ surface anywhere else in the same file, or any other revision pair of the
 named job, is scanned as before. RETIREMENT IS MANDATORY: once each
 destination is on `main`, delete that tuple.
 
-##### Admitted local-action generation transitions (temporary)
+##### Admitted local-action generation transitions
 
 Once Cross-sensitive, a local composite action is compared by whole-file
 digest. `LOCAL_ACTION_GENERATION_TRANSITIONS` admits exact, path-bound, one-way
@@ -3929,7 +3929,7 @@ jobs are Cross-sensitive and held to `main`'s own text by the trusted Cross
 policy (`.github/scripts/verify_cross_build_policy.py`), so a pull request
 cannot add a target to them. A new target is reviewed direct-to-`main` policy
 work, or a pull request whose exact job digests the trusted base admits first
-(see [Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions-temporary)
+(see [Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions)
 and [Published x86_64 GNU producer contract](#published-x86_64-gnu-producer-contract-standing)).
 
 Musl targets need their own toolchain setup. Add `musl-tools` before a native
@@ -4395,7 +4395,7 @@ text by the whole-job surface comparison (its former #4301/#4355 generation
 pairs are retired precisely because issue #4423 moved it again directly on
 `main`). Adding `--timings`, a timings-artifact upload, or a `timeout-minutes`
 to either producer is therefore a direct-to-`main` change. See
-[Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions-temporary)
+[Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions)
 and [Published x86_64 GNU producer contract (standing)](#published-x86_64-gnu-producer-contract-standing).
 
 #### Observed tail, and the budget it justifies

@@ -13259,7 +13259,7 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 )
 
 # ---------------------------------------------------------------------------
-# Admitted workflow-directory job SHA-256 generation transitions (temporary)
+# Admitted workflow-directory job SHA-256 generation transitions
 # ---------------------------------------------------------------------------
 # The `ci.yml` pairs above are consulted by the dedicated CI-workflow
 # comparison. Jobs in every OTHER workflow are compared by the generic
