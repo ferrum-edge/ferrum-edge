@@ -1273,6 +1273,8 @@ requests and pushes to `main`:
 
 ```bash
 cargo fmt --all -- --check
+# src/main.rs include!s src/gateway_entry.rs, which cargo fmt never visits:
+rustfmt --edition 2024 --check src/gateway_entry.rs
 # Also diffs tests/integration/*.rs against integration::<module> filters in ci.yml.
 ```
 

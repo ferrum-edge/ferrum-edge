@@ -159,8 +159,9 @@ cargo clippy --all-targets -- -D warnings
 # Format code
 cargo fmt
 
-# Check formatting
+# Check formatting (src/gateway_entry.rs is include!d, so cargo fmt skips it)
 cargo fmt --check
+rustfmt --edition 2024 --check src/gateway_entry.rs
 ```
 
 ## Making Changes
