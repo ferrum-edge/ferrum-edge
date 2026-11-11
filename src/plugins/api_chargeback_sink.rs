@@ -15951,7 +15951,7 @@ fn emit_periodic_snapshot(
 }
 
 async fn wait_for_snapshot_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
-    while !*shutdown_rx.borrow() {
+    while !*(*shutdown_rx).borrow() {
         if shutdown_rx.changed().await.is_err() {
             break;
         }
@@ -16919,7 +16919,7 @@ mod snapshot_cleanup_race_tests {
 
         let accumulator = Arc::new(SnapshotAccumulator::new());
         let metadata = test_metadata();
-        accumulator.record_at(metadata.clone(), call_charge(1, 0.01), 100);
+        accumulator.record_at(metadata.key_ref(), call_charge(1, 0.01), 100);
         assert_eq!(
             accumulator
                 .compute_deltas(&config, "node-a", 100, "snap-1")
@@ -16944,7 +16944,7 @@ mod snapshot_cleanup_race_tests {
             thread::spawn(move || cleanup_accumulator.cleanup_stale(200, /* ttl */ 0));
 
         entered.wait();
-        accumulator.record_at(metadata, call_charge(2, 0.02), 201);
+        accumulator.record_at(metadata.key_ref(), call_charge(2, 0.02), 201);
         release.wait();
 
         assert_eq!(
