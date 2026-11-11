@@ -1832,13 +1832,13 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                     (true, false) => {
                         warnings.push(precedence_message.clone());
                         for (key, _) in &claims.effective_tls {
-                            refuse(key, "ProtocolConflict", &precedence_message);
+                            refuse(key, "ProtocolConflict", precedence_message.as_str());
                         }
                     }
                     (false, true) => {
                         warnings.push(precedence_message.clone());
                         for key in &claims.plaintext {
-                            refuse(key, "ProtocolConflict", &precedence_message);
+                            refuse(key, "ProtocolConflict", precedence_message.as_str());
                         }
                     }
                     _ => {
@@ -1853,7 +1853,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                             .iter()
                             .chain(claims.effective_tls.iter().map(|(key, _)| key))
                         {
-                            refuse(key, "ProtocolConflict", &message);
+                            refuse(key, "ProtocolConflict", message.as_str());
                         }
                     }
                 }
@@ -1872,7 +1872,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                     .effective_tls
                     .iter()
                     .filter(|(key, _)| precedence(key) == first_tier)
-                    .map(|(_, namespace)| credentials_for(namespace))
+                    .map(|(_, namespace)| credentials_for(namespace.as_str()))
                     .collect();
                 if first_tier_credentials.len() == 1
                     && let Some(winner) = first_tier_credentials.into_iter().next()
@@ -1884,8 +1884,8 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                     );
                     warnings.push(message.clone());
                     for (key, namespace) in &claims.effective_tls {
-                        if credentials_for(namespace) != winner {
-                            refuse(key, "HostnameConflict", &message);
+                        if credentials_for(namespace.as_str()) != winner {
+                            refuse(key, "HostnameConflict", message.as_str());
                         }
                     }
                 } else {
@@ -1896,7 +1896,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                     );
                     warnings.push(message.clone());
                     for (key, _) in &claims.effective_tls {
-                        refuse(key, "HostnameConflict", &message);
+                        refuse(key, "HostnameConflict", message.as_str());
                     }
                 }
             }

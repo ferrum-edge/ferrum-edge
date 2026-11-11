@@ -336,7 +336,7 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                 None => continue,
             },
         };
-        let precedence = listener_claim_precedence(acc, key);
+        let precedence = listener_claim_precedence(&*acc, key);
         by_gateway
             .entry(gateway)
             .or_default()
