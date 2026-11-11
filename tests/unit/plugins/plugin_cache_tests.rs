@@ -12544,7 +12544,7 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
     let mut wide = make_plugin_config_with_json(
         "wide",
         "tcp_connection_throttle",
-        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+        json!({"max_connections_per_key": 2}),
         PluginScope::Proxy,
         Some("p1"),
     );
@@ -12552,7 +12552,7 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
     let mut strict = make_plugin_config_with_json(
         "strict",
         "tcp_connection_throttle",
-        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        json!({"max_connections_per_key": 1}),
         PluginScope::Proxy,
         Some("p1"),
     );
@@ -12590,14 +12590,14 @@ async fn test_tcp_connection_throttle_active_connections_counts_live_permits() {
             make_plugin_config_with_json(
                 "wide",
                 "tcp_connection_throttle",
-                json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+                json!({"max_connections_per_key": 2}),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
             make_plugin_config_with_json(
                 "strict",
                 "tcp_connection_throttle",
-                json!({"max_connections_per_key": 5, "cleanup_interval_seconds": 0}),
+                json!({"max_connections_per_key": 5}),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
@@ -12639,7 +12639,7 @@ async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12671,7 +12671,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12682,8 +12682,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
     assert!(run_tcp_connect_chain(&old_plugins, &mut old_connection).await);
 
     let mut replacement = initial.clone();
-    replacement.plugin_configs[0].config =
-        json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0});
+    replacement.plugin_configs[0].config = json!({"max_connections_per_key": 2});
     replacement.plugin_configs[0].updated_at = Utc::now();
     cache
         .apply_delta(
@@ -12711,7 +12710,7 @@ async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_d
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 2}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12724,8 +12723,7 @@ async fn test_tcp_connection_throttle_decreased_limit_waits_for_old_permits_to_d
     assert!(run_tcp_connect_chain(&old_plugins, &mut second).await);
 
     let mut replacement = initial.clone();
-    replacement.plugin_configs[0].config =
-        json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0});
+    replacement.plugin_configs[0].config = json!({"max_connections_per_key": 1});
     cache.rebuild(&replacement).unwrap();
     let new_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let mut blocked = make_tcp_stream_context("10.0.0.5");
@@ -12744,7 +12742,7 @@ async fn test_tcp_connection_throttle_scope_move_keeps_same_proxy_accounting() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12773,7 +12771,7 @@ async fn test_tcp_connection_throttle_rejected_reload_keeps_old_generation() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
@@ -12801,7 +12799,7 @@ async fn test_tcp_connection_throttle_removed_policy_is_generation_isolated() {
         vec![make_plugin_config_with_json(
             "throttle",
             "tcp_connection_throttle",
-            json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+            json!({"max_connections_per_key": 1}),
             PluginScope::Proxy,
             Some("p1"),
         )],
