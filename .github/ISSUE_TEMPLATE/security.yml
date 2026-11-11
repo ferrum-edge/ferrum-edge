@@ -16,7 +16,7 @@ body:
         - Coordinate a responsible disclosure timeline
         - Protect users who may be affected
         
-        See [SECURITY.md](SECURITY.md) for our full security policy.
+        See [SECURITY.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/SECURITY.md) for our full security policy.
   - type: textarea
     id: description
     attributes:
