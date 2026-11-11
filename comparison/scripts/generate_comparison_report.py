@@ -6,7 +6,8 @@ Usage:
     python3 generate_comparison_report.py results/
 
 Expects result files named: {gateway}_{protocol}_{endpoint}_results.txt
-Example: ferrum_http_health_results.txt, kong_https_api_users_results.txt
+Example: ferrum_http_api_echo_results.txt, kong_e2e_tls_api_echo_results.txt,
+ferrum_key_auth_api_echo_results.txt
 """
 
 import os
@@ -61,7 +62,7 @@ def parse_wrk_output(file_path):
     if non2xx_match:
         metrics["non2xx"] = int(non2xx_match.group(1))
 
-    # --- Machine-parseable block from comparison_test.lua ---
+    # --- Machine-parseable block from comparison/lua/comparison_test_post*.lua ---
     block = _COMPARISON_RESULTS_RE.search(content)
     if block:
         for line in block.group(1).strip().splitlines():
@@ -118,7 +119,6 @@ ENDPOINTS = ["api_echo"]
 
 def _gateway_labels(meta):
     """Build gateway display labels based on metadata (native vs Docker)."""
-    kong_native = meta.get("kong_native", False)
     kong_ver = meta.get("kong_version", "")
     tyk_ver = meta.get("tyk_version", "")
     krakend_ver = meta.get("krakend_version", "")
@@ -127,7 +127,7 @@ def _gateway_labels(meta):
     return {
         "baseline": "Direct Backend",
         "ferrum": f"Ferrum Edge ({ferrum_where})",
-        "kong": f"Kong Gateway ({'native' if kong_native else 'Docker'})" if not kong_ver else f"Kong ({kong_ver})",
+        "kong": f"Kong ({kong_ver})" if kong_ver else "Kong Gateway (Docker)",
         "tyk": f"Tyk ({tyk_ver})" if tyk_ver else "Tyk Gateway (Docker)",
         "krakend": f"KrakenD ({krakend_ver})" if krakend_ver else "KrakenD (Docker)",
         "envoy": f"Envoy ({envoy_ver})" if envoy_ver else "Envoy Proxy (Docker)",
@@ -566,15 +566,15 @@ def generate_report(results_dir, output_path, meta=None):
   <h2>Methodology &amp; Caveats</h2>
   <ul>
     <li><strong>Ferrum Edge</strong> runs {"inside a Docker container (local build) — the same Docker overhead caveats as the other gateways apply." if meta.get("execution_mode") == "all-docker" else "as a native binary on the host — zero container overhead."}</li>
-    <li><strong>Kong</strong> runs {"natively on the host (installed via package manager) — no container overhead." if meta.get("kong_native") else "inside a Docker container. On <strong>macOS</strong>, Docker Desktop runs containers in a Linux VM with userspace networking, which adds <strong>~0.1–0.5 ms per round-trip</strong> (port-mapped) plus higher CPU scheduling variance (~9.5x). On <strong>Linux</strong> with <code>--network host</code>, Docker overhead is negligible (&lt;5 &micro;s). To eliminate this overhead on Linux, install Kong natively via the official apt/yum packages."}</li>
+    <li><strong>Kong</strong> runs inside a Docker container. On <strong>macOS</strong>, Docker Desktop runs containers in a Linux VM with userspace networking, which adds <strong>~0.1–0.5 ms per round-trip</strong> (port-mapped) plus higher CPU scheduling variance (~9.5x). On <strong>Linux</strong> with <code>--network host</code>, Docker overhead is negligible (&lt;5 &micro;s).</li>
     <li><strong>Tyk</strong> runs inside a Docker container (no official macOS binary; Linux-only native packages available via <a href="https://tyk.io/docs/apim/open-source/installation">packagecloud</a>). The same Docker overhead caveats as Kong apply. Additionally, Tyk requires Redis which also runs in a container.</li>
     <li><strong>KrakenD</strong> runs inside a Docker container (Go-based, stateless gateway). The same Docker overhead caveats apply. KrakenD is configured with <code>no-op</code> encoding for raw response pass-through, matching the minimal-overhead proxy behavior of other gateways. Key-auth benchmarks are excluded because API key authentication requires KrakenD Enterprise Edition.</li>
     <li><strong>Envoy Proxy</strong> runs inside a Docker container (C++-based, high-performance proxy). The same Docker overhead caveats apply. Envoy is configured as a minimal HTTP reverse proxy with static route configuration, no access logging, and connection pooling defaults. Key-auth benchmarks include Envoy when its key-auth arm runs: the fixture checks the <code>apikey</code> header with an in-process Lua filter, so no external authorization service is involved. That arm is absent only when Envoy is skipped (<code>SKIP_GATEWAYS</code>) or fails to start.</li>
-    <li><strong>HTTPS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). <strong>E2E TLS tests</strong> measure full encryption (client &rarr; HTTPS &rarr; gateway &rarr; HTTPS &rarr; backend), the most secure pattern.</li>
+    <li><strong>HTTPS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). <strong>E2E TLS tests</strong> measure full encryption (client &rarr; HTTPS &rarr; gateway &rarr; HTTPS &rarr; backend). No gateway verifies the backend certificate on this leg, so every gateway does the same re-encryption work.</li>
     <li>All gateways run sequentially (one at a time) to avoid resource contention on the host.</li>
     <li>The <strong>/api/echo</strong> endpoint receives a POST with a ~10 KB JSON payload that the backend echoes back, measuring realistic request+response body proxying overhead.</li>
     <li>Each test includes a {meta.get("duration", "30s")} measured run preceded by a warm-up phase (results discarded).</li>
-    <li>To get the fairest comparison on macOS, install Kong natively and run the benchmark again. Tyk results on macOS should be interpreted with Docker overhead in mind (~0.1–0.5 ms added latency, ~5-15% throughput reduction).</li>
+    <li>Every gateway pays the same Docker overhead, so the comparison is like-for-like; on macOS read absolute numbers with that overhead in mind (~0.1–0.5 ms added latency, ~5-15% throughput reduction).</li>
   </ul>
 </div>
 

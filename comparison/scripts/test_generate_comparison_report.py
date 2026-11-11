@@ -9,11 +9,16 @@ Covers three report defects:
   run's ``result_files`` manifest.
 - #6512: the Envoy methodology bullet must not claim key-auth is
   excluded; the suite runs an Envoy key-auth arm.
+- #7306: the report never offers a native-Kong mode the driver lacks,
+  every gateway's E2E TLS leg skips backend verification the same way,
+  and a key-auth arm that fails to start is skipped instead of aborting
+  the run.
 
 Run directly: python3 comparison/scripts/test_generate_comparison_report.py
 """
 
 import importlib.util
+import json
 import re
 import tempfile
 import unittest
@@ -86,6 +91,20 @@ class ComparisonReportContractTests(unittest.TestCase):
         self.assertNotIn("Key-auth benchmarks are excluded as Envoy", html)
         self.assertIn("Key-auth benchmarks include Envoy", html)
 
+    def test_report_never_offers_a_native_kong_mode(self):
+        # The driver runs every gateway in Docker; a stale meta key must
+        # not resurrect the native-Kong label or advice.
+        write_result(self.dir, "kong_http_api_echo_results.txt", 80000)
+        html = render(self.dir, {"execution_mode": "all-docker", "kong_native": True})
+        self.assertNotIn("Kong Gateway (native)", html)
+        self.assertNotIn("natively on the host (installed", html)
+        self.assertNotIn("install Kong natively", html)
+        self.assertIn("<strong>Kong</strong> runs inside a Docker container", html)
+
+    def test_e2e_tls_methodology_says_no_gateway_verifies_the_backend(self):
+        html = render(self.dir, {"execution_mode": "all-docker"})
+        self.assertIn("No gateway verifies the backend certificate on this leg", html)
+
     def test_skipped_gateway_prior_results_stay_out_with_manifest(self):
         # A prior run left parseable Kong results in the shared directory;
         # the new run skipped Kong, so its manifest omits both files.
@@ -128,6 +147,76 @@ class RunComparisonManifestContractTests(unittest.TestCase):
                 window,
                 f"result writer at offset {start} does not record its file in the manifest",
             )
+
+
+COMPARISON_DIR = SCRIPT.parents[1]
+CONFIGS = COMPARISON_DIR / "configs"
+
+
+def driver_function(text, name):
+    """Return the body of shell function ``name`` in run_comparison.sh."""
+    match = re.search(rf"^{name}\(\) \{{\n(.*?)^\}}$", text, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise AssertionError(f"run_comparison.sh has no {name}()")
+    return match.group(1)
+
+
+class E2ETlsVerificationParityTests(unittest.TestCase):
+    """Every E2E TLS leg must do the same backend-TLS work (#7306).
+
+    The backend serves tests/certs/server.crt, a self-signed CA:TRUE
+    certificate that rustls rejects as an end entity, so Ferrum cannot
+    verify it; the other gateways must not verify it either.
+    """
+
+    def test_ferrum_skips_backend_verification_on_every_https_proxy(self):
+        text = (CONFIGS / "ferrum_comparison_e2e_tls.yaml").read_text()
+        https_proxies = len(re.findall(r"^\s+backend_scheme: https$", text, re.MULTILINE))
+        skips = re.findall(r"^\s+backend_tls_verify_server_cert: (\S+)$", text, re.MULTILINE)
+        self.assertGreater(https_proxies, 0)
+        self.assertEqual(skips, ["false"] * https_proxies)
+
+    def test_envoy_upstream_tls_has_no_validation_context(self):
+        lines = (CONFIGS / "envoy" / "envoy_e2e_tls.yaml").read_text().splitlines()
+        text = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+        self.assertIn("UpstreamTlsContext", text)
+        self.assertNotIn("validation_context", text)
+        self.assertNotIn("trusted_ca", text)
+
+    def test_krakend_client_tls_skips_verification(self):
+        config = json.loads((CONFIGS / "krakend" / "krakend_e2e_tls.json").read_text())
+        self.assertEqual(config["client_tls"], {"allow_insecure_connections": True})
+
+    def test_tyk_e2e_apps_skip_verification(self):
+        apps = sorted((CONFIGS / "tyk" / "apps_e2e_tls").glob("*.json"))
+        self.assertTrue(apps)
+        for app in apps:
+            transport = json.loads(app.read_text())["proxy"]["transport"]
+            self.assertIs(transport.get("ssl_insecure_skip_verify"), True, app.name)
+
+    def test_kong_e2e_container_disables_verification(self):
+        text = (COMPARISON_DIR / "run_comparison.sh").read_text()
+        self.assertIn("-e KONG_TLS_CERTIFICATE_VERIFY=off", driver_function(text, "start_kong_e2e_tls"))
+
+
+class KeyAuthStartGuardTests(unittest.TestCase):
+    """A key-auth arm whose container fails to start must be skipped.
+
+    run_comparison.sh runs under ``set -euo pipefail``: a bare failing
+    ``docker run`` in a test_*_key_auth arm aborted the whole run before
+    generate_report (#7306).
+    """
+
+    def test_each_key_auth_arm_starts_inside_a_guard(self):
+        text = (COMPARISON_DIR / "run_comparison.sh").read_text()
+        for gateway in ("ferrum", "kong", "tyk", "envoy"):
+            with self.subTest(gateway=gateway):
+                arm = driver_function(text, f"test_{gateway}_key_auth")
+                self.assertNotIn("docker_run_gateway", arm)
+                self.assertNotIn("docker run", arm)
+                self.assertRegex(arm, rf"if !? ?start_{gateway}_key_auth; then")
+                start = driver_function(text, f"start_{gateway}_key_auth")
+                self.assertRegex(start, r"\|\| return 1\n")
 
 
 if __name__ == "__main__":

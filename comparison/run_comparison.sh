@@ -80,6 +80,35 @@ REDIS_CONTAINER="ferrum-bench-redis"
 # Docker image names for locally-built images
 FERRUM_IMAGE="ferrum-bench:local"
 
+# Tuning shared by every Ferrum container (HTTP, HTTPS, E2E TLS, key-auth):
+# quiet logging, no proxy headers, a warm HTTP/1.1 backend pool and every
+# request/response limit lifted so only proxying cost is measured.
+FERRUM_TUNING_ENV=(
+    -e FERRUM_LOG_LEVEL=error
+    -e FERRUM_ADD_VIA_HEADER=false
+    -e FERRUM_ADD_FORWARDED_HEADER=false
+    -e FERRUM_POOL_WARMUP_ENABLED=true
+    -e FERRUM_POOL_MAX_IDLE_PER_HOST=200
+    -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
+    -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
+    -e FERRUM_POOL_ENABLE_HTTP2=false
+    -e FERRUM_POOL_CLEANUP_INTERVAL_SECONDS=30
+    -e FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608
+    -e FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432
+    -e FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true
+    -e FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576
+    -e FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000
+    -e FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000
+    -e FERRUM_MAX_CONNECTIONS=0
+    -e FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0
+    -e FERRUM_MAX_HEADER_COUNT=0
+    -e FERRUM_MAX_URL_LENGTH_BYTES=0
+    -e FERRUM_MAX_QUERY_PARAMS=0
+    -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0
+    -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0
+    -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0
+)
+
 # Processes and Docker resources created by this run.
 BACKEND_PID=""
 OWNED_CONTAINER_NAMES=()
@@ -278,7 +307,6 @@ cleanup() {
     if [[ "$CLEANUP_READY" == "true" ]]; then
         rm -f "$COMP_DIR/configs/.ferrum_runtime"*.yaml 2>/dev/null || true
         rm -f "$COMP_DIR/configs/.kong_runtime"*.yaml 2>/dev/null || true
-        rm -f "$COMP_DIR/configs/.kong_runtime_key_auth.yaml" 2>/dev/null || true
         rm -rf "$COMP_DIR/configs/.tyk_runtime_apps" 2>/dev/null || true
         rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls" 2>/dev/null || true
         rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_key_auth" 2>/dev/null || true
@@ -503,29 +531,7 @@ start_ferrum_http() {
         -e FERRUM_MODE=file \
         -e FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml \
         -e FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-        -e FERRUM_LOG_LEVEL=error \
-        -e FERRUM_ADD_VIA_HEADER=false \
-        -e FERRUM_ADD_FORWARDED_HEADER=false \
-        -e FERRUM_POOL_WARMUP_ENABLED=true \
-        -e FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
-        -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
-        -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
-        -e FERRUM_POOL_ENABLE_HTTP2=false \
-        -e FERRUM_POOL_CLEANUP_INTERVAL_SECONDS=30 \
-        -e FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608 \
-        -e FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432 \
-        -e FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true \
-        -e FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576 \
-        -e FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-        -e FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-        -e FERRUM_MAX_CONNECTIONS=0 \
-        -e FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0 \
-        -e FERRUM_MAX_HEADER_COUNT=0 \
-        -e FERRUM_MAX_URL_LENGTH_BYTES=0 \
-        -e FERRUM_MAX_QUERY_PARAMS=0 \
-        -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
-        -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
-        -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0 \
+        "${FERRUM_TUNING_ENV[@]}" \
         "$FERRUM_IMAGE"
 
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (HTTP)" 15 "$FERRUM_CONTAINER"
@@ -545,29 +551,7 @@ start_ferrum_https() {
         -e FERRUM_PROXY_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
         -e FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/server.crt \
         -e FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/server.key \
-        -e FERRUM_LOG_LEVEL=error \
-        -e FERRUM_ADD_VIA_HEADER=false \
-        -e FERRUM_ADD_FORWARDED_HEADER=false \
-        -e FERRUM_POOL_WARMUP_ENABLED=true \
-        -e FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
-        -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
-        -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
-        -e FERRUM_POOL_ENABLE_HTTP2=false \
-        -e FERRUM_POOL_CLEANUP_INTERVAL_SECONDS=30 \
-        -e FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608 \
-        -e FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432 \
-        -e FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true \
-        -e FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576 \
-        -e FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-        -e FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-        -e FERRUM_MAX_CONNECTIONS=0 \
-        -e FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0 \
-        -e FERRUM_MAX_HEADER_COUNT=0 \
-        -e FERRUM_MAX_URL_LENGTH_BYTES=0 \
-        -e FERRUM_MAX_QUERY_PARAMS=0 \
-        -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
-        -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
-        -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0 \
+        "${FERRUM_TUNING_ENV[@]}" \
         "$FERRUM_IMAGE"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (HTTPS)" 15 "$FERRUM_CONTAINER"
@@ -587,29 +571,7 @@ start_ferrum_e2e_tls() {
         -e FERRUM_PROXY_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
         -e FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/server.crt \
         -e FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/server.key \
-        -e FERRUM_LOG_LEVEL=error \
-        -e FERRUM_ADD_VIA_HEADER=false \
-        -e FERRUM_ADD_FORWARDED_HEADER=false \
-        -e FERRUM_POOL_WARMUP_ENABLED=true \
-        -e FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
-        -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
-        -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
-        -e FERRUM_POOL_ENABLE_HTTP2=false \
-        -e FERRUM_POOL_CLEANUP_INTERVAL_SECONDS=30 \
-        -e FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608 \
-        -e FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432 \
-        -e FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true \
-        -e FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576 \
-        -e FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-        -e FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-        -e FERRUM_MAX_CONNECTIONS=0 \
-        -e FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0 \
-        -e FERRUM_MAX_HEADER_COUNT=0 \
-        -e FERRUM_MAX_URL_LENGTH_BYTES=0 \
-        -e FERRUM_MAX_QUERY_PARAMS=0 \
-        -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
-        -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
-        -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0 \
+        "${FERRUM_TUNING_ENV[@]}" \
         "$FERRUM_IMAGE"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (E2E TLS)" 15 "$FERRUM_CONTAINER"
@@ -1137,7 +1099,7 @@ prepare_tyk_key_auth_config() {
     done
 }
 
-test_ferrum_key_auth() {
+start_ferrum_key_auth() {
     log_info "Starting Ferrum Edge Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
     stop_owned_container "$FERRUM_CONTAINER"
 
@@ -1146,43 +1108,22 @@ test_ferrum_key_auth() {
         -e FERRUM_MODE=file \
         -e FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml \
         -e FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-        -e FERRUM_LOG_LEVEL=error \
-        -e FERRUM_ADD_VIA_HEADER=false \
-        -e FERRUM_ADD_FORWARDED_HEADER=false \
-        -e FERRUM_POOL_WARMUP_ENABLED=true \
-        -e FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
-        -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
-        -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
-        -e FERRUM_POOL_ENABLE_HTTP2=false \
-        -e FERRUM_POOL_CLEANUP_INTERVAL_SECONDS=30 \
-        -e FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608 \
-        -e FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432 \
-        -e FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true \
-        -e FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576 \
-        -e FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-        -e FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-        -e FERRUM_MAX_CONNECTIONS=0 \
-        -e FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0 \
-        -e FERRUM_MAX_HEADER_COUNT=0 \
-        -e FERRUM_MAX_URL_LENGTH_BYTES=0 \
-        -e FERRUM_MAX_QUERY_PARAMS=0 \
-        -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
-        -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
-        -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0 \
-        "$FERRUM_IMAGE"
+        "${FERRUM_TUNING_ENV[@]}" \
+        "$FERRUM_IMAGE" || return 1
 
-    if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (Key Auth)" 15 "$FERRUM_CONTAINER"; then
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (Key Auth)" 15 "$FERRUM_CONTAINER"
+}
+
+test_ferrum_key_auth() {
+    if start_ferrum_key_auth; then
+        run_wrk_key_auth "ferrum" "$GATEWAY_HTTP_PORT"
+    else
         log_warn "Ferrum Key Auth failed to start — skipping"
-        stop_ferrum
-        return 0
     fi
-    run_wrk_key_auth "ferrum" "$GATEWAY_HTTP_PORT"
     stop_ferrum
 }
 
-test_kong_key_auth() {
-    prepare_kong_key_auth_config
-
+start_kong_key_auth() {
     log_info "Starting Kong Gateway Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
     stop_owned_container "$KONG_CONTAINER"
 
@@ -1196,20 +1137,23 @@ test_kong_key_auth() {
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-        "kong/kong-gateway:${KONG_VERSION}"
+        "kong/kong-gateway:${KONG_VERSION}" || return 1
 
-    if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (Key Auth)" 20 "$KONG_CONTAINER"; then
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (Key Auth)" 20 "$KONG_CONTAINER"
+}
+
+test_kong_key_auth() {
+    prepare_kong_key_auth_config
+
+    if start_kong_key_auth; then
+        run_wrk_key_auth "kong" "$GATEWAY_HTTP_PORT"
+    else
         log_warn "Kong Key Auth failed to start — skipping"
-        stop_kong
-        return 0
     fi
-    run_wrk_key_auth "kong" "$GATEWAY_HTTP_PORT"
     stop_kong
 }
 
-test_tyk_key_auth() {
-    prepare_tyk_key_auth_config
-
+start_tyk_key_auth() {
     log_info "Starting Tyk Gateway (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
     stop_owned_container "$TYK_CONTAINER"
 
@@ -1228,7 +1172,13 @@ test_tyk_key_auth() {
         "tykio/tyk-gateway:${TYK_VERSION}") || return 1
     register_owned_container "$TYK_CONTAINER" "$tyk_id"
 
-    if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (Key Auth)" 20 "$TYK_CONTAINER"; then
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (Key Auth)" 20 "$TYK_CONTAINER"
+}
+
+test_tyk_key_auth() {
+    prepare_tyk_key_auth_config
+
+    if ! start_tyk_key_auth; then
         log_warn "Tyk Key Auth failed to start — skipping"
         stop_tyk
         return 0
@@ -1290,22 +1240,25 @@ test_tyk_key_auth() {
     stop_tyk
 }
 
-test_envoy_key_auth() {
-    prepare_envoy_config
-
+start_envoy_key_auth() {
     log_info "Starting Envoy Proxy Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
     stop_owned_container "$ENVOY_CONTAINER"
 
     docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml:/etc/envoy/envoy.yaml:ro" \
-        "envoyproxy/envoy:v${ENVOY_VERSION}"
+        "envoyproxy/envoy:v${ENVOY_VERSION}" || return 1
 
-    if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (Key Auth)" 20 "$ENVOY_CONTAINER"; then
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (Key Auth)" 20 "$ENVOY_CONTAINER"
+}
+
+test_envoy_key_auth() {
+    prepare_envoy_config
+
+    if start_envoy_key_auth; then
+        run_wrk_key_auth "envoy" "$GATEWAY_HTTP_PORT"
+    else
         log_warn "Envoy Key Auth failed to start — skipping"
-        stop_envoy
-        return 0
     fi
-    run_wrk_key_auth "envoy" "$GATEWAY_HTTP_PORT"
     stop_envoy
 }
 
@@ -1371,8 +1324,6 @@ write_metadata() {
     "tyk_version": "Docker ${TYK_VERSION}",
     "krakend_version": "Docker ${KRAKEND_VERSION}",
     "envoy_version": "Docker ${ENVOY_VERSION}",
-    "kong_native": false,
-    "envoy_native": false,
     "os": "$(uname -s) $(uname -r) $(uname -m)",
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
