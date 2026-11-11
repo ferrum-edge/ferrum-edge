@@ -1614,7 +1614,7 @@ jobs:
     name: Anonymous image pull smoke
     needs: docker-manifest
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -1634,3 +1634,10 @@ jobs:
           set -euo pipefail
           bash scripts/smoke_anonymous_pull.sh "docker.io/ferrumedge/ferrum-edge:${VERSION_TAG}"
           bash scripts/smoke_anonymous_pull.sh "ghcr.io/${GHCR_REPOSITORY}:${VERSION_TAG}"
+
+      # A fresh anonymous `/data` volume must work with the published image's own
+      # non-root identity: migrate, serve, restart, and keep the records.
+      - name: SQLite volume smoke on the published image
+        env:
+          VERSION_TAG: ${{ github.ref_name }}
+        run: bash scripts/smoke_sqlite_volume.sh "docker.io/ferrumedge/ferrum-edge:${VERSION_TAG}"

@@ -205,7 +205,9 @@ mode, probes `/live` and readiness, restarts the gateway, and checks that the
 original migration records persist in a valid SQLite database. It removes its
 containers, volume, and temporary snapshots on exit.
 
-This script is not yet wired into CI as an automated gate.
+The release workflow runs it against every published `docker.io` image tag
+(`release.yml`, job `anonymous-pull-smoke`), so a release whose image cannot
+use a fresh `/data` volume turns the release run red.
 
 ### Health Check
 
