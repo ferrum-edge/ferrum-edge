@@ -67,7 +67,7 @@ RELEASE_GATE_ENV = (
 )
 RELEASE_GATE_ACTIVE_COMMANDS = (
     "set -euo pipefail",
-    'if [[ ! "$TAG_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then',
+    'if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
     'echo "Invalid release tag format: $TAG_NAME" >&2',
     "exit 1",
     "fi",
@@ -2252,7 +2252,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
         run: |
           set -euo pipefail
 
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
