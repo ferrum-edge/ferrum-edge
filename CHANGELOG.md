@@ -232,6 +232,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The write-only per-session UDP request-size store and the
   `bench-udp-profile` `request_size_stores` counter that only counted it
   (#7173). The response amplification budget is unchanged.
+- The unused `tracing-appender` dependency, with its `symlink` dependency,
+  from `Cargo.toml` and the root, fuzz and mesh-benchmark lockfiles (#7295).
 
 ### Changed
 - **ferrum-mesh chart: values now reach the workload they name, once**
