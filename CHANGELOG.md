@@ -538,6 +538,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so future relay fixes apply to both paths at once.
 
 ### Fixed
+- `request_transformer` and `response_transformer` body rules that `remove` a
+  JSON member no longer reorder the members that remain. The removal was a
+  swap-remove under serde_json's insertion-ordered map, which moved the last
+  member into the removed member's place.
 - **`body_validator` response-side rejections no longer describe the upstream
   body** (advisory `GHSA-84xq-rr63-39pw`). A 502 `details` field used to carry
   serde_json's line/column for an upstream body that did not parse, the

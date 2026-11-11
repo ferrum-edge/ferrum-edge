@@ -123,6 +123,46 @@ fn test_add_only_when_absent() {
     );
 }
 
+/// Removing a member keeps the remaining members in their original order.
+/// serde_json's `preserve_order` map (enabled in this build) swap-removes,
+/// which moved the last member into the removed slot. The kept keys are
+/// already sorted, so the expected bytes hold for a sorted map too.
+#[test]
+fn test_remove_preserves_member_order() {
+    for (body, key, expected) in [
+        (
+            r#"{"debug":true,"id":1,"name":"a","price":2}"#,
+            "debug",
+            r#"{"id":1,"name":"a","price":2}"#,
+        ),
+        (
+            r#"{"id":1,"internal":true,"name":"a","price":2}"#,
+            "internal",
+            r#"{"id":1,"name":"a","price":2}"#,
+        ),
+        (
+            r#"{"outer":{"a":1,"drop":0,"b":2,"c":3},"z":0}"#,
+            "outer.drop",
+            r#"{"outer":{"a":1,"b":2,"c":3},"z":0}"#,
+        ),
+    ] {
+        let rules = parse_body_rules(
+            &json!({ "rules": [{"operation": "remove", "target": "body", "key": key}] }),
+        )
+        .expect("valid body rules");
+        match apply_request_body_rules(body.as_bytes(), &rules) {
+            RequestBodyRulesOutcome::Replaced(bytes) => assert_eq!(
+                String::from_utf8(bytes).expect("UTF-8 body"),
+                expected,
+                "removing {key:?} must not reorder the remaining members"
+            ),
+            RequestBodyRulesOutcome::Skipped(_) | RequestBodyRulesOutcome::Unchanged => {
+                panic!("removing {key:?} must rewrite the body")
+            }
+        }
+    }
+}
+
 #[test]
 fn test_remove_nested_field() {
     let root = json!({"user": {"name": "Alice", "age": 30}});
