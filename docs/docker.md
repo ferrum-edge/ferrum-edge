@@ -73,7 +73,7 @@ docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 
 ### Base Image Pinning
 
-Every image reference in `Dockerfile`, `Dockerfile.release`, `Dockerfile.test`,
+Every image reference in `Dockerfile`, `Dockerfile.release`,
 `Dockerfile.ebpf-tools-layer`, and `Dockerfile.iproute2-layer` — `FROM` lines and
 the `ARG <NAME>=<image>` defaults their `FROM ${VAR}` stages expand — is pinned
 by `@sha256:` digest, fixing the base image bytes independently of the tag.

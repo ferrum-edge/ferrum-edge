@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 20
     env:
       # One inventory for resolution and staging, including the live image layer.
-      DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.test Dockerfile.ebpf-tools-layer Dockerfile.iproute2-layer"
+      DOCKERFILES: "Dockerfile Dockerfile.release Dockerfile.ebpf-tools-layer Dockerfile.iproute2-layer"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

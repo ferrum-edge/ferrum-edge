@@ -624,7 +624,7 @@ the group must be ready — see the `Removal trigger` column).
    also runs.
 4. `git rm -r vendor/<crate>-<ver>-ferrum-patched/` (and `vendor/` if empty),
    then `git grep '<crate>-<ver>-ferrum-patched'` for remaining references
-   (CI steps in `.github/workflows/ci.yml`, `.github/scripts/`, `Dockerfile.test`).
+   (CI steps in `.github/workflows/ci.yml` and `.github/scripts/`).
 5. Move `docs/upstream-<crate>-patches/NNN-…/` to `…/_retired/NNN-…/` with a
    `STATUS.md` (merge commit + registry version), or delete per that crate's
    README.
@@ -722,8 +722,8 @@ blocking dependency audit when `Cargo.lock` changes.
 
 ## Base image pinning
 
-Production container images (`Dockerfile`, `Dockerfile.release`, and
-`Dockerfile.test`) must pin every external `FROM` base by registry digest, not
+Production container images (`Dockerfile`, `Dockerfile.release`,
+`Dockerfile.ebpf-tools-layer`, and `Dockerfile.iproute2-layer`) must pin every external `FROM` base by registry digest, not
 by a mutable tag alone. Write the reference as `repo:tag@sha256:…`, the same form
 `IPROUTE2_BASE` already uses: the digest decides which bytes are pulled and the
 tag stays in the reference as documentation. A Dockerfile comment is a WHOLE line
@@ -763,7 +763,7 @@ its first token or skipped.
 ### Container build inputs (enforcement and refresh)
 
 Every registry image reference in `Dockerfile`, `Dockerfile.release`,
-`Dockerfile.test`, `Dockerfile.ebpf-tools-layer`, and
+`Dockerfile.ebpf-tools-layer`, and
 `Dockerfile.iproute2-layer` — both `FROM <ref>` and the `ARG <NAME>=<ref>`
 defaults those `FROM ${VAR}` lines expand — carries an `@sha256:` digest.
 `Dockerfile.iproute2-layer`'s default `BASE_IMAGE` matches the source runtime

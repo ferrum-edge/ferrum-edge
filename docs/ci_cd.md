@@ -4066,7 +4066,7 @@ gh run list --workflow release.yml
 3. Expand job logs for details
 
 **Common Issues**:
-- Build prerequisites: CI installs `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows. Hosted Ubuntu already provides `cmake`; the Docker builder, `Dockerfile.test`, FIPS compile jobs, and ARM64 Cross `pre-build` also install `cmake` (Cross additionally installs `libcurl4-openssl-dev`). Local workstations get both from `scripts/install-build-deps.sh`.
+- Build prerequisites: CI installs `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows. Hosted Ubuntu already provides `cmake`; the Docker builder, FIPS compile jobs, and ARM64 Cross `pre-build` also install `cmake` (Cross additionally installs `libcurl4-openssl-dev`). Local workstations get both from `scripts/install-build-deps.sh`.
 - Missing dependencies: Check `Cargo.toml` and the release Build Process prerequisites above
 - Rust version: Workflows use `stable` Rust toolchain
 

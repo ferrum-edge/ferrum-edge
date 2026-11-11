@@ -147,7 +147,6 @@ DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKERFILE_RELEASE = REPO_ROOT / "Dockerfile.release"
 DOCKERFILE_EBPF_TOOLS_LAYER = REPO_ROOT / "Dockerfile.ebpf-tools-layer"
 DOCKERFILE_IPROUTE2_LAYER = REPO_ROOT / "Dockerfile.iproute2-layer"
-DOCKERFILE_TEST = REPO_ROOT / "Dockerfile.test"
 SETUP_RUST = REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 SETUP_SCCACHE = REPO_ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
 SETUP_FAST_LINKER = REPO_ROOT / ".github" / "actions" / "setup-fast-linker" / "action.yml"
@@ -5378,7 +5377,6 @@ def check_dockerfile(failures: list[str]) -> None:
     for label, text in (
         ("Dockerfile", dockerfile),
         ("Dockerfile.release", release),
-        ("Dockerfile.test", read_pinned(DOCKERFILE_TEST)),
         ("Dockerfile.ebpf-tools-layer", ebpf_tools_layer),
         ("Dockerfile.iproute2-layer", iproute2_layer),
     ):
