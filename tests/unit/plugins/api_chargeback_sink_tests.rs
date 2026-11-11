@@ -12905,7 +12905,10 @@ async fn custom_tls_sink_builds_one_clickhouse_client_for_delivery_and_replay() 
     let temp = tempfile::tempdir().unwrap();
     let mut config = valid_config(temp.path());
     config["clickhouse"]["url"] = json!("https://clickhouse.example:8443");
-    config["clickhouse"]["tls"] = json!({ "verify_hostname": false });
+    // reqwest's rustls backend only disables hostname verification together
+    // with a pinned CA or with certificate verification off; this test needs
+    // no CA file, so it turns both off.
+    config["clickhouse"]["tls"] = json!({ "verify_hostname": false, "insecure_skip_verify": true });
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
         .expect("custom-TLS sink with spool");
 
