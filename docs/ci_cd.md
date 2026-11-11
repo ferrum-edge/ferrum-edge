@@ -1142,8 +1142,10 @@ versions/checksums, install subset, and runner OS/arch; checksums are verified
 after both restore and download. `ci.yml` has no deploy-only mesh smoke jobs:
 each dedicated full live suite performs the same SPIRE/workload rollout and
 then continues into traffic probes and fail-closed live assertions. Independent
-workflows start concurrently and do not poll each other for executables; the
-shared `ci-live-pr-build` cache is the compile reuse.
+workflows start concurrently and do not poll each other for executables. No
+main-push job produces `ci-live-pr-build` (a saved `pr-build` archive would
+cost 1-2 GB of the 10 GB quota), so today every live lab compiles cold; the key
+only keeps the four labs on one lane should a producer be added.
 
 On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That

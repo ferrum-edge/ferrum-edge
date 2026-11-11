@@ -244,8 +244,11 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           # Same default-feature `pr-build` ferrum-edge graph as the other
-          # live labs that compile only that binary. Do not share with
-          # extra-binary, extra-feature, or debug-profile lanes.
+          # live labs that compile only that binary. No main-push job produces
+          # this lane (10 GB quota policy, docs/ci_cd.md), so it restores
+          # nothing today; it stays a consumer-only key so a future producer
+          # needs no edit here. Do not share with extra-binary, extra-feature,
+          # or debug-profile lanes.
           shared-key: "ci-live-pr-build"
 
       - name: Build runtime binary

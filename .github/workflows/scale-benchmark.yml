@@ -70,7 +70,9 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: "ci-scale-bench"
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Dispatch-only lane: it never runs on a push to main, so it never
+          # saves (see docs/ci_cd.md, 10 GB quota policy).
+          save-if: "false"
 
       - name: Install system dependencies
         run: |
