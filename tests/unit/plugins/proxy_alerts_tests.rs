@@ -2987,7 +2987,7 @@ fn startup_diagnostics_preserve_second_alert_recovery_context() {
         assert_rendered_alert_diagnostic(
             &config,
             &[
-                "`rules[1].recovery`",
+                "`rules[1]`: `recovery`:",
                 "unknown configuration key(s)",
                 "did you mean `resolved_window_seconds`?",
             ],

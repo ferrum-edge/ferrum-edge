@@ -846,7 +846,9 @@ fn read_recovery(
         rec_obj,
         &format!("rules[{rule_id}].recovery"),
         RECOVERY_KEYS,
-        "",
+        // The caller adds `proxy_alerts: `rules[N]`: `; name the nested block
+        // here, because the qualified keys are redacted at startup.
+        "`recovery`: ",
     )?;
     let resolved_window_seconds =
         read_object_u32(rec, "resolved_window_seconds", rule_name, "recovery")?
