@@ -4077,9 +4077,11 @@ and no registry login. Both jobs retain every production-image contract check;
 `ambient-host-udp-image` requires the selected job to pass and the other to skip.
 The existing outer required check remains `Ambient Host UDP Live`.
 
-This replaces the former `ambient-host-udp-images` GHA scope. Its existing
-entries expire under the usual 10 GB/LRU policy; the workflows no longer export
-new Ambient layers there. The Actions limit and $0 budgets remain unchanged.
+This replaced the former `ambient-host-udp-images` GHA scope, whose entries
+have expired under the 10 GB/LRU policy. Neither trusted verifier admits that
+single-job `type=gha` recipe any more: `verify_cross_build_policy.py` freezes
+only the reader/writer/aggregate jobs and `verify_ci_runtime_cache.py` checks
+only them (#7281). The Actions limit and $0 budgets remain unchanged.
 Each of the three targets has its own `ambient-v1-linux-amd64-` cache tag so a
 later target does not overwrite another target's cache graph. GHCR container
 storage and bandwidth are currently free under GitHub's published policy.

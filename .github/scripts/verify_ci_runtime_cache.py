@@ -1018,31 +1018,6 @@ def require(condition: bool, message: str, failures: list[str]) -> None:
 
 FORK_IS_TRUE = "github.event.pull_request.head.repo.fork == true"
 FORK_NOT_TRUE = "github.event.pull_request.head.repo.fork != true"
-AMBIENT_GHA_CACHE_SCOPE = "ambient-host-udp-images"
-AMBIENT_GHA_CACHE_FROM = f"type=gha,scope={AMBIENT_GHA_CACHE_SCOPE}"
-AMBIENT_GHA_CACHE_TO_EXPORT = f"type=gha,mode=max,scope={AMBIENT_GHA_CACHE_SCOPE}"
-AMBIENT_GHA_CACHE_TO = (
-    "${{ github.event_name != 'pull_request' && "
-    "github.event_name != 'merge_group' && "
-    "github.ref == 'refs/heads/main' && "
-    f"{FORK_NOT_TRUE} && "
-    f"'{AMBIENT_GHA_CACHE_TO_EXPORT}' || '' }}}}"
-)
-AMBIENT_IMAGE_BUILDS = (
-    ("Build the capture tool base stage", "capture-tools-base"),
-    (
-        "Build the production Ambient UDP lifecycle runtime",
-        "runtime-ebpf-tools",
-    ),
-    ("Build the distroless eBPF runtime", "runtime-ebpf"),
-)
-AMBIENT_IMAGE_CONTRACTS = (
-    "Prove the published runtime can execute the production tool set",
-    "Prove the `-ebpf` image keeps its distroless contract",
-)
-UNCONDITIONAL_AMBIENT_CACHE_TO = re.compile(
-    r"(?m)^[ \t]*cache-to:[ \t]*type=gha,mode=max,scope=ambient-host-udp-images\s*$"
-)
 COLD_IS_TRUE = "github.event.inputs.force_cold_cache == 'true'"
 COLD_NOT_TRUE = "github.event.inputs.force_cold_cache != 'true'"
 SAVE_IF_NON_FORK = re.compile(
@@ -3501,120 +3476,25 @@ def with_scalar(with_block: str, key: str) -> str:
 
 
 def check_ambient_workflow_cache_budget(workflow: str, failures: list[str]) -> None:
-    """Keep the complete reader/writer generation tied to the trusted contract."""
-    image, extraction_errors = extract_job_contract_block(
-        workflow, "Ambient registry cache", "ambient-host-udp-image", required=True
-    )
-    failures.extend(extraction_errors)
-    if image == AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB:
-        for name, expected in (
-            ("ambient-host-udp-image-read", AMBIENT_REGISTRY_IMAGE_READ_JOB),
-            ("ambient-host-udp-image-write", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
-        ):
-            actual, extraction_errors = extract_job_contract_block(
-                workflow, "Ambient registry cache", name, required=True
-            )
-            failures.extend(extraction_errors)
-            require(
-                actual == expected,
-                f"{name} must preserve the complete registry cache contract",
-                failures,
-            )
-    else:
-        check_ambient_image_cache_budget(
-            extract_job(workflow, "ambient-host-udp-image"),
-            "ambient-host-udp-image",
-            failures,
-        )
+    """Hold the Ambient image recipe to the complete registry-cache generation.
 
-
-def check_ambient_image_cache_budget(
-    job_body: str,
-    source: str,
-    failures: list[str],
-) -> None:
-    require(
-        UNCONDITIONAL_AMBIENT_CACHE_TO.search(job_body) is None,
-        f"{source} must not publish the Ambient GHA BuildKit cache "
-        "unconditionally from pull requests",
-        failures,
-    )
-    steps_by_name: dict[str, str] = {}
-    for step in job_steps(job_body):
-        match = _STEP_NAME_RE.search(step)
-        if match:
-            steps_by_name[match.group(1).strip()] = step
-    build_steps = [
-        step
-        for step in job_steps(job_body)
-        if step_uses(step).startswith(BUILD_PUSH)
-    ]
-    require(
-        len(build_steps) == 3,
-        f"{source} must keep exactly three pinned build-push steps, found "
-        f"{len(build_steps)}",
-        failures,
-    )
-    for name, target in AMBIENT_IMAGE_BUILDS:
-        step = steps_by_name.get(name, "")
+    The trusted Cross policy freezes the same three jobs; the retired single-job
+    `type=gha` recipe is no longer admitted by either verifier (#7281).
+    """
+    for name, expected in (
+        ("ambient-host-udp-image", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB),
+        ("ambient-host-udp-image-read", AMBIENT_REGISTRY_IMAGE_READ_JOB),
+        ("ambient-host-udp-image-write", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
+    ):
+        actual, extraction_errors = extract_job_contract_block(
+            workflow, "Ambient registry cache", name, required=True
+        )
+        failures.extend(extraction_errors)
         require(
-            bool(step),
-            f"{source} must keep the {name!r} image build",
+            actual == expected,
+            f"{name} must preserve the complete registry cache contract",
             failures,
         )
-        if not step:
-            continue
-        require(
-            not step_if(step),
-            f"{source} must keep {name!r} unconditional; a missing/invalid "
-            "event must not skip the required image build",
-            failures,
-        )
-        require(
-            step_uses(step).startswith(BUILD_PUSH),
-            f"{source} {name!r} must keep the pinned build-push-action",
-            failures,
-        )
-        with_block = step_with(step)
-        require(
-            with_scalar(with_block, "target") == target,
-            f"{source} {name!r} must build target {target}",
-            failures,
-        )
-        require(
-            with_scalar(with_block, "load") == "true",
-            f"{source} {name!r} must load the image for contract checks",
-            failures,
-        )
-        require(
-            with_scalar(with_block, "cache-from") == AMBIENT_GHA_CACHE_FROM,
-            f"{source} {name!r} must restore the Ambient GHA BuildKit cache",
-            failures,
-        )
-        require(
-            with_scalar(with_block, "cache-to") == AMBIENT_GHA_CACHE_TO,
-            f"{source} {name!r} must publish GHA cache only from trusted "
-            "refs/heads/main, never from pull_request or merge_group, and "
-            "never from a fork",
-            failures,
-        )
-        require(
-            FORK_NOT_TRUE in with_scalar(with_block, "cache-to"),
-            f"{source} {name!r} cache-to must keep the fork publication guard",
-            failures,
-        )
-    for name in AMBIENT_IMAGE_CONTRACTS:
-        require(
-            name in steps_by_name,
-            f"{source} must keep the {name!r} contract check",
-            failures,
-        )
-        if name in steps_by_name:
-            require(
-                not step_if(steps_by_name[name]),
-                f"{source} must keep {name!r} unconditional",
-                failures,
-            )
 
 
 def check_nul_delimited_plan(plan_job: str, source: str, failures: list[str]) -> None:
@@ -4903,9 +4783,10 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     require(
         "10 GB" in ci_cd
         and "LRU" in ci_cd
-        and "ambient-host-udp-images" in ci_cd,
-        "docs/ci_cd.md must document the Ambient GHA cache-budget policy, "
-        "10 GB quota, and LRU eviction",
+        and "target-specific GHCR registry caches" in ci_cd,
+        "docs/ci_cd.md must document the Ambient cache-budget policy: the "
+        "10 GB quota, LRU eviction, and the GHCR registry caches that replace "
+        "BuildKit `type=gha` layers",
         failures,
     )
     require(
@@ -8498,88 +8379,6 @@ def self_test() -> int:
         not real_block_failures,
         "self-test: NodeWaypoint planner `run: |` with summary then exit 1 "
         "should pass: " + "; ".join(real_block_failures),
-        failures,
-    )
-
-    def _ambient_image_job(cache_to: str, extra_if: str = "") -> str:
-        if_line = f"        if: {extra_if}\n" if extra_if else ""
-        chunks: list[str] = ["    steps:\n"]
-        for name, target in AMBIENT_IMAGE_BUILDS:
-            chunks.append(
-                f"      - name: {name}\n"
-                f"{if_line}"
-                f"        uses: {BUILD_PUSH}\n"
-                "        with:\n"
-                "          context: .\n"
-                "          file: Dockerfile\n"
-                f"          target: {target}\n"
-                "          load: true\n"
-                f"          cache-from: {AMBIENT_GHA_CACHE_FROM}\n"
-                f"          cache-to: {cache_to}\n"
-                "          provenance: false\n"
-            )
-        for name in AMBIENT_IMAGE_CONTRACTS:
-            chunks.append(f"      - name: {name}\n        run: echo ok\n")
-        return "".join(chunks)
-
-    good_ambient_failures: list[str] = []
-    check_ambient_image_cache_budget(
-        _ambient_image_job(AMBIENT_GHA_CACHE_TO),
-        "self-test-good-ambient-cache",
-        good_ambient_failures,
-    )
-    require(
-        not good_ambient_failures,
-        "self-test: trusted-main Ambient cache-to should pass: "
-        + "; ".join(good_ambient_failures),
-        failures,
-    )
-
-    unconditional_ambient_failures: list[str] = []
-    check_ambient_image_cache_budget(
-        _ambient_image_job(AMBIENT_GHA_CACHE_TO_EXPORT),
-        "self-test-unconditional-ambient-cache-to",
-        unconditional_ambient_failures,
-    )
-    require(
-        any(
-            "unconditionally from pull requests" in item
-            for item in unconditional_ambient_failures
-        ),
-        "self-test: restoring unconditional Ambient cache-to must fail",
-        failures,
-    )
-
-    skipped_ambient_failures: list[str] = []
-    check_ambient_image_cache_budget(
-        _ambient_image_job(
-            AMBIENT_GHA_CACHE_TO, extra_if="github.event_name == 'workflow_dispatch'"
-        ),
-        "self-test-skipped-ambient-image-build",
-        skipped_ambient_failures,
-    )
-    require(
-        any(
-            "must not skip the required image build" in item
-            for item in skipped_ambient_failures
-        ),
-        "self-test: event-gated Ambient image builds must fail",
-        failures,
-    )
-
-    fork_publish_failures: list[str] = []
-    inverted_fork = AMBIENT_GHA_CACHE_TO.replace(FORK_NOT_TRUE, FORK_IS_TRUE)
-    check_ambient_image_cache_budget(
-        _ambient_image_job(inverted_fork),
-        "self-test-ambient-fork-publish",
-        fork_publish_failures,
-    )
-    require(
-        any(
-            "never from a fork" in item or "fork publication guard" in item
-            for item in fork_publish_failures
-        ),
-        "self-test: inverted Ambient fork cache-to guard must fail",
         failures,
     )
 

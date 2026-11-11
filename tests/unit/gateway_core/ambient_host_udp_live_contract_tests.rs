@@ -117,7 +117,9 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
     );
     for complete_contract in [
         "AMBIENT_HOST_UDP_LIVE_JOB",
-        "AMBIENT_HOST_UDP_IMAGE_JOB",
+        "AMBIENT_REGISTRY_IMAGE_READ_JOB",
+        "AMBIENT_REGISTRY_IMAGE_WRITE_JOB",
+        "AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB",
         "AMBIENT_HOST_UDP_GATE_JOB",
         "AMBIENT_HOST_UDP_TOP_LEVEL_PERMISSIONS",
         "AMBIENT_HOST_UDP_FORBIDDEN_INHERITED_KEYS",
