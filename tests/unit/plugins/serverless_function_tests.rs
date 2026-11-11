@@ -292,7 +292,13 @@ fn test_unknown_fields_are_rejected_deterministically() {
         }),
         default_client(),
     ));
-    assert!(err.contains("forwad_body, z_future_field"), "got: {err}");
+    // Sorted, each qualified with its path, in one diagnostic.
+    assert!(
+        err.contains(
+            "\"config.forwad_body\" (did you mean `forward_body`?), \"config.z_future_field\""
+        ),
+        "got: {err}"
+    );
 }
 
 #[test]
