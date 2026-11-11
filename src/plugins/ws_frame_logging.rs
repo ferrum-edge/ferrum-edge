@@ -66,7 +66,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fips::backend::rand::SecureRandom;
 use async_trait::async_trait;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tracing::callsite::{DefaultCallsite, Identifier};
 use tracing::field::FieldSet;

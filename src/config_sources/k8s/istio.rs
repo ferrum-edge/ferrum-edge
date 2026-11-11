@@ -4999,7 +4999,7 @@ fn virtual_service_l4_proxies(
                          set match.port explicitly to select the listen port",
                     )
                 })?;
-                let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                let proxy = super::proxy_for_route(super::RouteProxySpec {
                     id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, 0),
                     namespace: namespace.clone(),
                     hosts: Vec::new(),
@@ -5042,7 +5042,7 @@ fn virtual_service_l4_proxies(
                                 )
                             })?,
                         };
-                    let mut proxy = super::proxy_for_route(super::RouteProxySpec {
+                    let proxy = super::proxy_for_route(super::RouteProxySpec {
                         id: virtual_service_l4_proxy_id("tcp", namespace, vs_name, bi, mi),
                         namespace: namespace.clone(),
                         hosts: Vec::new(),
