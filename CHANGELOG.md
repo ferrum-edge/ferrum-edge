@@ -2131,6 +2131,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CONTRIBUTING.md` correctly and list every operating mode (#7309).
 
 ### Performance
+- **A cold DNS miss sends the SRV and A/AAAA queries together.** Under an
+  order that starts with `SRV` followed by `A` or `AAAA` (the default
+  `CACHE,SRV,A,CNAME`), a hostname with no recorded answering type used to
+  wait a full SRV round trip before asking for its address. Both queries now
+  go out together through the same caching resolver, and the first non-empty
+  answer in configured order wins: SRV when it has addresses, otherwise the
+  address answer, looked up again if it arrived early and has since expired
+  or failed. Warm lookups and other orders are unchanged. This replaces the
+  approach of ferrum-edge/ferrum-edge#7036, which sent the early query
+  through a separate uncached resolver.
 - **`ai_tool_governor` drains its live SSE buffer once per chunk**
   (issue #7133). The streaming tool-call inspector removed each complete
   event from the front of its carry buffer, moving the rest of the chunk

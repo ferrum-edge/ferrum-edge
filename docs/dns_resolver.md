@@ -61,7 +61,7 @@ If a caller past its own stale window attempts a synchronous refresh and DNS fai
 | `FERRUM_DNS_STALE_TTL` | `u64` | `3600` | How long (seconds) stale cached data can be served while a background refresh is in progress. Also caps failed-entry lifetime and error-TTL exponential backoff. See [Stale-While-Revalidate](#stale-while-revalidate) and [Failed DNS Retry Task](#failed-dns-retry-task). |
 | `FERRUM_DNS_ERROR_TTL` | `u64` | `5` | Base TTL (seconds) for caching DNS errors and empty responses. Doubles on consecutive failures up to `FERRUM_DNS_STALE_TTL` (or 1 day when stale TTL is `0`). Prevents hammering DNS for known-bad hostnames. |
 | `FERRUM_DNS_CACHE_MAX_SIZE` | `usize` | `10000` | Maximum number of entries in the DNS cache. Expired entries are evicted automatically; if the cache still exceeds this limit, error entries are preferred for eviction over live success entries, then oldest `expires_at` within each class. |
-| `FERRUM_DNS_WARMUP_CONCURRENCY` | `usize` | `500` | Maximum number of concurrent DNS resolutions during startup/config warmup. Higher values reduce warmup time for large configs but increase burst load on upstream resolvers. |
+| `FERRUM_DNS_WARMUP_CONCURRENCY` | `usize` | `500` | Maximum number of concurrent DNS resolutions during startup/config warmup. Higher values reduce warmup time for large configs but increase burst load on upstream resolvers. A cold resolution under an `SRV,A` / `SRV,AAAA` leading order sends two queries at once (see [DNS Order](#dns-order)). |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 60s-TTL entry refreshes after 54s. Lower values add safety margin at the cost of more DNS queries. |
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | `u64` | `10` | Interval (seconds) for the background task that retries failed DNS lookups. Error-cached entries whose current (possibly backed-off) error TTL has expired are re-attempted at this interval, subject to age eviction and per-cycle work bounds. Set to `0` to disable. |
@@ -73,7 +73,9 @@ Ferrum starts from the platform system DNS configuration (on Linux, `/etc/resolv
 
 ## DNS Order
 
-The `FERRUM_DNS_ORDER` setting controls which DNS record types are queried and in what order. The resolver tries each type sequentially and returns the first successful result.
+The `FERRUM_DNS_ORDER` setting controls which DNS record types are queried and in what order. The resolver returns the first non-empty answer in that order, normally trying one type at a time.
+
+On a **cold miss** (no cache row yet records which type answered for the hostname), an order that starts with `SRV` followed by `A` or `AAAA`, as the default does, sends those two queries together through the same caching resolver. The SRV answer still wins when it has addresses, and a still-pending address lookup is dropped. Otherwise the address answer is used; if it arrived before SRV and has since expired, or was a failure, the address step runs again through the cache, as a sequential walk would. For an address-only host this saves the SRV round trip. For an SRV-backed host the address query is wasted. Warm lookups, and any other order, stay sequential.
 
 Valid values (case-insensitive):
 
