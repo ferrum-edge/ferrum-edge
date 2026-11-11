@@ -4454,9 +4454,11 @@ async fn run_two_instance_store_isolation(a_first: bool) {
         .get(&staging_key(second, "cache_base_key"))
         .cloned()
         .expect("second instance staged base key");
-    assert_ne!(
+    // The base key binds only the request and caller partitions, not instance
+    // config; each instance's staging namespace (below) keeps them apart.
+    assert_eq!(
         first_base, second_base,
-        "distinct query/consumer/Vary policies must stage independent base keys"
+        "the same request stages the same base key under each instance's namespace"
     );
     assert_ne!(
         staging_key(first, "cache_status"),
