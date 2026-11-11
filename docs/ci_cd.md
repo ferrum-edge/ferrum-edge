@@ -1085,6 +1085,11 @@ the Secret Backends and PKCS#11 jobs. Rust formatting and the integration-shard
 coverage contract also run as named steps in `CI Plan`, avoiding two additional
 runner allocations.
 
+In its kind cluster the `Helm Chart` job also installs the `charts/ferrum-gateway`
+file-mode example (`examples/file-values.yaml`) with the CI image, waits for the
+readiness probe, and reads `/health` through the admin port, so probe, mount and
+securityContext regressions fail CI rather than a user's install.
+
 The `Helm Chart` job additionally runs the trusted node-agent/ambient chart
 runtime lint (`.github/scripts/check_node_agent_chart_runtime.py`, issue #3615)
 after proving the working-tree `.github/actions/setup-kubernetes-tools` matches

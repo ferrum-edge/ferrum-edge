@@ -6314,6 +6314,47 @@ jobs:
             kubectl apply --dry-run=server -f "$manifest" >/dev/null
           done
 
+      # Lint and template cannot catch probe, mount or securityContext
+      # regressions; install the gateway chart's file-mode example for real,
+      # wait for its readiness probe, and read /health through the admin port.
+      - name: Install ferrum-gateway chart (file mode)
+        run: |
+          set -euo pipefail
+          namespace=ferrum-gw
+          dump() {
+            kubectl -n "$namespace" get pods -o wide || true
+            kubectl -n "$namespace" describe deploy/ferrum-gateway || true
+            kubectl -n "$namespace" logs deploy/ferrum-gateway --tail=200 || true
+          }
+          on_exit() {
+            local rc=$?
+            if [ "$rc" -ne 0 ]; then
+              dump
+            fi
+          }
+          trap on_exit EXIT
+          helm install ferrum-gateway ./charts/ferrum-gateway -n "$namespace" --create-namespace \
+            -f charts/ferrum-gateway/examples/file-values.yaml \
+            --set image.repository="${FERRUM_IMAGE%:*}" --set image.tag="${FERRUM_IMAGE##*:}" \
+            --set image.pullPolicy=Never --set service.type=ClusterIP --set replicaCount=1
+          kubectl -n "$namespace" rollout status deploy/ferrum-gateway --timeout=180s
+          kubectl -n "$namespace" port-forward deploy/ferrum-gateway 19000:9000 >/dev/null 2>&1 &
+          port_forward=$!
+          healthy=false
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:19000/health; then
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          kill "$port_forward" || true
+          if [ "$healthy" != "true" ]; then
+            echo "::error title=ferrum-gateway chart::file-mode install never answered /health on the admin port"
+            exit 1
+          fi
+          helm uninstall ferrum-gateway -n "$namespace" --wait
+
       - name: Validate Ambient UDP placement upgrade contract
         run: |
           set -euo pipefail
