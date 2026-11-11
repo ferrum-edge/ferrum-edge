@@ -1467,7 +1467,8 @@ async fn test_case_insensitive_hmac_prefix() {
     ctx.headers.insert(
         "authorization".to_string(),
         format!(
-            r#"HMAC username="hmacuser", algorithm="hmac-sha256", signature="{}""#,
+            r#"HMAC username="hmacuser", algorithm="hmac-sha256", nonce="{}", signature="{}""#,
+            nonce_for_signature(&signature),
             signature
         ),
     );
