@@ -2419,30 +2419,21 @@ What is invariant across every generation:
   asserts their 64 KiB `-max_len` and each shared bound;
 - the bounded budget runs only on the push to `main` and on manual dispatch,
   through `FUZZ_SANITIZER_SMOKE_WORKFLOW`'s only two triggers;
-- compiler caching is admitted only through the repository's own
-  `./.github/actions/setup-sccache`, the single local action the contract
-  permits. That action installs a checksum-pinned sccache release, never enables
-  the credential-bearing sccache GHA backend, never persists
-  `ACTIONS_RUNTIME_TOKEN` / `ACTIONS_RESULTS_URL` into later
-  pull-request-controlled steps, asserts those variables are absent before any
-  build runs, and clears the wrapper entirely if the install fails. Local
-  actions are not exempt from the policy: `validate_action_collection` and
-  `compare_pr_action_collection` reject a Cross executable or configuration
-  input in any of them, and the action's own surfaces are attributed to
-  `actions/<name>`, never withheld with the job's;
-- the job does not pin `RUSTC_WRAPPER` at job level — a job-level `env` entry
-  would override the installer's fail-closed `GITHUB_ENV` decision — while
-  `RUSTFLAGS: ""` stays, because the root Cargo configuration still selects a
-  mold linker this lane does not install;
-- the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
-  under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
+- the job installs no compiler-cache wrapper and references no local action.
+  Like the scheduled and push-to-main fuzz lanes it clears `RUSTC_WRAPPER`,
+  `CARGO_BUILD_RUSTC_WRAPPER` and `RUSTFLAGS` at job level, because the root
+  Cargo configuration selects a mold linker this lane does not install and a
+  runner-level wrapper must not reach the build. The `setup-sccache` store it
+  used to install was never persisted and measured 0 hits on main (#7285);
+- the restored `fuzz-property-smoke` target directory is the lane's only
+  compiler reuse, persisted by the pinned `Swatinem/rust-cache` step under
+  `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
   and nothing else. That predicate is the cache-quota control: `pull_request`
   (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
   may restore a fuzz cache but cannot publish one;
-- telemetry: the property gate prints `Fuzz property smoke seconds`, the lane
-  shape, closing sccache statistics, and the on-disk cache size, and warns
-  explicitly when sccache was unavailable; the sanitizer budget prints
-  `Fuzz sanitizer lane seconds` and its `Fuzz build resources:` records.
+- telemetry: the property gate prints `Fuzz property smoke seconds` and the
+  lane shape; the sanitizer budget prints `Fuzz sanitizer lane seconds` and its
+  `Fuzz build resources:` records.
 
 A transition is exact on both ends and one-way. `admitted_fuzz_smoke_errors`
 accepts a `fuzz-smoke` job only at an admitted text (or absent);
@@ -2458,9 +2449,9 @@ sanitizer budget to pull requests, dropping it from the push to `main`,
 re-adding it to the merge queue (now as `FUZZ_SANITIZER_SMOKE_WORKFLOW`
 mutations), returning any libFuzzer run to the adopted property gate,
 restoring the fat cache key or full debuginfo, skipping the property gate on pull requests,
-allowing untrusted cache writes, substituting an unpinned third-party sccache
-installer, enabling the credential-bearing GHA backend, widening the cached
-directory, deleting the `datagram_client_address` invocation, re-bounding it to
+allowing untrusted cache writes, adding a third-party sccache installer,
+leaving the rustc wrapper input to the runner, enabling the credential-bearing
+GHA backend, widening the cached directory, deleting the `datagram_client_address` invocation, re-bounding it to
 the generic 4 KiB ceiling, and pointing it at a target the loop already covers.
 
 The scheduled lane's own contract carries the same target inventory: the

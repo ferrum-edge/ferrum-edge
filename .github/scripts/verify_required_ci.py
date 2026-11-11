@@ -877,31 +877,6 @@ def native_binary_compile_gate_self_test() -> list[str]:
         failures.append("CI must not compile production release binaries")
     if 'shared-key: "build-${{ matrix.target }}-prbuild"' not in build_body:
         failures.append("CI verification must use the prbuild cache namespace")
-    if "./.github/actions/setup-sccache" not in build_body:
-        failures.append(
-            "jobs.build-binaries must install sccache via the pinned repository action"
-        )
-    if '"${FERRUM_SCCACHE_BIN}" --show-stats' not in build_body:
-        failures.append(
-            "jobs.build-binaries must report pinned sccache --show-stats telemetry"
-        )
-    # Issue #6282: an installer failure leaves FERRUM_SCCACHE_BIN empty while
-    # Cargo builds uncached, so the statistics step must be guarded and best
-    # effort rather than failing an otherwise successful build.
-    stats_guard = (
-        '          if [ -n "${FERRUM_SCCACHE_BIN:-}" ]; then\n'
-        '            "${FERRUM_SCCACHE_BIN}" --show-stats || echo '
-        '"::warning::sccache statistics were unavailable"\n'
-    )
-    if stats_guard not in build_body:
-        failures.append(
-            "jobs.build-binaries sccache statistics must be guarded on a non-empty "
-            "FERRUM_SCCACHE_BIN and be best effort (#6282)"
-        )
-    if "run: '\"${FERRUM_SCCACHE_BIN}\" --show-stats'" in build_body:
-        failures.append(
-            "jobs.build-binaries must not run unguarded sccache --show-stats (#6282)"
-        )
     return failures
 
 

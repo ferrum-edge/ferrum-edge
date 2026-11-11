@@ -3920,9 +3920,10 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 #     frozen-workflow removal rule refuses deleting the workflow once the
 #     trusted base carries it.
 #
-#     The generation holds only `contents: read`, uses the checksum-pinned
-#     sccache installer with a main-only rust-cache save, and has no remote
-#     compiler-cache backend.
+#     The generation holds only `contents: read`, installs no compiler-cache
+#     wrapper (it clears every wrapper input, like the other fuzz lanes),
+#     keeps a main-only rust-cache save, and has no remote compiler-cache
+#     backend.
 #
 #     Beyond the six-target loop, the budget fuzzes `datagram_client_address`
 #     (#4442). That target parses the Datagram PROXY v2 envelope -- address
@@ -4004,13 +4005,15 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     permissions:
       contents: read
     # The repository-root Cargo config also selects the mold linker through
-    # per-target rustflags, and this isolated lane installs no fast linker, so
-    # the inherited rustflags are cleared explicitly. The rustc wrapper is
-    # deliberately NOT pinned here: `setup-sccache` below publishes either the
-    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
-    # and a job-level `env` entry of the same name would override that
-    # fail-closed decision.
+    # per-target rustflags, and a runner- or user-level rustc-wrapper may
+    # select sccache, but this isolated lane installs neither: like the
+    # scheduled and push-to-main fuzz lanes, it clears both Cargo wrapper
+    # inputs and the inherited rustflags explicitly. Its compiler reuse is the
+    # restored `fuzz-property-smoke` target directory alone; a local sccache
+    # store measured 0 hits here because nothing persisted it (#7285).
     env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@0000000000000000000000000000000000000000
@@ -4027,15 +4030,6 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
         with:
           toolchain: nightly-2026-09-30
-
-      # The repository's own checksum-pinned sccache installer, and the only
-      # local action this contract admits. It never enables the
-      # credential-bearing sccache GHA backend, never persists
-      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
-      # those credentials are absent before any build runs, and fails closed to
-      # no wrapper at all. It must run BEFORE the cache restore below so the
-      # lazily started sccache server indexes the restored entries.
-      - uses: ./.github/actions/setup-sccache
 
       - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000
         with:
@@ -4067,21 +4061,10 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           cargo test --locked
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
-      - name: Report fuzz lane compiler-cache telemetry
+      - name: Report fuzz lane shape
         if: always()
         run: |
-          set -euo pipefail
-
           echo "Fuzz lane shape: deterministic property gate (sanitizer budget runs in fuzz-smoke-main.yml)"
-
-          sccache_bin="${RUSTC_WRAPPER:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            echo "Fuzz lane sccache statistics after this run:"
-            "$sccache_bin" --show-stats
-            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
-          else
-            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
-          fi
 """
 
 # Oldest first. The index of a revision's job text in this tuple is its
@@ -30176,12 +30159,9 @@ pre_build = []
                 "the parser-target smoke loop relaxes "
                 f"{shared_bound}, which the six-target loop still enforces"
             )
-    # The scheduled lane and the push-to-main sanitizer smoke install no
-    # compiler cache at all, so they clear every wrapper input the root Cargo
-    # config sets. This assertion used to cover the #2461 fuzz-smoke shape too,
-    # because it also disabled caching. That generation is gone: every
-    # fuzz-smoke generation since deliberately DOES use the checksum-pinned
-    # sccache installer, so asserting the opposite of it here would be false.
+    # No fuzz lane installs a compiler-cache wrapper (the property gate dropped
+    # its never-persisted sccache store after 0 measured hits, #7285), so each
+    # clears every wrapper input the root Cargo config or runner could set.
     cargo_override_block = (
         '    env:\n'
         '      RUSTC_WRAPPER: ""\n'
@@ -30191,35 +30171,16 @@ pre_build = []
     for admitted_label, admitted_text in (
         ("scheduled fuzz lane", FUZZ_WORKFLOW),
         ("push-to-main fuzz sanitizer smoke", FUZZ_SANITIZER_SMOKE_WORKFLOW),
+        ("adopted fuzz-smoke generation", CI_FUZZ_SMOKE_JOB),
     ):
         if cargo_override_block not in admitted_text:
             failures.append(
                 f"the {admitted_label} no longer disables repository sccache "
                 "wrapper inputs and inherited linker rustflags"
             )
-    # The adopted generation deliberately does the opposite for the wrapper: it
-    # leaves the name unset so the pinned installer's fail-closed GITHUB_ENV
-    # decision is the one cargo sees. Everything that makes that safe is
-    # asserted here rather than left to the prose of the contract.
-    if '    env:\n      RUSTFLAGS: ""\n' not in CI_FUZZ_SMOKE_JOB:
+    if "uses: ./.github/actions/" in CI_FUZZ_SMOKE_JOB:
         failures.append(
-            "the adopted fuzz-smoke generation no longer clears the inherited "
-            "linker rustflags of the root Cargo configuration"
-        )
-    if '      RUSTC_WRAPPER: ""\n' in CI_FUZZ_SMOKE_JOB:
-        failures.append(
-            "the adopted fuzz-smoke generation pins a job-level rustc wrapper, "
-            "which would override the pinned installer's fail-closed decision"
-        )
-    if CI_FUZZ_SMOKE_JOB.count("uses: ./.github/actions/") != 1:
-        failures.append(
-            "the adopted fuzz-smoke generation must reference exactly one local "
-            "action"
-        )
-    if "      - uses: ./.github/actions/setup-sccache\n" not in CI_FUZZ_SMOKE_JOB:
-        failures.append(
-            "the adopted fuzz-smoke generation no longer uses the repository's "
-            "checksum-pinned sccache installer"
+            "the adopted fuzz-smoke generation must reference no local action"
         )
     if (
         "id-token:" in CI_FUZZ_SMOKE_JOB
@@ -30485,13 +30446,18 @@ pre_build = []
             "github.ref == 'refs/heads/main' }}\n",
             "          save-if: true\n",
         ),
-        "unpinned third-party sccache installer": (
-            "      - uses: ./.github/actions/setup-sccache\n",
-            "      - uses: mozilla-actions/sccache-action@v0.0.9\n",
+        "third-party sccache installer": (
+            "      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000\n",
+            "      - uses: mozilla-actions/sccache-action@v0.0.9\n\n"
+            "      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000\n",
+        ),
+        "rustc wrapper input left to the runner": (
+            '      RUSTC_WRAPPER: ""\n',
+            "",
         ),
         "credential-bearing cache backend": (
-            '    env:\n      RUSTFLAGS: ""\n',
-            '    env:\n      RUSTFLAGS: ""\n      SCCACHE_GHA_ENABLED: "true"\n',
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n',
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n      SCCACHE_GHA_ENABLED: "true"\n',
         ),
         "cache directory escape": (
             "          cargo test --locked\n",

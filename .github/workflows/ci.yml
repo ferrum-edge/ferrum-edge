@@ -6892,13 +6892,15 @@ jobs:
     permissions:
       contents: read
     # The repository-root Cargo config also selects the mold linker through
-    # per-target rustflags, and this isolated lane installs no fast linker, so
-    # the inherited rustflags are cleared explicitly. The rustc wrapper is
-    # deliberately NOT pinned here: `setup-sccache` below publishes either the
-    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
-    # and a job-level `env` entry of the same name would override that
-    # fail-closed decision.
+    # per-target rustflags, and a runner- or user-level rustc-wrapper may
+    # select sccache, but this isolated lane installs neither: like the
+    # scheduled and push-to-main fuzz lanes, it clears both Cargo wrapper
+    # inputs and the inherited rustflags explicitly. Its compiler reuse is the
+    # restored `fuzz-property-smoke` target directory alone; a local sccache
+    # store measured 0 hits here because nothing persisted it (#7285).
     env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -6915,15 +6917,6 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
           toolchain: nightly-2026-09-30
-
-      # The repository's own checksum-pinned sccache installer, and the only
-      # local action this contract admits. It never enables the
-      # credential-bearing sccache GHA backend, never persists
-      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
-      # those credentials are absent before any build runs, and fails closed to
-      # no wrapper at all. It must run BEFORE the cache restore below so the
-      # lazily started sccache server indexes the restored entries.
-      - uses: ./.github/actions/setup-sccache
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -6955,21 +6948,10 @@ jobs:
           cargo test --locked
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
-      - name: Report fuzz lane compiler-cache telemetry
+      - name: Report fuzz lane shape
         if: always()
         run: |
-          set -euo pipefail
-
           echo "Fuzz lane shape: deterministic property gate (sanitizer budget runs in fuzz-smoke-main.yml)"
-
-          sccache_bin="${RUSTC_WRAPPER:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            echo "Fuzz lane sccache statistics after this run:"
-            "$sccache_bin" --show-stats
-            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
-          else
-            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
-          fi
 
   build-ebpf:
     name: Build eBPF Programs
@@ -7417,8 +7399,6 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: ./.github/actions/setup-sccache
-
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         # Required native deps only. mold + clang are an optional fast-linker
@@ -7527,20 +7507,6 @@ jobs:
         if: github.event_name != 'merge_group' || runner.os != 'macOS'
         run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
         shell: bash
-
-      - name: Report compiler cache statistics
-        if: always()
-        shell: bash
-        # Best-effort telemetry (#6282): setup-sccache may fail before it
-        # publishes a verified executable, leaving FERRUM_SCCACHE_BIN empty
-        # while Cargo builds uncached. That must not fail the job; real Cargo
-        # failures still fail their own steps above.
-        run: |
-          if [ -n "${FERRUM_SCCACHE_BIN:-}" ]; then
-            "${FERRUM_SCCACHE_BIN}" --show-stats || echo "::warning::sccache statistics were unavailable"
-          else
-            echo "::warning::sccache was unavailable; this build compiled without a compiler cache"
-          fi
 
   main-linux-image:
     name: Build Linux CI image

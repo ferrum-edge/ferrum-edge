@@ -109,9 +109,10 @@ the sanitizer target directory did not help: rust-cache drops the
 `ferrum-edge` path dependency and every vendored patch crate, so a restore
 (about three minutes for 7.2 GB) saved about three minutes of compile, and the
 entry evicted `ci-standalone-cargo` on alternate main runs. The property gate
-uses the repository's checksum-pinned `setup-sccache` action and
-`Swatinem/rust-cache`; it holds only `contents: read` and uses no remote
-compiler-cache backend. Both smoke caches (`fuzz-property-smoke` and
+reuses compiler output only through `Swatinem/rust-cache` and installs no
+compiler-cache wrapper (its never-persisted local sccache store measured 0 hits,
+#7285); it clears every rustc-wrapper input, holds only `contents: read` and
+uses no remote compiler-cache backend. Both smoke caches (`fuzz-property-smoke` and
 `fuzz-sanitizer-smoke`) save only under the strict `save-if`
 `${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`: pull
 requests (including same-repository PR refs and forks), `merge_group`, and
