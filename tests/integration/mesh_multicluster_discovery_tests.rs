@@ -449,7 +449,7 @@ mod audience_binding {
     use ferrum_edge::identity::spiffe::TrustDomain;
     use ferrum_edge::modes::mesh::multicluster::{
         NativeRemoteSource, RemoteClusterPollContext, RemoteDiscoveryConfig,
-        RemoteDiscoveryTlsConfig, RemoteServiceSource,
+        RemoteDiscoveryFailure, RemoteDiscoveryTlsConfig, RemoteServiceSource,
     };
     use ferrum_edge::modes::mesh::revision::{
         DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionGate,
@@ -635,9 +635,10 @@ mod audience_binding {
             .fetch()
             .await
             .expect_err("cluster C must refuse a token minted for cluster B");
-        assert!(
-            err.contains("MeshSubscribe failed"),
-            "the poll must fail at subscribe time, before any endpoint import: {err}"
+        assert_eq!(
+            err,
+            RemoteDiscoveryFailure::SubscribeFailed,
+            "the poll must fail at subscribe time, before any endpoint import"
         );
 
         // Control: C accepts a poll actually declared for C, proving the
