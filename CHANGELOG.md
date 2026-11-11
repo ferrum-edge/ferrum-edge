@@ -180,6 +180,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The never-read `UdpProxyMetrics` `datagrams_in` / `bytes_in` counters**
   (#7186). The remaining listener-local UDP counters are documented as
   internal, not exported.
+- The write-only per-session UDP request-size store and the
+  `bench-udp-profile` `request_size_stores` counter that only counted it
+  (#7173). The response amplification budget is unchanged.
 
 ### Changed
 - **ferrum-mesh chart: values now reach the workload they name, once**
