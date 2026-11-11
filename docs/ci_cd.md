@@ -1103,24 +1103,13 @@ no-symlink, mode, byte-content, no-extra-file, and ancestor-directory
 constraints entirely from that manifest, spawning no process of its own.
 Anything it cannot answer fails closed.
 
-The default comparison is byte-identical. Issue #3904 admits exactly one
-additional, controller-frozen generation transition for
-`.github/actions/setup-kubernetes-tools`, and only that path. The trusted-base
-tree whose sole governed file is non-executable `action.yml` at SHA-256
-`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08` may move to
-the PR #3910 tree whose `action.yml` is SHA-256
-`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9` with the same
-path set and executable bit. Both source and destination generations are bound
-inside the extracted checker (complete file set, modes, and content hashes).
-Another base generation, a one-byte or mode change, an extra or missing file,
-or any other local-action path is still rejected. The candidate cannot supply
-a digest, a mutable allowlist, or an unbound proposed manifest.
-
-The current `action.yml` on `main` is the destination generation, so an
-unchanged working tree passes by ordinary byte identity and any further
-unadmitted drift fails. The predecessor constants in
-`verify_trusted_local_action.py` are therefore inert and should be retired so
-the old tree cannot remain an admitted source.
+The comparison is byte-identical (apart from external action pins, which the
+trusted pin rotation check governs), and nothing else is admitted. Issue
+#3904's one-way move of `.github/actions/setup-kubernetes-tools` to the PR
+#3910 cached-installer tree is spent: that tree is the trusted base, and the
+predecessor and destination constants are gone from the checker. An installer
+edit therefore has to match the trusted tree, which makes it reviewed
+direct-to-`main` policy work.
 
 Keeping the proof in Python rather than inline shell also keeps `helm-chart`
 free of the opaque-inline-shell and Cross surfaces that `Trusted Cross Build

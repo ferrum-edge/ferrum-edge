@@ -13954,9 +13954,9 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
 # A future entry admits one exact, path-bound, one-way retired→adopted pair;
 # the candidate cannot supply a digest. RETIREMENT: once each destination is on
-# `main`, delete that tuple. The Helm Chart setup-kubernetes-tools generation
-# lives in `verify_trusted_local_action.py`, not here: that gate is
-# byte-identity of the extracted checker, not a Cross surface comparison.
+# `main`, delete that tuple. The Helm Chart setup-kubernetes-tools action is
+# held to byte identity by `verify_trusted_local_action.py`, not here: that
+# gate is not a Cross surface comparison.
 LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
     # Empty: no local-action generation transition is currently admitted.
     #

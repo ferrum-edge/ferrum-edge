@@ -82,8 +82,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   action refs, pipe-to-shell installers, and unverified tool downloads. The
   pull request's proposed policy is tested separately but never controls gates.
 - `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the
-  trusted revision before `uses:`; the admitted checker generation is bound
-  inside `verify_trusted_local_action.py`, never supplied by the candidate.
+  trusted revision before `uses:`; `verify_trusted_local_action.py` admits only
+  byte identity with the trusted tree, never a candidate-supplied generation.
 - A committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
 
