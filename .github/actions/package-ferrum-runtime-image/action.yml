@@ -90,8 +90,14 @@ runs:
         # newer glibc than the runtime base ships: compare the highest GLIBC_
         # symbol version each binary needs with the highest one the base's
         # libc.so.6 defines. A binary with no GLIBC_ requirement is not checked.
+        if ! command -v objdump >/dev/null 2>&1; then
+          echo "::error title=Runtime base glibc::objdump (binutils) is required for the glibc check"
+          exit 1
+        fi
         docker pull --quiet "$base_image" >/dev/null
-        base_container="$(docker create "$base_image")"
+        # The distroless base sets no ENTRYPOINT or CMD, so docker create needs
+        # an explicit command. The container is only exported, never started.
+        base_container="$(docker create "$base_image" /glibc-check-never-runs)"
         docker export "$base_container" \
           | tar -x -C "$base_rootfs" --wildcards --no-anchored 'libc.so.6' 2>/dev/null || true
         base_libc="$(find "$base_rootfs" -name libc.so.6 -type f -print -quit)"
