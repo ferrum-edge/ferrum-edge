@@ -2195,9 +2195,10 @@ async fn matchless_virtualservice_preserves_header_transforms() {
 /// A VirtualService `http[].mirror` translates to a proxy-scoped
 /// `request_mirror` plugin whose config drives an actual fire-and-forget
 /// mirror against the configured target. The mirror leaves the proxy in
-/// cleartext (not over mesh mTLS), so translation admits only a loopback IP
-/// literal destination (GHSA-gcwp-xp94-4pcv; the refusal for a Service host is
-/// pinned by `mesh_tier3_mirror_to_service_host_fails_closed`).
+/// cleartext (not over mesh mTLS), so translation emits it only for a loopback
+/// IP literal destination (GHSA-gcwp-xp94-4pcv; the omission for a Service
+/// host is pinned by
+/// `mesh_tier3_mirror_to_service_host_is_omitted_and_route_still_translates`).
 #[tokio::test]
 async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     use ferrum_edge::plugins::create_plugin;
@@ -2327,12 +2328,14 @@ async fn mesh_tier3_mirror_and_exact_rewrite_share_one_route_scope() {
     );
 }
 
-/// A mirror to a Service host would leave the proxy in cleartext, and an Istio
-/// VirtualService cannot express the explicit plaintext opt-in, so the
-/// translation fails closed rather than silently opting in.
+/// A mirror to a Service host would leave the proxy in cleartext (it does
+/// not ride mesh mTLS) and an Istio VirtualService cannot express the
+/// plaintext opt-in, so the mirror is omitted, never silently opted in, while
+/// the route itself still translates and serves (GHSA-gcwp-xp94-4pcv). The
+/// Istio status writer reports the omission in `deferred_fields`.
 #[test]
-fn mesh_tier3_mirror_to_service_host_fails_closed() {
-    let error = translate_k8s_objects(
+fn mesh_tier3_mirror_to_service_host_is_omitted_and_route_still_translates() {
+    let result = translate_k8s_objects(
         &[object(
             "VirtualService",
             serde_json::json!({
@@ -2347,11 +2350,28 @@ fn mesh_tier3_mirror_to_service_host_fails_closed() {
         )],
         options(),
     )
-    .expect_err("a cleartext mirror to a Service host must fail closed");
-    let rendered = error.to_string();
+    .expect("the VirtualService translates; only the mirror is omitted");
     assert!(
-        rendered.contains("http[].mirror") && rendered.contains("mesh mTLS"),
-        "unexpected mirror refusal: {rendered}"
+        !result
+            .config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.plugin_name == "request_mirror"),
+        "no cleartext mirror may be emitted for a Service-host mirror"
+    );
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.listen_path.as_deref() == Some("/v1")),
+        "the primary route must still be translated: {:?}",
+        result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.listen_path.as_deref())
+            .collect::<Vec<_>>()
     );
 }
 

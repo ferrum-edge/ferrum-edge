@@ -40,6 +40,11 @@ pub(crate) use istio::cors_policy_translatable;
 // the translator accepts without enforcing, and Telemetry entries past the
 // first translated one, are reported by the same predicates that decide them.
 pub(crate) use istio::{telemetry_deferred_fields, virtual_service_retry_deferred_fields};
+// Same for `http[].mirror` / `http[].mirrors` that are valid Istio but not
+// projected (GHSA-gcwp-xp94-4pcv).
+pub(crate) use istio::{
+    virtual_service_route_mirror_is_deferred, virtual_service_route_mirrors_are_deferred,
+};
 // Shared with the Istio status writer the same way: Sidecar `ingress[]`
 // classification used by resolution and deferred-field reporting is one
 // predicate, so modeled HTTP and stream listeners cannot be reported deferred.

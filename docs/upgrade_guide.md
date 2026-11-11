@@ -49,11 +49,13 @@ protected, set `allow_plaintext: true` instead.
 Istio `VirtualService.http[].mirror` translation changes with it. Ferrum's
 mirror dials the destination directly from the proxy process, not over mesh
 mTLS, and a VirtualService cannot express the opt-in, so a non-zero mirror to
-any host other than a loopback IP literal now reports `FerrumAccepted=False` /
-`Invalid` and the VirtualService is not applied. **Operator action:** remove
-`mirror` / `mirrorPercentage` from such VirtualServices (or set the percentage
-to `0`), and configure mirroring with a native `request_mirror` plugin using
-`mirror_protocol: https`.
+any host other than a loopback IP literal is now **omitted**: the
+VirtualService and its routes keep translating (`FerrumAccepted=True`), no
+mirror traffic is sent, and `status.ferrum.translation.deferred_fields` names
+the omitted `http[].mirror` with the reason. **Operator action:** if you rely
+on that mirroring, configure it with a native `request_mirror` plugin using
+`mirror_protocol: https`; otherwise remove the `mirror` block to clear the
+deferred field.
 
 ### CNI ADD fails closed until an opted-in pod is enrolled (GHSA-7x6j-vmqm-xx2v)
 

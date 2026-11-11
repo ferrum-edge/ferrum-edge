@@ -6256,14 +6256,27 @@ fn route_redirect_value(
 /// `mirrorPercent`). Returns `None` when no `mirror` destination is present.
 /// Returns `Err` when the mirror destination is malformed (missing host, or a
 /// `port.name` that does not resolve) so the bug is surfaced rather than the
-/// mirror silently dropped, and when a non-zero mirror targets anything but a
-/// loopback IP literal: the mirror would leave the proxy in cleartext.
+/// mirror silently dropped. A well-formed non-zero mirror to anything but a
+/// loopback IP literal returns `None` and is reported in `deferred_fields`
+/// ([`virtual_service_route_mirror_is_deferred`]).
 fn route_mirror_plugin(
     object: &K8sObject,
     http: &Value,
     acc: &K8sAccumulator,
     proxy_id: &str,
 ) -> Result<Option<PluginConfig>, K8sTranslateError> {
+    if virtual_service_route_mirrors_are_deferred(http) {
+        // `http[].mirrors` is never projected; the status writer reports it in
+        // `deferred_fields` (`virtual_service_route_mirrors_are_deferred`).
+        crate::warn_sampled!(
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            name = %sanitize_startup_cause(format!("{:?}", object.metadata.name.to_string()), &[]),
+            "VirtualService http[].mirrors is not translated; no mirror traffic is sent for it"
+        );
+    }
     let Some(mirror) = http.get("mirror") else {
         return Ok(None);
     };
@@ -6275,19 +6288,7 @@ fn route_mirror_plugin(
     };
     let port = resolve_destination_port(object, mirror, host, acc)?.unwrap_or(80);
 
-    // `mirrorPercentage.value` is a float 0-100; the legacy `mirrorPercent` is
-    // an integer. Default (neither present) is 100% per Istio.
-    let percentage = if let Some(value) = http
-        .get("mirrorPercentage")
-        .and_then(|m| m.get("value"))
-        .and_then(Value::as_f64)
-    {
-        value.clamp(0.0, 100.0)
-    } else if let Some(percent) = http.get("mirrorPercent").and_then(Value::as_u64) {
-        percent.min(100) as f64
-    } else {
-        100.0
-    };
+    let percentage = route_mirror_percentage(http);
 
     // A 0% mirror is a no-op; skip emitting the plugin entirely so the proxy
     // does not carry an inert instance (and the route can still collapse).
@@ -6295,23 +6296,23 @@ fn route_mirror_plugin(
         return Ok(None);
     }
 
-    // Istio carries a mirror over the sidecar's mesh mTLS. Ferrum's
-    // `request_mirror` dials the destination directly from the proxy process
-    // with the plugin HTTP client (the proxy UID is excluded from capture), so
-    // the shadow request — which replays the request body — would travel in
-    // cleartext. Cleartext is admitted without an explicit opt-in only to a
-    // loopback IP literal (GHSA-gcwp-xp94-4pcv), and nothing in an Istio
-    // VirtualService expresses that opt-in, so any other destination fails
-    // closed here instead of being silently opted in.
-    if !crate::plugins::utils::socket_host::is_loopback_ip_literal_host(host.trim()) {
-        return Err(invalid_resource(
-            object,
-            "VirtualService http[].mirror is not supported for this destination: Ferrum \
-             sends the mirror request directly over cleartext HTTP, not over mesh mTLS, and \
-             cleartext mirroring is admitted only to a loopback IP literal; remove the \
-             mirror or attach a `request_mirror` plugin with `mirror_protocol: https` (or an \
-             explicit `allow_plaintext: true`) through native Ferrum configuration",
-        ));
+    // GHSA-gcwp-xp94-4pcv: never opt in to cleartext silently. The mirror is
+    // a best-effort side effect, so it is omitted (and reported in
+    // `deferred_fields`) while the rest of the VirtualService translates.
+    if virtual_service_route_mirror_is_deferred(http) {
+        crate::warn_sampled!(
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", object.metadata.namespace.to_string()),
+                &[]
+            ),
+            name = %sanitize_startup_cause(format!("{:?}", object.metadata.name.to_string()), &[]),
+            "VirtualService http[].mirror is not translated for a destination other than a \
+             loopback IP literal: Ferrum would send the mirror request directly over cleartext \
+             HTTP, outside the mesh's mTLS, and a VirtualService cannot express the \
+             request_mirror allow_plaintext opt-in; the route is translated without the mirror. \
+             Configure a request_mirror plugin with mirror_protocol https instead."
+        );
+        return Ok(None);
     }
 
     let now = chrono::Utc::now();
@@ -6334,6 +6335,52 @@ fn route_mirror_plugin(
         created_at: now,
         updated_at: now,
     }))
+}
+
+/// `mirrorPercentage.value` is a float 0-100; the legacy `mirrorPercent` is an
+/// integer. Default (neither present) is 100% per Istio.
+fn route_mirror_percentage(http: &Value) -> f64 {
+    if let Some(value) = http
+        .get("mirrorPercentage")
+        .and_then(|m| m.get("value"))
+        .and_then(Value::as_f64)
+    {
+        value.clamp(0.0, 100.0)
+    } else if let Some(percent) = http.get("mirrorPercent").and_then(Value::as_u64) {
+        percent.min(100) as f64
+    } else {
+        100.0
+    }
+}
+
+/// Whether an `http[]` route's `mirror` is valid Istio that Ferrum does not
+/// project (GHSA-gcwp-xp94-4pcv). Istio carries a mirror over the sidecar's
+/// mesh mTLS; Ferrum's `request_mirror` dials the destination directly from
+/// the proxy process with the plugin HTTP client (the proxy UID is excluded
+/// from capture), so the shadow request, which replays the request body,
+/// would travel in cleartext. Cleartext is admitted without an explicit
+/// `allow_plaintext` opt-in only to a loopback IP literal, and a
+/// VirtualService cannot express that opt-in, so a non-zero mirror to any
+/// other destination is omitted rather than silently opted in. Shared by the
+/// translator and the status writer's `deferred_fields` so the two never
+/// disagree. A mirror without a host is malformed, not deferred.
+pub(crate) fn virtual_service_route_mirror_is_deferred(http: &Value) -> bool {
+    let Some(host) = http
+        .get("mirror")
+        .and_then(|mirror| string_field(mirror, "host"))
+    else {
+        return false;
+    };
+    route_mirror_percentage(http) != 0.0
+        && !crate::plugins::utils::socket_host::is_loopback_ip_literal_host(host.trim())
+}
+
+/// Whether an `http[]` route carries Istio's `mirrors[]` list, which Ferrum
+/// never projects (only the single `mirror` is translated).
+pub(crate) fn virtual_service_route_mirrors_are_deferred(http: &Value) -> bool {
+    http.get("mirrors")
+        .and_then(Value::as_array)
+        .is_some_and(|mirrors| !mirrors.is_empty())
 }
 
 fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
@@ -13588,43 +13635,55 @@ extensionProviders:
         );
     }
 
-    /// GHSA-gcwp-xp94-4pcv: the mirror request leaves the proxy process
-    /// directly over cleartext HTTP (it does not ride mesh mTLS), so a mirror
-    /// to a Service host fails translation closed instead of being silently
-    /// opted in to plaintext.
+    /// GHSA-gcwp-xp94-4pcv: the mirror request would leave the proxy process
+    /// over cleartext HTTP (it does not ride mesh mTLS) and a VirtualService
+    /// cannot express the plaintext opt-in, so a mirror to a Service host is
+    /// omitted. The rest of the VirtualService still translates.
     #[test]
-    fn virtual_service_mirror_to_service_host_fails_closed() {
+    fn virtual_service_mirror_to_service_host_is_omitted_not_refused() {
         for host in [
             "shadow.default.svc.cluster.local",
             "shadow",
             "10.0.0.7",
             "localhost",
         ] {
-            let err = translate_k8s_objects(
+            let route = serde_json::json!({
+                "match": [{"uri": {"prefix": "/v1"}}],
+                "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                "mirror": {"host": host, "port": {"number": 9090}}
+            });
+            assert!(virtual_service_route_mirror_is_deferred(&route), "{host}");
+            let result = translate_k8s_objects(
                 &[object(
                     "VirtualService",
                     serde_json::json!({
                         "hosts": ["api.example.com"],
-                        "http": [{
-                            "match": [{"uri": {"prefix": "/v1"}}],
-                            "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
-                            "mirror": {"host": host, "port": {"number": 9090}}
-                        }]
+                        "http": [route]
                     }),
                 )],
                 options(),
             )
-            .expect_err("a cleartext mirror to a non-loopback host must fail closed");
-            let rendered = format!("{err}");
+            .unwrap_or_else(|error| panic!("{host}: the VirtualService must translate: {error}"));
             assert!(
-                rendered.contains("http[].mirror") && rendered.contains("mesh mTLS"),
-                "got: {rendered}"
+                !result
+                    .config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.plugin_name == "request_mirror"),
+                "{host}: no cleartext mirror may be emitted"
             );
             assert!(
-                !rendered.contains(host),
-                "must not echo the host: {rendered}"
+                !result.config.proxies.is_empty(),
+                "{host}: the primary route must still be translated"
             );
         }
+        let loopback = serde_json::json!({"mirror": {"host": "127.0.0.1"}});
+        assert!(!virtual_service_route_mirror_is_deferred(&loopback));
+        let zero = serde_json::json!({
+            "mirror": {"host": "shadow"},
+            "mirrorPercentage": {"value": 0.0}
+        });
+        assert!(!virtual_service_route_mirror_is_deferred(&zero));
     }
 
     #[test]
