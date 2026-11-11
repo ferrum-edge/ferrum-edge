@@ -4534,6 +4534,38 @@ mod tests {
     }
 
     #[test]
+    fn redis_one_second_prior_bucket_decays_instead_of_full_suppression() {
+        use crate::_test_support::redis_window_progress_at;
+
+        // TOKEN-ACCOUNTING path only (`ai_rate_limiter` budgets, `ws_rate_limiting`
+        // frames): prev bucket full (10), current has the candidate request (1). At
+        // fraction 0.0 the old code always denied; with subsecond decay the
+        // mid-window candidate is admitted. Request quotas moved off this estimate
+        // onto the sub-bucket ladder covered below.
+        let window = FixedWindow::new(10, 1);
+        let start = redis_window_progress_at(Duration::from_secs(50), 1);
+        let mid = redis_window_progress_at(Duration::from_millis(50_500), 1);
+        let near_end = redis_window_progress_at(Duration::from_nanos(50_900_000_000), 1);
+
+        assert!(
+            !window.outcome(10, 1, start.elapsed_fraction).allowed,
+            "at window start a full prior bucket still suppresses (weighted=11)"
+        );
+        assert!(
+            window.outcome(10, 1, mid.elapsed_fraction).allowed,
+            "mid one-second window must decay prior bucket (weighted=6)"
+        );
+        assert!(
+            window.outcome(10, 1, near_end.elapsed_fraction).allowed,
+            "near end of one-second window prior bucket is nearly gone"
+        );
+        assert!(
+            (window.weighted_count(10, 0, mid.elapsed_fraction) - 5.0).abs() < 1e-12,
+            "half-elapsed prior bucket of 10 contributes exactly 5"
+        );
+    }
+
+    #[test]
     fn local_window_algorithm_threshold_matches_http_construction() {
         assert_eq!(
             local_window_algorithm(Duration::from_secs(5)),
