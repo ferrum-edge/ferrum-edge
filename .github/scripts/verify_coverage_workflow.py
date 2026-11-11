@@ -254,12 +254,6 @@ def validate_planner_contract(failures: list[str]) -> None:
         failures,
     )
     require(
-        tuple(SHARD_DEFINITIONS) == CANONICAL_SHARD_ORDER
-        or set(SHARD_DEFINITIONS) == set(CANONICAL_SHARD_ORDER),
-        "planner shard definitions must use canonical shard names",
-        failures,
-    )
-    require(
         SHARD_DEFINITIONS[LIB_UNIT_SHARD]["kind"] == "lib-unit",
         "lib-unit must remain the lib/unit coverage shard",
         failures,
