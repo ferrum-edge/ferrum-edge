@@ -6208,7 +6208,7 @@ mod tests {
                     "backendRefs": [{
                         "name": "api",
                         "port": 8080,
-                        "weight": 65536
+                        "weight": 1_000_001
                     }]
                 }]
             }),
@@ -6582,7 +6582,7 @@ mod tests {
                 "parentRefs": [{"name": "edge"}],
                 "rules": [{
                     "matches": [{"path": {"type": "PathPrefix", "value": "/api"}}],
-                    "backendRefs": [{"name": "api", "port": 8080, "weight": 65536}]
+                    "backendRefs": [{"name": "api", "port": 8080, "weight": 1_000_001}]
                 }]
             }),
         );
