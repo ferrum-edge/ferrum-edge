@@ -151,10 +151,6 @@ fn admit_udp_response(
 }
 
 fn publish_session_request_budget(session: &UdpSession, request_size: u64) {
-    udp_count!(RequestSizeStores, 1);
-    session
-        .last_request_size
-        .store(request_size, Ordering::Release);
     if let Some(factor) = session.amplification_factor {
         udp_count!(RequestBudgetCalls, 1);
         crate::udp_amplification::publish_request_budget(
@@ -286,11 +282,6 @@ struct UdpSession {
     expired: std::sync::atomic::AtomicBool,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
-    /// Size of the latest accepted client→backend datagram for amplification
-    /// factor checking. Published before the backend send so a loopback reply
-    /// cannot race ahead of the response budget.
-    /// Updated on each policy-accepted request; read on each backend→client response.
-    last_request_size: AtomicU64,
     /// Remaining backend→client payload-byte budget. Each policy-admitted
     /// client datagram **accrues** its per-request budget onto this slot
     /// (saturating, capped at a fixed multiple of one request's budget) and
@@ -6677,7 +6668,6 @@ async fn handle_dtls_client(
     };
     let bytes_sent = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
-    let last_request_size = Arc::new(AtomicU64::new(0));
     let response_budget_remaining = Arc::new(AtomicU64::new(0));
     // Shared sink for per-datagram WAF metadata recorded by the forwarding tasks
     // inside `handle_dtls_client_inner`; drained into the disconnect summary
@@ -6698,7 +6688,6 @@ async fn handle_dtls_client(
         &mut backend_info,
         Arc::clone(&bytes_sent),
         Arc::clone(&bytes_received),
-        Arc::clone(&last_request_size),
         Arc::clone(&response_budget_remaining),
         Arc::clone(&datagram_metadata),
         datagram_plugins,
@@ -7909,7 +7898,6 @@ async fn handle_dtls_client_inner(
     backend_info: &mut DtlsBackendInfo,
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
-    last_request_size: Arc<AtomicU64>,
     response_budget_remaining: Arc<AtomicU64>,
     datagram_metadata: Arc<std::sync::Mutex<crate::plugins::MetadataMap>>,
     datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
@@ -8250,7 +8238,6 @@ async fn handle_dtls_client_inner(
     let metrics_fwd = metrics.clone();
     let proxy_id_fwd = proxy_id.to_string();
     let bytes_sent_fwd = Arc::clone(&bytes_sent);
-    let last_request_size_fwd = Arc::clone(&last_request_size);
     let remaining_fwd = Arc::clone(&response_budget_remaining);
     let amplification_factor_fwd = proxy.udp_max_response_amplification_factor;
     // Pre-compute datagram plugin list once, share between both direction tasks.
@@ -8414,7 +8401,6 @@ async fn handle_dtls_client_inner(
 
             // Publish before sending so a fast backend reply cannot observe a
             // zero or stale amplification budget.
-            last_request_size_fwd.store(len as u64, Ordering::Release);
             if let Some(factor) = amplification_factor_fwd {
                 crate::udp_amplification::publish_request_budget(
                     remaining_fwd.as_ref(),
@@ -9276,7 +9262,6 @@ async fn create_session(
         // Start without credit: the first datagram, like every follow-up, earns
         // its budget in forward_client_datagram_commit before the backend send.
         // Seeding it here as well would grant the first request twice.
-        last_request_size: AtomicU64::new(initial_data.len() as u64),
         response_budget_remaining: AtomicU64::new(0),
         amplification_factor: proxy.udp_max_response_amplification_factor,
         backend_target: format!("{}:{}", backend_host, backend_port),
@@ -10634,7 +10619,6 @@ impl UdpAuthorizationSessionProbe {
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
-            last_request_size: AtomicU64::new(0),
             response_budget_remaining: AtomicU64::new(0),
             amplification_factor: None,
             backend_target: backend_addr.to_string(),
@@ -11036,7 +11020,6 @@ impl UdpEgressWriterProbe {
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
-            last_request_size: AtomicU64::new(0),
             response_budget_remaining: AtomicU64::new(0),
             amplification_factor: factor,
             backend_target: backend_addr.to_string(),
@@ -11306,7 +11289,6 @@ mod tests {
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(128),
             bytes_received: AtomicU64::new(256),
-            last_request_size: AtomicU64::new(64),
             response_budget_remaining: AtomicU64::new(0),
             amplification_factor: None,
             backend_target: "10.0.0.50:5353".to_string(),
@@ -11364,8 +11346,8 @@ mod tests {
         let mut raw_session = make_udp_session();
         raw_session.backend_socket = Some(socket);
         // A guarded session is what makes the "publish before send" invariant
-        // observable: the remaining budget, not `last_request_size`, is what
-        // the backend→client path now charges.
+        // observable: the remaining budget is what the backend→client path
+        // charges.
         raw_session.amplification_factor = Some(2.0);
         raw_session
             .last_activity
@@ -11390,11 +11372,6 @@ mod tests {
             session.bytes_sent.load(Ordering::Relaxed),
             128,
             "failed sends must not increment bytes_sent"
-        );
-        assert_eq!(
-            session.last_request_size.load(Ordering::Relaxed),
-            b"payload".len() as u64,
-            "accepted client datagrams must record their request size before send"
         );
         assert_eq!(
             session.response_budget_remaining.load(Ordering::Acquire),
@@ -12788,7 +12765,6 @@ backend_tls_verify_server_cert: false
             expired: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
-            last_request_size: AtomicU64::new(0),
             response_budget_remaining: AtomicU64::new(0),
             amplification_factor: None,
             backend_target: "10.0.0.50:5353".to_string(),
