@@ -5334,20 +5334,19 @@ fn committed_borrowed_h3_streaming_responses_reset_unless_a_finish_landed() {
     // The guard has to be armed BEFORE the HEADERS commit, not after it: the
     // commit's own `ClientWriteFailed` / expiry arms are inside the region a
     // partially written HEADERS frame can already have committed.
-    for relay_fn in ["async fn stream_h3_open_response_to_client("] {
-        let body = server
-            .split(relay_fn)
-            .nth(1)
-            .expect("the borrowing H3 streaming relay must still exist");
-        let pre_commit = body
-            .split("commit_authorized_streaming_response_headers(")
-            .next()
-            .expect("each relay must still commit its streaming response headers");
-        assert!(
-            pre_commit.contains("BorrowedCommittedH3ResponseStream::new(h3_stream)"),
-            "{relay_fn} must arm the fail-closed terminal before it commits response headers"
-        );
-    }
+    let relay_fn = "async fn stream_h3_open_response_to_client(";
+    let body = server
+        .split(relay_fn)
+        .nth(1)
+        .expect("the borrowing H3 streaming relay must still exist");
+    let pre_commit = body
+        .split("commit_authorized_streaming_response_headers(")
+        .next()
+        .expect("the relay must still commit its streaming response headers");
+    assert!(
+        pre_commit.contains("BorrowedCommittedH3ResponseStream::new(h3_stream)"),
+        "{relay_fn} must arm the fail-closed terminal before it commits response headers"
+    );
 
     let guarded_relays: Vec<&str> = server
         .split("BorrowedCommittedH3ResponseStream::new(h3_stream)")

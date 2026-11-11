@@ -93,7 +93,7 @@ fn multi_cp_failure_backoff_reaches_max_without_resetting_on_switch() {
     let sleeps = failure_backoff_sequence(2, 12);
     assert_eq!(sleeps.first().copied(), Some(BACKOFF_INITIAL_SECS));
     assert!(
-        sleeps.iter().any(|s| *s == BACKOFF_MAX_SECS),
+        sleeps.contains(&BACKOFF_MAX_SECS),
         "expected multi-CP failure sequence to reach {backoff}, got {sleeps:?}",
         backoff = BACKOFF_MAX_SECS
     );
