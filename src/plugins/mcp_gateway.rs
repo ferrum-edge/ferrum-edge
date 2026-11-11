@@ -5152,7 +5152,7 @@ impl McpGateway {
         // `allowed_methods` refuses can never be called, so it is not listed
         // either.
         let route_ctx: &RequestContext = ctx;
-        let tools: Vec<Value> = catalog
+        let tools: Vec<PublicToolItem<'_>> = catalog
             .tools
             .values()
             .filter(|entry| {
