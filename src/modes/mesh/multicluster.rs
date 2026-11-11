@@ -3778,10 +3778,8 @@ mod tests {
             namespace: "default".to_string(),
             tls_config: RemoteDiscoveryTlsConfig::default(),
         };
-        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
-            Arc::new(MissingSecretSource {
-                cluster_name: ctx.cluster_name.clone(),
-            })
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |_| {
+            Arc::new(MissingSecretSource)
         })
         .with_credentials(test_discovery_credentials());
         let mc = MultiClusterConfig {
@@ -3965,10 +3963,8 @@ mod tests {
             "credB".to_string(),
             GrpcJwtSecret::new("per-remote-secret-padding-32-chars".to_string()),
         );
-        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
-            Arc::new(MissingSecretSource {
-                cluster_name: ctx.cluster_name.clone(),
-            })
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |_| {
+            Arc::new(MissingSecretSource)
         })
         .with_credentials(std::sync::Arc::new(credentials));
 
@@ -4012,10 +4008,8 @@ mod tests {
             tls_config: RemoteDiscoveryTlsConfig::default(),
         };
         // Empty credential map: the referenced "missing" ref cannot resolve.
-        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
-            Arc::new(MissingSecretSource {
-                cluster_name: ctx.cluster_name.clone(),
-            })
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |_| {
+            Arc::new(MissingSecretSource)
         })
         .with_credentials(std::sync::Arc::new(std::collections::HashMap::new()));
 
@@ -4061,10 +4055,8 @@ mod tests {
             namespace: "default".to_string(),
             tls_config: RemoteDiscoveryTlsConfig::default(),
         };
-        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
-            Arc::new(MissingSecretSource {
-                cluster_name: ctx.cluster_name.clone(),
-            })
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |_| {
+            Arc::new(MissingSecretSource)
         })
         .with_credentials(test_discovery_credentials());
 
@@ -4115,10 +4107,8 @@ mod tests {
             namespace: "default".to_string(),
             tls_config: RemoteDiscoveryTlsConfig::default(),
         };
-        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
-            Arc::new(MissingSecretSource {
-                cluster_name: ctx.cluster_name.clone(),
-            })
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |_| {
+            Arc::new(MissingSecretSource)
         })
         .with_credentials(test_discovery_credentials());
         let mc = MultiClusterConfig {
@@ -4190,10 +4180,8 @@ mod tests {
             namespace: "default".to_string(),
             tls_config: RemoteDiscoveryTlsConfig::default(),
         };
-        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
-            Arc::new(MissingSecretSource {
-                cluster_name: ctx.cluster_name.clone(),
-            })
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |_| {
+            Arc::new(MissingSecretSource)
         })
         .with_credentials(test_discovery_credentials());
 
