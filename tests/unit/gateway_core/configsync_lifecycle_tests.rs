@@ -991,9 +991,12 @@ fn dp_client_acts_on_the_stream_disposition_decisions() {
         "DeltaRejectionKind::InvalidTrustSideChannel",
         "DeltaRejectionKind::NonEmptyApplyRejected",
     ] {
+        // rustfmt wraps a long call with a trailing comma, which survives
+        // whitespace compaction.
         let site = format!("react_to_rejected_delta({kind})");
+        let wrapped_site = format!("react_to_rejected_delta({kind},)");
         assert!(
-            compact.contains(&site),
+            compact.contains(&site) || compact.contains(&wrapped_site),
             "every delta rejection kind must end the stream through its disposition: {site}"
         );
     }
