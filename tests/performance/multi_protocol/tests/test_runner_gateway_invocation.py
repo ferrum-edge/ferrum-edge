@@ -13,7 +13,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 RUNNERS = [
-    "tests/performance/run_perf_test.sh",
     "tests/performance/payload_size/run_payload_test.sh",
     "tests/performance/multi_protocol/run_protocol_test.sh",
 ]

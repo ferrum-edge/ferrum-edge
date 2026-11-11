@@ -637,8 +637,8 @@ LIVE_SUITE_SHARED_PATTERNS = (
 # package-ferrum-runtime-image are already justified by the shared-pattern
 # comment above (the ci.yml jobs cargo-test locally and build no runtime image).
 #
-# `tests/k8s/lib/` (kind.sh, spire.sh, live_assertions.sh,
-# native_probe_classify.py, spire_ambient_metrics.py) is the shared Kind/SPIRE
+# `tests/k8s/lib/` (spire.sh, live_assertions.sh, native_probe_classify.py,
+# spire_ambient_metrics.py) is the shared Kind/SPIRE
 # live harness. No ci.yml live job consumes it, so none of the three gates list
 # it. On a pull request it is deliberately non-sensitive for
 # `node-waypoint-ebpf-live` (that workflow has no `paths:` filter, and

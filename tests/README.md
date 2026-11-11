@@ -150,13 +150,10 @@ cargo test --test service_integration db_tls
 ```
 
 ### Performance Tests
-```bash
-cd tests/performance
-./run_perf_test.sh          # Local HTTP/1.1 wrk smoke test
-```
 
-See [`performance/README.md`](performance/README.md) for the full suite index
-(multi-protocol, payload-size, mesh Criterion, mesh DNS/HBONE E2E).
+See [`performance/README.md`](performance/README.md) for the suite index
+(CI overhead gate, multi-protocol, payload-size, mesh Criterion, mesh DNS/HBONE
+E2E, mesh runtime).
 
 ## Test Categories Explained
 

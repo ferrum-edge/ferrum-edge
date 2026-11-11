@@ -27777,8 +27777,14 @@ pre_build = []
     for benign_program, expected_reference in (
         ("bash scripts/coverage.sh", "scripts/coverage.sh"),
         ("cd scripts\ncd ..\nbash scripts/coverage.sh", "scripts/coverage.sh"),
-        ("cd tests\ncd performance\nbash run_perf_test.sh", "tests/performance/run_perf_test.sh"),
-        ("cd tests/performance\nbash ./run_perf_test.sh", "tests/performance/run_perf_test.sh"),
+        (
+            "cd tests\ncd performance\nbash payload_size/run_payload_test.sh",
+            "tests/performance/payload_size/run_payload_test.sh",
+        ),
+        (
+            "cd tests/performance\nbash ./payload_size/run_payload_test.sh",
+            "tests/performance/payload_size/run_payload_test.sh",
+        ),
     ):
         benign_references, _, benign_errors = command_reference_result(benign_program)
         if benign_errors:
