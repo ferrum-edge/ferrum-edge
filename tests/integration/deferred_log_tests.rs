@@ -309,8 +309,9 @@ async fn direct_terminal_dispatch_reaches_log_sinks() {
     assert_eq!(delivered[0].response_status_code, 200);
 }
 
-/// Records the mesh key terminal delivery precomputes. Named like the built-in
-/// so `log_with_mirror` computes the key for it.
+/// Records the mesh key terminal delivery precomputes. It declares
+/// `uses_mesh_request_key` like the built-in consumers, so `log_with_mirror`
+/// computes the key for it.
 struct MeshKeyCapture {
     keys: Arc<Mutex<Vec<Option<MeshRequestKey>>>>,
 }
@@ -319,6 +320,10 @@ struct MeshKeyCapture {
 impl Plugin for MeshKeyCapture {
     fn name(&self) -> &str {
         "workload_metrics"
+    }
+
+    fn uses_mesh_request_key(&self) -> bool {
+        true
     }
 
     async fn log_with_mesh_key(
