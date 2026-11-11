@@ -10,8 +10,8 @@
 # Token placement differs between the two lists because cargo-deny's schemas do:
 #   * [advisories.ignore] entries accept a free-text `reason = "..."` field, so
 #     the token MUST live inside that string.
-#   * [licenses.exceptions] entries do NOT. cargo-deny (0.19.9 and 0.20.2
-#     alike) rejects any key other than the crate spec plus `allow`
+#   * [licenses.exceptions] entries do NOT. cargo-deny (0.20.2, the pinned
+#     gate, and 0.19.9 alike) rejects any key other than the crate spec plus `allow`
 #     ("error[unexpected-keys]: found 1 unexpected keys, expected: [\"allow\"]"),
 #     so there is nowhere in the value to put a rationale. The repo convention is
 #     therefore a `#` comment carrying owner, rationale and token, either on the
@@ -195,7 +195,7 @@ done < <(grep -E 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$DENY_TOML" | grep -vE '^[[:space:
 # ---------------------------------------------------------------------------
 # [licenses.exceptions]
 #
-# cargo-deny (0.19.9 and 0.20.2) accepts no free-text field inside an exceptions entry, so the
+# cargo-deny (0.20.2, the pinned gate, and 0.19.9) accepts no free-text field inside an exceptions entry, so the
 # [expires:] token lives in a `#` comment on the line immediately preceding the
 # entry (or trailing it). Emit one "<crate>\t<date-or-empty>" record per entry
 # with awk, walking the `exceptions = [ ... ]` array inside [licenses] with

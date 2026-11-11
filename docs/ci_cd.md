@@ -3894,9 +3894,9 @@ Modify build commands in workflows:
 **Check**:
 - Tag format: a stable `vMAJOR.MINOR.PATCH` that matches `[package].version`
   in `Cargo.toml` (e.g., `v0.2.0`). `release-dispatch.yml` creates only that
-  shape. Do not push a prerelease-suffixed tag such as `v0.2.0-rc1` by hand:
-  `release.yml` still accepts one, publishes it as a normal release, and moves
-  the stable `0.2` image aliases to it.
+  shape. A prerelease-suffixed tag such as `v0.2.0-rc1` pushed by hand is
+  rejected: every `release.yml` tag check fails it with "Invalid release tag
+  format" before anything is built or published.
 - Tag exists: `git tag` lists tags
 - Push origin: `git push origin v0.2.0`
 
