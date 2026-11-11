@@ -5758,7 +5758,10 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             tags: vec![],
             server_urls: vec![],
             operation_count: 0,
-            resource_hash: String::new(),
+            resource_hash: ferrum_edge::config::store_policy::store_canonical_resource_hash(
+                &bundle,
+            )
+            .expect("bundle resource hash"),
             external_ref_snapshot: None,
             external_ref_digest: None,
             created_at: chrono::Utc::now(),
@@ -5805,7 +5808,10 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             tags: vec![],
             server_urls: vec![],
             operation_count: 0,
-            resource_hash: String::new(),
+            resource_hash: ferrum_edge::config::store_policy::store_canonical_resource_hash(
+                &bundle,
+            )
+            .expect("bundle resource hash"),
             external_ref_snapshot: None,
             external_ref_digest: None,
             created_at: chrono::Utc::now(),
