@@ -633,20 +633,21 @@ def validate_performance_lane_contract(text: str, failures: list[str]) -> None:
         "performance-regression.yml must syntax-check the protocol regression scenario harness",
         failures,
     )
-    # Ensure the static gate is not buried behind optional benchmark path filters.
+    # The static gate runs before any benchmark toolchain or build.
     checkout_idx = text.find("performance-regression:")
     static_idx = text.find("Verify protocol-perf contracts (static)")
-    detect_idx = text.find("Detect performance-sensitive changes")
+    benchmark_setup_idx = text.find("uses: ./.github/actions/setup-rust-ci")
     require(
-        checkout_idx != -1 and static_idx != -1 and detect_idx != -1,
-        "performance-regression.yml must contain performance-regression, static protocol-perf, and path detect steps",
+        checkout_idx != -1 and static_idx != -1 and benchmark_setup_idx != -1,
+        "performance-regression.yml must contain performance-regression, static protocol-perf, and "
+        "benchmark toolchain setup steps",
         failures,
     )
-    if checkout_idx != -1 and static_idx != -1 and detect_idx != -1:
+    if checkout_idx != -1 and static_idx != -1 and benchmark_setup_idx != -1:
         require(
-            checkout_idx < static_idx < detect_idx,
+            checkout_idx < static_idx < benchmark_setup_idx,
             "performance-regression.yml must run protocol-perf static contracts after checkout and before "
-            "optional benchmark path gating",
+            "the benchmark toolchain setup",
             failures,
         )
 
@@ -802,8 +803,8 @@ def validate_repository_contract(failures: list[str]) -> None:
             failures,
         )
         require(
-            "ci.yml" in runbook and "overhead" in runbook.lower(),
-            "runbook must preserve the lightweight PR overhead check",
+            "ci_overhead_bench.py" in runbook,
+            "runbook must document the daily HTTP/1 overhead check",
             failures,
         )
         require(
@@ -912,7 +913,7 @@ SIGHUP was not delivered
             f"self-test unexpectedly rejected good scenarios snippet: {good_scenario_failures}"
         )
 
-    pr_ci_good = """
+    lane_good = """
   performance-regression:
     name: Performance Regression Check
     permissions:
@@ -927,20 +928,19 @@ SIGHUP was not delivered
           python3 .github/scripts/verify_protocol_perf_regression_workflow.py
           python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
           python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
-      - name: Detect performance-sensitive changes
-        run: echo detect
+      - uses: ./.github/actions/setup-rust-ci
 """
-    pr_ci_failures: list[str] = []
-    validate_performance_lane_contract(pr_ci_good, pr_ci_failures)
-    if pr_ci_failures:
+    lane_failures: list[str] = []
+    validate_performance_lane_contract(lane_good, lane_failures)
+    if lane_failures:
         failures.append(
             "self-test unexpectedly rejected a good performance-regression.yml "
-            f"snippet: {pr_ci_failures}"
+            f"snippet: {lane_failures}"
         )
 
     self_test_only_failures: list[str] = []
     validate_performance_lane_contract(
-        pr_ci_good.replace(
+        lane_good.replace(
             "          python3 .github/scripts/verify_protocol_perf_regression_workflow.py\n",
             "",
             1,
@@ -953,17 +953,16 @@ SIGHUP was not delivered
             "verifier to be rejected"
         )
 
-    pr_ci_bad_failures: list[str] = []
+    lane_bad_failures: list[str] = []
     validate_performance_lane_contract(
         """
   performance-regression:
     steps:
-      - name: Detect performance-sensitive changes
-        run: echo detect
+      - uses: ./.github/actions/setup-rust-ci
 """,
-        pr_ci_bad_failures,
+        lane_bad_failures,
     )
-    if not any("static" in item for item in pr_ci_bad_failures):
+    if not any("static" in item for item in lane_bad_failures):
         failures.append(
             "self-test expected the performance-regression.yml lane's missing "
             "static protocol-perf checks to be detected"

@@ -1887,9 +1887,8 @@ Immediately after checkout, the job always runs lightweight protocol-perf static
 validation (no benchmarks): workflow verifier `--self-test`,
 repository-contract verification, evaluator `--self-test`, and
 `python3 -m py_compile` on
-`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. The
-change classifier is retained for manual dispatch parity; on the scheduled and
-dispatched events it schedules every benchmark. The job builds the gateway in
+`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. Every
+run then executes every benchmark. The job builds the gateway in
 the `ci-release` profile, builds `tests/performance/backend_server`, starts both
 services, and runs:
 
@@ -1944,13 +1943,9 @@ measurement fidelity:
   and budgets are re-baselined.
 
 Every scheduled or manual run executes all four Criterion microbenchmarks (IP
-restriction, WRR, RoundRobin, AI semantic-cache cleanup). The "Detect
-performance-sensitive changes" step still contains `pull_request` /
-`merge_group` path rules (measured sources, fixtures, verifiers, and
-Criterion-relevant `ci.yml` hunks, failing closed when a diff cannot be
-computed), but the workflow no longer triggers on those events. The
-`verify_rr_selection_benchmark.py` and `verify_wrr_selection_benchmark.py`
-`--self-test` helpers run on every job.
+restriction, WRR, RoundRobin, AI semantic-cache cleanup); the workflow has no
+change classifier. The `verify_rr_selection_benchmark.py` and
+`verify_wrr_selection_benchmark.py` `--self-test` helpers run on every job.
 
 The WRR parallel-speedup floor stays at 1.10x for its mandatory
 high-cardinality fixtures (32 and 129 targets), which genuinely scale. On
@@ -1969,9 +1964,9 @@ selection together; their costs need not inflate proportionally on a busy
 runner. The old 0.50 multiplier could reject unchanged selection code.
 
 `run_rr_selection_comparison.sh` builds candidate and immutable baseline with
-only the candidate benchmark harness overlaid. The PR base SHA, merge-group
-base SHA, or main push before SHA selects the baseline when present; scheduled
-and manual runs default to the preceding commit (`HEAD^`). Both compilations use the same
+only the candidate benchmark harness overlaid. `performance-regression.yml`
+passes the preceding commit (`HEAD^`) as the baseline on scheduled and manual
+runs; another caller supplies its own base SHA. Both compilations use the same
 deterministic runner-temporary source path and target directory, with the
 runner-root Cargo configuration and toolchain. The completed binary is copied
 immediately, then its newly created source worktree is moved aside; the next

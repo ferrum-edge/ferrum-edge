@@ -2144,14 +2144,6 @@ def main() -> int:
     performance_regression_body = extract_job_body(
         performance_regression_yml, "performance-regression"
     )
-    if (
-        'git diff --name-only --no-renames "${perf_base}...HEAD"'
-        not in performance_regression_body
-    ):
-        planner_errors.append(
-            "jobs.performance-regression must disable rename detection when "
-            "collecting changed files for pull_request and merge_group diffs"
-        )
     if "verify_mesh_performance_baselines_workflow.py" not in performance_regression_body:
         planner_errors.append(
             "jobs.performance-regression must invoke "
@@ -2176,11 +2168,13 @@ def main() -> int:
     static_idx = performance_regression_body.find(
         "Verify mesh performance baselines workflow contract"
     )
-    detect_idx = performance_regression_body.find("Detect performance-sensitive changes")
-    if static_idx == -1 or detect_idx == -1 or static_idx > detect_idx:
+    benchmark_setup_idx = performance_regression_body.find(
+        "uses: ./.github/actions/setup-rust-ci"
+    )
+    if static_idx == -1 or benchmark_setup_idx == -1 or static_idx > benchmark_setup_idx:
         planner_errors.append(
             "jobs.performance-regression must run mesh baseline workflow "
-            "contracts after checkout and before optional benchmark path gating"
+            "contracts after checkout and before the benchmark toolchain setup"
         )
 
     for output in sorted(set(PATH_GATED_JOBS.values())):

@@ -901,11 +901,13 @@ def check_performance_lane_wiring(failures: list[str], ci: str | None = None) ->
         failures,
     )
     static_idx = ci.find("Verify mesh performance baselines workflow contract")
-    detect_idx = ci.find("Detect performance-sensitive changes")
+    benchmark_setup_idx = ci.find("uses: ./.github/actions/setup-rust-ci")
     require(
-        static_idx != -1 and detect_idx != -1 and static_idx < detect_idx,
+        static_idx != -1
+        and benchmark_setup_idx != -1
+        and static_idx < benchmark_setup_idx,
         "performance-regression.yml must run mesh baseline workflow contracts after checkout and "
-        "before optional benchmark path gating",
+        "before the benchmark toolchain setup",
         failures,
     )
 
