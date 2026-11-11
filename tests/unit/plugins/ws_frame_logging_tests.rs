@@ -1304,7 +1304,7 @@ async fn policy_close_emits_from_on_ws_policy_close_with_distinct_outcome() {
         Some("rate exceeded".len() as u64)
     );
     assert_eq!(events[0].size_bytes, Some(2 + "rate exceeded".len() as u64));
-    assert_eq!(events[0].direction.as_deref(), Some("backend->client"));
+    assert_eq!(events[0].direction.as_deref(), Some("backend_to_client"));
 
     // A Close(None) decision is still recorded, without close fields.
     plugin.on_ws_policy_close(
