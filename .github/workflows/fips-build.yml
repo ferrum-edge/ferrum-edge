@@ -26,7 +26,7 @@ name: FIPS Build Policy
 #      CMake trees before Cargo: those intermediates are runner-local and can
 #      fail an incremental delocate pass after crossing runners.
 #    - Exact producer handoff artifact: the successful producer tree
-#      (workspace target + sccache + the checkout's Git tree identity) is
+#      (workspace target + the checkout's Git tree identity) is
 #      packaged as a zstd tar and published as the immutable, one-day artifact
 #      `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
 #      This artifact IS the same-run compile-to-consumer channel. It is not a
@@ -367,6 +367,14 @@ jobs:
     if: needs.fips-plan.outputs.relevant == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 90
+    # Like FIPS Feature Policy, this job installs no compiler-cache wrapper.
+    # Cargo hashes the resolved rustc-wrapper executable into every artifact,
+    # so a runner- or user-level wrapper would invalidate the exact target
+    # handoff across jobs; clear both inputs. The handoff is this gate's
+    # compiler cache (#7285 removed a never-useful local sccache store).
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -377,23 +385,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      - uses: ./.github/actions/setup-sccache
-
-      # Cargo fingerprints the resolved rustc-wrapper executable, including
-      # its runner-local path and metadata. setup-sccache deliberately installs
-      # into a fresh private directory, so carrying that wrapper identity into
-      # Cargo would invalidate every restored Rust artifact on the next job or
-      # runner. The exact target handoff is the compiler cache for this gate;
-      # clear the wrapper before any Cargo/cache operation so its artifacts
-      # retain the native rustc identity across trusted restores.
-      - name: Stabilize Cargo compiler identity for exact-target reuse
-        run: |
-          set -euo pipefail
-          if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
-            "${FERRUM_SCCACHE_BIN}" --stop-server > /dev/null 2>&1 || true
-          fi
-          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
 
       - name: Install aws-lc-fips-sys build prerequisites
         # The FIPS build of AWS-LC is compiled through the upstream crate's
@@ -411,13 +402,12 @@ jobs:
       # `shared-key` because pinned rust-cache ignores `key` whenever
       # `shared-key` is set. Do not add `key:` or `add-job-id-key`. Automatic
       # env/manifest/lock hashing remains enabled. This key is not SHA-scoped.
-      - name: Cache FIPS Rust, AWS-LC, and sccache outputs
+      - name: Cache FIPS Rust and AWS-LC outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
-          cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
           # Main-only saves: the FIPS gate no longer runs on most pull
           # requests, and PR-scoped saves were evicting the shared lanes.
@@ -432,8 +422,8 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name rust-cache \
             --hit "$CACHE_HIT" \
-            --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; shared-key=ci-fips-contract save-if=main-push fork=${FORK_PR:-false}"
+            --path "${GITHUB_WORKSPACE}/target" \
+            --note "layer=stable-fallback; measured=restored-target-directory; rust-cache Cargo registry/git bytes are not exposed; shared-key=ci-fips-contract save-if=main-push fork=${FORK_PR:-false}"
 
       # The stable cache crosses runners. AWS-LC's CMake build tree does not:
       # an incremental rerun can feed the restored libbcm archive back through
@@ -609,7 +599,7 @@ jobs:
           fi
           rm -f "$listing_tmp" "$verbose_tmp" "$identity_verbose_tmp"
           tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"
-          for path in target .cache/sccache; do
+          for path in target; do
             source_path="${extract_root}/${path}"
             if [ ! -d "$source_path" ] || [ -L "$source_path" ]; then
               echo "::error::inter-run FIPS handoff is missing a real ${path} directory" >&2
@@ -671,10 +661,8 @@ jobs:
             echo "::error::tracked checkout content changed before FIPS handoff promotion" >&2
             exit 1
           fi
-          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
-          mkdir -p "${GITHUB_WORKSPACE}/.cache"
+          rm -rf "${GITHUB_WORKSPACE}/target"
           mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"
-          mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"
           # Checkout gives the identical source tree fresh mtimes. The handoff
           # is already bound to this exact head/run/attempt, so make its regular
           # outputs newer only after validating the restored executable. This
@@ -758,7 +746,7 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-build --status "$status"
           exit "$status"
 
-      # Exact producer archive: full workspace target + sccache as left by this
+      # Exact producer archive: full workspace target as left by this
       # successful profile build, plus the checkout's Git tree identity.
       # Test-binary precompile is a parallel consumer so claimed-profile and
       # clippy work do not wait on it. Artifact ZIP extraction normalizes
@@ -816,7 +804,7 @@ jobs:
           # archive link targets into the trusted handoff surface.
           tar --zstd --hard-dereference -cf "$archive" -C "$RUNNER_TEMP" \
             fips-producer-identity fips-producer-source-tree \
-            -C "$GITHUB_WORKSPACE" target .cache/sccache
+            -C "$GITHUB_WORKSPACE" target
           rm -f "$tree_manifest" "$identity"
           if [ ! -s "$archive" ] || [ -L "$archive" ]; then
             echo "::error::failed to create a real FIPS producer handoff archive" >&2
@@ -837,13 +825,9 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-      - name: Record sccache stats
+      - name: Summarize runtime telemetry
         if: always()
         run: |
-          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            "$sccache_bin" --show-stats || true
-          fi
           python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS compile"
 
   fips-claimed-checks:
@@ -861,6 +845,14 @@ jobs:
             shard_name: 2-of-3
           - shard_index: 2
             shard_name: 3-of-3
+    # Like FIPS Feature Policy, this job installs no compiler-cache wrapper.
+    # Cargo hashes the resolved rustc-wrapper executable into every artifact,
+    # so a runner- or user-level wrapper would invalidate the exact target
+    # handoff across jobs; clear both inputs. The handoff is this gate's
+    # compiler cache (#7285 removed a never-useful local sccache store).
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -872,16 +864,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - uses: ./.github/actions/setup-sccache
-
-      - name: Stabilize Cargo compiler identity for exact-target reuse
-        run: |
-          set -euo pipefail
-          if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
-            "${FERRUM_SCCACHE_BIN}" --stop-server > /dev/null 2>&1 || true
-          fi
-          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
-
       - name: Install aws-lc-fips-sys build prerequisites
         run: |
           sudo apt-get update
@@ -890,13 +872,12 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
-      - name: Cache FIPS Rust, AWS-LC, and sccache outputs
+      - name: Cache FIPS Rust and AWS-LC outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
-          cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
           save-if: "false"
 
@@ -909,18 +890,18 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name rust-cache \
             --hit "$CACHE_HIT" \
-            --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; save-if=false fork=${FORK_PR:-false}"
+            --path "${GITHUB_WORKSPACE}/target" \
+            --note "layer=stable-fallback; measured=restored-target-directory; rust-cache Cargo registry/git bytes are not exposed; save-if=false fork=${FORK_PR:-false}"
 
       # The stable rust-cache fallback may have restored an inter-commit
-      # target/sccache tree. Drop it before promotion so the exact producer
+      # target tree. Drop it before promotion so the exact producer
       # tree cannot mix with stale fallback outputs. Runs for fork PRs too:
       # the artifact channel, unlike the former cache channel, is fork-usable.
       - name: Drop stable target before producer promotion
         if: github.event.inputs.force_cold_cache != 'true'
         run: |
           set -euo pipefail
-          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
+          rm -rf "${GITHUB_WORKSPACE}/target"
 
       # Same-run producer channel: download every handoff attempt this source
       # SHA/run_id has published. The pattern is attempt-independent, so a
@@ -1269,7 +1250,7 @@ jobs:
           rm -rf "$extract_root"
           mkdir -p "$extract_root"
           tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"
-          for path in target .cache/sccache; do
+          for path in target; do
             source_path="${extract_root}/${path}"
             if [ ! -d "$source_path" ] || [ -L "$source_path" ]; then
               echo "::error::same-run FIPS producer handoff is missing a real ${path} directory" >&2
@@ -1308,10 +1289,8 @@ jobs:
             echo "::error::tracked checkout content changed before FIPS handoff promotion" >&2
             exit 1
           fi
-          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
-          mkdir -p "${GITHUB_WORKSPACE}/.cache"
+          rm -rf "${GITHUB_WORKSPACE}/target"
           mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"
-          mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"
           # The promoted handoff is bound to this source SHA/run_id tree.
           # Refresh only regular target files after the executable proof so
           # newer checkout mtimes do not force Cargo to relink identical
@@ -1338,7 +1317,7 @@ jobs:
             --name fips-producer \
             --hit true \
             --path "${GITHUB_WORKSPACE}/target" \
-            --note "layer=producer; measured=target-directory; transport=same-run-artifact; sccache promoted from the same handoff"
+            --note "layer=producer; measured=target-directory; transport=same-run-artifact"
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -1402,15 +1381,11 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py end --phase "$phase" --status "$status"
           exit "$status"
 
-      - name: Record sccache stats
+      - name: Summarize runtime telemetry
         if: always()
         env:
           FIPS_CLAIMED_SHARD_INDEX: ${{ matrix.shard_index }}
         run: |
-          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            "$sccache_bin" --show-stats || true
-          fi
           python3 .github/scripts/ci_runtime_telemetry.py summarize \
             --title "FIPS claimed profiles (${FIPS_CLAIMED_SHARD_INDEX})"
 
@@ -1430,6 +1405,11 @@ jobs:
     # crates checked side by side in the tail, and the additive swapfile below
     # gives the single large check the headroom the 7 GiB image lacks.
     env:
+      # No compiler-cache wrapper: Cargo hashes the resolved rustc-wrapper
+      # executable into every artifact, so a runner- or user-level wrapper
+      # would invalidate the exact target handoff across jobs (#7285).
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
       CARGO_BUILD_JOBS: "3"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1444,16 +1424,6 @@ jobs:
         with:
           components: clippy
 
-      - uses: ./.github/actions/setup-sccache
-
-      - name: Stabilize Cargo compiler identity for exact-target reuse
-        run: |
-          set -euo pipefail
-          if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
-            "${FERRUM_SCCACHE_BIN}" --stop-server > /dev/null 2>&1 || true
-          fi
-          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
-
       - name: Install aws-lc-fips-sys build prerequisites
         run: |
           sudo apt-get update
@@ -1462,13 +1432,12 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
-      - name: Cache FIPS Rust, AWS-LC, and sccache outputs
+      - name: Cache FIPS Rust and AWS-LC outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
-          cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
           save-if: "false"
 
@@ -1481,18 +1450,18 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name rust-cache \
             --hit "$CACHE_HIT" \
-            --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; save-if=false fork=${FORK_PR:-false}"
+            --path "${GITHUB_WORKSPACE}/target" \
+            --note "layer=stable-fallback; measured=restored-target-directory; rust-cache Cargo registry/git bytes are not exposed; save-if=false fork=${FORK_PR:-false}"
 
       # The stable rust-cache fallback may have restored an inter-commit
-      # target/sccache tree. Drop it before promotion so the exact producer
+      # target tree. Drop it before promotion so the exact producer
       # tree cannot mix with stale fallback outputs. Runs for fork PRs too:
       # the artifact channel, unlike the former cache channel, is fork-usable.
       - name: Drop stable target before producer promotion
         if: github.event.inputs.force_cold_cache != 'true'
         run: |
           set -euo pipefail
-          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
+          rm -rf "${GITHUB_WORKSPACE}/target"
 
       # Same-run producer channel: download every handoff attempt this source
       # SHA/run_id has published. The pattern is attempt-independent, so a
@@ -1841,7 +1810,7 @@ jobs:
           rm -rf "$extract_root"
           mkdir -p "$extract_root"
           tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"
-          for path in target .cache/sccache; do
+          for path in target; do
             source_path="${extract_root}/${path}"
             if [ ! -d "$source_path" ] || [ -L "$source_path" ]; then
               echo "::error::same-run FIPS producer handoff is missing a real ${path} directory" >&2
@@ -1880,10 +1849,8 @@ jobs:
             echo "::error::tracked checkout content changed before FIPS handoff promotion" >&2
             exit 1
           fi
-          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
-          mkdir -p "${GITHUB_WORKSPACE}/.cache"
+          rm -rf "${GITHUB_WORKSPACE}/target"
           mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"
-          mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"
           # The promoted handoff is bound to this source SHA/run_id tree.
           # Refresh only regular target files after the executable proof so
           # newer checkout mtimes do not force Cargo to relink identical
@@ -1910,7 +1877,7 @@ jobs:
             --name fips-producer \
             --hit true \
             --path "${GITHUB_WORKSPACE}/target" \
-            --note "layer=producer; measured=target-directory; transport=same-run-artifact; sccache promoted from the same handoff"
+            --note "layer=producer; measured=target-directory; transport=same-run-artifact"
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -1957,13 +1924,9 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py end --phase fips-clippy --status "$status"
           exit "$status"
 
-      - name: Record sccache stats
+      - name: Summarize runtime telemetry
         if: always()
         run: |
-          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            "$sccache_bin" --show-stats || true
-          fi
           python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS clippy"
 
   fips-test-build:
@@ -1995,6 +1958,11 @@ jobs:
     # test filters by the downstream FIPS consumers; nothing symbolicates locals
     # from them.
     env:
+      # No compiler-cache wrapper: Cargo hashes the resolved rustc-wrapper
+      # executable into every artifact, so a runner- or user-level wrapper
+      # would invalidate the exact target handoff across jobs (#7285).
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
       CARGO_BUILD_JOBS: "3"
       # Set on BOTH profiles rather than relying on `test` inheriting from
       # `dev`, so the override cannot silently miss the profile that actually
@@ -2012,16 +1980,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - uses: ./.github/actions/setup-sccache
-
-      - name: Stabilize Cargo compiler identity for exact-target reuse
-        run: |
-          set -euo pipefail
-          if [ -n "${FERRUM_SCCACHE_BIN:-}" ] && [ -x "${FERRUM_SCCACHE_BIN}" ]; then
-            "${FERRUM_SCCACHE_BIN}" --stop-server > /dev/null 2>&1 || true
-          fi
-          printf '%s\n' 'RUSTC_WRAPPER=' 'CARGO_BUILD_RUSTC_WRAPPER=' >> "$GITHUB_ENV"
-
       - name: Install aws-lc-fips-sys build prerequisites
         run: |
           sudo apt-get update
@@ -2030,13 +1988,12 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
-      - name: Cache FIPS Rust, AWS-LC, and sccache outputs
+      - name: Cache FIPS Rust and AWS-LC outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
-          cache-directories: ${{ github.workspace }}/.cache/sccache
           cache-on-failure: "true"
           save-if: "false"
 
@@ -2049,18 +2006,18 @@ jobs:
           python3 .github/scripts/ci_runtime_telemetry.py cache \
             --name rust-cache \
             --hit "$CACHE_HIT" \
-            --path "${GITHUB_WORKSPACE}/.cache/sccache" \
-            --note "layer=stable-fallback; measured=sccache-directory-subset; rust-cache Cargo/target archive bytes are not exposed; save-if=false fork=${FORK_PR:-false}"
+            --path "${GITHUB_WORKSPACE}/target" \
+            --note "layer=stable-fallback; measured=restored-target-directory; rust-cache Cargo registry/git bytes are not exposed; save-if=false fork=${FORK_PR:-false}"
 
       # The stable rust-cache fallback may have restored an inter-commit
-      # target/sccache tree. Drop it before promotion so the exact producer
+      # target tree. Drop it before promotion so the exact producer
       # tree cannot mix with stale fallback outputs. Runs for fork PRs too:
       # the artifact channel, unlike the former cache channel, is fork-usable.
       - name: Drop stable target before producer promotion
         if: github.event.inputs.force_cold_cache != 'true'
         run: |
           set -euo pipefail
-          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
+          rm -rf "${GITHUB_WORKSPACE}/target"
 
       # Same-run producer channel: download every handoff attempt this source
       # SHA/run_id has published. The pattern is attempt-independent, so a
@@ -2408,7 +2365,7 @@ jobs:
           rm -rf "$extract_root"
           mkdir -p "$extract_root"
           tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"
-          for path in target .cache/sccache; do
+          for path in target; do
             source_path="${extract_root}/${path}"
             if [ ! -d "$source_path" ] || [ -L "$source_path" ]; then
               echo "::error::same-run FIPS producer handoff is missing a real ${path} directory" >&2
@@ -2447,10 +2404,8 @@ jobs:
             echo "::error::tracked checkout content changed before FIPS handoff promotion" >&2
             exit 1
           fi
-          rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cache/sccache"
-          mkdir -p "${GITHUB_WORKSPACE}/.cache"
+          rm -rf "${GITHUB_WORKSPACE}/target"
           mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"
-          mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"
           # The promoted handoff is bound to this source SHA/run_id tree.
           # Refresh only regular target files after the executable proof so
           # newer checkout mtimes do not force Cargo to relink identical
@@ -2477,7 +2432,7 @@ jobs:
             --name fips-producer \
             --hit true \
             --path "${GITHUB_WORKSPACE}/target" \
-            --note "layer=producer; measured=target-directory; transport=same-run-artifact; sccache promoted from the same handoff"
+            --note "layer=producer; measured=target-directory; transport=same-run-artifact"
 
       - name: Assert cache-service credentials are absent
         run: |
@@ -2636,13 +2591,9 @@ jobs:
       - name: Remove staged FIPS test artifact
         run: rm -rf "${GITHUB_WORKSPACE}/target/fips-test-bundle"
 
-      - name: Record sccache stats
+      - name: Summarize runtime telemetry
         if: always()
         run: |
-          sccache_bin="${FERRUM_SCCACHE_BIN:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            "$sccache_bin" --show-stats || true
-          fi
           python3 .github/scripts/ci_runtime_telemetry.py summarize --title "FIPS test binaries"
 
   fips-test:

@@ -410,7 +410,7 @@ artifact handoff:
   and never publish. The test job does not restore build caches.
 - **Immutable producer handoff (same-run channel and inter-run warm
   source).** A successful non-cold `fips-compile`
-  packages its exact `target/` + `.cache/sccache` producer tree, the
+  packages its exact `target/` producer tree, the
   checkout's Git tree identity, and a `fips-producer-identity` member that
   records source SHA, run id, and run attempt as a zstd tar
   (preserving executable modes that artifact ZIP extraction would normalize)
@@ -458,8 +458,9 @@ artifact handoff:
   `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-<run_id>-<run_attempt>` from that run
   in the current repository. A promoted artifact — same-run or explicitly
   requested — must contain a
-  real tar payload that extracts to real `target/` and `.cache/sccache`
-  directories or the consuming job fails closed. The archive carries the
+  real tar payload that extracts to a real `target/` directory or the
+  consuming job fails closed (an older artifact's extra `.cache/sccache` member
+  is ignored). The archive carries the
   producer
   checkout's Git tree identity; promotion requires an equal, clean current
   checkout, preventing a synthetic PR merge tree from masquerading as the same
@@ -472,12 +473,12 @@ artifact handoff:
   look newer and invalidate its dependents.
 
   Cargo also includes the resolved `RUSTC_WRAPPER` executable identity in its
-  artifact hashes. The checksum-pinned sccache wrapper is a runner-private
-  install, which is fine for ordinary compiler caching but is not a stable
-  identity for an exact `target/` tree across jobs. Each FIPS Cargo job
-  therefore stops that private wrapper and clears both wrapper variables before
-  any cache or Cargo operation; the immutable exact-target channel is the FIPS
-  compiler cache. These two controls keep Cargo from rebuilding
+  artifact hashes, so any wrapper would break exact `target/` reuse across
+  jobs. The FIPS Cargo jobs therefore install no compiler-cache wrapper and
+  clear `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` at job level; the
+  immutable exact-target channel is the FIPS compiler cache. (They used to
+  install `setup-sccache` and then stop and clear it before Cargo ran, and
+  still cached, packed and reported its empty store; #7285 removed that.) These two controls keep Cargo from rebuilding
   content-identical outputs without allowing a partial, fork, cold,
   mismatched-tree, or runner-unique-compiler restore to masquerade as current.
   `force_cold_cache` skips both handoff download and upload. Run artifacts
@@ -522,9 +523,9 @@ hit/miss from the action output as **stable fallback**, same-run producer
 handoff promotion as an evidence-backed **hit** (a missing handoff fails the
 job rather than recording a fabricated miss), and the
 explicit inter-run handoff artifact as **hit / miss** (never as a fabricated
-hit). Measured restored bytes are the sccache-directory subset for
-rust-cache and the on-disk `target/` directory for the promoted producer
-handoff; rust-cache Cargo/target archive bytes are not exposed. The
+hit). Measured restored bytes are the restored `target/` directory for rust-cache
+(its Cargo registry and git bytes are not exposed) and the on-disk `target/`
+directory for the promoted producer handoff. The
 required `FIPS Build & Test`
 aggregate depends on `fips-test-build` and fails closed if that test-binary
 producer does not succeed.
@@ -544,15 +545,16 @@ and recreated before the verified copy: rust-cache hashes the wrapper path
 into its key, and a randomized root made every lane unrestorable (#4643). It persists
 `SCCACHE_GHA_ENABLED` as empty so a later step cannot re-enable the
 credential-bearing GHA backend. Install failure clears the rustc wrapper and
-continues uncached. Compiler outputs use a 2 GiB local directory persisted by
-rust-cache / the FIPS producer archive. Production-image caches use pinned
+continues uncached. Compiler outputs use a 2 GiB local directory that no
+lane persists (the restored `target/` already skips dependency compilation),
+and the FIPS and fuzz-smoke jobs do not install it at all (#7285).
+Production-image caches use pinned
 BuildKit registry imports and trusted-main exports. PR recipes remain
 `permissions: contents: read`; only the mutually exclusive trusted-main
 publisher receives `packages: write`. Static checks live in
 `.github/scripts/verify_ci_runtime_cache.py`. The cache-credential gate is
 structural: `fips-build.yml` may invoke only a closed allowlist of pinned
-actions and the two local shell-only composites (`setup-sccache`,
-`setup-fast-linker`). Extracted `uses` must match that allowlist with exact
+actions and the one local shell-only composite `setup-fast-linker`. Extracted `uses` must match that allowlist with exact
 occurrence counts, so inserting a duplicate of an already-admitted
 checkout, rust-cache, artifact, toolchain, or local action fails. Each
 `actions/checkout` step must keep the current-repository / default-ref /

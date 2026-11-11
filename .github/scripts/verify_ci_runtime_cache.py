@@ -226,7 +226,6 @@ SCCACHE_EXPORT_VARIABLE_TOKEN = "exportVariable"
 FIPS_ALLOWED_ACTION_COUNTS = {
     CHECKOUT: 7,
     RUST_TOOLCHAIN: 5,
-    "./.github/actions/setup-sccache": 4,
     "./.github/actions/setup-fast-linker": 4,
     RUST_CACHE: 4,
     DOWNLOAD_ARTIFACT: 5,
@@ -2617,15 +2616,9 @@ def check_fips_producer_channel(
         'find "$target_root" -xdev -type f '
         '\\\n            -exec touch --reference="$mtime_reference" -- {} +'
     )
-    compiler_identity_step_name = (
-        "Stabilize Cargo compiler identity for exact-target reuse"
-    )
-    compiler_identity_contract = (
-        "FERRUM_SCCACHE_BIN",
-        "--stop-server",
-        "'RUSTC_WRAPPER='",
-        "'CARGO_BUILD_RUSTC_WRAPPER='",
-        '>> "$GITHUB_ENV"',
+    compiler_identity_env = (
+        '      RUSTC_WRAPPER: ""\n',
+        '      CARGO_BUILD_RUSTC_WRAPPER: ""\n',
     )
     cmake_quarantine_step_name = (
         "Quarantine restored AWS-LC FIPS CMake state"
@@ -2666,34 +2659,19 @@ def check_fips_producer_channel(
         ("fips-clippy", clippy_job),
         ("fips-test-build", test_build_job),
     ):
-        identity_steps = [
-            step
-            for step in job_steps(job_body)
-            if f"name: {compiler_identity_step_name}" in step
-        ]
+        # Cargo hashes the resolved rustc-wrapper executable into every
+        # artifact, so the exact target handoff only survives across jobs when
+        # no wrapper is active. A job-level `env` entry outranks any
+        # `GITHUB_ENV` write, so it clears the wrapper for every step.
+        job_header = job_body.split("\n    steps:\n", 1)[0] + "\n"
+        env_block = job_header.split("\n    env:\n", 1)[1] if "\n    env:\n" in job_header else ""
         require(
-            len(identity_steps) == 1,
-            f"{job_name} must stabilize the Cargo compiler identity exactly once",
-            failures,
-        )
-        setup_position = job_body.find("uses: ./.github/actions/setup-sccache")
-        identity_position = job_body.find(compiler_identity_step_name)
-        cache_position = job_body.find(
-            "Cache FIPS Rust, AWS-LC, and sccache outputs"
-        )
-        require(
-            setup_position >= 0
-            and identity_position >= 0
-            and cache_position >= 0
-            and setup_position < identity_position < cache_position
-            and bool(identity_steps)
-            and not step_if(identity_steps[0])
-            and all(
-                contract in identity_steps[0]
-                for contract in compiler_identity_contract
-            ),
-            f"{job_name} must clear the runner-unique rustc-wrapper identity "
-            "after setup-sccache and before any Cargo/cache operation",
+            all(entry in env_block for entry in compiler_identity_env)
+            and "setup-sccache" not in job_body
+            and "RUSTC_WRAPPER=" not in job_body,
+            f"{job_name} must clear RUSTC_WRAPPER and CARGO_BUILD_RUSTC_WRAPPER "
+            "at job level and install no compiler-cache wrapper, so the exact "
+            "target handoff keeps the native rustc identity",
             failures,
         )
     cmake_quarantine_steps = [
@@ -2904,7 +2882,7 @@ def check_fips_producer_channel(
         failures,
     )
     cache_position = compile_job.find(
-        "Cache FIPS Rust, AWS-LC, and sccache outputs"
+        "Cache FIPS Rust and AWS-LC outputs"
     )
     quarantine_position = compile_job.find(cmake_quarantine_step_name)
     download_position = compile_job.find(
@@ -2937,9 +2915,9 @@ def check_fips_producer_channel(
         and '[ ! -f "$archive" ] || [ -L "$archive" ]' in compile_job
         and 'tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"'
         in compile_job
-        and 'for path in target .cache/sccache; do' in compile_job
+        and 'for path in target; do' in compile_job
         and '[ ! -d "$source_path" ] || [ -L "$source_path" ]' in compile_job,
-        "fips-compile must validate the tar payload and both restored directories, "
+        "fips-compile must validate the tar payload and the restored target directory, "
         "reject symlinks, and preserve archived modes",
         failures,
     )
@@ -2974,11 +2952,11 @@ def check_fips_producer_channel(
         in package_steps[0]
         and "fips-producer-identity fips-producer-source-tree"
         in package_steps[0]
-        and '-C "$GITHUB_WORKSPACE" target .cache/sccache'
+        and '-C "$GITHUB_WORKSPACE" target\n'
         in package_steps[0]
         and '[ ! -s "$archive" ] || [ -L "$archive" ]'
         in package_steps[0],
-        "fips-compile must package target, sccache, identity, and the clean "
+        "fips-compile must package target, identity, and the clean "
         "checkout tree identity into a nonempty tar.zst handoff that preserves "
         "executable modes and materializes hard-linked outputs as regular files",
         failures,
@@ -3093,7 +3071,7 @@ def check_fips_producer_channel(
         'archive="${payload_dir}/fips-producer-handoff.tar.zst"',
         '[ ! -f "$archive" ] || [ -L "$archive" ]',
         'tar --zstd --no-same-owner -xf "$archive" -C "$extract_root"',
-        "for path in target .cache/sccache; do",
+        "for path in target; do",
         '[ ! -d "$source_path" ] || [ -L "$source_path" ]',
         'tree_manifest="${extract_root}/fips-producer-source-tree"',
         '[ ! -f "$tree_manifest" ] || [ -L "$tree_manifest" ]',
@@ -3104,7 +3082,6 @@ def check_fips_producer_channel(
         "git diff --quiet --no-ext-diff",
         "git diff --cached --quiet --no-ext-diff",
         'mv "${extract_root}/target" "${GITHUB_WORKSPACE}/target"',
-        'mv "${extract_root}/.cache/sccache" "${GITHUB_WORKSPACE}/.cache/sccache"',
         'mtime_reference="${RUNNER_TEMP}/fips-target-mtime-reference"',
         'touch "$mtime_reference"',
         'rm -f "$mtime_reference"',
@@ -3259,7 +3236,7 @@ def check_fips_producer_channel(
         )
         require(
             "Drop stable target before producer promotion" in job_body,
-            f"{job_name} must drop rust-cache target/sccache before promoting "
+            f"{job_name} must drop the rust-cache target before promoting "
             "the SHA-scoped producer handoff",
             failures,
         )
@@ -4095,21 +4072,20 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         "FIPS rust-cache must save after ordinary failures when post-job cleanup still runs",
         failures,
     )
+    # The handoff is the FIPS compiler cache (#7285): a local sccache store
+    # was never persisted, and any wrapper changes Cargo's artifact identity.
     require(
-        "./.github/actions/setup-sccache" in workflow,
-        "FIPS jobs must install sccache through the local action",
+        "setup-sccache" not in workflow
+        and "FERRUM_SCCACHE_BIN" not in workflow
+        and "command -v sccache" not in workflow
+        and ".cache/sccache" not in workflow,
+        "FIPS jobs must not install, invoke, cache or hand off sccache",
         failures,
     )
     require(
-        "command -v sccache" not in workflow,
-        "FIPS jobs must not PATH-lookup sccache after the trusted installer",
-        failures,
-    )
-    require(
-        workflow.count('sccache_bin="${FERRUM_SCCACHE_BIN:-}"') == 4
-        and workflow.count('"$sccache_bin" --show-stats') == 4,
-        "FIPS compile/claimed-checks/clippy/test-binary jobs must record sccache "
-        "stats via FERRUM_SCCACHE_BIN",
+        workflow.count("ci_runtime_telemetry.py summarize") == 5,
+        "FIPS compile/claimed-checks/clippy/test-binary/test jobs must each "
+        "summarize their runtime telemetry",
         failures,
     )
     require(
@@ -4357,11 +4333,13 @@ def check_fips(workflow: str, failures: list[str]) -> None:
             failures,
         )
         require(
-            "sccache-directory-subset" in job_body
+            "measured=restored-target-directory" in job_body
+            and '--path "${GITHUB_WORKSPACE}/target"' in job_body
             and "not exposed" in job_body
             and "layer=stable-fallback" in job_body,
-            f"{job_name} must label rust-cache as stable-fallback and state that "
-            "archive bytes are not exposed",
+            f"{job_name} must label rust-cache as stable-fallback, measure the "
+            "restored target directory, and state that registry bytes are not "
+            "exposed",
             failures,
         )
         require(
@@ -4882,8 +4860,9 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "sccache-directory" in ci_cd or "sccache directory subset" in ci_cd.lower(),
-        "docs/ci_cd.md must document that FIPS telemetry measures the sccache subset",
+        "restored `target/` directory for rust-cache" in ci_cd,
+        "docs/ci_cd.md must document that FIPS telemetry measures the restored "
+        "target directory for rust-cache",
         failures,
     )
     require(
@@ -5833,10 +5812,10 @@ def self_test() -> int:
     github_script = (
         "actions/github-script@0000000000000000000000000000000000000000"
     )
-    setup_step = "      - uses: ./.github/actions/setup-sccache\n"
+    setup_step = "      - uses: ./.github/actions/setup-fast-linker\n"
     require(
         setup_step in real_fips,
-        "self-test: fips-build.yml must still contain the setup-sccache step",
+        "self-test: fips-build.yml must still contain the setup-fast-linker step",
         failures,
     )
 
@@ -5863,15 +5842,15 @@ def self_test() -> int:
         "    branches:\n"
         "      - main\n"
         "      - |\n"
-        "          uses: ./.github/actions/setup-sccache\n",
+        "          uses: ./.github/actions/setup-fast-linker\n",
         1,
     ).replace(setup_step, "      - run: true\n", 1)
     require(
-        "      - |\n          uses: ./.github/actions/setup-sccache\n"
+        "      - |\n          uses: ./.github/actions/setup-fast-linker\n"
         in scalar_count_decoy
         and scalar_count_decoy.count(setup_step) == real_fips.count(setup_step) - 1,
         "self-test: sequence block-scalar decoy mutation must insert inert text "
-        "and remove exactly one real setup-sccache action",
+        "and remove exactly one real setup-fast-linker action",
         failures,
     )
     scalar_count_failures: list[str] = []
@@ -5882,7 +5861,7 @@ def self_test() -> int:
     )
     require(
         any(
-            "./.github/actions/setup-sccache observed=3 expected=4" in item
+            "./.github/actions/setup-fast-linker observed=3 expected=4" in item
             for item in scalar_count_failures
         ),
         "self-test: inert sequence block-scalar text must not replace a real "
@@ -6100,7 +6079,7 @@ def self_test() -> int:
     )
     require(
         any("must not invoke nested actions" in item for item in nested_failures),
-        f"self-test: nested github-script in setup-sccache must fail: {nested_failures}",
+        f"self-test: nested github-script in setup-fast-linker must fail: {nested_failures}",
         failures,
     )
     require(
@@ -6144,7 +6123,7 @@ def self_test() -> int:
         require(
             setup_step in mutated and snippet.split("\n", 1)[0] in mutated,
             "self-test: FIPS carrier mutation must insert into the real workflow "
-            f"without dropping setup-sccache: {snippet!r}",
+            f"without dropping setup-fast-linker: {snippet!r}",
             failures,
         )
         return mutated
@@ -6256,7 +6235,7 @@ def self_test() -> int:
         ("occurrence counts", "observed="),
     )
     require_fips_carrier(
-        "self-test-duplicate-setup-sccache",
+        "self-test-duplicate-setup-fast-linker",
         setup_step,
         ("occurrence counts", "observed="),
     )
@@ -6293,7 +6272,7 @@ def self_test() -> int:
     require(
         setup_step in repo_redirect and "persist-credentials: false" in repo_redirect,
         "self-test: repository redirect mutation must keep original admitted "
-        "checkout and setup-sccache text",
+        "checkout and setup-fast-linker text",
         failures,
     )
     repo_redirect_failures: list[str] = []
@@ -6309,13 +6288,13 @@ def self_test() -> int:
     )
     path_redirect = real_fips.replace(
         checkout_with,
-        checkout_with + "          path: .github/actions/setup-sccache\n",
+        checkout_with + "          path: .github/actions/setup-fast-linker\n",
         1,
     )
     require(
         setup_step in path_redirect
-        and "./.github/actions/setup-sccache" in path_redirect,
-        "self-test: path redirect mutation must keep original setup-sccache text",
+        and "./.github/actions/setup-fast-linker" in path_redirect,
+        "self-test: path redirect mutation must keep original setup-fast-linker text",
         failures,
     )
     path_redirect_failures: list[str] = []
@@ -6337,7 +6316,7 @@ def self_test() -> int:
     require(
         setup_step in duplicate_with and duplicate_with.count(checkout_with) >= 1,
         "self-test: duplicate checkout with mutation must keep the original "
-        "checkout provenance and setup-sccache text",
+        "checkout provenance and setup-fast-linker text",
         failures,
     )
     duplicate_with_failures: list[str] = []
@@ -7432,19 +7411,19 @@ def self_test() -> int:
         failures,
     )
 
-    unstable_compiler_identity = handoff_channel.replace(
-        "      - name: Stabilize Cargo compiler identity for exact-target reuse\n",
-        "      - name: Leave runner-unique Cargo compiler identity active\n",
-        1,
-    )
+    # Drop the wrapper clear from fips-compile only (FIPS Feature Policy, which
+    # precedes it, carries the same env entry and is not a Cargo handoff job).
+    compile_start = handoff_channel.index("\n  fips-compile:\n")
+    unstable_compiler_identity = handoff_channel[:compile_start] + handoff_channel[
+        compile_start:
+    ].replace('      RUSTC_WRAPPER: ""\n', "", 1)
     unstable_compiler_identity_failures: list[str] = []
     check_fips_producer_channel(
         unstable_compiler_identity, unstable_compiler_identity_failures
     )
     require(
         any(
-            "stabilize the Cargo compiler identity" in item
-            or "clear the runner-unique rustc-wrapper identity" in item
+            "must clear RUSTC_WRAPPER and CARGO_BUILD_RUSTC_WRAPPER" in item
             for item in unstable_compiler_identity_failures
         ),
         "self-test: exact FIPS restores with a runner-unique wrapper must fail",
@@ -7488,7 +7467,7 @@ def self_test() -> int:
     unpackaged_handoff = handoff_channel.replace(
         '          tar --zstd --hard-dereference -cf "$archive" -C "$RUNNER_TEMP" \\\n'
         "            fips-producer-identity fips-producer-source-tree \\\n"
-        '            -C "$GITHUB_WORKSPACE" target .cache/sccache\n',
+        '            -C "$GITHUB_WORKSPACE" target\n',
         "          true\n",
         1,
     )
@@ -7496,7 +7475,7 @@ def self_test() -> int:
     check_fips_producer_channel(unpackaged_handoff, unpackaged_failures)
     require(
         any(
-            "package target, sccache" in item for item in unpackaged_failures
+            "package target, identity" in item for item in unpackaged_failures
         ),
         "self-test: direct permission-losing producer upload must fail",
         failures,
