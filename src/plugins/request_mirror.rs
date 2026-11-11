@@ -228,7 +228,8 @@
 //! |-------|------|---------|-------------|
 //! | `mirror_host` | string | **(required)** | Hostname or IP of the mirror target |
 //! | `mirror_port` | u16 | 80 (http) / 443 (https) | Port of the mirror target |
-//! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"` |
+//! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"`. `http` is accepted without `allow_plaintext` only when `mirror_host` is a loopback IP literal (`127.0.0.0/8`, `::1`) |
+//! | `allow_plaintext` | bool | `false` | Explicit opt-in to mirror over cleartext `http` to a `mirror_host` that is not a loopback IP literal. The mirror request carries the backend-visible request (body included by default, plus any allowlisted credentials), so leave it `false` and use `https` unless the mirror path is otherwise protected |
 //! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, prefers the mesh route rewrite path when present; otherwise the backend-effective authorized path if backend-path policy is active; otherwise the original request path |
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0). Deterministic evenly spaced sampling at 0.1% granularity (see sampling notes below) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
@@ -298,6 +299,7 @@ use super::utils::query::OrderedQuery;
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
 };
+use super::utils::socket_host::is_loopback_ip_literal_host;
 use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::proxy::headers::{
     SecondaryRequestHostPolicy, filter_secondary_request_headers,
@@ -310,6 +312,7 @@ use crate::proxy::headers::{
 /// stay in lockstep with this list so misspelled sampling, body, protocol, or
 /// endpoint controls cannot silently fall back to security-sensitive defaults.
 pub const REQUEST_MIRROR_CONFIG_KEYS: &[&str] = &[
+    "allow_plaintext",
     "forward_sensitive_header_allowlist",
     "forward_sensitive_headers",
     "forward_sensitive_query",
@@ -2127,6 +2130,23 @@ impl RequestMirror {
             ));
         }
 
+        // The mirror request replays the backend-visible request — its body
+        // by default and any allowlisted credential headers or query names —
+        // to a second origin. Cleartext is admitted without an explicit opt-in
+        // only to a loopback IP literal (a co-located shadow service), the
+        // same rule every other plugin egress follows. The judgement uses the
+        // canonical host the mirror URL is built from.
+        let allow_plaintext = optional_bool(config, "allow_plaintext")?.unwrap_or(false);
+        if mirror_protocol == "http"
+            && !allow_plaintext
+            && !is_loopback_ip_literal_host(&mirror_host)
+        {
+            return Err(
+                "request_mirror: `mirror_protocol` is `http` (the default) to a `mirror_host` that is not a loopback IP literal, which is rejected by default; set `mirror_protocol: https` or `allow_plaintext: true`"
+                    .to_string(),
+            );
+        }
+
         let default_port: u16 = if mirror_protocol == "https" { 443 } else { 80 };
         let mirror_port = optional_u64(config, "mirror_port")?
             .map(|p| {
@@ -3624,7 +3644,7 @@ mod tests {
     #[test]
     fn build_mirror_url_preserves_raw_query_edge_cases_byte_for_byte() {
         let plugin = RequestMirror::new(
-            &json!({ "mirror_host": "mirror.example", "mirror_port": 8080 }),
+            &json!({ "mirror_host": "mirror.example", "mirror_port": 8080, "allow_plaintext": true }),
             PluginHttpClient::default(),
         )
         .unwrap();

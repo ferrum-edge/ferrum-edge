@@ -2194,7 +2194,11 @@ async fn matchless_virtualservice_preserves_header_transforms() {
 
 /// A VirtualService `http[].mirror` translates to a proxy-scoped
 /// `request_mirror` plugin whose config drives an actual fire-and-forget
-/// mirror against the configured target.
+/// mirror against the configured target. The mirror leaves the proxy in
+/// cleartext (not over mesh mTLS), so translation emits it only for a loopback
+/// IP literal destination (GHSA-gcwp-xp94-4pcv; the omission for a Service
+/// host is pinned by
+/// `mesh_tier3_mirror_to_service_host_is_omitted_and_route_still_translates`).
 #[tokio::test]
 async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     use ferrum_edge::plugins::create_plugin;
@@ -2207,7 +2211,7 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
                 "http": [{
                     "match": [{"uri": {"prefix": "/v1"}}],
                     "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
-                    "mirror": {"host": "shadow.default.svc.cluster.local", "port": {"number": 9090}},
+                    "mirror": {"host": "127.0.0.1", "port": {"number": 9090}},
                     "mirrorPercentage": {"value": 100.0}
                 }]
             }),
@@ -2222,10 +2226,7 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
         .iter()
         .find(|p| p.plugin_name == "request_mirror")
         .expect("request_mirror plugin emitted for http[].mirror");
-    assert_eq!(
-        mirror.config["mirror_host"].as_str(),
-        Some("shadow.default.svc.cluster.local")
-    );
+    assert_eq!(mirror.config["mirror_host"].as_str(), Some("127.0.0.1"));
     assert_eq!(mirror.config["mirror_port"].as_u64(), Some(9090));
 
     // The emitted config builds into a real plugin instance, and the
@@ -2269,7 +2270,7 @@ async fn mesh_tier3_mirror_and_exact_rewrite_share_one_route_scope() {
                         "authority": "internal.example.com"
                     },
                     "mirror": {
-                        "host": "shadow.default.svc.cluster.local",
+                        "host": "127.0.0.1",
                         "port": {"number": 9090}
                     },
                     "mirrorPercentage": {"value": 100.0}
@@ -2298,7 +2299,7 @@ async fn mesh_tier3_mirror_and_exact_rewrite_share_one_route_scope() {
         .expect("route-local mirror plugin");
     assert_eq!(
         mirror_config.config["mirror_host"].as_str(),
-        Some("shadow.default.svc.cluster.local")
+        Some("127.0.0.1")
     );
 
     let rewrite = &dispatch_config.config["rules"][0]["rewrite"];
@@ -2327,6 +2328,53 @@ async fn mesh_tier3_mirror_and_exact_rewrite_share_one_route_scope() {
     );
 }
 
+/// A mirror to a Service host would leave the proxy in cleartext (it does
+/// not ride mesh mTLS) and an Istio VirtualService cannot express the
+/// plaintext opt-in, so the mirror is omitted, never silently opted in, while
+/// the route itself still translates and serves (GHSA-gcwp-xp94-4pcv). The
+/// Istio status writer reports the omission in `deferred_fields`.
+#[test]
+fn mesh_tier3_mirror_to_service_host_is_omitted_and_route_still_translates() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/v1"}}],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                    "mirror": {"host": "shadow.default.svc.cluster.local", "port": {"number": 9090}},
+                    "mirrorPercentage": {"value": 100.0}
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("the VirtualService translates; only the mirror is omitted");
+    assert!(
+        !result
+            .config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.plugin_name == "request_mirror"),
+        "no cleartext mirror may be emitted for a Service-host mirror"
+    );
+    assert!(
+        result
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.listen_path.as_deref() == Some("/v1")),
+        "the primary route must still be translated: {:?}",
+        result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.listen_path.as_deref())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn mesh_tier3_route_local_mirror_fails_closed_when_route_collapse_is_required() {
     let error = translate_k8s_objects(
@@ -2346,7 +2394,7 @@ fn mesh_tier3_route_local_mirror_fails_closed_when_route_collapse_is_required() 
                             "authority": "canary.internal.example.com"
                         },
                         "mirror": {
-                            "host": "shadow.default.svc.cluster.local",
+                            "host": "127.0.0.1",
                             "port": {"number": 9191}
                         },
                         "mirrorPercentage": {"value": 100.0}

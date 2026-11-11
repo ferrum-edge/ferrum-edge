@@ -1605,12 +1605,27 @@ impl MeshSlice {
         // from. The enforcement and dry-run flags gate Sidecar resolution so
         // existing deployments see zero behavior change unless one of the
         // rollout flags is enabled.
+        //
+        // SECURITY (GHSA-mhm9-gp97-237q): on a `labels_ambiguous` slice
+        // `effective_labels` is only the INTERSECTION of several same-SPIFFE
+        // workloads' divergent label sets, so a `workloadSelector` Sidecar that
+        // really selects one of them can miss it and egress narrowing would
+        // fall through to a wider tier (or to none). The same candidate label
+        // sets the #3262 outbound-policy fold uses are resolved here too and
+        // every distinct scope must admit a resource (strictest wins). See
+        // `resolve_applicable_sidecar_egress_scopes`.
+        let ambiguous_policy_candidates: &[&BTreeMap<String, String>] = if labels_ambiguous {
+            &policy_candidate_labels
+        } else {
+            &[]
+        };
         let resolved_sidecar = if sidecar_enforced || sidecar_dry_run {
-            resolve_applicable_sidecar_egress(
+            resolve_applicable_sidecar_egress_scopes(
                 &mesh.sidecars,
                 effective_namespace,
                 &effective_labels,
                 mesh.istio_root_namespace.as_str(),
+                ambiguous_policy_candidates,
             )
         } else {
             None
@@ -1618,7 +1633,7 @@ impl MeshSlice {
         let applicable_sidecar = if sidecar_dry_run {
             None
         } else {
-            resolved_sidecar
+            resolved_sidecar.as_ref()
         };
 
         // ONE `select_applicable_sidecar` scan, shared by the two consumers that
@@ -1673,11 +1688,6 @@ impl MeshSlice {
         // default. The extra candidate label sets are therefore passed in (empty
         // unless ambiguous) and the resolution folds them fail-closed. See
         // `resolve_applicable_sidecar_outbound_policy`.
-        let ambiguous_policy_candidates: &[&BTreeMap<String, String>] = if labels_ambiguous {
-            &policy_candidate_labels
-        } else {
-            &[]
-        };
         let sidecar_outbound_traffic_policy = if sidecar_enforced && !sidecar_dry_run {
             resolve_applicable_sidecar_outbound_policy(
                 &mesh.sidecars,
@@ -1761,9 +1771,7 @@ impl MeshSlice {
                             .iter()
                             .map(String::as_str)
                             .collect();
-                        sidecar_egress_includes_service(
-                            sidecar.namespace,
-                            sidecar.egress,
+                        sidecar.includes_service(
                             &host_scope.scope_namespace,
                             &host_refs,
                             Some(&[*port]),
@@ -1793,7 +1801,7 @@ impl MeshSlice {
                     )
                     .then(|| service.clone());
                 };
-                narrow_service_ports(service, sidecar, &cluster_domain)
+                sidecar.narrow_service(service, &cluster_domain)
             })
             .collect();
         // Inbound serving must not be gated by egress scope. When a Sidecar
@@ -1975,7 +1983,7 @@ impl MeshSlice {
                 let Some(sidecar) = applicable_sidecar else {
                     return vec![entry.clone()];
                 };
-                narrow_service_entry_ports(entry, sidecar)
+                sidecar.narrow_service_entry(entry)
             })
             .collect();
         // A waypoint (NodeWaypoint or ServiceWaypoint) terminates requests for
@@ -2045,13 +2053,7 @@ impl MeshSlice {
                     ) || dr.namespace.trim() == mesh.istio_root_namespace.trim();
                 };
                 let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
-                sidecar_egress_includes_service(
-                    sidecar.namespace,
-                    sidecar.egress,
-                    resource_namespace,
-                    &host_refs,
-                    None,
-                )
+                sidecar.includes_service(resource_namespace, &host_refs, None)
             },
         );
         // VirtualService-derived CORS policies narrow EXACTLY like
@@ -2108,13 +2110,7 @@ impl MeshSlice {
                     .iter()
                     .map(String::as_str)
                     .collect();
-                sidecar_egress_includes_service(
-                    sidecar.namespace,
-                    sidecar.egress,
-                    &host_scope.scope_namespace,
-                    &host_refs,
-                    None,
-                )
+                sidecar.includes_service(&host_scope.scope_namespace, &host_refs, None)
             })
             .cloned()
             .collect();
@@ -2145,7 +2141,7 @@ impl MeshSlice {
                 workloads
             };
 
-        let sidecar_egress_scope = resolved_sidecar.map(|sidecar| {
+        let sidecar_egress_scope = resolved_sidecar.as_ref().map(|sidecar| {
             build_sidecar_egress_scope_snapshot(EgressScopeBuildContext {
                 mesh,
                 sidecar,
@@ -2962,7 +2958,7 @@ struct AdmittedEgressScope<'a> {
 
 struct EgressScopeBuildContext<'a> {
     mesh: &'a MeshConfig,
-    sidecar: ResolvedSidecarEgress<'a>,
+    sidecar: &'a SidecarEgressScopes<'a>,
     /// `Some` when `sidecar` is the slice's applied Sidecar (not dry-run):
     /// the snapshot then reports the slice's own admitted set verbatim.
     admitted: Option<AdmittedEgressScope<'a>>,
@@ -2998,13 +2994,13 @@ fn build_sidecar_egress_scope_snapshot(
             let services: Vec<MeshService> = mesh
                 .services
                 .iter()
-                .filter_map(|service| narrow_service_ports(service, sidecar, cluster_domain))
+                .filter_map(|service| sidecar.narrow_service(service, cluster_domain))
                 .collect();
             let service_entries: Vec<ServiceEntry> = mesh
                 .service_entries
                 .iter()
                 .filter(|entry| service_entry_applies_to_workload(entry, workload_namespace))
-                .flat_map(|entry| narrow_service_entry_ports(entry, sidecar))
+                .flat_map(|entry| sidecar.narrow_service_entry(entry))
                 .collect();
             // The operator-facing egress-scope snapshot must report the SAME
             // admitted set the live slice serves, so it runs the one shared
@@ -3023,13 +3019,7 @@ fn build_sidecar_egress_scope_snapshot(
                 &destination_rule_scope,
                 |_dr, resource_namespace, host_candidates| {
                     let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
-                    sidecar_egress_includes_service(
-                        sidecar.namespace,
-                        sidecar.egress,
-                        resource_namespace,
-                        &host_refs,
-                        None,
-                    )
+                    sidecar.includes_service(resource_namespace, &host_refs, None)
                 },
             );
             (services, service_entries, destination_rules)
@@ -4332,6 +4322,158 @@ fn sidecar_host_match_namespace<'a>(
 struct ResolvedSidecarEgress<'a> {
     namespace: &'a str,
     egress: &'a [MeshSidecarEgress],
+}
+
+impl ResolvedSidecarEgress<'_> {
+    /// Two resolutions are the same scope when they match hosts against the
+    /// same namespace with the same egress listeners.
+    fn same_scope(&self, other: &ResolvedSidecarEgress<'_>) -> bool {
+        self.namespace == other.namespace && self.egress == other.egress
+    }
+}
+
+/// The Sidecar egress scope(s) a slice must satisfy (GHSA-mhm9-gp97-237q).
+///
+/// Normally exactly one [`ResolvedSidecarEgress`]. On a `labels_ambiguous`
+/// slice it holds every distinct scope the intersection labels or any
+/// candidate label set resolves, and a resource is admitted only when EVERY
+/// scope admits it: the egress counterpart of the #3262 strictest-wins
+/// outbound-policy fold. Admission is therefore order-independent, and a
+/// candidate that resolves no narrowing at all contributes nothing (the
+/// identity of an intersection), so ambiguity can only narrow.
+///
+/// Never empty: built only by [`Self::single`] / [`resolve_applicable_sidecar_egress_scopes`],
+/// and every check fails closed if it ever were.
+#[derive(Debug, Clone)]
+struct SidecarEgressScopes<'a> {
+    scopes: Vec<ResolvedSidecarEgress<'a>>,
+}
+
+impl<'a> SidecarEgressScopes<'a> {
+    fn single(scope: ResolvedSidecarEgress<'a>) -> Self {
+        Self {
+            scopes: vec![scope],
+        }
+    }
+
+    /// [`sidecar_egress_includes_service`] for every scope.
+    fn includes_service(
+        &self,
+        resource_namespace: &str,
+        host_candidates: &[&str],
+        resource_ports: Option<&[u16]>,
+    ) -> bool {
+        !self.scopes.is_empty()
+            && self.scopes.iter().all(|scope| {
+                sidecar_egress_includes_service(
+                    scope.namespace,
+                    scope.egress,
+                    resource_namespace,
+                    host_candidates,
+                    resource_ports,
+                )
+            })
+    }
+
+    /// [`narrow_service_ports`] through every scope: the service survives
+    /// with the ports every scope admits, or not at all.
+    fn narrow_service(&self, service: &MeshService, cluster_domain: &str) -> Option<MeshService> {
+        let (first, rest) = self.scopes.split_first()?;
+        let mut narrowed = narrow_service_ports(service, *first, cluster_domain)?;
+        for scope in rest {
+            narrowed = narrow_service_ports(&narrowed, *scope, cluster_domain)?;
+        }
+        Some(narrowed)
+    }
+
+    /// [`narrow_service_entry_ports`] through every scope: each host keeps
+    /// the ports every scope admits for it.
+    fn narrow_service_entry(&self, entry: &ServiceEntry) -> Vec<ServiceEntry> {
+        let Some((first, rest)) = self.scopes.split_first() else {
+            return Vec::new();
+        };
+        let mut narrowed = narrow_service_entry_ports(entry, *first);
+        for scope in rest {
+            narrowed = narrowed
+                .iter()
+                .flat_map(|entry| narrow_service_entry_ports(entry, *scope))
+                .collect();
+        }
+        narrowed
+    }
+}
+
+/// Resolve the Sidecar egress scope(s) for a slice (GHSA-mhm9-gp97-237q).
+///
+/// `ambiguous_candidate_labels` is EMPTY on an unambiguous slice, and the
+/// result is then exactly [`resolve_applicable_sidecar_egress`] for
+/// `effective_labels`. It is non-empty only on a `labels_ambiguous` slice,
+/// where `effective_labels` is merely the intersection of several same-SPIFFE
+/// workloads' divergent label sets. A `workloadSelector` Sidecar that really
+/// selects one of those workloads can then miss the intersection, and the
+/// resolution would fall through to a namespace default (or to no narrowing),
+/// handing the workload destinations its own Sidecar excluded.
+///
+/// This applies the rule issue #3262 settled for `outboundTrafficPolicy`
+/// (`resolve_applicable_sidecar_outbound_policy`): resolve each candidate label
+/// set on its own and keep the strictest outcome. For egress scope "strictest"
+/// is the intersection of the admitted views, so every distinct resolved scope
+/// is kept and a resource must satisfy all of them. The intersection-derived
+/// scope is included, so the fold only ever narrows; cold path, once per slice
+/// build, bounded by `candidates × sidecars`.
+fn resolve_applicable_sidecar_egress_scopes<'a>(
+    sidecars: &'a [MeshSidecar],
+    workload_namespace: &'a str,
+    effective_labels: &BTreeMap<String, String>,
+    istio_root_namespace: &str,
+    ambiguous_candidate_labels: &[&BTreeMap<String, String>],
+) -> Option<SidecarEgressScopes<'a>> {
+    let intersection = resolve_applicable_sidecar_egress(
+        sidecars,
+        workload_namespace,
+        effective_labels,
+        istio_root_namespace,
+    );
+    if ambiguous_candidate_labels.is_empty() {
+        return intersection.map(SidecarEgressScopes::single);
+    }
+
+    let mut scopes: Vec<ResolvedSidecarEgress<'a>> = intersection.into_iter().collect();
+    for labels in ambiguous_candidate_labels {
+        let Some(scope) = resolve_applicable_sidecar_egress(
+            sidecars,
+            workload_namespace,
+            *labels,
+            istio_root_namespace,
+        ) else {
+            continue;
+        };
+        if !scopes.iter().any(|existing| existing.same_scope(&scope)) {
+            scopes.push(scope);
+        }
+    }
+
+    let intersection_scopes = usize::from(intersection.is_some());
+    if scopes.len() == intersection_scopes {
+        debug!(
+            candidates = ambiguous_candidate_labels.len(),
+            "Ambiguous workload labels did not change the Sidecar egress scope"
+        );
+    } else {
+        warn!(
+            namespace = %sanitize_startup_cause(
+                format!("{:?}", workload_namespace.to_string()),
+                &[]
+            ),
+            candidates = ambiguous_candidate_labels.len(),
+            intersection_scope = intersection.is_some(),
+            resolved_scopes = scopes.len(),
+            "Workload labels are ambiguous (several workloads share this SPIFFE id with divergent \
+             labels); narrowing the Sidecar egress scope to what every Sidecar any candidate could \
+             select admits. Set explicit workload labels to resolve it exactly"
+        );
+    }
+    (!scopes.is_empty()).then_some(SidecarEgressScopes { scopes })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

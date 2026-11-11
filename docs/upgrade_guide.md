@@ -28,6 +28,53 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `request_mirror` refuses cleartext to a non-loopback host without `allow_plaintext` (GHSA-gcwp-xp94-4pcv, #6659)
+
+`request_mirror` now follows the plugin-egress rule of #6659: `mirror_protocol:
+http` (still the default) is admitted without an opt-in only when `mirror_host`
+is a loopback IP literal (`127.0.0.0/8`, `::1`). Any other host is refused at
+construction like any other invalid `KeepLastKnownGood` plugin config: the
+Admin API returns 400, a reload or data-plane update that carries one is
+rejected and the last accepted configuration keeps serving, and a file- or
+database-mode startup that loads one fails. Fix existing configs before
+upgrading. The mirror replays the
+backend-visible request, body included by default, so this closes a path that
+sent request bodies (and any allowlisted credentials) in cleartext.
+
+**Operator action:** for every `request_mirror` whose `mirror_host` is a name
+or a non-loopback IP, set `mirror_protocol: https` (and `mirror_port` if the
+mirror's TLS port is not 443). Only where the path to the mirror is otherwise
+protected, set `allow_plaintext: true` instead.
+
+Istio `VirtualService.http[].mirror` translation changes with it. Ferrum's
+mirror dials the destination directly from the proxy process, not over mesh
+mTLS, and a VirtualService cannot express the opt-in, so a non-zero mirror to
+any host other than a loopback IP literal is now **omitted**: the
+VirtualService and its routes keep translating (`FerrumAccepted=True`), no
+mirror traffic is sent, and `status.ferrum.translation.deferred_fields` names
+the omitted `http[].mirror` with the reason. **Operator action:** if you rely
+on that mirroring, configure it with a native `request_mirror` plugin using
+`mirror_protocol: https`; otherwise remove the `mirror` block to clear the
+deferred field.
+
+### CNI ADD fails closed until an opted-in pod is enrolled (GHSA-7x6j-vmqm-xx2v)
+
+With `nodeAgent.cni.enabled=true`, ADD now enrolls an opted-in pod from the
+primary CNI's `prevResult` addresses and returns a CNI error (kubelet retries
+the sandbox) instead of acknowledging it when the pod's Kubernetes metadata
+cannot be read, when the API pod UID is missing or differs from
+`K8S_POD_UID`, or when an opted-in pod's enrollment did not land.
+
+**Operator action:** on a CNI that gives every pod a dedicated host route
+(an exact `/32` or `/128` route to a per-pod veth) nothing changes except that
+enrollment now happens before the pod starts. On a CNI that reaches pods only
+through a shared device (`cni0`, Cilium's default `cilium_host`), the
+node-agent could never capture those pods; opted-in pods there now stay in
+`ContainerCreating`, so remove the mesh opt-in or the chained conflist on such
+nodes. The new ADD request field means `ferrum-cni` and the node-agent must run
+the same build; the chart installs the binary from the node-agent DaemonSet, so
+a normal rolling upgrade keeps them in step.
+
 ### ferrum-mesh chart value removals (#7297, #7299)
 
 Two `charts/ferrum-mesh` values are removed. The values schema rejects them, so
@@ -140,8 +187,10 @@ Leave `emit_metadata` at its default `true` if dashboards read those keys.
 
 ### WebSocket frame records spell `direction` like every other record (#7144)
 
-`ws_frame_logging` frame records (the `ws_frame_log` tracing target) and the
-`ws_rate_limiting` and `waf` WebSocket warnings now write `direction` as
+`ws_frame_logging` frame records (the `ws_frame_log` tracing target), the
+`ws_rate_limiting` and `waf` WebSocket warnings, and the WebSocket relay's
+size-policy warnings (`ws_message_size_limiting`, the global message limit,
+incomplete-message and permessage-deflate rejections) now write `direction` as
 `client_to_backend` / `backend_to_client`, the spelling the `ws_frame_logging`
 `direction` filter, its disconnect records, stream summaries, metrics and
 traces already used. They wrote `client->backend` / `backend->client` before.

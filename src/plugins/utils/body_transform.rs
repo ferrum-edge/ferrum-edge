@@ -206,6 +206,9 @@ fn set_nested_value_inner(
 
 /// Remove the value at a compiled dot-notation path, returning it if it
 /// existed. For arrays this uses `Vec::remove`, which shifts later elements.
+/// For objects the remaining members keep their order: `Map::remove` is a
+/// swap-remove under serde_json's `preserve_order` (which this build enables
+/// transitively), and it would move the last member into the removed slot.
 fn remove_nested_value_compiled(root: &mut Value, path: &CompiledPath) -> Option<Value> {
     let mut iter = path.segments.iter().peekable();
     iter.peek()?;
@@ -215,7 +218,18 @@ fn remove_nested_value_compiled(root: &mut Value, path: &CompiledPath) -> Option
         if iter.peek().is_none() {
             // Terminal: remove at current.
             return match current {
-                Value::Object(map) => map.remove(segment),
+                Value::Object(map) => {
+                    let mut removed = None;
+                    map.retain(|key, value| {
+                        if removed.is_none() && key == segment {
+                            removed = Some(std::mem::take(value));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    removed
+                }
                 Value::Array(arr) => segment.parse::<usize>().ok().and_then(|i| {
                     if i < arr.len() {
                         Some(arr.remove(i))

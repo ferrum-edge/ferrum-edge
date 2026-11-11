@@ -1024,7 +1024,7 @@ fn outbound_destination_paths_are_projected() {
     );
     let root = project(
         "request_mirror",
-        json!({"mirror_host": "shadow.internal", "mirror_path": "/"}),
+        json!({"allow_plaintext": true, "mirror_host": "shadow.internal", "mirror_path": "/"}),
     );
     assert_eq!(root["mirror_path"], "/");
 

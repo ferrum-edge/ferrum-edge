@@ -284,6 +284,7 @@ pub fn probe_node_agent_status(config: &RollbackWatchConfig) -> bool {
         ifname: None,
         netns_path: None,
         valid_attachments: Vec::new(),
+        pod_ips: Vec::new(),
     };
     if request.validate().is_err() {
         return false;

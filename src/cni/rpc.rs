@@ -33,6 +33,10 @@ pub const MAX_RPC_BYTES: usize = 1024 * 1024;
 /// Length-prefix size in bytes (big-endian `u32` of the JSON body length).
 pub const LENGTH_PREFIX_BYTES: usize = 4;
 
+/// Most pod addresses one ADD may carry (a dual-stack pod has two; a few more
+/// allow for secondary addresses the primary CNI reports on the pod interface).
+pub const MAX_CNI_POD_IPS: usize = 8;
+
 /// The verb the CNI binary is asking the node-agent to perform. Mirrors
 /// the CNI `ADD`/`DEL`/`CHECK`/`STATUS`/`GC` lifecycle one-for-one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +115,13 @@ pub struct CniRpcRequest {
     /// Already bounded/validated by the CNI binary before the RPC is sent.
     #[serde(default)]
     pub valid_attachments: Vec<CniValidAttachment>,
+    /// Pod addresses the primary CNI allocated for this attachment, read from
+    /// the chained `prevResult` on [`RpcVerb::Add`] (GHSA-7x6j-vmqm-xx2v).
+    /// Kubernetes publishes `status.podIP` only after ADD returns, so this is
+    /// the node-agent's only way to resolve the pod's dedicated host route and
+    /// enroll it before kubelet starts the pod. Empty for every other verb.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pod_ips: Vec<std::net::IpAddr>,
 }
 
 impl<'de> Deserialize<'de> for CniRpcRequest {
@@ -140,6 +151,8 @@ impl<'de> Deserialize<'de> for CniRpcRequest {
                 deserialize_with = "crate::util::json_object::deserialize_optional_object_vec"
             )]
             valid_attachments: Option<Vec<CniValidAttachment>>,
+            #[serde(default)]
+            pod_ips: Vec<std::net::IpAddr>,
         }
 
         let wire = WireRequest::deserialize(deserializer)?;
@@ -156,6 +169,7 @@ impl<'de> Deserialize<'de> for CniRpcRequest {
             ifname: wire.ifname,
             netns_path: wire.netns_path,
             valid_attachments: wire.valid_attachments.unwrap_or_default(),
+            pod_ips: wire.pod_ips,
         })
     }
 }
@@ -199,6 +213,17 @@ impl CniRpcRequest {
         if !self.valid_attachments.is_empty() {
             return Err("non-GC request contains a GC attachment set".to_string());
         }
+        if !self.pod_ips.is_empty() {
+            if self.verb != RpcVerb::Add {
+                return Err("non-ADD request contains pod addresses".to_string());
+            }
+            if self.pod_ips.len() > MAX_CNI_POD_IPS {
+                return Err("ADD request contains too many pod addresses".to_string());
+            }
+            if self.pod_ips.iter().any(|ip| !is_assignable_pod_ip(*ip)) {
+                return Err("ADD request contains an invalid pod address".to_string());
+            }
+        }
         if !is_safe_k8s_namespace(&self.pod_namespace) {
             return Err("invalid Kubernetes pod namespace".to_string());
         }
@@ -230,6 +255,14 @@ impl CniRpcRequest {
         }
         Ok(())
     }
+}
+
+/// A unicast address a primary CNI can assign to a pod interface.
+fn is_assignable_pod_ip(ip: std::net::IpAddr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast())
 }
 
 fn is_safe_k8s_namespace(value: &str) -> bool {
@@ -335,6 +368,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(!json.contains("pod_uid"));
@@ -358,6 +392,7 @@ mod tests {
                 container_id: "ctr-1".to_string(),
                 ifname: "eth0".to_string(),
             }],
+            pod_ips: Vec::new(),
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let back: CniRpcRequest = serde_json::from_str(&json).expect("deserialize");
@@ -405,6 +440,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let frame = encode_frame(&req).expect("encode");
         assert!(frame.len() > LENGTH_PREFIX_BYTES);
@@ -431,6 +467,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let err = encode_frame(&req).expect_err("oversized payload should reject");
         assert!(

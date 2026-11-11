@@ -1676,9 +1676,17 @@ fn listener_is_effective_tls_serving_claim(
 /// no effective claim, so they cannot poison a healthy physical slot.
 ///
 /// Refusals are order-independent: they are decided from the fully collected
-/// listener-policy set and complete namespace credential plan, and every
-/// physically competing effective claim is refused rather than guessing a
-/// winner. Canonical translation publishes this helper's conflicts in
+/// listener-policy set and complete namespace credential plan. The winner is
+/// never guessed from observation order; it follows Gateway API precedence
+/// (GEP-1713), extended across parents because the socket is shared
+/// (GHSA-496f-3547-p3fw): every Gateway's own listeners form the first tier,
+/// then each ListenerSet in the global oldest-`creationTimestamp`, then
+/// `{namespace}/{name}` order (`listenerset::listener_claim_precedence`). When
+/// the first tier holding a claim on the port is compatible with itself, only
+/// the later incompatible claims are refused, so a ListenerSet can never
+/// withdraw a Gateway's (or an older ListenerSet's) listener. When the first
+/// tier is itself incompatible — peer Gateways, or one owner's own listeners —
+/// every physically competing effective claim is refused. Canonical translation publishes this helper's conflicts in
 /// `K8sTranslation`; the status-only conflict context also runs it solely to
 /// keep route-conflict indexing aligned. Gateway listener status consumes the
 /// published physical and hostname conflict maps instead of independently
@@ -1694,8 +1702,9 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
     #[derive(Default)]
     struct PortClaims {
         plaintext: Vec<GatewayApiListenerKey>,
-        /// Materializable TLS listeners on this physical port.
-        effective_tls: Vec<GatewayApiListenerKey>,
+        /// Materializable TLS listeners on this physical port, with the
+        /// Gateway namespace whose serving slot each one competes for.
+        effective_tls: Vec<(GatewayApiListenerKey, String)>,
         /// Namespaces with an effective TLS serving claim on this port.
         effective_tls_namespaces: BTreeSet<String>,
         /// Distinct complete namespace credential sets used by those claims.
@@ -1739,7 +1748,10 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
             let claims = claims_by_port.entry(port).or_default();
             if policy.requires_frontend_tls {
                 if listener_is_effective_tls_serving_claim(key, policy, &plan) {
-                    claims.effective_tls.push(key.clone());
+                    claims.effective_tls.push((
+                        key.clone(),
+                        gateway_frontend_tls_slot_namespace(key, policy).to_string(),
+                    ));
                     claims
                         .effective_tls_namespaces
                         .insert(gateway_frontend_tls_slot_namespace(key, policy).to_string());
@@ -1768,46 +1780,126 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
             if !protocol_conflict && !credential_conflict {
                 continue;
             }
+            // Gateway API precedence (GEP-1713: the first listener in the
+            // precedence list MUST be accepted, later conflicting ones MUST be
+            // Conflicted), extended across parents because the socket is
+            // shared (GHSA-496f-3547-p3fw): every Gateway's own listeners are
+            // the first tier, then each ListenerSet in the global
+            // creation-time/name order. When the first tier holding a claim
+            // on this port is itself compatible, only the later incompatible
+            // claims are refused; a first tier that is itself incompatible
+            // (peer Gateways, or one owner's own listeners) withdraws every
+            // conflicting claim, as before.
+            //
             // Deterministic bounded wording: numeric port + fixed conflict
             // category only. Never join listener keys or echo namespace /
             // Gateway / ListenerSet / listener / hostname / credential strings
             // (cross-tenant disclosure on Gateway.status.listeners[]).
-            let (reason, refused_keys, message) = if protocol_conflict {
-                (
-                    "ProtocolConflict",
-                    claims
-                        .plaintext
-                        .iter()
-                        .chain(claims.effective_tls.iter())
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    format!(
-                        "Port \"{port}\" is claimed by both plaintext and an effective TLS-serving \
-                         frontend shape, so every conflicting claim on this port is refused \
-                         (Conflicted)."
-                    ),
-                )
+            let precedence = |key: &GatewayApiListenerKey| {
+                super::listenerset::listener_claim_precedence(&*acc, key)
+            };
+            let mut refuse = |key: &GatewayApiListenerKey, reason: &'static str, message: &str| {
+                refused.push((
+                    key.clone(),
+                    GatewayApiListenerConflict {
+                        reason,
+                        message: message.to_string(),
+                    },
+                ));
+            };
+            if protocol_conflict {
+                let first_tier = claims
+                    .plaintext
+                    .iter()
+                    .chain(claims.effective_tls.iter().map(|(key, _)| key))
+                    .map(precedence)
+                    .min()
+                    .unwrap_or(0);
+                let first_plaintext = claims
+                    .plaintext
+                    .iter()
+                    .any(|key| precedence(key) == first_tier);
+                let first_tls = claims
+                    .effective_tls
+                    .iter()
+                    .any(|(key, _)| precedence(key) == first_tier);
+                let precedence_message = format!(
+                    "Port \"{port}\" is already claimed by a higher-precedence listener with the \
+                     other frontend shape (plaintext vs effective TLS-serving), so this claim is \
+                     refused (Conflicted)."
+                );
+                match (first_plaintext, first_tls) {
+                    (true, false) => {
+                        warnings.push(precedence_message.clone());
+                        for (key, _) in &claims.effective_tls {
+                            refuse(key, "ProtocolConflict", precedence_message.as_str());
+                        }
+                    }
+                    (false, true) => {
+                        warnings.push(precedence_message.clone());
+                        for key in &claims.plaintext {
+                            refuse(key, "ProtocolConflict", precedence_message.as_str());
+                        }
+                    }
+                    _ => {
+                        let message = format!(
+                            "Port \"{port}\" is claimed by both plaintext and an effective \
+                             TLS-serving frontend shape, so every conflicting claim on this port \
+                             is refused (Conflicted)."
+                        );
+                        warnings.push(message.clone());
+                        for key in claims
+                            .plaintext
+                            .iter()
+                            .chain(claims.effective_tls.iter().map(|(key, _)| key))
+                        {
+                            refuse(key, "ProtocolConflict", message.as_str());
+                        }
+                    }
+                }
             } else {
-                (
-                    "HostnameConflict",
-                    claims.effective_tls,
-                    format!(
+                let credentials_for = |namespace: &str| {
+                    plan.serving_by_namespace_port
+                        .get(&(namespace.to_string(), port))
+                };
+                let first_tier = claims
+                    .effective_tls
+                    .iter()
+                    .map(|(key, _)| precedence(key))
+                    .min()
+                    .unwrap_or(0);
+                let first_tier_credentials: BTreeSet<Option<&BTreeSet<(String, String)>>> = claims
+                    .effective_tls
+                    .iter()
+                    .filter(|(key, _)| precedence(key) == first_tier)
+                    .map(|(_, namespace)| credentials_for(namespace.as_str()))
+                    .collect();
+                if first_tier_credentials.len() == 1
+                    && let Some(winner) = first_tier_credentials.into_iter().next()
+                {
+                    let message = format!(
+                        "Port \"{port}\" is already served by a higher-precedence listener with a \
+                         different effective TLS credential set, so this claim is refused \
+                         (Conflicted)."
+                    );
+                    warnings.push(message.clone());
+                    for (key, namespace) in &claims.effective_tls {
+                        if credentials_for(namespace.as_str()) != winner {
+                            refuse(key, "HostnameConflict", message.as_str());
+                        }
+                    }
+                } else {
+                    let message = format!(
                         "Port \"{port}\" has incompatible effective TLS credential sets across \
                          namespaces, so every conflicting claim on this port is refused \
                          (Conflicted)."
-                    ),
-                )
-            };
-            warnings.push(message.clone());
-            refused.extend(refused_keys.into_iter().map(|key| {
-                (
-                    key,
-                    GatewayApiListenerConflict {
-                        reason,
-                        message: message.clone(),
-                    },
-                )
-            }));
+                    );
+                    warnings.push(message.clone());
+                    for (key, _) in &claims.effective_tls {
+                        refuse(key, "HostnameConflict", message.as_str());
+                    }
+                }
+            }
         }
 
         if refused.is_empty() {

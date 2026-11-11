@@ -515,6 +515,64 @@ pub struct FerrumCniOptions {
     pub socket_path: Option<String>,
 }
 
+/// Pod addresses from a chained `prevResult` (CNI result `ips[]`), for the
+/// node-agent to enroll the pod at ADD before `status.podIP` exists
+/// (GHSA-7x6j-vmqm-xx2v).
+///
+/// An address counts when its `interface` index names an interface that has a
+/// `sandbox` (the container side), or when it names no interface at all; an
+/// address explicitly on a host-side interface is skipped. Malformed entries
+/// are skipped, never guessed. The result is deduplicated and bounded by
+/// [`crate::cni::rpc::MAX_CNI_POD_IPS`]; a missing or pre-0.3 (`ip4`/`ip6`)
+/// `prevResult` yields none.
+pub fn prev_result_pod_ips(prev_result: Option<&serde_json::Value>) -> Vec<std::net::IpAddr> {
+    let Some(result) = prev_result.and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let interfaces = result
+        .get("interfaces")
+        .and_then(serde_json::Value::as_array);
+    let Some(ips) = result.get("ips").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<std::net::IpAddr> = Vec::new();
+    for entry in ips {
+        if out.len() >= crate::cni::rpc::MAX_CNI_POD_IPS {
+            break;
+        }
+        let Some(entry) = entry.as_object() else {
+            continue;
+        };
+        if let Some(index) = entry.get("interface") {
+            let Some(index) = index.as_u64().and_then(|i| usize::try_from(i).ok()) else {
+                continue;
+            };
+            let in_sandbox = interfaces
+                .and_then(|interfaces| interfaces.get(index))
+                .and_then(|interface| interface.get("sandbox"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|sandbox| !sandbox.is_empty());
+            if !in_sandbox {
+                continue;
+            }
+        }
+        let Some(address) = entry.get("address").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let host = address.split_once('/').map_or(address, |(host, _)| host);
+        let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+            continue;
+        }
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 /// CNI result returned on stdout for ADD/CHECK.
 ///
 /// Ferrum is a chained "meta-plugin" that does NOT allocate IPs or

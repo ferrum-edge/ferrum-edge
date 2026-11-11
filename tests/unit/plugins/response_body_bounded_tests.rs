@@ -91,7 +91,7 @@ async fn response_body_limit_rejections_retain_rendered_fields_for_every_caller(
         (
             "request_mirror",
             "max_response_body_bytes",
-            json!({"mirror_host": "mirror.example.test"}),
+            json!({"allow_plaintext": true, "mirror_host": "mirror.example.test"}),
         ),
         (
             "opa",

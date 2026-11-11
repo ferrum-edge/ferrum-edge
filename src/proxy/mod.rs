@@ -22645,7 +22645,7 @@ where
                                     plugin = "ws_message_size_limiting",
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
-                                    direction = "client->backend",
+                                    direction = "client_to_backend",
                                     limit_kind,
                                     size,
                                     max_size,
@@ -22677,7 +22677,7 @@ where
                                 warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
-                                    direction = "client->backend",
+                                    direction = "client_to_backend",
                                     limit_kind,
                                     size,
                                     max_size,
@@ -22703,7 +22703,7 @@ where
                                 warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
-                                    direction = "client->backend",
+                                    direction = "client_to_backend",
                                     limit_kind,
                                     "WebSocket incomplete-message policy rejected input before forwarding"
                                 );
@@ -22728,7 +22728,7 @@ where
                                 warn_sampled!(
                                     proxy_id = %proxy_id_ctb,
                                     connection_id,
-                                    direction = "client->backend",
+                                    direction = "client_to_backend",
                                     limit_kind,
                                     "WebSocket permessage-deflate input rejected before forwarding"
                                 );
@@ -23053,7 +23053,7 @@ where
                                     plugin = "ws_message_size_limiting",
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
-                                    direction = "backend->client",
+                                    direction = "backend_to_client",
                                     limit_kind,
                                     size,
                                     max_size,
@@ -23083,7 +23083,7 @@ where
                                 warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
-                                    direction = "backend->client",
+                                    direction = "backend_to_client",
                                     limit_kind,
                                     size,
                                     max_size,
@@ -23109,7 +23109,7 @@ where
                                 warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
-                                    direction = "backend->client",
+                                    direction = "backend_to_client",
                                     limit_kind,
                                     "WebSocket incomplete-message policy rejected input before forwarding"
                                 );
@@ -23134,7 +23134,7 @@ where
                                 warn_sampled!(
                                     proxy_id = %proxy_id_btc,
                                     connection_id,
-                                    direction = "backend->client",
+                                    direction = "backend_to_client",
                                     limit_kind,
                                     "WebSocket permessage-deflate input rejected before forwarding"
                                 );

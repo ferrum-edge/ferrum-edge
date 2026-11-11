@@ -40,6 +40,11 @@ pub(crate) use istio::cors_policy_translatable;
 // the translator accepts without enforcing, and Telemetry entries past the
 // first translated one, are reported by the same predicates that decide them.
 pub(crate) use istio::{telemetry_deferred_fields, virtual_service_retry_deferred_fields};
+// Same for `http[].mirror` / `http[].mirrors` that are valid Istio but not
+// projected (GHSA-gcwp-xp94-4pcv).
+pub(crate) use istio::{
+    virtual_service_route_mirror_is_deferred, virtual_service_route_mirrors_are_deferred,
+};
 // Shared with the Istio status writer the same way: Sidecar `ingress[]`
 // classification used by resolution and deferred-field reporting is one
 // predicate, so modeled HTTP and stream listeners cannot be reported deferred.
@@ -1131,6 +1136,13 @@ pub(crate) struct K8sAccumulator {
     /// listener this translator explicitly refused.
     pub(crate) gateway_api_listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// ListenerSet `(namespace, name)` → its index in the global Gateway API
+    /// precedence order (oldest `creationTimestamp`, then `{namespace}/{name}`),
+    /// recorded by ListenerSet admission so later physical same-port
+    /// arbitration applies the same precedence
+    /// (`listenerset::listener_claim_precedence`, GHSA-496f-3547-p3fw).
+    pub(crate) gateway_api_listenerset_precedence:
+        std::collections::BTreeMap<(String, String), u64>,
     /// Post-admission explicit-SNI collision losers and their winners.
     pub(crate) gateway_api_frontend_tls_hostname_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
@@ -1221,6 +1233,7 @@ impl K8sAccumulator {
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_frontend_tls_listeners: Vec::new(),
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
+            gateway_api_listenerset_precedence: std::collections::BTreeMap::new(),
             gateway_api_frontend_tls_hostname_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             gateway_class_name_by_gateway: HashMap::new(),

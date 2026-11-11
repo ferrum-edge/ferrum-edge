@@ -3015,9 +3015,10 @@ async fn response_lexeme_preserving_rewrite_honours_the_retained_ceiling() {
         "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
     }))
     .unwrap();
-    // Kept keys already sorted and the removed key last, so the expected bytes
-    // hold for a sorted map and for preserve_order's swap-remove alike.
-    let body = br#"{"id":18446744073709551617,"price":1.50,"debug":true}"#;
+    // The removed key comes first: removal must keep the remaining members in
+    // order (preserve_order's plain `Map::remove` swap-removed them). The kept
+    // keys are already sorted, so the bytes hold for a sorted map too.
+    let body = br#"{"debug":true,"id":18446744073709551617,"price":1.50}"#;
     let expected = br#"{"id":18446744073709551617,"price":1.50}"#;
     let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 

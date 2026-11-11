@@ -8,6 +8,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **CNI ADD no longer lets an opted-in pod start uncaptured**
+  (GHSA-7x6j-vmqm-xx2v). With the chained `ferrum-cni` conflist, ADD was
+  acknowledged when the node-agent could not read the pod from the Kubernetes
+  API, or when an opted-in pod's enrollment did not land (it never could at
+  ADD, because `status.podIP` is published only after ADD returns), so the pod
+  ran outside the mesh until the watcher caught up. `ferrum-cni` now forwards
+  the primary CNI's `prevResult` pod addresses, the node-agent enrolls the pod
+  during ADD, and ADD fails closed (kubelet retries the sandbox) when the pod
+  metadata cannot be read after one bounded retry, when the API pod UID is
+  missing or differs, or when an opted-in pod is not enrolled. Refusals log a
+  `warn!` and count in `ferrum_node_agent_cni_calls_total{verb="add",outcome="error"}`.
+  **Operator action:** none on CNIs that give each pod a dedicated host route;
+  on a CNI that reaches pods only through a shared device, opted-in pods now
+  stay in `ContainerCreating` instead of running uncaptured, so remove the mesh
+  opt-in or the chained conflist on such nodes. Upgrade `ferrum-cni` and the
+  node-agent together (the chart's DaemonSet does).
+- **A ListenerSet can no longer withdraw another tenant's Gateway listener
+  on a shared port** (GHSA-496f-3547-p3fw). A raw TCP/TLS listener (or a
+  plaintext one, or a different TLS credential set) declared in a ListenerSet
+  on a port a Gateway already served marked every claim on that port
+  `Conflicted`, including the listeners of independent Gateways. Same-port
+  conflicts now follow Gateway API precedence (GEP-1713) across the shared
+  socket: every Gateway's own listeners first, then ListenerSets oldest first,
+  then by `{namespace}/{name}`, and only the later claim is refused. Conflicts
+  between peer Gateways, or inside one Gateway or one ListenerSet, still
+  withdraw every claim on the port.
+- **Ambiguous workload labels no longer skip a workload-selector Sidecar's
+  egress scope** (GHSA-mhm9-gp97-237q). When several workloads share one
+  SPIFFE id with divergent labels and no explicit workload labels are set, the
+  slice's labels are only their intersection, so a `workloadSelector` Sidecar
+  that narrowed one of them could miss it and egress fell back to the wider
+  namespace default. The egress scope now folds every candidate like the
+  `outboundTrafficPolicy` fold of #3262: a destination rides the slice only
+  when every candidate's scope admits it. Such workloads may see fewer
+  destinations; set `FERRUM_MESH_WORKLOAD_LABELS` (or distinct service
+  accounts) to resolve the scope exactly.
+- **`request_mirror` no longer mirrors to a remote host over cleartext by
+  default** (GHSA-gcwp-xp94-4pcv). The mirror replays the backend-visible
+  request (body included by default, plus any allowlisted credentials).
+  `mirror_protocol: http`, still the default, is now admitted without the new
+  `allow_plaintext: true` only for a loopback IP literal `mirror_host`, the
+  rule every other plugin egress follows (#6659). An Istio `http[].mirror` to
+  any other host, whose mirror never rode mesh mTLS, is now omitted instead of
+  mirroring in cleartext: the VirtualService stays accepted and
+  `status.ferrum.translation.deferred_fields` reports the omitted mirror.
+  **Operator action:** set `mirror_protocol: https` on each remote mirror (or
+  `allow_plaintext: true` where the path is otherwise protected), and move
+  Istio mirrors you rely on to a native `request_mirror`; see the upgrade
+  guide.
 - **A VirtualService that derives another VirtualService's route id is refused,
   not silently shadowed** (GHSA-qw5p-g8jx-pmv8). Route proxy and weighted-split
   upstream ids are now claimed per VirtualService. A later VirtualService in
@@ -438,7 +487,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / `backend_to_client`** (issue #7144). `ws_frame_logging` frame records and
   the `ws_rate_limiting` and `waf` WebSocket warnings used `client->backend` /
   `backend->client`, unlike the `ws_frame_logging` direction filter, its
-  disconnect records, stream summaries, metrics and traces.
+  disconnect records, stream summaries, metrics and traces. The WebSocket
+  relay's size-policy warnings (`ws_message_size_limiting`, the global message
+  limit, incomplete-message and permessage-deflate rejections) now use the
+  same spelling too.
 - `plugin_triggers.missing_decision_carriers` no longer counts instances whose
   trigger reads `consumer` or `auth_method` (issue #7144). Those are undecided
   by design on stream connections and before `authenticate`; their hooks still
@@ -491,6 +543,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so future relay fixes apply to both paths at once.
 
 ### Fixed
+- An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
+  neither `clickhouse.tls.ca_file` nor `clickhouse.tls.insecure_skip_verify:
+  true` is now refused at admission with a message naming both remedies. It
+  used to be admitted and then never activate, because the TLS client refuses
+  to disable hostname verification without a pinned CA bundle.
+- Admission now refuses a `graphql` instance composed beside a request-body
+  egress plugin or at or after an `ai_semantic_cache` instance, as runtime
+  plugin-cache construction already did (issue #7118). `graphql` was missing
+  from the finalized-request-policy candidate inventory, so an Admin API write
+  could persist a composition every data plane then refused.
+- `request_transformer` and `response_transformer` body rules that `remove` a
+  JSON member no longer reorder the members that remain. The removal was a
+  swap-remove under serde_json's insertion-ordered map, which moved the last
+  member into the removed member's place.
 - **`body_validator` response-side rejections no longer describe the upstream
   body** (advisory `GHSA-84xq-rr63-39pw`). A 502 `details` field used to carry
   serde_json's line/column for an upstream body that did not parse, the

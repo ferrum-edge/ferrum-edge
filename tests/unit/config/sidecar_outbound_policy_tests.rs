@@ -14,7 +14,9 @@
 //!   - **Ambiguous labels (security)**: when several workloads share one SPIFFE
 //!     id with divergent labels the slice carries only their intersection, so
 //!     resolution folds every candidate strictest-wins and can never relax a
-//!     stricter possibly-applicable workload policy.
+//!     stricter possibly-applicable workload policy. The Sidecar egress scope
+//!     folds the same candidates (GHSA-mhm9-gp97-237q): a destination rides the
+//!     slice only when every candidate's scope admits it.
 //!   - **Gate**: the policy applies only under
 //!     `enforce_sidecar_egress && !sidecar_egress_dry_run`.
 //!   - **Effective precedence**: Sidecar → mesh-wide → runtime default.
@@ -39,8 +41,8 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshConfig, MeshSidecar, MeshSidecarEgress, OutboundTrafficPolicy, Workload,
-    WorkloadPort, WorkloadSelector,
+    AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, OutboundTrafficPolicy,
+    ServicePort, Workload, WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::config_consumer::xds_client::{
     XdsClientConfig, reverse_translate_xds_snapshot,
@@ -1150,6 +1152,185 @@ fn ambiguous_labels_still_respect_the_enforcement_gate() {
     assert_eq!(
         slice.sidecar_outbound_traffic_policy, None,
         "dry-run reports but never arms or disarms the registry gate"
+    );
+}
+
+// ── Ambiguous labels: Sidecar egress scope (GHSA-mhm9-gp97-237q) ──────────
+//
+// The egress scope applies the same rule #3262 settled for the outbound
+// policy: resolve every candidate label set and keep the strictest outcome,
+// which for egress scope is the INTERSECTION of the admitted views.
+
+fn mesh_service(namespace: &str, name: &str) -> MeshService {
+    MeshService {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: Vec::new(),
+        protocol_overrides: HashMap::new(),
+        cluster_ips: Vec::new(),
+        uid: None,
+        allow_path_parameters: false,
+    }
+}
+
+/// `default/*`: admits only services in the workload's own namespace.
+fn namespace_local_egress_sidecar(name: &str, selector: Option<WorkloadSelector>) -> MeshSidecar {
+    MeshSidecar {
+        egress: vec![MeshSidecarEgress {
+            hosts: vec!["default/*".to_string()],
+            port: None,
+        }],
+        ..sidecar(name, "default", selector, None)
+    }
+}
+
+fn egress_services() -> Vec<MeshService> {
+    vec![
+        mesh_service("default", "reviews"),
+        mesh_service("default", "ratings"),
+        mesh_service("billing", "payments"),
+    ]
+}
+
+fn shared_spiffe_candidates() -> Vec<Workload> {
+    vec![
+        shared_spiffe_workload("reviews", &[("app", "reviews")]),
+        shared_spiffe_workload("ratings", &[("app", "ratings")]),
+    ]
+}
+
+fn slice_service_names(slice: &MeshSlice) -> Vec<String> {
+    let mut names: Vec<String> = slice
+        .services
+        .iter()
+        .map(|service| format!("{}/{}", service.namespace, service.name))
+        .collect();
+    names.sort();
+    names
+}
+
+fn ambiguous_egress_slice(sidecars: Vec<MeshSidecar>) -> MeshSlice {
+    let config = config_with_mesh(MeshConfig {
+        sidecars,
+        workloads: shared_spiffe_candidates(),
+        services: egress_services(),
+        ..MeshConfig::default()
+    });
+    let slice = slice_for(&config, ambiguous_request());
+    assert!(
+        slice.labels_ambiguous,
+        "the fixture must actually produce an ambiguous slice, or the fold is not under test"
+    );
+    slice
+}
+
+/// The advisory's scenario: the empty label intersection matches only a wide
+/// namespace default, while a real candidate is selected by a narrower
+/// `workloadSelector` Sidecar. The narrow scope must still apply.
+#[test]
+fn ambiguous_labels_do_not_widen_a_workload_scoped_sidecar_egress_scope() {
+    let slice = ambiguous_egress_slice(vec![
+        sidecar("ns-default-wide", "default", None, None),
+        namespace_local_egress_sidecar("reviews-narrow", Some(selector_for("reviews", "default"))),
+    ]);
+    assert!(slice.labels.is_empty(), "the candidates share no labels");
+    assert_eq!(
+        slice_service_names(&slice),
+        vec!["default/ratings".to_string(), "default/reviews".to_string()],
+        "a destination the reviews Sidecar excludes must not ride the slice because the \
+         label intersection only matched the wider namespace default"
+    );
+}
+
+/// A candidate no Sidecar selects contributes no narrowing; it must not cancel
+/// the scope another candidate's Sidecar imposes.
+#[test]
+fn ambiguous_labels_keep_a_candidate_scope_when_another_candidate_has_none() {
+    let slice = ambiguous_egress_slice(vec![namespace_local_egress_sidecar(
+        "reviews-narrow",
+        Some(selector_for("reviews", "default")),
+    )]);
+    assert_eq!(
+        slice_service_names(&slice),
+        vec!["default/ratings".to_string(), "default/reviews".to_string()],
+        "the reviews candidate's egress scope still applies"
+    );
+}
+
+/// The fold must not over-tighten: candidates that resolve the same wide
+/// scope keep it, and explicit labels resolve exactly.
+#[test]
+fn egress_scope_fold_does_not_narrow_when_candidates_agree_or_labels_are_explicit() {
+    let slice = ambiguous_egress_slice(vec![sidecar("ns-default-wide", "default", None, None)]);
+    assert_eq!(
+        slice_service_names(&slice),
+        vec![
+            "billing/payments".to_string(),
+            "default/ratings".to_string(),
+            "default/reviews".to_string()
+        ]
+    );
+
+    let config = config_with_mesh(MeshConfig {
+        sidecars: vec![
+            sidecar("ns-default-wide", "default", None, None),
+            namespace_local_egress_sidecar(
+                "reviews-narrow",
+                Some(selector_for("reviews", "default")),
+            ),
+        ],
+        workloads: shared_spiffe_candidates(),
+        services: egress_services(),
+        ..MeshConfig::default()
+    });
+    let explicit = MeshSliceRequest {
+        labels: [("app".to_string(), "ratings".to_string())]
+            .into_iter()
+            .collect(),
+        ..ambiguous_request()
+    };
+    let slice = slice_for(&config, explicit);
+    assert!(!slice.labels_ambiguous);
+    assert_eq!(
+        slice_service_names(&slice).len(),
+        3,
+        "explicit ratings labels select only the wide namespace default"
+    );
+}
+
+/// Admission under the fold is order-independent.
+#[test]
+fn ambiguous_egress_scope_resolution_is_order_independent() {
+    let sidecars = || {
+        vec![
+            sidecar("ns-default-wide", "default", None, None),
+            namespace_local_egress_sidecar(
+                "reviews-narrow",
+                Some(selector_for("reviews", "default")),
+            ),
+        ]
+    };
+    let forward = ambiguous_egress_slice(sidecars());
+    let mut reversed_sidecars = sidecars();
+    reversed_sidecars.reverse();
+    let mut workloads = shared_spiffe_candidates();
+    workloads.reverse();
+    let config = config_with_mesh(MeshConfig {
+        sidecars: reversed_sidecars,
+        workloads,
+        services: egress_services(),
+        ..MeshConfig::default()
+    });
+    let reversed = slice_for(&config, ambiguous_request());
+    assert_eq!(
+        slice_service_names(&forward),
+        slice_service_names(&reversed)
     );
 }
 
