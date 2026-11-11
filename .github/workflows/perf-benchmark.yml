@@ -62,6 +62,12 @@ on:
 permissions:
   contents: read
 
+# An explicit bash shell runs every step with `-eo pipefail`, so a harness
+# failure piped into `tee` fails the step instead of taking tee's status.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   benchmark:
     name: Multi-Protocol Benchmark
