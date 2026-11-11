@@ -1232,8 +1232,8 @@ fn test_env_config_mesh_mode_file_needs_no_ferrum_cp_credentials() {
 /// Issue #7075: `EnvConfig` validation (what `ferrum-edge validate` runs),
 /// `bootstrap_allowed`, and `bootstrap_dev_root` read
 /// `FERRUM_MESH_CA_BOOTSTRAP_DEV` through one helper, so they agree on every
-/// spelling. Only `true` (ASCII case-insensitive, untrimmed) opts in; every
-/// other value fails closed.
+/// spelling. Only the strict guardrail truthy values (`true`/`1`, trimmed,
+/// ASCII case-insensitive) opt in; every other value fails closed.
 #[test]
 fn test_internal_ca_bootstrap_opt_in_spelling_agrees_between_validate_and_bootstrap() {
     use ferrum_edge::identity::ca::bootstrap;
@@ -1243,9 +1243,11 @@ fn test_internal_ca_bootstrap_opt_in_spelling_agrees_between_validate_and_bootst
         ("true", true),
         ("TRUE", true),
         ("True", true),
-        (" true", false),
-        ("true ", false),
-        ("1", false),
+        // The identity guardrail rule (#7237): trimmed, case-insensitive
+        // true/1 opt in; anything that is not a boolean is refused.
+        (" true", true),
+        ("true ", true),
+        ("1", true),
         ("yes", false),
         ("false", false),
         ("", false),
