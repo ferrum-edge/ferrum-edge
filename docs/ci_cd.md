@@ -87,8 +87,6 @@ adding, removing, or materially changing a workflow.
 | `pool-internal-profile.yml` | Pool Internal Profile | PRs on the pool profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual same-host measurement campaign. Optional. See [Optional PR lanes](#optional-pr-lanes-and-post-merge-validation). |
 | `h1-internal-profile.yml` | H1 Internal Profile | PRs on the H1 profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/cadence/trace-fixture checks; manual measurement campaign. Optional. |
 | `udp-internal-profile.yml` | UDP Internal Profile | PRs on the UDP profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual measurement campaign. Optional. |
-| `h2-guard-observation.yml` | H2 Guard Observation | PRs on its own paths, push to `main` on its own paths plus the repository files it pins, manual | Temporary [#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588) patched-`h2` guard regressions; manual dispatch can add the H2/gRPC campaign. `prepare.py` fails closed on pin drift, so a main push that stales a pin turns red on that commit; see [Optional lanes that pin files outside their own paths](#optional-lanes-that-pin-files-outside-their-own-paths). Not a required check. |
-| `h2-guard-pin-check.yml` | H2 Guard Pin Check | PRs on pinned H2 inputs and guard assets | Cheap, build-free verification of the H2 guard's admin pre/postimage hashes and Cargo/Docker anchors. Prints replacement hashes on drift; not a required check. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
@@ -891,16 +889,13 @@ concurrency:
 A new push to a pull request cancels that PR's superseded run. Pushes to
 `main`, dispatches, and schedules get a unique `run-<id>` group, so they are
 never cancelled and never displace a queued dispatch. `h3-live-comparison.yml`
-and `h2-guard-observation.yml` keep their own named groups and likewise cancel
-only on `pull_request`, but their manual dispatches also get a unique
-`run-<id>` group: `cancel-in-progress: false` alone protects only a campaign
-that is already running (a group otherwise holds one running and one pending
-run, and a later same-group dispatch would replace the pending one), while the
-per-run group preserves every queued manual campaign. H2 main pushes keep the
-ref group and the coalescing described under
-[Main-push concurrency](#main-push-concurrency). `h3-proof-preflight.yml` uses
-its own group keyed on the PR number or ref and always cancels the superseded
-run. The required workflows keep their own event-aware groups (see below).
+keeps its own named group and likewise cancels only on `pull_request`, but its
+manual dispatches also get a unique `run-<id>` group: `cancel-in-progress:
+false` alone protects only a campaign that is already running (a group
+otherwise holds one running and one pending run, and a later same-group
+dispatch would replace the pending one), while the per-run group preserves
+every queued manual campaign. `h3-proof-preflight.yml` uses its own group keyed
+on the PR number or ref and always cancels the superseded run. The required workflows keep their own event-aware groups (see below).
 
 **Measuring gate changes.** `.github/scripts/ci_gate_replay.py` replays merged
 pull requests through two revisions of `pr_ci_plan.py`,
@@ -943,31 +938,11 @@ run red on the commit that caused it. Its concurrency group follows
 [Main-push concurrency](#main-push-concurrency): cancel superseded
 `pull_request` runs only; main pushes and manual runs complete.
 
-| Workflow | Pin check | Pinned repository inputs (in its `push` paths) |
-|---|---|---|
-| `h2-guard-observation.yml` | `tests/performance/multi_protocol/h2_guard/prepare.py` | `src/admin/mod.rs` (`context_files` SHA-256 in `h2_guard/source.json`), the path-sourced `h2` entry in `Cargo.lock`, the single `[patch.crates-io]` table and its vendored `h2` line in `Cargo.toml`, the vendored h2 patches (`docs/upstream-h2-patches/00{1,3,4}-…/*.patch`) and their `vendor/VENDOR_INTEGRITY.sha256` hashes, the two `cargo build` calls in `Dockerfile` |
-
-`h2-guard-pin-check.yml` runs the same pin and anchor validation on the pull
-request that changes one of those inputs or the H2 guard assets. Its
-`prepare.py --check-pins-only` mode uses only Python's standard library to read
-the checkout, hash the admin source and its prepared postimage, and validate
-the Cargo/Docker anchors. It does not download the crate or create a build
-context. A mismatch prints the replacement `context_files` object and
-`metrics-hook.txt` hash for `tests/performance/multi_protocol/h2_guard/source.json`;
-the heavier observation workflow remains responsible for build and regression
-validation.
-
-When `src/admin/mod.rs` changes on purpose, refresh its pin in the same PR
-using the replacement values printed by the automatic `H2 guard pins` check.
-Otherwise the post-merge run goes red and the next PR must refresh it. When the
-`h2` entry in `Cargo.lock`, the `[patch.crates-io]` table or the Dockerfile
-`cargo build` calls change on purpose, update the shared anchor constants at the
-top of `prepare.py` in the same PR; the heavy observation lane also runs on those
-PRs and fails if the prepared build no longer applies. Any new
-optional lane whose prepare script hashes files under `src/` (for example a
-`context_files` entry) must add those files to its `push` paths and a row here.
-Lanes that hash only their own assets or runtime evidence (the internal-profile
-and trace lanes) need no extra trigger.
+No current lane pins a file outside its own paths. A new optional lane whose
+prepare script hashes files under `src/` (for example a `context_files` entry)
+must add those files to its `push` paths and say so here. Lanes that hash only
+their own assets or runtime evidence (the internal-profile and trace lanes)
+need no extra trigger.
 
 ### Rust cache lanes
 

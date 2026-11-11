@@ -20,7 +20,7 @@ _MATERIALIZED_ADAPTIVE_WINDOW_RE = re.compile(
 
 def load_experiment(path, protocol):
     plan = json.loads(Path(path).read_text())
-    if set(plan) - {"enabled", "name", "protocol", "arms", "h2_campaign", "h2_guard_observation"} or not {
+    if set(plan) - {"enabled", "name", "protocol", "arms", "h2_campaign"} or not {
             "enabled", "name", "protocol", "arms"} <= set(plan):
         raise ValueError("unexpected experiment fields")
     if not isinstance(plan["enabled"], bool):
@@ -48,17 +48,12 @@ def load_experiment(path, protocol):
         parse_env(env)
     if arms[0]["gateway"] != "ferrum":
         raise ValueError("first arm must be the ferrum reference")
-    if "h2_guard_observation" in plan and (type(plan["h2_guard_observation"]) is not int or plan["h2_guard_observation"] != 1 or "h2_campaign" not in plan):
-        raise ValueError("guard observation requires the H2 campaign and schema 1")
     if "h2_campaign" in plan:
         expected = dict(pairs=4, duration=15, concurrency=200,
                         payload_sizes={"http2": [71680], "grpcs": [10240, 71680]})
         if protocols != ["http2", "grpcs"] or plan["h2_campaign"] != expected:
             raise ValueError("H2 campaign must retain its predeclared scope and four pairs")
-        level = "warn,ferrum_h2_observe=debug"
-        if plan.get("h2_guard_observation") == 1:
-            level += ",ferrum_h2_guard=debug"
-        common = dict(FERRUM_LOG_LEVEL=level,
+        common = dict(FERRUM_LOG_LEVEL="warn,ferrum_h2_observe=debug",
                       FERRUM_METRICS_ALLOWED_CIDRS="127.0.0.1/32", FERRUM_ADMIN_HTTP_PORT="9000")
         if len(arms) != 2 or any(parse_env(arm["FERRUM_EXTRA_ENV"]) != dict(
                 common, FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=adaptive)
@@ -74,8 +69,7 @@ def parse_env(env):
     for entry in env.split(" "):
         key, separator, value = entry.partition("=")
         valid = _ENV_VALUE_RE.fullmatch(value)
-        if key == "FERRUM_LOG_LEVEL" and value in ("warn,ferrum_h2_observe=debug",
-                "warn,ferrum_h2_observe=debug,ferrum_h2_guard=debug"):
+        if key == "FERRUM_LOG_LEVEL" and value == "warn,ferrum_h2_observe=debug":
             valid = True
         if not separator or not _ENV_KEY_RE.fullmatch(key) or not valid:
             raise ValueError("environment must contain literal space-separated KEY=VALUE entries")
@@ -153,8 +147,6 @@ if __name__ == "__main__":
     plan = load_experiment(path, protocol)
     if command == "names":
         print(" ".join(arm["gateway"] for arm in plan["arms"][1:]) if plan else "")
-    elif command == "guard":
-        print(1 if plan and plan.get("h2_guard_observation") == 1 else 0)
     elif command == "env":
         matches = [arm for arm in plan["arms"] if arm["gateway"] == args[0]] if plan else []
         if len(matches) != 1:
