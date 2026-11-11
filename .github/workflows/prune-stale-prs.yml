@@ -370,4 +370,3 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           ORPHAN_MERGED_GRACE_DAYS: '1'
-
