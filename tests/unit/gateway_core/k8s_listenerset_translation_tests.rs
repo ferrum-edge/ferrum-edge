@@ -684,34 +684,59 @@ fn listenerset_hostname_conflict_marks_loser_not_materialized() {
     }
 }
 
+const PRECEDENCE_PROTOCOL_CONFLICT_MESSAGE_80: &str = "Port \"80\" is already claimed by a \
+     higher-precedence listener of the other protocol family on the same TCP transport \
+     (HTTP-family vs raw stream), so this claim is refused (Conflicted).";
+
+fn listener_key(
+    namespace: &str,
+    parent_kind: GatewayApiListenerParentKind,
+    parent: &str,
+    listener: &str,
+) -> GatewayApiListenerKey {
+    GatewayApiListenerKey {
+        namespace: namespace.to_string(),
+        parent_kind,
+        gateway: parent.to_string(),
+        listener: listener.to_string(),
+    }
+}
+
+fn tcp_listener(name: &str, port: u64) -> Value {
+    json!({
+        "name": name,
+        "port": port,
+        "protocol": "TCP",
+        "allowedRoutes": {
+            "kinds": [{ "kind": "TCPRoute" }],
+            "namespaces": { "from": "Same" }
+        }
+    })
+}
+
+fn http_listener(name: &str, port: u64, hostname: &str) -> Value {
+    json!({
+        "name": name,
+        "port": port,
+        "protocol": "HTTP",
+        "hostname": hostname,
+        "allowedRoutes": { "namespaces": { "from": "Same" } }
+    })
+}
+
+/// GHSA-496f-3547-p3fw / GEP-1713: the parent Gateway's listener is first in
+/// the precedence list and MUST stay accepted; only the later ListenerSet
+/// claim of the other protocol family is Conflicted.
 #[test]
 fn listenerset_protocol_conflict_with_gateway_listener() {
     let objects = vec![
         gateway_class(),
         {
             let mut gw = http_gateway("edge", Some("Same"));
-            gw.spec["listeners"] = json!([{
-                "name": "http",
-                "port": 80,
-                "protocol": "HTTP",
-                "hostname": "shared.example.com",
-                "allowedRoutes": { "namespaces": { "from": "Same" } }
-            }]);
+            gw.spec["listeners"] = json!([http_listener("http", 80, "shared.example.com")]);
             gw
         },
-        listenerset(
-            "tcp-conflict",
-            "edge",
-            json!([{
-                "name": "tcp",
-                "port": 80,
-                "protocol": "TCP",
-                "allowedRoutes": {
-                    "kinds": [{ "kind": "TCPRoute" }],
-                    "namespaces": { "from": "Same" }
-                }
-            }]),
-        ),
+        listenerset("tcp-conflict", "edge", json!([tcp_listener("tcp", 80)])),
     ];
     let translation = translate_k8s_objects(&objects, options()).expect("translate");
     let status = translation
@@ -727,20 +752,288 @@ fn listenerset_protocol_conflict_with_gateway_listener() {
     );
     assert!(!status.accepted);
     assert_eq!(status.accepted_reason, "ListenersNotValid");
-    let gateway_http = GatewayApiListenerKey {
-        namespace: "default".to_string(),
-        parent_kind: GatewayApiListenerParentKind::Gateway,
-        gateway: "edge".to_string(),
-        listener: "http".to_string(),
-    };
-    assert_eq!(
-        translation
-            .listener_conflicts
-            .get(&gateway_http)
-            .map(|conflict| conflict.reason),
-        Some("ProtocolConflict"),
-        "Gateway HTTP claim must appear in translation.listener_conflicts for status parity: {:?}",
+    let listenerset_tcp = listener_key(
+        "default",
+        GatewayApiListenerParentKind::ListenerSet,
+        "tcp-conflict",
+        "tcp",
+    );
+    let conflict = translation
+        .listener_conflicts
+        .get(&listenerset_tcp)
+        .expect("the ListenerSet TCP claim must be Conflicted");
+    assert_eq!(conflict.reason, "ProtocolConflict");
+    assert_eq!(conflict.message, PRECEDENCE_PROTOCOL_CONFLICT_MESSAGE_80);
+    let gateway_http = listener_key(
+        "default",
+        GatewayApiListenerParentKind::Gateway,
+        "edge",
+        "http",
+    );
+    assert!(
+        !translation.listener_conflicts.contains_key(&gateway_http),
+        "a ListenerSet must never withdraw its parent Gateway's listener: {:?}",
         translation.listener_conflicts
+    );
+    let services: Vec<&str> = translation
+        .config
+        .mesh
+        .as_ref()
+        .map(|mesh| {
+            mesh.services
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        services.contains(
+            &gateway_api_listener_mesh_service_name(
+                GatewayApiListenerParentKind::Gateway,
+                "edge",
+                "http",
+            )
+            .as_str()
+        ),
+        "the Gateway HTTP listener must stay materialized: {services:?}"
+    );
+}
+
+/// The advisory's cross-tenant shape: a tenant ListenerSet attached to one
+/// Gateway declares raw TCP on a port another, independent Gateway serves
+/// HTTP on. The socket is process-wide, so the claims do conflict, but every
+/// Gateway's own listeners precede every ListenerSet: only the tenant claim
+/// loses, whatever order the objects are observed in.
+#[test]
+fn listenerset_cannot_withdraw_an_independent_gateways_listener() {
+    let build = |reverse: bool| {
+        let mut victim = http_gateway("victim", None);
+        victim.spec["listeners"] = json!([http_listener("http", 80, "victim.example.com")]);
+        let mut tenant_parent = http_gateway("tenant-parent", Some("Same"));
+        tenant_parent.spec["listeners"] =
+            json!([http_listener("http", 8080, "tenant.example.com")]);
+        let tenant = listenerset(
+            "tenant-tcp",
+            "tenant-parent",
+            json!([tcp_listener("tcp", 80)]),
+        );
+        let mut objects = vec![gateway_class(), victim, tenant_parent, tenant];
+        if reverse {
+            objects[1..].reverse();
+        }
+        translate_k8s_objects(&objects, options()).expect("translate")
+    };
+    for reverse in [false, true] {
+        let translation = build(reverse);
+        let victim = listener_key(
+            "default",
+            GatewayApiListenerParentKind::Gateway,
+            "victim",
+            "http",
+        );
+        assert!(
+            !translation.listener_conflicts.contains_key(&victim),
+            "reverse={reverse}: the independent Gateway's listener must keep serving: {:?}",
+            translation.listener_conflicts
+        );
+        let tenant = listener_key(
+            "default",
+            GatewayApiListenerParentKind::ListenerSet,
+            "tenant-tcp",
+            "tcp",
+        );
+        let conflict = translation
+            .listener_conflicts
+            .get(&tenant)
+            .unwrap_or_else(|| panic!("reverse={reverse}: tenant TCP claim must be Conflicted"));
+        assert_eq!(conflict.reason, "ProtocolConflict");
+        assert_eq!(conflict.message, PRECEDENCE_PROTOCOL_CONFLICT_MESSAGE_80);
+        assert_eq!(
+            translation.listener_conflicts.len(),
+            1,
+            "reverse={reverse}: exactly the tenant claim is refused: {:?}",
+            translation.listener_conflicts
+        );
+    }
+}
+
+/// Between ListenerSets the older one is first in the precedence list: a newer
+/// ListenerSet of the other protocol family cannot take the port away from it,
+/// and the newer one alone is Conflicted.
+#[test]
+fn older_listenerset_keeps_its_port_against_a_newer_other_family_listenerset() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([http_listener("http", 8080, "gateway.example.com")]);
+    let mut older = listenerset(
+        "z-older-http",
+        "edge",
+        json!([http_listener("http", 80, "older.example.com")]),
+    );
+    older.metadata.creation_timestamp = Some("2024-01-01T00:00:00Z".to_string());
+    let mut newer = listenerset("a-newer-tcp", "edge", json!([tcp_listener("tcp", 80)]));
+    newer.metadata.creation_timestamp = Some("2024-06-01T00:00:00Z".to_string());
+
+    for objects in [
+        vec![
+            gateway_class(),
+            gateway.clone(),
+            older.clone(),
+            newer.clone(),
+        ],
+        vec![
+            gateway_class(),
+            newer.clone(),
+            older.clone(),
+            gateway.clone(),
+        ],
+    ] {
+        let translation = translate_k8s_objects(&objects, options()).expect("translate");
+        let older_key = listener_key(
+            "default",
+            GatewayApiListenerParentKind::ListenerSet,
+            "z-older-http",
+            "http",
+        );
+        assert!(
+            !translation.listener_conflicts.contains_key(&older_key),
+            "the older ListenerSet keeps the port: {:?}",
+            translation.listener_conflicts
+        );
+        let newer_key = listener_key(
+            "default",
+            GatewayApiListenerParentKind::ListenerSet,
+            "a-newer-tcp",
+            "tcp",
+        );
+        assert_eq!(
+            translation
+                .listener_conflicts
+                .get(&newer_key)
+                .map(|conflict| conflict.reason),
+            Some("ProtocolConflict"),
+            "the newer ListenerSet loses even though its name sorts first: {:?}",
+            translation.listener_conflicts
+        );
+    }
+}
+
+/// A first tier that is itself incompatible — here one ListenerSet declaring
+/// both families on a port — withdraws every family claim on that port, and a
+/// later ListenerSet cannot take the port over.
+#[test]
+fn listenerset_with_both_families_on_one_port_withdraws_the_port() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([http_listener("http", 8080, "gateway.example.com")]);
+    let mut first = listenerset(
+        "first",
+        "edge",
+        json!([
+            http_listener("http", 80, "first.example.com"),
+            tcp_listener("tcp", 80)
+        ]),
+    );
+    first.metadata.creation_timestamp = Some("2024-01-01T00:00:00Z".to_string());
+    let mut later = listenerset(
+        "later",
+        "edge",
+        json!([http_listener("http", 80, "later.example.com")]),
+    );
+    later.metadata.creation_timestamp = Some("2024-06-01T00:00:00Z".to_string());
+    let translation = translate_k8s_objects(&[gateway_class(), gateway, first, later], options())
+        .expect("translate");
+    for (parent, listener) in [("first", "http"), ("first", "tcp"), ("later", "http")] {
+        let key = listener_key(
+            "default",
+            GatewayApiListenerParentKind::ListenerSet,
+            parent,
+            listener,
+        );
+        assert_eq!(
+            translation
+                .listener_conflicts
+                .get(&key)
+                .map(|conflict| conflict.reason),
+            Some("ProtocolConflict"),
+            "{parent}/{listener} must be withdrawn: {:?}",
+            translation.listener_conflicts
+        );
+    }
+    let gateway_http = listener_key(
+        "default",
+        GatewayApiListenerParentKind::Gateway,
+        "edge",
+        "http",
+    );
+    assert!(!translation.listener_conflicts.contains_key(&gateway_http));
+}
+
+/// The plaintext-vs-TLS physical refusal follows the same precedence: a
+/// ListenerSet plaintext HTTP listener on the parent Gateway's HTTPS port is
+/// refused while the Gateway's TLS listener keeps serving.
+#[test]
+fn listenerset_plaintext_claim_cannot_withdraw_gateway_tls_listener() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([{
+        "name": "https",
+        "port": 443,
+        "protocol": "HTTPS",
+        "hostname": "secure.example.com",
+        "tls": {
+            "mode": "Terminate",
+            "certificateRefs": [{ "name": "edge-cert" }]
+        },
+        "allowedRoutes": { "namespaces": { "from": "Same" } }
+    }]);
+    let plaintext = listenerset(
+        "tenant-plain",
+        "edge",
+        json!([http_listener("plain", 443, "plain.example.com")]),
+    );
+    let translation = translate_k8s_objects(
+        &[
+            gateway_class(),
+            tls_secret("edge-cert", "default"),
+            gateway,
+            plaintext,
+        ],
+        options(),
+    )
+    .expect("translate");
+    let gateway_https = listener_key(
+        "default",
+        GatewayApiListenerParentKind::Gateway,
+        "edge",
+        "https",
+    );
+    assert!(
+        !translation.listener_conflicts.contains_key(&gateway_https),
+        "the Gateway TLS listener must keep serving: {:?}",
+        translation.listener_conflicts
+    );
+    let tenant = listener_key(
+        "default",
+        GatewayApiListenerParentKind::ListenerSet,
+        "tenant-plain",
+        "plain",
+    );
+    let conflict = translation
+        .listener_conflicts
+        .get(&tenant)
+        .expect("the ListenerSet plaintext claim must be Conflicted");
+    assert_eq!(conflict.reason, "ProtocolConflict");
+    assert_eq!(
+        conflict.message,
+        "Port \"443\" is already claimed by a higher-precedence listener with the other \
+         frontend shape (plaintext vs effective TLS-serving), so this claim is refused \
+         (Conflicted)."
+    );
+    assert!(
+        translation
+            .config
+            .frontend_tls_certificate_sources
+            .iter()
+            .any(|source| source.gateway == "edge"),
+        "the Gateway's certificate stays in the serving set"
     );
 }
 

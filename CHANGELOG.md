@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **A ListenerSet can no longer withdraw another tenant's Gateway listener
+  on a shared port** (GHSA-496f-3547-p3fw). A raw TCP/TLS listener (or a
+  plaintext one, or a different TLS credential set) declared in a ListenerSet
+  on a port a Gateway already served marked every claim on that port
+  `Conflicted`, including the listeners of independent Gateways. Same-port
+  conflicts now follow Gateway API precedence (GEP-1713) across the shared
+  socket: every Gateway's own listeners first, then ListenerSets oldest first,
+  then by `{namespace}/{name}`, and only the later claim is refused. Conflicts
+  between peer Gateways, or inside one Gateway or one ListenerSet, still
+  withdraw every claim on the port.
 - **Ambiguous workload labels no longer skip a workload-selector Sidecar's
   egress scope** (GHSA-mhm9-gp97-237q). When several workloads share one
   SPIFFE id with divergent labels and no explicit workload labels are set, the

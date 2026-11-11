@@ -1131,6 +1131,13 @@ pub(crate) struct K8sAccumulator {
     /// listener this translator explicitly refused.
     pub(crate) gateway_api_listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// ListenerSet `(namespace, name)` → its index in the global Gateway API
+    /// precedence order (oldest `creationTimestamp`, then `{namespace}/{name}`),
+    /// recorded by ListenerSet admission so later physical same-port
+    /// arbitration applies the same precedence
+    /// (`listenerset::listener_claim_precedence`, GHSA-496f-3547-p3fw).
+    pub(crate) gateway_api_listenerset_precedence:
+        std::collections::BTreeMap<(String, String), u64>,
     /// Post-admission explicit-SNI collision losers and their winners.
     pub(crate) gateway_api_frontend_tls_hostname_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
@@ -1221,6 +1228,7 @@ impl K8sAccumulator {
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_frontend_tls_listeners: Vec::new(),
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
+            gateway_api_listenerset_precedence: std::collections::BTreeMap::new(),
             gateway_api_frontend_tls_hostname_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             gateway_class_name_by_gateway: HashMap::new(),
