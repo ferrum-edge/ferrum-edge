@@ -1672,7 +1672,10 @@ async fn test_loki_terminal_and_exhausted_delivery_counts_batch_discard() {
 fn startup_diagnostics_withhold_loki_config_keys_and_label_names() {
     let secret = "'diagnostic-secret-5594`\"\\\n";
     for (extra, context) in [
-        (json!({secret: true}), "at `config`"),
+        (
+            json!({secret: true}),
+            "`config`: unknown configuration key(s)",
+        ),
         (json!({"labels": {secret: "safe"}}), "label name"),
         (
             json!({"labels": {"diagnostic_secret_5594": 987654321}}),

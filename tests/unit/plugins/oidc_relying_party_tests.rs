@@ -2152,7 +2152,7 @@ fn shared_validation_entrypoint_rejects_authorization_policy_typo() {
     let error = validate_plugin_config("oidc_relying_party", &config)
         .expect_err("validation must reject unknown authorization fields");
     assert!(error.contains("`provider[0]`"));
-    assert!(error.contains("\"required_role\""));
+    assert!(error.contains("\"provider[0].required_role\""), "{error}");
 }
 
 #[test]
