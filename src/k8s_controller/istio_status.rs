@@ -1458,7 +1458,9 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // upstream-backed stream proxy). Malformed predicates, `destination.subset`,
     // and invalid weights surface via the `Invalid` arm of
     // `virtual_service_status`. `mirror` /
-    // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
+    // `mirrorPercentage` / `redirect` / `rewrite` are translated (a mirror to
+    // anything but a loopback IP literal is refused through the `Invalid` arm,
+    // GHSA-gcwp-xp94-4pcv), and
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
     // `StringMatch` (exact projected LITERALLY, so a wildcard-shaped or
@@ -3841,7 +3843,7 @@ mod tests {
                 "http": [
                     {
                         "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
-                        "mirror": { "host": "reviews-canary.default.svc.cluster.local" },
+                        "mirror": { "host": "127.0.0.1" },
                         "corsPolicy": { "allowOrigins": [ { "exact": "https://example.com" } ] }
                     }
                 ]

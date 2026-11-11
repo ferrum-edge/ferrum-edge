@@ -28,6 +28,33 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `request_mirror` refuses cleartext to a non-loopback host without `allow_plaintext` (GHSA-gcwp-xp94-4pcv, #6659)
+
+`request_mirror` now follows the plugin-egress rule of #6659: `mirror_protocol:
+http` (still the default) is admitted without an opt-in only when `mirror_host`
+is a loopback IP literal (`127.0.0.0/8`, `::1`). Any other host is refused at
+construction like any other invalid `KeepLastKnownGood` plugin config: the
+Admin API returns 400, a reload or data-plane update that carries one is
+rejected and the last accepted configuration keeps serving, and a file- or
+database-mode startup that loads one fails. Fix existing configs before
+upgrading. The mirror replays the
+backend-visible request, body included by default, so this closes a path that
+sent request bodies (and any allowlisted credentials) in cleartext.
+
+**Operator action:** for every `request_mirror` whose `mirror_host` is a name
+or a non-loopback IP, set `mirror_protocol: https` (and `mirror_port` if the
+mirror's TLS port is not 443). Only where the path to the mirror is otherwise
+protected, set `allow_plaintext: true` instead.
+
+Istio `VirtualService.http[].mirror` translation changes with it. Ferrum's
+mirror dials the destination directly from the proxy process, not over mesh
+mTLS, and a VirtualService cannot express the opt-in, so a non-zero mirror to
+any host other than a loopback IP literal now reports `FerrumAccepted=False` /
+`Invalid` and the VirtualService is not applied. **Operator action:** remove
+`mirror` / `mirrorPercentage` from such VirtualServices (or set the percentage
+to `0`), and configure mirroring with a native `request_mirror` plugin using
+`mirror_protocol: https`.
+
 ### ferrum-mesh chart value removals (#7297, #7299)
 
 Two `charts/ferrum-mesh` values are removed. The values schema rejects them, so

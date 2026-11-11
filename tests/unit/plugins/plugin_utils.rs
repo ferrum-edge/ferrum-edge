@@ -865,7 +865,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "serverless_function" => {
             json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
         }
-        "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "request_mirror" => json!({"allow_plaintext": true, "mirror_host": "mirror.local"}),
         "load_testing" => json!({
             "key": "test-load-key-0123456789abcdef!!",
             "concurrent_clients": 1,

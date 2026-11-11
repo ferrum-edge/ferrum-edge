@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **`request_mirror` no longer mirrors to a remote host over cleartext by
+  default** (GHSA-gcwp-xp94-4pcv). The mirror replays the backend-visible
+  request (body included by default, plus any allowlisted credentials).
+  `mirror_protocol: http`, still the default, is now admitted without the new
+  `allow_plaintext: true` only for a loopback IP literal `mirror_host`, the
+  rule every other plugin egress follows (#6659). Istio `http[].mirror`
+  translation, whose mirror never rode mesh mTLS, now fails closed
+  (`FerrumAccepted=False`) for any other host instead of mirroring in
+  cleartext. **Operator action:** set `mirror_protocol: https` on each remote
+  mirror (or `allow_plaintext: true` where the path is otherwise protected),
+  and move Istio mirrors to a native `request_mirror`; see the upgrade guide.
 - **A VirtualService that derives another VirtualService's route id is refused,
   not silently shadowed** (GHSA-qw5p-g8jx-pmv8). Route proxy and weighted-split
   upstream ids are now claimed per VirtualService. A later VirtualService in

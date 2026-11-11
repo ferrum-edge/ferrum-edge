@@ -618,7 +618,7 @@ async fn expired_grpc_deadline_does_not_suppress_transaction_logging() {
 #[test]
 fn test_plugin_name() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -628,7 +628,7 @@ fn test_plugin_name() {
 #[test]
 fn test_plugin_priority() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -638,7 +638,7 @@ fn test_plugin_priority() {
 #[test]
 fn test_supported_protocols() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -666,7 +666,7 @@ fn test_missing_mirror_host_is_error() {
 #[test]
 fn test_blank_plugin_config_id_is_error() {
     let error = RequestMirror::new_with_config_id(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
         Some("  "),
     )
@@ -682,27 +682,27 @@ fn test_blank_plugin_config_id_is_error() {
 fn test_invalid_field_types_are_error() {
     for (config, expected) in [
         (
-            json!({ "mirror_host": "mirror.local", "mirror_protocol": true }),
+            json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_protocol": true }),
             "`mirror_protocol` must be a string",
         ),
         (
-            json!({ "mirror_host": "mirror.local", "mirror_port": "8080" }),
+            json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_port": "8080" }),
             "`mirror_port` must be an unsigned integer",
         ),
         (
-            json!({ "mirror_host": "mirror.local", "mirror_path": 42 }),
+            json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_path": 42 }),
             "`mirror_path` must be a string",
         ),
         (
-            json!({ "mirror_host": "mirror.local", "percentage": "50" }),
+            json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "percentage": "50" }),
             "`percentage` must be a number",
         ),
         (
-            json!({ "mirror_host": "mirror.local", "mirror_request_body": "true" }),
+            json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_request_body": "true" }),
             "`mirror_request_body` must be a boolean",
         ),
         (
-            json!({ "mirror_host": "mirror.local", "max_in_flight": "10" }),
+            json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_in_flight": "10" }),
             "`max_in_flight` must be an unsigned integer",
         ),
     ] {
@@ -716,7 +716,7 @@ fn test_invalid_field_types_are_error() {
 #[test]
 fn test_mirror_path_must_start_with_slash() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_path": "shadow" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_path": "shadow" }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -727,7 +727,7 @@ fn test_mirror_path_must_start_with_slash() {
 fn test_mirror_path_rejects_query_and_fragment_syntax() {
     for mirror_path in ["/shadow?src=config", "/shadow#fragment"] {
         let error = RequestMirror::new(
-            &json!({ "mirror_host": "mirror.local", "mirror_path": mirror_path }),
+            &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_path": mirror_path }),
             PluginHttpClient::default(),
         )
         .err()
@@ -770,17 +770,94 @@ fn test_mirror_host_rejects_url_authority_and_path_material() {
 #[test]
 fn test_invalid_protocol_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_protocol": "ftp" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_protocol": "ftp" }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("mirror_protocol"));
 }
 
+/// GHSA-gcwp-xp94-4pcv: the mirror replays the backend-visible request (body
+/// by default, plus any allowlisted credentials), so cleartext `http` is
+/// admitted without an explicit opt-in only to a loopback IP literal — the
+/// rule every other plugin egress already follows.
+#[test]
+fn cleartext_mirror_to_non_loopback_host_requires_allow_plaintext() {
+    for config in [
+        json!({ "mirror_host": "mirror.local" }),
+        json!({ "mirror_host": "mirror.local", "mirror_protocol": "http" }),
+        json!({ "mirror_host": "mirror.local", "mirror_protocol": "HTTP" }),
+        json!({ "mirror_host": "mirror.local", "allow_plaintext": false }),
+        json!({ "mirror_host": "mirror.local", "allow_plaintext": null }),
+        // A name that resolves to loopback is not a loopback IP literal.
+        json!({ "mirror_host": "localhost" }),
+        json!({ "mirror_host": "10.0.0.7" }),
+        json!({ "mirror_host": "2001:db8::10" }),
+        // An IPv4-mapped loopback address is not a loopback literal either.
+        json!({ "mirror_host": "::ffff:127.0.0.1" }),
+        json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["authorization"]
+        }),
+    ] {
+        let err = match RequestMirror::new(&config, PluginHttpClient::default()) {
+            Ok(_) => panic!("cleartext mirror without opt-in must be rejected: {config}"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("`allow_plaintext: true`") && err.contains("`mirror_protocol: https`"),
+            "rejection must name both remedies, got: {err}"
+        );
+        assert!(
+            !err.contains("mirror.local") && !err.contains("10.0.0.7"),
+            "rejection must not echo the configured host, got: {err}"
+        );
+        ferrum_edge::plugins::validate_plugin_config("request_mirror", &config)
+            .expect_err("shared admission must reject a cleartext mirror without opt-in");
+    }
+}
+
+#[test]
+fn cleartext_mirror_admits_loopback_literals_https_and_explicit_opt_in() {
+    for config in [
+        json!({ "mirror_host": "127.0.0.1" }),
+        json!({ "mirror_host": "127.1.2.3", "mirror_protocol": "http" }),
+        json!({ "mirror_host": "::1" }),
+        json!({ "mirror_host": "[::1]" }),
+        json!({ "mirror_host": "[127.0.0.1]" }),
+        json!({ "mirror_host": "mirror.local", "mirror_protocol": "https" }),
+        json!({ "mirror_host": "mirror.local", "mirror_protocol": "HTTPS" }),
+        json!({ "mirror_host": "mirror.local", "allow_plaintext": true }),
+        json!({
+            "mirror_host": "10.0.0.7",
+            "mirror_protocol": "http",
+            "allow_plaintext": true
+        }),
+    ] {
+        assert!(
+            RequestMirror::new(&config, PluginHttpClient::default()).is_ok(),
+            "config must be admitted: {config}"
+        );
+    }
+}
+
+#[test]
+fn allow_plaintext_must_be_a_boolean() {
+    let err = match RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "allow_plaintext": "yes" }),
+        PluginHttpClient::default(),
+    ) {
+        Ok(_) => panic!("a non-boolean allow_plaintext must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+}
+
 #[test]
 fn test_port_zero_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_port": 0 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_port": 0 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -790,7 +867,7 @@ fn test_port_zero_is_error() {
 #[test]
 fn test_port_too_large_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_port": 70000 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_port": 70000 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -799,7 +876,7 @@ fn test_port_too_large_is_error() {
 #[test]
 fn test_percentage_below_zero_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "percentage": -1.0 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "percentage": -1.0 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -809,7 +886,7 @@ fn test_percentage_below_zero_is_error() {
 #[test]
 fn test_percentage_above_100_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "percentage": 101.0 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "percentage": 101.0 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -818,7 +895,7 @@ fn test_percentage_above_100_is_error() {
 #[test]
 fn test_max_in_flight_zero_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_in_flight": 0 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_in_flight": 0 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -834,7 +911,7 @@ fn test_max_in_flight_zero_is_error() {
 fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
     // Exactly at the documented cap (2^20) is accepted.
     let at_cap = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_in_flight": 1_048_576u64 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_in_flight": 1_048_576u64 }),
         PluginHttpClient::default(),
     );
     assert!(
@@ -845,7 +922,7 @@ fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
 
     // One above the cap is rejected as a config error.
     let above_cap = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_in_flight": 1_048_577u64 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_in_flight": 1_048_577u64 }),
         PluginHttpClient::default(),
     );
     assert!(
@@ -861,7 +938,7 @@ fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
     // Semaphore::new; it must be a config error, never a panic.
     let tokio_max_permits: u64 = (usize::MAX >> 3) as u64;
     let past_tokio_cap = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_in_flight": tokio_max_permits }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_in_flight": tokio_max_permits }),
         PluginHttpClient::default(),
     );
     assert!(
@@ -875,7 +952,7 @@ fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
 
     // A value that overflows u64's usable range but still parses as u64.
     let huge = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_in_flight": u64::MAX }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_in_flight": u64::MAX }),
         PluginHttpClient::default(),
     );
     assert!(
@@ -960,7 +1037,7 @@ fn max_in_flight_is_documented_across_source_guide_and_example() {
 #[test]
 fn test_default_protocol_is_http() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -981,7 +1058,7 @@ fn test_default_port_for_https_is_443() {
 #[test]
 fn test_default_percentage_is_100() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -992,7 +1069,7 @@ fn test_default_percentage_is_100() {
 #[test]
 fn test_mirror_request_body_default_true() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1002,7 +1079,7 @@ fn test_mirror_request_body_default_true() {
 #[test]
 fn test_mirror_request_body_false_disables_buffering() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_request_body": false }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_request_body": false }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1016,7 +1093,7 @@ fn test_mirror_request_body_false_disables_buffering() {
 #[test]
 fn test_warmup_hostnames() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "shadow.example.com" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "shadow.example.com" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1029,7 +1106,7 @@ fn test_warmup_hostnames() {
 #[test]
 fn test_hostname_normalized_to_lowercase() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "MIRROR.Example.COM" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "MIRROR.Example.COM" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1059,7 +1136,7 @@ fn test_warmup_hostnames_skips_ip_literals() {
 #[tokio::test]
 async fn test_before_proxy_returns_continue() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_port": 9999 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_port": 9999 }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1138,7 +1215,7 @@ async fn test_mirror_never_forwards_load_testing_trigger_even_if_it_runs_first()
 #[tokio::test]
 async fn test_before_proxy_with_zero_percentage_returns_continue() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "percentage": 0.0 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "percentage": 0.0 }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1153,7 +1230,7 @@ async fn test_before_proxy_with_zero_percentage_returns_continue() {
 #[tokio::test]
 async fn test_before_proxy_with_body_metadata() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_request_body": true }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_request_body": true }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1173,7 +1250,7 @@ async fn test_before_proxy_with_matched_proxy_uses_proxy_timeout() {
     // The actual timeout is applied inside the spawned task (fire-and-forget),
     // so we can only verify the plugin reads proxy config without errors.
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1191,7 +1268,7 @@ async fn test_before_proxy_without_matched_proxy_uses_default_timeout() {
     // When no proxy is matched (shouldn't happen in practice), the plugin
     // falls back to a 60s default timeout.
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1216,6 +1293,7 @@ const SAMPLE_PERIOD: u64 = 1000;
 fn mirror_plugin(percentage: f64) -> RequestMirror {
     RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "percentage": percentage,
             "mirror_request_body": false,
@@ -1524,7 +1602,7 @@ async fn test_sampling_dispatch_observes_selection_not_just_continue() {
 #[tokio::test]
 async fn test_should_buffer_request_body_when_body_mirroring_enabled() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_request_body": true }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_request_body": true }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1544,7 +1622,7 @@ async fn test_should_buffer_request_body_when_body_mirroring_enabled() {
 #[test]
 fn test_should_not_buffer_request_body_when_body_mirroring_disabled() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_request_body": false }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_request_body": false }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1575,7 +1653,7 @@ fn test_valid_config_with_all_options() {
 #[test]
 fn test_valid_config_minimal() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     );
     assert!(plugin.is_ok());
@@ -1584,7 +1662,7 @@ fn test_valid_config_minimal() {
 #[test]
 fn test_percentage_boundary_zero() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "percentage": 0.0 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "percentage": 0.0 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_ok());
@@ -1593,7 +1671,7 @@ fn test_percentage_boundary_zero() {
 #[test]
 fn test_percentage_boundary_100() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "percentage": 100.0 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "percentage": 100.0 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_ok());
@@ -1602,7 +1680,7 @@ fn test_percentage_boundary_100() {
 #[test]
 fn test_mirror_path_override() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_path": "/shadow" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_path": "/shadow" }),
         PluginHttpClient::default(),
     );
     assert!(plugin.is_ok());
@@ -1888,7 +1966,7 @@ async fn test_mirror_captures_proxy_context() {
     // Verify that the plugin captures proxy context (proxy_id, proxy_name,
     // consumer_username) from the request context for mirror logging.
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_request_body": false }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_request_body": false }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -1916,6 +1994,7 @@ async fn test_mirror_captures_proxy_context() {
 async fn test_mirror_uses_binary_body_bytes_over_metadata() {
     let plugin = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "mirror_request_body": true,
         }),
@@ -1952,6 +2031,7 @@ async fn test_mirror_uses_binary_body_bytes_over_metadata() {
 async fn test_mirror_falls_back_to_metadata_when_no_body_bytes() {
     let plugin = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "mirror_request_body": true,
         }),
@@ -1986,7 +2066,7 @@ fn test_max_response_body_bytes_default() {
     // No config field set → defaults to 1 MiB. Plugin construction should
     // succeed.
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
         PluginHttpClient::default(),
     );
     assert!(plugin.is_ok());
@@ -1995,7 +2075,7 @@ fn test_max_response_body_bytes_default() {
 #[test]
 fn test_max_response_body_bytes_zero_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_response_body_bytes": 0 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_response_body_bytes": 0 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -2008,7 +2088,7 @@ fn test_max_response_body_bytes_zero_is_error() {
 #[test]
 fn test_max_response_body_bytes_negative_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_response_body_bytes": -1 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_response_body_bytes": -1 }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -2017,7 +2097,7 @@ fn test_max_response_body_bytes_negative_is_error() {
 #[test]
 fn test_max_response_body_bytes_string_is_error() {
     let result = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_response_body_bytes": "1024" }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_response_body_bytes": "1024" }),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -2026,7 +2106,7 @@ fn test_max_response_body_bytes_string_is_error() {
 #[test]
 fn test_max_response_body_bytes_valid_value() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "max_response_body_bytes": 4096 }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_response_body_bytes": 4096 }),
         PluginHttpClient::default(),
     );
     assert!(plugin.is_ok());
@@ -2904,6 +2984,7 @@ async fn test_mirror_does_not_serialize_stale_map_without_outbound_or_raw() {
 fn forward_sensitive_query_opt_in_is_fail_closed() {
     let missing_allowlist = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_query": true
         }),
@@ -2919,6 +3000,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
 
     let allowlist_without_flag = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_query_allowlist": ["access_token"]
         }),
@@ -2934,6 +3016,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
 
     let non_sensitive = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_query": true,
             "forward_sensitive_query_allowlist": ["page"]
@@ -2950,6 +3033,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
 
     let invalid_name = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_query": true,
             "forward_sensitive_query_allowlist": ["bad name"]
@@ -2966,6 +3050,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
 
     let malformed = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_query_patterns": "not-an-array"
         }),
@@ -2982,6 +3067,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
     assert!(
         RequestMirror::new(
             &json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "sensitive_query_patterns": ["x-vendor-"],
                 "forward_sensitive_query": true,
@@ -2995,6 +3081,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
     assert!(
         RequestMirror::new(
             &json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "forward_sensitive_query": true,
                 "forward_sensitive_query_allowlist": ["x-amz-signature", "oauth_token"]
@@ -3010,6 +3097,7 @@ fn forward_sensitive_query_opt_in_is_fail_closed() {
 fn sensitive_query_config_bounds_reject_unbounded_lists_and_items() {
     let patterns_overflow = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_query_patterns": (0..65).map(|i| format!("pat{i}")).collect::<Vec<_>>()
         }),
@@ -3025,6 +3113,7 @@ fn sensitive_query_config_bounds_reject_unbounded_lists_and_items() {
 
     let pattern_len = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_query_patterns": ["x".repeat(129)]
         }),
@@ -3039,6 +3128,7 @@ fn sensitive_query_config_bounds_reject_unbounded_lists_and_items() {
 
     let allow_count = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_query_patterns": (0..64).map(|i| format!("vendorkey{i}")).collect::<Vec<_>>(),
             "forward_sensitive_query": true,
@@ -3580,6 +3670,7 @@ fn mirror_timeout_remains_finite_when_backend_read_timeout_is_zero() {
 fn forward_sensitive_headers_opt_in_is_fail_closed() {
     let missing_allowlist = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_headers": true
         }),
@@ -3595,6 +3686,7 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
 
     let allowlist_without_flag = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_header_allowlist": ["authorization"]
         }),
@@ -3613,6 +3705,7 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
     // that would never be stripped is a config error (catches typos).
     let non_sensitive = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_headers": true,
             "forward_sensitive_header_allowlist": ["x-trace-id"]
@@ -3630,6 +3723,7 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
     // An entry that is not a valid HTTP header name is rejected.
     let invalid_name = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_headers": true,
             "forward_sensitive_header_allowlist": ["bad header name"]
@@ -3649,6 +3743,7 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
     assert!(
         RequestMirror::new(
             &json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "sensitive_header_patterns": ["x-vendor-"],
                 "forward_sensitive_headers": true,
@@ -3663,6 +3758,7 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
     assert!(
         RequestMirror::new(
             &json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "forward_sensitive_headers": true,
                 "forward_sensitive_header_allowlist": ["authorization", "cookie"]
@@ -3677,6 +3773,7 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
 fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
     let patterns_overflow = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_header_patterns": (0..65).map(|i| format!("pat{i}")).collect::<Vec<_>>()
         }),
@@ -3692,6 +3789,7 @@ fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
 
     let pattern_len = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_header_patterns": ["x".repeat(129)]
         }),
@@ -3706,6 +3804,7 @@ fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
 
     let allow_count = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_header_patterns": (0..64).map(|i| format!("vendorkey{i}")).collect::<Vec<_>>(),
             "forward_sensitive_headers": true,
@@ -3727,6 +3826,7 @@ fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
     assert!(long_allow.len() > 256);
     let allow_len = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_header_patterns": ["x-aaaa"],
             "forward_sensitive_headers": true,
@@ -3758,6 +3858,7 @@ fn sensitive_header_config_bounds_reject_unbounded_lists_and_items() {
         .collect();
     let ok = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "sensitive_header_patterns": patterns,
             "forward_sensitive_headers": true,
@@ -4761,7 +4862,7 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
             REQUEST_MIRROR_CONFIG_KEYS.contains(&canonical),
             "fixture must target a recognized key: {canonical}"
         );
-        let mut config = json!({"mirror_host": "mirror.local"});
+        let mut config = json!({"allow_plaintext": true, "mirror_host": "mirror.local"});
         config
             .as_object_mut()
             .expect("object")
@@ -4789,6 +4890,7 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
     }
 
     let arbitrary = json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "zzz_arbitrary_unknown": true
     });
@@ -4803,6 +4905,7 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
 fn test_request_mirror_rejects_multiple_unknown_keys_sorted() {
     let err = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "zzz_extra": true,
             "aaa_extra": false
@@ -4856,6 +4959,7 @@ fn advisory_ctx(content_length: Option<u64>) -> RequestContext {
 #[tokio::test]
 async fn advisory_percentage_zero_disables_every_request_body_capability() {
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 0.0,
         "mirror_request_body": true
@@ -4900,6 +5004,7 @@ async fn advisory_percentage_zero_disables_every_request_body_capability() {
 #[tokio::test]
 async fn advisory_body_mirroring_disabled_keeps_requests_streaming() {
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": false
@@ -4918,6 +5023,7 @@ async fn advisory_body_mirroring_disabled_keeps_requests_streaming() {
 async fn advisory_low_sampling_buffers_only_the_selected_request() {
     // 0.1% → threshold 1 → exactly one selection per 1,000-request cycle.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 0.1,
         "mirror_request_body": true
@@ -4956,6 +5062,7 @@ async fn advisory_low_sampling_buffers_only_the_selected_request() {
 #[tokio::test]
 async fn advisory_saturated_permits_keep_the_request_streaming() {
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -5029,6 +5136,7 @@ async fn advisory_aggregate_budget_bounds_concurrent_unknown_length_uploads() {
     // Chunked uploads declare no length, so each admission reserves the whole
     // plugin-local ceiling. Four ceilings exactly fill the aggregate budget.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -5076,6 +5184,7 @@ async fn advisory_full_aggregate_budget_refuses_then_reuses_released_capacity() 
     // declared zero or tiny Content-Length) must be refused *without mutating*
     // the aggregate, and the released capacity must become reusable.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -5139,6 +5248,7 @@ async fn advisory_aggregate_budget_is_exact_at_the_u64_max_boundary() {
     // budget does not have — the exact fail-open the advisory bound exists to
     // prevent.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -5244,6 +5354,7 @@ async fn advisory_reservation_reconciles_to_the_observed_body_length() {
 #[tokio::test]
 async fn advisory_cancelled_request_releases_admission_without_dispatch() {
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -5295,6 +5406,7 @@ async fn advisory_cancelled_request_releases_admission_without_dispatch() {
 #[tokio::test]
 async fn advisory_repeated_authorize_replaces_same_instance_admission() {
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -5539,6 +5651,7 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
 #[tokio::test]
 async fn advisory_oversized_declared_body_stays_streaming_and_unmirrored() {
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -5574,6 +5687,7 @@ fn advisory_plugin_local_ceiling_survives_an_unlimited_global_limit() {
     };
 
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true
@@ -5612,7 +5726,7 @@ async fn advisory_admission_ignores_content_type_and_declared_framing() {
     // `tests/functional/functional_request_mirror_admission_test.rs`.
     assert_eq!(
         RequestMirror::new(
-            &json!({ "mirror_host": "mirror.local" }),
+            &json!({ "allow_plaintext": true, "mirror_host": "mirror.local" }),
             PluginHttpClient::default()
         )
         .unwrap()
@@ -5627,6 +5741,7 @@ async fn advisory_admission_ignores_content_type_and_declared_framing() {
         ("grpc-declared", "application/grpc+proto", Some(2048)),
     ] {
         let zero = advisory_plugin(json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "percentage": 0.0,
             "mirror_request_body": true
@@ -5641,6 +5756,7 @@ async fn advisory_admission_ignores_content_type_and_declared_framing() {
         );
 
         let full = advisory_plugin(json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "percentage": 100.0,
             "mirror_request_body": true,
@@ -5669,7 +5785,7 @@ async fn advisory_admission_ignores_content_type_and_declared_framing() {
 fn advisory_max_mirrored_request_body_bytes_validation() {
     assert!(
         RequestMirror::new(
-            &json!({ "mirror_host": "mirror.local", "max_mirrored_request_body_bytes": 0 }),
+            &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_mirrored_request_body_bytes": 0 }),
             PluginHttpClient::default()
         )
         .err()
@@ -5679,6 +5795,7 @@ fn advisory_max_mirrored_request_body_bytes_validation() {
 
     let err = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "max_retained_request_body_bytes": 1024,
             "max_mirrored_request_body_bytes": 4096
@@ -5694,7 +5811,7 @@ fn advisory_max_mirrored_request_body_bytes_validation() {
 
     assert!(
         RequestMirror::new(
-            &json!({ "mirror_host": "mirror.local", "max_mirrored_request_body_bytes": "1024" }),
+            &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "max_mirrored_request_body_bytes": "1024" }),
             PluginHttpClient::default()
         )
         .err()
@@ -5703,6 +5820,7 @@ fn advisory_max_mirrored_request_body_bytes_validation() {
 
     RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "max_retained_request_body_bytes": 8192,
             "max_mirrored_request_body_bytes": 8192
@@ -5720,6 +5838,7 @@ fn advisory_default_ceiling_clamps_to_a_smaller_aggregate_budget() {
     // ceiling is defaulted, not operator-declared, so it clamps down instead of
     // failing an instance the operator never mis-configured.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "max_retained_request_body_bytes": 4096
     }));
@@ -5737,6 +5856,7 @@ fn advisory_default_ceiling_clamps_to_a_smaller_aggregate_budget() {
 
     // A larger aggregate budget leaves the default ceiling untouched.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "max_retained_request_body_bytes": ADVISORY_DEFAULT_MIRROR_BODY_CEILING * 4
     }));
@@ -5806,6 +5926,7 @@ async fn advisory_buffering_decision_stays_stable_after_before_proxy_consumes_it
 #[tokio::test]
 async fn advisory_declared_length_is_read_from_the_raw_wire_headers() {
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -5893,6 +6014,7 @@ async fn advisory_undeclared_request_reserves_the_ceiling_regardless_of_method()
     // charge), so the aggregate budget really bounds concurrent transient
     // prebuffers.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -6106,6 +6228,7 @@ async fn advisory_body_inflated_past_the_ceiling_is_attributed_to_the_ceiling() 
     // `max_mirrored_request_body_bytes` — an operator told the aggregate budget
     // was exhausted would resize a knob that cannot fix it.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -6170,6 +6293,7 @@ async fn refused_mirror_publishes_a_query_free_target_without_preparing_egress()
     // stripped form a dispatched mirror logs: no query at all, so neither the
     // credential nor ordinary application parameters are echoed.
     let plugin = advisory_plugin(json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
@@ -6214,7 +6338,7 @@ async fn refused_mirror_publishes_a_query_free_target_without_preparing_egress()
 #[test]
 fn test_request_mirror_declares_finalized_egress_phase() {
     let plugin = RequestMirror::new(
-        &json!({ "mirror_host": "mirror.local", "mirror_request_body": true }),
+        &json!({ "allow_plaintext": true, "mirror_host": "mirror.local", "mirror_request_body": true }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -6598,22 +6722,22 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let token = "'\"`UNREGISTERED_TRAFFIC_TOKEN\\tail";
     for (config, field, reason) in [
         (
-            json!({"mirror_host": "example.com", "mirror_protocol": token}),
+            json!({"allow_plaintext": true, "mirror_host": "example.com", "mirror_protocol": token}),
             "`mirror_protocol`",
             "must be `http` or `https`",
         ),
         (
-            json!({"mirror_host": "example.com", token: true}),
+            json!({"allow_plaintext": true, "mirror_host": "example.com", token: true}),
             "`config`",
             "unknown configuration key",
         ),
         (
-            json!({"mirror_host": "example.com", "mirror_port": 918273641}),
+            json!({"allow_plaintext": true, "mirror_host": "example.com", "mirror_port": 918273641}),
             "`mirror_port`",
             "must be 1–65535",
         ),
         (
-            json!({"mirror_host": "example.com", "mirror_protocol": false}),
+            json!({"allow_plaintext": true, "mirror_host": "example.com", "mirror_protocol": false}),
             "`mirror_protocol`",
             "must be a string",
         ),
@@ -6838,6 +6962,7 @@ fn operator_pattern_alone_makes_a_vendor_name_sensitive() {
     ] {
         let without_pattern = RequestMirror::new(
             &json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 forward_key: true,
                 allow_key: ["x-vendor-value"]
@@ -6850,6 +6975,7 @@ fn operator_pattern_alone_makes_a_vendor_name_sensitive() {
         );
         let with_pattern = RequestMirror::new(
             &json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 patterns_key: ["x-vendor-"],
                 forward_key: true,
@@ -7021,6 +7147,7 @@ async fn dpop_proof_header_is_stripped_unless_allowlisted() {
     assert!(
         RequestMirror::new(
             &json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "forward_sensitive_headers": true,
                 "forward_sensitive_header_allowlist": ["dpop"]
@@ -7039,6 +7166,7 @@ fn credential_class_names_are_allowlistable() {
     assert!(
         RequestMirror::new(
             &json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "forward_sensitive_headers": true,
                 "forward_sensitive_header_allowlist": ["x-session-id", "jwt"],
@@ -7052,6 +7180,7 @@ fn credential_class_names_are_allowlistable() {
     );
     let err = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "mirror.local",
             "forward_sensitive_headers": true,
             "forward_sensitive_header_allowlist": ["x-author"]

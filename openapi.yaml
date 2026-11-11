@@ -35567,9 +35567,11 @@ components:
         pattern and allowlist lengths are measured in UTF-8 BYTES after trimming
         (JSON Schema maxLength counts characters); an explicit
         max_mirrored_request_body_bytes must not exceed the sibling
-        max_retained_request_body_bytes; and byte-count fields require a JSON
+        max_retained_request_body_bytes; byte-count fields require a JSON
         integer LITERAL, so a whole-valued float such as 1.0 is rejected at
-        construction even though JSON Schema treats it as an integer. Label-safe
+        construction even though JSON Schema treats it as an integer; and a
+        cleartext mirror (mirror_protocol http, the default) to a mirror_host
+        that is not a loopback IP literal requires allow_plaintext true. Label-safe
         process-wide ferrum_request_mirror_*_total lifecycle counters are exported
         on authenticated /metrics (no URLs, header names, or plugin IDs). The mirror
         request-target snapshots the same canonical backend-visible query primary
@@ -35630,10 +35632,23 @@ components:
           description: >
             Transport scheme for the mirror URL. Matched case-insensitively:
             the value is ASCII-lowercased at construction, so HTTPS and https are
-            the same setting. For native gRPC content-types,
+            the same setting. http (the default) is admitted without
+            allow_plaintext only when mirror_host is a loopback IP literal
+            (127.0.0.0/8 or ::1); any other host needs https or an explicit
+            allow_plaintext true. For native gRPC content-types,
             http uses cleartext HTTP/2 prior knowledge (h2c) and https negotiates
             ALPN h2 via the shared plugin HTTP/2 companion. Ordinary HTTP mirrors
             retain the default all-version client (HTTP/1.1 capable).
+        allow_plaintext:
+          type: [boolean, "null"]
+          default: false
+          description: >-
+            Explicit opt-in to mirror over cleartext http to a mirror_host that
+            is not a loopback IP literal. The mirror request replays the
+            backend-visible request (its body by default, plus any allowlisted
+            credential headers or query names), so leave this false and use
+            mirror_protocol https unless the path to the mirror is otherwise
+            protected. Has no effect with https or a loopback IP literal host.
         mirror_path:
           type: [string, "null"]
           pattern: '^$|^/[^?#]*$'

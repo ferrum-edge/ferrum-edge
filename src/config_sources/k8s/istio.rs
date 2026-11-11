@@ -6256,7 +6256,8 @@ fn route_redirect_value(
 /// `mirrorPercent`). Returns `None` when no `mirror` destination is present.
 /// Returns `Err` when the mirror destination is malformed (missing host, or a
 /// `port.name` that does not resolve) so the bug is surfaced rather than the
-/// mirror silently dropped.
+/// mirror silently dropped, and when a non-zero mirror targets anything but a
+/// loopback IP literal: the mirror would leave the proxy in cleartext.
 fn route_mirror_plugin(
     object: &K8sObject,
     http: &Value,
@@ -6292,6 +6293,25 @@ fn route_mirror_plugin(
     // does not carry an inert instance (and the route can still collapse).
     if percentage == 0.0 {
         return Ok(None);
+    }
+
+    // Istio carries a mirror over the sidecar's mesh mTLS. Ferrum's
+    // `request_mirror` dials the destination directly from the proxy process
+    // with the plugin HTTP client (the proxy UID is excluded from capture), so
+    // the shadow request — which replays the request body — would travel in
+    // cleartext. Cleartext is admitted without an explicit opt-in only to a
+    // loopback IP literal (GHSA-gcwp-xp94-4pcv), and nothing in an Istio
+    // VirtualService expresses that opt-in, so any other destination fails
+    // closed here instead of being silently opted in.
+    if !crate::plugins::utils::socket_host::is_loopback_ip_literal_host(host.trim()) {
+        return Err(invalid_resource(
+            object,
+            "VirtualService http[].mirror is not supported for this destination: Ferrum \
+             sends the mirror request directly over cleartext HTTP, not over mesh mTLS, and \
+             cleartext mirroring is admitted only to a loopback IP literal; remove the \
+             mirror or attach a `request_mirror` plugin with `mirror_protocol: https` (or an \
+             explicit `allow_plaintext: true`) through native Ferrum configuration",
+        ));
     }
 
     let now = chrono::Utc::now();
@@ -13510,7 +13530,7 @@ extensionProviders:
                     "http": [{
                         "match": [{"uri": {"prefix": "/v1"}}],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
-                        "mirror": {"host": "shadow.default.svc.cluster.local", "port": {"number": 9090}},
+                        "mirror": {"host": "127.0.0.1", "port": {"number": 9090}},
                         "mirrorPercentage": {"value": 25.0}
                     }]
                 }),
@@ -13525,12 +13545,11 @@ extensionProviders:
             .iter()
             .find(|p| p.plugin_name == "request_mirror")
             .expect("request_mirror plugin emitted for http[].mirror");
-        assert_eq!(
-            mirror.config["mirror_host"].as_str(),
-            Some("shadow.default.svc.cluster.local")
-        );
+        assert_eq!(mirror.config["mirror_host"].as_str(), Some("127.0.0.1"));
         assert_eq!(mirror.config["mirror_port"].as_u64(), Some(9090));
         assert_eq!(mirror.config["percentage"].as_f64(), Some(25.0));
+        // No cleartext opt-in is ever written by translation.
+        assert!(mirror.config.get("allow_plaintext").is_none());
         // The mirror plugin is proxy-scoped to the route's proxy.
         assert_eq!(
             mirror.proxy_id.as_deref(),
@@ -13567,6 +13586,45 @@ extensionProviders:
                 .any(|p| p.plugin_name == "request_mirror"),
             "0% mirror must not emit an inert plugin"
         );
+    }
+
+    /// GHSA-gcwp-xp94-4pcv: the mirror request leaves the proxy process
+    /// directly over cleartext HTTP (it does not ride mesh mTLS), so a mirror
+    /// to a Service host fails translation closed instead of being silently
+    /// opted in to plaintext.
+    #[test]
+    fn virtual_service_mirror_to_service_host_fails_closed() {
+        for host in [
+            "shadow.default.svc.cluster.local",
+            "shadow",
+            "10.0.0.7",
+            "localhost",
+        ] {
+            let err = translate_k8s_objects(
+                &[object(
+                    "VirtualService",
+                    serde_json::json!({
+                        "hosts": ["api.example.com"],
+                        "http": [{
+                            "match": [{"uri": {"prefix": "/v1"}}],
+                            "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                            "mirror": {"host": host, "port": {"number": 9090}}
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect_err("a cleartext mirror to a non-loopback host must fail closed");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains("http[].mirror") && rendered.contains("mesh mTLS"),
+                "got: {rendered}"
+            );
+            assert!(
+                !rendered.contains(host),
+                "must not echo the host: {rendered}"
+            );
+        }
     }
 
     #[test]

@@ -342,6 +342,7 @@ async fn in_memory_chargeback_bills_each_primary_once_below_100_percent() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![plugin];
     let sampler = RequestMirror::new(
         &json!({
+            "allow_plaintext": true,
             "mirror_host": "shadow.local",
             "percentage": 50.0,
             "mirror_request_body": false
