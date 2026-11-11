@@ -967,10 +967,7 @@ fn note_read_only_rejection() {
     );
 }
 
-// Consumed only by the external `tests/` crates. `src/lib.rs` and `src/main.rs`
-// both declare the full module tree, so in the BIN target this has no caller and
-// `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+// Consumed only by the external `tests/` crates.
 #[doc(hidden)]
 pub fn reset_read_only_rejection_observability_for_test() {
     READ_ONLY_REJECTION_WARN_LAST_MS.store(0, Ordering::Relaxed);
@@ -1510,8 +1507,7 @@ impl http_body::Body for GuardedAdminBody {
 /// [`serve_admin_io`] does and collect its body, so tests can observe what the
 /// wrapper does once hyper takes the document (issue #5276).
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) async fn collect_guarded_admin_response_for_test(
     response: Response<Full<Bytes>>,
 ) -> Bytes {
@@ -1526,8 +1522,7 @@ pub(crate) async fn collect_guarded_admin_response_for_test(
 /// Wrap an admin response as [`serve_admin_io`] does, then drop it without
 /// polling its body: a connection that went away before writing the response.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn drop_guarded_admin_response_unpolled_for_test(response: Response<Full<Bytes>>) {
     let guard = AdminActivityGuard::new(Arc::new(AdminConnActivity::new()));
     drop(GuardedAdminBody::wrap_response(response, guard));
@@ -2546,9 +2541,7 @@ fn namespace_serving_block(state: &AdminState) -> serde_json::Value {
 /// the wire; this constant is the spelling used in `openapi.yaml` and the docs.
 ///
 /// Consumed by the external `tests/` crates (spec parity and response
-/// assertions); `src/main.rs` declares the same module tree, so in the BIN
-/// target it has no caller and `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+/// assertions).
 pub const NAMESPACE_UNSERVED_HEADER: &str = "X-Ferrum-Namespace-Unserved";
 
 /// Lowercase wire form of [`NAMESPACE_UNSERVED_HEADER`].
@@ -2708,9 +2701,7 @@ fn note_unserved_namespace_mutation(marker: &UnservedNamespaceMutation) {
 }
 
 /// Reset the issue #5447 warning bookkeeping. Consumed only by the external
-/// `tests/` crates; `src/main.rs` declares the same module tree, so in the BIN
-/// target this has no caller and `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+/// `tests/` crates.
 #[doc(hidden)]
 pub fn reset_unserved_namespace_observability_for_test() {
     unserved_namespace_warned().clear();
@@ -2722,7 +2713,6 @@ pub fn reset_unserved_namespace_observability_for_test() {
 /// Process-cumulative count of accepted admin mutations that targeted a
 /// namespace this process's data plane does not serve. Test-only observation of
 /// [`note_unserved_namespace_mutation`].
-#[allow(dead_code)]
 #[doc(hidden)]
 pub fn unserved_namespace_mutation_count_for_test() -> u64 {
     UNSERVED_NAMESPACE_MUTATION_COUNT.load(Ordering::Relaxed)
@@ -2731,7 +2721,6 @@ pub fn unserved_namespace_mutation_count_for_test() -> u64 {
 /// How many `WARN` lines [`note_unserved_namespace_mutation`] actually emitted.
 /// In-process tests capture no gateway logs, so this counter is the observable
 /// proof that the `(namespace, resource kind)` deduplication holds.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub fn unserved_namespace_warn_emitted_count_for_test() -> u64 {
     UNSERVED_NAMESPACE_WARN_EMITTED.load(Ordering::Relaxed)
@@ -6938,13 +6927,11 @@ impl MtlsDnsAdmissionHoldState {
     }
 
     // External tests reach these through the lib target's `_test_support`
-    // shim; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
+    // shim.
     pub(crate) fn mark_restore_cleared_for_test(&self) {
         self.set_restore_phase(MtlsDnsRestorePhase::Cleared);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn mark_restore_import_failed_for_test(&self) {
         self.set_restore_phase(MtlsDnsRestorePhase::ImportedWithErrors);
     }
@@ -7165,9 +7152,7 @@ pub(crate) fn mtls_dns_admission_unavailable_response() -> Response<Full<Bytes>>
     response
 }
 
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
     mutation_started: bool,
     outcome_settled: bool,
@@ -7187,9 +7172,7 @@ pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
 /// errors), the namespace lease reacquisition is cancelled while it waits
 /// behind another holder, and the request drops the restore guard it kept
 /// across that reacquisition. Returns the abandoned guard owner.
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 pub(crate) async fn abandon_restore_lost_lease_recovery_for_test(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,
@@ -7863,9 +7846,7 @@ fn intervening_clear_recovery_candidate(
 }
 
 #[doc(hidden)]
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 pub(crate) fn intervening_clear_recovery_candidate_for_test(
     snapshot: GatewayConfig,
     current: GatewayConfig,
@@ -8112,9 +8093,7 @@ fn plan_additive_rollback_api_specs(
 /// Test view of [`plan_additive_rollback_api_specs`]: the replayed spec ids, the
 /// skipped/cleared counts, and each replayed proxy's surviving ownership tag.
 #[doc(hidden)]
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 #[allow(clippy::type_complexity)]
 pub(crate) fn plan_additive_rollback_api_specs_for_test(
     snapshot: GatewayConfig,
@@ -9247,8 +9226,7 @@ fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
 /// same parse the handler runs before any deletion, not the later semantic
 /// validation.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), serde_json::Error> {
     crate::util::json_object::from_json_object_slice::<RestorePayload>(body).map(|_| ())
 }
@@ -9258,8 +9236,7 @@ pub(crate) fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), ser
 /// Same object-only parse `POST /batch` maps to `400` with
 /// `{"error": "Invalid JSON body: …"}` — the restore envelope's error shape.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
     crate::util::json_object::from_json_object_slice::<BatchCreateRequest>(body).is_ok()
 }
@@ -9270,7 +9247,6 @@ pub(crate) fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
 /// Test-only support for [`restore_envelope_field_names_for_test`] and
 /// [`batch_envelope_field_names_for_test`]; nothing in the serving paths
 /// constructs one.
-#[allow(dead_code)]
 #[derive(Default)]
 struct RestoreFieldNameCollector {
     fields: Vec<String>,
@@ -9317,8 +9293,7 @@ impl<'de> serde::Deserializer<'de> for &mut RestoreFieldNameCollector {
 /// `RestoreRequest.properties`, so adding a Rust member fails that test until
 /// the published schema describes it.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn restore_envelope_field_names_for_test() -> Vec<String> {
     serde_struct_field_names::<RestorePayload>()
 }
@@ -9330,13 +9305,11 @@ pub(crate) fn restore_envelope_field_names_for_test() -> Vec<String> {
 /// [`restore_envelope_field_names_for_test`] uses. The OpenAPI contract test
 /// asserts set-equality against `BatchCreateRequest.properties`.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn batch_envelope_field_names_for_test() -> Vec<String> {
     serde_struct_field_names::<BatchCreateRequest>()
 }
 
-#[allow(dead_code)]
 fn serde_struct_field_names<T>() -> Vec<String>
 where
     T: for<'de> Deserialize<'de>,
@@ -9352,8 +9325,7 @@ where
 /// for `namespace`. Keyed per namespace so tests sharing a process cannot
 /// perturb each other. Always clear the fault when the test finishes.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn set_batch_reference_check_fault(namespace: &str, detail: Option<&str>) {
     let mut faults = batch_ref_faults();
     match detail {
