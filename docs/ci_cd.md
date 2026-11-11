@@ -2295,9 +2295,8 @@ shapes and nothing else:
   workspace build script requires `protoc`. The libFuzzer half of the contract
   — `cargo-fuzz 0.13.1`, the ten target names, every bound (`-runs`,
   `-max_total_time`, `-max_len`, `-timeout`, `-rss_limit_mb`) — belongs to
-  whichever frozen text hosts the push-to-main budget: the retired
-  `CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB` generation, or `FUZZ_SANITIZER_SMOKE_WORKFLOW`
-  beside the adopted one. Its 1024 MiB RSS cap leaves bounded headroom above
+  `FUZZ_SANITIZER_SMOKE_WORKFLOW`, which hosts the push-to-main budget. Its
+  1024 MiB RSS cap leaves bounded headroom above
   the roughly 400 MiB baseline of the fully linked, sanitizer-instrumented fuzz
   binaries.
 
@@ -2383,62 +2382,25 @@ unreviewed place to set a target linker, runner, or rustflags.
 The whole job is frozen, so neither moving the lane nor extending its target
 list can be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS` therefore lists the job's
 admitted texts oldest first, and a generation retires once its successor is on
-`main`. One transition is open (2026-11-09 test sweep), so two generations
-remain:
+`main`. No transition is open, so one generation remains:
 
-- `CI_FUZZ_SMOKE_JOB` — the adopted end: the deterministic property smoke alone
+- `CI_FUZZ_SMOKE_JOB` — the deterministic property smoke alone
   (`cargo test --locked` in `fuzz/`), the required gate on `pull_request`,
-  `merge_group`, the push to `main`, and `workflow_dispatch`. It drops the swap
-  extension, the `cargo-fuzz` install, and the sanitizer step, caches under the
-  new `fuzz-property-smoke` key at line-tables-only debuginfo, and has a
-  60-minute deadline. The bounded budget moved verbatim to
-  `FUZZ_SANITIZER_SMOKE_WORKFLOW`. Measured reason: over 14 main runs Fuzz
-  Smoke took 44–78 minutes against a next-longest job of 20–30 minutes, because
-  its sanitizer build (~47 minutes for the first target plus ~8 minutes of
-  serial per-target rebuilds) bought fewer than ten seconds of fuzzing (every
-  target reaches `-runs=512` in 0–2 seconds). Main's `CI` concurrency group is
-  serialized, so that also delayed `Main Latest Image` and left more main
-  commits superseded before their own run started.
-- `CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB` — the retired end, main's shape before
-  that sweep. It accumulates what each earlier retired generation added:
-  - issue #4238's lane split. `Fuzz Smoke` had been the longest job in required
-    pull-request CI (roughly 47 minutes, of which roughly 46 were compilation)
-    because the six sanitizer-instrumented libFuzzer targets were rebuilt from
-    scratch on every pull request to buy about 48 seconds of actual fuzzing.
-    #3902 moved that budget off the pull-request path and added the
-    checksum-pinned `setup-sccache` compiler cache; #4238 moved it off
-    `merge_group` as well, because a hosted-runner reclamation (`exit 143`)
-    inside the ~38-minute window ejected the queue entry and cascaded a rebuild
-    of everything behind it with no defect in the ejected change. The
-    deterministic property smoke is the required `pull_request` and
-    `merge_group` gate, and the bounded budget runs on the push to `main` and on
-    `workflow_dispatch` only.
-  - issue #4442's seventh bounded libFuzzer invocation for
-    `datagram_client_address`. That target parses the Datagram PROXY v2
-    envelope — address block, the `0xE0` authentication-tag and `0xE1`
-    freshness TLVs, and the freshness value — on attacker-controlled UDP input,
-    entirely **before** the MAC decision. It had been registered,
-    corpus-seeded, and property-tested since #3289/#3862, but neither libFuzzer
-    lane executed it. It is invoked on its own rather than appended to the
-    six-target loop because its documented input budget is 64 KiB
-    (`fuzz_support::MAX_FUZZ_INPUT_BYTES`), not the loop's 4 KiB. The scheduled
-    `fuzz.yml` lane runs every target at `-max_len=65536`; running this one at
-    4 KiB here would leave the same parser's length boundaries reachable in one
-    required lane and unreachable in the other. Every other bound —
-    `-runs=512`, `-max_total_time=8`, `-timeout=2`, `-rss_limit_mb=1024` — is
-    byte-identical to the loop's, so the budget is widened by one target rather
-    than relaxed.
-  - issue #6584's bounded loop over `ocsp_response`, `jwt_svid`, and
-    `tls_material`: the hand-rolled stapled-OCSP DER grammar, the JWT-SVID
-    strict-JSON, token, and JWKS validators, and PEM certificate/key/CRL
-    admission, at the same 64 KiB `-max_len` and otherwise the six-target
-    loop's bounds. Adopted-generation mutations reject dropping a target and
-    re-bounding the loop to 4 KiB, and the `fuzz.yml` freeze carries all three
-    targets in its matrix and shell allowlist.
-  - issue #6573's BoringCache retirement. Each command runs native Cargo only,
-    the job holds only `contents: read`, `Swatinem/rust-cache` restores
-    unconditionally and saves only on a push to `main`, and the sanitizer step
-    and closing report print `sccache --show-stats`.
+  `merge_group`, the push to `main`, and `workflow_dispatch`, cached under the
+  `fuzz-property-smoke` key at line-tables-only debuginfo, with a 60-minute
+  deadline. The bounded libFuzzer budget lives verbatim in
+  `FUZZ_SANITIZER_SMOKE_WORKFLOW`. Measured reason (2026-11-09 test sweep):
+  over 14 main runs the in-CI sanitizer shape took 44–78 minutes against a
+  next-longest job of 20–30 minutes, because its sanitizer build (~47 minutes
+  plus ~8 minutes of serial per-target rebuilds) bought fewer than ten seconds
+  of fuzzing.
+
+Every earlier generation is retired: #3902/#4238's lane split (the budget
+moved off pull requests and then the merge queue), #4442's seventh bounded
+invocation for `datagram_client_address` (its own 64 KiB `-max_len`, every
+other bound identical to the loop's), #6584's `ocsp_response` / `jwt_svid` /
+`tls_material` loop, #6573's BoringCache retirement, and the in-CI sanitizer
+shape that the 2026-11-09 sweep moved to `fuzz-smoke-main.yml`.
 
 A change to what the job runs edits the byte-frozen `fuzz-smoke` job together
 with the policy that admits it: the new text becomes `CI_FUZZ_SMOKE_JOB`, and
@@ -2466,11 +2428,8 @@ What is invariant across every generation:
   `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` and `CI_FUZZ_SMOKE_PARSER_BUDGET` must each
   appear exactly once in every budget host, and the self-test separately
   asserts their 64 KiB `-max_len` and each shared bound;
-- the bounded budget runs only on the push to `main` and on manual dispatch: in
-  the retired generation through the allow-list
-  `if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'`
-  (a `!=` form is rejected outright), in `FUZZ_SANITIZER_SMOKE_WORKFLOW`
-  through its only two triggers;
+- the bounded budget runs only on the push to `main` and on manual dispatch,
+  through `FUZZ_SANITIZER_SMOKE_WORKFLOW`'s only two triggers;
 - compiler caching is admitted only through the repository's own
   `./.github/actions/setup-sccache`, the single local action the contract
   permits. That action installs a checksum-pinned sccache release, never enables

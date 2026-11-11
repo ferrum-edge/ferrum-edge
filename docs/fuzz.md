@@ -129,7 +129,8 @@ unavailable.
 
 All three hosted shapes are byte-frozen by the trusted Cross build policy. The
 `fuzz-smoke` job is admitted as an ordered list of generations with one-way
-transitions (`CI_FUZZ_SMOKE_JOB_GENERATIONS`); `fuzz.yml` (`FUZZ_WORKFLOW`) and
+transitions (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, currently one generation);
+`fuzz.yml` (`FUZZ_WORKFLOW`) and
 `fuzz-smoke-main.yml` (`FUZZ_SANITIZER_SMOKE_WORKFLOW`) are whole-file
 contracts; see [ci_cd.md](ci_cd.md#admitted-fuzz-smoke-generations).
 Scheduling a new target therefore moves both whole-file freezes, a
