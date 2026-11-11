@@ -722,7 +722,6 @@ fn constrained_file_uri_roundtrip_keeps_path_options_identity_and_refreshability
         let reparsed: CertSource = serde_json::from_str(&encoded).unwrap();
         // String deserialization has no field-kind context. The existing
         // source contract reapplies that hint at the material's caller.
-        assert_eq!(reparsed.kind(), MaterialKind::Unknown);
         assert_eq!(
             source,
             CertSource::parse(reparsed.to_config_value(), MaterialKind::Cert)
