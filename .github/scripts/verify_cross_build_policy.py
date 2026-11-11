@@ -440,41 +440,6 @@ UPLOAD_ARTIFACT_ACTION = re.compile(r"^actions/upload-artifact(?:@|\s*$)", re.IG
 # ARM64 image containing the wrong binary. The matrix row and both consuming
 # steps are therefore frozen as one artifact-selection contract.
 PUBLISH_ARTIFACT_STEP_CONTRACTS = {
-    "CI workflow": {
-        "docker": {
-            "Download Linux binary": (
-                "      - name: Download Linux binary\n"
-                "        uses: actions/download-artifact"
-                "@0000000000000000000000000000000000000000\n"
-                "        with:\n"
-                "          name: binary-${{ matrix.binary_target }}\n"
-                "          path: downloaded-artifacts\n"
-            ),
-            "Prepare Docker context": DOCKER_CONTEXT_STEP,
-        },
-        "docker-manifest": {
-            "Download digests": DOCKER_MANIFEST_DOWNLOAD_STEP,
-            "Create and push multi-arch manifest (Docker Hub)": (
-                "      - name: Create and push multi-arch manifest (Docker Hub)\n"
-                "        working-directory: /tmp/digests\n"
-                "        run: |\n"
-                "          docker buildx imagetools create \\\n"
-                "            -t ferrumedge/ferrum-edge:latest \\\n"
-                "            -t ferrumedge/ferrum-edge:main-${{ github.sha }} \\\n"
-                "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n"
-            ),
-            "Create and push multi-arch manifest (GHCR)": (
-                "      - name: Create and push multi-arch manifest (GHCR)\n"
-                "        working-directory: /tmp/digests\n"
-                "        run: |\n"
-                "          docker buildx imagetools create \\\n"
-                "            -t ghcr.io/${{ github.repository }}:latest \\\n"
-                "            -t ghcr.io/${{ github.repository }}:main-"
-                "${{ github.sha }} \\\n"
-                "            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)\n"
-            ),
-        },
-    },
     "release workflow": {
         "docker": {
             "Download Linux binary": (
@@ -510,176 +475,6 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
 # Any step of these jobs can write into the wildcard, including a step whose
 # stated purpose is release notes, so the whole `steps:` list is the contract.
 # Changing one is a trusted-base change, exactly like the protected build job.
-
-CI_LATEST_RELEASE_STEPS = r"""    steps:
-      - uses: actions/checkout@0000000000000000000000000000000000000000
-
-      # Download exactly the five trusted build artifacts by name. A wildcard
-      # pattern would also accept any other artifact whose name happened to
-      # start with the same prefix, so an unrelated job could contribute files
-      # to the published `latest` release.
-      - name: Download native binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-x86_64-unknown-linux-gnu
-          path: downloaded-artifacts/binary-x86_64-unknown-linux-gnu
-
-      - name: Download protected ARM64 binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-aarch64-unknown-linux-gnu
-          path: downloaded-artifacts/binary-aarch64-unknown-linux-gnu
-
-      - name: Download macOS x86_64 binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-x86_64-apple-darwin
-          path: downloaded-artifacts/binary-x86_64-apple-darwin
-
-      - name: Download macOS aarch64 binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-aarch64-apple-darwin
-          path: downloaded-artifacts/binary-aarch64-apple-darwin
-
-      - name: Download Windows binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-x86_64-pc-windows-msvc
-          path: downloaded-artifacts/binary-x86_64-pc-windows-msvc
-
-      - name: Prepare release assets
-        run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          # The closed, auditable published asset set. Each entry names one
-          # exact trusted artifact directory and one exact file inside it, so a
-          # colliding or extra upload can neither add nor replace an asset.
-          copy_trusted_asset() {
-            if [ ! -f "downloaded-artifacts/$1" ] || [ -L "downloaded-artifacts/$1" ]; then
-              echo "::error::missing trusted release asset $1" >&2
-              exit 1
-            fi
-            cp "downloaded-artifacts/$1" "release-assets/$2"
-            echo "$2" >> "$RUNNER_TEMP/expected-assets"
-          }
-          : > "$RUNNER_TEMP/expected-assets"
-          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64 ferrum-edge-linux-x86_64
-          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64.sha256 ferrum-edge-linux-x86_64.sha256
-          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64 ferrum-cni-linux-x86_64
-          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256
-          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64 ferrum-edge-linux-aarch64
-          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64.sha256 ferrum-edge-linux-aarch64.sha256
-          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64 ferrum-cni-linux-aarch64
-          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256
-          copy_trusted_asset binary-x86_64-apple-darwin/ferrum-edge-macos-x86_64 ferrum-edge-macos-x86_64
-          copy_trusted_asset binary-x86_64-apple-darwin/ferrum-edge-macos-x86_64.sha256 ferrum-edge-macos-x86_64.sha256
-          copy_trusted_asset binary-aarch64-apple-darwin/ferrum-edge-macos-aarch64 ferrum-edge-macos-aarch64
-          copy_trusted_asset binary-aarch64-apple-darwin/ferrum-edge-macos-aarch64.sha256 ferrum-edge-macos-aarch64.sha256
-          copy_trusted_asset binary-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe ferrum-edge-windows-x86_64.exe
-          copy_trusted_asset binary-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe.sha256 ferrum-edge-windows-x86_64.exe.sha256
-          # Publishing must be exactly the trusted set, never whatever the
-          # download happened to produce.
-          LC_ALL=C sort -o "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/expected-assets"
-          ls -A release-assets | LC_ALL=C sort > "$RUNNER_TEMP/published-assets"
-          if ! diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/published-assets"; then
-            echo "::error::published release asset set drifted from the trusted set" >&2
-            exit 1
-          fi
-          cd release-assets
-          sha256sum -c ./*.sha256
-          cd ..
-          ls -la release-assets/
-      - name: Create or update latest release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Delete existing latest release and tag
-          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-
-          # Build release notes
-          cat > notes.md << 'NOTES'
-          ## Latest Development Build
-
-          Auto-built from the latest commit on `main` (${{ github.sha }}).
-
-          For stable releases, download a versioned tag (e.g., `v1.0.0`).
-
-          ### Binaries
-
-          | Platform | Binary |
-          |----------|--------|
-          | Linux x86_64 | `ferrum-edge-linux-x86_64` |
-          | Linux x86_64 CNI plugin | `ferrum-cni-linux-x86_64` |
-          | Linux ARM64 | `ferrum-edge-linux-aarch64` |
-          | Linux ARM64 CNI plugin | `ferrum-cni-linux-aarch64` |
-          | macOS x86_64 | `ferrum-edge-macos-x86_64` |
-          | macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
-          | Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |
-
-          ### Docker
-
-          ```bash
-          docker pull ferrumedge/ferrum-edge:latest
-          docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
-          ```
-
-          ### Checksums
-
-          ```
-          NOTES
-          cat release-assets/*.sha256 >> notes.md
-          echo '```' >> notes.md
-
-          # Create the release
-          gh release create latest \
-            --title "Latest Build ($(date -u +%Y-%m-%d))" \
-            --notes-file notes.md \
-            --prerelease \
-            --target "${{ github.sha }}" \
-            release-assets/*
-"""
-
-CI_DOCKER_MANIFEST_STEPS = r"""    steps:
-      - name: Download digests
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          path: /tmp/digests
-          pattern: docker-digest-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@0000000000000000000000000000000000000000
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@0000000000000000000000000000000000000000
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create and push multi-arch manifest (Docker Hub)
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create \
-            -t ferrumedge/ferrum-edge:latest \
-            -t ferrumedge/ferrum-edge:main-${{ github.sha }} \
-            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
-
-      - name: Create and push multi-arch manifest (GHCR)
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create \
-            -t ghcr.io/${{ github.repository }}:latest \
-            -t ghcr.io/${{ github.repository }}:main-${{ github.sha }} \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
-"""
 
 # `create-release` states its gating rationale as a comment between `name:` and
 # `needs:`. A comment line is not a mapping key, so `extract_job_field_block`
@@ -1859,151 +1654,7 @@ RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS = (
 
 GATEWAY_WORKFLOW_FILENAME = "gateway-api-conformance.yml"
 
-# The main-branch publication gate inside `ci.yml` is itself a
-# release-integrity boundary. Its complete job is frozen for the same reason.
-CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
-    name: Main Publish Gate
-    needs: [test, build-binaries]
-    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-26.04
-    # The polling loop stops at its own 60-minute deadline, so the fail-closed
-    # timeout below is always the branch that fires. This job-level ceiling is
-    # only a backstop against a wedged runner and bounds runner occupancy.
-    timeout-minutes: 75
-    permissions:
-      actions: read
-    steps:
-      - name: Wait for dedicated release checks
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          HEAD_SHA: ${{ github.sha }}
-          BRANCH_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          # Each record binds the API endpoint, the run-reported workflow path,
-          # and the display name. A display name alone is not an identity: a
-          # second workflow can reuse it and must never satisfy publication for
-          # a missing canonical run.
-          required_workflow_specs=(
-            "coverage.yml|.github/workflows/coverage.yml|Coverage"
-            "gateway-api-conformance.yml|.github/workflows/gateway-api-conformance.yml|Gateway API Conformance"
-            "mesh-e2e-sidecar-live.yml|.github/workflows/mesh-e2e-sidecar-live.yml|Mesh E2E Sidecar Live Datapath"
-          )
-
-          # Bound the wait inside `timeout-minutes` so the runner is never held
-          # past this deadline and the diagnostic below stays reachable.
-          deadline=$((SECONDS + 3600))
-
-          while :; do
-            pending=0
-
-            for specification in "${required_workflow_specs[@]}"; do
-              IFS='|' read -r workflow_file workflow_path workflow <<<"$specification"
-
-              # Query the canonical workflow endpoint, not the repository-wide
-              # run list. The endpoint identity prevents a different workflow
-              # with the same display name from satisfying this requirement.
-              # The remaining fields independently bind the run to this exact
-              # file, name, commit, push event, and branch.
-              runs=""
-              api_succeeded=0
-              for attempt in 1 2 3; do
-                if runs="$(
-                  gh api --paginate \
-                    -H "Accept: application/vnd.github+json" \
-                    "/repos/${REPOSITORY}/actions/workflows/${workflow_file}/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
-                    --jq '.workflow_runs[] | [.name, .path, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
-                )"; then
-                  api_succeeded=1
-                  break
-                fi
-                if [ "$attempt" -lt 3 ]; then
-                  echo "::warning::Actions API query failed for ${workflow_path}; retrying (${attempt}/3)."
-                  sleep $((attempt * 5))
-                fi
-              done
-              if [ "$api_succeeded" -ne 1 ]; then
-                echo "::error::Actions API query failed for ${workflow_path} after 3 attempts."
-                exit 1
-              fi
-
-              # A record that does not carry exactly seven fields cannot be
-              # matched field by field. Reject malformed data instead of
-              # silently treating the canonical workflow as absent.
-              if awk -F '\t' 'NF > 0 && NF != 7 { found = 1 } END { exit !found }' \
-                <<<"$runs"; then
-                echo "::error::Malformed ${workflow_path} run data for ${HEAD_SHA}."
-                exit 1
-              fi
-
-              # The workflow-specific endpoint should return only this file.
-              # Verify both server-reported identity fields anyway so an API or
-              # repository identity drift fails immediately and visibly.
-              if awk -F '\t' \
-                -v name="$workflow" \
-                -v path="$workflow_path" \
-                'NF == 7 && ($1 != name || $2 != path) { found = 1 } END { exit !found }' \
-                <<<"$runs"; then
-                echo "::error::Workflow identity mismatch for ${workflow_path}."
-                exit 1
-              fi
-
-              # Every matching run must succeed. Selecting a single run would
-              # let one passing duplicate mask a failed run of the same
-              # workflow for this same commit and branch.
-              matching="$(awk -F '\t' \
-                -v name="$workflow" \
-                -v path="$workflow_path" \
-                -v branch="$BRANCH_NAME" \
-                -v sha="$HEAD_SHA" \
-                'NF == 7 && $1 == name && $2 == path && $5 == branch && $6 == "push" && $7 == sha { print $3 "\t" $4 }' \
-                <<<"$runs")"
-              if [ -z "$matching" ]; then
-                echo "Waiting for ${workflow} to start for ${HEAD_SHA}."
-                pending=1
-                continue
-              fi
-
-              workflow_pending=0
-              # A here-string keeps this loop in the current shell so the flag
-              # it sets, and any `exit`, take effect for the whole step.
-              while IFS=$'\t' read -r status conclusion; do
-                if [ "$status" != "completed" ]; then
-                  echo "Waiting for ${workflow}: ${status}."
-                  workflow_pending=1
-                elif [ "$conclusion" != "success" ]; then
-                  echo "::error::${workflow} concluded ${conclusion:-unknown} for ${HEAD_SHA}."
-                  exit 1
-                fi
-              done <<<"$matching"
-
-              if [ "$workflow_pending" -eq 1 ]; then
-                pending=1
-              else
-                echo "${workflow} passed."
-              fi
-            done
-
-            if [ "$pending" -eq 0 ]; then
-              exit 0
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              break
-            fi
-            sleep 30
-          done
-
-          echo "::error::Timed out waiting for dedicated release checks for ${HEAD_SHA}."
-          exit 1
-"""
-
 PUBLISH_EXACT_JOB_CONTRACTS = {
-    "CI workflow": {
-        "main-publish-gate": CI_MAIN_PUBLISH_GATE_JOB,
-    },
     "release workflow": {
         "attest-release-images": RELEASE_ATTEST_RELEASE_IMAGES_JOB,
     },
@@ -2021,51 +1672,6 @@ PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS = {
 # The publication-control fields that gate the protected ARM64 artifacts are
 # frozen, and so is the full step list of every job that publishes by wildcard.
 PUBLISH_CONTROL_CONTRACTS = {
-    "CI workflow": {
-        "latest-release": {
-            "needs": (
-                "    needs: [test, build-binaries, build-arm64-cross, "
-                "main-publish-gate]\n"
-            ),
-            "if": (
-                "    if: always() && needs.test.result == 'success' && "
-                "needs.build-binaries.result == 'success' && "
-                "needs.build-arm64-cross.result == 'success' && "
-                "needs.main-publish-gate.result == 'success' && "
-                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
-            ),
-            "steps": CI_LATEST_RELEASE_STEPS,
-        },
-        "docker": {
-            "needs": (
-                "    needs: [test, build-binaries, build-arm64-cross, "
-                "main-publish-gate]\n"
-            ),
-            "if": (
-                "    if: always() && needs.test.result == 'success' && "
-                "needs.build-binaries.result == 'success' && "
-                "needs.build-arm64-cross.result == 'success' && "
-                "needs.main-publish-gate.result == 'success' && "
-                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
-            ),
-            "strategy": DOCKER_ARTIFACT_MATRIX,
-            "steps": (
-                DOCKER_PUBLISH_STEPS_PREFIX
-                + "          name: binary-${{ matrix.binary_target }}\n"
-                + DOCKER_PUBLISH_STEPS_MIDDLE
-                + DOCKER_CONTEXT_STEP
-                + DOCKER_PUBLISH_STEPS_TAIL
-            ),
-        },
-        "docker-manifest": {
-            "needs": "    needs: docker\n",
-            "if": (
-                "    if: always() && needs.docker.result == 'success' && "
-                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
-            ),
-            "steps": CI_DOCKER_MANIFEST_STEPS,
-        },
-    },
     "release workflow": {
         "create-release": {
             "name": RELEASE_CREATE_RELEASE_NAME,
@@ -11571,12 +11177,6 @@ def heredoc_body_lines(contents: str) -> frozenset[int]:
     return frozenset(body)
 
 
-def shell_continuation_lines(contents: str) -> frozenset[int]:
-    """Return the raw lines a backslash continuation joins onto a previous one."""
-
-    return shell_non_command_start_lines(contents)
-
-
 def shell_continuation_command_starts(contents: str) -> frozenset[int]:
     """Return continuation lines whose first word is still executable argv.
 
@@ -12514,7 +12114,7 @@ def unprotected_cross_surfaces(
 
     lines = outside.splitlines(keepends=True)
     evaluated_lines = shell_evaluated_lines(outside)
-    continuation_lines = shell_continuation_lines(outside)
+    continuation_lines = shell_non_command_start_lines(outside)
     continuation_command_starts = shell_continuation_command_starts(outside)
     jobs_index = next(
         index
@@ -28011,8 +27611,6 @@ pre_build = []
     # Every job that publishes by wildcard freezes its whole step list, not
     # just the download or the `needs` graph that feeds it.
     for contract_source, contract_job in (
-        ("CI workflow", "latest-release"),
-        ("CI workflow", "docker-manifest"),
         ("release workflow", "create-release"),
         ("release workflow", "docker-manifest"),
         ("release workflow", "docker-ebpf-manifest"),
@@ -28773,7 +28371,6 @@ pre_build = []
         failures.append("an unbacked `-ebpf-tools` publish tag was not rejected")
 
     for wildcard_source, wildcard_job, wildcard_token in (
-        ("CI workflow", "latest-release", "release-assets/*"),
         ("release workflow", "create-release", "files: release-assets/*"),
         ("release workflow", "docker-manifest", "docker buildx imagetools create"),
         (
