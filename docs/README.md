@@ -127,7 +127,7 @@ Contributing to Ferrum Edge itself.
 | [functional_testing_load_stress.md](functional_testing_load_stress.md) | Load and stress testing |
 | [protocol_perf_regression.md](protocol_perf_regression.md) | Protocol performance regression gate |
 | [scaling_reload_diagnostics.md](scaling_reload_diagnostics.md) | 30,000-proxy scale harness publication and slow-query diagnostics |
-| [route_status_profile.md](route_status_profile.md) | Isolated route-status measurements in the Resources Scale Benchmark workflow |
+| [route_status_profile.md](route_status_profile.md) | Isolated route-status measurements (dated study; lane retired) |
 | [h1_internal_profile.md](h1_internal_profile.md) | `bench-h1-profile` hosted HTTP/1 internal profiling feature |
 | [pool_internal_profile.md](pool_internal_profile.md) | `bench-pool-profile` H2/native-gRPC pool acquisition profiling |
 | [udp_internal_profile.md](udp_internal_profile.md) | `bench-udp-profile` UDP internal profiling |
@@ -135,10 +135,10 @@ Contributing to Ferrum Edge itself.
 | [mesh_runtime_benchmark.md](mesh_runtime_benchmark.md) | Mesh data-plane head-to-head benchmark methodology |
 | [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md) | Rust CodeQL extraction diagnostic |
 | [unit_compile_diagnostics.md](unit_compile_diagnostics.md) | Retained CI unit-test compilation diagnostics |
-| [native_cache_envelope.md](native_cache_envelope.md) | Native compiler-cache container-envelope proof |
-| [native_compiler_store_transfer.md](native_compiler_store_transfer.md) | Native compiler-store transfer proof |
-| [release_profile_study.md](release_profile_study.md) | Release build profile (LTO / codegen units) study |
-| [release_platform_build_study.md](release_platform_build_study.md) | Non-publishing macOS/Windows/Linux release-build timing study |
+| [native_cache_envelope.md](native_cache_envelope.md) | Native compiler-cache container-envelope proof (dated study; lane retired) |
+| [native_compiler_store_transfer.md](native_compiler_store_transfer.md) | Native compiler-store transfer proof (dated study; lane retired) |
+| [release_profile_study.md](release_profile_study.md) | Release build profile (LTO / codegen units) study (dated study; lane retired) |
+| [release_platform_build_study.md](release_platform_build_study.md) | Non-publishing macOS/Windows/Linux release-build timing study (dated study; lane retired) |
 | [plans/diagnostic_ref_cross_replica_adr.md](plans/diagnostic_ref_cross_replica_adr.md) | ADR: diagnostic reference lookup across replicas |
 | [plans/mesh_multicluster_lifecycle_adr.md](plans/mesh_multicluster_lifecycle_adr.md) | ADR: mesh multicluster lifecycle |
 | [plans/node_waypoint_transport_adr.md](plans/node_waypoint_transport_adr.md) | ADR: NodeWaypoint secured transport |

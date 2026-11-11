@@ -27,11 +27,10 @@ env:
   CARGO_TERM_COLOR: always
   # Absolute line-coverage FLOORS (regression backstops), not targets. They sit
   # deliberately BELOW measured coverage so ordinary drift does not flap main red.
-  # Every PR is measured against its own base, but many PRs land independently and
-  # the merged total on main can dip a fraction of a point below any single PR's
-  # figure — a floor pinned to the peak then fails ~half of merges for a sub-0.1pt
-  # miss. The real protection for NEW code is the diff-scoped
-  # MIN_CHANGED_PLUGIN_LINE_COVERAGE gate that runs on pull_request events.
+  # Main's measured total moves by a fraction of a point between runs, so a floor
+  # pinned to the peak fails ~half of main runs for a sub-0.1pt miss. PRs and
+  # merge groups skip instrumented coverage unless they edit a coverage
+  # controller; these main-branch floors are the gate.
   #
   # Sizing: when this gate was introduced main measured ~78.29% overall / ~84.99%
   # plugins; it has since oscillated 78.20%–78.42% overall (a ~0.2pt band that
@@ -63,7 +62,7 @@ jobs:
       shard-matrix: ${{ steps.plan.outputs.shard-matrix }}
       plugin_gate: ${{ steps.plan.outputs.plugin_gate }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -182,7 +181,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -539,15 +538,14 @@ jobs:
             echo "## Coverage Gate"
             echo ""
             echo "No coverage-relevant files changed in this run."
-            echo "Full coverage still runs on core source, proto/build-input, pushes to main, manual dispatch, and schedule."
-            echo "Classifiable pull-request and merge-group diffs run lib-unit plus the affected integration shards."
+            echo "Pull requests and merge groups skip coverage unless they edit a coverage controller; pushes to main, manual dispatch and schedule run the full matrix."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail when planned coverage shards fail
         if: needs.coverage-plan.outputs.mode != 'skip' && needs.coverage-shard.result != 'success'
         run: exit 1
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.coverage-plan.outputs.mode != 'skip'
         with:
           persist-credentials: false

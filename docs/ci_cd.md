@@ -75,9 +75,7 @@ adding, removing, or materially changing a workflow.
 | `performance-regression.yml` | Performance Regression | Daily schedule on `main`, manual | Out-of-band self-relative overhead benchmark, Criterion microbenchmarks, and the protocol-perf / mesh-baseline static contracts. Not a PR or main-push check; a red run marks the daily `main` tip as regressed. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `h1-tls-post-regression.yml` | H1 TLS POST Historical Baseline | Daily schedule on `main`, manual | Paired same-runner HTTP/1.1 TLS POST/echo throughput of the `main` tip against the historical reference pinned in `tests/performance/multi_protocol/h1_tls_post_reference.json`; gates the paired ratio per payload size, alerts on rolling-ratio drift, downgrades noisy-runner verdicts to provisional. Manual dispatch accepts a reference SHA override for matched-host bisects. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md#historical-baseline-h1-tls-post-check). |
-| `grpc-deadline-ab-benchmark.yml` | gRPC Deadline A/B Benchmark | Manual; push to `perf/grpc-deadline-ab/**` | Paired same-runner A/B of the gRPC RPC-deadline response path (#6904): unary and server-streaming, open and `key_auth`, with and without `grpc-timeout`, between the revisions pinned in `tests/performance/multi_protocol/grpc_deadline_reference.json` or dispatched overrides. Proves from the backend that deadline cells carried `grpc-timeout`, probes stalled-stream termination and backend release, and reports the deadline-path difference-in-differences. Never a required check; see [protocol_perf_regression.md](protocol_perf_regression.md#grpc-rpc-deadline-ab-6904). |
 | `mesh-performance-baselines.yml` | Mesh Performance Baselines | Manual (`workflow_dispatch`) and reusable (`workflow_call`) | Provenance-complete collection of mesh Criterion + HBONE/DNS E2E baseline artifacts for [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) on pinned `ubuntu-26.04`. Uploads `mesh-performance-baselines-<sha>`; fails selected-suite acceptance when gates are false (artifacts still upload); does not invent `baseline.md` numbers. |
-| `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
 | `perf-benchmark.yml` | Multi Protocol Performance Benchmark | Manual | Multi-protocol benchmark suite for selected refs. |
 | `payload-size-benchmark.yml` | Payload Size Performance Benchmark | Manual | Payload-size benchmark suite for selected refs. |
@@ -89,8 +87,6 @@ adding, removing, or materially changing a workflow.
 | `pool-internal-profile.yml` | Pool Internal Profile | PRs on the pool profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual same-host measurement campaign. Optional. See [Optional PR lanes](#optional-pr-lanes-and-post-merge-validation). |
 | `h1-internal-profile.yml` | H1 Internal Profile | PRs on the H1 profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/cadence/trace-fixture checks; manual measurement campaign. Optional. |
 | `udp-internal-profile.yml` | UDP Internal Profile | PRs on the UDP profiler's own paths, daily schedule on `main`, manual | Observer-feature lint/contract checks; manual measurement campaign. Optional. |
-| `h2-guard-observation.yml` | H2 Guard Observation | PRs on its own paths, push to `main` on its own paths plus the repository files it pins, manual | Temporary [#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588) patched-`h2` guard regressions; manual dispatch can add the H2/gRPC campaign. `prepare.py` fails closed on pin drift, so a main push that stales a pin turns red on that commit; see [Optional lanes that pin files outside their own paths](#optional-lanes-that-pin-files-outside-their-own-paths). Not a required check. |
-| `h2-guard-pin-check.yml` | H2 Guard Pin Check | PRs on pinned H2 inputs and guard assets | Cheap, build-free verification of the H2 guard's admin pre/postimage hashes and Cargo/Docker anchors. Prints replacement hashes on drift; not a required check. |
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
@@ -103,13 +99,7 @@ adding, removing, or materially changing a workflow.
 | `h3-proof-preflight.yml` | H3 Proof Preflight | PRs on its own paths, manual | H3 observer compile and hosted self-tests. Optional. |
 | `h3-live-comparison.yml` | H3 Live Comparison | PRs on its own paths, manual | H3 feature contracts and fixtures on PRs; manual dispatch runs the calibrated H3 payload campaign. Optional. |
 | `rr-build-comparison.yml` | RoundRobin Build Comparison | PRs and push to `main` on its own paths, manual | Evidence-contract checks; manual dispatch runs a paired RoundRobin comparison against a chosen ancestor SHA. Optional. |
-| `stream-profile.yml` | Stream Profile | Push to `bench/5588-stream-**`, manual | Low-rate streaming latency profile for the response-aggregation window ([#5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588)). Optional. |
-| `release-sbom-smoke.yml` | Release SBOM Smoke | PRs and push to `main` on its own paths | Read-only SPDX SBOM reproduction per image family/registry/architecture; no registry login, signing, or publication. Optional. |
-| `release-profile-study.yml` | Release Profile Study | Manual; PRs and push to `main` on its own paths run contracts only | Nonpublishing fat-vs-thin LTO build and benchmark study; see [release_profile_study.md](release_profile_study.md). |
-| `release-platform-study.yml` | Release Platform Build Study | Manual; PRs and push to `main` on its own paths run telemetry contracts only | Nonpublishing macOS/Windows release-build timing study; see [release_platform_build_study.md](release_platform_build_study.md). |
 | `windows-confinement.yml` | Windows File Confinement | PRs and push to `main` on `src/tls/source/**`, the confinement tests and their registration chain (`tests/unit_tests.rs`, `tests/unit/mod.rs`, `tests/unit/tls/mod.rs`), `src/lib.rs`, `src/config/file_loader.rs`, Cargo/toolchain/build configuration, or its own file; manual | Runs the Windows-only tenant-file confinement unit tests (`windows_confined_files`) natively on `windows-latest`, including the elevated case-sensitive NTFS directory test that is `#[ignore]`d elsewhere. Every unit shard runs on Linux, where these tests compile out ([#6540](https://github.com/ferrum-edge/ferrum-edge/issues/6540)). Fails when fewer tests run than the module holds. Optional. |
-| `native-cache-envelope.yml` | Native Cache Envelope Proof | Manual; PRs and push to `main` on its own paths run contracts only | Synthetic GHCR envelope proof for native compiler caches; see [native_cache_envelope.md](native_cache_envelope.md). |
-| `native-compiler-store.yml` | Native Compiler Store Transfer | Manual; PRs and push to `main` on its own paths | Real compiler-store transfer proof through GHCR; see [native_compiler_store_transfer.md](native_compiler_store_transfer.md). |
 | `codeql.yml` | CodeQL | PRs and pushes to `main` (actions, c-cpp, python); daily 01:11 UTC and manual (all four languages, including Rust) | CodeQL advanced setup replacing default setup. The ~2h Rust analysis runs only on the daily schedule and manual dispatch, never on PRs. Optional. |
 | `codeql-extraction-diagnostic.yml` | CodeQL Rust Extraction Diagnostic | Manual | Extraction-only default vs FIPS feature comparison; see [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md). |
 | `compose-fixture-qualification.yml` | Compose Fixture Qualification | PRs on `docker-compose.yml`, `docker-compose.tls-test.yml`, `setup_db_tls.sh`, `check_compose_fixtures.sh`, and the workflow itself; manual | Disposable Compose fixture boundary checks. Optional. |
@@ -398,7 +388,8 @@ while PR-controlled planner bytes remain at the executed path. Filenames in the
 plan summary are JSON-escaped then HTML-escaped
 inside `<code>` so a hostile name cannot break Markdown.
 
-**FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit.
+**FIPS.** `FIPS Feature Policy` stays a cheap always-on graph audit; the
+required `FIPS Build & Test` aggregate needs it and fails unless it succeeded.
 Compile, claimed-profile `cargo check`, clippy `-D warnings`, and the
 policy/key-admission/handshake tests share one cache layer plus an immutable
 artifact handoff:
@@ -417,7 +408,7 @@ artifact handoff:
   and never publish. The test job does not restore build caches.
 - **Immutable producer handoff (same-run channel and inter-run warm
   source).** A successful non-cold `fips-compile`
-  packages its exact `target/` + `.cache/sccache` producer tree, the
+  packages its exact `target/` producer tree, the
   checkout's Git tree identity, and a `fips-producer-identity` member that
   records source SHA, run id, and run attempt as a zstd tar
   (preserving executable modes that artifact ZIP extraction would normalize)
@@ -465,8 +456,9 @@ artifact handoff:
   `fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-<run_id>-<run_attempt>` from that run
   in the current repository. A promoted artifact — same-run or explicitly
   requested — must contain a
-  real tar payload that extracts to real `target/` and `.cache/sccache`
-  directories or the consuming job fails closed. The archive carries the
+  real tar payload that extracts to a real `target/` directory or the
+  consuming job fails closed (an older artifact's extra `.cache/sccache` member
+  is ignored). The archive carries the
   producer
   checkout's Git tree identity; promotion requires an equal, clean current
   checkout, preventing a synthetic PR merge tree from masquerading as the same
@@ -479,12 +471,12 @@ artifact handoff:
   look newer and invalidate its dependents.
 
   Cargo also includes the resolved `RUSTC_WRAPPER` executable identity in its
-  artifact hashes. The checksum-pinned sccache wrapper is a runner-private
-  install, which is fine for ordinary compiler caching but is not a stable
-  identity for an exact `target/` tree across jobs. Each FIPS Cargo job
-  therefore stops that private wrapper and clears both wrapper variables before
-  any cache or Cargo operation; the immutable exact-target channel is the FIPS
-  compiler cache. These two controls keep Cargo from rebuilding
+  artifact hashes, so any wrapper would break exact `target/` reuse across
+  jobs. The FIPS Cargo jobs therefore install no compiler-cache wrapper and
+  clear `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` at job level; the
+  immutable exact-target channel is the FIPS compiler cache. (They used to
+  install `setup-sccache` and then stop and clear it before Cargo ran, and
+  still cached, packed and reported its empty store; #7285 removed that.) These two controls keep Cargo from rebuilding
   content-identical outputs without allowing a partial, fork, cold,
   mismatched-tree, or runner-unique-compiler restore to masquerade as current.
   `force_cold_cache` skips both handoff download and upload. Run artifacts
@@ -529,9 +521,9 @@ hit/miss from the action output as **stable fallback**, same-run producer
 handoff promotion as an evidence-backed **hit** (a missing handoff fails the
 job rather than recording a fabricated miss), and the
 explicit inter-run handoff artifact as **hit / miss** (never as a fabricated
-hit). Measured restored bytes are the sccache-directory subset for
-rust-cache and the on-disk `target/` directory for the promoted producer
-handoff; rust-cache Cargo/target archive bytes are not exposed. The
+hit). Measured restored bytes are the restored `target/` directory for rust-cache
+(its Cargo registry and git bytes are not exposed) and the on-disk `target/`
+directory for the promoted producer handoff. The
 required `FIPS Build & Test`
 aggregate depends on `fips-test-build` and fails closed if that test-binary
 producer does not succeed.
@@ -551,15 +543,16 @@ and recreated before the verified copy: rust-cache hashes the wrapper path
 into its key, and a randomized root made every lane unrestorable (#4643). It persists
 `SCCACHE_GHA_ENABLED` as empty so a later step cannot re-enable the
 credential-bearing GHA backend. Install failure clears the rustc wrapper and
-continues uncached. Compiler outputs use a 2 GiB local directory persisted by
-rust-cache / the FIPS producer archive. Production-image caches use pinned
+continues uncached. Compiler outputs use a 2 GiB local directory that no
+lane persists (the restored `target/` already skips dependency compilation),
+and the FIPS and fuzz-smoke jobs do not install it at all (#7285).
+Production-image caches use pinned
 BuildKit registry imports and trusted-main exports. PR recipes remain
 `permissions: contents: read`; only the mutually exclusive trusted-main
 publisher receives `packages: write`. Static checks live in
 `.github/scripts/verify_ci_runtime_cache.py`. The cache-credential gate is
 structural: `fips-build.yml` may invoke only a closed allowlist of pinned
-actions and the two local shell-only composites (`setup-sccache`,
-`setup-fast-linker`). Extracted `uses` must match that allowlist with exact
+actions and the one local shell-only composite `setup-fast-linker`. Extracted `uses` must match that allowlist with exact
 occurrence counts, so inserting a duplicate of an already-admitted
 checkout, rust-cache, artifact, toolchain, or local action fails. Each
 `actions/checkout` step must keep the current-repository / default-ref /
@@ -777,7 +770,7 @@ aggregate accepts a skipped job only when its gate was `false`:
 
 | Gate | Schedules | Pull-request trigger surface |
 |---|---|---|
-| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/` and the standalone benchmark workspaces under `tests/performance/`, other than the `PERFORMANCE_TREE_WORKSPACE_INPUTS` fixtures root-crate tests embed), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `ci.yml`, the Rust setup actions |
+| `run_rust` | Unit Tests, Lint, Integration, Functional, Redis regression | `src/`, `tests/` (except `tests/k8s/` and the standalone benchmark workspaces under `tests/performance/`, other than the `PERFORMANCE_TREE_WORKSPACE_INPUTS` fixtures root-crate tests embed), `custom_plugins/`, `ebpf/`, `proto/`, `vendor/`, Cargo/toolchain/`build.rs`/`build/`, `.config/nextest.toml`, `ferrum.conf`, `openapi.yaml`, `deny.toml`, `clippy.toml`, `ci.yml`, the Rust setup actions |
 | `run_artifacts` | Build Test Artifacts | `run_rust` or `run_helm` |
 | `run_acme` | ACME Feature Tests (`--features acme`, own job) | `src/tls/`, `tests/acme_dns01/`, `tests/unit/tls/`, build graph |
 | `run_conformance` | Mesh Conformance Tests | `tests/conformance/`, mesh/xDS/k8s translation modules, build graph |
@@ -896,16 +889,13 @@ concurrency:
 A new push to a pull request cancels that PR's superseded run. Pushes to
 `main`, dispatches, and schedules get a unique `run-<id>` group, so they are
 never cancelled and never displace a queued dispatch. `h3-live-comparison.yml`
-and `h2-guard-observation.yml` keep their own named groups and likewise cancel
-only on `pull_request`, but their manual dispatches also get a unique
-`run-<id>` group: `cancel-in-progress: false` alone protects only a campaign
-that is already running (a group otherwise holds one running and one pending
-run, and a later same-group dispatch would replace the pending one), while the
-per-run group preserves every queued manual campaign. H2 main pushes keep the
-ref group and the coalescing described under
-[Main-push concurrency](#main-push-concurrency). `h3-proof-preflight.yml` uses
-its own group keyed on the PR number or ref and always cancels the superseded
-run. The required workflows keep their own event-aware groups (see below).
+keeps its own named group and likewise cancels only on `pull_request`, but its
+manual dispatches also get a unique `run-<id>` group: `cancel-in-progress:
+false` alone protects only a campaign that is already running (a group
+otherwise holds one running and one pending run, and a later same-group
+dispatch would replace the pending one), while the per-run group preserves
+every queued manual campaign. `h3-proof-preflight.yml` uses its own group keyed
+on the PR number or ref and always cancels the superseded run. The required workflows keep their own event-aware groups (see below).
 
 **Measuring gate changes.** `.github/scripts/ci_gate_replay.py` replays merged
 pull requests through two revisions of `pr_ci_plan.py`,
@@ -948,31 +938,11 @@ run red on the commit that caused it. Its concurrency group follows
 [Main-push concurrency](#main-push-concurrency): cancel superseded
 `pull_request` runs only; main pushes and manual runs complete.
 
-| Workflow | Pin check | Pinned repository inputs (in its `push` paths) |
-|---|---|---|
-| `h2-guard-observation.yml` | `tests/performance/multi_protocol/h2_guard/prepare.py` | `src/admin/mod.rs` (`context_files` SHA-256 in `h2_guard/source.json`), the path-sourced `h2` entry in `Cargo.lock`, the single `[patch.crates-io]` table and its vendored `h2` line in `Cargo.toml`, the vendored h2 patches (`docs/upstream-h2-patches/00{1,3,4}-…/*.patch`) and their `vendor/VENDOR_INTEGRITY.sha256` hashes, the two `cargo build` calls in `Dockerfile` |
-
-`h2-guard-pin-check.yml` runs the same pin and anchor validation on the pull
-request that changes one of those inputs or the H2 guard assets. Its
-`prepare.py --check-pins-only` mode uses only Python's standard library to read
-the checkout, hash the admin source and its prepared postimage, and validate
-the Cargo/Docker anchors. It does not download the crate or create a build
-context. A mismatch prints the replacement `context_files` object and
-`metrics-hook.txt` hash for `tests/performance/multi_protocol/h2_guard/source.json`;
-the heavier observation workflow remains responsible for build and regression
-validation.
-
-When `src/admin/mod.rs` changes on purpose, refresh its pin in the same PR
-using the replacement values printed by the automatic `H2 guard pins` check.
-Otherwise the post-merge run goes red and the next PR must refresh it. When the
-`h2` entry in `Cargo.lock`, the `[patch.crates-io]` table or the Dockerfile
-`cargo build` calls change on purpose, update the shared anchor constants at the
-top of `prepare.py` in the same PR; the heavy observation lane also runs on those
-PRs and fails if the prepared build no longer applies. Any new
-optional lane whose prepare script hashes files under `src/` (for example a
-`context_files` entry) must add those files to its `push` paths and a row here.
-Lanes that hash only their own assets or runtime evidence (the internal-profile
-and trace lanes, `native-cache-envelope.yml`) need no extra trigger.
+No current lane pins a file outside its own paths. A new optional lane whose
+prepare script hashes files under `src/` (for example a `context_files` entry)
+must add those files to its `push` paths and say so here. Lanes that hash only
+their own assets or runtime evidence (the internal-profile and trace lanes)
+need no extra trigger.
 
 ### Rust cache lanes
 
@@ -1084,12 +1054,18 @@ same event guard as the other path-gated Helm/eBPF/secrets/PKCS jobs), empty or
 unavailable diffs, unclassifiable/unsafe changed paths, a missing or non-`true`
 `paths_classifiable` handshake from an old trusted-base planner, and edits to
 the gate-controller scripts force all of these gates on. Shared compile-graph
-inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs`, `proto/`,
-`rust-toolchain.toml`, `.cargo/`, `.github/workflows/ci.yml`, and the
-`setup-rust-ci` / `setup-sccache` / `setup-fast-linker` actions) also schedule
+inputs (`Cargo.toml`/`Cargo.lock`, `vendor/`, `build.rs` and the `build/`
+modules it includes, `proto/`, `rust-toolchain.toml`, `.cargo/`,
+`.github/workflows/ci.yml`, and the `setup-rust-ci` / `setup-sccache` /
+`setup-fast-linker` actions) also schedule
 the Secret Backends and PKCS#11 jobs. Rust formatting and the integration-shard
 coverage contract also run as named steps in `CI Plan`, avoiding two additional
 runner allocations.
+
+In its kind cluster the `Helm Chart` job also installs the `charts/ferrum-gateway`
+file-mode example (`examples/file-values.yaml`) with the CI image, waits for the
+readiness probe, and reads `/health` through the admin port, so probe, mount and
+securityContext regressions fail CI rather than a user's install.
 
 The `Helm Chart` job additionally runs the trusted node-agent/ambient chart
 runtime lint (`.github/scripts/check_node_agent_chart_runtime.py`, issue #3615)
@@ -1104,24 +1080,13 @@ no-symlink, mode, byte-content, no-extra-file, and ancestor-directory
 constraints entirely from that manifest, spawning no process of its own.
 Anything it cannot answer fails closed.
 
-The default comparison is byte-identical. Issue #3904 admits exactly one
-additional, controller-frozen generation transition for
-`.github/actions/setup-kubernetes-tools`, and only that path. The trusted-base
-tree whose sole governed file is non-executable `action.yml` at SHA-256
-`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08` may move to
-the PR #3910 tree whose `action.yml` is SHA-256
-`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9` with the same
-path set and executable bit. Both source and destination generations are bound
-inside the extracted checker (complete file set, modes, and content hashes).
-Another base generation, a one-byte or mode change, an extra or missing file,
-or any other local-action path is still rejected. The candidate cannot supply
-a digest, a mutable allowlist, or an unbound proposed manifest.
-
-The current `action.yml` on `main` is the destination generation, so an
-unchanged working tree passes by ordinary byte identity and any further
-unadmitted drift fails. The predecessor constants in
-`verify_trusted_local_action.py` are therefore inert and should be retired so
-the old tree cannot remain an admitted source.
+The comparison is byte-identical (apart from external action pins, which the
+trusted pin rotation check governs), and nothing else is admitted. Issue
+#3904's one-way move of `.github/actions/setup-kubernetes-tools` to the PR
+#3910 cached-installer tree is spent: that tree is the trusted base, and the
+predecessor and destination constants are gone from the checker. An installer
+edit therefore has to match the trusted tree, which makes it reviewed
+direct-to-`main` policy work.
 
 Keeping the proof in Python rather than inline shell also keeps `helm-chart`
 free of the opaque-inline-shell and Cross surfaces that `Trusted Cross Build
@@ -1143,8 +1108,10 @@ versions/checksums, install subset, and runner OS/arch; checksums are verified
 after both restore and download. `ci.yml` has no deploy-only mesh smoke jobs:
 each dedicated full live suite performs the same SPIRE/workload rollout and
 then continues into traffic probes and fail-closed live assertions. Independent
-workflows start concurrently and do not poll each other for executables; the
-shared `ci-live-pr-build` cache is the compile reuse.
+workflows start concurrently and do not poll each other for executables. No
+main-push job produces `ci-live-pr-build` (a saved `pr-build` archive would
+cost 1-2 GB of the 10 GB quota), so today every live lab compiles cold; the key
+only keeps the four labs on one lane should a producer be added.
 
 On pull requests and merge groups the checker is extracted from the base revision when
 one exists, then self-tested and executed against the proposed chart tree. That
@@ -1281,6 +1248,8 @@ requests and pushes to `main`:
 
 ```bash
 cargo fmt --all -- --check
+# src/main.rs include!s src/gateway_entry.rs, which cargo fmt never visits:
+rustfmt --edition 2024 --check src/gateway_entry.rs
 # Also diffs tests/integration/*.rs against integration::<module> filters in ci.yml.
 ```
 
@@ -1888,9 +1857,8 @@ Immediately after checkout, the job always runs lightweight protocol-perf static
 validation (no benchmarks): workflow verifier `--self-test`,
 repository-contract verification, evaluator `--self-test`, and
 `python3 -m py_compile` on
-`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. The
-change classifier is retained for manual dispatch parity; on the scheduled and
-dispatched events it schedules every benchmark. The job builds the gateway in
+`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. Every
+run then executes every benchmark. The job builds the gateway in
 the `ci-release` profile, builds `tests/performance/backend_server`, starts both
 services, and runs:
 
@@ -1945,13 +1913,9 @@ measurement fidelity:
   and budgets are re-baselined.
 
 Every scheduled or manual run executes all four Criterion microbenchmarks (IP
-restriction, WRR, RoundRobin, AI semantic-cache cleanup). The "Detect
-performance-sensitive changes" step still contains `pull_request` /
-`merge_group` path rules (measured sources, fixtures, verifiers, and
-Criterion-relevant `ci.yml` hunks, failing closed when a diff cannot be
-computed), but the workflow no longer triggers on those events. The
-`verify_rr_selection_benchmark.py` and `verify_wrr_selection_benchmark.py`
-`--self-test` helpers run on every job.
+restriction, WRR, RoundRobin, AI semantic-cache cleanup); the workflow has no
+change classifier. The `verify_rr_selection_benchmark.py` and
+`verify_wrr_selection_benchmark.py` `--self-test` helpers run on every job.
 
 The WRR parallel-speedup floor stays at 1.10x for its mandatory
 high-cardinality fixtures (32 and 129 targets), which genuinely scale. On
@@ -1970,9 +1934,9 @@ selection together; their costs need not inflate proportionally on a busy
 runner. The old 0.50 multiplier could reject unchanged selection code.
 
 `run_rr_selection_comparison.sh` builds candidate and immutable baseline with
-only the candidate benchmark harness overlaid. The PR base SHA, merge-group
-base SHA, or main push before SHA selects the baseline when present; scheduled
-and manual runs default to the preceding commit (`HEAD^`). Both compilations use the same
+only the candidate benchmark harness overlaid. `performance-regression.yml`
+passes the preceding commit (`HEAD^`) as the baseline on scheduled and manual
+runs; another caller supplies its own base SHA. Both compilations use the same
 deterministic runner-temporary source path and target directory, with the
 runner-root Cargo configuration and toolchain. The completed binary is copied
 immediately, then its newly created source worktree is moved aside; the next
@@ -2143,19 +2107,23 @@ No release version or build-profile change is part of this rotation.
 
 ##### Trusted-base relevance for required live gates
 
-`mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
-required status checks that may legitimately skip their expensive live job when
-a pull request touches nothing relevant. That skip is a security boundary: if
+`gateway-api-conformance.yml`, `mesh-e2e-sidecar-live.yml`,
+`multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`, and
+`ambient-host-udp-live.yml` publish required status checks that may legitimately
+skip their expensive live job when a pull request touches nothing relevant. That skip is a security boundary: if
 the relevance verdict were computed by the pull request's own copy of
 `.github/scripts/live_suite_path_filter.py`, a pull request could widen
 `SUITE_PATTERNS`, declare itself irrelevant, skip the live job, and still turn
 the required gate green.
 
-Both workflows therefore share one byte-identical relevance job, frozen in the
+These workflows therefore share one byte-identical relevance job, frozen in the
 trusted verifier as `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` and enforced absolutely
 by `live_suite_relevance_errors` in exact validation *and* in pull-request
 comparison. Only the display name, temp-file slug, and `--suite` selector
-differ. Its load-bearing properties:
+differ. `Gateway API Conformance` joined the contract for GHSA-c57q-j5hg-w4vc:
+its `changes` job had run the pull request's own copy of the filter, so a pull
+request could make its own diff irrelevant and turn the required `gate` green
+without the lab. Its load-bearing properties:
 
 - The relevance script comes from the base-branch tip of the **base**
   repository, never from the pull-request checkout. This holds for fork pull
@@ -2295,17 +2263,15 @@ shapes and nothing else:
   workspace build script requires `protoc`. The libFuzzer half of the contract
   — `cargo-fuzz 0.13.1`, the ten target names, every bound (`-runs`,
   `-max_total_time`, `-max_len`, `-timeout`, `-rss_limit_mb`) — belongs to
-  whichever frozen text hosts the push-to-main budget: the retired
-  `CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB` generation, or `FUZZ_SANITIZER_SMOKE_WORKFLOW`
-  beside the adopted one. Its 1024 MiB RSS cap leaves bounded headroom above
+  `FUZZ_SANITIZER_SMOKE_WORKFLOW`, which hosts the push-to-main budget. Its
+  1024 MiB RSS cap leaves bounded headroom above
   the roughly 400 MiB baseline of the fully linked, sanitizer-instrumented fuzz
   binaries.
 
   Because a whole-job freeze cannot express an edit, a change to *where* each
   half of the lane runs (#3902, #4238) or to *which targets* the budget covers
   (#4442) is admitted as two byte-frozen **generations** with a one-way
-  transition between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first) — the
-  same shape as the admitted `release.yml` image-family adoption. See
+  transition between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first). See
   [Admitted `fuzz-smoke` generations](#admitted-fuzz-smoke-generations).
 - `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
   that has not adopted it may omit it; once the trusted base carries it, a pull
@@ -2383,62 +2349,25 @@ unreviewed place to set a target linker, runner, or rustflags.
 The whole job is frozen, so neither moving the lane nor extending its target
 list can be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS` therefore lists the job's
 admitted texts oldest first, and a generation retires once its successor is on
-`main`. One transition is open (2026-11-09 test sweep), so two generations
-remain:
+`main`. No transition is open, so one generation remains:
 
-- `CI_FUZZ_SMOKE_JOB` — the adopted end: the deterministic property smoke alone
+- `CI_FUZZ_SMOKE_JOB` — the deterministic property smoke alone
   (`cargo test --locked` in `fuzz/`), the required gate on `pull_request`,
-  `merge_group`, the push to `main`, and `workflow_dispatch`. It drops the swap
-  extension, the `cargo-fuzz` install, and the sanitizer step, caches under the
-  new `fuzz-property-smoke` key at line-tables-only debuginfo, and has a
-  60-minute deadline. The bounded budget moved verbatim to
-  `FUZZ_SANITIZER_SMOKE_WORKFLOW`. Measured reason: over 14 main runs Fuzz
-  Smoke took 44–78 minutes against a next-longest job of 20–30 minutes, because
-  its sanitizer build (~47 minutes for the first target plus ~8 minutes of
-  serial per-target rebuilds) bought fewer than ten seconds of fuzzing (every
-  target reaches `-runs=512` in 0–2 seconds). Main's `CI` concurrency group is
-  serialized, so that also delayed `Main Latest Image` and left more main
-  commits superseded before their own run started.
-- `CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB` — the retired end, main's shape before
-  that sweep. It accumulates what each earlier retired generation added:
-  - issue #4238's lane split. `Fuzz Smoke` had been the longest job in required
-    pull-request CI (roughly 47 minutes, of which roughly 46 were compilation)
-    because the six sanitizer-instrumented libFuzzer targets were rebuilt from
-    scratch on every pull request to buy about 48 seconds of actual fuzzing.
-    #3902 moved that budget off the pull-request path and added the
-    checksum-pinned `setup-sccache` compiler cache; #4238 moved it off
-    `merge_group` as well, because a hosted-runner reclamation (`exit 143`)
-    inside the ~38-minute window ejected the queue entry and cascaded a rebuild
-    of everything behind it with no defect in the ejected change. The
-    deterministic property smoke is the required `pull_request` and
-    `merge_group` gate, and the bounded budget runs on the push to `main` and on
-    `workflow_dispatch` only.
-  - issue #4442's seventh bounded libFuzzer invocation for
-    `datagram_client_address`. That target parses the Datagram PROXY v2
-    envelope — address block, the `0xE0` authentication-tag and `0xE1`
-    freshness TLVs, and the freshness value — on attacker-controlled UDP input,
-    entirely **before** the MAC decision. It had been registered,
-    corpus-seeded, and property-tested since #3289/#3862, but neither libFuzzer
-    lane executed it. It is invoked on its own rather than appended to the
-    six-target loop because its documented input budget is 64 KiB
-    (`fuzz_support::MAX_FUZZ_INPUT_BYTES`), not the loop's 4 KiB. The scheduled
-    `fuzz.yml` lane runs every target at `-max_len=65536`; running this one at
-    4 KiB here would leave the same parser's length boundaries reachable in one
-    required lane and unreachable in the other. Every other bound —
-    `-runs=512`, `-max_total_time=8`, `-timeout=2`, `-rss_limit_mb=1024` — is
-    byte-identical to the loop's, so the budget is widened by one target rather
-    than relaxed.
-  - issue #6584's bounded loop over `ocsp_response`, `jwt_svid`, and
-    `tls_material`: the hand-rolled stapled-OCSP DER grammar, the JWT-SVID
-    strict-JSON, token, and JWKS validators, and PEM certificate/key/CRL
-    admission, at the same 64 KiB `-max_len` and otherwise the six-target
-    loop's bounds. Adopted-generation mutations reject dropping a target and
-    re-bounding the loop to 4 KiB, and the `fuzz.yml` freeze carries all three
-    targets in its matrix and shell allowlist.
-  - issue #6573's BoringCache retirement. Each command runs native Cargo only,
-    the job holds only `contents: read`, `Swatinem/rust-cache` restores
-    unconditionally and saves only on a push to `main`, and the sanitizer step
-    and closing report print `sccache --show-stats`.
+  `merge_group`, the push to `main`, and `workflow_dispatch`, cached under the
+  `fuzz-property-smoke` key at line-tables-only debuginfo, with a 60-minute
+  deadline. The bounded libFuzzer budget lives verbatim in
+  `FUZZ_SANITIZER_SMOKE_WORKFLOW`. Measured reason (2026-11-09 test sweep):
+  over 14 main runs the in-CI sanitizer shape took 44–78 minutes against a
+  next-longest job of 20–30 minutes, because its sanitizer build (~47 minutes
+  plus ~8 minutes of serial per-target rebuilds) bought fewer than ten seconds
+  of fuzzing.
+
+Every earlier generation is retired: #3902/#4238's lane split (the budget
+moved off pull requests and then the merge queue), #4442's seventh bounded
+invocation for `datagram_client_address` (its own 64 KiB `-max_len`, every
+other bound identical to the loop's), #6584's `ocsp_response` / `jwt_svid` /
+`tls_material` loop, #6573's BoringCache retirement, and the in-CI sanitizer
+shape that the 2026-11-09 sweep moved to `fuzz-smoke-main.yml`.
 
 A change to what the job runs edits the byte-frozen `fuzz-smoke` job together
 with the policy that admits it: the new text becomes `CI_FUZZ_SMOKE_JOB`, and
@@ -2466,35 +2395,23 @@ What is invariant across every generation:
   `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` and `CI_FUZZ_SMOKE_PARSER_BUDGET` must each
   appear exactly once in every budget host, and the self-test separately
   asserts their 64 KiB `-max_len` and each shared bound;
-- the bounded budget runs only on the push to `main` and on manual dispatch: in
-  the retired generation through the allow-list
-  `if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'`
-  (a `!=` form is rejected outright), in `FUZZ_SANITIZER_SMOKE_WORKFLOW`
-  through its only two triggers;
-- compiler caching is admitted only through the repository's own
-  `./.github/actions/setup-sccache`, the single local action the contract
-  permits. That action installs a checksum-pinned sccache release, never enables
-  the credential-bearing sccache GHA backend, never persists
-  `ACTIONS_RUNTIME_TOKEN` / `ACTIONS_RESULTS_URL` into later
-  pull-request-controlled steps, asserts those variables are absent before any
-  build runs, and clears the wrapper entirely if the install fails. Local
-  actions are not exempt from the policy: `validate_action_collection` and
-  `compare_pr_action_collection` reject a Cross executable or configuration
-  input in any of them, and the action's own surfaces are attributed to
-  `actions/<name>`, never withheld with the job's;
-- the job does not pin `RUSTC_WRAPPER` at job level — a job-level `env` entry
-  would override the installer's fail-closed `GITHUB_ENV` decision — while
-  `RUSTFLAGS: ""` stays, because the root Cargo configuration still selects a
-  mold linker this lane does not install;
-- the sccache directory is persisted by the pinned `Swatinem/rust-cache` step
-  under `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
+- the bounded budget runs only on the push to `main` and on manual dispatch,
+  through `FUZZ_SANITIZER_SMOKE_WORKFLOW`'s only two triggers;
+- the job installs no compiler-cache wrapper and references no local action.
+  Like the scheduled and push-to-main fuzz lanes it clears `RUSTC_WRAPPER`,
+  `CARGO_BUILD_RUSTC_WRAPPER` and `RUSTFLAGS` at job level, because the root
+  Cargo configuration selects a mold linker this lane does not install and a
+  runner-level wrapper must not reach the build. The `setup-sccache` store it
+  used to install was never persisted and measured 0 hits on main (#7285);
+- the restored `fuzz-property-smoke` target directory is the lane's only
+  compiler reuse, persisted by the pinned `Swatinem/rust-cache` step under
+  `save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}`
   and nothing else. That predicate is the cache-quota control: `pull_request`
   (same-repository PR refs and forks), `merge_group`, and `workflow_dispatch`
   may restore a fuzz cache but cannot publish one;
-- telemetry: the property gate prints `Fuzz property smoke seconds`, the lane
-  shape, closing sccache statistics, and the on-disk cache size, and warns
-  explicitly when sccache was unavailable; the sanitizer budget prints
-  `Fuzz sanitizer lane seconds` and its `Fuzz build resources:` records.
+- telemetry: the property gate prints `Fuzz property smoke seconds` and the
+  lane shape; the sanitizer budget prints `Fuzz sanitizer lane seconds` and its
+  `Fuzz build resources:` records.
 
 A transition is exact on both ends and one-way. `admitted_fuzz_smoke_errors`
 accepts a `fuzz-smoke` job only at an admitted text (or absent);
@@ -2510,9 +2427,9 @@ sanitizer budget to pull requests, dropping it from the push to `main`,
 re-adding it to the merge queue (now as `FUZZ_SANITIZER_SMOKE_WORKFLOW`
 mutations), returning any libFuzzer run to the adopted property gate,
 restoring the fat cache key or full debuginfo, skipping the property gate on pull requests,
-allowing untrusted cache writes, substituting an unpinned third-party sccache
-installer, enabling the credential-bearing GHA backend, widening the cached
-directory, deleting the `datagram_client_address` invocation, re-bounding it to
+allowing untrusted cache writes, adding a third-party sccache installer,
+leaving the rustc wrapper input to the runner, enabling the credential-bearing
+GHA backend, widening the cached directory, deleting the `datagram_client_address` invocation, re-bounding it to
 the generic 4 KiB ceiling, and pointing it at a target the loop already covers.
 
 The scheduled lane's own contract carries the same target inventory: the
@@ -2529,119 +2446,60 @@ the retired step did (the planner sets every gate on a push to `main`).
 Delete a retired generation from `CI_FUZZ_SMOKE_JOB_GENERATIONS`, with any
 self-test row that names it, once its successor is on `main`.
 
-##### Admitted release image-family adoption (`-ebpf-tools`)
+##### Release image-family contract (`-ebpf-tools`)
 
-Every job in `release.yml` that publishes by wildcard is frozen byte for byte, so
-adding a third production image family is not something an ordinary pull request
-can express: the new publisher, the new digest name space, and the new
-attestation subjects all live inside frozen text. Rather than relaxing that
-freeze, the policy admits **exactly two** shapes of the release workflow and one
-transition between them (`RELEASE_IMAGE_FAMILY_GENERATIONS`):
+`release.yml` publishes three production image families, `:<tag>`,
+`:<tag>-ebpf` and `:<tag>-ebpf-tools`, and every job that publishes by wildcard
+is frozen byte for byte. The trusted publication tables
+(`PUBLISH_EXACT_JOB_CONTRACTS`, `PUBLISH_CONTROL_CONTRACTS`,
+`PUBLISH_ARTIFACT_STEP_CONTRACTS`, `DIGEST_ARTIFACT_OWNERS` and
+`PUBLISH_CLOSED_JOB_FIELDS`) hold the complete `-ebpf-tools` contract:
 
-- **two-family** — the original shape: `:<tag>` and `:<tag>-ebpf`. In this
-  shape the `-ebpf-tools` family may not be named anywhere in the file at all.
-- **three-family** — the shape on `main` today: the same workflow plus the complete `-ebpf-tools` contract:
-  the `docker-ebpf-tools-manifest` job (its `needs` and its whole step list,
+- the `docker-ebpf-tools-manifest` job: its `needs` and its whole step list,
   including the `docker-ebpf-tools-digest-*` download pattern, the
-  `/tmp/digests-tools` working directory, and every published tag); the tools
-  build/export/upload steps inside the single `docker-ebpf` job; sole ownership
-  of the `docker-ebpf-tools-digest-` wildcard by that same job; the extended
-  `create-release` `needs`, the gating rationale comment that shares its `name:`
-  field block, and its release notes; and an `attest-release-images` job
-  that resolves, cross-registry-compares, SBOMs, provenances, signs, attests, and
-  verifies all three families in both registries.
+  `/tmp/digests-tools` working directory, and every published tag;
+- the tools build/export/upload steps inside the single `docker-ebpf` job, and
+  sole ownership of the `docker-ebpf-tools-digest-` wildcard by that same job;
+- the extended `create-release` `needs`, the gating rationale comment that
+  shares its `name:` field block, and its release notes;
+- an `attest-release-images` job that resolves, cross-registry-compares, SBOMs,
+  provenances, signs, attests, and verifies all three families in both
+  registries.
 
 The credentialed `docker-ebpf` producer is closed over its complete ordered
-job-field set and its entire `steps:` list in both shapes; the tools manifest is
-closed the same way after adoption. An extra context-rewrite step, an alternate
-runner, `continue-on-error`, `if`, `environment`, `container`, `services`, or
-any other added job control is therefore a contract violation even when every
-named build/upload fragment remains unchanged.
+job-field set and its entire `steps:` list, and the tools manifest is closed
+the same way. An extra context-rewrite step, an alternate runner,
+`continue-on-error`, `if`, `environment`, `container`, `services`, or any other
+added job control is therefore a contract violation even when every named
+build/upload fragment remains unchanged.
 
-A revision is classified from itself, and is then held to the complete contract of
-the shape it claims — so a partial adoption, an extra publisher or tag, an
-alternate action/runner/permission/`needs`/step, a missing attestation operation,
-and a mixed digest name space are all rejected. Which transitions are legal is a
-separate, comparative question decided from the trusted base
-(`release_image_family_transition_errors`), never from the proposal: while the
-base is still two-family a pull request may leave the workflow byte-identical or
-move it in one step to the complete three-family shape, and once the base carries
-the three-family shape reverting to two-family is refused. The
-`docker-ebpf-tools-digest-` prefix is refused to repo-local composite actions in
-both generations, because a local action is never a digest owner in any shape.
+The contract is enforced twice. `validate_publish_control_contract` holds the
+proposed file to it as an absolute property, so a partial or extra family, an
+extra publisher or tag, an alternate action/runner/permission/`needs`/step, a
+missing attestation operation, and a mixed digest name space are all rejected.
+The pull-request comparison (`compare_pr_publish_control_contract`) also refuses
+any change to the frozen text against the trusted base. Dropping a family is
+therefore an ordinary frozen-text change, made as a reviewed policy edit on
+`main`, never by a pull request. The `docker-ebpf-tools-digest-` prefix is also
+refused to repo-local composite actions, because a local action is never a
+digest owner. The generic pull-request scan still hashes every Cross-sensitive
+release job and requires the two revisions to agree, so a Cross command, a
+`CROSS_*` input, or any other executable surface added anywhere in the file is
+rejected whatever else is valid.
 
-The publication contract is only half of the gate. The generic pull-request scan
-also hashes every job it reads as Cross-sensitive and requires the two revisions
-to agree, and the adoption moves frozen text inside such jobs by design — the
-extended `create-release` `needs` names `build-release-arm64-cross`. That
-comparison therefore rejected the complete admitted shape, which made the
-transition unreachable. It is repaired by a projection rather than an exemption
-(`release_family_transition_surface_contents`): once both revisions have
-classified, the proposal has validated against the whole three-family contract,
-and the base carries every two-family frozen text verbatim, the proposal is
-re-rendered in the two-family text it came from — each frozen fragment
-substituted back to its original, the new manifest job removed whole — and the
-surface comparison then reads the same bytes on both sides. The substitution
-table is derived from the two contract tables themselves, so it cannot drift from
-them; every substitution must match exactly once or the projection is abandoned
-and the unmodified revisions are compared. Nothing outside those frozen fragments
-is withheld — the only non-contract text the projection removes is the comments
-and blank lines inside the removed manifest job, which that job's closed
-field set and frozen `steps:` list already prevent from carrying any surface — so
-a Cross command, a `CROSS_*` input, or any other executable
-surface added anywhere in the file — including elsewhere inside a transitioned
-job — is still rejected while the adoption is in flight, and the projection never
-applies to any other workflow, to an unchanged release workflow, or to a
-rollback.
+The `-ebpf-tools` family landed through a one-time, admitted two-family to
+three-family transition (PR #3768), with a projection that let the Cross-surface
+comparison read the adoption. Both were retired once `main` carried the
+three-family shape (#7281); the policy now admits only that shape.
 
-The trusted-base verifier is what reads the base and executes; the proposed
-verifier never decides its own pull request's safety. An admission layer like
-this is therefore adopted in two stages, like the original trusted-CI
-bootstrap: a policy-only pull request lands the admission (its own
-`Trusted Cross Build Policy` check fails by design, because that check refuses
-any modification of the verifier it protects, and the landing is administrative
-after root review), then an ordinary pull request adopts the release workflow
-under the now-trusted policy and runs the full hosted matrix. Because the base
-now carries the three-family shape, the two-family generation only matters as
-the refused rollback target.
+##### `fips-build.yml` generation transitions (none open)
 
-##### Admitted `fips-build.yml` generation transition (issue #3888 lineage / issue #4018, temporary)
-
-The temporary whole-file SHA-256 admission first used for PR #3889 (retired by
-#3943), then re-armed for PR #3950 and spent when #3950 landed, is **re-armed
-for exactly one transition**: the issue #4018 mitigation for the
-`fips-test-build` job.
-
-`Precompile FIPS test binaries for consumers` is killed with `exit code 143`
-and `The runner has received a shutdown signal` on a large minority of runs.
-The log always ends the same way — the dependency graph finishes, the run goes
-silent for several minutes while Cargo builds `unit_tests` and
-`integration_tests`, and the runner dies mid-tail with no diagnostic. That is
-the hosted runner's memory ceiling, not a compile error: `[profile.dev]` sets
-`debug = true` and the `test` profile inherits it, so every concurrent codegen
-thread holds a full-debuginfo LLVM module for the whole crate.
-
-The destination adds a job-level `env` capping `CARGO_BUILD_JOBS` at 3 and
-setting `line-tables-only` debuginfo on the `dev` **and** `test` profiles (both,
-rather than relying on `test` inheriting from `dev`), plus a best-effort
-additive 8 GiB Ferrum-owned swapfile immediately before that step. The swap
-step is deliberately not fail-closed — it is insurance rather than a
-correctness gate, and this file is digest-frozen. It never disables, removes,
-or rewrites the runner image's existing swap; failure cleanup targets only
-`/mnt/ferrum-fips-swapfile`. It cannot pass silently: any failure raises a
-warning annotation and the resulting `SwapTotal` is always printed.
-
-The pair is exact and one-way: trusted-base
-`17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1` (the workflow
-after PR #3950's landed artifact handoff — the previous admission's adopted end)
-→ `7d995d79d9932c9595d3f19eddf16c1dbd1a0d2842230f1d92eb1b24502ca401`. Recompute
-and re-pin if review changes the workflow bytes. The digest is over
-universal-newline-decoded text. The mitigation has landed (the swapfile step is
-in `fips-build.yml`, and later edits moved the file past both pinned digests),
-so this admission is spent; its `FIPS_BUILD_*_GENERATION_SHA256` constants in
-`verify_cross_build_policy.py` must be retired, exactly as #3943 retired the
-#3889 pair. Any other `fips-build.yml` edit
-is still compared by the normal fail-closed Cross surface scan.
+No whole-file `fips-build.yml` generation transition is open, and the verifier
+no longer carries the mechanism. Its admissions (PR #3889, retired by #3943;
+PR #3950; and the issue #4018 `fips-test-build` memory mitigation) are all
+spent: each destination landed on `main` and later edits moved the file past
+both pinned digests. Every `fips-build.yml` edit is compared by the normal
+fail-closed Cross surface scan.
 
 ##### Coverage-shard compile-memory knobs (issues #4099 / #4368)
 
@@ -2680,7 +2538,7 @@ pins `CARGO_BUILD_JOBS=2`, `timeout-minutes: 120`, and the combined `--lib` /
 `--test unit_tests` invocation so those knobs cannot drift without failing
 Coverage Plan.
 
-##### Admitted CI job SHA-256 generation transitions (temporary)
+##### Admitted CI job SHA-256 generation transitions
 
 `ci.yml` is a protected workflow. The ARM64 job stays digest-frozen; every other
 job the pull-request scan reads as Cross-sensitive is compared by its whole-job
@@ -2798,7 +2656,7 @@ drives both halves with fixtures: a producer missing the pins or the
 credential-free checkout, and a contract file with a substituted digest,
 registry, repository, protoc host, or smoke image.
 
-##### Admitted workflow-directory job SHA-256 generation transitions (temporary)
+##### Admitted workflow-directory job SHA-256 generation transitions
 
 The `CI_JOB_GENERATION_TRANSITIONS` table above only reaches `ci.yml`, which
 has its own dedicated comparison. Every other workflow is compared by the
@@ -2808,9 +2666,10 @@ its surface and is refused. `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` in
 `.github/scripts/verify_cross_build_policy.py` admits exact retired→adopted
 pairs for those jobs, keyed by the workflow filename AND the job name.
 
-The table is currently **empty**. Its only entry, the `coverage.yml`
-`coverage-merge` pair for PR #3917 (issue #3907), was retired after #3917
-merged and a later action-pin bump moved the job off that digest.
+The table is currently **empty**. Both of its entries were `coverage.yml`
+`coverage-merge` pairs: PR #3917's (issue #3907), retired after #3917 merged
+and a later action-pin bump moved the job off that digest, and PR #6958's
+45 → 75-minute timeout pair, retired once the 75-minute job was main's.
 
 A future entry follows the same rules: each digest is the SHA-256 of
 `extract_job_block` text, both ends are exact, the binding includes the
@@ -2820,7 +2679,7 @@ surface anywhere else in the same file, or any other revision pair of the
 named job, is scanned as before. RETIREMENT IS MANDATORY: once each
 destination is on `main`, delete that tuple.
 
-##### Admitted local-action generation transitions (temporary)
+##### Admitted local-action generation transitions
 
 Once Cross-sensitive, a local composite action is compared by whole-file
 digest. `LOCAL_ACTION_GENERATION_TRANSITIONS` admits exact, path-bound, one-way
@@ -3803,12 +3662,6 @@ Required for pushing Docker Hub images. The workflows unconditionally run the Do
   `GITHUB_TOKEN` do not trigger **Release**. See
   [Creating a New Release](#creating-a-new-release).
 
-#### Pending-review cleanup
-
-- `REVIEW_TOKEN` - PAT of a named environment reviewer, used for every API call
-  in `cleanup-pending-reviews.yml` (`GITHUB_TOKEN` cannot approve or reject
-  deployment reviews).
-
 For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare
 job-level `permissions: { contents: write }` for release creation,
 `permissions: { contents: read, packages: write }` for Docker/GHCR publishing,
@@ -3957,7 +3810,7 @@ jobs are Cross-sensitive and held to `main`'s own text by the trusted Cross
 policy (`.github/scripts/verify_cross_build_policy.py`), so a pull request
 cannot add a target to them. A new target is reviewed direct-to-`main` policy
 work, or a pull request whose exact job digests the trusted base admits first
-(see [Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions-temporary)
+(see [Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions)
 and [Published x86_64 GNU producer contract](#published-x86_64-gnu-producer-contract-standing)).
 
 Musl targets need their own toolchain setup. Add `musl-tools` before a native
@@ -3985,9 +3838,9 @@ Modify build commands in workflows:
 **Check**:
 - Tag format: a stable `vMAJOR.MINOR.PATCH` that matches `[package].version`
   in `Cargo.toml` (e.g., `v0.2.0`). `release-dispatch.yml` creates only that
-  shape. Do not push a prerelease-suffixed tag such as `v0.2.0-rc1` by hand:
-  `release.yml` still accepts one, publishes it as a normal release, and moves
-  the stable `0.2` image aliases to it.
+  shape. A prerelease-suffixed tag such as `v0.2.0-rc1` pushed by hand is
+  rejected: every `release.yml` tag check fails it with "Invalid release tag
+  format" before anything is built or published.
 - Tag exists: `git tag` lists tags
 - Push origin: `git push origin v0.2.0`
 
@@ -4008,7 +3861,7 @@ gh run list --workflow release.yml
 3. Expand job logs for details
 
 **Common Issues**:
-- Build prerequisites: CI installs `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows. Hosted Ubuntu already provides `cmake`; the Docker builder, `Dockerfile.test`, FIPS compile jobs, and ARM64 Cross `pre-build` also install `cmake` (Cross additionally installs `libcurl4-openssl-dev`). Local workstations get both from `scripts/install-build-deps.sh`.
+- Build prerequisites: CI installs `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows. Hosted Ubuntu already provides `cmake`; the Docker builder, FIPS compile jobs, and ARM64 Cross `pre-build` also install `cmake` (Cross additionally installs `libcurl4-openssl-dev`). Local workstations get both from `scripts/install-build-deps.sh`.
 - Missing dependencies: Check `Cargo.toml` and the release Build Process prerequisites above
 - Rust version: Workflows use `stable` Rust toolchain
 
@@ -4109,9 +3962,11 @@ and no registry login. Both jobs retain every production-image contract check;
 `ambient-host-udp-image` requires the selected job to pass and the other to skip.
 The existing outer required check remains `Ambient Host UDP Live`.
 
-This replaces the former `ambient-host-udp-images` GHA scope. Its existing
-entries expire under the usual 10 GB/LRU policy; the workflows no longer export
-new Ambient layers there. The Actions limit and $0 budgets remain unchanged.
+This replaced the former `ambient-host-udp-images` GHA scope, whose entries
+have expired under the 10 GB/LRU policy. Neither trusted verifier admits that
+single-job `type=gha` recipe any more: `verify_cross_build_policy.py` freezes
+only the reader/writer/aggregate jobs and `verify_ci_runtime_cache.py` checks
+only them (#7281). The Actions limit and $0 budgets remain unchanged.
 Each of the three targets has its own `ambient-v1-linux-amd64-` cache tag so a
 later target does not overwrite another target's cache graph. GHCR container
 storage and bandwidth are currently free under GitHub's published policy.
@@ -4344,7 +4199,7 @@ text by the whole-job surface comparison (its former #4301/#4355 generation
 pairs are retired precisely because issue #4423 moved it again directly on
 `main`). Adding `--timings`, a timings-artifact upload, or a `timeout-minutes`
 to either producer is therefore a direct-to-`main` change. See
-[Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions-temporary)
+[Admitted CI job SHA-256 generation transitions](#admitted-ci-job-sha-256-generation-transitions)
 and [Published x86_64 GNU producer contract (standing)](#published-x86_64-gnu-producer-contract-standing).
 
 #### Observed tail, and the budget it justifies
@@ -4369,9 +4224,8 @@ cold cache and a slow runner:
 
 - `build-release-binaries`: **`timeout-minutes: 180` at the job level with
   `timeout-minutes: 165` on the build step** — 1.32× the 136.3-minute worst
-  observed job. This matches the 180/165 pair the non-publishing
-  `release-platform-study.yml` uses for the same three cold shipping-profile
-  compiles.
+  observed job. The retired non-publishing release platform study used the
+  same 180/165 pair for the same three cold shipping-profile compiles.
 - `build-release-arm64-cross`: originally **`timeout-minutes: 120`** — 2.6×
   its 45m39s observed compile step. The v0.9.19 recovery uses **240 minutes**,
   twice that allowance and over 5× the observed compile, to include swap
@@ -4427,8 +4281,9 @@ swap:
 
 The timings capture and finite budgets have landed. The remaining work is:
 (1) agree an explicit tolerated throughput/p99 regression budget *before* any
-profile comparison is scored; (2) re-run the non-publishing studies in `release-platform-study.yml` /
-`release-profile-study.yml` against that budget, including protected ARM64
+profile comparison is scored; (2) re-run non-publishing release-profile and
+platform studies (the dated lanes were retired in #7279) against that budget,
+including protected ARM64
 Cross phase measurements and oldest-baseline ABI/install/image results on
 every platform whose compiler or linker settings change. No CI verification
 profile is ever published as a release, and exact-SHA publication gates,

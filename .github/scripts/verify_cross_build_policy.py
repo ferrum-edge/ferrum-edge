@@ -365,8 +365,6 @@ DOCKER_EBPF_UPLOAD_DIGEST_STEP = (
 # pointing the tools upload at the `-ebpf` digest directory, would publish a
 # distroless image under the tag the mesh chart selects for the Ambient UDP
 # lifecycle — which cannot run the `sh -c` iptables scripts that datapath needs.
-# These three steps only become contract once the trusted base has adopted the
-# three-family release shape; see `RELEASE_IMAGE_FAMILY_GENERATIONS`.
 DOCKER_EBPF_TOOLS_BUILD_STEP = (
     "      - name: Build and push per-platform eBPF tools digest\n"
     "        id: build_tools\n"
@@ -406,23 +404,19 @@ DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP = (
 # matches. Any other upload whose artifact name could match — including one
 # whose name is assembled by an expression whose literal prefix does not rule
 # the wildcard out — is rejected.
+#
+# The `-ebpf-tools` name space is owned by the single job that builds both eBPF
+# variants, so the two eBPF manifests can never collect each other's
+# descriptors.
+RELEASE_TOOLS_DIGEST_PREFIX = "docker-ebpf-tools-digest-"
+RELEASE_TOOLS_MANIFEST_JOB_NAME = "docker-ebpf-tools-manifest"
 DIGEST_ARTIFACT_OWNERS = {
     "CI workflow": {"docker-digest-": ("docker",)},
     "release workflow": {
         "docker-digest-": ("docker",),
         "docker-ebpf-digest-": ("docker-ebpf",),
+        RELEASE_TOOLS_DIGEST_PREFIX: ("docker-ebpf",),
     },
-}
-# The `-ebpf-tools` name space is owned by the single job that builds both eBPF
-# variants, so the two eBPF manifests can never collect each other's
-# descriptors. It is a separate table because it is only in force once the
-# trusted base has adopted the three-family release shape. The prefix below is
-# nevertheless refused to repo-local composite actions in every generation,
-# since a local action is never a digest owner at all.
-RELEASE_TOOLS_DIGEST_PREFIX = "docker-ebpf-tools-digest-"
-RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS = {
-    **DIGEST_ARTIFACT_OWNERS["release workflow"],
-    RELEASE_TOOLS_DIGEST_PREFIX: ("docker-ebpf",),
 }
 # Ownership of the digest namespace does not depend on how the uploading action
 # is pinned. `actions/upload-artifact@v7` uploads exactly what the SHA-pinned
@@ -433,7 +427,6 @@ UPLOAD_ARTIFACT_ACTION = re.compile(r"^actions/upload-artifact(?:@|\s*$)", re.IG
 # A repo-local composite action is a step like any other and can run the upload
 # itself. The calling job is not knowable from the action file, so a local action
 # is never a digest owner.
-LOCAL_ACTION_STEP_REFERENCE = re.compile(r"^\.{1,2}/")
 # The Docker jobs never name the protected ARM64 artifact literally. They
 # select it through matrix values that the download step and the context step
 # interpolate, so freezing the job's `needs`/`if` alone would still let a pull
@@ -441,41 +434,6 @@ LOCAL_ACTION_STEP_REFERENCE = re.compile(r"^\.{1,2}/")
 # ARM64 image containing the wrong binary. The matrix row and both consuming
 # steps are therefore frozen as one artifact-selection contract.
 PUBLISH_ARTIFACT_STEP_CONTRACTS = {
-    "CI workflow": {
-        "docker": {
-            "Download Linux binary": (
-                "      - name: Download Linux binary\n"
-                "        uses: actions/download-artifact"
-                "@0000000000000000000000000000000000000000\n"
-                "        with:\n"
-                "          name: binary-${{ matrix.binary_target }}\n"
-                "          path: downloaded-artifacts\n"
-            ),
-            "Prepare Docker context": DOCKER_CONTEXT_STEP,
-        },
-        "docker-manifest": {
-            "Download digests": DOCKER_MANIFEST_DOWNLOAD_STEP,
-            "Create and push multi-arch manifest (Docker Hub)": (
-                "      - name: Create and push multi-arch manifest (Docker Hub)\n"
-                "        working-directory: /tmp/digests\n"
-                "        run: |\n"
-                "          docker buildx imagetools create \\\n"
-                "            -t ferrumedge/ferrum-edge:latest \\\n"
-                "            -t ferrumedge/ferrum-edge:main-${{ github.sha }} \\\n"
-                "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n"
-            ),
-            "Create and push multi-arch manifest (GHCR)": (
-                "      - name: Create and push multi-arch manifest (GHCR)\n"
-                "        working-directory: /tmp/digests\n"
-                "        run: |\n"
-                "          docker buildx imagetools create \\\n"
-                "            -t ghcr.io/${{ github.repository }}:latest \\\n"
-                "            -t ghcr.io/${{ github.repository }}:main-"
-                "${{ github.sha }} \\\n"
-                "            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)\n"
-            ),
-        },
-    },
     "release workflow": {
         "docker": {
             "Download Linux binary": (
@@ -491,11 +449,23 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
         "docker-manifest": {
             "Download digests": DOCKER_MANIFEST_DOWNLOAD_STEP,
         },
+        # One job builds both eBPF variants, so all four steps that decide
+        # what each digest name space receives are frozen together.
         "docker-ebpf": {
+            "Build and push per-platform eBPF tools digest": (
+                DOCKER_EBPF_TOOLS_BUILD_STEP
+            ),
+            "Export digest": DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP,
             "Upload digest": DOCKER_EBPF_UPLOAD_DIGEST_STEP,
+            "Upload tools digest": DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
         },
         "docker-ebpf-manifest": {
             "Download digests": DOCKER_EBPF_MANIFEST_DOWNLOAD_STEP,
+        },
+        RELEASE_TOOLS_MANIFEST_JOB_NAME: {
+            "Download tools digests": (
+                DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP
+            ),
         },
     },
 }
@@ -512,203 +482,44 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
 # stated purpose is release notes, so the whole `steps:` list is the contract.
 # Changing one is a trusted-base change, exactly like the protected build job.
 
-CI_LATEST_RELEASE_STEPS = r"""    steps:
-      - uses: actions/checkout@0000000000000000000000000000000000000000
-
-      # Download exactly the five trusted build artifacts by name. A wildcard
-      # pattern would also accept any other artifact whose name happened to
-      # start with the same prefix, so an unrelated job could contribute files
-      # to the published `latest` release.
-      - name: Download native binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-x86_64-unknown-linux-gnu
-          path: downloaded-artifacts/binary-x86_64-unknown-linux-gnu
-
-      - name: Download protected ARM64 binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-aarch64-unknown-linux-gnu
-          path: downloaded-artifacts/binary-aarch64-unknown-linux-gnu
-
-      - name: Download macOS x86_64 binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-x86_64-apple-darwin
-          path: downloaded-artifacts/binary-x86_64-apple-darwin
-
-      - name: Download macOS aarch64 binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-aarch64-apple-darwin
-          path: downloaded-artifacts/binary-aarch64-apple-darwin
-
-      - name: Download Windows binary artifact
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          name: binary-x86_64-pc-windows-msvc
-          path: downloaded-artifacts/binary-x86_64-pc-windows-msvc
-
-      - name: Prepare release assets
-        run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          # The closed, auditable published asset set. Each entry names one
-          # exact trusted artifact directory and one exact file inside it, so a
-          # colliding or extra upload can neither add nor replace an asset.
-          copy_trusted_asset() {
-            if [ ! -f "downloaded-artifacts/$1" ] || [ -L "downloaded-artifacts/$1" ]; then
-              echo "::error::missing trusted release asset $1" >&2
-              exit 1
-            fi
-            cp "downloaded-artifacts/$1" "release-assets/$2"
-            echo "$2" >> "$RUNNER_TEMP/expected-assets"
-          }
-          : > "$RUNNER_TEMP/expected-assets"
-          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64 ferrum-edge-linux-x86_64
-          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-edge-linux-x86_64.sha256 ferrum-edge-linux-x86_64.sha256
-          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64 ferrum-cni-linux-x86_64
-          copy_trusted_asset binary-x86_64-unknown-linux-gnu/ferrum-cni-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256
-          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64 ferrum-edge-linux-aarch64
-          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-edge-linux-aarch64.sha256 ferrum-edge-linux-aarch64.sha256
-          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64 ferrum-cni-linux-aarch64
-          copy_trusted_asset binary-aarch64-unknown-linux-gnu/ferrum-cni-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256
-          copy_trusted_asset binary-x86_64-apple-darwin/ferrum-edge-macos-x86_64 ferrum-edge-macos-x86_64
-          copy_trusted_asset binary-x86_64-apple-darwin/ferrum-edge-macos-x86_64.sha256 ferrum-edge-macos-x86_64.sha256
-          copy_trusted_asset binary-aarch64-apple-darwin/ferrum-edge-macos-aarch64 ferrum-edge-macos-aarch64
-          copy_trusted_asset binary-aarch64-apple-darwin/ferrum-edge-macos-aarch64.sha256 ferrum-edge-macos-aarch64.sha256
-          copy_trusted_asset binary-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe ferrum-edge-windows-x86_64.exe
-          copy_trusted_asset binary-x86_64-pc-windows-msvc/ferrum-edge-windows-x86_64.exe.sha256 ferrum-edge-windows-x86_64.exe.sha256
-          # Publishing must be exactly the trusted set, never whatever the
-          # download happened to produce.
-          LC_ALL=C sort -o "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/expected-assets"
-          ls -A release-assets | LC_ALL=C sort > "$RUNNER_TEMP/published-assets"
-          if ! diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/published-assets"; then
-            echo "::error::published release asset set drifted from the trusted set" >&2
-            exit 1
-          fi
-          cd release-assets
-          sha256sum -c ./*.sha256
-          cd ..
-          ls -la release-assets/
-      - name: Create or update latest release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Delete existing latest release and tag
-          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-
-          # Build release notes
-          cat > notes.md << 'NOTES'
-          ## Latest Development Build
-
-          Auto-built from the latest commit on `main` (${{ github.sha }}).
-
-          For stable releases, download a versioned tag (e.g., `v1.0.0`).
-
-          ### Binaries
-
-          | Platform | Binary |
-          |----------|--------|
-          | Linux x86_64 | `ferrum-edge-linux-x86_64` |
-          | Linux x86_64 CNI plugin | `ferrum-cni-linux-x86_64` |
-          | Linux ARM64 | `ferrum-edge-linux-aarch64` |
-          | Linux ARM64 CNI plugin | `ferrum-cni-linux-aarch64` |
-          | macOS x86_64 | `ferrum-edge-macos-x86_64` |
-          | macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
-          | Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |
-
-          ### Docker
-
-          ```bash
-          docker pull ferrumedge/ferrum-edge:latest
-          docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
-          ```
-
-          ### Checksums
-
-          ```
-          NOTES
-          cat release-assets/*.sha256 >> notes.md
-          echo '```' >> notes.md
-
-          # Create the release
-          gh release create latest \
-            --title "Latest Build ($(date -u +%Y-%m-%d))" \
-            --notes-file notes.md \
-            --prerelease \
-            --target "${{ github.sha }}" \
-            release-assets/*
-"""
-
-CI_DOCKER_MANIFEST_STEPS = r"""    steps:
-      - name: Download digests
-        uses: actions/download-artifact@0000000000000000000000000000000000000000
-        with:
-          path: /tmp/digests
-          pattern: docker-digest-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@0000000000000000000000000000000000000000
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@0000000000000000000000000000000000000000
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create and push multi-arch manifest (Docker Hub)
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create \
-            -t ferrumedge/ferrum-edge:latest \
-            -t ferrumedge/ferrum-edge:main-${{ github.sha }} \
-            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
-
-      - name: Create and push multi-arch manifest (GHCR)
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create \
-            -t ghcr.io/${{ github.repository }}:latest \
-            -t ghcr.io/${{ github.repository }}:main-${{ github.sha }} \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
-"""
-
 # `create-release` states its gating rationale as a comment between `name:` and
 # `needs:`. A comment line is not a mapping key, so `extract_job_field_block`
 # reads it as the tail of the `name:` field block rather than as part of `needs:`.
 # The whole block is therefore frozen as one control field: the published
 # rationale names exactly the manifests the `needs` graph waits for, and the two
-# must move together or not at all. It is also what makes the job's control
-# surface completely substitutable, so the one admitted image-family adoption —
-# which rewrites the rationale and the `needs` graph in the same edit — can be
-# projected back to the text it came from instead of leaving a stale comment
-# behind for the Cross-surface comparison to reject.
+# must move together or not at all: a rationale that names fewer manifests
+# than the release notes advertise would describe a gate the workflow does
+# not have.
 RELEASE_CREATE_RELEASE_NAME_COMMENT = (
-    "    # Wait for BOTH manifests: the release notes advertise the `:<tag>` "
-    "default\n"
-    "    # image AND the `:<tag>-ebpf` variant, so the GitHub Release must not "
-    "publish\n"
-    "    # until the eBPF manifest exists — otherwise the notes link `-ebpf` "
-    "tags that\n"
-    "    # were never pushed. Both `docker-manifest` and `docker-ebpf-manifest` "
-    "run\n"
-    "    # unconditionally on every `v*` tag (no `if:`/path filters), so this "
-    "keeps the\n"
-    "    # default release path intact.\n"
+    "    # Wait for ALL THREE manifests: the release notes advertise "
+    "the `:<tag>`\n"
+    "    # default image, the `:<tag>-ebpf` variant, AND the "
+    "`:<tag>-ebpf-tools`\n"
+    "    # Ambient UDP lifecycle variant, so the GitHub Release must not "
+    "publish until\n"
+    "    # every advertised manifest exists — otherwise the notes link "
+    "tags that were\n"
+    "    # never pushed. All three manifest jobs run unconditionally on "
+    "every `v*` tag\n"
+    "    # (no `if:`/path filters), so this keeps the default release "
+    "path intact.\n"
 )
 RELEASE_CREATE_RELEASE_NAME = (
     "    name: Create GitHub Release\n" + RELEASE_CREATE_RELEASE_NAME_COMMENT
 )
+# `create-release` publishes the GitHub Release page. Gating it on every
+# manifest keeps the page from advertising a family whose tags were never
+# pushed.
+RELEASE_CREATE_RELEASE_NEEDS = (
+    "    needs: [build-release-binaries, build-release-arm64-cross, "
+    "docker-manifest, docker-ebpf-manifest, "
+    "docker-ebpf-tools-manifest]\n"
+)
 
+# The release notes are the published description of what a release contains, and
+# they are inside the frozen `create-release` step list. Advertising a tag the
+# workflow does not sign, or omitting the one it does, is the failure this text
+# freeze exists to prevent.
 RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
       - uses: actions/checkout@0000000000000000000000000000000000000000
 
@@ -793,7 +604,7 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -835,18 +646,32 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
           On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
           **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
           degrading. The published \`-ebpf\` image is **distroless** — it has no
-          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
-          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
-          published image **crash-loops**. To use the iptables fallback, build a
-          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
-          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
-          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
-          host iptables capture:
+          \`/bin/sh\` and no \`iptables\` — and stays that way on purpose:
 
           \`\`\`bash
           docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
           docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
           \`\`\`
+
+          The host iptables fallback and the Ambient host-network UDP capture
+          lifecycle run generated \`sh -c\` \`iptables\`/\`ip6tables\`/\`ip\`
+          commands, which the distroless \`-ebpf\` image cannot execute, so
+          \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` crash-loops there. Use the
+          **\`-ebpf-tools\`** variant instead: the same Linux-only eBPF build on a
+          Debian slim base carrying \`/bin/sh\`, \`iptables\`, \`ip6tables\`, and
+          \`ip\` (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)).
+          The mesh Helm chart auto-selects it for the Ambient UDP lifecycle:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf-tools
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf-tools
+          \`\`\`
+
+          All three image families — default, \`-ebpf\`, and \`-ebpf-tools\` — are
+          Cosign-signed on their immutable multi-arch digests in both registries
+          and carry SLSA provenance plus per-platform SPDX SBOM attestations; see
+          [docs/ci_cd.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/ci_cd.md#image-signatures-sboms-and-provenance)
+          for the verification commands.
 
           ## Checksums
 
@@ -884,6 +709,10 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 """
 
+# Every published family must be a first-class subject of this job: resolved,
+# compared across registries, SBOM'd, provenance'd, signed, attested, and
+# verified. A family that is published but skipped here ships an unsigned image
+# under a release tag the notes advertise.
 RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
@@ -911,7 +740,7 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
         run: |
           set -euo pipefail
 
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -952,6 +781,10 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           resolve_manifest standard_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}"
           resolve_manifest ebpf_docker "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf"
           resolve_manifest ebpf_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"
+          resolve_manifest ebpftools_docker \
+            "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf-tools"
+          resolve_manifest ebpftools_ghcr \
+            "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf-tools"
 
           compare_registry_manifests() {
             local family="$1"
@@ -969,6 +802,7 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
 
           compare_registry_manifests standard
           compare_registry_manifests ebpf
+          compare_registry_manifests ebpftools
 
       - name: Generate SPDX SBOMs and manifest provenance
         env:
@@ -980,6 +814,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -1031,6 +867,12 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
             "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
           generate_sboms \
             ebpf ghcr "$EBPF_GHCR_REF" \
+            "$GHCR_USERNAME" "$GHCR_TOKEN"
+          generate_sboms \
+            ebpftools docker "$EBPF_TOOLS_DOCKER_REF" \
+            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
+          generate_sboms \
+            ebpftools ghcr "$EBPF_TOOLS_GHCR_REF" \
             "$GHCR_USERNAME" "$GHCR_TOKEN"
 
           cat > "$work/create_provenance.jq" <<'JQ'
@@ -1106,6 +948,16 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
             "ghcr.io/${GITHUB_REPOSITORY}" \
             "$work/ebpf_ghcr.manifest.json" \
             "$work/ebpf_ghcr.provenance.json"
+          create_provenance \
+            ebpftools \
+            ferrumedge/ferrum-edge \
+            "$work/ebpftools_docker.manifest.json" \
+            "$work/ebpftools_docker.provenance.json"
+          create_provenance \
+            ebpftools \
+            "ghcr.io/${GITHUB_REPOSITORY}" \
+            "$work/ebpftools_ghcr.manifest.json" \
+            "$work/ebpftools_ghcr.provenance.json"
 
       - name: Sign and attest immutable image digests
         env:
@@ -1113,6 +965,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/image-attestations"
@@ -1142,6 +996,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           sign_and_attest standard ghcr "$STANDARD_GHCR_REF"
           sign_and_attest ebpf docker "$EBPF_DOCKER_REF"
           sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"
+          sign_and_attest ebpftools docker "$EBPF_TOOLS_DOCKER_REF"
+          sign_and_attest ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"
 
       - name: Verify signatures, provenance, subjects, and SBOMs
         env:
@@ -1149,6 +1005,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/image-attestations"
@@ -1245,12 +1103,14 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           verify_image standard ghcr "$STANDARD_GHCR_REF"
           verify_image ebpf docker "$EBPF_DOCKER_REF"
           verify_image ebpf ghcr "$EBPF_GHCR_REF"
+          verify_image ebpftools docker "$EBPF_TOOLS_DOCKER_REF"
+          verify_image ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"
 """
 
 RELEASE_ATTEST_RELEASE_IMAGES_JOB = (
     r"""  attest-release-images:
     name: Sign and attest release images
-    needs: [docker-manifest, docker-ebpf-manifest]
+    needs: [docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]
     runs-on: ubuntu-26.04
     permissions:
       id-token: write
@@ -1265,7 +1125,7 @@ RELEASE_DOCKER_MANIFEST_STEPS = r"""    steps:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -1345,7 +1205,7 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -1397,254 +1257,6 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 """
 
-# ---------------------------------------------------------------------------
-# Third release image family (`-ebpf-tools`): a one-time, base-aware adoption.
-#
-# The release workflow publishes two image families today. A third one cannot be
-# introduced by an ordinary pull request, because every publishing job here is
-# frozen byte for byte, and the frozen text cannot be widened without a policy
-# change that this same policy refuses to let a pull request make. The transition
-# is therefore modelled exactly like the admitted fuzz lane: the trusted base is
-# read, and a pull request may either leave the release workflow at the shape the
-# base already carries or move it, in one step, to the complete three-family
-# shape written below. Nothing in between is accepted, and once the base carries
-# the three-family shape the two-family shape is no longer reachable.
-#
-# The three-family contracts are derived from the two-family originals by
-# anchored substitution rather than being restated, so the parts that must not
-# change cannot drift while the parts that must change are the visible diff.
-# Every anchor is required to occur an exact number of times; a miss is a policy
-# failure reported by `self_test`, never a silently skipped substitution.
-RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS: list[str] = []
-
-
-def adopted_release_contract(
-    text: str,
-    replacements: tuple[tuple[str, str, int], ...],
-    label: str,
-) -> str:
-    """Derive one three-family contract from its frozen two-family original."""
-
-    derived = text
-    for anchor, replacement, expected in replacements:
-        found = derived.count(anchor)
-        if found != expected:
-            RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS.append(
-                f"the {label} three-family adoption anchor {anchor[:120]!r} "
-                f"occurs {found} times, expected {expected}"
-            )
-            continue
-        derived = derived.replace(anchor, replacement, expected)
-    if derived == text:
-        RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS.append(
-            f"the {label} three-family contract is identical to the two-family "
-            "one, so the adoption would admit no change at all"
-        )
-    return derived
-
-
-# The release notes are the published description of what a release contains, and
-# they are inside the frozen `create-release` step list. Advertising a tag the
-# workflow does not sign, or omitting the one it does, is the failure this text
-# freeze exists to prevent.
-RELEASE_THREE_FAMILY_CREATE_RELEASE_STEPS = adopted_release_contract(
-    RELEASE_CREATE_RELEASE_STEPS,
-    (
-        (
-            r"""          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
-          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
-          published image **crash-loops**. To use the iptables fallback, build a
-          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
-          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
-          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
-          host iptables capture:
-
-          \`\`\`bash
-          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
-          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
-          \`\`\`
-""",
-            r"""          \`/bin/sh\` and no \`iptables\` — and stays that way on purpose:
-
-          \`\`\`bash
-          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
-          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
-          \`\`\`
-
-          The host iptables fallback and the Ambient host-network UDP capture
-          lifecycle run generated \`sh -c\` \`iptables\`/\`ip6tables\`/\`ip\`
-          commands, which the distroless \`-ebpf\` image cannot execute, so
-          \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` crash-loops there. Use the
-          **\`-ebpf-tools\`** variant instead: the same Linux-only eBPF build on a
-          Debian slim base carrying \`/bin/sh\`, \`iptables\`, \`ip6tables\`, and
-          \`ip\` (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)).
-          The mesh Helm chart auto-selects it for the Ambient UDP lifecycle:
-
-          \`\`\`bash
-          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf-tools
-          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf-tools
-          \`\`\`
-
-          All three image families — default, \`-ebpf\`, and \`-ebpf-tools\` — are
-          Cosign-signed on their immutable multi-arch digests in both registries
-          and carry SLSA provenance plus per-platform SPDX SBOM attestations; see
-          [docs/ci_cd.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/ci_cd.md#image-signatures-sboms-and-provenance)
-          for the verification commands.
-""",
-            1,
-        ),
-    ),
-    "create-release",
-)
-
-# Every published family must be a first-class subject of this job: resolved,
-# compared across registries, SBOM'd, provenance'd, signed, attested, and
-# verified. A family that is published but skipped here ships an unsigned image
-# under a release tag the notes advertise.
-RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_STEPS = adopted_release_contract(
-    RELEASE_ATTEST_RELEASE_IMAGES_STEPS,
-    (
-        (
-            '          resolve_manifest ebpf_ghcr '
-            '"ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"\n',
-            '          resolve_manifest ebpf_ghcr '
-            '"ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"\n'
-            "          resolve_manifest ebpftools_docker \\\n"
-            '            "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf-tools"\n'
-            "          resolve_manifest ebpftools_ghcr \\\n"
-            '            "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf-tools"\n',
-            1,
-        ),
-        (
-            "          compare_registry_manifests ebpf\n",
-            "          compare_registry_manifests ebpf\n"
-            "          compare_registry_manifests ebpftools\n",
-            1,
-        ),
-        # The same two refs are exported to each of the three shell steps that
-        # consume them, so this anchor is deliberately replaced three times.
-        (
-            "          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}\n",
-            "          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}\n"
-            "          EBPF_TOOLS_DOCKER_REF: "
-            "${{ steps.images.outputs.ebpftools_docker_ref }}\n"
-            "          EBPF_TOOLS_GHCR_REF: "
-            "${{ steps.images.outputs.ebpftools_ghcr_ref }}\n",
-            3,
-        ),
-        (
-            "          generate_sboms \\\n"
-            '            ebpf ghcr "$EBPF_GHCR_REF" \\\n'
-            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n',
-            "          generate_sboms \\\n"
-            '            ebpf ghcr "$EBPF_GHCR_REF" \\\n'
-            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n'
-            "          generate_sboms \\\n"
-            '            ebpftools docker "$EBPF_TOOLS_DOCKER_REF" \\\n'
-            '            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"\n'
-            "          generate_sboms \\\n"
-            '            ebpftools ghcr "$EBPF_TOOLS_GHCR_REF" \\\n'
-            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n',
-            1,
-        ),
-        (
-            "          create_provenance \\\n"
-            "            ebpf \\\n"
-            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
-            '            "$work/ebpf_ghcr.manifest.json" \\\n'
-            '            "$work/ebpf_ghcr.provenance.json"\n',
-            "          create_provenance \\\n"
-            "            ebpf \\\n"
-            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
-            '            "$work/ebpf_ghcr.manifest.json" \\\n'
-            '            "$work/ebpf_ghcr.provenance.json"\n'
-            "          create_provenance \\\n"
-            "            ebpftools \\\n"
-            "            ferrumedge/ferrum-edge \\\n"
-            '            "$work/ebpftools_docker.manifest.json" \\\n'
-            '            "$work/ebpftools_docker.provenance.json"\n'
-            "          create_provenance \\\n"
-            "            ebpftools \\\n"
-            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
-            '            "$work/ebpftools_ghcr.manifest.json" \\\n'
-            '            "$work/ebpftools_ghcr.provenance.json"\n',
-            1,
-        ),
-        (
-            '          sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"\n',
-            '          sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"\n'
-            '          sign_and_attest ebpftools docker "$EBPF_TOOLS_DOCKER_REF"\n'
-            '          sign_and_attest ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"\n',
-            1,
-        ),
-        (
-            '          verify_image ebpf ghcr "$EBPF_GHCR_REF"\n',
-            '          verify_image ebpf ghcr "$EBPF_GHCR_REF"\n'
-            '          verify_image ebpftools docker "$EBPF_TOOLS_DOCKER_REF"\n'
-            '          verify_image ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"\n',
-            1,
-        ),
-    ),
-    "attest-release-images steps",
-)
-
-RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_JOB = (
-    adopted_release_contract(
-        RELEASE_ATTEST_RELEASE_IMAGES_JOB.replace(
-            RELEASE_ATTEST_RELEASE_IMAGES_STEPS,
-            RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_STEPS,
-            1,
-        ),
-        (
-            (
-                "    needs: [docker-manifest, docker-ebpf-manifest]\n",
-                "    needs: [docker-manifest, docker-ebpf-manifest, "
-                "docker-ebpf-tools-manifest]\n",
-                1,
-            ),
-        ),
-        "attest-release-images job",
-    )
-)
-
-# `create-release` publishes the GitHub Release page. Gating it on the third
-# manifest keeps the page from advertising a family whose tags were never
-# pushed.
-RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS = (
-    "    needs: [build-release-binaries, build-release-arm64-cross, "
-    "docker-manifest, docker-ebpf-manifest, "
-    "docker-ebpf-tools-manifest]\n"
-)
-
-# The rationale comment above that `needs` graph is part of the same frozen
-# control field, so the adoption moves it in the same step. Restating which
-# manifests the release page waits for is not cosmetic: the comment is the
-# reviewed justification for the gate, and a version of it that still says "BOTH
-# manifests" after a third family is published would describe a gate the workflow
-# no longer has.
-RELEASE_THREE_FAMILY_CREATE_RELEASE_NAME = adopted_release_contract(
-    RELEASE_CREATE_RELEASE_NAME,
-    (
-        (
-            RELEASE_CREATE_RELEASE_NAME_COMMENT,
-            "    # Wait for ALL THREE manifests: the release notes advertise "
-            "the `:<tag>`\n"
-            "    # default image, the `:<tag>-ebpf` variant, AND the "
-            "`:<tag>-ebpf-tools`\n"
-            "    # Ambient UDP lifecycle variant, so the GitHub Release must not "
-            "publish until\n"
-            "    # every advertised manifest exists — otherwise the notes link "
-            "tags that were\n"
-            "    # never pushed. All three manifest jobs run unconditionally on "
-            "every `v*` tag\n"
-            "    # (no `if:`/path filters), so this keeps the default release "
-            "path intact.\n",
-            1,
-        ),
-    ),
-    "create-release name",
-)
-
 # The `-ebpf-tools` tag family assembles from its own digest name space in its
 # own job. It publishes by wildcard exactly like the other manifest jobs, so its
 # whole step list is frozen: the download pattern, the working directory the
@@ -1659,7 +1271,7 @@ RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -1714,23 +1326,9 @@ RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 """
 
-RELEASE_TOOLS_MANIFEST_JOB_NAME = "docker-ebpf-tools-manifest"
-RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS = (
+RELEASE_TOOLS_MANIFEST_NEEDS = (
     "    needs: [build-release-binaries, docker-manifest, "
     "docker-ebpf, docker-ebpf-manifest]\n"
-)
-# Any of these tokens in a release workflow means the `-ebpf-tools` family is
-# being touched. Before adoption none of them may appear anywhere in the file:
-# that is what makes "leave it byte-identical or adopt the whole shape" the only
-# two reachable states, and what rejects a partial adoption that plants a tools
-# tag, a tools digest directory, or a tools upload without the frozen jobs.
-RELEASE_TOOLS_FAMILY_TOKENS = (
-    "-ebpf-tools",
-    "ebpftools",
-    "digests-tools",
-    "runtime-ebpf-tools",
-    RELEASE_TOOLS_DIGEST_PREFIX,
-    RELEASE_TOOLS_MANIFEST_JOB_NAME,
 )
 
 # The eBPF producer owns package-write credentials and the source tree handed to
@@ -1738,7 +1336,7 @@ RELEASE_TOOLS_FAMILY_TOKENS = (
 # sufficient: an extra step could rewrite the Docker context before either
 # frozen build, and an extra job-level key could move the job to an untrusted
 # runner or make failure advisory. The complete `steps:` value is therefore a
-# direct job-field contract in both admitted generations, and the closed-field
+# direct job-field contract, and the closed-field
 # set below rejects every additional job-level execution control.
 RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
       - uses: actions/checkout@0000000000000000000000000000000000000000
@@ -1772,11 +1370,31 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
           outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
           provenance: false
 
+      # `-ebpf-tools`: the Ambient UDP lifecycle runtime the mesh chart selects
+      # for `ambient.captureMode`-independent UDP capture (#3705). It is built in
+      # THIS job, from the same source and the same `FEATURES`, so the tools tag
+      # can never lag or drift from the `-ebpf` tag the chart's other tiers use;
+      # its manifest is gated by exactly the same release path below.
+      - name: Build and push per-platform eBPF tools digest
+        id: build_tools
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf-tools
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
       - name: Export digest
         run: |
-          mkdir -p /tmp/digests
+          mkdir -p /tmp/digests /tmp/digests-tools
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
+          tools_digest="${{ steps.build_tools.outputs.digest }}"
+          touch "/tmp/digests-tools/${tools_digest#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@0000000000000000000000000000000000000000
@@ -1784,59 +1402,14 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
           name: docker-ebpf-digest-${{ matrix.arch_dir }}
           path: /tmp/digests/*
           if-no-files-found: error
-"""
 
-RELEASE_DOCKER_EBPF_BUILD_STEP = r"""      - name: Build and push per-platform eBPF digest
-        id: build
-        uses: docker/build-push-action@0000000000000000000000000000000000000000
+      - name: Upload tools digest
+        uses: actions/upload-artifact@0000000000000000000000000000000000000000
         with:
-          context: .
-          file: Dockerfile
-          target: runtime-ebpf
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            FEATURES=cloud-secrets,ebpf
-          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
-          provenance: false
+          name: docker-ebpf-tools-digest-${{ matrix.arch_dir }}
+          path: /tmp/digests-tools/*
+          if-no-files-found: error
 """
-RELEASE_DOCKER_EBPF_EXPORT_DIGEST_STEP = r"""      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-"""
-RELEASE_DOCKER_EBPF_TOOLS_COMMENT = r"""      # `-ebpf-tools`: the Ambient UDP lifecycle runtime the mesh chart selects
-      # for `ambient.captureMode`-independent UDP capture (#3705). It is built in
-      # THIS job, from the same source and the same `FEATURES`, so the tools tag
-      # can never lag or drift from the `-ebpf` tag the chart's other tiers use;
-      # its manifest is gated by exactly the same release path below.
-"""
-RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS = adopted_release_contract(
-    RELEASE_DOCKER_EBPF_STEPS,
-    (
-        (
-            RELEASE_DOCKER_EBPF_BUILD_STEP,
-            RELEASE_DOCKER_EBPF_BUILD_STEP
-            + "\n"
-            + RELEASE_DOCKER_EBPF_TOOLS_COMMENT
-            + DOCKER_EBPF_TOOLS_BUILD_STEP,
-            1,
-        ),
-        (
-            RELEASE_DOCKER_EBPF_EXPORT_DIGEST_STEP,
-            DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP,
-            1,
-        ),
-        (
-            DOCKER_EBPF_UPLOAD_DIGEST_STEP,
-            DOCKER_EBPF_UPLOAD_DIGEST_STEP
-            + "\n"
-            + DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
-            1,
-        ),
-    ),
-    "docker-ebpf steps",
-)
 
 # Direct fields of these jobs form a closed set. This is the semantic equivalent
 # of an exact whole-job contract while allowing comments to remain review notes:
@@ -1860,151 +1433,7 @@ RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS = (
 
 GATEWAY_WORKFLOW_FILENAME = "gateway-api-conformance.yml"
 
-# The main-branch publication gate inside `ci.yml` is itself a
-# release-integrity boundary. Its complete job is frozen for the same reason.
-CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
-    name: Main Publish Gate
-    needs: [test, build-binaries]
-    if: always() && needs.test.result == 'success' && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-26.04
-    # The polling loop stops at its own 60-minute deadline, so the fail-closed
-    # timeout below is always the branch that fires. This job-level ceiling is
-    # only a backstop against a wedged runner and bounds runner occupancy.
-    timeout-minutes: 75
-    permissions:
-      actions: read
-    steps:
-      - name: Wait for dedicated release checks
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          HEAD_SHA: ${{ github.sha }}
-          BRANCH_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          # Each record binds the API endpoint, the run-reported workflow path,
-          # and the display name. A display name alone is not an identity: a
-          # second workflow can reuse it and must never satisfy publication for
-          # a missing canonical run.
-          required_workflow_specs=(
-            "coverage.yml|.github/workflows/coverage.yml|Coverage"
-            "gateway-api-conformance.yml|.github/workflows/gateway-api-conformance.yml|Gateway API Conformance"
-            "mesh-e2e-sidecar-live.yml|.github/workflows/mesh-e2e-sidecar-live.yml|Mesh E2E Sidecar Live Datapath"
-          )
-
-          # Bound the wait inside `timeout-minutes` so the runner is never held
-          # past this deadline and the diagnostic below stays reachable.
-          deadline=$((SECONDS + 3600))
-
-          while :; do
-            pending=0
-
-            for specification in "${required_workflow_specs[@]}"; do
-              IFS='|' read -r workflow_file workflow_path workflow <<<"$specification"
-
-              # Query the canonical workflow endpoint, not the repository-wide
-              # run list. The endpoint identity prevents a different workflow
-              # with the same display name from satisfying this requirement.
-              # The remaining fields independently bind the run to this exact
-              # file, name, commit, push event, and branch.
-              runs=""
-              api_succeeded=0
-              for attempt in 1 2 3; do
-                if runs="$(
-                  gh api --paginate \
-                    -H "Accept: application/vnd.github+json" \
-                    "/repos/${REPOSITORY}/actions/workflows/${workflow_file}/runs?head_sha=${HEAD_SHA}&event=push&branch=${BRANCH_NAME}&per_page=100" \
-                    --jq '.workflow_runs[] | [.name, .path, .status, (.conclusion // ""), .head_branch, .event, .head_sha] | @tsv'
-                )"; then
-                  api_succeeded=1
-                  break
-                fi
-                if [ "$attempt" -lt 3 ]; then
-                  echo "::warning::Actions API query failed for ${workflow_path}; retrying (${attempt}/3)."
-                  sleep $((attempt * 5))
-                fi
-              done
-              if [ "$api_succeeded" -ne 1 ]; then
-                echo "::error::Actions API query failed for ${workflow_path} after 3 attempts."
-                exit 1
-              fi
-
-              # A record that does not carry exactly seven fields cannot be
-              # matched field by field. Reject malformed data instead of
-              # silently treating the canonical workflow as absent.
-              if awk -F '\t' 'NF > 0 && NF != 7 { found = 1 } END { exit !found }' \
-                <<<"$runs"; then
-                echo "::error::Malformed ${workflow_path} run data for ${HEAD_SHA}."
-                exit 1
-              fi
-
-              # The workflow-specific endpoint should return only this file.
-              # Verify both server-reported identity fields anyway so an API or
-              # repository identity drift fails immediately and visibly.
-              if awk -F '\t' \
-                -v name="$workflow" \
-                -v path="$workflow_path" \
-                'NF == 7 && ($1 != name || $2 != path) { found = 1 } END { exit !found }' \
-                <<<"$runs"; then
-                echo "::error::Workflow identity mismatch for ${workflow_path}."
-                exit 1
-              fi
-
-              # Every matching run must succeed. Selecting a single run would
-              # let one passing duplicate mask a failed run of the same
-              # workflow for this same commit and branch.
-              matching="$(awk -F '\t' \
-                -v name="$workflow" \
-                -v path="$workflow_path" \
-                -v branch="$BRANCH_NAME" \
-                -v sha="$HEAD_SHA" \
-                'NF == 7 && $1 == name && $2 == path && $5 == branch && $6 == "push" && $7 == sha { print $3 "\t" $4 }' \
-                <<<"$runs")"
-              if [ -z "$matching" ]; then
-                echo "Waiting for ${workflow} to start for ${HEAD_SHA}."
-                pending=1
-                continue
-              fi
-
-              workflow_pending=0
-              # A here-string keeps this loop in the current shell so the flag
-              # it sets, and any `exit`, take effect for the whole step.
-              while IFS=$'\t' read -r status conclusion; do
-                if [ "$status" != "completed" ]; then
-                  echo "Waiting for ${workflow}: ${status}."
-                  workflow_pending=1
-                elif [ "$conclusion" != "success" ]; then
-                  echo "::error::${workflow} concluded ${conclusion:-unknown} for ${HEAD_SHA}."
-                  exit 1
-                fi
-              done <<<"$matching"
-
-              if [ "$workflow_pending" -eq 1 ]; then
-                pending=1
-              else
-                echo "${workflow} passed."
-              fi
-            done
-
-            if [ "$pending" -eq 0 ]; then
-              exit 0
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              break
-            fi
-            sleep 30
-          done
-
-          echo "::error::Timed out waiting for dedicated release checks for ${HEAD_SHA}."
-          exit 1
-"""
-
 PUBLISH_EXACT_JOB_CONTRACTS = {
-    "CI workflow": {
-        "main-publish-gate": CI_MAIN_PUBLISH_GATE_JOB,
-    },
     "release workflow": {
         "attest-release-images": RELEASE_ATTEST_RELEASE_IMAGES_JOB,
     },
@@ -2022,58 +1451,10 @@ PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS = {
 # The publication-control fields that gate the protected ARM64 artifacts are
 # frozen, and so is the full step list of every job that publishes by wildcard.
 PUBLISH_CONTROL_CONTRACTS = {
-    "CI workflow": {
-        "latest-release": {
-            "needs": (
-                "    needs: [test, build-binaries, build-arm64-cross, "
-                "main-publish-gate]\n"
-            ),
-            "if": (
-                "    if: always() && needs.test.result == 'success' && "
-                "needs.build-binaries.result == 'success' && "
-                "needs.build-arm64-cross.result == 'success' && "
-                "needs.main-publish-gate.result == 'success' && "
-                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
-            ),
-            "steps": CI_LATEST_RELEASE_STEPS,
-        },
-        "docker": {
-            "needs": (
-                "    needs: [test, build-binaries, build-arm64-cross, "
-                "main-publish-gate]\n"
-            ),
-            "if": (
-                "    if: always() && needs.test.result == 'success' && "
-                "needs.build-binaries.result == 'success' && "
-                "needs.build-arm64-cross.result == 'success' && "
-                "needs.main-publish-gate.result == 'success' && "
-                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
-            ),
-            "strategy": DOCKER_ARTIFACT_MATRIX,
-            "steps": (
-                DOCKER_PUBLISH_STEPS_PREFIX
-                + "          name: binary-${{ matrix.binary_target }}\n"
-                + DOCKER_PUBLISH_STEPS_MIDDLE
-                + DOCKER_CONTEXT_STEP
-                + DOCKER_PUBLISH_STEPS_TAIL
-            ),
-        },
-        "docker-manifest": {
-            "needs": "    needs: docker\n",
-            "if": (
-                "    if: always() && needs.docker.result == 'success' && "
-                "github.event_name == 'push' && github.ref == 'refs/heads/main'\n"
-            ),
-            "steps": CI_DOCKER_MANIFEST_STEPS,
-        },
-    },
     "release workflow": {
         "create-release": {
             "name": RELEASE_CREATE_RELEASE_NAME,
-            "needs": (
-                "    needs: [build-release-binaries, build-release-arm64-cross, "
-                "docker-manifest, docker-ebpf-manifest]\n"
-            ),
+            "needs": RELEASE_CREATE_RELEASE_NEEDS,
             "steps": RELEASE_CREATE_RELEASE_STEPS,
         },
         "docker": {
@@ -2124,238 +1505,35 @@ PUBLISH_CONTROL_CONTRACTS = {
             ),
             "steps": RELEASE_DOCKER_EBPF_MANIFEST_STEPS,
         },
-    },
-}
-
-# The two admitted shapes of the release workflow, keyed by how many production
-# image families it publishes. Exactly one of them is in force for any given
-# revision, chosen from that revision itself; which transitions between them are
-# legal is decided by comparing the trusted base with the proposal, never by the
-# proposal alone (`release_image_family_transition_errors`).
-RELEASE_TWO_FAMILY_GENERATION = "two-family"
-RELEASE_THREE_FAMILY_GENERATION = "three-family"
-RELEASE_IMAGE_FAMILY_GENERATIONS = {
-    RELEASE_TWO_FAMILY_GENERATION: {
-        "exact_jobs": dict(PUBLISH_EXACT_JOB_CONTRACTS["release workflow"]),
-        "control": dict(PUBLISH_CONTROL_CONTRACTS["release workflow"]),
-        "steps": dict(PUBLISH_ARTIFACT_STEP_CONTRACTS["release workflow"]),
-        "digest_owners": dict(DIGEST_ARTIFACT_OWNERS["release workflow"]),
-        "closed_job_fields": {
-            "docker-ebpf": RELEASE_DOCKER_EBPF_CLOSED_FIELDS,
-        },
-    },
-    RELEASE_THREE_FAMILY_GENERATION: {
-        "exact_jobs": {
-            **PUBLISH_EXACT_JOB_CONTRACTS["release workflow"],
-            "attest-release-images": (
-                RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_JOB
+        RELEASE_TOOLS_MANIFEST_JOB_NAME: {
+            "name": "    name: Docker eBPF Tools Manifest\n",
+            "needs": RELEASE_TOOLS_MANIFEST_NEEDS,
+            "runs-on": "    runs-on: ubuntu-26.04\n",
+            "permissions": (
+                "    permissions:\n"
+                "      contents: read\n"
+                "      packages: write\n"
             ),
-        },
-        "control": {
-            **PUBLISH_CONTROL_CONTRACTS["release workflow"],
-            "create-release": {
-                "name": RELEASE_THREE_FAMILY_CREATE_RELEASE_NAME,
-                "needs": RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
-                "steps": RELEASE_THREE_FAMILY_CREATE_RELEASE_STEPS,
-            },
-            "docker-ebpf": {
-                **PUBLISH_CONTROL_CONTRACTS["release workflow"]["docker-ebpf"],
-                "steps": RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS,
-            },
-            RELEASE_TOOLS_MANIFEST_JOB_NAME: {
-                "name": "    name: Docker eBPF Tools Manifest\n",
-                "needs": RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS,
-                "runs-on": "    runs-on: ubuntu-26.04\n",
-                "permissions": (
-                    "    permissions:\n"
-                    "      contents: read\n"
-                    "      packages: write\n"
-                ),
-                "steps": RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS,
-            },
-        },
-        "steps": {
-            **PUBLISH_ARTIFACT_STEP_CONTRACTS["release workflow"],
-            # One job builds both eBPF variants, so all four steps that decide
-            # what each digest name space receives are frozen together.
-            "docker-ebpf": {
-                "Build and push per-platform eBPF tools digest": (
-                    DOCKER_EBPF_TOOLS_BUILD_STEP
-                ),
-                "Export digest": DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP,
-                "Upload digest": DOCKER_EBPF_UPLOAD_DIGEST_STEP,
-                "Upload tools digest": DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
-            },
-            RELEASE_TOOLS_MANIFEST_JOB_NAME: {
-                "Download tools digests": (
-                    DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP
-                ),
-            },
-        },
-        "digest_owners": dict(RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS),
-        "closed_job_fields": {
-            "docker-ebpf": RELEASE_DOCKER_EBPF_CLOSED_FIELDS,
-            RELEASE_TOOLS_MANIFEST_JOB_NAME: (
-                RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS
-            ),
+            "steps": RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS,
         },
     },
 }
 
-
-# The publication contract above admits the `-ebpf-tools` adoption. The generic
-# Cross-surface comparison in `compare_pr_workflow_job` did not, and it does not
-# read contracts: it hashes every job it reads as Cross-sensitive and requires
-# the two revisions to agree. The adoption moves frozen text inside such jobs by
-# design — the extended `create-release` `needs` names `build-release-arm64-cross`
-# — so the digest surface moved, the comparison rejected it, and the admitted
-# transition was unreachable no matter how completely the proposal satisfied the
-# contract it was written for.
-#
-# The repair is a projection, not an exemption. Once BOTH revisions have
-# classified and the proposal has validated against the COMPLETE three-family
-# contract, the proposal is re-rendered in the two-family text it came from:
-# every frozen fragment the adoption is allowed to change is substituted back to
-# its two-family original, and the wholly new manifest job is removed. Only text
-# already proven byte-equal to a frozen contract is touched, so nothing else in
-# the file is withheld and the surface comparison still reads every other byte on
-# both sides. The projection is only ever applied to the proposal; the trusted
-# base is the baseline and is never rewritten.
-#
-# The substitution table is derived from the two contract tables themselves
-# rather than transcribed, so it cannot drift from the shapes it maps between,
-# and any contract change it cannot express (a job the adoption drops, a field it
-# invents on a pre-existing job) is a hard derivation error that disables the
-# projection entirely rather than silently narrowing it.
-def derive_release_family_transition(
-    two: dict[str, dict] | None = None,
-    three: dict[str, dict] | None = None,
-) -> tuple[tuple[tuple[str, str, str], ...], tuple[str, ...], list[str]]:
-    """Derive the exact frozen text the admitted family adoption moves.
-
-    The two generation tables are parameters so the self-test can hold the
-    derivation itself to its contract by feeding it deliberately broken tables.
-    In production both default to the module-level generations.
-    """
-
-    if two is None:
-        two = RELEASE_IMAGE_FAMILY_GENERATIONS[RELEASE_TWO_FAMILY_GENERATION]
-    if three is None:
-        three = RELEASE_IMAGE_FAMILY_GENERATIONS[RELEASE_THREE_FAMILY_GENERATION]
-    replacements: list[tuple[str, str, str]] = []
-    added_jobs: list[str] = []
-    errors: list[str] = []
-    # Jobs whose whole frozen text the projection substitutes, so a frozen step
-    # inside them is restored with it.
-    substituted: set[str] = set()
-
-    for job_name in two["exact_jobs"]:
-        if job_name not in three["exact_jobs"]:
-            errors.append(
-                f"the three-family release contract drops exact job {job_name!r}; "
-                "the admitted adoption may only extend the publication contract"
-            )
-    for job_name, adopted in three["exact_jobs"].items():
-        prior = two["exact_jobs"].get(job_name)
-        if prior is None:
-            errors.append(
-                f"the three-family release contract adds exact job {job_name!r}, "
-                "which the transition projection cannot map back to a "
-                "two-family text"
-            )
-            continue
-        if prior != adopted:
-            replacements.append((f"exact job {job_name!r}", adopted, prior))
-            substituted.add(job_name)
-
-    for job_name in two["control"]:
-        if job_name not in three["control"]:
-            errors.append(
-                f"the three-family release contract drops job {job_name!r}; "
-                "the admitted adoption may only extend the publication contract"
-            )
-    for job_name, fields in three["control"].items():
-        prior_fields = two["control"].get(job_name)
-        if prior_fields is None:
-            added_jobs.append(job_name)
-            continue
-        for field_name, adopted in fields.items():
-            prior = prior_fields.get(field_name)
-            if prior is None:
-                errors.append(
-                    f"the three-family release contract adds field "
-                    f"{field_name!r} to pre-existing job {job_name!r}, which "
-                    "the transition projection cannot map back to a two-family "
-                    "text"
-                )
-                continue
-            if prior != adopted:
-                replacements.append(
-                    (f"job {job_name!r} field {field_name!r}", adopted, prior)
-                )
-                if field_name == "steps":
-                    substituted.add(job_name)
-
-    # The same "may only extend" rule applies to the three tables that are keyed
-    # by job or by digest name space but are not themselves substituted text. A
-    # dropped entry there is not a projection failure, it is a silently narrowed
-    # contract: an artifact-selection step, a digest owner, or a closed job-field
-    # set that the two-family shape enforces and the three-family shape would
-    # stop enforcing. Checking them here fails the whole projection closed rather
-    # than admitting an adoption that relaxes the publication contract.
-    for table_name, entry_noun in (
-        ("steps", "artifact-selection steps for job"),
-        ("digest_owners", "digest name-space ownership of"),
-        ("closed_job_fields", "the closed direct-field set of job"),
-    ):
-        for entry_key in two[table_name]:
-            if entry_key not in three[table_name]:
-                errors.append(
-                    f"the three-family release contract drops {entry_noun} "
-                    f"{entry_key!r}; the admitted adoption may only extend the "
-                    "publication contract"
-                )
-
-    # A frozen artifact-selection step only moves inside a job whose whole
-    # `steps` block is already being substituted, or inside a job the adoption
-    # adds outright. Anything else would be frozen text the projection cannot
-    # restore, and the surface comparison would reject the adoption again.
-    for job_name, steps in three["steps"].items():
-        if job_name in added_jobs or job_name in substituted:
-            continue
-        if steps != two["steps"].get(job_name):
-            errors.append(
-                f"the three-family release contract changes artifact-selection "
-                f"steps in job {job_name!r} without substituting that job's "
-                "whole frozen text"
-            )
-
-    if not replacements or not added_jobs:
-        errors.append(
-            "the release image-family transition projection derived no "
-            "substitutions or no added job, so it no longer describes the "
-            "admitted adoption"
-        )
-    for _, adopted, prior in replacements:
-        if not adopted or not prior:
-            errors.append(
-                "the release image-family transition projection derived an "
-                "empty frozen text"
-            )
-    return tuple(replacements), tuple(added_jobs), errors
-
-
-(
-    RELEASE_FAMILY_TRANSITION_REPLACEMENTS,
-    RELEASE_FAMILY_TRANSITION_ADDED_JOBS,
-    RELEASE_FAMILY_TRANSITION_DERIVATION_ERRORS,
-) = derive_release_family_transition()
+# The credentialed producer and the tools manifest are closed over their
+# complete ordered direct-field sets (`closed_job_field_errors`).
+PUBLISH_CLOSED_JOB_FIELDS = {
+    "release workflow": {
+        "docker-ebpf": RELEASE_DOCKER_EBPF_CLOSED_FIELDS,
+        RELEASE_TOOLS_MANIFEST_JOB_NAME: RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Trusted-base relevance contract for the required live-datapath gates
 # ---------------------------------------------------------------------------
-# `mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`, and
-# `multicluster-poller-partition-live.yml` publish REQUIRED status checks that
+# `gateway-api-conformance.yml`, `mesh-e2e-sidecar-live.yml`,
+# `multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`,
+# and `ambient-host-udp-live.yml` publish REQUIRED status checks that
 # may skip their expensive live job when a pull request touches nothing
 # relevant. That skip is a security boundary: if the relevance verdict is
 # computed by a script the PULL REQUEST supplies, the pull request can widen
@@ -2576,6 +1754,16 @@ LIVE_SUITE_RELEVANCE_CONTRACTS = {
         "cni-lifecycle",
         "cni-lifecycle",
     ),
+    # GHSA-c57q-j5hg-w4vc: `Gateway API Conformance` is a required check whose
+    # `gate` passes on `relevant == 'false'`; it used to run the pull request's
+    # own filter copy, so a PR could declare itself irrelevant.
+    "gateway-api-conformance.yml": (
+        "changes",
+        "gateway-api-conformance",
+        "Gateway API conformance trigger",
+        "gateway-api-conformance",
+        "gateway-api",
+    ),
     "istio-status-cas-live.yml": (
         "changes",
         "istio-status-cas-live",
@@ -2713,139 +1901,10 @@ AMBIENT_HOST_UDP_LIVE_JOB = (
           retention-days: 14
 """
 )
-AMBIENT_HOST_UDP_IMAGE_JOB = r"""  ambient-host-udp-image:
-    name: Ambient host-UDP production image contract
-    needs: changes
-    if: needs.changes.outputs.relevant == 'true'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout Ferrum Edge
-        uses: actions/checkout@0000000000000000000000000000000000000000
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
-
-      # GitHub Actions cache is a 10 GB repository quota with LRU eviction
-      # across every ref. `type=gha,mode=max` exports multi-gigabyte BuildKit
-      # layers scoped to the writing ref. Pull requests and merge groups restore
-      # the default-branch cache and must not publish; only a trusted
-      # `refs/heads/main` run (currently `workflow_dispatch` on `main`) may
-      # cache-to. Fork PRs cannot publish: `github.ref` is never
-      # `refs/heads/main` on a PR, and the fork guard stays fail-closed if that
-      # ref check is later weakened. An empty cache-to does not skip the build.
-      #
-      # Cheap, deterministic half: the tool-provisioning stage the production
-      # runtime is built FROM. This alone would not prove the shipped image, so
-      # the full target is smoked below; running it first surfaces a broken tool
-      # closure in ~1 minute instead of after the Rust + nightly eBPF builds.
-      - name: Build the capture tool base stage
-        uses: docker/build-push-action@0000000000000000000000000000000000000000
-        with:
-          context: .
-          file: Dockerfile
-          target: capture-tools-base
-          load: true
-          tags: ferrum-edge-capture-tools-base:ci
-          cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
-          provenance: false
-
-      # The exact target the mesh chart's `-ebpf-tools` tag publishes.
-      - name: Build the production Ambient UDP lifecycle runtime
-        uses: docker/build-push-action@0000000000000000000000000000000000000000
-        with:
-          context: .
-          file: Dockerfile
-          target: runtime-ebpf-tools
-          build-args: |
-            CARGO_PROFILE=pr-build
-            FEATURES=cloud-secrets,ebpf
-          load: true
-          tags: ferrum-edge-ebpf-tools:ci
-          cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
-          provenance: false
-
-      - name: Prove the published runtime can execute the production tool set
-        run: |
-          set -euo pipefail
-
-          # Every tool the generated host/pod-netns UDP setup and teardown
-          # scripts invoke. `preflight_capture_tools` refuses startup without
-          # them, so an image failing here crash-loops the Ambient UDP producer.
-          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c '
-            set -eu
-            for tool in ip iptables ip6tables iptables-save ip6tables-save; do
-              command -v "$tool" >/dev/null 2>&1 || {
-                echo "missing required tool: $tool" >&2
-                exit 1
-              }
-            done
-            ip -V >/dev/null
-            iptables --version >/dev/null
-            ip6tables --version >/dev/null
-            iptables-save --version >/dev/null
-            ip6tables-save --version >/dev/null
-          '
-
-          # The image must still be a working Ferrum runtime, and must carry the
-          # eBPF ELF that makes it a strict superset of the `-ebpf` variant.
-          docker run --rm ferrum-edge-ebpf-tools:ci version >/dev/null
-          docker run --rm --entrypoint /bin/sh ferrum-edge-ebpf-tools:ci -c \
-            'test -s /app/bpf/ferrum-ebpf'
-
-      # The complementary half of the contract: the ordinary `-ebpf` image the
-      # chart still selects for eBPF capture / NodeWaypoint must REMAIN
-      # distroless. Proving the tools image alone would let a later change
-      # "fix" this finding by quietly adding a shell to `-ebpf` instead.
-      - name: Build the distroless eBPF runtime
-        uses: docker/build-push-action@0000000000000000000000000000000000000000
-        with:
-          context: .
-          file: Dockerfile
-          target: runtime-ebpf
-          build-args: |
-            CARGO_PROFILE=pr-build
-            FEATURES=cloud-secrets,ebpf
-          load: true
-          tags: ferrum-edge-ebpf:ci
-          cache-from: type=gha,scope=ambient-host-udp-images
-          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.fork != true && 'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}
-          provenance: false
-
-      - name: Prove the `-ebpf` image keeps its distroless contract
-        run: |
-          set -euo pipefail
-          container="$(docker create ferrum-edge-ebpf:ci)"
-          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
-          listing="$RUNNER_TEMP/ebpf-image-files.txt"
-          # Normalize exactly like the production Dockerfile smoke so the
-          # exact-path assertions below cannot be defeated by a `./` prefix.
-          docker export "$container" | tar -tf - \
-            | sed -e 's#^\./##' -e 's#^/##' > "$listing"
-
-          # Positive control: prove the exact-path assertion is live before
-          # asserting absences against the same inventory.
-          grep -Fxq app/ferrum-edge "$listing"
-          # `ip` IS expected: NodeWaypoint owns an exact policy rule/route.
-          grep -Fxq usr/sbin/ip "$listing"
-
-          for forbidden in \
-            bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
-            bin/busybox usr/bin/busybox usr/bin/apt usr/bin/apt-get \
-            usr/bin/dpkg usr/sbin/iptables usr/sbin/ip6tables usr/sbin/nft; do
-            if grep -Fxq "$forbidden" "$listing"; then
-              echo "::error::the distroless -ebpf image must not ship /$forbidden" >&2
-              exit 1
-            fi
-          done
-"""
-# Issue #4643: admit an exact registry-cache generation after this policy
-# reaches main. Stage one leaves the current workflow unchanged. Stage two
-# replaces only its image recipe with these complete reader/writer/aggregate
-# jobs. The required outer gate and live-kernel job remain unchanged.
+# Issue #4643: the Ambient production-image recipe is exactly these complete
+# reader/writer/aggregate jobs with a GHCR registry cache. The retired
+# single-job `type=gha` shape and its cache-budget checks are gone (#7281);
+# the required outer gate and live-kernel job are frozen beside them.
 AMBIENT_REGISTRY_IMAGE_READ_JOB = r"""  ambient-host-udp-image-read:
     name: Ambient production image (registry reader)
     needs: changes
@@ -3190,82 +2249,6 @@ AMBIENT_HOST_UDP_TOP_LEVEL_PERMISSIONS = "permissions:\n  contents: read\n"
 AMBIENT_HOST_UDP_FORBIDDEN_INHERITED_KEYS = ("defaults", "env")
 AMBIENT_HOST_UDP_REQUIRED_CHECK_NAME = "Ambient Host UDP Live"
 AMBIENT_HOST_UDP_REQUIRED_CHECK_OWNER = ("ambient-host-udp-live.yml", "gate")
-AMBIENT_HOST_UDP_IMAGE_CACHE_FROM = (
-    "cache-from: type=gha,scope=ambient-host-udp-images"
-)
-AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO = (
-    "cache-to: type=gha,mode=max,scope=ambient-host-udp-images"
-)
-AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO = (
-    "cache-to: ${{ github.event_name != 'pull_request' && "
-    "github.event_name != 'merge_group' && "
-    "github.ref == 'refs/heads/main' && "
-    "github.event.pull_request.head.repo.fork != true && "
-    "'type=gha,mode=max,scope=ambient-host-udp-images' || '' }}"
-)
-AMBIENT_HOST_UDP_IMAGE_BUILD_STEPS = (
-    "Build the capture tool base stage",
-    "Build the production Ambient UDP lifecycle runtime",
-    "Build the distroless eBPF runtime",
-)
-AMBIENT_HOST_UDP_IMAGE_TARGETS = (
-    "capture-tools-base",
-    "runtime-ebpf-tools",
-    "runtime-ebpf",
-)
-AMBIENT_HOST_UDP_IMAGE_CONTRACT_CHECKS = (
-    "Prove the published runtime can execute the production tool set",
-    "Prove the `-ebpf` image keeps its distroless contract",
-)
-
-
-def ambient_host_udp_image_cache_budget_errors(job: str, source: str) -> list[str]:
-    """Reject Ambient image-job cache publication from PR and merge-group refs.
-
-    Exact job freeze still owns runner, checkout, and contract-check bytes.
-    These checks stay in force if a later trusted-policy edit updates that
-    freeze and the workflow together: an unconditional `type=gha,mode=max`
-    export, a missing restore, a skipped required target, or an `if:` on a
-    required build must fail closed.
-    """
-
-    errors: list[str] = []
-    if AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO in job:
-        errors.append(
-            f"{source} must not publish the Ambient GHA BuildKit cache "
-            "unconditionally from pull requests"
-        )
-    gated = job.count(AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO)
-    if gated != 3:
-        errors.append(
-            f"{source} must gate all three Ambient image cache-to exports on "
-            f"trusted refs/heads/main (found {gated})"
-        )
-    restored = job.count(AMBIENT_HOST_UDP_IMAGE_CACHE_FROM)
-    if restored != 3:
-        errors.append(
-            f"{source} must restore the Ambient GHA BuildKit cache on all three "
-            f"image builds (found {restored})"
-        )
-    for target in AMBIENT_HOST_UDP_IMAGE_TARGETS:
-        if f"target: {target}" not in job:
-            errors.append(
-                f"{source} must still build the {target} image target"
-            )
-    for name in AMBIENT_HOST_UDP_IMAGE_BUILD_STEPS:
-        if f"- name: {name}\n        uses: docker/build-push-action@" not in job:
-            errors.append(
-                f"{source} must keep {name!r} unconditional; a missing/invalid "
-                "event must not skip the required image build"
-            )
-    for name in AMBIENT_HOST_UDP_IMAGE_CONTRACT_CHECKS:
-        if f"- name: {name}" not in job:
-            errors.append(
-                f"{source} must keep the {name!r} contract check"
-            )
-    return errors
-
-
 # Freezing the relevance job alone is not sufficient. A pull request that left
 # the frozen block untouched but rewrote the live job's `needs`/`if` would skip
 # the expensive job just as effectively, so the binding from the trusted
@@ -3893,33 +2876,27 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 # a new image family: as two byte-frozen GENERATIONS with a one-way transition
 # between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first).
 #
-# Every earlier transition is spent: the newest generation reached `main`, and
-# the rule is to retire a generation once its successor is on `main`. #4238's
-# shape, the #4442 datagram-target shape, the pre-parser-target shape and the
-# BoringCache rollout retired by issue #6573 are therefore gone from this file.
-# One transition is open (2026-11-09 test sweep), so two generations remain:
+# Every transition is spent: the newest generation reached `main`, and the
+# rule is to retire a generation once its successor is on `main`. #4238's
+# shape, the #4442 datagram-target shape, the pre-parser-target shape, the
+# BoringCache rollout retired by issue #6573 and the in-CI sanitizer shape
+# retired after the 2026-11-09 test sweep are therefore gone from this file.
+# One generation remains:
 #
-#   * `CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB` (retired end) is the shape main
-#     carried until that sweep: the deterministic property smoke as the
-#     required pull-request and merge_group gate, and the bounded libFuzzer
-#     budget on push to `main` / manual dispatch only, inside this one
-#     required job. Its sanitizer build (~47 min plus ~8 min of serial
-#     per-target rebuilds, for under ten seconds of fuzzing) made `Fuzz Smoke`
-#     the critical path of every main CI run by 25-55 minutes, and its
-#     `fuzz-smoke` rust-cache entry (7.2 GB) evicted `ci-standalone-cargo`.
-#   * `CI_FUZZ_SMOKE_JOB` (adopted end) is the property gate alone, on every
-#     event, with a slim `fuzz-property-smoke` cache. The bounded budget moved
-#     verbatim into `FUZZ_SANITIZER_SMOKE_WORKFLOW`
+#   * `CI_FUZZ_SMOKE_JOB` is the property gate alone, on every event, with a
+#     slim `fuzz-property-smoke` cache. The bounded libFuzzer budget lives in
+#     `FUZZ_SANITIZER_SMOKE_WORKFLOW`
 #     (`.github/workflows/fuzz-smoke-main.yml`), a whole-file contract that
 #     runs on every push to `main` and on manual dispatch, outside the
 #     required `Tests` aggregate. `fuzz_budget_placement_errors` refuses the
-#     adopted generation unless that workflow is present and frozen, so the
-#     transition can never drop the budget, and the frozen-workflow removal
-#     rule refuses deleting the workflow once the trusted base carries it.
+#     generation unless that workflow is present and frozen, and the
+#     frozen-workflow removal rule refuses deleting the workflow once the
+#     trusted base carries it.
 #
-#     Both generations hold only `contents: read`, use the checksum-pinned
-#     sccache installer with a main-only rust-cache save, and have no remote
-#     compiler-cache backend.
+#     The generation holds only `contents: read`, installs no compiler-cache
+#     wrapper (it clears every wrapper input, like the other fuzz lanes),
+#     keeps a main-only rust-cache save, and has no remote compiler-cache
+#     backend.
 #
 #     Beyond the six-target loop, the budget fuzzes `datagram_client_address`
 #     (#4442). That target parses the Datagram PROXY v2 envelope -- address
@@ -3964,337 +2941,6 @@ NODE_WAYPOINT_RELEVANCE_CONTRACT = {
 # / `-max_len` / `-timeout` / `-rss_limit_mb` bounds cannot drift while a
 # generation is added or the budget moves.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
-CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB = r"""  fuzz-smoke:
-    # Byte-frozen by the trusted Cross build policy
-    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
-    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
-    # issue #3902 decides where each half of it runs, and issue #4442 decides
-    # which targets it covers. This is its entire
-    # permitted shape. Every command, action pin, toolchain pin, tool version,
-    # target name, and libFuzzer bound below is part of the contract, so a pull
-    # request cannot widen the budget, change the target list, add a step, or
-    # redirect this job at a repository-supplied script.
-    #
-    # Lane split (#3902, narrowed by #4238): the deterministic property smoke
-    # stays the required gate and runs on pull_request AND merge_group. The
-    # sanitizer-instrumented libFuzzer build spends roughly 39 minutes
-    # compiling to buy under a minute of fuzzing, so it runs only on the push
-    # to `main` and on manual dispatch.
-    #
-    # #3902 took it off the pull-request path for cost. #4238 takes it off the
-    # merge_group path for blast radius: a hosted-runner reclamation (exit 143)
-    # anywhere in that ~38-minute window ejected the queue entry and cascaded a
-    # rebuild of every entry behind it, and it did so without a defect in the
-    # ejected change. Discovery coverage is unchanged -- every merged change is
-    # still fuzzed at byte-identical bounds by the push to `main` that follows
-    # it, which is also the only event permitted to populate this lane's cache.
-    #
-    # Target inventory (#4442): `datagram_client_address` is the seventh smoke
-    # target. It is invoked on its own rather than from the six-target loop
-    # because its documented input budget is 64 KiB
-    # (`fuzz_support::MAX_FUZZ_INPUT_BYTES`) rather than the loop's 4 KiB, and
-    # the scheduled sanitizer lane already fuzzes it at that ceiling. A parser
-    # whose length boundaries are reachable in one required lane and not the
-    # other is not actually scheduled. Every other bound is byte-identical to
-    # the loop's.
-    #
-    # Parser targets (#6584): `ocsp_response`, `jwt_svid` and `tls_material`
-    # fuzz the hand-rolled stapled-OCSP DER grammar, the JWT-SVID strict-JSON,
-    # token and JWKS validators, and PEM certificate/key/CRL admission. They
-    # run in their own loop for the same reason: their size bounds (64 KiB
-    # OCSP, 8 KiB token, larger PEM) sit above the six-target loop's 4 KiB
-    # ceiling.
-    name: Fuzz Smoke
-    needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_fuzz_smoke == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-26.04
-    timeout-minutes: 120
-    permissions:
-      contents: read
-    # The repository-root Cargo config also selects the mold linker through
-    # per-target rustflags, and this isolated lane installs no fast linker, so
-    # the inherited rustflags are cleared explicitly. The rustc wrapper is
-    # deliberately NOT pinned here: `setup-sccache` below publishes either the
-    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
-    # and a job-level `env` entry of the same name would override that
-    # fail-closed decision.
-    env:
-      RUSTFLAGS: ""
-    steps:
-      - uses: actions/checkout@0000000000000000000000000000000000000000
-        with:
-          persist-credentials: false
-
-      - name: Extend runner swap for sanitizer compilation
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: |
-          set -euo pipefail
-          # The observed cold compile reached 14.3 GiB process RSS, less than
-          # 250 MiB available RAM and nearly full 3 GiB swap before shutdown.
-          # Match the existing unit/PKCS11 jobs' bounded 12 GiB extension,
-          # preserving the runner's existing swap and every compiler/test bound.
-          free -h
-          df -h /mnt
-          sudo fallocate -l 12G /mnt/ferrum-fuzz-swapfile
-          sudo chmod 600 /mnt/ferrum-fuzz-swapfile
-          sudo mkswap /mnt/ferrum-fuzz-swapfile
-          sudo swapon /mnt/ferrum-fuzz-swapfile
-          free -h
-          swapon --show
-
-      - name: Install required build dependency
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
-
-      - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
-        with:
-          toolchain: nightly-2026-09-30
-
-      # The repository's own checksum-pinned sccache installer, and the only
-      # local action this contract admits. It never enables the
-      # credential-bearing sccache GHA backend, never persists
-      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
-      # those credentials are absent before any build runs, and fails closed to
-      # no wrapper at all. It must run BEFORE the cache restore below so the
-      # lazily started sccache server indexes the restored entries.
-      - uses: ./.github/actions/setup-sccache
-
-      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000
-        with:
-          workspaces: fuzz -> target
-          shared-key: fuzz-smoke
-          # Only a push to `main` may write this lane's cache. GitHub already
-          # scopes a pull request's cache writes to its own ref; writing
-          # nothing at all from an untrusted ref is the stronger statement,
-          # and it keeps every compiler artifact the sanitizer build reuses
-          # attributable to code that has already merged.
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-
-      - name: Install pinned cargo-fuzz
-        run: cargo install cargo-fuzz --locked --version 0.13.1
-
-      - name: Run deterministic property smoke tests
-        working-directory: fuzz
-        # From nightly-2026-09-30 the cold property-suite compile exhausts the
-        # hosted runner's memory at full parallelism ("The runner has received
-        # a shutdown signal" + exit 143, reproduced twice on #5971 while the
-        # fuzz crate overlapped the ferrum-edge lib codegen). Cap jobs as the
-        # coverage shard does (#4368); output and fingerprints are unchanged.
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          set -euo pipefail
-
-          property_started=$SECONDS
-          cargo test --locked
-          echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
-
-      - name: Run bounded libFuzzer smoke budget
-        # Issue #4238: the push to `main` and manual dispatch only. This step
-        # is a probabilistic DISCOVERY run, not a verdict on one diff, so it
-        # must not be able to eject a merge-queue entry: its bounds buy about
-        # 48 seconds of fuzzing behind roughly 39 minutes of sanitizer compile,
-        # and a runner reclamation in that window costs the whole queue.
-        # Every merged change still reaches this budget through the push to
-        # `main`, at byte-identical bounds, seconds later.
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        working-directory: fuzz
-        run: |
-          set -euo pipefail
-
-          sanitizer_started=$SECONDS
-          # Logs and annotations are best effort: hard runner loss can prevent
-          # either upload. Send a few pressure transitions to the live timeline
-          # as well as the full log, without granting this process API access.
-          python3 -u - <<'PYRES' &
-          import json
-          import os
-          import time
-          from pathlib import Path
-
-
-          def counters(path, names=None):
-              try:
-                  text = Path(path).read_text()[:8192]
-              except (OSError, UnicodeError):
-                  return None
-              result = {}
-              for line in text.splitlines():
-                  parts = line.replace(":", " ").split()
-                  if len(parts) >= 2 and (names is None or parts[0] in names):
-                      try:
-                          result[parts[0]] = int(parts[1])
-                      except ValueError:
-                          continue
-              return result
-
-
-          def scalar(path):
-              try:
-                  value = Path(path).read_text()[:64].strip()
-                  return int(value) if value.isdecimal() else value
-              except (OSError, UnicodeError):
-                  return None
-
-
-          started = time.monotonic()
-          reported_notices = set()
-          initial_oom = None
-          for sample_index in range(240):
-              rss_sum = 0
-              rss_max = 0
-              process_count = 0
-              scan_truncated = False
-              try:
-                  with os.scandir("/proc") as entries:
-                      for entry in entries:
-                          if not entry.name.isdecimal():
-                              continue
-                          if process_count == 1024:
-                              scan_truncated = True
-                              break
-                          process_count += 1
-                          values = counters(entry.path + "/status", {"VmRSS"})
-                          rss = values.get("VmRSS", 0) if values is not None else 0
-                          rss_sum += rss
-                          rss_max = max(rss_max, rss)
-              except OSError:
-                  scan_truncated = True
-              snapshot = {
-                  "sample": sample_index,
-                  "elapsed_seconds": round(time.monotonic() - started, 3),
-                  "host_memory_kib": counters("/proc/meminfo", {
-                      "MemTotal", "MemAvailable", "SwapTotal", "SwapFree", "Dirty"
-                  }),
-                  "host_swap_pages": counters("/proc/vmstat", {"pswpin", "pswpout"}),
-                  "root_cgroup_memory_current_bytes": scalar("/sys/fs/cgroup/memory.current"),
-                  "root_cgroup_memory_max": scalar("/sys/fs/cgroup/memory.max"),
-                  "root_cgroup_memory_events": counters("/sys/fs/cgroup/memory.events"),
-                  "process_count_scanned": process_count,
-                  "process_scan_truncated": scan_truncated,
-                  "process_rss_sum_kib": rss_sum,
-                  "largest_process_rss_kib": rss_max,
-              }
-              print("Fuzz build resources: " + json.dumps(snapshot, sort_keys=True), flush=True)
-              # At most nine distinct reasons, each emitted once. Group simultaneous
-              # transitions to stay below the runner's ten-notice limit per step.
-              reasons = {"initial"} if sample_index == 0 else set()
-              memory = snapshot["host_memory_kib"] or {}
-              total = memory.get("MemTotal", 0)
-              available = memory.get("MemAvailable")
-              if total > 0 and available is not None:
-                  for percent in (75, 50, 25, 10, 5):
-                      if available * 100 <= total * percent:
-                          reasons.add(f"available-memory-at-most-{percent}-percent")
-              swap_total = memory.get("SwapTotal", 0)
-              swap_free = memory.get("SwapFree")
-              if swap_total > 0 and swap_free is not None:
-                  for percent in (25, 5):
-                      if swap_free * 100 <= swap_total * percent:
-                          reasons.add(f"free-swap-at-most-{percent}-percent")
-              events = snapshot["root_cgroup_memory_events"] or {}
-              oom = {name: events[name] for name in ("oom", "oom_kill") if name in events}
-              if initial_oom is None and oom:
-                  initial_oom = oom
-              if initial_oom and any(oom.get(name, value) > value
-                                     for name, value in initial_oom.items()):
-                  reasons.add("root-cgroup-oom-counter-increased")
-              new_reasons = reasons - reported_notices
-              if new_reasons:
-                  notice = {
-                      "reasons": sorted(new_reasons),
-                      "sample": sample_index,
-                      "elapsed_seconds": snapshot["elapsed_seconds"],
-                      "host_memory_kib": memory,
-                      "host_swap_pages": snapshot["host_swap_pages"],
-                      "root_cgroup_oom_counters": oom,
-                      "largest_process_rss_kib": rss_max,
-                  }
-                  message = json.dumps(notice, sort_keys=True)
-                  message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-                  print("::notice title=Fuzz build resource snapshot::" + message, flush=True)
-                  reported_notices.update(new_reasons)
-              remaining = 7200.0 - (time.monotonic() - started)
-              if remaining <= 0:
-                  break
-              time.sleep(min(30.0, remaining))
-          PYRES
-          fuzz_resource_pid=$!
-          stop_fuzz_resource_observer() {
-            local original_status=$?
-            trap - EXIT
-            if ! kill -0 "$fuzz_resource_pid" 2>/dev/null; then
-              echo "::warning::fuzz resource observer ended before the sanitizer step"
-            fi
-            kill "$fuzz_resource_pid" 2>/dev/null || true
-            wait "$fuzz_resource_pid" 2>/dev/null || true
-            exit "$original_status"
-          }
-          trap stop_fuzz_resource_observer EXIT
-
-          sccache_bin="${RUSTC_WRAPPER:-}"
-          echo "Fuzz sanitizer lane sccache statistics before the sanitizer build:"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            "$sccache_bin" --show-stats
-          else
-            echo "sccache is unavailable; this sanitizer build cannot reuse compiler output"
-          fi
-
-          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
-            echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
-              -runs=512 \
-              -max_total_time=8 \
-              -max_len=4096 \
-              -timeout=2 \
-              -rss_limit_mb=1024
-          done
-
-          for fuzz_target in ocsp_response jwt_svid tls_material; do
-            echo "Fuzz smoke target: ${fuzz_target}"
-            cargo fuzz run --codegen-units 16 "$fuzz_target" -- \
-              -runs=512 \
-              -max_total_time=8 \
-              -max_len=65536 \
-              -timeout=2 \
-              -rss_limit_mb=1024
-          done
-
-          echo "Fuzz smoke target: datagram_client_address"
-          cargo fuzz run --codegen-units 16 datagram_client_address -- \
-            -runs=512 \
-            -max_total_time=8 \
-            -max_len=65536 \
-            -timeout=2 \
-            -rss_limit_mb=1024
-          echo "Fuzz sanitizer lane seconds: $((SECONDS - sanitizer_started))"
-
-      - name: Report fuzz lane compiler-cache telemetry
-        if: always()
-        run: |
-          set -euo pipefail
-
-          if [ "$GITHUB_EVENT_NAME" = "push" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "Fuzz lane shape: property gate plus the ten-target sanitizer budget"
-          else
-            echo "Fuzz lane shape: deterministic property gate only"
-          fi
-
-          sccache_bin="${RUSTC_WRAPPER:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            echo "Fuzz lane sccache statistics after this run:"
-            "$sccache_bin" --show-stats
-            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
-          else
-            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
-          fi
-"""
-
-# The adopted generation: the deterministic property gate alone. The bounded
-# libFuzzer budget it no longer carries is `FUZZ_SANITIZER_SMOKE_WORKFLOW`.
 CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
     # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
@@ -4332,13 +2978,15 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     permissions:
       contents: read
     # The repository-root Cargo config also selects the mold linker through
-    # per-target rustflags, and this isolated lane installs no fast linker, so
-    # the inherited rustflags are cleared explicitly. The rustc wrapper is
-    # deliberately NOT pinned here: `setup-sccache` below publishes either the
-    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
-    # and a job-level `env` entry of the same name would override that
-    # fail-closed decision.
+    # per-target rustflags, and a runner- or user-level rustc-wrapper may
+    # select sccache, but this isolated lane installs neither: like the
+    # scheduled and push-to-main fuzz lanes, it clears both Cargo wrapper
+    # inputs and the inherited rustflags explicitly. Its compiler reuse is the
+    # restored `fuzz-property-smoke` target directory alone; a local sccache
+    # store measured 0 hits here because nothing persisted it (#7285).
     env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@0000000000000000000000000000000000000000
@@ -4355,15 +3003,6 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
         with:
           toolchain: nightly-2026-09-30
-
-      # The repository's own checksum-pinned sccache installer, and the only
-      # local action this contract admits. It never enables the
-      # credential-bearing sccache GHA backend, never persists
-      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
-      # those credentials are absent before any build runs, and fails closed to
-      # no wrapper at all. It must run BEFORE the cache restore below so the
-      # lazily started sccache server indexes the restored entries.
-      - uses: ./.github/actions/setup-sccache
 
       - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000
         with:
@@ -4395,29 +3034,15 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
           cargo test --locked
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
-      - name: Report fuzz lane compiler-cache telemetry
+      - name: Report fuzz lane shape
         if: always()
         run: |
-          set -euo pipefail
-
           echo "Fuzz lane shape: deterministic property gate (sanitizer budget runs in fuzz-smoke-main.yml)"
-
-          sccache_bin="${RUSTC_WRAPPER:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            echo "Fuzz lane sccache statistics after this run:"
-            "$sccache_bin" --show-stats
-            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
-          else
-            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
-          fi
 """
 
 # Oldest first. The index of a revision's job text in this tuple is its
 # generation; a higher index may replace a lower one, never the reverse.
-CI_FUZZ_SMOKE_JOB_GENERATIONS = (
-    CI_FUZZ_SMOKE_IN_CI_SANITIZER_JOB,
-    CI_FUZZ_SMOKE_JOB,
-)
+CI_FUZZ_SMOKE_JOB_GENERATIONS = (CI_FUZZ_SMOKE_JOB,)
 
 # The bounded libFuzzer budget, verbatim. Whichever frozen text hosts the
 # push-to-main budget must carry it exactly once, wherever in it it runs.
@@ -5111,11 +3736,19 @@ ENV_OPTION = (
     rf"{ASSIGNMENT_VALUE})"
 )
 ENV_PREFIX = rf"(?:{TOOL_PATH_PREFIX}env(?:\s+{ENV_OPTION})*\s+)"
+# Whether an option word takes a separate operand depends on the wrapper
+# (`sudo -E` takes none, `sudo -D dir` and `ionice -c 3` do, `stdbuf -o L` does,
+# `exec -a name` does), and an option this layer has never heard of may take
+# one too. A shared operand list consumed the executable after `sudo -E` and
+# put an option operand in the executable slot after `ionice -c 3`
+# (GHSA-q636-fxjc-3r78). Every short or long option is therefore allowed to
+# take the next word as an operand OR to stand alone, and the regex engine's
+# backtracking tries both readings, so a Cross executable behind either one is
+# still found.
 WRAPPER_OPTION = (
     r"(?:--(?=\s)|"
-    r"-[nupgEC]\s+[^\s]+|"
-    r"--(?:user|group|chdir|niceness|priority|signal|kill-after)"
-    r"(?:=[^\s]+|\s+[^\s]+)|"
+    r"-[A-Za-z]\s+[^\s]+|"
+    r"--[A-Za-z][A-Za-z0-9-]*(?:=[^\s]+|\s+[^\s]+)|"
     r"--?[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?|"
     r"[0-9]+(?:\.[0-9]+)?[smhd]?)"
 )
@@ -5432,10 +4065,6 @@ YAML_DYNAMIC_COMMAND_FIELD = re.compile(
 )
 YAML_DYNAMIC_USES_FIELD = re.compile(
     r"^\s*(?:-\s*)?(?:uses|'uses'|\"uses\")\s*:\s*[*!&]"
-)
-HEREDOC_START = re.compile(
-    r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)"
-    r"(?P=quote)"
 )
 BLOCK_SCALAR_HEADER = re.compile(
     r"^[|>](?:(?:[1-9][+-]?)|(?:[+-][1-9]?))?(?:\s+#.*)?$"
@@ -7157,12 +5786,6 @@ def digest_artifact_prefixes() -> tuple[str, ...]:
                 for owners in DIGEST_ARTIFACT_OWNERS.values()
                 for prefix in owners
             }
-            # The `-ebpf-tools` name space is refused to repo-local composite
-            # actions in every generation, adopted or not. A local action is
-            # never a digest owner, so pre-reserving the prefix costs nothing
-            # and closes the window where the adoption commit would otherwise
-            # inherit an already-planted local-action upload.
-            | set(RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS)
         )
     )
 
@@ -7193,73 +5816,21 @@ def local_action_digest_upload_errors(contents: str, source: str) -> list[str]:
     return errors
 
 
-def release_image_family_generation(
-    contents: str,
-    source: str,
-) -> tuple[str | None, list[str]]:
-    """Classify a release workflow as one of the two admitted family shapes.
-
-    The classifier reads one structural fact — whether the frozen
-    `docker-ebpf-tools-manifest` job exists — and then requires the rest of the
-    file to agree with it. Before adoption the `-ebpf-tools` family may not be
-    named anywhere at all, which is what makes "byte-identical or the complete
-    new shape" the only two reachable states: a half-landed adoption that plants
-    a tools tag, a tools digest directory, or a tools upload without the frozen
-    jobs classifies as neither and is rejected here rather than being validated
-    against contracts that do not describe it.
-
-    Classification decides which contract table applies to THIS revision only.
-    Whether moving from one table to the other is permitted is a separate,
-    comparative question answered by `release_image_family_transition_errors`.
-    """
-
-    lines = contents.splitlines()
-    job_names = {name for name, _, _ in workflow_job_ranges(lines)}
-    present_tokens = [
-        token for token in RELEASE_TOOLS_FAMILY_TOKENS if token in contents
-    ]
-    if RELEASE_TOOLS_MANIFEST_JOB_NAME in job_names:
-        return RELEASE_THREE_FAMILY_GENERATION, []
-    if present_tokens:
-        return None, [
-            f"{source} names the `-ebpf-tools` release image family "
-            f"({', '.join(repr(token) for token in present_tokens)}) without "
-            f"the frozen {RELEASE_TOOLS_MANIFEST_JOB_NAME!r} job; the third "
-            "image family is admitted only as the complete frozen shape, never "
-            "as a partial adoption"
-        ]
-    return RELEASE_TWO_FAMILY_GENERATION, []
-
-
-def release_generation_tables(generation: str | None) -> dict[str, dict]:
-    """Return the contract tables in force for one classified revision.
-
-    An unclassifiable revision falls back to the two-family tables so the rest
-    of the publication contract is still enforced against it; the classification
-    error itself is already reported by the caller.
-    """
-
-    return RELEASE_IMAGE_FAMILY_GENERATIONS[
-        generation
-        if generation in RELEASE_IMAGE_FAMILY_GENERATIONS
-        else RELEASE_TWO_FAMILY_GENERATION
-    ]
-
-
-def build_release_family_fixture(generation: str) -> str:
-    """Assemble a complete release workflow for one admitted family shape.
+def build_release_family_fixture() -> str:
+    """Assemble a complete release workflow from the frozen contracts.
 
     Self-tests that exercise release-workflow policy must feed it a file the
-    policy can actually classify and validate: the proposal is held to the
-    COMPLETE contract of the shape it claims, so a generic stub labelled
-    "release workflow" is rejected before the behaviour under test is reached.
-    The fixtures are assembled from the frozen contracts themselves rather than
-    transcribed, so they cannot drift from the policy they are used to test.
+    policy can actually validate: the proposal is held to the COMPLETE
+    publication contract, so a generic stub labelled "release workflow" is
+    rejected before the behaviour under test is reached. The fixture is
+    assembled from the frozen contracts themselves rather than transcribed, so
+    it cannot drift from the policy it is used to test.
     """
 
-    tables = RELEASE_IMAGE_FAMILY_GENERATIONS[generation]
-    control = tables["control"]
-    fixture = (
+    exact_jobs = PUBLISH_EXACT_JOB_CONTRACTS["release workflow"]
+    control = PUBLISH_CONTROL_CONTRACTS["release workflow"]
+    tools_manifest = control[RELEASE_TOOLS_MANIFEST_JOB_NAME]
+    return (
         "name: Release fixture\n"
         # The canonical block mapping, not `on: [push]`: the pull-request
         # comparison extracts the trigger as a whole top-level block and rejects
@@ -7269,12 +5840,12 @@ def build_release_family_fixture(generation: str) -> str:
         "    tags:\n"
         "      - 'v*'\n"
         "jobs:\n"
-        + tables["exact_jobs"]["attest-release-images"]
+        + exact_jobs["attest-release-images"]
         + "\n"
         + "  create-release:\n"
         # Comment-bearing on purpose: the real `create-release` carries its
-        # gating rationale between `name:` and `needs:`, so a fixture without it
-        # would not exercise the field block the adoption actually rewrites.
+        # gating rationale between `name:` and `needs:`, and that comment is
+        # part of the frozen `name:` field block.
         + control["create-release"]["name"]
         + control["create-release"]["needs"]
         + "    runs-on: ubuntu-26.04\n"
@@ -7303,314 +5874,22 @@ def build_release_family_fixture(generation: str) -> str:
         + control["docker-ebpf-manifest"]["needs"]
         + "    runs-on: ubuntu-26.04\n"
         + control["docker-ebpf-manifest"]["steps"]
+        + "\n"
+        + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
+        + tools_manifest["name"]
+        + tools_manifest["needs"]
+        + tools_manifest["runs-on"]
+        + tools_manifest["permissions"]
+        + tools_manifest["steps"]
     )
-    if generation == RELEASE_THREE_FAMILY_GENERATION:
-        fixture += (
-            "\n"
-            + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
-            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["name"]
-            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
-            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["runs-on"]
-            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["permissions"]
-            + control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["steps"]
-        )
-    return fixture
 
 
 # Where a self-test splices an extra job into a release fixture. It is a job
-# boundary the assembled fixture always contains, in both admitted shapes.
+# boundary the assembled fixture always contains.
 RELEASE_FIXTURE_JOB_ANCHOR = "\n  docker-manifest:\n"
 
 
-def release_image_family_transition_errors(
-    merge_base_contents: str,
-    proposed_contents: str,
-    source: str,
-) -> list[str]:
-    """Admit the `-ebpf-tools` adoption once, in one direction, and completely.
-
-    Three properties, in the order they are checked:
-
-    * The proposal is held to the COMPLETE contract of whichever shape it
-      claims. This is an absolute validation of the proposed file rather than a
-      comparison, because during the adoption the frozen text changes by design
-      and a comparison would have to be suspended precisely where the new
-      publisher, the new digest name space, and the new attestation subjects
-      arrive. Being absolute, it also rejects every partial adoption, extra
-      publisher or tag, alternate action/runner/permission/needs/step, missing
-      attestation operation, and mixed digest name space.
-    * A trusted base that has already adopted the three-family shape can never
-      be taken back to the two-family one. Without this the admission would be
-      a permanent either/or hole: a later pull request could delete the third
-      family's manifest job, its digest ownership, and its attestation coverage
-      and still classify as a valid two-family workflow.
-    * Any transition other than two-family to three-family fails closed.
-
-    The trusted base is read only as the baseline; it is never the thing being
-    validated here, and the proposal never decides its own admissibility.
-    """
-
-    base_generation, errors = release_image_family_generation(
-        merge_base_contents,
-        f"merge-base {source}",
-    )
-    proposed_generation, proposed_errors = release_image_family_generation(
-        proposed_contents,
-        f"proposed {source}",
-    )
-    errors = [*errors, *proposed_errors]
-    errors.extend(validate_publish_control_contract(proposed_contents, source))
-    if base_generation is None or proposed_generation is None:
-        return errors
-    if base_generation == proposed_generation:
-        return errors
-    if (
-        base_generation == RELEASE_THREE_FAMILY_GENERATION
-        and proposed_generation == RELEASE_TWO_FAMILY_GENERATION
-    ):
-        errors.append(
-            f"{source} cannot remove the `-ebpf-tools` release image family "
-            "after the trusted base adopts it; the third family's manifest "
-            "job, digest ownership, and attestation coverage are one-way"
-        )
-        return errors
-    if not (
-        base_generation == RELEASE_TWO_FAMILY_GENERATION
-        and proposed_generation == RELEASE_THREE_FAMILY_GENERATION
-    ):
-        errors.append(
-            f"{source} proposes an unadmitted release image-family transition "
-            f"({base_generation} to {proposed_generation})"
-        )
-    return errors
-
-
-def release_two_family_anchor_errors(contents: str, source: str) -> list[str]:
-    """Require a revision to carry every two-family frozen text exactly once.
-
-    The projection substitutes the adopted text back to these originals, so a
-    baseline that does not carry them verbatim is not the shape the projection
-    maps onto and the withholding must not happen. Requiring exactly one
-    occurrence also makes the substitution unambiguous.
-    """
-
-    errors: list[str] = []
-    for label, _, prior in RELEASE_FAMILY_TRANSITION_REPLACEMENTS:
-        occurrences = contents.count(prior)
-        if occurrences != 1:
-            errors.append(
-                f"{source} must carry the two-family {label} text exactly once "
-                f"for the admitted `-ebpf-tools` adoption to be comparable "
-                f"(found {occurrences})"
-            )
-    for job_name in RELEASE_FAMILY_TRANSITION_ADDED_JOBS:
-        block, failures = extract_job_block(
-            contents,
-            source,
-            job_name,
-            required=False,
-        )
-        errors.extend(failures)
-        if not failures and block is not None:
-            errors.append(
-                f"{source} already carries job {job_name!r}, so it is not the "
-                "two-family baseline the admitted adoption starts from"
-            )
-    return errors
-
-
-def release_two_family_projection(
-    contents: str,
-    source: str,
-) -> tuple[str | None, list[str]]:
-    """Re-render a validated three-family release workflow in two-family text.
-
-    Every substitution is a frozen contract the caller has already proven this
-    revision carries byte for byte, and each must occur exactly once so the
-    rewrite is unambiguous. The added manifest job is removed whole: its direct
-    field set is closed and every one of its fields is frozen, so nothing but
-    comments and blank lines can live inside it.
-
-    That is the exact boundary of what this projection withholds from the
-    Cross-surface comparison, and it is worth stating in full: every byte it
-    removes or rewrites is either text already proven byte-equal to a frozen
-    contract, or a comment or blank line inside the removed job. Those inert
-    lines are the ONLY text withheld that is not itself frozen contract text.
-    They can carry no executable step, no `uses:`, no `env:`, and no other
-    configuration surface, because a line that did would be a direct field the
-    closed field set rejects or a step the frozen `steps` block rejects — so
-    withholding them removes nothing the comparison would have anything to say
-    about. Every other byte of the proposal, in every other job and outside the
-    frozen fragments of the transitioned jobs, survives into the projection and
-    is still compared.
-
-    Anything the projection cannot perform exactly returns `None` with a
-    diagnostic, and the caller then compares the unmodified revisions — the
-    fail-closed direction.
-    """
-
-    projected = contents
-    errors: list[str] = []
-    for label, adopted, prior in RELEASE_FAMILY_TRANSITION_REPLACEMENTS:
-        occurrences = projected.count(adopted)
-        if occurrences != 1:
-            errors.append(
-                f"{source} must carry the admitted three-family {label} text "
-                f"exactly once (found {occurrences})"
-            )
-            continue
-        projected = projected.replace(adopted, prior, 1)
-    for job_name in RELEASE_FAMILY_TRANSITION_ADDED_JOBS:
-        block, failures = extract_job_block(
-            projected,
-            source,
-            job_name,
-            required=True,
-        )
-        errors.extend(failures)
-        if failures or block is None:
-            continue
-        start = projected.find(block)
-        if start < 0:
-            errors.append(f"{source} job {job_name!r} cannot be isolated")
-            continue
-        projected = projected[:start] + projected[start + len(block) :]
-        # `extract_job_block` trims trailing blank lines, so removing a job that
-        # a blank line separated from its neighbour would leave that separator
-        # behind. Dropping exactly one keeps the projection byte-identical to
-        # the workflow the adoption started from.
-        if projected.endswith("\n\n", 0, start):
-            projected = projected[: start - 1] + projected[start:]
-    if errors:
-        return None, errors
-    return projected, []
-
-
-def release_family_transition_surface_contents(
-    merge_base_contents: str,
-    proposed_contents: str,
-    source: str,
-) -> tuple[str, str, list[str]]:
-    """Withhold ONLY the frozen text of a fully validated family adoption.
-
-    Returns the two revisions the Cross-surface comparison should read. Outside
-    an exact, completely validated two-family to three-family adoption both are
-    the unmodified inputs, so every other release-workflow change — and every
-    other workflow — reaches that comparison exactly as before.
-
-    The gate is deliberately narrow and is evaluated in this order:
-
-    * the trusted base must classify as exactly two-family, and the proposal as
-      exactly three-family, with no classification error on either side;
-    * the derived substitution table must itself be sound. This is checked only
-      once the pair is already the exact transition candidate, because outside
-      one the projection is never consulted and strict comparison of the
-      unmodified revisions is the safe fallback: reporting a table defect on
-      every unrelated pull request would fail them all closed for a contract
-      they do not touch. The table is still validated unconditionally by
-      `self_test`, so a defective table cannot reach a merge unnoticed;
-    * `release_image_family_transition_errors` must be empty, which is what
-      proves the proposal satisfies the COMPLETE three-family contract — the
-      frozen publisher, the closed job-field sets, the digest name-space
-      ownership, and the attestation coverage — and that the transition is the
-      admitted one;
-    * the baseline must carry every two-family frozen text verbatim and must not
-      already carry the added job.
-
-    Only then is the proposal re-rendered, and only in the frozen fragments the
-    adoption is defined to move. A Cross surface anywhere else in the file is
-    still present in the projection and still compared.
-    """
-
-    if source != "release workflow":
-        return merge_base_contents, proposed_contents, []
-    base_generation, base_errors = release_image_family_generation(
-        merge_base_contents,
-        f"merge-base {source}",
-    )
-    proposed_generation, proposed_errors = release_image_family_generation(
-        proposed_contents,
-        f"proposed {source}",
-    )
-    if base_errors or proposed_errors:
-        return merge_base_contents, proposed_contents, []
-    if (
-        base_generation != RELEASE_TWO_FAMILY_GENERATION
-        or proposed_generation != RELEASE_THREE_FAMILY_GENERATION
-    ):
-        return merge_base_contents, proposed_contents, []
-    # From here the pair IS the exact transition candidate, so a defect in the
-    # derived substitution table is this pull request's problem and fails it
-    # closed. Before here it is not, and reporting it would have failed every
-    # unrelated pull request that merely touches the release workflow.
-    if RELEASE_FAMILY_TRANSITION_DERIVATION_ERRORS:
-        return (
-            merge_base_contents,
-            proposed_contents,
-            list(RELEASE_FAMILY_TRANSITION_DERIVATION_ERRORS),
-        )
-    if release_image_family_transition_errors(
-        merge_base_contents,
-        proposed_contents,
-        source,
-    ):
-        # The contract rejected this adoption; its own errors are reported by
-        # `compare_pr_publish_control_contract`. Comparing the unmodified
-        # revisions keeps the surface rejection alongside them.
-        return merge_base_contents, proposed_contents, []
-    anchor_errors = release_two_family_anchor_errors(
-        merge_base_contents,
-        f"merge-base {source}",
-    )
-    if anchor_errors:
-        return merge_base_contents, proposed_contents, anchor_errors
-    projected, projection_errors = release_two_family_projection(
-        proposed_contents,
-        f"proposed {source}",
-    )
-    if projected is None:
-        return merge_base_contents, proposed_contents, projection_errors
-    return merge_base_contents, projected, []
-
-
-# Marker carried by every diagnostic raised while reading a projected rendering
-# rather than a revision as it was written.
-PROJECTED_RENDERING_LABEL = (
-    "family-transition projected rendering; line numbers are of this rendering, "
-    "not of the file under review"
-)
-
-
-def projected_surface_label(
-    side: str,
-    source: str,
-    original: str,
-    rendered: str,
-) -> str:
-    """Name the revision a surface diagnostic was actually computed from.
-
-    A projected revision is not the file the author wrote: substituted frozen
-    fragments differ in length from the ones they replace and a whole job has
-    been removed, so a `source:line` diagnostic raised while reading it points
-    at a line of the projection, not at that line of the proposed file. Saying
-    so in the source label is cheaper than letting a reviewer chase a line
-    number that does not mean what it appears to mean.
-
-    The label is unchanged whenever the rendering is the revision itself, which
-    is every revision except the proposal of the one admitted release
-    image-family adoption.
-    """
-
-    if rendered == original:
-        return f"{side} {source}"
-    return f"{side} {source} ({PROJECTED_RENDERING_LABEL})"
-
-
-def digest_artifact_ownership_errors(
-    contents: str,
-    source: str,
-    owners: dict[str, tuple[str, ...]] | None = None,
-) -> list[str]:
+def digest_artifact_ownership_errors(contents: str, source: str) -> list[str]:
     """Reject any job outside the frozen producers that can feed a manifest.
 
     The manifest jobs collect their inputs by wildcard, and artifacts are scoped
@@ -7618,14 +5897,9 @@ def digest_artifact_ownership_errors(
     anywhere in the run reaches `docker buildx imagetools create` whether or not
     the job graph connects it. Ownership of the name space is what makes the
     frozen download pattern meaningful.
-
-    `owners` overrides the per-source table when the caller has already resolved
-    which release image-family generation is in force; the third eBPF name space
-    exists only in the adopted one.
     """
 
-    if owners is None:
-        owners = DIGEST_ARTIFACT_OWNERS.get(source, {})
+    owners = DIGEST_ARTIFACT_OWNERS.get(source, {})
     if not owners:
         return []
     errors: list[str] = []
@@ -7730,25 +6004,8 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
     contracts = PUBLISH_CONTROL_CONTRACTS.get(source, {})
     exact_jobs = PUBLISH_EXACT_JOB_CONTRACTS.get(source, {})
     step_contracts = PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {})
-    owners = DIGEST_ARTIFACT_OWNERS.get(source, {})
-    closed_job_fields: dict[str, tuple[str, ...]] = {}
+    closed_job_fields = PUBLISH_CLOSED_JOB_FIELDS.get(source, {})
     errors: list[str] = []
-    if source == "release workflow":
-        # Which release image families this revision publishes decides which
-        # frozen contracts describe it. The choice is made from the file itself
-        # and constrains it completely; it is the caller's comparison against
-        # the trusted base that decides whether reaching this shape was allowed.
-        generation, generation_errors = release_image_family_generation(
-            contents,
-            source,
-        )
-        errors.extend(generation_errors)
-        tables = release_generation_tables(generation)
-        contracts = tables["control"]
-        exact_jobs = tables["exact_jobs"]
-        step_contracts = tables["steps"]
-        owners = tables["digest_owners"]
-        closed_job_fields = tables["closed_job_fields"]
     for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
         block, failures = extract_top_level_block(
             contents,
@@ -7814,7 +6071,7 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
                 expected_fields,
             )
         )
-    errors.extend(digest_artifact_ownership_errors(contents, source, owners))
+    errors.extend(digest_artifact_ownership_errors(contents, source))
     # A step may declare its inputs as `with: {name: docker-digest-evil}`, which
     # names no key at the start of any line. The same ownership scan run over the
     # block rendering sees it.
@@ -7822,11 +6079,7 @@ def validate_publish_control_contract(contents: str, source: str) -> list[str]:
         flow_normalized_findings(
             contents,
             source,
-            lambda rendered, rendered_source: digest_artifact_ownership_errors(
-                rendered,
-                rendered_source,
-                owners,
-            ),
+            digest_artifact_ownership_errors,
         )
     )
     return list(dict.fromkeys(errors))
@@ -7841,36 +6094,13 @@ def compare_pr_publish_control_contract(
     exact_jobs = PUBLISH_EXACT_JOB_CONTRACTS.get(source, {})
     step_contracts = PUBLISH_ARTIFACT_STEP_CONTRACTS.get(source, {})
     errors: list[str] = []
-    # A frozen contract is normally held in place by comparing the proposal with
-    # the trusted base. The one admitted release image-family adoption changes
-    # that frozen text on purpose, so for the release workflow the proposal is
-    # additionally — and during an adoption, instead — held to the complete
-    # contract of the shape it claims, and the base is consulted only to decide
-    # whether that shape was reachable from it.
-    compare_frozen_text = True
+    # A frozen contract is held in place by comparing the proposal with the
+    # trusted base. The release workflow is additionally held to the complete
+    # publication contract as an absolute property of the proposal, so an edit
+    # that drops a published family, a closed job field, or a digest owner is
+    # named for what it breaks rather than only as a frozen-text difference.
     if source == "release workflow":
-        errors.extend(
-            release_image_family_transition_errors(
-                merge_base_contents,
-                proposed_contents,
-                source,
-            )
-        )
-        base_generation, _ = release_image_family_generation(
-            merge_base_contents,
-            f"merge-base {source}",
-        )
-        proposed_generation, _ = release_image_family_generation(
-            proposed_contents,
-            f"proposed {source}",
-        )
-        if base_generation is not None and base_generation == proposed_generation:
-            tables = release_generation_tables(base_generation)
-            contracts = tables["control"]
-            exact_jobs = tables["exact_jobs"]
-            step_contracts = tables["steps"]
-        else:
-            compare_frozen_text = False
+        errors.extend(validate_publish_control_contract(proposed_contents, source))
     for key_name in PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS.get(source, ()):
         baseline, baseline_failures = extract_top_level_block(
             merge_base_contents,
@@ -7892,10 +6122,6 @@ def compare_pr_publish_control_contract(
                     f"{source} top-level {key_name!r} cannot be changed by a "
                     "pull request because protected publication jobs inherit it"
                 )
-    if not compare_frozen_text:
-        exact_jobs = {}
-        contracts = {}
-        step_contracts = {}
     for job_name in exact_jobs:
         baseline, baseline_failures = extract_job_block(
             merge_base_contents,
@@ -9184,6 +7410,82 @@ def rustup_run_operand(tokens: tuple[str, ...], index: int) -> int | None:
 # that spelling too only widens the executable slot, so this stays fail-closed.
 ASSIGNMENT_PARSING_WRAPPERS = frozenset({"sudo", "time"})
 
+# Options that take a separate operand word, per wrapper (GHSA-q636-fxjc-3r78).
+# A single shared set made `sudo -E`, `sudo -n` and `time -p` swallow the
+# executable as an operand, and left `ionice -c 3`, `exec -a name`,
+# `stdbuf -o L`, `sudo -D dir`, `sudo -h host`, `sudo -T 30` and `sudo -R dir`
+# putting their operand in the executable slot. The sets come from each
+# tool's documented synopsis (sudo(8), nice(1), ionice(1), timeout(1),
+# stdbuf(1), bash `exec`, GNU time(1)); `command`, `nohup` and `setsid` take no
+# operand-bearing options. `-s` is `timeout --signal` but `sudo -s` runs a
+# shell, which is why the sets are scoped per wrapper.
+WRAPPER_OPTION_OPERANDS: dict[str, frozenset[str]] = {
+    "command": frozenset(),
+    "exec": frozenset({"-a"}),
+    "ionice": frozenset(
+        {"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid",
+         "--pgid", "--uid"}
+    ),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "nohup": frozenset(),
+    "setsid": frozenset(),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "sudo": frozenset(
+        {"-u", "-g", "-p", "-C", "-h", "-r", "-t", "-T", "-U", "-D", "-R",
+         "--user", "--group", "--prompt", "--close-from", "--host", "--role",
+         "--type", "--command-timeout", "--other-user", "--chdir", "--chroot"}
+    ),
+    "time": frozenset({"-f", "-o", "--format", "--output"}),
+    "timeout": frozenset({"-k", "-s", "--kill-after", "--signal"}),
+}
+# Documented options that take no operand. An option in neither set is
+# unknown: the token walk reads it as standing alone, and
+# `wrapper_option_operand_variants` adds the reading in which it consumes the
+# next word, so the executable behind either reading is analysed.
+WRAPPER_OPTION_FLAGS: dict[str, frozenset[str]] = {
+    "command": frozenset({"-p"}),
+    "exec": frozenset({"-c", "-l"}),
+    "ionice": frozenset({"-t", "--ignore"}),
+    "nice": frozenset(),
+    "nohup": frozenset(),
+    "setsid": frozenset({"-c", "-f", "-w", "--ctty", "--fork", "--wait"}),
+    "stdbuf": frozenset(),
+    "sudo": frozenset(
+        {"-A", "-B", "-b", "-E", "-e", "-H", "-i", "-K", "-k", "-l", "-N",
+         "-n", "-P", "-S", "-s", "-V", "-v", "--askpass", "--bell",
+         "--background", "--preserve-env", "--edit", "--set-home", "--login",
+         "--remove-timestamp", "--reset-timestamp", "--list", "--no-update",
+         "--non-interactive", "--preserve-groups", "--stdin", "--shell",
+         "--version", "--validate"}
+    ),
+    "time": frozenset({"-p", "-a", "-q", "-v", "--append", "--portability",
+                       "--quiet", "--verbose"}),
+    "timeout": frozenset({"-v", "--foreground", "--preserve-status",
+                          "--verbose"}),
+}
+
+
+def wrapper_option_width(wrapper: str, option: str) -> int:
+    """Return how many words a wrapper option occupies on the default reading.
+
+    A short-option cluster (`-Eu root`, `-nE`) is read letter by letter: an
+    operand-taking letter with text after it carries its operand inline, and
+    one in the last position takes the next word. `--name=value` is always
+    self-contained. Unknown options stand alone here; the alternative reading
+    is supplied as a separate scan variant.
+    """
+
+    operands = WRAPPER_OPTION_OPERANDS.get(wrapper, frozenset())
+    if option in operands:
+        return 2
+    if option.startswith("--") or "=" in option:
+        return 1
+    if len(option) > 2 and option.startswith("-"):
+        for position, letter in enumerate(option[1:], start=1):
+            if f"-{letter}" in operands:
+                return 2 if position == len(option) - 1 else 1
+    return 1
+
 
 def skip_wrapper_prefixes(
     tokens: tuple[str, ...],
@@ -9221,29 +7523,9 @@ def skip_wrapper_prefixes(
         "time",
         "timeout",
     }
-    option_operands = {
-        "-C",
-        "-E",
-        "-g",
-        "-k",
-        "-n",
-        "-p",
-        "-S",
-        "-u",
-        "--chdir",
-        "--group",
-        "--kill-after",
-        "--niceness",
-        "--priority",
-        "--signal",
-        "--user",
-    }
-    # `-s` is `timeout --signal` in short form, but `sudo -s` runs a shell and
-    # takes no operand, so it is scoped to the wrapper that documents it rather
-    # than added to the shared set. Without it,
-    # `timeout -s TERM 30 target/evil.sh` consumed `TERM` as the mandatory
-    # duration and handed the command slot to `30`.
-    wrapper_option_operands = {"timeout": {"-s"}}
+    # Operand-taking options are per wrapper (`WRAPPER_OPTION_OPERANDS`):
+    # `timeout -s TERM 30 target/evil.sh` must consume `TERM` while `sudo -s`
+    # takes nothing, and `sudo -E` must not swallow the executable.
     while index < len(tokens) and (
         tool_name(tokens[index]) in wrappers or tool_name(tokens[index]) == "rustup"
     ):
@@ -9270,14 +7552,8 @@ def skip_wrapper_prefixes(
             if option == "--":
                 index += 1
                 break
-            if option in option_operands or option in wrapper_option_operands.get(
-                wrapper,
-                frozenset(),
-            ):
-                index += 2
-                continue
             if option.startswith("-"):
-                index += 1
+                index += wrapper_option_width(wrapper, option)
                 continue
             break
         if wrapper == "timeout":
@@ -11478,6 +9754,70 @@ def brace_options(value: str) -> tuple[str, ...] | None:
     return None
 
 
+BRACE_GROUP = re.compile(r"\{([^{}\n]*)\}")
+CROSS_OR_CARGO_WORD = re.compile(r"(?<![A-Za-z0-9_])(?:cross|cargo)(?![A-Za-z0-9_])")
+
+
+def bounded_word_brace_expansions(word: str) -> tuple[str, ...] | None:
+    """Expand one shell word's brace groups, or `None` past 256 results."""
+
+    expansions = [word]
+    while True:
+        expanded: list[str] = []
+        changed = False
+        for candidate in expansions:
+            expandable = next(
+                (
+                    (match, options)
+                    for match in BRACE_GROUP.finditer(candidate)
+                    if (options := brace_options(match.group(1))) is not None
+                ),
+                None,
+            )
+            if expandable is None:
+                expanded.append(candidate)
+                continue
+            match, options = expandable
+            changed = True
+            for option in options:
+                expanded.append(
+                    candidate[: match.start()] + option + candidate[match.end() :]
+                )
+                if len(expanded) > 256:
+                    return None
+        expansions = list(dict.fromkeys(expanded))
+        if not changed:
+            return tuple(expansions)
+
+
+def brace_overflow_hides_cross(value: str) -> bool:
+    """Whether an over-bound brace expansion could assemble a Cross word.
+
+    Bash expands brace groups inside one word, so the product that overflows
+    the line-level bound comes from groups in DIFFERENT words, and no single
+    word's spelling depends on another word's choice. Each word is therefore
+    expanded on its own: if any expansion yields a `cross`/`cargo` word the
+    literal word did not already show, the overflow hid it
+    (GHSA-q636-fxjc-3r78: eight two-way groups ahead of `cr{o,x}ss build`).
+    A single word that overflows on its own cannot be checked and fails
+    closed. Overflowing lines whose groups spell no such word (awk bodies,
+    JSON) are not reported.
+    """
+
+    for match in re.finditer(r"\S+", value):
+        word = match.group()
+        if "{" not in word:
+            continue
+        expansions = bounded_word_brace_expansions(word)
+        if expansions is None:
+            return True
+        if CROSS_OR_CARGO_WORD.search(word):
+            continue
+        if any(CROSS_OR_CARGO_WORD.search(expansion) for expansion in expansions):
+            return True
+    return False
+
+
 def brace_expansion_variants(value: str) -> tuple[str, ...]:
     """Enumerate bounded Bash brace expansions and fail closed on explosion."""
 
@@ -11505,11 +9845,83 @@ def brace_expansion_variants(value: str) -> tuple[str, ...]:
                 )
                 if len(expanded) > 256:
                     # A deliberately explosive shell expansion is an unknown
-                    # executable surface and therefore fails closed.
-                    return tuple([*dict.fromkeys(variants), "cross"])
+                    # executable surface when it can spell a Cross word, and
+                    # then fails closed with a whole Cross command: the bare
+                    # word `cross` the overflow used to return is not a surface
+                    # any consumer reports (GHSA-q636-fxjc-3r78).
+                    if brace_overflow_hides_cross(value):
+                        return tuple(
+                            [*dict.fromkeys(variants), WHOLE_CROSS_COMMAND]
+                        )
+                    return tuple(dict.fromkeys(variants))
         variants = list(dict.fromkeys(expanded))
         if not changed:
             return tuple(variants)
+
+
+# At most this many unknown wrapper options on one line are read both ways;
+# beyond it the line is an unknown executable surface and fails closed.
+MAXIMUM_AMBIGUOUS_WRAPPER_OPTIONS = 4
+
+
+def wrapper_option_operand_variants(line: str) -> tuple[str, ...]:
+    """Read every unknown wrapper option as also consuming the next word.
+
+    The token walk reads an option it has no table entry for as standing alone
+    (`WRAPPER_OPTION_FLAGS` / `WRAPPER_OPTION_OPERANDS`). If the wrapper in fact
+    takes an operand for it, the real executable is one word later, so each
+    combination of those options is also offered with the option and its
+    operand removed. Removing words never creates a dispatch the shell would
+    not perform under one of the two readings.
+    """
+
+    if not any(wrapper in line for wrapper in WRAPPER_OPTION_OPERANDS):
+        return ()
+    words = list(re.finditer(r"[^\s;&|()]+", line))
+    ambiguous: list[tuple[int, int]] = []
+    position = 0
+    while position < len(words):
+        wrapper = tool_name(words[position].group())
+        if wrapper not in WRAPPER_OPTION_OPERANDS:
+            position += 1
+            continue
+        position += 1
+        while position < len(words):
+            option = words[position].group()
+            if option == "--" or not option.startswith("-"):
+                break
+            width = wrapper_option_width(wrapper, option)
+            known = (
+                option in WRAPPER_OPTION_OPERANDS[wrapper]
+                or option in WRAPPER_OPTION_FLAGS[wrapper]
+                or option.startswith("--") and "=" in option
+            )
+            if (
+                not known
+                and width == 1
+                and position + 1 < len(words)
+                and not words[position + 1].group().startswith("-")
+            ):
+                ambiguous.append(
+                    (words[position].start(), words[position + 1].end())
+                )
+                # Keep reading options past the possible operand, so a later
+                # unknown option on the same wrapper is found too.
+                width = 2
+            position += width
+    if not ambiguous:
+        return ()
+    if len(ambiguous) > MAXIMUM_AMBIGUOUS_WRAPPER_OPTIONS:
+        return (WHOLE_CROSS_COMMAND,)
+    variants: list[str] = []
+    for mask in range(1, 1 << len(ambiguous)):
+        text = line
+        for bit in reversed(range(len(ambiguous))):
+            if mask & (1 << bit):
+                start, end = ambiguous[bit]
+                text = text[:start] + text[end:]
+        variants.append(text)
+    return tuple(variants)
 
 
 def scan_variants(
@@ -11546,6 +9958,7 @@ def scan_variants(
         )
     variants.extend(ansi_c_quoted_variants(line))
     variants.extend(word_splitting_variants(line))
+    variants.extend(wrapper_option_operand_variants(line))
     collapsed = quote_stripped_command_scan_text(line)
     if collapsed != line:
         variants.append(collapsed)
@@ -11931,12 +10344,6 @@ def heredoc_body_lines(contents: str) -> frozenset[int]:
             delimiter for _, delimiter in quote_aware_heredoc_starts(line)
         )
     return frozenset(body)
-
-
-def shell_continuation_lines(contents: str) -> frozenset[int]:
-    """Return the raw lines a backslash continuation joins onto a previous one."""
-
-    return shell_non_command_start_lines(contents)
 
 
 def shell_continuation_command_starts(contents: str) -> frozenset[int]:
@@ -12876,7 +11283,7 @@ def unprotected_cross_surfaces(
 
     lines = outside.splitlines(keepends=True)
     evaluated_lines = shell_evaluated_lines(outside)
-    continuation_lines = shell_continuation_lines(outside)
+    continuation_lines = shell_non_command_start_lines(outside)
     continuation_command_starts = shell_continuation_command_starts(outside)
     jobs_index = next(
         index
@@ -13193,36 +11600,13 @@ def live_suite_relevance_errors(
                 )
 
         if name == "ambient-host-udp-live.yml":
-            image_job, _ = extract_job_contract_block(
-                contents, located, "ambient-host-udp-image", required=True
-            )
-            registry_generation = image_job == AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB
             protected_jobs = (
                 (live_job, AMBIENT_HOST_UDP_LIVE_JOB),
-                (
-                    "ambient-host-udp-image",
-                    AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB
-                    if registry_generation else AMBIENT_HOST_UDP_IMAGE_JOB,
-                ),
+                ("ambient-host-udp-image", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB),
                 ("gate", AMBIENT_HOST_UDP_GATE_JOB),
-            )
-            registry_jobs = (
                 ("ambient-host-udp-image-read", AMBIENT_REGISTRY_IMAGE_READ_JOB),
                 ("ambient-host-udp-image-write", AMBIENT_REGISTRY_IMAGE_WRITE_JOB),
             )
-            if registry_generation:
-                protected_jobs += registry_jobs
-            else:
-                for registry_job, _ in registry_jobs:
-                    extra, extra_failures = extract_job_contract_block(
-                        contents, located, registry_job, required=False
-                    )
-                    errors.extend(extra_failures)
-                    if extra is not None:
-                        errors.append(
-                            f"{located} has a partial registry-cache generation: "
-                            f"{registry_job} requires the registry image aggregate"
-                        )
             for protected_job, expected_job in protected_jobs:
                 actual_job, job_failures = extract_job_contract_block(
                     contents,
@@ -13236,17 +11620,6 @@ def live_suite_relevance_errors(
                         f"{located} must keep complete job {protected_job!r} "
                         "exactly frozen; runner, failure, environment, step, and "
                         "dependency semantics are one closed execution contract"
-                    )
-                if (
-                    not job_failures
-                    and actual_job is not None
-                    and protected_job == "ambient-host-udp-image"
-                    and not registry_generation
-                ):
-                    errors.extend(
-                        ambient_host_udp_image_cache_budget_errors(
-                            actual_job, located
-                        )
                     )
 
             permissions, permission_failures = extract_top_level_block(
@@ -13457,8 +11830,7 @@ def admitted_fuzz_smoke_removal_errors(
 
       * an adopted job may not be removed or replaced by unadmitted text;
       * an adopted generation may not be replaced by an older one. The trusted
-        base decides when a generation retires, exactly as it does for the
-        admitted `release.yml` image-family adoption.
+        base decides when a generation retires.
     """
 
     baseline_block, baseline_failures = extract_job_block(
@@ -13956,82 +12328,6 @@ def validate_workflow_collection(
     ]
 
 
-# ---------------------------------------------------------------------------
-# Admitted `fips-build.yml` generation transition (issue #3888, PR #3889)
-# ---------------------------------------------------------------------------
-# `.github/workflows/fips-build.yml` is an ordinary workflow: unprotected and
-# uncontracted, so the only thing the pull-request scan says about it is that
-# its Cross executable/configuration surface must not move. The FIPS runtime
-# rework in PR #3889 rewrites the file — trusted-base path planning, split
-# compile/lint phases, scoped caches, a dispatch input, per-phase summaries —
-# and moves that surface, so the scan rejects it with
-# `workflow directory/fips-build.yml cannot add or change Cross
-# executable/configuration surfaces`. The verifier that decides this is always
-# executed from the trusted base, so that pull request cannot repair it inside
-# its own proposal, and `FIPS Build & Test` is a required gate that must not be
-# left unscanned in the meantime.
-#
-# The repair is the same shape as the admitted release image-family adoption,
-# reduced to what a ~1,500-line workflow with no frozen job contract can carry.
-# There is no per-fragment projection to derive here, so the transition is bound
-# instead to the two exact file GENERATIONS it moves between, each named by the
-# SHA-256 of its complete text. Nothing about the admission comes from the pull
-# request — not the digest, not a manifest, not an allowlist, not a projection,
-# not a rationale — so a proposal reaches it only by being, byte for byte, the
-# destination revision this trusted policy already names.
-#
-# Properties, each fail-closed:
-#
-#   * The binding is exact on BOTH sides. The trusted base must be the retired
-#     generation and the proposal the adopted one. Any other pair — a one-byte
-#     drift on either side, an absent file, a file added outright, a partially
-#     applied rewrite — is scanned exactly as before.
-#   * It is bound to the path as well as to the two contents: the same two
-#     revisions under any other workflow filename are not this transition.
-#   * It is one-way. Once the trusted base carries the adopted generation, a
-#     proposal that returns the file to the retired one is refused explicitly,
-#     rather than relying on the two surfaces happening to differ.
-#   * It withholds ONE file's surface comparison for ONE revision pair. Every
-#     other workflow, and every action, automation script, protected job
-#     contract, digest name space, required-check binding, and live-gate
-#     relevance contract, is evaluated exactly as before — so a Cross surface
-#     added anywhere else in the same pull request is still rejected.
-#   * It suppresses no failure. Hard scan failures on either revision are
-#     appended before the comparison is reached and are still reported; only the
-#     surface-equality verdict for this one pair is withheld.
-#
-# RETIREMENT IS MANDATORY. Once the issue #4018 mitigation is on `main` the
-# trusted base IS the adopted generation, so the admission is permanently
-# unreachable: the retired generation can only become a trusted base again by
-# first passing the one-way refusal above. Delete this block, the
-# `admitted_generation_transition` parameter, and the matching self-tests in
-# the next trusted-policy change, exactly as #3943 retired the #3889 admission
-# this mechanism previously served. See `docs/ci_cd.md` and
-# `docs/dependency-policy.md`.
-FIPS_BUILD_WORKFLOW_FILENAME = "fips-build.yml"
-# `.github/workflows/fips-build.yml` as it stands on the trusted base after
-# PR #3950's landed artifact-based same-run producer handoff. This digest was
-# the ADOPTED end of the previous admission, which is now spent.
-FIPS_BUILD_RETIRED_GENERATION_SHA256 = (
-    "17bfb40fbd31e80e6ae1a0efca922069c54ec485ec7a611c3420840da3e5e9e1"
-)
-# `.github/workflows/fips-build.yml` carrying the issue #4018 memory mitigation
-# on the `fips-test-build` job. "Precompile FIPS test binaries for consumers"
-# is killed with `exit code 143` and a runner shutdown signal while building the
-# `unit_tests` / `integration_tests` binaries — the hosted runner's memory
-# ceiling, not a compile error. The destination caps `CARGO_BUILD_JOBS` at 3,
-# sets `line-tables-only` debuginfo on the `dev` AND `test` profiles, and adds a
-# best-effort 8 GiB Ferrum-owned swapfile alongside the runner image's existing
-# swap immediately before that step. It never disables or rewrites image swap.
-FIPS_BUILD_ADOPTED_GENERATION_SHA256 = (
-    "7d995d79d9932c9595d3f19eddf16c1dbd1a0d2842230f1d92eb1b24502ca401"
-)
-FIPS_BUILD_ADMITTED_GENERATION_TRANSITION = (
-    FIPS_BUILD_WORKFLOW_FILENAME,
-    FIPS_BUILD_RETIRED_GENERATION_SHA256,
-    FIPS_BUILD_ADOPTED_GENERATION_SHA256,
-)
-
 WORKFLOW_GENERATION_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -14044,7 +12340,7 @@ def workflow_generation_digest(contents: str) -> str | None:
 
     The digest is taken over the text the loader produced. `load_text` decodes
     with Python's universal newlines, so it is the digest of the LF-normalized
-    file; both admitted generations are LF-only, which makes it equal to the
+    file; admitted generations are LF-only, which makes it equal to the
     digest of their committed bytes. Every other frozen-text contract in this
     file compares that same normalized text, so this binding is exactly as
     strong as they are.
@@ -14053,39 +12349,6 @@ def workflow_generation_digest(contents: str) -> str | None:
     if not contents:
         return None
     return hashlib.sha256(contents.encode("utf-8")).hexdigest()
-
-
-def fips_build_generation_transition(
-    name: str,
-    merge_base_contents: str,
-    proposed_contents: str,
-    *,
-    transition: tuple[str, str, str] = FIPS_BUILD_ADMITTED_GENERATION_TRANSITION,
-) -> str:
-    """Classify one workflow's revision pair against the admitted transition.
-
-    Returns `"adoption"` for exactly the admitted retired-to-adopted move,
-    `"rollback"` for exactly its reverse, and `"unrelated"` for everything
-    else — which is every other file name, every other content on either side,
-    and every pair where either side is absent.
-
-    `transition` is a keyword parameter so the self-test can drive the
-    production comparison with fixtures it is able to construct; the two
-    admitted generations are complete workflow files and cannot be embedded
-    here. Production always uses the module binding, and no repository input,
-    argument, or environment variable reaches this parameter.
-    """
-
-    filename, retired, adopted = transition
-    if name != filename:
-        return "unrelated"
-    baseline_digest = workflow_generation_digest(merge_base_contents)
-    proposed_digest = workflow_generation_digest(proposed_contents)
-    if baseline_digest == retired and proposed_digest == adopted:
-        return "adoption"
-    if baseline_digest == adopted and proposed_digest == retired:
-        return "rollback"
-    return "unrelated"
 
 
 # ---------------------------------------------------------------------------
@@ -14164,7 +12427,7 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 )
 
 # ---------------------------------------------------------------------------
-# Admitted workflow-directory job SHA-256 generation transitions (temporary)
+# Admitted workflow-directory job SHA-256 generation transitions
 # ---------------------------------------------------------------------------
 # The `ci.yml` pairs above are consulted by the dedicated CI-workflow
 # comparison. Jobs in every OTHER workflow are compared by the generic
@@ -14185,18 +12448,11 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     tuple[str, str, str, str], ...
 ] = (
-    # PR #6958's coverage-merge timeout increase. The only admitted change is
-    # the exact current-main 45-minute job block to the reviewed 75-minute
-    # timeout-only block. Digests use load_workflow's pin-normalized job text:
-    # action identity/path and all other job content stay bound, while SHA-only
-    # pin rotations remain under the independent release-tag/ancestry checks.
-    # Retire this one-way pair once the 75-minute destination reaches main.
-    (
-        "coverage.yml",
-        "coverage-merge",
-        "e9fbc0d60bf413d1979893e49fa09ada67719ff06100f19f056a129e3178d65d",
-        "faa0d9cb5aff48fb6ce0c54373b53b74a21d3d61e43ade6a724e16db9d00663c",
-    ),
+    # Empty: no workflow-directory job generation transition is admitted.
+    #
+    # PR #6958's `coverage.yml` `coverage-merge` timeout pair (45 -> 75
+    # minutes) was retired here once its 75-minute destination was main's
+    # live job.
     #
     # The `coverage.yml` `coverage-merge` pair for PR #3917 (issue #3907) was
     # retired here. Both are closed -- #3917 merged 2026-08-18 and its
@@ -14210,9 +12466,9 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
 # A future entry admits one exact, path-bound, one-way retired→adopted pair;
 # the candidate cannot supply a digest. RETIREMENT: once each destination is on
-# `main`, delete that tuple. The Helm Chart setup-kubernetes-tools generation
-# lives in `verify_trusted_local_action.py`, not here: that gate is
-# byte-identity of the extracted checker, not a Cross surface comparison.
+# `main`, delete that tuple. The Helm Chart setup-kubernetes-tools action is
+# held to byte identity by `verify_trusted_local_action.py`, not here: that
+# gate is not a Cross surface comparison.
 LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
     # Empty: no local-action generation transition is currently admitted.
     #
@@ -14353,9 +12609,6 @@ def scan_pr_workflow_collection_cross_surfaces(
     proposed_workflows: dict[str, str],
     source: str,
     *,
-    admitted_generation_transition: tuple[str, str, str] = (
-        FIPS_BUILD_ADMITTED_GENERATION_TRANSITION
-    ),
     directory_job_transitions: tuple[tuple[str, str, str, str], ...] = (
         WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS
     ),
@@ -14412,22 +12665,6 @@ def scan_pr_workflow_collection_cross_surfaces(
             continue
         baseline_contents = cross_image_refresh_scan_contents(name, baseline_contents)
         proposed_contents = cross_image_refresh_scan_contents(name, proposed_contents)
-        # The one admitted `fips-build.yml` generation transition. Both ends are
-        # complete file texts named by this trusted policy, so the only revision
-        # pair that reaches `"adoption"` is the exact one it names; the reverse
-        # pair is refused outright, and everything else is scanned as before.
-        generation_transition = fips_build_generation_transition(
-            name,
-            baseline_contents,
-            proposed_contents,
-            transition=admitted_generation_transition,
-        )
-        if generation_transition == "rollback":
-            errors.append(
-                f"proposed {source}/{name} cannot return to the retired FIPS "
-                "workflow generation after the trusted base adopts the "
-                "admitted one"
-            )
         baseline_surfaces, baseline_failures = generic_workflow_cross_surfaces(
             baseline_contents,
             f"merge-base {source}/{name}",
@@ -14492,13 +12729,7 @@ def scan_pr_workflow_collection_cross_surfaces(
                 admitted_file_jobs,
             )
         if not baseline_failures and not proposed_failures:
-            # The admitted generation transition withholds this one verdict, for
-            # this one file, for this one revision pair. Both failure lists above
-            # are already reported unconditionally.
-            if (
-                baseline_surfaces != proposed_surfaces
-                and generation_transition != "adoption"
-            ):
+            if baseline_surfaces != proposed_surfaces:
                 errors.append(
                     f"{source}/{name} cannot add or change Cross executable/"
                     "configuration surfaces"
@@ -19321,14 +17552,12 @@ def compare_pr_workflow_job(
     Equality with the trusted base already prevents a pull request from moving
     any of the three.
 
-    Three admissions are withheld from the surface comparison, each tied to a
+    Two admissions are withheld from the surface comparison, each tied to a
     contract that has already validated exactly: the anchored `fuzz-smoke`
-    wiring in `ci.yml`; the one admitted release image-family adoption, whose
-    frozen text is projected back to the shape it came from by
-    `release_family_transition_surface_contents`; and the SHA-256 job-generation
-    pairs in `CI_JOB_GENERATION_TRANSITIONS`, which withhold one whole-job
-    digest surface for one named retired→adopted pair. None is reachable
-    without the complete frozen contract the trusted base already names.
+    wiring in `ci.yml`, and the SHA-256 job-generation pairs in
+    `CI_JOB_GENERATION_TRANSITIONS`, which withhold one whole-job digest
+    surface for one named retired→adopted pair. Neither is reachable without
+    the complete frozen contract the trusted base already names.
     """
 
     baseline, failures = extract_job_block(
@@ -19414,50 +17643,14 @@ def compare_pr_workflow_job(
             )
         )
 
-    # The one admitted release image-family adoption moves frozen text inside
-    # Cross-sensitive publication jobs by design. When — and only when — both
-    # revisions classify and the proposal validates against the complete
-    # three-family contract, the proposal is re-rendered in the two-family text
-    # it came from so this comparison reads the same bytes on both sides. Every
-    # other byte of the file, and every other workflow, is untouched.
-    (
-        baseline_surface_source,
-        proposed_surface_source,
-        family_transition_errors,
-    ) = release_family_transition_surface_contents(
-        baseline_wiring.contents,
-        proposed_wiring.contents,
-        source,
-    )
-    errors.extend(family_transition_errors)
-
-    # A projected revision is not the file the author wrote: the substituted
-    # frozen fragments differ in length from the ones they replace and a whole
-    # job has been removed, so any `source:line` diagnostic raised while reading
-    # it points at a line of the projection, not at that line of the proposed
-    # file. Label the rendering explicitly rather than let a reviewer chase a
-    # line number that does not mean what it appears to mean. Surfaces
-    # themselves carry no line numbers, so the comparison below is unaffected.
-    # The label never varies for an unprojected revision, which is every
-    # revision except the one admitted image-family adoption.
     baseline_surfaces, baseline_surface_failures = pr_workflow_job_surfaces(
-        baseline_surface_source,
-        projected_surface_label(
-            "merge-base",
-            source,
-            baseline_wiring.contents,
-            baseline_surface_source,
-        ),
+        baseline_wiring.contents,
+        f"merge-base {source}",
         job_name,
     )
     proposed_surfaces, proposed_surface_failures = pr_workflow_job_surfaces(
-        proposed_surface_source,
-        projected_surface_label(
-            "proposed",
-            source,
-            proposed_wiring.contents,
-            proposed_surface_source,
-        ),
+        proposed_wiring.contents,
+        f"proposed {source}",
         job_name,
     )
     errors.extend(baseline_surface_failures)
@@ -20628,27 +18821,21 @@ pre_build = []
             "configuration input"
         )
     # The release-workflow comparison holds the proposal to the COMPLETE frozen
-    # contract of the image-family shape it claims, so its cases need a file the
-    # policy can classify and validate rather than the generic fixture above.
-    # Both admitted shapes are assembled from the frozen contracts themselves, so
-    # they cannot drift from the policy; the three-family fixture is exercised
-    # further down, where the adoption transition is tested.
-    release_family_fixtures: dict[str, str] = {
-        generation: build_release_family_fixture(generation)
-        for generation in RELEASE_IMAGE_FAMILY_GENERATIONS
-    }
-    two_family_release = release_family_fixtures[RELEASE_TWO_FAMILY_GENERATION]
-    three_family_release = release_family_fixtures[RELEASE_THREE_FAMILY_GENERATION]
+    # publication contract, so its cases need a file the policy can validate
+    # rather than the generic fixture above. It is assembled from the frozen
+    # contracts themselves, so it cannot drift from the policy; the contract
+    # itself is exercised further down.
+    release_fixture = build_release_family_fixture()
 
     def release_fixture_with_job(job_block: str, label: str) -> str:
-        """Splice one extra job into the assembled two-family release fixture."""
+        """Splice one extra job into the assembled release fixture."""
 
-        spliced = two_family_release.replace(
+        spliced = release_fixture.replace(
             RELEASE_FIXTURE_JOB_ANCHOR,
             "\n" + job_block + RELEASE_FIXTURE_JOB_ANCHOR,
             1,
         )
-        if spliced == two_family_release:
+        if spliced == release_fixture:
             failures.append(
                 f"the release fixture job anchor did not match for {label}"
             )
@@ -20667,7 +18854,7 @@ pre_build = []
         "the flow-spelled digest upload",
     )
     if not compare_pr_workflow_job(
-        two_family_release,
+        release_fixture,
         flow_digest_workflow,
         "release workflow",
         "protected-arm",
@@ -20687,7 +18874,7 @@ pre_build = []
         "the block-spelled digest upload",
     )
     if not compare_pr_workflow_job(
-        two_family_release,
+        release_fixture,
         block_digest_workflow,
         "release workflow",
         "protected-arm",
@@ -20708,7 +18895,7 @@ pre_build = []
         "the unrelated added job",
     )
     if compare_pr_workflow_job(
-        two_family_release,
+        release_fixture,
         benign_added_job,
         "release workflow",
         "protected-arm",
@@ -20721,7 +18908,7 @@ pre_build = []
         "the benign flow-spelled step",
     )
     if compare_pr_workflow_job(
-        two_family_release,
+        release_fixture,
         benign_flow_job,
         "release workflow",
         "protected-arm",
@@ -21079,288 +19266,17 @@ pre_build = []
     ):
         failures.append("adding benign pinned remote actions was rejected")
 
-    # --- The one admitted `fips-build.yml` generation transition (#3888) ----
-    # The production binding names two complete workflow files that cannot be
-    # embedded here, so the fixtures below are two synthetic generations and the
-    # admitted pair is supplied through the same keyword production uses. The
-    # two digests are the ONLY thing that differs from production: every rule
-    # under test is the production rule, reached through the production
-    # comparison. The adopted fixture carries a literal Cross execution so the
-    # two generations are guaranteed to disagree on their Cross surface, which
-    # is what makes every "was not admitted" assertion below meaningful.
-    fips_name = FIPS_BUILD_WORKFLOW_FILENAME
-    fips_retired_generation = safe_extra_workflow.replace(
-        "name: Coverage\n",
-        "name: FIPS fixture\n",
-    )
-    fips_adopted_generation = fips_retired_generation.replace(
-        "      - run: echo safe\n",
-        "      - run: cross build --target aarch64-unknown-linux-gnu\n",
-    )
-    fips_fixture_transition = (
-        fips_name,
-        hashlib.sha256(fips_retired_generation.encode("utf-8")).hexdigest(),
-        hashlib.sha256(fips_adopted_generation.encode("utf-8")).hexdigest(),
-    )
-    fips_rollback_refusal = (
-        f"proposed self-test workflow directory/{fips_name} "
-        "cannot return to the retired FIPS workflow generation after the "
-        "trusted base adopts the admitted one"
-    )
-
-    def fips_surface_conflict(workflow_name: str) -> str:
+    def workflow_surface_conflict(workflow_name: str) -> str:
         return (
             f"self-test workflow directory/{workflow_name} cannot add or "
             "change Cross executable/configuration surfaces"
         )
 
-    def fips_scan(
-        baseline: dict[str, str],
-        proposed: dict[str, str],
-        *,
-        transition: tuple[str, str, str] | None = fips_fixture_transition,
-    ) -> list[str]:
-        """Scan one fixture pair, optionally under the production binding."""
-
-        if transition is None:
-            return scan_pr_workflow_collection_cross_surfaces(
-                baseline,
-                proposed,
-                "self-test workflow directory",
-            )
-        return scan_pr_workflow_collection_cross_surfaces(
-            baseline,
-            proposed,
-            "self-test workflow directory",
-            admitted_generation_transition=transition,
-        )
-
-    if fips_surface_conflict(fips_name) in fips_scan(
-        {fips_name: fips_retired_generation},
-        {fips_name: fips_adopted_generation},
-    ):
-        failures.append("the admitted FIPS workflow generation transition was rejected")
-    # The same file name and the same two revisions, under the production
-    # binding: the admission is the two exact generations, not the path.
-    if fips_surface_conflict(fips_name) not in fips_scan(
-        {fips_name: fips_retired_generation},
-        {fips_name: fips_adopted_generation},
-        transition=None,
-    ):
-        failures.append(
-            "the FIPS workflow admission is bound to a file name rather than to "
-            "the two exact generations it names"
-        )
-
-    fips_rejected_transitions = {
-        "a wrong predecessor": (
-            fips_retired_generation.replace("echo safe", "echo other-predecessor"),
-            fips_adopted_generation,
-        ),
-        "a wrong destination": (
-            fips_retired_generation,
-            fips_adopted_generation.replace(
-                "aarch64-unknown-linux-gnu\n",
-                "aarch64-unknown-linux-gnu\n      - run: echo extra\n",
-            ),
-        ),
-        "a one-byte predecessor drift": (
-            fips_retired_generation + "\n",
-            fips_adopted_generation,
-        ),
-        "a one-byte destination drift": (
-            fips_retired_generation,
-            fips_adopted_generation + "\n",
-        ),
-        "the destination added outright": ("", fips_adopted_generation),
-        "deletion of the adopted generation": (fips_adopted_generation, ""),
-        "further drift after adoption": (
-            fips_adopted_generation,
-            fips_adopted_generation.replace(
-                "cross build --target aarch64-unknown-linux-gnu",
-                "echo drifted",
-            ),
-        ),
-        "the reverse transition": (
-            fips_adopted_generation,
-            fips_retired_generation,
-        ),
-    }
-    for label, (fips_baseline, fips_proposed) in fips_rejected_transitions.items():
-        if fips_surface_conflict(fips_name) not in fips_scan(
-            {fips_name: fips_baseline} if fips_baseline else {},
-            {fips_name: fips_proposed} if fips_proposed else {},
-        ):
-            failures.append(f"the FIPS generation admission accepted {label}")
-
-    if fips_surface_conflict(fips_name) in fips_scan(
-        {fips_name: fips_adopted_generation},
-        {fips_name: fips_adopted_generation},
-    ):
-        failures.append("an unchanged adopted FIPS workflow generation was rejected")
-
-    if fips_rollback_refusal not in fips_scan(
-        {fips_name: fips_adopted_generation},
-        {fips_name: fips_retired_generation},
-    ):
-        failures.append(
-            "returning the FIPS workflow to the retired generation was not "
-            "refused as a one-way transition"
-        )
-    fips_non_rollbacks = {
-        "the admitted adoption": (
-            fips_retired_generation,
-            fips_adopted_generation,
-        ),
-        "an unchanged adopted generation": (
-            fips_adopted_generation,
-            fips_adopted_generation,
-        ),
-        "an unchanged retired generation": (
-            fips_retired_generation,
-            fips_retired_generation,
-        ),
-    }
-    for label, (fips_baseline, fips_proposed) in fips_non_rollbacks.items():
-        if fips_rollback_refusal in fips_scan(
-            {fips_name: fips_baseline},
-            {fips_name: fips_proposed},
-        ):
-            failures.append(f"{label} was reported as a one-way FIPS rollback")
-
-    for other_name in ("coverage.yml", "fips-build.yaml", "fips-build-2.yml"):
-        if fips_surface_conflict(other_name) not in fips_scan(
-            {other_name: fips_retired_generation},
-            {other_name: fips_adopted_generation},
-        ):
-            failures.append(
-                f"the FIPS generation admission was applied to {other_name!r}"
-            )
-
-    fips_simultaneous = fips_scan(
-        {
-            fips_name: fips_retired_generation,
-            "coverage.yml": safe_extra_workflow,
-        },
-        {
-            fips_name: fips_adopted_generation,
-            "coverage.yml": added_cross_workflow,
-        },
-    )
-    if fips_surface_conflict("coverage.yml") not in fips_simultaneous:
-        failures.append(
-            "a Cross surface added alongside the admitted FIPS generation "
-            "transition was not rejected"
-        )
-    if fips_surface_conflict(fips_name) in fips_simultaneous:
-        failures.append(
-            "the admitted FIPS generation transition was rejected because an "
-            "unrelated workflow changed in the same proposal"
-        )
-
-    fips_generation_pairs = {
-        "absent predecessor": ("", fips_adopted_generation, "unrelated"),
-        "absent proposal": (fips_retired_generation, "", "unrelated"),
-        "both absent": ("", "", "unrelated"),
-        "unchanged retired": (
-            fips_retired_generation,
-            fips_retired_generation,
-            "unrelated",
-        ),
-        "unchanged adopted": (
-            fips_adopted_generation,
-            fips_adopted_generation,
-            "unrelated",
-        ),
-        "one-byte predecessor drift": (
-            fips_retired_generation + "\n",
-            fips_adopted_generation,
-            "unrelated",
-        ),
-        "one-byte destination drift": (
-            fips_retired_generation,
-            fips_adopted_generation + "\n",
-            "unrelated",
-        ),
-        "exact adoption": (
-            fips_retired_generation,
-            fips_adopted_generation,
-            "adoption",
-        ),
-        "exact rollback": (
-            fips_adopted_generation,
-            fips_retired_generation,
-            "rollback",
-        ),
-    }
-    for label, (fips_baseline, fips_proposed, expected) in (
-        fips_generation_pairs.items()
-    ):
-        verdict = fips_build_generation_transition(
-            fips_name,
-            fips_baseline,
-            fips_proposed,
-            transition=fips_fixture_transition,
-        )
-        if verdict != expected:
-            failures.append(
-                f"the FIPS generation pair {label!r} classified as {verdict!r} "
-                f"rather than {expected!r}"
-            )
-    for other_name in ("coverage.yml", "fips-build.yaml", "ci.yml", ""):
-        if (
-            fips_build_generation_transition(
-                other_name,
-                fips_retired_generation,
-                fips_adopted_generation,
-                transition=fips_fixture_transition,
-            )
-            != "unrelated"
-        ):
-            failures.append(
-                "the FIPS generation admission is not bound to its path "
-                f"({other_name!r})"
-            )
-
-    for label, digest in (
-        ("retired", FIPS_BUILD_RETIRED_GENERATION_SHA256),
-        ("adopted", FIPS_BUILD_ADOPTED_GENERATION_SHA256),
-    ):
-        if WORKFLOW_GENERATION_DIGEST.fullmatch(digest) is None:
-            failures.append(
-                f"the {label} FIPS workflow generation is not named by a "
-                "lowercase SHA-256 digest"
-            )
-    if FIPS_BUILD_RETIRED_GENERATION_SHA256 == FIPS_BUILD_ADOPTED_GENERATION_SHA256:
-        failures.append(
-            "the admitted FIPS workflow generations must be two distinct revisions"
-        )
-    if FIPS_BUILD_ADMITTED_GENERATION_TRANSITION != (
-        FIPS_BUILD_WORKFLOW_FILENAME,
-        FIPS_BUILD_RETIRED_GENERATION_SHA256,
-        FIPS_BUILD_ADOPTED_GENERATION_SHA256,
-    ):
-        failures.append(
-            "the admitted FIPS workflow generation transition does not name the "
-            "pinned path and digests"
-        )
-    # A file the comparison loop never reaches — a protected workflow, or the
-    # frozen fuzz lane, which is decided before the generation transition is
-    # consulted — could not be admitted, so naming one would be a silent no-op.
-    if (
-        FIPS_BUILD_WORKFLOW_FILENAME in PROTECTED_WORKFLOW_FILENAMES
-        or FIPS_BUILD_WORKFLOW_FILENAME in FROZEN_FUZZ_WORKFLOWS
-        or WORKFLOW_FILENAME.fullmatch(FIPS_BUILD_WORKFLOW_FILENAME) is None
-    ):
-        failures.append(
-            "the admitted FIPS workflow generation transition names a workflow "
-            "the pull-request comparison never reaches"
-        )
     if workflow_generation_digest("") is not None:
         failures.append("an absent workflow revision was given a generation digest")
     if (
-        workflow_generation_digest(fips_adopted_generation)
-        != fips_fixture_transition[2]
+        workflow_generation_digest(safe_extra_workflow)
+        != hashlib.sha256(safe_extra_workflow.encode("utf-8")).hexdigest()
     ):
         failures.append(
             "the workflow generation digest is not the SHA-256 of the revision"
@@ -21449,7 +19365,7 @@ pre_build = []
                 directory_job_transitions=transitions,
             )
 
-        if fips_surface_conflict(directory_job_fixture_name) in directory_job_scan(
+        if workflow_surface_conflict(directory_job_fixture_name) in directory_job_scan(
             {directory_job_fixture_name: directory_job_retired_generation},
             {directory_job_fixture_name: directory_job_adopted_generation},
         ):
@@ -21459,7 +19375,7 @@ pre_build = []
             )
         # The same file and the same two revisions under the production table:
         # the admission is the two exact job digests, not the file or job name.
-        if fips_surface_conflict(
+        if workflow_surface_conflict(
             directory_job_fixture_name
         ) not in directory_job_scan(
             {directory_job_fixture_name: directory_job_retired_generation},
@@ -21498,7 +19414,7 @@ pre_build = []
             directory_job_baseline,
             directory_job_proposed,
         ) in directory_job_rejected_pairs.items():
-            if fips_surface_conflict(
+            if workflow_surface_conflict(
                 directory_job_fixture_name
             ) not in directory_job_scan(
                 {directory_job_fixture_name: directory_job_baseline},
@@ -21515,7 +19431,7 @@ pre_build = []
                 "returning the workflow-directory job to the retired generation "
                 "was not refused as a one-way transition"
             )
-        if fips_surface_conflict("attacker.yml") not in directory_job_scan(
+        if workflow_surface_conflict("attacker.yml") not in directory_job_scan(
             {"attacker.yml": directory_job_retired_generation},
             {"attacker.yml": directory_job_adopted_generation},
         ):
@@ -21533,12 +19449,12 @@ pre_build = []
                 "attacker.yml": added_cross_workflow,
             },
         )
-        if fips_surface_conflict("attacker.yml") not in directory_job_simultaneous:
+        if workflow_surface_conflict("attacker.yml") not in directory_job_simultaneous:
             failures.append(
                 "a Cross surface added alongside the admitted workflow-directory "
                 "job transition was not rejected"
             )
-        if fips_surface_conflict(
+        if workflow_surface_conflict(
             directory_job_fixture_name
         ) in directory_job_simultaneous:
             failures.append(
@@ -21823,7 +19739,7 @@ pre_build = []
                 f"duplicate CI job generation tuple for {job_name!r}"
             )
         seen_job_generation_tuples.add((job_name, retired, adopted))
-        if job_name in {CI_FUZZ_SMOKE_JOB_NAME, "build-arm64-cross"}:
+        if job_name == CI_FUZZ_SMOKE_JOB_NAME or job_name in PROTECTED_BUILD_JOB_NAMES:
             failures.append(
                 f"CI job generation {job_name!r} collides with a whole-text freeze"
             )
@@ -22004,9 +19920,7 @@ pre_build = []
         "docker-digest-evil",
         "docker-ebpf-digest-evil",
     )
-    # The third eBPF name space is refused to a local action before the release
-    # workflow adopts it, so the adoption commit cannot inherit an upload that
-    # was already planted here.
+    # The third eBPF name space is refused to a local action like the other two.
     tools_digest_upload_action = digest_upload_action.replace(
         "docker-digest-evil",
         "docker-ebpf-tools-digest-evil",
@@ -23963,6 +21877,128 @@ pre_build = []
                 f"'timeout {signal_option}' resolved the wrong word as its "
                 "command operand"
             )
+    # GHSA-q636-fxjc-3r78: wrapper options are per wrapper, and an option the
+    # tables do not know is read both ways. Every prefix below must still
+    # expose an interpreter-embedded Cross dispatch to both workflow scans.
+    def q636_workflow(run_line: str) -> str:
+        return (
+            "name: Wrapper option fixture\n"
+            "on: [push]\n"
+            "permissions:\n"
+            "  contents: read\n"
+            "jobs:\n"
+            "  fixture:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - run: |\n"
+            f"          {run_line}\n"
+        )
+
+    q636_base = {"base.yml": q636_workflow("echo ok")}
+
+    def q636_reported(run_line: str) -> tuple[bool, bool]:
+        proposed = {**q636_base, "fixture.yml": q636_workflow(run_line)}
+        return (
+            bool(scan_workflow_collection_cross_surfaces(proposed, "q636 fixture")),
+            bool(
+                scan_pr_workflow_collection_cross_surfaces(
+                    q636_base, proposed, "q636 fixture"
+                )
+            ),
+        )
+
+    q636_payloads = (
+        f"perl -e 'system(\"cross build --target {TARGET}\")'",
+        f"python3 -c 'import os; os.system(\"cross build --target {TARGET}\")'",
+        f"node -e 'require(\"child_process\").execSync(\"cross build --target {TARGET}\")'",
+    )
+    for q636_prefix in (
+        "",
+        "sudo ",
+        "sudo -E ",
+        "sudo -n ",
+        "sudo -nE ",
+        "sudo -Eu root ",
+        "sudo -u root ",
+        "sudo -D /tmp ",
+        "sudo -h host ",
+        "sudo -T 30 ",
+        "sudo -R /srv ",
+        "sudo --chroot=/srv ",
+        "sudo --unlisted-option value ",
+        "nice -n 5 ",
+        "ionice -c 3 ",
+        "exec -a name ",
+        "stdbuf -oL ",
+        "stdbuf -o L ",
+        "time -p ",
+        "timeout -k 5 30 ",
+        "setsid -w ",
+    ):
+        for q636_payload in q636_payloads:
+            if q636_reported(q636_prefix + q636_payload) != (True, True):
+                failures.append(
+                    f"an interpreter-embedded Cross dispatch behind "
+                    f"{q636_prefix.strip() or 'no wrapper'!r} escaped a workflow scan"
+                )
+    for q636_line, q636_operand in (
+        ("sudo -E scripts/evil.sh", "scripts/evil.sh"),
+        ("sudo -n scripts/evil.sh", "scripts/evil.sh"),
+        ("sudo -D /tmp scripts/evil.sh", "scripts/evil.sh"),
+        ("ionice -c 3 scripts/evil.sh", "scripts/evil.sh"),
+        ("exec -a name scripts/evil.sh", "scripts/evil.sh"),
+        ("stdbuf -o L scripts/evil.sh", "scripts/evil.sh"),
+        ("time -p scripts/evil.sh", "scripts/evil.sh"),
+        ("sudo -Eu root scripts/evil.sh", "scripts/evil.sh"),
+    ):
+        q636_tokens = shell_tokens(q636_line)
+        if q636_tokens is None:
+            failures.append(f"{q636_line!r} did not tokenize")
+            continue
+        q636_index, q636_dispatches, _ = skip_wrapper_prefixes(q636_tokens, 0)
+        if not q636_dispatches or q636_index >= len(q636_tokens) or (
+            q636_tokens[q636_index] != q636_operand
+        ):
+            failures.append(
+                f"{q636_line!r} resolved the wrong word as its command operand"
+            )
+    # Brace overflow: eight two-way groups ahead of `cr{o,x}ss` push the
+    # expansion past 256 variants, which must fail closed as a whole Cross
+    # command; seven groups stay under the bound and a benign seven-group line
+    # is not reported.
+    q636_groups = " ".join(["{a,b}"] * 8)
+    if q636_reported(
+        f"echo {q636_groups}; cr{{o,x}}ss build --target {TARGET}"
+    ) != (True, True):
+        failures.append("an eight-group brace overflow hid a Cross dispatch")
+    if q636_reported(f"echo {q636_groups}; echo x{{c,d}}") != (False, False):
+        failures.append(
+            "a nine-group brace overflow that spells no Cross word was reported"
+        )
+    if q636_reported(
+        f"echo {q636_groups}; ca{{r,x}}go build --target {TARGET}"
+    ) != (True, True):
+        failures.append("an eight-group brace overflow hid a Cargo word")
+    if not brace_overflow_hides_cross("x" + "{a,b}" * 9 + " build"):
+        failures.append("a single word that overflows on its own must fail closed")
+    q636_seven = " ".join(["{a,b}"] * 7)
+    if q636_reported(
+        f"echo {q636_seven}; cr{{o,x}}ss build --target {TARGET}"
+    ) != (True, True):
+        failures.append("a seven-group brace expansion hid a Cross dispatch")
+    if q636_reported(f"echo {q636_seven}; echo done") != (False, False):
+        failures.append("a benign seven-group brace expansion was reported")
+    if WHOLE_CROSS_COMMAND not in brace_expansion_variants(
+        q636_groups + " cr{o,x}ss"
+    ):
+        failures.append("brace overflow must return a whole Cross command")
+    if wrapper_option_operand_variants(
+        "sudo --a 1 --b 2 --c 3 --d 4 --e 5 run"
+    ) != (WHOLE_CROSS_COMMAND,):
+        failures.append(
+            "more ambiguous wrapper options than the bound must fail closed"
+        )
+
     # The benign control keeps the same option shape with nothing in a command
     # slot behind it.
     if CROSS_COMMAND_CONTEXT.search(
@@ -28207,8 +26243,14 @@ pre_build = []
     for benign_program, expected_reference in (
         ("bash scripts/coverage.sh", "scripts/coverage.sh"),
         ("cd scripts\ncd ..\nbash scripts/coverage.sh", "scripts/coverage.sh"),
-        ("cd tests\ncd performance\nbash run_perf_test.sh", "tests/performance/run_perf_test.sh"),
-        ("cd tests/performance\nbash ./run_perf_test.sh", "tests/performance/run_perf_test.sh"),
+        (
+            "cd tests\ncd performance\nbash payload_size/run_payload_test.sh",
+            "tests/performance/payload_size/run_payload_test.sh",
+        ),
+        (
+            "cd tests/performance\nbash ./payload_size/run_payload_test.sh",
+            "tests/performance/payload_size/run_payload_test.sh",
+        ),
     ):
         benign_references, _, benign_errors = command_reference_result(benign_program)
         if benign_errors:
@@ -28691,8 +26733,6 @@ pre_build = []
     # Every job that publishes by wildcard freezes its whole step list, not
     # just the download or the `needs` graph that feeds it.
     for contract_source, contract_job in (
-        ("CI workflow", "latest-release"),
-        ("CI workflow", "docker-manifest"),
         ("release workflow", "create-release"),
         ("release workflow", "docker-manifest"),
         ("release workflow", "docker-ebpf-manifest"),
@@ -28715,10 +26755,10 @@ pre_build = []
     # complete job contract is frozen. Freezing only the visible steps would
     # still permit a pull request to select an attacker-controlled runner or
     # introduce another job-level execution surface.
-    # The complete two-family fixture leads with the attestation job, so the
+    # The complete release fixture leads with the attestation job, so the
     # single-substitution tampers below land in it, and the comparison reaches
     # the exact-job contract instead of stopping at an incomplete release file.
-    attestation_workflow = two_family_release
+    attestation_workflow = release_fixture
     appended_privileged_step = attestation_workflow.replace(
         "    steps:\n",
         "    steps:\n"
@@ -28749,18 +26789,17 @@ pre_build = []
         failures.append("an attacker-controlled attestation runner was not rejected")
 
     # ----------------------------------------------------------------------
-    # The one admitted release image-family adoption (`-ebpf-tools`).
+    # The three release image families (default, `-ebpf`, `-ebpf-tools`).
     # ----------------------------------------------------------------------
-    failures.extend(RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS)
-
-    three_family = RELEASE_IMAGE_FAMILY_GENERATIONS[RELEASE_THREE_FAMILY_GENERATION]
-    two_family = RELEASE_IMAGE_FAMILY_GENERATIONS[RELEASE_TWO_FAMILY_GENERATION]
+    release_control = PUBLISH_CONTROL_CONTRACTS["release workflow"]
 
     # Every published image family must be a first-class subject of the frozen
     # attestation job. A family that is published but not resolved, compared,
     # scanned, signed, attested, and verified would ship an unsigned image under
     # a release tag that the notes advertise.
-    adopted_attestation_job = three_family["exact_jobs"]["attest-release-images"]
+    attestation_job = PUBLISH_EXACT_JOB_CONTRACTS["release workflow"][
+        "attest-release-images"
+    ]
     for family, docker_variable, ghcr_variable in (
         ("standard", "$STANDARD_DOCKER_REF", "$STANDARD_GHCR_REF"),
         ("ebpf", "$EBPF_DOCKER_REF", "$EBPF_GHCR_REF"),
@@ -28775,155 +26814,82 @@ pre_build = []
             f'verify_image {family} docker "{docker_variable}"',
             f'verify_image {family} ghcr "{ghcr_variable}"',
         ):
-            if required_invocation not in adopted_attestation_job:
+            if required_invocation not in attestation_job:
                 failures.append(
-                    "the adopted attestation job does not cover image family "
+                    "the attestation job does not cover image family "
                     f"{family!r}: missing {required_invocation!r}"
                 )
-    if "docker-ebpf-tools-manifest" not in adopted_attestation_job:
+    if RELEASE_TOOLS_MANIFEST_JOB_NAME not in attestation_job:
         failures.append(
-            "the adopted attestation job does not wait for the `-ebpf-tools` "
-            "manifest job"
+            "the attestation job does not wait for the `-ebpf-tools` manifest job"
         )
 
     # The third digest name space must be owned exactly like the other two, and
     # only the single job that builds both eBPF variants may produce it.
-    adopted_digest_owners = three_family["digest_owners"]
-    if adopted_digest_owners.get(RELEASE_TOOLS_DIGEST_PREFIX) != ("docker-ebpf",):
+    release_digest_owners = DIGEST_ARTIFACT_OWNERS["release workflow"]
+    if release_digest_owners.get(RELEASE_TOOLS_DIGEST_PREFIX) != ("docker-ebpf",):
         failures.append(
             "the `-ebpf-tools` digest wildcard is not owned by exactly the "
             "docker-ebpf job"
         )
-    if RELEASE_TOOLS_DIGEST_PREFIX in two_family["digest_owners"]:
-        failures.append(
-            "the `-ebpf-tools` digest wildcard is owned before the release "
-            "workflow adopts the family"
-        )
     if RELEASE_TOOLS_DIGEST_PREFIX not in digest_artifact_prefixes():
         failures.append(
             "the `-ebpf-tools` digest wildcard is not refused to repo-local "
-            "composite actions in every generation"
+            "composite actions"
         )
-    adopted_tools_manifest_steps = three_family["control"][
-        RELEASE_TOOLS_MANIFEST_JOB_NAME
-    ]["steps"]
-    for owned_prefix in adopted_digest_owners:
+    tools_manifest_steps = release_control[RELEASE_TOOLS_MANIFEST_JOB_NAME]["steps"]
+    for owned_prefix in release_digest_owners:
         if owned_prefix == RELEASE_TOOLS_DIGEST_PREFIX:
             continue
-        if f"pattern: {owned_prefix}*" in adopted_tools_manifest_steps:
+        if f"pattern: {owned_prefix}*" in tools_manifest_steps:
             failures.append(
                 "the `-ebpf-tools` manifest collects another family's digest "
                 f"name space {owned_prefix!r}"
             )
     if (
-        DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP not in adopted_tools_manifest_steps
+        DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP not in tools_manifest_steps
         or DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP == DOCKER_EBPF_UPLOAD_DIGEST_STEP
     ):
         failures.append(
             "the `-ebpf-tools` digest download/upload contract is not distinct "
             "from the `-ebpf` one"
         )
-    if not adopted_tools_manifest_steps.startswith(
+    if not tools_manifest_steps.startswith(
         "    steps:\n"
-    ) or not adopted_tools_manifest_steps.endswith("\n"):
+    ) or not tools_manifest_steps.endswith("\n"):
         failures.append(
             f"release workflow job {RELEASE_TOOLS_MANIFEST_JOB_NAME!r} step "
             "contract is not a whole extracted steps block"
         )
-    if "docker buildx imagetools create" not in adopted_tools_manifest_steps:
+    if "docker buildx imagetools create" not in tools_manifest_steps:
         failures.append(
             f"release workflow job {RELEASE_TOOLS_MANIFEST_JOB_NAME!r} step "
             "contract no longer covers its wildcard publish command"
         )
 
-    # The two complete release workflows, one per admitted shape, were assembled
-    # from the frozen contracts themselves earlier in this self-test.
-    for generation, fixture in release_family_fixtures.items():
-        classified, classification_failures = release_image_family_generation(
-            fixture,
-            "self-test release workflow",
-        )
-        if classification_failures or classified != generation:
-            failures.append(
-                f"the {generation} release fixture did not classify as itself"
-            )
-        if validate_publish_control_contract(fixture, "release workflow"):
-            failures.append(
-                f"a valid {generation} release publication contract was rejected"
-            )
-        if compare_pr_publish_control_contract(
-            fixture,
-            fixture,
-            "release workflow",
-        ):
-            failures.append(
-                f"an unchanged {generation} release workflow was rejected"
-            )
-
-        producer_steps = RELEASE_IMAGE_FAMILY_GENERATIONS[generation]["control"][
-            "docker-ebpf"
-        ]["steps"]
-        extra_step = fixture.replace(
-            producer_steps,
-            producer_steps.replace(
-                "    steps:\n",
-                "    steps:\n"
-                "      - name: Rewrite the trusted Docker context\n"
-                "        run: cp attacker.Dockerfile Dockerfile\n\n",
-                1,
-            ),
-            1,
-        )
-        extra_field = fixture.replace(
-            RELEASE_IMAGE_FAMILY_GENERATIONS[generation]["control"]["docker-ebpf"][
-                "runs-on"
-            ],
-            RELEASE_IMAGE_FAMILY_GENERATIONS[generation]["control"]["docker-ebpf"][
-                "runs-on"
-            ]
-            + "    continue-on-error: true\n",
-            1,
-        )
-        for tamper_label, tampered in (
-            ("extra producer step", extra_step),
-            ("extra producer field", extra_field),
-        ):
-            if tampered == fixture:
-                failures.append(
-                    f"the {generation} {tamper_label} fixture did not change"
-                )
-            elif not validate_publish_control_contract(
-                tampered,
-                "release workflow",
-            ):
-                failures.append(
-                    f"the {generation} release contract accepted an {tamper_label}"
-                )
-
-    # The admitted transition: exactly this, in exactly this direction.
+    # The complete release workflow, assembled from the frozen contracts earlier
+    # in this self-test, satisfies them as it stands.
+    if validate_publish_control_contract(release_fixture, "release workflow"):
+        failures.append("a valid release publication contract was rejected")
     if compare_pr_publish_control_contract(
-        two_family_release,
-        three_family_release,
+        release_fixture,
+        release_fixture,
         "release workflow",
     ):
-        failures.append("the exact `-ebpf-tools` adoption transition was rejected")
-    if not compare_pr_publish_control_contract(
-        three_family_release,
-        two_family_release,
-        "release workflow",
-    ):
-        failures.append(
-            "a downgrade away from the adopted `-ebpf-tools` release shape was "
-            "not rejected"
-        )
+        failures.append("an unchanged release workflow was rejected")
 
-    # Anything that is not the complete shape is neither of the two admitted
-    # states, whichever side of the adoption it is proposed from.
-    partial_adoptions = {
+    # Anything short of the complete contract is rejected both as an absolute
+    # property of the proposal and by the merge-base comparison: an extra
+    # publisher or tag, an alternate runner/`needs`/step, a dropped family, a
+    # missing attestation operation, and a mixed digest name space.
+    producer_steps = release_control["docker-ebpf"]["steps"]
+    producer_runs_on = release_control["docker-ebpf"]["runs-on"]
+    tools_manifest = release_control[RELEASE_TOOLS_MANIFEST_JOB_NAME]
+    release_tampers = {
         "extra producer step rewrites the Docker context": (
-            three_family_release.replace(
-                RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS,
-                RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS.replace(
+            release_fixture.replace(
+                producer_steps,
+                producer_steps.replace(
                     "    steps:\n",
                     "    steps:\n"
                     "      - name: Rewrite the trusted Docker context\n"
@@ -28934,64 +26900,61 @@ pre_build = []
             )
         ),
         "producer moved to an attacker-controlled runner": (
-            three_family_release.replace(
-                three_family["control"]["docker-ebpf"]["runs-on"],
+            release_fixture.replace(
+                producer_runs_on,
                 "    runs-on: self-hosted\n",
                 1,
             )
         ),
         "producer failure made advisory": (
-            three_family_release.replace(
-                three_family["control"]["docker-ebpf"]["runs-on"],
-                three_family["control"]["docker-ebpf"]["runs-on"]
-                + "    continue-on-error: true\n",
+            release_fixture.replace(
+                producer_runs_on,
+                producer_runs_on + "    continue-on-error: true\n",
                 1,
             )
         ),
         "tools manifest moved to an attacker-controlled runner": (
-            three_family_release.replace(
-                "  docker-ebpf-tools-manifest:\n"
-                "    name: Docker eBPF Tools Manifest\n"
-                + RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS
-                + "    runs-on: ubuntu-26.04\n",
-                "  docker-ebpf-tools-manifest:\n"
-                "    name: Docker eBPF Tools Manifest\n"
-                + RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS
+            release_fixture.replace(
+                f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
+                + tools_manifest["name"]
+                + tools_manifest["needs"]
+                + tools_manifest["runs-on"],
+                f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
+                + tools_manifest["name"]
+                + tools_manifest["needs"]
                 + "    runs-on: self-hosted\n",
                 1,
             )
         ),
         "tools manifest job removed but its uploads kept": (
-            three_family_release.replace(
+            release_fixture.replace(
                 "\n"
                 + f"  {RELEASE_TOOLS_MANIFEST_JOB_NAME}:\n"
-                + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["name"]
-                + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"]
-                + "    runs-on: ubuntu-26.04\n"
-                + three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME][
-                    "permissions"
-                ]
-                + adopted_tools_manifest_steps,
+                + tools_manifest["name"]
+                + tools_manifest["needs"]
+                + tools_manifest["runs-on"]
+                + tools_manifest["permissions"]
+                + tools_manifest_steps,
                 "",
                 1,
             )
         ),
         "tools upload retargeted at the `-ebpf` digest directory": (
-            three_family_release.replace(
+            release_fixture.replace(
                 "          path: /tmp/digests-tools/*\n",
                 "          path: /tmp/digests/*\n",
                 1,
             )
         ),
         "tools manifest collects the `-ebpf` digest name space": (
-            three_family_release.replace(
+            release_fixture.replace(
                 "          pattern: docker-ebpf-tools-digest-*\n",
                 "          pattern: docker-ebpf-digest-*\n",
                 1,
             )
         ),
         "tools manifest publishes an extra unattested tag": (
-            three_family_release.replace(
+            release_fixture.replace(
                 "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n"
                 "\n"
                 "      - name: Create and push multi-arch eBPF tools manifest (GHCR)",
@@ -29003,372 +26966,121 @@ pre_build = []
             )
         ),
         "tools build retargeted at the distroless stage": (
-            three_family_release.replace(
+            release_fixture.replace(
                 "          target: runtime-ebpf-tools\n",
                 "          target: runtime-ebpf\n",
                 1,
             )
         ),
         "tools manifest `needs` weakened": (
-            three_family_release.replace(
-                three_family["control"][RELEASE_TOOLS_MANIFEST_JOB_NAME]["needs"],
+            release_fixture.replace(
+                tools_manifest["needs"],
                 "    needs: docker-ebpf\n",
                 1,
             )
         ),
         "attestation coverage of the tools family dropped": (
-            three_family_release.replace(
+            release_fixture.replace(
                 "          compare_registry_manifests ebpftools\n",
                 "",
                 1,
             )
         ),
         "create-release no longer waits for the tools manifest": (
-            three_family_release.replace(
-                RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
-                two_family["control"]["create-release"]["needs"],
+            release_fixture.replace(
+                release_control["create-release"]["needs"],
+                "    needs: [build-release-binaries, build-release-arm64-cross, "
+                "docker-manifest, docker-ebpf-manifest]\n",
                 1,
             )
         ),
-        # The rationale comment shares the `name:` field block with nothing else,
-        # so leaving it at "BOTH manifests" while publishing three families is a
-        # partial adoption of a frozen control field like any other.
-        "create-release rationale still describes the two-family gate": (
-            three_family_release.replace(
-                RELEASE_THREE_FAMILY_CREATE_RELEASE_NAME,
-                two_family["control"]["create-release"]["name"],
+        # A comment is not a mapping key, so the gating rationale between
+        # `create-release`'s `name:` and `needs:` is read as the tail of the
+        # frozen `name:` field block: the published justification for the gate
+        # cannot drift from the gate.
+        "create-release gating rationale rewritten": (
+            release_fixture.replace(
+                "    # Wait for ALL THREE manifests:",
+                "    # Wait for the default manifest:",
                 1,
             )
         ),
     }
-    for label, tampered in partial_adoptions.items():
-        if tampered == three_family_release:
+    for label, tampered in release_tampers.items():
+        if tampered == release_fixture:
             failures.append(f"{label!r} fixture did not change the release workflow")
             continue
         if not validate_publish_control_contract(tampered, "release workflow"):
-            failures.append(f"a partial `-ebpf-tools` adoption ({label}) was accepted")
+            failures.append(f"the release publication contract accepted a {label}")
         if not compare_pr_publish_control_contract(
-            two_family_release,
+            release_fixture,
             tampered,
             "release workflow",
         ):
             failures.append(
-                f"a partial `-ebpf-tools` adoption ({label}) was allowed by the "
-                "merge-base comparison"
-            )
-        if not compare_pr_publish_control_contract(
-            three_family_release,
-            tampered,
-            "release workflow",
-        ):
-            failures.append(
-                f"a post-adoption mutation ({label}) was allowed by the "
+                f"a release workflow tamper ({label}) was allowed by the "
                 "merge-base comparison"
             )
 
     # ----------------------------------------------------------------------
-    # The same adoption, seen by the generic Cross-surface comparison.
+    # The release workflow seen by the generic Cross-surface comparison.
     # ----------------------------------------------------------------------
-    # The publication contract admitting the transition is not enough on its
-    # own: `compare_pr_workflow_job` hashes every job it reads as
-    # Cross-sensitive, the adoption moves frozen text inside such jobs (the
-    # extended `create-release` `needs` names `build-release-arm64-cross`), and
-    # that comparison rejected the complete admitted shape. These cases hold the
-    # projection that repairs it to the same boundary the contract has.
-    failures.extend(RELEASE_FAMILY_TRANSITION_DERIVATION_ERRORS)
-
-    # A comment is not a mapping key, so the rationale between `create-release`'s
-    # `name:` and `needs:` is read as the tail of the `name:` field block. If
-    # that block were not a frozen, substituted control field, the adoption's
-    # rewritten rationale would survive the projection and the Cross-surface
-    # comparison would reject the exact adoption this policy admits. The
-    # assembled fixtures carry the block, so the byte-exact projection equality
-    # below is the end-to-end proof; these are the guards that keep the block
-    # comment-bearing and substituted in the first place.
-    two_family_create_release_name = two_family["control"].get(
-        "create-release",
-        {},
-    ).get("name")
-    three_family_create_release_name = three_family["control"].get(
-        "create-release",
-        {},
-    ).get("name")
-    for generation, name_block in (
-        (RELEASE_TWO_FAMILY_GENERATION, two_family_create_release_name),
-        (RELEASE_THREE_FAMILY_GENERATION, three_family_create_release_name),
-    ):
-        if name_block is None:
-            failures.append(
-                f"the {generation} release contract does not freeze the "
-                "`create-release` `name:` field block, so its gating rationale "
-                "is neither frozen nor substitutable"
-            )
-            continue
-        if not name_block.startswith("    name: "):
-            failures.append(
-                f"the {generation} `create-release` name contract is not a whole "
-                "extracted field block"
-            )
-        if "\n    # " not in name_block:
-            failures.append(
-                f"the {generation} `create-release` name contract no longer "
-                "carries the gating rationale the field block includes"
-            )
-    if two_family_create_release_name == three_family_create_release_name:
-        failures.append(
-            "the `-ebpf-tools` adoption leaves the `create-release` gating "
-            "rationale unchanged, so it would still describe a two-manifest gate"
-        )
-    if not any(
-        label == "job 'create-release' field 'name'"
-        for label, _, _ in RELEASE_FAMILY_TRANSITION_REPLACEMENTS
-    ):
-        failures.append(
-            "the family-transition projection does not substitute the "
-            "`create-release` name/comment block, so the adoption's rewritten "
-            "rationale would survive into the surface comparison"
-        )
-
-    # Dropping an entry from any table the projection reads narrows the
-    # publication contract rather than extending it, and must be a hard
-    # derivation error in every one of them — not only in the two that were
-    # originally checked.
-    for table_name in (
-        "exact_jobs",
-        "control",
-        "steps",
-        "digest_owners",
-        "closed_job_fields",
-    ):
-        two_table = two_family[table_name]
-        if not two_table:
-            failures.append(
-                f"the two-family release {table_name!r} table is empty, so its "
-                "dropped-entry derivation guard proves nothing"
-            )
-            continue
-        dropped_key = next(iter(two_table))
-        narrowed_three = dict(three_family)
-        narrowed_three[table_name] = {
-            key: value
-            for key, value in three_family[table_name].items()
-            if key != dropped_key
-        }
-        _, _, narrowed_errors = derive_release_family_transition(
-            two_family,
-            narrowed_three,
-        )
-        if not any(
-            "drops" in error and repr(dropped_key) in error
-            for error in narrowed_errors
-        ):
-            failures.append(
-                f"the family-transition derivation accepted a {table_name!r} "
-                f"entry ({dropped_key!r}) dropped by the adoption"
-            )
-
-    # A diagnostic computed from a projected rendering must say so, because its
-    # line numbers are the projection's rather than the reviewed file's.
-    unprojected_label = projected_surface_label(
-        "proposed",
-        "release workflow",
-        three_family_release,
-        three_family_release,
-    )
-    if unprojected_label != "proposed release workflow":
-        failures.append("an unprojected revision was labelled as a projection")
-    projected_label = projected_surface_label(
-        "proposed",
-        "release workflow",
-        three_family_release,
-        two_family_release,
-    )
-    if not projected_label.startswith("proposed release workflow"):
-        failures.append("a projected-rendering label lost its revision identity")
-    if PROJECTED_RENDERING_LABEL not in projected_label:
-        failures.append(
-            "a diagnostic read from a projected rendering does not say its line "
-            "numbers are the projection's"
-        )
-
-    # The projection is exact: an adopted workflow re-renders to precisely the
-    # workflow the adoption started from, byte for byte. That equality is what
-    # makes the withholding safe to describe as "the frozen transition text and
-    # nothing else".
-    projected_release, projection_failures = release_two_family_projection(
-        three_family_release,
-        "self-test release workflow",
-    )
-    if projection_failures:
-        failures.append(
-            "the adopted release fixture could not be projected back to its "
-            f"two-family text: {projection_failures}"
-        )
-    elif projected_release != two_family_release:
-        failures.append(
-            "projecting the adopted release fixture did not reproduce the "
-            "two-family workflow exactly"
-        )
-    # It is a projection of an adoption, not a general rewriter: a workflow that
-    # never adopted carries none of the adopted text and fails closed.
-    unadopted_projection, unadopted_failures = release_two_family_projection(
-        two_family_release,
-        "self-test release workflow",
-    )
-    if unadopted_projection is not None or not unadopted_failures:
-        failures.append(
-            "the family-transition projection accepted a workflow that never "
-            "adopted the `-ebpf-tools` family"
-        )
-    # A baseline that already carries the added job is not the shape the
-    # projection maps onto.
-    if not release_two_family_anchor_errors(
-        three_family_release,
-        "self-test release workflow",
-    ):
-        failures.append(
-            "an already-adopted baseline was accepted as the two-family "
-            "starting point of the admitted adoption"
-        )
-    if release_two_family_anchor_errors(
-        two_family_release,
-        "self-test release workflow",
-    ):
-        failures.append("the two-family release fixture was not read as the baseline")
-    # Withholding is scoped to the release workflow and to the adoption itself:
-    # any other source, and any pair that is not an admitted transition, reaches
-    # the surface comparison as the unmodified revisions.
-    for scope_label, scope_source, scope_base, scope_proposed in (
-        ("another workflow", "CI workflow", two_family_release, three_family_release),
-        (
-            "an unchanged release workflow",
-            "release workflow",
-            two_family_release,
-            two_family_release,
-        ),
-        (
-            "a rollback",
-            "release workflow",
-            three_family_release,
-            two_family_release,
-        ),
-    ):
-        scope_baseline, scope_rendered, scope_errors = (
-            release_family_transition_surface_contents(
-                scope_base,
-                scope_proposed,
-                scope_source,
-            )
-        )
-        if (
-            scope_errors
-            or scope_baseline != scope_base
-            or scope_rendered != scope_proposed
-        ):
-            failures.append(
-                f"the family-transition projection was applied to {scope_label}"
-            )
-
-    # The admitted adoption now passes the surface comparison, in this direction
-    # only, and taking the third family back out is still refused.
+    # `compare_pr_workflow_job` hashes every job it reads as Cross-sensitive
+    # and also holds the publication contract. An unchanged release workflow
+    # passes it. Representatives of the tamper table above, including removal
+    # of the third family, are carried all the way through it; a full
+    # comparison per entry would rescan two complete workflows for a property
+    # the contract decides on its own.
     if compare_pr_workflow_job(
-        two_family_release,
-        three_family_release,
+        release_fixture,
+        release_fixture,
         "release workflow",
         "build-release-arm64-cross",
     ):
         failures.append(
-            "the exact `-ebpf-tools` adoption was rejected by the Cross surface "
-            "comparison"
+            "an unchanged release workflow was rejected by the pull-request "
+            "workflow comparison"
         )
-    if not compare_pr_workflow_job(
-        three_family_release,
-        two_family_release,
-        "release workflow",
-        "build-release-arm64-cross",
-    ):
-        failures.append(
-            "removing the adopted `-ebpf-tools` family was not rejected by the "
-            "pull-request workflow comparison"
-        )
-
-    # Tampering with any transitioned publication control keeps the withholding
-    # switched off entirely: the projection is gated on the complete contract,
-    # so every entry of the full tamper table above is compared as the
-    # unmodified revisions and stays rejected. This is asserted directly rather
-    # than through a full comparison per entry, which would rescan two complete
-    # workflows thirty times over for a property the gate decides on its own.
-    for label, tampered in partial_adoptions.items():
-        for tamper_base_label, tamper_base in (
-            ("before adoption", two_family_release),
-            ("after adoption", three_family_release),
-        ):
-            _, tamper_rendered, _ = release_family_transition_surface_contents(
-                tamper_base,
-                tampered,
-                "release workflow",
-            )
-            if tamper_rendered != tampered:
-                failures.append(
-                    f"a tampered `-ebpf-tools` adoption ({label}, "
-                    f"{tamper_base_label}) was granted the transition "
-                    "withholding"
-                )
-    # Two representatives — one that breaks the added job's own contract, one
-    # that breaks a transitioned pre-existing job — are carried all the way
-    # through the pull-request comparison the withholding lives in.
     for label in (
+        "tools manifest job removed but its uploads kept",
         "tools manifest moved to an attacker-controlled runner",
         "extra producer step rewrites the Docker context",
     ):
-        tampered = partial_adoptions.get(label)
+        tampered = release_tampers.get(label)
         if tampered is None:
             failures.append(
-                f"the {label!r} tamper case is no longer in the adoption table"
+                f"the {label!r} tamper case is no longer in the release tamper table"
             )
             continue
         if not compare_pr_workflow_job(
-            two_family_release,
+            release_fixture,
             tampered,
             "release workflow",
             "build-release-arm64-cross",
         ):
             failures.append(
-                f"a partial `-ebpf-tools` adoption ({label}) was allowed by the "
+                f"a release workflow tamper ({label}) was allowed by the "
                 "pull-request workflow comparison"
             )
 
-    # An otherwise perfect adoption may not smuggle a Cross surface with it.
-    # Every case below satisfies the complete three-family publication contract,
-    # so the projection runs; the surface it adds survives the projection and is
-    # rejected exactly as it would be without an adoption in flight.
-    def adopted_fixture_with_job(job_block: str, label: str) -> str:
-        spliced = three_family_release.replace(
-            RELEASE_FIXTURE_JOB_ANCHOR,
-            "\n" + job_block + RELEASE_FIXTURE_JOB_ANCHOR,
-            1,
-        )
-        if spliced == three_family_release:
-            failures.append(
-                f"the adopted release fixture job anchor did not match for {label}"
-            )
-        return spliced
-
-    smuggled_adoptions = {
-        "added Cross build job": adopted_fixture_with_job(
+    # A release workflow that satisfies the complete publication contract may
+    # still not carry a Cross surface outside the protected job: the surface it
+    # adds is rejected by the comparison whatever else is valid.
+    smuggled_surfaces = {
+        "added Cross build job": release_fixture_with_job(
             "  smuggled-cross:\n"
             "    runs-on: ubuntu-26.04\n"
             "    steps:\n"
             f"      - run: cross build --target {TARGET}\n",
             "the smuggled Cross build",
         ),
-        "added flow-spelled Cross build job": adopted_fixture_with_job(
+        "added flow-spelled Cross build job": release_fixture_with_job(
             "  smuggled-flow-cross:\n"
             "    runs-on: ubuntu-26.04\n"
             f"    steps: [{{run: cross build --target {TARGET}}}]\n",
             "the smuggled flow-spelled Cross build",
         ),
-        "added Cross configuration job": adopted_fixture_with_job(
+        "added Cross configuration job": release_fixture_with_job(
             "  smuggled-cross-config:\n"
             "    runs-on: ubuntu-26.04\n"
             "    env:\n"
@@ -29377,37 +27089,31 @@ pre_build = []
             "      - run: echo staged\n",
             "the smuggled Cross configuration",
         ),
-        # Inside a transitioned job, outside its frozen text: `create-release`
-        # has no closed field set, so this is the case the projection must not
-        # launder along with the frozen fragments it restores.
-        "Cross configuration added to a transitioned job": (
-            three_family_release.replace(
-                RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
-                RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS
+        # Inside a publication job, outside its frozen fields: `create-release`
+        # has no closed field set, so only the surface comparison sees this.
+        "Cross configuration added to a publication job": (
+            release_fixture.replace(
+                release_control["create-release"]["needs"],
+                release_control["create-release"]["needs"]
                 + "    env:\n      CROSS_CONFIG: attacker.toml\n",
                 1,
             )
         ),
     }
-    for label, smuggled in smuggled_adoptions.items():
-        if smuggled == three_family_release:
-            failures.append(f"the {label} adoption fixture did not change anything")
+    for label, smuggled in smuggled_surfaces.items():
+        if smuggled == release_fixture:
+            failures.append(f"the {label} release fixture did not change anything")
             continue
         if not compare_pr_workflow_job(
-            two_family_release,
+            release_fixture,
             smuggled,
             "release workflow",
             "build-release-arm64-cross",
         ):
-            failures.append(
-                f"an `-ebpf-tools` adoption carrying a {label} was accepted"
-            )
+            failures.append(f"a release workflow carrying a {label} was accepted")
 
-    # Injecting the third digest name space into a workflow that has not adopted
-    # the family, and into one that has, are separate failures: before adoption
-    # the family may not be named at all, and after it the name space belongs to
-    # exactly one job.
-    injected_tools_upload = (
+    # The third digest name space belongs to exactly one job.
+    injected = release_fixture + (
         "\n"
         "  unrelated:\n"
         "    runs-on: ubuntu-26.04\n"
@@ -29416,44 +27122,19 @@ pre_build = []
         "        with:\n"
         f"          name: {RELEASE_TOOLS_DIGEST_PREFIX}evil\n"
     )
-    for label, base_fixture in (
-        ("before adoption", two_family_release),
-        ("after adoption", three_family_release),
-    ):
-        injected = base_fixture + injected_tools_upload
-        if not validate_publish_control_contract(injected, "release workflow"):
-            failures.append(
-                f"a `-ebpf-tools` digest name-space injection {label} was accepted"
-            )
-        if not compare_pr_publish_control_contract(
-            base_fixture,
-            injected,
-            "release workflow",
-        ):
-            failures.append(
-                f"a `-ebpf-tools` digest name-space injection {label} was allowed "
-                "by the merge-base comparison"
-            )
-
-    # Naming the family without the frozen jobs is a partial adoption too, even
-    # when nothing is uploaded.
-    tools_tag_only = two_family_release.replace(
-        "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n",
-        "            -t ferrumedge/ferrum-edge:latest-ebpf-tools \\\n"
-        "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n",
-        1,
-    )
-    if tools_tag_only == two_family_release:
-        failures.append("the `-ebpf-tools` tag-only fixture did not change anything")
-    elif not compare_pr_publish_control_contract(
-        two_family_release,
-        tools_tag_only,
+    if not validate_publish_control_contract(injected, "release workflow"):
+        failures.append("a `-ebpf-tools` digest name-space injection was accepted")
+    if not compare_pr_publish_control_contract(
+        release_fixture,
+        injected,
         "release workflow",
     ):
-        failures.append("an unbacked `-ebpf-tools` publish tag was not rejected")
+        failures.append(
+            "a `-ebpf-tools` digest name-space injection was allowed by the "
+            "merge-base comparison"
+        )
 
     for wildcard_source, wildcard_job, wildcard_token in (
-        ("CI workflow", "latest-release", "release-assets/*"),
         ("release workflow", "create-release", "files: release-assets/*"),
         ("release workflow", "docker-manifest", "docker buildx imagetools create"),
         (
@@ -29559,7 +27240,11 @@ pre_build = []
             execution_jobs = (
                 AMBIENT_HOST_UDP_LIVE_JOB
                 + "\n"
-                + AMBIENT_HOST_UDP_IMAGE_JOB
+                + AMBIENT_REGISTRY_IMAGE_READ_JOB
+                + "\n"
+                + AMBIENT_REGISTRY_IMAGE_WRITE_JOB
+                + "\n"
+                + AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB
                 + "\n"
                 + AMBIENT_HOST_UDP_GATE_JOB
             )
@@ -29596,25 +27281,84 @@ pre_build = []
     if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
         failures.append("the trusted-base relevance contract was rejected")
 
+    # GHSA-c57q-j5hg-w4vc: the required Gateway API gate must not decide its
+    # relevance with the pull request's own filter copy, either by running it
+    # directly (the pre-advisory shape) or by reading it from the checkout
+    # instead of the pinned trusted blob.
+    gateway_name = "gateway-api-conformance.yml"
+    gateway_contract = LIVE_SUITE_RELEVANCE_CONTRACTS.get(gateway_name)
+    if gateway_contract is None or gateway_contract[4] != "gateway-api":
+        failures.append(
+            "Gateway API Conformance must decide relevance through the trusted-base "
+            "gateway-api suite contract"
+        )
+    else:
+        gateway_trusted_job = live_suite_relevance_job(
+            gateway_contract[2], gateway_contract[3], gateway_contract[4]
+        )
+        pr_supplied_gateway_job = (
+            "  changes:\n"
+            f"    name: {gateway_contract[2]}\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    outputs:\n"
+            "      relevant: ${{ steps.filter.outputs.relevant }}\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
+            "      - id: filter\n"
+            "        run: |\n"
+            "          python3 .github/scripts/live_suite_path_filter.py --self-test\n"
+            "          plan=\"$(python3 .github/scripts/live_suite_path_filter.py "
+            "--suite gateway-api --changed-files changed.txt)\"\n"
+            "          printf '%s\\n' \"$plan\" | sed -n 's/^relevant=//p' "
+            ">> \"$GITHUB_OUTPUT\"\n"
+        )
+        checkout_read_gateway_job = gateway_trusted_job.replace(
+            'git cat-file blob "$entry_object" > "$trusted_filter"',
+            'cp -- "$filter_path" "$trusted_filter"',
+            1,
+        )
+        if checkout_read_gateway_job == gateway_trusted_job:
+            failures.append(
+                "self-test: the checkout-read Gateway API fixture must alter the job"
+            )
+        for label, job in (
+            ("runs the pull request's own filter", pr_supplied_gateway_job),
+            ("reads the filter from the checkout", checkout_read_gateway_job),
+        ):
+            mutated = dict(relevance_workflows)
+            mutated[gateway_name] = mutated[gateway_name].replace(
+                gateway_trusted_job, job, 1
+            )
+            if mutated[gateway_name] == relevance_workflows[gateway_name]:
+                failures.append(
+                    f"self-test: Gateway API relevance fixture that {label} "
+                    "did not alter the workflow"
+                )
+                continue
+            if not any(
+                f"{gateway_name} job 'changes' must be exactly the trusted-base "
+                "relevance contract" in error
+                for error in live_suite_relevance_errors(mutated, "self-test workflows")
+            ):
+                failures.append(
+                    f"a Gateway API relevance job that {label} was accepted"
+                )
+
     registry_workflows = dict(relevance_workflows)
     ambient_name = "ambient-host-udp-live.yml"
-    registry_workflows[ambient_name] = registry_workflows[ambient_name].replace(
-        AMBIENT_HOST_UDP_IMAGE_JOB,
-        AMBIENT_REGISTRY_IMAGE_READ_JOB + "\n"
-        + AMBIENT_REGISTRY_IMAGE_WRITE_JOB + "\n"
-        + AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
-        1,
-    )
-    if live_suite_relevance_errors(registry_workflows, "registry-cache fixture"):
-        failures.append("the complete Ambient registry-cache generation was rejected")
     # Whole-job equality keeps target execution, token scope and success
-    # aggregation coupled; each incomplete generation must remain rejected.
+    # aggregation coupled; each incomplete registry generation is rejected.
     for label, old_text, new_text in (
         ("missing reader", AMBIENT_REGISTRY_IMAGE_READ_JOB, ""),
         ("missing writer", AMBIENT_REGISTRY_IMAGE_WRITE_JOB, ""),
         ("missing image aggregate", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB, ""),
-        ("mixed generations", AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB, AMBIENT_HOST_UDP_IMAGE_JOB),
         ("missing cache export", "mode=max,image-manifest=true,oci-mediatypes=true", "mode=min"),
+        (
+            "GHA cache backend",
+            "cache-from: type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:",
+            "cache-from: type=gha,scope=ambient-host-udp-images\n"
+            "          # type=registry,ref=ghcr.io/ferrum-edge/ferrum-edge-buildcache:",
+        ),
     ):
         mutated = dict(registry_workflows)
         mutated[ambient_name] = mutated[ambient_name].replace(old_text, new_text, 1)
@@ -29622,77 +27366,6 @@ pre_build = []
             failures.append(f"registry-cache fixture did not change: {label}")
         elif not live_suite_relevance_errors(mutated, f"registry-cache {label}"):
             failures.append(f"incomplete registry-cache generation accepted: {label}")
-
-    image_cache_budget = ambient_host_udp_image_cache_budget_errors(
-        AMBIENT_HOST_UDP_IMAGE_JOB, "self-test-ambient-image-cache"
-    )
-    if image_cache_budget:
-        failures.append(
-            "the frozen Ambient image job failed its cache-budget contract: "
-            + "; ".join(image_cache_budget)
-        )
-
-    unconditional_image_job = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
-        AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO,
-        AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO,
-    )
-    if unconditional_image_job == AMBIENT_HOST_UDP_IMAGE_JOB:
-        failures.append(
-            "the unconditional Ambient cache-to self-test mutation is stale"
-        )
-    elif not any(
-        "unconditionally from pull requests" in item
-        for item in ambient_host_udp_image_cache_budget_errors(
-            unconditional_image_job,
-            "self-test-unconditional-ambient-cache-to",
-        )
-    ):
-        failures.append(
-            "self-test: restoring unconditional Ambient cache-to must fail"
-        )
-
-    skipped_image_job = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
-        "- name: Build the capture tool base stage\n"
-        "        uses: docker/build-push-action@",
-        "- name: Build the capture tool base stage\n"
-        "        if: github.event_name == 'workflow_dispatch'\n"
-        "        uses: docker/build-push-action@",
-        1,
-    )
-    if skipped_image_job == AMBIENT_HOST_UDP_IMAGE_JOB:
-        failures.append(
-            "the skipped Ambient image-build self-test mutation is stale"
-        )
-    elif not any(
-        "must not skip the required image build" in item
-        for item in ambient_host_udp_image_cache_budget_errors(
-            skipped_image_job, "self-test-skipped-ambient-image-build"
-        )
-    ):
-        failures.append(
-            "self-test: gating a required Ambient image build on event name "
-            "must fail"
-        )
-
-    main_only_without_pr_guard = AMBIENT_HOST_UDP_IMAGE_JOB.replace(
-        "github.event_name != 'pull_request' && github.event_name != 'merge_group' && ",
-        "",
-    )
-    if main_only_without_pr_guard == AMBIENT_HOST_UDP_IMAGE_JOB:
-        failures.append(
-            "the Ambient cache-to pull_request/merge_group guard mutation is stale"
-        )
-    elif not any(
-        "gate all three Ambient image cache-to exports" in item
-        for item in ambient_host_udp_image_cache_budget_errors(
-            main_only_without_pr_guard,
-            "self-test-ambient-cache-to-without-pr-guard",
-        )
-    ):
-        failures.append(
-            "self-test: Ambient cache-to without pull_request/merge_group "
-            "exclusions must fail"
-        )
 
     relevance_mutations: dict[str, tuple[str, str]] = {
         "pull-request-supplied filter": (
@@ -29986,7 +27659,8 @@ pre_build = []
         **relevance_workflows,
         **node_waypoint_fixture,
         **isolated_fixture,
-        GATEWAY_WORKFLOW_FILENAME: gateway_validation_workflow,
+        # `relevance_workflows` already carries the governed
+        # gateway-api-conformance.yml fixture (GHSA-c57q-j5hg-w4vc).
         CROSS_IMAGE_REFRESH_WORKFLOW: "name: Cross image inventory\n"
         + CROSS_IMAGE_REFRESH_TRIGGER
         + "jobs:\n"
@@ -30131,13 +27805,8 @@ pre_build = []
     )
     ambient_mutation(
         "removed production-image contract job",
-        "\n" + AMBIENT_HOST_UDP_IMAGE_JOB,
+        "\n" + AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
         "",
-    )
-    ambient_mutation(
-        "unconditional GHA cache-to",
-        AMBIENT_HOST_UDP_IMAGE_GATED_CACHE_TO,
-        AMBIENT_HOST_UDP_IMAGE_UNCONDITIONAL_CACHE_TO,
     )
     ambient_mutation(
         "event-gated production-image build",
@@ -30536,12 +28205,9 @@ pre_build = []
                 "the parser-target smoke loop relaxes "
                 f"{shared_bound}, which the six-target loop still enforces"
             )
-    # The scheduled lane and the push-to-main sanitizer smoke install no
-    # compiler cache at all, so they clear every wrapper input the root Cargo
-    # config sets. This assertion used to cover the #2461 fuzz-smoke shape too,
-    # because it also disabled caching. That generation is gone: every
-    # fuzz-smoke generation since deliberately DOES use the checksum-pinned
-    # sccache installer, so asserting the opposite of it here would be false.
+    # No fuzz lane installs a compiler-cache wrapper (the property gate dropped
+    # its never-persisted sccache store after 0 measured hits, #7285), so each
+    # clears every wrapper input the root Cargo config or runner could set.
     cargo_override_block = (
         '    env:\n'
         '      RUSTC_WRAPPER: ""\n'
@@ -30551,35 +28217,16 @@ pre_build = []
     for admitted_label, admitted_text in (
         ("scheduled fuzz lane", FUZZ_WORKFLOW),
         ("push-to-main fuzz sanitizer smoke", FUZZ_SANITIZER_SMOKE_WORKFLOW),
+        ("adopted fuzz-smoke generation", CI_FUZZ_SMOKE_JOB),
     ):
         if cargo_override_block not in admitted_text:
             failures.append(
                 f"the {admitted_label} no longer disables repository sccache "
                 "wrapper inputs and inherited linker rustflags"
             )
-    # The adopted generation deliberately does the opposite for the wrapper: it
-    # leaves the name unset so the pinned installer's fail-closed GITHUB_ENV
-    # decision is the one cargo sees. Everything that makes that safe is
-    # asserted here rather than left to the prose of the contract.
-    if '    env:\n      RUSTFLAGS: ""\n' not in CI_FUZZ_SMOKE_JOB:
+    if "uses: ./.github/actions/" in CI_FUZZ_SMOKE_JOB:
         failures.append(
-            "the adopted fuzz-smoke generation no longer clears the inherited "
-            "linker rustflags of the root Cargo configuration"
-        )
-    if '      RUSTC_WRAPPER: ""\n' in CI_FUZZ_SMOKE_JOB:
-        failures.append(
-            "the adopted fuzz-smoke generation pins a job-level rustc wrapper, "
-            "which would override the pinned installer's fail-closed decision"
-        )
-    if CI_FUZZ_SMOKE_JOB.count("uses: ./.github/actions/") != 1:
-        failures.append(
-            "the adopted fuzz-smoke generation must reference exactly one local "
-            "action"
-        )
-    if "      - uses: ./.github/actions/setup-sccache\n" not in CI_FUZZ_SMOKE_JOB:
-        failures.append(
-            "the adopted fuzz-smoke generation no longer uses the repository's "
-            "checksum-pinned sccache installer"
+            "the adopted fuzz-smoke generation must reference no local action"
         )
     if (
         "id-token:" in CI_FUZZ_SMOKE_JOB
@@ -30845,13 +28492,18 @@ pre_build = []
             "github.ref == 'refs/heads/main' }}\n",
             "          save-if: true\n",
         ),
-        "unpinned third-party sccache installer": (
-            "      - uses: ./.github/actions/setup-sccache\n",
-            "      - uses: mozilla-actions/sccache-action@v0.0.9\n",
+        "third-party sccache installer": (
+            "      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000\n",
+            "      - uses: mozilla-actions/sccache-action@v0.0.9\n\n"
+            "      - uses: Swatinem/rust-cache@0000000000000000000000000000000000000000\n",
+        ),
+        "rustc wrapper input left to the runner": (
+            '      RUSTC_WRAPPER: ""\n',
+            "",
         ),
         "credential-bearing cache backend": (
-            '    env:\n      RUSTFLAGS: ""\n',
-            '    env:\n      RUSTFLAGS: ""\n      SCCACHE_GHA_ENABLED: "true"\n',
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n',
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n      SCCACHE_GHA_ENABLED: "true"\n',
         ),
         "cache directory escape": (
             "          cargo test --locked\n",

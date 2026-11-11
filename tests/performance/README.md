@@ -13,7 +13,6 @@ duration, build profile, and comparison baseline.
 
 | Suite | Entry point | Measures | Result/provenance docs |
 |---|---|---|---|
-| HTTP wrk smoke | `./run_perf_test.sh` | Local HTTP/1.1 gateway overhead against a direct Hyper backend using `wrk`. Useful for quick development smoke tests. | This README. Raw wrk output and `performance_report.html` are generated per run. |
 | CI HTTP overhead gate | `ci_overhead_bench.py` | Short self-relative HTTP overhead regression check run by `performance-regression.yml`. | CI artifacts under `tests/performance/ci_results/`. |
 | Published multi-protocol numbers | [`multi_protocol/run_published_benchmark.sh`](multi_protocol/run_published_benchmark.sh) | Repeated, provenance-stamped runs of the multi-protocol matrix: throughput per payload size, light-load added latency, and gateway CPU per request, summarized as medians with spread. | [`multi_protocol/README.md#publishing-numbers`](multi_protocol/README.md#publishing-numbers). |
 | Multi-protocol matrix | [`multi_protocol/`](multi_protocol/) | HTTP/1.1, HTTPS, HTTP/2, HTTP/3, WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS through Ferrum and direct backend baselines. Also includes Envoy comparison and connection saturation harnesses. | [`multi_protocol/README.md`](multi_protocol/README.md). |
@@ -39,36 +38,9 @@ Every checked-in benchmark result should state:
 If one of these fields is unknown, mark the result as historical or
 directional instead of presenting it as a current headline number.
 
-## Quick HTTP Smoke Test
-
-The root `run_perf_test.sh` harness is a local HTTP smoke test:
-
-```bash
-cd tests/performance
-
-# Requires wrk, Python 3, and a Rust toolchain.
-./run_perf_test.sh
-```
-
-Environment variables:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `WRK_DURATION` | `30s` | Test duration for each wrk phase. |
-| `WRK_THREADS` | `8` | Number of wrk worker threads. |
-| `WRK_CONNECTIONS` | `100` | Concurrent wrk connections. |
-
-The harness starts a direct Hyper backend, starts Ferrum Edge in file mode with
-`perf_config.yaml`, runs wrk against gateway health/users endpoints and the
-direct backend, then writes raw wrk output plus an optional
-`performance_report.html`.
-
-This smoke test intentionally covers a narrow HTTP/1.1 path. Use
-`multi_protocol/` or `payload_size/` for headline protocol claims.
-
 ## Port conflicts and cleanup ownership
 
-Every runner in this tree (`run_perf_test.sh`, `multi_protocol/run_*`,
+Every runner in this tree (`multi_protocol/run_*`,
 `payload_size/run_payload_test.sh`, and the `mesh-dns-e2e` / `mesh-hbone-e2e`
 `run.sh` harnesses) checks its fixed ports before starting and exits with a
 clear diagnostic if one is already bound, rather than terminating the listener.
@@ -79,23 +51,9 @@ failed start cannot kill or remove an unrelated local service's resources.
 
 ## Requirements
 
-- `wrk` for `run_perf_test.sh`.
 - Python 3 for report generation and CI overhead scripts.
 - Rust toolchain and `protoc` for Rust benchmark binaries.
 - Docker/kind only for suites that explicitly say they need them.
-
-Install `wrk`:
-
-```bash
-# macOS
-brew install wrk
-
-# Ubuntu/Debian
-sudo apt-get install wrk
-
-# CentOS/RHEL
-sudo yum install wrk
-```
 
 ## CI and Manual Workflows
 

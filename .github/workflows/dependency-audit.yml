@@ -1,8 +1,7 @@
 name: Dependency Audit
 
 # Scheduled supply-chain governance for the dependency tree and the vendored,
-# patched crates (reqwest / h3 / tungstenite / tokio-tungstenite / dimpl —
-# canonically docs/vendored-patch-lifecycle.json). The blocking
+# patched crates listed in docs/vendored-patch-lifecycle.json. The blocking
 # advisories gate also runs per-PR in ci.yml; this workflow re-checks against the
 # latest advisory database WITHOUT a PR (so a newly-published RUSTSEC advisory is
 # caught within a week even on a quiet repo) and adds two time-sensitive checks
@@ -37,7 +36,7 @@ jobs:
     name: Advisories & exception expiry
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -51,7 +50,7 @@ jobs:
         with:
           # cargo-deny pinned to the validated schema version; cargo-audit is a
           # non-blocking second opinion, so it tracks latest.
-          tool: cargo-deny@0.19.9,cargo-audit
+          tool: cargo-deny@0.20.2,cargo-audit
 
       - name: cargo-deny (advisories, bans, sources, licenses)
         # Same blocking policy as the per-PR gate, re-evaluated against the
@@ -71,8 +70,8 @@ jobs:
         # never pulls in); with `unused-ignored-advisory = "deny"` those entries
         # would otherwise fail this run for not matching anything here.
         run: >-
-          cargo deny --manifest-path ebpf/Cargo.toml
-          check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
+          cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
+          check --allow advisory-not-detected advisories bans sources licenses
 
       - name: cargo-deny advisories (standalone Cargo workspaces)
         # Every standalone Cargo workspace (fuzz/, tests/performance/**, and any
@@ -90,8 +89,8 @@ jobs:
           failed=0
           for manifest in "${manifests[@]}"; do
             echo "::group::cargo deny advisories ${manifest}"
-            if ! cargo deny --manifest-path "$manifest" \
-              check --allow advisory-not-detected --config deny.toml advisories; then
+            if ! cargo deny --manifest-path "$manifest" --config deny.toml \
+              check --allow advisory-not-detected advisories; then
               echo "::error file=${manifest}::cargo-deny advisories failed for ${manifest}"
               failed=1
             fi
@@ -148,7 +147,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

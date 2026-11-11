@@ -64,7 +64,7 @@ jobs:
       INPUT_SKIP_GATEWAYS: ${{ inputs.skip_gateways }}
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -84,7 +84,9 @@ jobs:
           # Host builds use a nested workspace; root target/ has no reuse here.
           cache-targets: "false"
           cache-directories: ${{ github.workspace }}/.cache/sccache
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Dispatch-only lane: it never runs on a push to main, so it never
+          # saves (see docs/ci_cd.md, 10 GB quota policy).
+          save-if: "false"
 
       - name: Install system dependencies
         run: |
@@ -552,7 +554,6 @@ jobs:
               # Compute win counts: for each (proto, ep), which gateway had highest RPS?
               wins = {}  # gw -> win count
               total_scenarios = 0
-              scenario_winners = []  # [(proto, ep, winner_gw, rps)]
 
               for proto in PROTOCOLS:
                   for ep in ENDPOINTS:
@@ -568,7 +569,6 @@ jobs:
                       if best_gw:
                           wins[best_gw] = wins.get(best_gw, 0) + 1
                           total_scenarios += 1
-                          scenario_winners.append((proto, ep, best_gw, best_rps))
 
               # Key-auth scenario
               if key_auth:
@@ -584,7 +584,6 @@ jobs:
                   if best_ka_gw:
                       wins[best_ka_gw] = wins.get(best_ka_gw, 0) + 1
                       total_scenarios += 1
-                      scenario_winners.append(("key_auth", "users-auth", best_ka_gw, best_ka_rps))
 
               lines.append(f"**Scenario Wins** (out of {total_scenarios} test scenarios):\n")
               lines.append("| Gateway | Wins | Win Rate |")

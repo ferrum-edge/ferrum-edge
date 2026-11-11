@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Runner syntax and summarizer tests
@@ -100,7 +100,7 @@ jobs:
       ALLOC_DURATION: ${{ inputs.duration }}
       ALLOC_ROUNDS: ${{ inputs.rounds }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The baseline commit must be present for its worktree.
           fetch-depth: 0

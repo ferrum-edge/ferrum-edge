@@ -97,7 +97,8 @@ also directly inspected the decisive raw gateway records and pinned source.
 
 ## What the extension can and cannot answer
 
-The [temporary lane contract](../tests/performance/multi_protocol/h2_guard/README.md)
+The temporary lane contract (`tests/performance/multi_protocol/h2_guard/README.md`,
+retired with the lane under #7279)
 describes numeric transition tails, exact pending/high-water/minimum-credit
 state, byte-window and receive-poll epochs, memory/emission caps, reserved
 failure emission, explicit live snapshots and independent HTTP/log-fence

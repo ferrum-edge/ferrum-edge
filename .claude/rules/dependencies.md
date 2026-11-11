@@ -82,8 +82,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   action refs, pipe-to-shell installers, and unverified tool downloads. The
   pull request's proposed policy is tested separately but never controls gates.
 - `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the
-  trusted revision before `uses:`; the admitted checker generation is bound
-  inside `verify_trusted_local_action.py`, never supplied by the candidate.
+  trusted revision before `uses:`; `verify_trusted_local_action.py` admits only
+  byte identity with the trusted tree, never a candidate-supplied generation.
 - A committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
 
@@ -100,8 +100,10 @@ sections:
   PR-mutable parity check). → "Publish-blocking required checks".
 - Live-suite relevance (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`,
   `LIVE_SUITE_RELEVANCE_CONTRACTS`): required live gates decide relevance from a
-  pinned trusted-base `live_suite_path_filter.py`, and governed live workflows
-  carry no workflow-level `paths:` filter. Extending the contract set is
+  pinned trusted-base `live_suite_path_filter.py` (Gateway API Conformance,
+  the mesh/multicluster/Ambient live gates, and the optional Istio status CAS
+  and CNI lifecycle suites), and governed live workflows carry no
+  workflow-level `paths:` filter. Extending the contract set is
   direct-to-`main`. `NodeWaypoint eBPF Live`, `Istio Status CAS Live`, and
   `CNI Lifecycle Live` are not branch-protection-required; never add them to
   `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`. →
@@ -119,10 +121,10 @@ sections:
   exactly once in its host (a generation that carries the budget, or
   `fuzz-smoke-main.yml` beside one that does not; `fuzz_budget_placement_errors`).
   → "Admitted `fuzz-smoke` generations".
-- Release image families (`RELEASE_IMAGE_FAMILY_GENERATIONS`): `release.yml` is
-  either the two-family shape or the complete three-family `-ebpf-tools`
-  contract; the trusted base decides, and a three-family base refuses a revert.
-  → "Admitted release image-family adoption".
+- Release image families (`PUBLISH_CONTROL_CONTRACTS`, `DIGEST_ARTIFACT_OWNERS`):
+  `release.yml` must carry the complete three-family (`-ebpf-tools`) publication
+  contract, as an absolute check and against the trusted base; dropping a family
+  is a direct-to-`main` policy edit. → "Release image-family contract".
 - GNU producer (`LINUX_GNU_X86_PRODUCERS`, `linux_gnu_producer_contract_errors`):
   the published x86_64 GNU binaries are built only by `release.yml`'s
   `build-release-binaries` in the digest-pinned AlmaLinux 8.10 sysroot and are

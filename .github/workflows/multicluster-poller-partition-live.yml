@@ -37,7 +37,7 @@ jobs:
       relevant: ${{ steps.filter.outputs.relevant }}
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -219,15 +219,18 @@ jobs:
           fi
 
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           # Same default-feature `pr-build` ferrum-edge graph as the other
-          # live labs that compile only that binary. Do not share with
-          # extra-binary, extra-feature, or debug-profile lanes.
+          # live labs that compile only that binary. No main-push job produces
+          # this lane (10 GB quota policy, docs/ci_cd.md), so it restores
+          # nothing today; it stays a consumer-only key so a future producer
+          # needs no edit here. Do not share with extra-binary, extra-feature,
+          # or debug-profile lanes.
           shared-key: "ci-live-pr-build"
 
       - name: Build runtime binary
@@ -312,13 +315,13 @@ jobs:
 
       - name: Checkout validator
         if: steps.summarize.outputs.validate == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download emitted evidence
         if: steps.summarize.outputs.validate == 'true'
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: multicluster-poller-partition-results
           path: multicluster-poller-partition-artifact

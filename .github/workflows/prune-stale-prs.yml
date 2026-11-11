@@ -5,6 +5,11 @@ name: Prune Stale PRs and Branches
 #   explicit `refs/heads/<branch>` ref, so a same-named tag can never be hit.
 # - Protected branches (main, master, develop, release/*) are always skipped.
 # - A branch that is the head of any OPEN PR is always skipped (branch-reuse guard).
+# - A merged or closed PR's branch is deleted only while its live tip is still
+#   that PR's head commit (or, for a merged PR, is contained in the default
+#   branch). A branch name reused for new work keeps its new commits. Every
+#   deletion is leased to the inspected tip and logs it, so it can be restored
+#   with `git push origin <sha>:refs/heads/<branch>`.
 # - Only remote branches in THIS repo (forks excluded) are considered.
 # - Coverage rule: `gh pr list` defaults to only 30 results. Every call MUST pass
 #   `--limit "$PR_LIST_LIMIT"`, otherwise older PRs are silently skipped and their
@@ -61,7 +66,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: true
           fetch-depth: 0
@@ -76,19 +81,19 @@ jobs:
           REPO_OWNER="${GITHUB_REPOSITORY%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
 
-          # Head branches of MERGED PRs whose head repo is this repository (exclude forks).
+          # Fresh remote-tracking refs, so every tip below is the live remote tip.
+          git fetch --quiet --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+          # "branch<TAB>head commit" of every MERGED PR whose head repo is this
+          # repository (forks excluded). A branch name can recur across PRs.
           # --limit is mandatory (gh defaults to 30 and would skip older PRs).
-          MERGED_PRS=$(gh pr list --state merged --limit "$PR_LIST_LIMIT" \
-            --json headRefName,headRepositoryOwner,headRepository \
-            --jq "map(select(.headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName" | sort -u)
+          MERGED_HEADS=$(gh pr list --state merged --limit "$PR_LIST_LIMIT" \
+            --json headRefName,headRefOid,headRepositoryOwner,headRepository \
+            --jq "map(select(.headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[] | \"\(.headRefName)\t\(.headRefOid)\"" | sort -u)
 
           # Never delete a branch that is still the head of an OPEN PR (branch reuse).
           OPEN_BRANCHES=$(gh pr list --state open --limit "$PR_LIST_LIMIT" \
             --json headRefName --jq '.[].headRefName' | sort -u)
-
-          # Snapshot every live remote branch once (one network call, not one per branch).
-          LIVE_BRANCHES="$RUNNER_TEMP/live_branches.txt"
-          git ls-remote --heads origin | sed 's#.*refs/heads/##' | sort -u > "$LIVE_BRANCHES"
 
           DELETED_COUNT=0
           SKIPPED_COUNT=0
@@ -97,7 +102,7 @@ jobs:
             [[ -z "$branch" ]] && continue
 
             # Skip protected branches
-            if [[ "$branch" == "main" || "$branch" == "master" || "$branch" == "develop" || "$branch" == release/* ]]; then
+            if [[ "$branch" == "$DEFAULT_BRANCH" || "$branch" == "main" || "$branch" == "master" || "$branch" == "develop" || "$branch" == release/* ]]; then
               echo "⏭️ Skipping protected branch: $branch"
               SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
@@ -110,19 +115,33 @@ jobs:
               continue
             fi
 
-            # Exact-name existence check (no substring/regex false matches)
-            if grep -Fxq "$branch" "$LIVE_BRANCHES"; then
-              if [[ "$DRY_RUN" == "true" ]]; then
-                echo "🧪 [DRY RUN] Would delete merged PR branch: $branch"
-              else
-                echo "🗑️ Deleting merged PR branch: $branch"
-                git push origin --delete "refs/heads/$branch" || echo "⚠️ Failed to delete $branch"
-              fi
-              DELETED_COUNT=$((DELETED_COUNT + 1))
-            else
+            if ! tip=$(git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}"); then
               echo "✅ Already deleted: $branch"
+              continue
             fi
-          done <<< "$MERGED_PRS"
+
+            # Delete only a tip that carries no work beyond a merged PR: the
+            # head of one of this name's merged PRs (a squash merge leaves the
+            # tip there, not in the default branch), or a commit the default
+            # branch already contains. Anything else is the name reused.
+            if ! awk -F '\t' -v b="$branch" -v t="$tip" '$1 == b && $2 == t { found = 1 } END { exit !found }' <<< "$MERGED_HEADS" \
+              && ! git merge-base --is-ancestor "$tip" "refs/remotes/origin/$DEFAULT_BRANCH"; then
+              echo "⏭️ Skipping reused branch: $branch @ $tip is not a merged PR head"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "🧪 [DRY RUN] Would delete merged PR branch: $branch @ $tip"
+            elif git push --force-with-lease="refs/heads/$branch:$tip" \
+              origin --delete "refs/heads/$branch"; then
+              echo "🗑️ Deleted merged PR branch: $branch @ $tip"
+            else
+              echo "⚠️ Failed to delete $branch (the remote tip may have changed)"
+              continue
+            fi
+            DELETED_COUNT=$((DELETED_COUNT + 1))
+          done < <(cut -f1 <<< "$MERGED_HEADS" | sort -u)
 
           echo "deleted_count=$DELETED_COUNT" >> "$GITHUB_OUTPUT"
           echo "skipped_count=$SKIPPED_COUNT" >> "$GITHUB_OUTPUT"
@@ -131,13 +150,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
 
   prune-stale-closed-prs:
     name: Delete branches from stale closed (unmerged) PRs
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: true
           fetch-depth: 0
@@ -159,21 +179,21 @@ jobs:
           CUTOFF_DATE=$(date -u -d "$DAYS_STALE days ago" +%Y-%m-%dT%H:%M:%SZ)
           echo "Cutoff date: $CUTOFF_DATE"
 
-          # Closed-but-UNMERGED PRs in this repo, closed before the cutoff.
-          # --limit is mandatory (gh defaults to 30 and would skip older PRs).
+          # Fresh remote-tracking refs, so every tip below is the live remote tip.
+          git fetch --quiet --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+          # "branch<TAB>head commit" of closed-but-UNMERGED PRs in this repo,
+          # closed before the cutoff. --limit is mandatory (gh defaults to 30
+          # and would skip older PRs).
           # NB: `gh pr list --state closed` returns both CLOSED and MERGED PRs, so
           # the `mergedAt == null` filter is what isolates the truly-unmerged ones.
-          STALE_PRS=$(gh pr list --state closed --limit "$PR_LIST_LIMIT" \
-            --json headRefName,number,closedAt,mergedAt,headRepositoryOwner,headRepository \
-            --jq "map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\" and .headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName" | sort -u)
+          STALE_HEADS=$(gh pr list --state closed --limit "$PR_LIST_LIMIT" \
+            --json headRefName,headRefOid,number,closedAt,mergedAt,headRepositoryOwner,headRepository \
+            --jq "map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\" and .headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[] | \"\(.headRefName)\t\(.headRefOid)\"" | sort -u)
 
           # Never delete a branch that is still the head of an OPEN PR (branch reuse).
           OPEN_BRANCHES=$(gh pr list --state open --limit "$PR_LIST_LIMIT" \
             --json headRefName --jq '.[].headRefName' | sort -u)
-
-          # Snapshot every live remote branch once.
-          LIVE_BRANCHES="$RUNNER_TEMP/live_branches.txt"
-          git ls-remote --heads origin | sed 's#.*refs/heads/##' | sort -u > "$LIVE_BRANCHES"
 
           DELETED_COUNT=0
           SKIPPED_COUNT=0
@@ -195,18 +215,30 @@ jobs:
               continue
             fi
 
-            if grep -Fxq "$branch" "$LIVE_BRANCHES"; then
-              if [[ "$DRY_RUN" == "true" ]]; then
-                echo "🧪 [DRY RUN] Would delete stale closed PR branch: $branch"
-              else
-                echo "🗑️ Deleting stale closed PR branch: $branch"
-                git push origin --delete "refs/heads/$branch" || echo "⚠️ Failed to delete $branch"
-              fi
-              DELETED_COUNT=$((DELETED_COUNT + 1))
-            else
+            if ! tip=$(git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}"); then
               echo "✅ Already deleted: $branch"
+              continue
             fi
-          done <<< "$STALE_PRS"
+
+            # Delete only while the live tip is still a stale closed PR's head;
+            # any other tip is the name reused for new work.
+            if ! awk -F '\t' -v b="$branch" -v t="$tip" '$1 == b && $2 == t { found = 1 } END { exit !found }' <<< "$STALE_HEADS"; then
+              echo "⏭️ Skipping reused branch: $branch @ $tip is not a stale closed PR head"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "🧪 [DRY RUN] Would delete stale closed PR branch: $branch @ $tip"
+            elif git push --force-with-lease="refs/heads/$branch:$tip" \
+              origin --delete "refs/heads/$branch"; then
+              echo "🗑️ Deleted stale closed PR branch: $branch @ $tip"
+            else
+              echo "⚠️ Failed to delete $branch (the remote tip may have changed)"
+              continue
+            fi
+            DELETED_COUNT=$((DELETED_COUNT + 1))
+          done < <(cut -f1 <<< "$STALE_HEADS" | sort -u)
 
           echo "deleted_count=$DELETED_COUNT" >> "$GITHUB_OUTPUT"
           echo "skipped_count=$SKIPPED_COUNT" >> "$GITHUB_OUTPUT"
@@ -221,7 +253,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: true
           fetch-depth: 0
@@ -338,22 +370,3 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           ORPHAN_MERGED_GRACE_DAYS: '1'
-
-  cleanup-local-refs:
-    name: Prune remote-tracking branches
-    runs-on: ubuntu-26.04
-    needs: [prune-merged-branches, prune-stale-closed-prs, prune-orphan-branches]
-    if: github.event.inputs.dry_run != 'true'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Prune remote-tracking branches
-        run: |
-          echo "🧹 Pruning remote-tracking branches..."
-          git remote prune origin
-          echo "✅ Remote-tracking branches pruned"

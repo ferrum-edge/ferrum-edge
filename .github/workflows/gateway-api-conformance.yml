@@ -48,16 +48,33 @@ jobs:
   changes:
     name: Gateway API conformance trigger
     runs-on: ubuntu-26.04
+    permissions:
+      contents: read
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
           fetch-depth: 0
 
-      - name: Check for Gateway API conformance changes
+      # Relevance decides whether a REQUIRED live gate runs at all, so it must
+      # never be computed by code the pull request supplies: a PR that widens
+      # its own suite patterns could declare itself irrelevant, skip the live
+      # job, and still turn the required check green.
+      #
+      # Everything below reads ONE immutable trusted commit. The base-branch
+      # tip is fetched from the base repository, pinned once to a full object
+      # id, checked to hold the filter as a regular blob, and then read BY
+      # OBJECT ID rather than by path. A fork head, a rewritten head, or a push
+      # to the base branch mid-run therefore cannot swap the script between
+      # validation and execution, and every failure exits non-zero so the gate
+      # fails closed instead of quietly declaring itself irrelevant.
+      #
+      # This block is frozen by .github/scripts/verify_cross_build_policy.py
+      # (see live_suite_relevance_errors); it is byte-identical across every
+      # live-suite workflow apart from the suite, slug, and display name.
+      - name: Check for gateway-api-conformance changes
         id: filter
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -66,25 +83,34 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 .github/scripts/live_suite_path_filter.py --self-test
+          filter_path=.github/scripts/live_suite_path_filter.py
           changed_files="$RUNNER_TEMP/gateway-api-conformance-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/gateway-api-conformance-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
           : > "$changed_files"
 
           filter_args=(--suite gateway-api --changed-files "$changed_files")
+
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            # Diff against the live base branch ref (triple-dot = merge-base) so the
-            # path filter only sees this PR's changes. github.event.pull_request.base.sha
-            # is the base recorded when the synthetic merge ref was last built and can
-            # lag main on long-lived PRs; diffing against it would pull in files that
-            # main changed afterwards and wrongly route the PR through the 90-minute lab.
-            base_ref="origin/${BASE_REF}"
-            # Retry the base-ref fetch so a single 403/5xx/network blip does not fail
-            # the changes job. Only hard-fail after exhausting the attempts: an
-            # incomplete fetch would diff against a stale/missing base and mis-gate
-            # the lab, so silently swallowing the failure is not safe here.
+            # `github.base_ref` names a branch in the BASE repository, so a fork
+            # cannot control its contents -- but it is still untrusted text.
+            # Reject anything outside a conservative branch charset before it
+            # reaches a refspec so no option, pathspec, or revision-syntax
+            # metacharacter can be smuggled into a git invocation.
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
             fetched=false
             for attempt in 1 2 3; do
-              if git fetch --no-tags origin "${BASE_REF}"; then
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
                 fetched=true
                 break
               fi
@@ -92,13 +118,15 @@ jobs:
               sleep $(( attempt * 10 ))
             done
             if [ "$fetched" != true ]; then
-              echo "git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
               exit 1
             fi
-            git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"
+            # Pin the moving tip exactly once; nothing below re-resolves a ref.
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
           elif [ "$EVENT_NAME" = "merge_group" ]; then
-            # Validate the synthesized merge-group SHA against its payload base.
-            # Do not consult pull_request fields; they are absent on merge_group.
+            # Merge queues synthesize a combined SHA. Use the event's base_sha
+            # as the trusted filter source and the change-set base so a missing
+            # pull_request payload cannot force-skip or check only main.
             if ! printf '%s' "$MERGE_BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
               echo "::error::merge_group base_sha missing or malformed" >&2
               exit 1
@@ -106,7 +134,8 @@ jobs:
             if ! git cat-file -e "${MERGE_BASE_SHA}^{commit}" 2>/dev/null; then
               fetched=false
               for attempt in 1 2 3; do
-                if git fetch --no-tags origin "${MERGE_BASE_SHA}"; then
+                if git fetch --no-tags --no-recurse-submodules origin \
+                  "${MERGE_BASE_SHA}"; then
                   fetched=true
                   break
                 fi
@@ -118,23 +147,84 @@ jobs:
                 exit 1
               fi
             fi
-            git diff --name-only --no-renames "${MERGE_BASE_SHA}...HEAD" | sort > "$changed_files"
+            trusted_sha="$MERGE_BASE_SHA"
           else
+            # A push to the default branch and a manual dispatch already run
+            # trusted code, so the checked-out commit IS the trusted base.
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
             filter_args+=(--force-run)
           fi
 
-          plan="$(python3 .github/scripts/live_suite_path_filter.py "${filter_args[@]}")"
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          # Reject anything that is not a regular blob at that exact commit: a
+          # symlink (mode 120000) would make a content read emit its target
+          # path, a gitlink (160000) or tree (040000) carries no script at all,
+          # and a missing entry must fail closed rather than fall back to the
+          # pull request's own copy.
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "merge_group" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          # Isolated interpreter: no user site directory, no PYTHON* overrides,
+          # and no implicit path entry, so nothing the pull request committed
+          # can be imported by the trusted filter.
+          python3 -I "$trusted_filter" --self-test
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
 
   gateway-api-conformance:
     name: Gateway API conformance suite
     needs: changes
     if: needs.changes.outputs.relevant == 'true'
-    # The host-built binary is packaged into a distroless Debian 13 image.
-    # Pin the build host so its glibc stays no newer than the runtime image.
     runs-on: ubuntu-26.04
+    # The host-built binary is packaged into the Dockerfile's distroless
+    # Debian 13 runtime base; package-ferrum-runtime-image fails when it needs
+    # a newer glibc than that image provides.
     timeout-minutes: 90
     env:
       KIND_CLUSTER_NAME: ferrum-gwapi
@@ -147,18 +237,33 @@ jobs:
         run: echo "GATEWAY_API_LAB_OWNERSHIP_FILE=$RUNNER_TEMP/gateway-api-gatewayclass-ownership.tsv" >> "$GITHUB_ENV"
 
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Resolve inputs
         id: inputs
+        # Dispatch inputs are data: they reach the shell only through the
+        # environment, never by expression interpolation into the script.
+        env:
+          DISPATCH_GATEWAY_API_VERSION: ${{ inputs.gateway_api_version }}
+          DISPATCH_CONFORMANCE_PROFILE: ${{ inputs.conformance_profile }}
+          DISPATCH_SUPPORTED_FEATURES: ${{ inputs.supported_features }}
+          DISPATCH_SKIP_TESTS: ${{ inputs.skip_tests }}
         run: |
           set -euo pipefail
-          gateway_api_version="${{ github.event.inputs.gateway_api_version }}"
-          conformance_profile="${{ github.event.inputs.conformance_profile }}"
-          supported_features="${{ github.event.inputs.supported_features }}"
-          skip_tests="${{ github.event.inputs.skip_tests }}"
+          gateway_api_version="$DISPATCH_GATEWAY_API_VERSION"
+          conformance_profile="$DISPATCH_CONFORMANCE_PROFILE"
+          supported_features="$DISPATCH_SUPPORTED_FEATURES"
+          skip_tests="$DISPATCH_SKIP_TESTS"
+          for value in "$gateway_api_version" "$conformance_profile" "$supported_features" "$skip_tests"; do
+            case "$value" in
+              *$'\n'*|*$'\r'*)
+                echo "::error::dispatch inputs must be single-line values" >&2
+                exit 1
+                ;;
+            esac
+          done
           if [ -z "$gateway_api_version" ]; then
             gateway_api_version="v1.5.1"
           fi
@@ -182,8 +287,11 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
         with:
           # Same default-feature `pr-build` ferrum-edge graph as the other
-          # live labs that compile only that binary. Do not share with
-          # extra-binary, extra-feature, or debug-profile lanes.
+          # live labs that compile only that binary. No main-push job produces
+          # this lane (10 GB quota policy, docs/ci_cd.md), so it restores
+          # nothing today; it stays a consumer-only key so a future producer
+          # needs no edit here. Do not share with extra-binary, extra-feature,
+          # or debug-profile lanes.
           shared-key: "ci-live-pr-build"
 
       - name: Build gateway binary

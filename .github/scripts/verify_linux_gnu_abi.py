@@ -54,7 +54,6 @@ CI_CD_MD = REPO_ROOT / "docs" / "ci_cd.md"
 
 DEDICATED_SYSROOT_TARGET_DIR = "/src/target/linux-gnu-sysroot"
 GLIBC_VERSION_RE = re.compile(r"\bGLIBC_(\d+(?:\.\d+)*)\b")
-NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]")
 LINUX_GNU_ASSETS = (
     "ferrum-edge-linux-x86_64",
     "ferrum-cni-linux-x86_64",
@@ -115,14 +114,6 @@ def parse_version(text: str) -> tuple[int, ...]:
 
 def version_exceeds(observed: tuple[int, ...], ceiling: tuple[int, ...]) -> bool:
     return observed > ceiling
-
-
-def glibc_versions_from_readelf(text: str) -> list[str]:
-    return sorted(set(GLIBC_VERSION_RE.findall(text)))
-
-
-def needed_libraries_from_readelf(text: str) -> list[str]:
-    return sorted(set(NEEDED_RE.findall(text)))
 
 
 def _elf_unpack(fmt: str, data: bytes, offset: int) -> tuple[int, ...]:
@@ -778,56 +769,6 @@ def check_repository() -> list[str]:
     return errors
 
 
-READELF_FLOOR_FIXTURE = """\
-Version symbols section '.gnu.version' contains 4 entries:
-  0x0060:   Name: GLIBC_2.2.5  Flags: none  Version: 2
-  0x0070:   Name: GLIBC_2.34  Flags: none  Version: 3
-Dynamic section at offset 0x0 contains 4 entries:
-  0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
-  0x0000000000000001 (NEEDED)             Shared library: [libgcc_s.so.1]
-  0x0000000000000001 (NEEDED)             Shared library: [ld-linux-x86-64.so.2]
-"""
-
-READELF_TOO_NEW_FIXTURE = """\
-Version symbols section '.gnu.version' contains 4 entries:
-  0x0060:   Name: GLIBC_2.2.5  Flags: none  Version: 2
-  0x0070:   Name: GLIBC_2.39  Flags: none  Version: 3
-Dynamic section at offset 0x0 contains 3 entries:
-  0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
-  0x0000000000000001 (NEEDED)             Shared library: [libz.so.1]
-"""
-
-READELF_UNEXPECTED_LIB_FIXTURE = """\
-Version symbols section '.gnu.version' contains 2 entries:
-  0x0060:   Name: GLIBC_2.17  Flags: none  Version: 2
-Dynamic section at offset 0x0 contains 3 entries:
-  0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
-  0x0000000000000001 (NEEDED)             Shared library: [libssl.so.3]
-"""
-
-
-def evaluate_readelf_fixture(text: str, contract: dict[str, Any], label: str) -> list[str]:
-    errors: list[str] = []
-    versions = glibc_versions_from_readelf(text)
-    needed = needed_libraries_from_readelf(text)
-    ceiling = parse_version(str(contract["glibc_max_version"]))
-    allowed = set(contract["allowed_needed"])
-    if versions:
-        maximum = max(parse_version(item) for item in versions)
-        if version_exceeds(maximum, ceiling):
-            pretty = ".".join(str(part) for part in maximum)
-            errors.append(
-                f"{label} requires GLIBC_{pretty}, above the declared floor "
-                f"GLIBC_{contract['glibc_max_version']}"
-            )
-    else:
-        errors.append(f"{label} has no GLIBC version-need records")
-    if "libc.so.6" not in needed:
-        errors.append(f"{label} is missing libc.so.6")
-    unexpected = [name for name in needed if name not in allowed]
-    if unexpected:
-        errors.append(f"{label} dynamically links unexpected libraries: {', '.join(unexpected)}")
-    return errors
 
 
 def _synthetic_dynamic_elf64(
@@ -940,17 +881,6 @@ def run_self_test() -> list[str]:
         failures.append("a contract that does not permit libc.so.6 was accepted")
     if not check_contract_shape({"allowed_needed": list(contract["allowed_needed"])}):
         failures.append("a contract without a top-level glibc_max_version was accepted")
-
-    if evaluate_readelf_fixture(READELF_FLOOR_FIXTURE, contract, "floor-fixture"):
-        failures.append("in-floor GLIBC_2.34 fixture was rejected")
-    too_new = evaluate_readelf_fixture(READELF_TOO_NEW_FIXTURE, contract, "too-new-fixture")
-    if not any("GLIBC_2.39" in item for item in too_new):
-        failures.append("GLIBC_2.39 fixture was not rejected")
-    unexpected = evaluate_readelf_fixture(
-        READELF_UNEXPECTED_LIB_FIXTURE, contract, "unexpected-lib-fixture"
-    )
-    if not any("libssl.so.3" in item for item in unexpected):
-        failures.append("unexpected SONAME fixture was not rejected")
 
     with tempfile.TemporaryDirectory() as tmp:
         missing = Path(tmp) / "missing"

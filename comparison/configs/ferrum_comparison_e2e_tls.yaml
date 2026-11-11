@@ -2,11 +2,14 @@
 # Ferrum Edge comparison benchmark configuration — end-to-end TLS
 # Frontend: HTTPS (TLS termination) → Backend: HTTPS (re-encryption)
 #
-# backend_tls_verify_server_cert is false because the benchmark measures TLS
-# encryption overhead, not certificate verification.  The self-signed test cert
-# lacks basicConstraints CA:TRUE which causes webpki to reject it as a trust
-# anchor.  All other gateways in this benchmark also skip backend cert
-# verification for E2E TLS.
+# backend_tls_verify_server_cert is false because the E2E TLS leg measures
+# re-encryption overhead, not certificate verification, and every gateway in
+# this benchmark skips backend verification the same way (Kong
+# KONG_TLS_CERTIFICATE_VERIFY=off, Tyk ssl_insecure_skip_verify, KrakenD
+# allow_insecure_connections, Envoy with no validation_context). The backend
+# serves tests/certs/server.crt, a self-signed certificate marked CA:TRUE, which
+# rustls/webpki rejects as an end-entity certificate (CaUsedAsEndEntity), so
+# Ferrum could not verify it even with that file as its CA.
 
 proxies:
   - id: "proxy-health"

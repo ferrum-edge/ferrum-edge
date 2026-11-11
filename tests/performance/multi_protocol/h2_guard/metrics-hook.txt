@@ -1,4 +1,0 @@
-        // Temporary generated diagnostic context only; after /metrics auth.
-        if req.headers().get("x-ferrum-h2-guard-snapshot").is_some_and(|v| v == "1") {
-            metrics_output.push_str(&h2::ferrum_guard_snapshot());
-        }

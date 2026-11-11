@@ -96,7 +96,6 @@ h1_trace_pid=""
 h1_trace_output=""
 POOL_PROFILE=""
 UDP_PROFILE=""
-H2_GUARD_OBSERVE=0
 # Workflow-level dispatch inputs arrive as environment because the hosted
 # benchmark job that invokes this runner is frozen (see the workflow header).
 H2_WINDOW="${BENCH_H2_WINDOW:-default}"
@@ -1296,16 +1295,6 @@ run_bench() {
     else
         echo '{"available":false,"error":"process usage unavailable or disabled"}' > "$usage"
     fi
-    if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$target" = gateway ]; then
-        mkdir -p "$OUTPUT_DIR/diagnostics"
-        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" \
-            "$OUTPUT_DIR/diagnostics/${gateway}_${payload}_guard_before.json" \
-            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
-    fi
-    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
-            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation start
-    fi
     # Backend connection/echo counters around the client, H2 family only
     # (#6022 item 6). Best effort: a missing snapshot marks the stamp unavailable.
     local backend_stats_before="$diagnostics/${gateway}_${payload}_backend_stats_before.json"
@@ -1343,10 +1332,6 @@ run_bench() {
             --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
             || rc=$?
     fi
-    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-        python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_invocation.json" \
-            --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID" --invocation end --exit-code "$rc"
-    fi
     if [ "$PROTOCOL" = http2 ] || [ "$PROTOCOL" = grpcs ]; then
         curl -sf --max-time 5 http://127.0.0.1:3010/bench-stats \
             > "$backend_stats_after" 2>/dev/null || true
@@ -1373,10 +1358,6 @@ run_bench() {
         cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     fi
     if [ "$target" = "gateway" ] && [ -n "$GATEWAY_CID" ]; then
-        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-            python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$diagnostics/${gateway}_${payload}_guard_after.json" \
-                --identity "$gateway" "$PROTOCOL" "$payload" "$PAIR" "$HOST_ID"
-        fi
         docker logs --timestamps "$GATEWAY_CID" > "$diagnostics/${gateway}_${payload}.log" 2>&1 || true
         if [[ "$gateway" == envoy* ]]; then
             curl --max-time 5 -fsS 'http://127.0.0.1:15000/stats?format=json' \
@@ -1412,10 +1393,6 @@ run_bench() {
     if [ "$H2_OBSERVE" -eq 1 ]; then
         python3 "$SCRIPT_DIR/h2_diagnostics.py" "$out" "$usage" \
             "$diagnostics/${gateway}_${payload}_backend.log"
-    fi
-    if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-        python3 "$SCRIPT_DIR/h2_guard_observation.py" "$out" "$usage" \
-            "$diagnostics/${gateway}_${payload}.log"
     fi
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
@@ -1487,12 +1464,6 @@ main() {
                 "$GATEWAYS" "$ADAPTIVE" "$PAYLOAD_SIZES")
             if [ -n "$campaign" ]; then
                 H2_OBSERVE=1
-                H2_GUARD_OBSERVE=$(python3 "$SCRIPT_DIR/experiment_arms.py" guard \
-                    "$EXPERIMENT_MANIFEST" "$PROTOCOL")
-                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && { [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; }; then
-                    echo "[experiment] guard observation is hosted-only" >&2
-                    exit 2
-                fi
                 PAIRS="${campaign%% *}"
                 PAYLOAD_SIZES="${campaign#* }"
                 if [ "$PROCESS_USAGE" != true ]; then
@@ -1567,14 +1538,6 @@ PYEOF
         --format '{{.Id}} {{json .RepoTags}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
         > "$root_output/images.txt"
     if [ "$H2_OBSERVE" -eq 1 ] || [ -n "$H1_PROFILE" ] || [ -n "$UDP_PROFILE" ]; then
-        if [ "$H2_GUARD_OBSERVE" -eq 1 ]; then
-            local source_identity
-            source_identity=$(docker image inspect "$FERRUM_IMAGE" --format '{{index .Config.Labels "io.ferrum.h2-guard-source"}}')
-            if [ "$source_identity" != "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118" ]; then
-                echo "[experiment] image is not the pinned guard diagnostic build" >&2
-                exit 2
-            fi
-        fi
         # Pin the resolved ID for every arm, even if a mutable tag is retargeted.
         FERRUM_IMAGE=$(docker image inspect "$FERRUM_IMAGE" --format '{{.Id}}')
         if [ -n "$BASELINE_IMAGE" ]; then
@@ -1660,19 +1623,6 @@ PYEOF
                     if [[ "$gw" == envoy* ]]; then
                         cp "$SCRIPT_DIR/envoy_runtime.yaml" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
                     fi
-                fi
-                if [ "$H2_GUARD_OBSERVE" -eq 1 ] && [ "$gw" != direct ]; then
-                    # Explicit trigger/HTTP ack/log-fence smoke before offered work.
-                    python3 "$SCRIPT_DIR/h2_guard_snapshot.py" "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" \
-                        --identity "$gw" "$PROTOCOL" 0 "$PAIR" "$HOST_ID"
-                    docker logs --timestamps "$GATEWAY_CID" \
-                        > "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.log" 2>&1 || true
-                    python3 "$SCRIPT_DIR/h2_guard/verify.py" smoke \
-                        "$OUTPUT_DIR/diagnostics/${gw}_guard_smoke.json" || {
-                        echo "[guard] snapshot smoke incomplete; retained raw evidence" >&2
-                        stop_gateway
-                        continue
-                    }
                 fi
                 for size in $PAYLOAD_SIZES; do
                     if [ "$gw" = direct ]; then

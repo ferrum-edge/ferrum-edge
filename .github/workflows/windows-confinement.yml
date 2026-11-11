@@ -48,8 +48,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The repository Cargo config names sccache as the rustc wrapper; this
-  # workflow builds without a compiler cache.
+  # Clear any user-level sccache wrapper; this workflow builds without a
+  # compiler cache.
   RUSTC_WRAPPER: ""
   CARGO_BUILD_RUSTC_WRAPPER: ""
 
@@ -74,7 +74,7 @@ jobs:
       # vendored OpenSSL's Configure needs. Use the image's Strawberry Perl.
       OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

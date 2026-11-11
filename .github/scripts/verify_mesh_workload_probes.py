@@ -955,12 +955,6 @@ def validate_host_veth_source_usage() -> None:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--root",
-        type=Path,
-        default=REPO_ROOT,
-        help="Repository root (defaults to the checkout containing this script)",
-    )
-    parser.add_argument(
         "--results-dir",
         type=Path,
         required=True,
@@ -973,7 +967,6 @@ def main(argv: list[str]) -> int:
         help="Declarative JSON fixture of workload/probe expectations",
     )
     args = parser.parse_args(argv)
-    _ = args.root.resolve()
     results_dir = args.results_dir.resolve()
     expectations = load_expectations(args.expectations.resolve())
 

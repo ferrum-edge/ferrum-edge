@@ -51,7 +51,7 @@ on:
       build_profile:
         description: "Cargo build profile for gateway binary"
         required: false
-        default: "dev"
+        default: "release"
         type: choice
         options:
           - release
@@ -62,6 +62,12 @@ on:
 permissions:
   contents: read
 
+# An explicit bash shell runs every step with `-eo pipefail`, so a harness
+# failure piped into `tee` fails the step instead of taking tee's status.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   benchmark:
     name: Payload Size Benchmark
@@ -69,7 +75,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -86,7 +92,9 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: "ci-payload-bench"
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Dispatch-only lane: it never runs on a push to main, so it never
+          # saves (see docs/ci_cd.md, 10 GB quota policy).
+          save-if: "false"
 
       - name: Install system dependencies
         run: |

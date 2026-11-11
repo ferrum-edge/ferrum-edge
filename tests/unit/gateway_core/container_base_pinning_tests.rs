@@ -8,7 +8,6 @@ const PRODUCTION_DOCKERFILES: &[(&str, &str)] = &[
         "Dockerfile.release",
         include_str!("../../../Dockerfile.release"),
     ),
-    ("Dockerfile.test", include_str!("../../../Dockerfile.test")),
     // The eBPF tools layer builds a published `-ebpf-tools` image, so it is a
     // production image and belongs in this inventory.
     (

@@ -5,10 +5,10 @@ _format_version: "3.0"
 #
 # NOTE: BACKEND_HOST is replaced at runtime by run_comparison.sh
 # NOTE: Backend TLS verification is disabled via KONG_TLS_CERTIFICATE_VERIFY=off
-# in run_comparison.sh because the benchmark measures TLS encryption overhead,
-# not certificate verification. The self-signed test cert causes hostname
-# verification failures in Kong/OpenSSL. Kong 3.14+ forbids service-level
-# tls_verify overrides when the global setting is enabled.
+# in run_comparison.sh because the E2E TLS leg measures re-encryption overhead,
+# not certificate verification; every gateway in this benchmark skips backend
+# verification the same way (see ferrum_comparison_e2e_tls.yaml). Kong 3.14+
+# forbids service-level tls_verify overrides when the global setting is enabled.
 
 services:
   - name: health-service-e2e

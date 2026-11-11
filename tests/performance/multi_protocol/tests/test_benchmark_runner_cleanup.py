@@ -19,7 +19,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 RUNNERS = [
-    "tests/performance/run_perf_test.sh",
     "tests/performance/payload_size/run_payload_test.sh",
     "tests/performance/multi_protocol/run_protocol_test.sh",
     "tests/performance/multi_protocol/run_gateway_protocol_bench.sh",
@@ -32,7 +31,6 @@ RUNNERS = [
 # Every CI workflow path token that names one of the runners above, so the
 # workflow scan covers any lane that invokes them.
 RUNNER_TOKENS = {
-    "run_perf_test.sh",
     "run_payload_test.sh",
     "run_protocol_test.sh",
     "run_gateway_protocol_bench.sh",

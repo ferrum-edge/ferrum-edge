@@ -651,7 +651,6 @@ def parse_dns_report(
         "transport": transport,
         "qps": qps,
         "p50_us": p50,
-        "p95_us": p90,  # retained for draft compatibility naming
         "p90_us": p90,
         "p99_us": p99,
         "total_errors": errors,
@@ -1602,7 +1601,6 @@ def _self_test_health_probes(required_reps: int) -> str:
 
 
 def self_test() -> int:
-    assert abs((((100.0 - 80.0) / 100.0) * 100.0) - 20.0) < 1e-9
     assert "µs" in fmt_duration_ns(1500.0) or "us" in fmt_duration_ns(1500.0)
     assert required_repetitions(None) == 3
     assert required_repetitions(5) == 5
@@ -1653,6 +1651,10 @@ def self_test() -> int:
         assert evidence["gateway"]["actual"] == 1
         assert evidence["direct"]["actual"] == 1
         assert evidence["gateway"]["ok"] is False
+        # The overhead formula is exercised through summarize_hbone, not a
+        # literal: gateway 80 rps against direct 100 rps is 20% (issue #7282).
+        under_overhead = hbone_under["1kib_c50_30s"]["overhead_percent_mean"]
+        assert under_overhead is not None and abs(under_overhead - 20.0) < 1e-9
 
         # --- duplicate relevant blobs in one run file must not satisfy reps ---
         dup = root / "dup_blobs" / "hbone" / "1kib_c50_30s"
@@ -1713,15 +1715,12 @@ def self_test() -> int:
         # --- malformed relevant blobs alongside valid samples fail closed ---
         malformed = root / "malformed_mixed" / "hbone" / "1kib_c50_30s"
         malformed.mkdir(parents=True)
-        bad_mixed = {
-            "label": "hbone_e2e",
-            "target": "http://127.0.0.1:18000/echo",
-            "rps": "not-a-number",
-            "p50_us": 1,
-            "p95_us": 2,
-            "p99_us": 3,
-            "total_errors": 0,
-        }
+        # Every bad-metric fixture below differs from a parseable blob only by
+        # the defect it names, so its rejection is attributable to that defect.
+        assert parse_hbone_sample(gateway, "x", HBONE_SCENARIOS[0]) is not None
+        assert parse_hbone_sample(direct, "x", HBONE_SCENARIOS[0]) is not None
+        bad_mixed = {**gateway, "rps": "not-a-number"}
+        assert parse_hbone_sample(bad_mixed, "x", HBONE_SCENARIOS[0]) is None
         for run in range(1, 4):
             _write_hbone_run(
                 malformed / f"run_{run}.txt",
@@ -1927,33 +1926,10 @@ def self_test() -> int:
         # --- bad metrics rejected (NaN / non-positive / invalid latency) ---
         bad = root / "bad_metrics" / "hbone" / "1kib_c50_30s"
         bad.mkdir(parents=True)
-        bad_blob = {
-            "label": "hbone_e2e",
-            "target": "http://127.0.0.1:18000/echo",
-            "rps": "not-a-number",
-            "p50_us": 1,
-            "p95_us": 2,
-            "p99_us": 3,
-            "total_errors": 0,
-        }
-        nan_blob = {
-            "label": "hbone_e2e",
-            "target": "http://127.0.0.1:19000/echo",
-            "rps": float("nan"),
-            "p50_us": 1,
-            "p95_us": 2,
-            "p99_us": 3,
-            "total_errors": 0,
-        }
-        zero_blob = {
-            "label": "hbone_e2e",
-            "target": "http://127.0.0.1:19000/echo",
-            "rps": 0.0,
-            "p50_us": 1,
-            "p95_us": 2,
-            "p99_us": 3,
-            "total_errors": 0,
-        }
+        bad_blob = {**gateway, "rps": "not-a-number"}
+        nan_blob = {**direct, "rps": float("nan")}
+        zero_blob = {**direct, "rps": 0.0}
+        negative_latency_blob = {**gateway, "p99_us": -1}
         (bad / "run_1.txt").write_text(
             "\n".join(json.dumps(x) for x in (bad_blob, nan_blob, zero_blob)) + "\n",
             encoding="utf-8",
@@ -1961,40 +1937,28 @@ def self_test() -> int:
         assert parse_hbone_sample(bad_blob, "x", HBONE_SCENARIOS[0]) is None
         assert parse_hbone_sample(nan_blob, "x", HBONE_SCENARIOS[0]) is None
         assert parse_hbone_sample(zero_blob, "x", HBONE_SCENARIOS[0]) is None
+        assert parse_hbone_sample(negative_latency_blob, "x", HBONE_SCENARIOS[0]) is None
         missing_hbone_errors = {
-            "label": "hbone_e2e",
-            "target": "http://127.0.0.1:18000/echo",
-            "rps": 1.0,
-            "p50_us": 1,
-            "p95_us": 2,
-            "p99_us": 3,
+            key: value for key, value in gateway.items() if key != "total_errors"
         }
         assert parse_hbone_sample(missing_hbone_errors, "x", HBONE_SCENARIOS[0]) is None
+        valid_dns_report = _dns_blob(
+            target=DNS_GATEWAY_TARGET,
+            rows=[("mesh-internal", "udp", 1.0)],
+        )["reports"][0]
+        assert parse_dns_report(valid_dns_report, "x", DNS_DURATION_SECS) is not None
         assert parse_dns_report(
-            {
-                "name_class": "mesh-internal",
-                "transport": "udp",
-                "qps": -5,
-                "p50_us": 1,
-                "p90_us": 2,
-                "p99_us": 3,
-                "total_errors": 0,
-            },
-            "x",
-            DNS_DURATION_SECS,
+            {**valid_dns_report, "qps": -5}, "x", DNS_DURATION_SECS
         ) is None
         assert parse_dns_report(
-            {
-                "name_class": "mesh-internal",
-                "transport": "udp",
-                "qps": 1,
-                "p50_us": 1,
-                "p90_us": 2,
-                "p99_us": 3,
-            },
-            "x",
-            DNS_DURATION_SECS,
+            {**valid_dns_report, "p90_us": float("nan")}, "x", DNS_DURATION_SECS
         ) is None
+        missing_dns_errors = {
+            key: value
+            for key, value in valid_dns_report.items()
+            if key != "total_errors"
+        }
+        assert parse_dns_report(missing_dns_errors, "x", DNS_DURATION_SECS) is None
         assert criterion_mean(Path("/no/such/estimates.json")) is None
 
         # --- nonzero errors fail errors_ok ---
@@ -2078,14 +2042,9 @@ def self_test() -> int:
         )
 
         missing_nxdomain = {
-            "name_class": "mesh-internal",
-            "transport": "udp",
-            "qps": 1,
-            "p50_us": 1,
-            "p90_us": 2,
-            "p99_us": 3,
-            "total_errors": 0,
-            "duration_secs": DNS_DURATION_SECS,
+            key: value
+            for key, value in valid_dns_report.items()
+            if key != "total_nxdomain"
         }
         assert parse_dns_report(missing_nxdomain, "x", DNS_DURATION_SECS) is None
 

@@ -22,7 +22,7 @@ jobs:
     name: Validate release version
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -56,7 +56,7 @@ jobs:
       checks: read
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -78,7 +78,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -174,7 +174,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target == 'x86_64-apple-darwin' && '10.12' || matrix.target == 'aarch64-apple-darwin' && '11.0' || '' }}
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -366,7 +366,7 @@ jobs:
         shell: bash
         working-directory: ${{ github.workspace }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -475,7 +475,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -519,7 +519,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Download exactly the five trusted build artifacts by name. A wildcard
       # pattern would also accept any other artifact whose name happened to
@@ -602,7 +602,7 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -728,7 +728,7 @@ jobs:
             cni_asset: ferrum-cni-linux-aarch64
             arch_dir: arm64
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download Linux binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -794,7 +794,7 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -884,7 +884,7 @@ jobs:
             platform: linux/arm64
             arch_dir: arm64
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -977,7 +977,7 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -1065,7 +1065,7 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -1153,7 +1153,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -1540,7 +1540,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -1587,7 +1587,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -1614,11 +1614,11 @@ jobs:
     name: Anonymous image pull smoke
     needs: docker-manifest
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1634,3 +1634,10 @@ jobs:
           set -euo pipefail
           bash scripts/smoke_anonymous_pull.sh "docker.io/ferrumedge/ferrum-edge:${VERSION_TAG}"
           bash scripts/smoke_anonymous_pull.sh "ghcr.io/${GHCR_REPOSITORY}:${VERSION_TAG}"
+
+      # A fresh anonymous `/data` volume must work with the published image's own
+      # non-root identity: migrate, serve, restart, and keep the records.
+      - name: SQLite volume smoke on the published image
+        env:
+          VERSION_TAG: ${{ github.ref_name }}
+        run: bash scripts/smoke_sqlite_volume.sh "docker.io/ferrumedge/ferrum-edge:${VERSION_TAG}"

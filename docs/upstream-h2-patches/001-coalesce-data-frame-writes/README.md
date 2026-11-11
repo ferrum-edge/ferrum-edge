@@ -108,8 +108,7 @@ h2's library suite also passes, apart from the HPACK fixture tests, which read d
 CI also runs every Ferrum Hyper regression (`ferrum_*`, including Hyper patch
 002's flow-control progress tests) against this h2, then runs h2's dynamic
 budget tests (upstream hyperium/h2#965, formerly Ferrum h2 patch 002) in the
-`Vendored Patch Regressions` job. The H2 guard observation
-lane builds its observed h2 from the verified archive plus these patches.
+`Vendored Patch Regressions` job.
 
 ## Retirement
 
@@ -124,6 +123,5 @@ are superseded:
 
 1. Remove the `h2` line from `[patch.crates-io]` in `Cargo.toml`, `tests/performance/mesh/Cargo.toml` and `fuzz/Cargo.toml`.
 2. Update the three lockfiles (`Cargo.lock`, `fuzz/Cargo.lock`, `tests/performance/mesh/Cargo.lock`), then drop `vendor/h2-0.4.20-ferrum-patched/`.
-3. Point the H2 guard lane (`tests/performance/multi_protocol/h2_guard/prepare.py`) back at the registry h2.
-4. Remove the inventory row and the `docs/vendored-patch-lifecycle.json` entry.
-5. Regenerate the drift manifest.
+3. Remove the inventory row and the `docs/vendored-patch-lifecycle.json` entry.
+4. Regenerate the drift manifest.

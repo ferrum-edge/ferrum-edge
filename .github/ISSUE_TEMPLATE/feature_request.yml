@@ -57,6 +57,8 @@ body:
         - Protocol (WebSocket)
         - Protocol (gRPC)
         - Protocol (TCP/UDP)
+        - Service Mesh / Kubernetes
+        - AI Gateway
         - Documentation
         - Other
     validations:

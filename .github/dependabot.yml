@@ -80,8 +80,8 @@ updates:
       - "dependencies"
 
   # Docker discovers every file whose name matches /dockerfile|containerfile/i,
-  # so `Dockerfile`, `Dockerfile.release`, `Dockerfile.test`, and
-  # `Dockerfile.ebpf-tools-layer` are all in scope. Its parser only reads `FROM`
+  # so `Dockerfile`, `Dockerfile.release`, `Dockerfile.ebpf-tools-layer` and
+  # `Dockerfile.iproute2-layer` are all in scope. Its parser only reads `FROM`
   # lines; the `ARG <NAME>=<image>@sha256:...` defaults are refreshed by
   # `.github/workflows/base-image-digest-refresh.yml` instead. Both mechanisms
   # are digest-preserving: they rewrite the digest, never drop it.

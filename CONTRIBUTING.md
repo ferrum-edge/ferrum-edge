@@ -97,7 +97,7 @@ fast-linker override in the checked-in configuration.
 
 CI installs the linker/cache tools through separate setup actions. GitHub-hosted Ubuntu
 images already include `cmake`; Linux CI jobs and `setup-rust-ci` install
-`libcurl4-openssl-dev`. The Docker builder and `Dockerfile.test` install `cmake`;
+`libcurl4-openssl-dev`. The Docker builder installs `cmake`;
 ARM64 Cross `pre-build` installs both `cmake` and `libcurl4-openssl-dev`. A missing linker
 tool locally causes a build failure; there is no automatic local fallback. A wrapper you
 configured but whose `sccache` binary is gone fails the same way. To relocate the compiler
@@ -159,8 +159,9 @@ cargo clippy --all-targets -- -D warnings
 # Format code
 cargo fmt
 
-# Check formatting
+# Check formatting (src/gateway_entry.rs is include!d, so cargo fmt skips it)
 cargo fmt --check
+rustfmt --edition 2024 --check src/gateway_entry.rs
 ```
 
 ## Making Changes

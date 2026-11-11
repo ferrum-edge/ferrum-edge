@@ -54,11 +54,6 @@ EXTERNAL_ACTION = re.compile(
     r"uses:\s*(?P<action>(?!\./)[^@\s]+)@(?P<ref>[^\s#]+)",
     re.IGNORECASE,
 )
-APPROVED_SETUP = (
-    "./.github/actions/setup-rust-ci",
-    "./.github/actions/setup-sccache",
-    "./.github/actions/setup-fast-linker",
-)
 PINNED_SHA = re.compile(r"^[0-9a-f]{40}$")
 PUBLISHED_BASELINE_DATE = re.compile(r"\bPublished \d{4}-\d{2}-\d{2}\b")
 PUBLISHED_BASELINE_STATUS = re.compile(
@@ -388,7 +383,6 @@ def check_workflow(text: str, failures: list[str]) -> None:
     require("workflow_dispatch:" in text, "workflow_dispatch trigger required", failures)
     require("runs-on: ubuntu-26.04" in text, "collection must pin runs-on ubuntu-26.04", failures)
     require("BENCH_RUNNER_CLASS: ubuntu-26.04" in text, "BENCH_RUNNER_CLASS must be ubuntu-26.04", failures)
-    require("ubuntu-26.04" in text, "default runner class must be ubuntu-26.04", failures)
     require("inputs:\n      runner:" not in text and "runner:" not in _workflow_inputs_block(text), "arbitrary runner input must be removed", failures)
     require(
         "runs-on: self-hosted" not in text.lower()
@@ -490,9 +484,7 @@ def check_workflow(text: str, failures: list[str]) -> None:
             failures,
         )
 
-    for setup in APPROVED_SETUP:
-        if setup == "./.github/actions/setup-rust-ci":
-            require(setup in text, "must use setup-rust-ci", failures)
+    require("./.github/actions/setup-rust-ci" in text, "must use setup-rust-ci", failures)
 
     mesh_step = _named_step(text, "Collect mesh Criterion microbenchmarks")
     hbone_step = _named_step(text, "Collect HBONE E2E baselines (3+ repetitions)")
@@ -659,7 +651,7 @@ def check_scripts(failures: list[str]) -> None:
         "interval probes must expose begin/end snapshots",
         failures,
     )
-    require('"mesh"' in health or "mesh" in health, "runner health script must accept mesh Criterion probes", failures)
+    require('"mesh"' in health, "runner health script must accept mesh Criterion probes", failures)
     require("--self-test" in health, "runner health script must provide hosted self-tests", failures)
     require(
         "parse failure cannot become healthy evidence" in health,
@@ -880,8 +872,17 @@ def check_dns_tcp_stub_and_fail_closed(
     )
 
 
-def check_pr_ci_wiring(failures: list[str]) -> None:
-    ci = CI_YML.read_text(encoding="utf-8")
+# The bare script path also appears in the `--self-test` line, so the real
+# contract invocation is matched as its own line (issue #7282).
+_MESH_BASELINES_VERIFIER_RUN_RE = re.compile(
+    r"(?m)^\s*python3 \.github/scripts/"
+    r"verify_mesh_performance_baselines_workflow\.py\s*$"
+)
+
+
+def check_performance_lane_wiring(failures: list[str], ci: str | None = None) -> None:
+    if ci is None:
+        ci = CI_YML.read_text(encoding="utf-8")
     match = _PERFORMANCE_REGRESSION_JOB_RE.search(ci)
     body = match.group("body") if match else ""
     require(
@@ -895,16 +896,18 @@ def check_pr_ci_wiring(failures: list[str]) -> None:
         failures,
     )
     require(
-        "python3 .github/scripts/verify_mesh_performance_baselines_workflow.py" in body,
+        _MESH_BASELINES_VERIFIER_RUN_RE.search(body) is not None,
         "jobs.performance-regression must run the mesh baselines workflow verifier",
         failures,
     )
     static_idx = ci.find("Verify mesh performance baselines workflow contract")
-    detect_idx = ci.find("Detect performance-sensitive changes")
+    benchmark_setup_idx = ci.find("uses: ./.github/actions/setup-rust-ci")
     require(
-        static_idx != -1 and detect_idx != -1 and static_idx < detect_idx,
+        static_idx != -1
+        and benchmark_setup_idx != -1
+        and static_idx < benchmark_setup_idx,
         "performance-regression.yml must run mesh baseline workflow contracts after checkout and "
-        "before optional benchmark path gating",
+        "before the benchmark toolchain setup",
         failures,
     )
 
@@ -1420,7 +1423,7 @@ jobs:
   collect:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust-ci
       - run: sudo apt-get install -y protobuf-compiler lsof curl
       - run: authz_match ip_restriction slice_apply xds_translation
@@ -1471,7 +1474,7 @@ jobs:
         run: --check-acceptance
       - name: Upload mesh baseline artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mesh-performance-baselines-${{ github.sha }}
 """
@@ -1481,6 +1484,18 @@ jobs:
     _self_test_hbone_trusted_fixture_contract(failures)
     _self_test_dns_tcp_stub_and_fail_closed(failures)
     _self_test_baseline_publication_state(failures)
+    lane = CI_YML.read_text(encoding="utf-8")
+    contract_only = "          python3 .github/scripts/verify_mesh_performance_baselines_workflow.py\n"
+    if contract_only not in lane:
+        failures.append("self-test: performance-regression.yml no longer runs the verifier line")
+    else:
+        dropped: list[str] = []
+        check_performance_lane_wiring(dropped, lane.replace(contract_only, "", 1))
+        if not any("must run the mesh baselines workflow verifier" in item for item in dropped):
+            failures.append(
+                "self-test: dropping the real verifier run (keeping --self-test) "
+                "was not detected"
+            )
     # Intentionally skip repository docs checks in self-test; the publication
     # state machine above is exercised with isolated fixtures.
     if failures:
@@ -1500,7 +1515,7 @@ def main(argv: list[str] | None = None) -> int:
     check_workflow(text, failures)
     check_scripts(failures)
     check_docs_and_baselines(failures)
-    check_pr_ci_wiring(failures)
+    check_performance_lane_wiring(failures)
     if failures:
         for failure in failures:
             print(f"::error::{failure}")

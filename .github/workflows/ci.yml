@@ -62,7 +62,7 @@ jobs:
       run_standalone_cargo: ${{ steps.plan.outputs.run_standalone_cargo }}
       binary-matrix: ${{ steps.binary-matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -403,6 +403,18 @@ jobs:
         if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
         run: cargo fmt --all -- --check
 
+      # src/main.rs pulls src/gateway_entry.rs in with include!, so cargo fmt
+      # never visits it. Check it directly with the same edition cargo fmt
+      # uses for the crate.
+      - name: Check include!d gateway entry formatting
+        if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+        run: |
+          set -euo pipefail
+          if ! rustfmt --edition 2024 --check src/gateway_entry.rs; then
+            echo "::error file=src/gateway_entry.rs::not rustfmt-clean; run rustfmt --edition 2024 src/gateway_entry.rs"
+            exit 1
+          fi
+
       - name: Verify every integration_tests module is sharded
         if: steps.plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
         run: |
@@ -435,7 +447,7 @@ jobs:
     outputs:
       verified: ${{ steps.verify.outputs.verified }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -556,7 +568,7 @@ jobs:
       UNIT_TARGET: ${{ matrix.target }}
       UNIT_PRECOMPILE_TARGETS: ${{ matrix.precompile }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -784,7 +796,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -879,7 +891,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -972,7 +984,7 @@ jobs:
     # merge queue, cost the whole group its budget. Fail fast instead.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1012,7 +1024,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1105,9 +1117,9 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_artifacts == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     # The gateway binary is packaged into a distroless Debian 13 image by
-    # conformance consumers. Pin the build host so its glibc stays no newer
-    # than the runtime image glibc; all native archive consumers use the same
-    # Linux architecture.
+    # conformance consumers; package-ferrum-runtime-image fails when it needs a
+    # newer glibc than that image provides. All native archive consumers use
+    # the same Linux architecture.
     runs-on: ubuntu-26.04
     env:
       # Shared `ci-debug` rust-cache lane: every member must compile with
@@ -1116,7 +1128,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1405,7 +1417,7 @@ jobs:
               integration::gateway_trust_bundle_store_tests
               integration::vendor_integrity_tests
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1651,7 +1663,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1696,7 +1708,7 @@ jobs:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1768,7 +1780,7 @@ jobs:
         with:
           # Pinned to the version the deny.toml schema was validated against, so
           # a future cargo-deny release can't silently change gate behavior.
-          tool: cargo-deny@0.19.9
+          tool: cargo-deny@0.20.2
 
       - name: cargo-deny (advisories, bans, sources, licenses)
         # BLOCKING dependency-security gate. A new RUSTSEC advisory not
@@ -1794,8 +1806,8 @@ jobs:
         # never pulls in); with `unused-ignored-advisory = "deny"` those entries
         # would otherwise fail this run for not matching anything here.
         run: >-
-          cargo deny --manifest-path ebpf/Cargo.toml
-          check --allow advisory-not-detected --config deny.toml advisories bans sources licenses
+          cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml
+          check --allow advisory-not-detected advisories bans sources licenses
 
       - name: cargo-deny advisories (standalone Cargo workspaces)
         # BLOCKING advisory scan over every standalone Cargo workspace the
@@ -1814,8 +1826,8 @@ jobs:
           failed=0
           for manifest in "${manifests[@]}"; do
             echo "::group::cargo deny advisories ${manifest}"
-            if ! cargo deny --manifest-path "$manifest" \
-              check --allow advisory-not-detected --config deny.toml advisories; then
+            if ! cargo deny --manifest-path "$manifest" --config deny.toml \
+              check --allow advisory-not-detected advisories; then
               echo "::error file=${manifest}::cargo-deny advisories failed for ${manifest}"
               failed=1
             fi
@@ -1894,7 +1906,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_BENCH_DEBUG: "0"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1966,7 +1978,7 @@ jobs:
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_vendor_patches == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1987,6 +1999,8 @@ jobs:
           cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
           cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
           cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
+          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib fragment
+          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib incomplete_message
 
       - name: Run vendored tokio-tungstenite raw-takeover regression
         run: cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
@@ -2312,7 +2326,7 @@ jobs:
               functional_plugin_quarantine_test
               functional_redis_rate_limiting_test
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -2939,7 +2953,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -3115,7 +3129,7 @@ jobs:
       FERRUM_IMAGE: ferrum-edge:helm-chart-ci
       GATEWAY_API_VERSION: v1.5.1
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history so the trusted base revision of the chart runtime
           # checker is reachable (issue #3615).
@@ -3682,6 +3696,7 @@ jobs:
             --set controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-helm-chart-grpc-secret-32bxx \
             --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
             --set-string 'controlPlane.env.FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH=/etc/ferrum/cp-dp-trust-bundle.json' \
+            --set-string controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
             > "$RUNNER_TEMP/ferrum-helm-results/multi-ns-trust-bundle-rendered.yaml"
           grep -A1 'name: FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH' "$RUNNER_TEMP/ferrum-helm-results/multi-ns-trust-bundle-rendered.yaml" \
             | grep -Fq 'value: "/etc/ferrum/cp-dp-trust-bundle.json"'
@@ -3697,6 +3712,7 @@ jobs:
             --set controlPlane.credentials.adminJwtSecret.existingSecret.key=admin-jwt-secret \
             --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.name=ferrum-mesh-production-credentials \
             --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.key=cp-dp-grpc-jwt-secret \
+            --set-string controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
             > "$RUNNER_TEMP/ferrum-helm-results/structured-direct-credentials-rendered.yaml"
           grep -F 'postgres://ferrum%2Fuser:p%2Fa%3Fs%23%20word@[2001:db8::1]:5432/ferrum%2Fmain%20db' "$RUNNER_TEMP/ferrum-helm-results/structured-direct-credentials-rendered.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
@@ -3704,6 +3720,7 @@ jobs:
             > "$RUNNER_TEMP/ferrum-helm-results/development-rendered.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml \
+            --set-string controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true \
             > "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml"
           for name in FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET; do
             if ! grep -A5 "name: ${name}" "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml" | grep -q 'valueFrom:'; then
@@ -6314,6 +6331,47 @@ jobs:
             kubectl apply --dry-run=server -f "$manifest" >/dev/null
           done
 
+      # Lint and template cannot catch probe, mount or securityContext
+      # regressions; install the gateway chart's file-mode example for real,
+      # wait for its readiness probe, and read /health through the admin port.
+      - name: Install ferrum-gateway chart (file mode)
+        run: |
+          set -euo pipefail
+          namespace=ferrum-gw
+          dump() {
+            kubectl -n "$namespace" get pods -o wide || true
+            kubectl -n "$namespace" describe deploy/ferrum-gateway || true
+            kubectl -n "$namespace" logs deploy/ferrum-gateway --tail=200 || true
+          }
+          on_exit() {
+            local rc=$?
+            if [ "$rc" -ne 0 ]; then
+              dump
+            fi
+          }
+          trap on_exit EXIT
+          helm install ferrum-gateway ./charts/ferrum-gateway -n "$namespace" --create-namespace \
+            -f charts/ferrum-gateway/examples/file-values.yaml \
+            --set image.repository="${FERRUM_IMAGE%:*}" --set image.tag="${FERRUM_IMAGE##*:}" \
+            --set image.pullPolicy=Never --set service.type=ClusterIP --set replicaCount=1
+          kubectl -n "$namespace" rollout status deploy/ferrum-gateway --timeout=180s
+          kubectl -n "$namespace" port-forward deploy/ferrum-gateway 19000:9000 >/dev/null 2>&1 &
+          port_forward=$!
+          healthy=false
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:19000/health; then
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          kill "$port_forward" || true
+          if [ "$healthy" != "true" ]; then
+            echo "::error title=ferrum-gateway chart::file-mode install never answered /health on the admin port"
+            exit 1
+          fi
+          helm uninstall ferrum-gateway -n "$namespace" --wait
+
       - name: Validate Ambient UDP placement upgrade contract
         run: |
           set -euo pipefail
@@ -6635,7 +6693,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -6754,7 +6812,7 @@ jobs:
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_rust == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -6824,16 +6882,18 @@ jobs:
     permissions:
       contents: read
     # The repository-root Cargo config also selects the mold linker through
-    # per-target rustflags, and this isolated lane installs no fast linker, so
-    # the inherited rustflags are cleared explicitly. The rustc wrapper is
-    # deliberately NOT pinned here: `setup-sccache` below publishes either the
-    # checksum-verified sccache path or an empty value through `GITHUB_ENV`,
-    # and a job-level `env` entry of the same name would override that
-    # fail-closed decision.
+    # per-target rustflags, and a runner- or user-level rustc-wrapper may
+    # select sccache, but this isolated lane installs neither: like the
+    # scheduled and push-to-main fuzz lanes, it clears both Cargo wrapper
+    # inputs and the inherited rustflags explicitly. Its compiler reuse is the
+    # restored `fuzz-property-smoke` target directory alone; a local sccache
+    # store measured 0 hits here because nothing persisted it (#7285).
     env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -6847,15 +6907,6 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
           toolchain: nightly-2026-09-30
-
-      # The repository's own checksum-pinned sccache installer, and the only
-      # local action this contract admits. It never enables the
-      # credential-bearing sccache GHA backend, never persists
-      # ACTIONS_RUNTIME_TOKEN / ACTIONS_RESULTS_URL into later steps, asserts
-      # those credentials are absent before any build runs, and fails closed to
-      # no wrapper at all. It must run BEFORE the cache restore below so the
-      # lazily started sccache server indexes the restored entries.
-      - uses: ./.github/actions/setup-sccache
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -6887,21 +6938,10 @@ jobs:
           cargo test --locked
           echo "Fuzz property smoke seconds: $((SECONDS - property_started))"
 
-      - name: Report fuzz lane compiler-cache telemetry
+      - name: Report fuzz lane shape
         if: always()
         run: |
-          set -euo pipefail
-
           echo "Fuzz lane shape: deterministic property gate (sanitizer budget runs in fuzz-smoke-main.yml)"
-
-          sccache_bin="${RUSTC_WRAPPER:-}"
-          if [ -n "$sccache_bin" ] && [ -x "$sccache_bin" ]; then
-            echo "Fuzz lane sccache statistics after this run:"
-            "$sccache_bin" --show-stats
-            du -sh "${GITHUB_WORKSPACE}/.cache/sccache" || true
-          else
-            echo "::warning::sccache was unavailable; this fuzz run compiled without a compiler cache"
-          fi
 
   build-ebpf:
     name: Build eBPF Programs
@@ -6909,7 +6949,7 @@ jobs:
     if: needs.ci-plan.outputs.mode == 'full' && needs.ci-plan.outputs.run_ebpf_build == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -6962,7 +7002,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -6995,7 +7035,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -7105,7 +7145,7 @@ jobs:
       CARGO_BUILD_JOBS: "3"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -7245,7 +7285,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -7339,7 +7379,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.ci-plan.outputs.binary-matrix) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -7348,8 +7388,6 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-
-      - uses: ./.github/actions/setup-sccache
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -7417,6 +7455,11 @@ jobs:
           Invoke-WebRequest `
             -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVersion/protoc-$protocVersion-win64.zip" `
             -OutFile $protocZip
+          $expectedProtocSha256 = "5d3ff218d7d91eea95f7569bcb5a98f3030f8996d44151279d9772edcff76082"
+          $actualProtocSha256 = (Get-FileHash -Algorithm SHA256 $protocZip).Hash.ToLowerInvariant()
+          if ($actualProtocSha256 -ne $expectedProtocSha256) {
+            throw "protoc archive SHA-256 mismatch: expected $expectedProtocSha256, got $actualProtocSha256"
+          }
           Expand-Archive -Path $protocZip -DestinationPath $protocRoot -Force
           $protocBin = Join-Path $protocRoot "bin"
           $protocExe = Join-Path $protocBin "protoc.exe"
@@ -7455,20 +7498,6 @@ jobs:
         run: cargo build --features cloud-secrets --profile pr-build --target ${{ matrix.target }}
         shell: bash
 
-      - name: Report compiler cache statistics
-        if: always()
-        shell: bash
-        # Best-effort telemetry (#6282): setup-sccache may fail before it
-        # publishes a verified executable, leaving FERRUM_SCCACHE_BIN empty
-        # while Cargo builds uncached. That must not fail the job; real Cargo
-        # failures still fail their own steps above.
-        run: |
-          if [ -n "${FERRUM_SCCACHE_BIN:-}" ]; then
-            "${FERRUM_SCCACHE_BIN}" --show-stats || echo "::warning::sccache statistics were unavailable"
-          else
-            echo "::warning::sccache was unavailable; this build compiled without a compiler cache"
-          fi
-
   main-linux-image:
     name: Build Linux CI image
     needs: [test, build-test-artifacts]
@@ -7478,7 +7507,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

@@ -178,7 +178,7 @@ it works as follows:
   shard reports do not enforce the overall or `src/plugins/` floors, which are
   only meaningful on the complete matrix.
 - Dependency/build-graph inputs (`Cargo.toml`, `Cargo.lock`, `build.rs`,
-  `proto/**`, `ebpf/**`, `.cargo/**`, `rust-toolchain.toml`) and unknown
+  `build/**`, `proto/**`, `ebpf/**`, `.cargo/**`, `rust-toolchain.toml`) and unknown
   coverage-relevant paths fail closed to the full matrix; diffs with no
   coverage-relevant files skip.
 

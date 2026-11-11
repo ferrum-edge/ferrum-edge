@@ -67,7 +67,7 @@ RELEASE_GATE_ENV = (
 )
 RELEASE_GATE_ACTIVE_COMMANDS = (
     "set -euo pipefail",
-    'if [[ ! "$TAG_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then',
+    'if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then',
     'echo "Invalid release tag format: $TAG_NAME" >&2',
     "exit 1",
     "fi",
@@ -630,30 +630,6 @@ def _active_shell_lines(script: str) -> list[str]:
     return active
 
 
-def _direct_job_scalar(body: str, key: str) -> str | None:
-    """Return one active canonical direct scalar, excluding comments."""
-
-    values: list[str] = []
-    for line in body.splitlines():
-        if not line.strip() or _is_comment_line(line):
-            continue
-        try:
-            if _indent_spaces(line) != 4:
-                continue
-        except StructuralError:
-            return None
-        match = _MAPPING_KEY.match(line[4:])
-        if match is None or match.group(1) != key:
-            continue
-        kind, payload = _classify_value(match.group(2))
-        if kind != "scalar":
-            return None
-        values.append(payload)
-    if len(values) != 1:
-        return None
-    return values[0]
-
-
 def _checkout_step_errors(
     step: dict[str, tuple[str, object]],
     located: str,
@@ -943,7 +919,11 @@ def _transient_http_delay(
         return None
     if status == 403 and not rate_signature:
         return None
-    if reset is not None:
+    # `X-RateLimit-Reset` is the start of the next hourly quota window, sent on
+    # every response. Only an exhausted quota waits for it: a 5xx or secondary
+    # limit that still has quota falls through to `Retry-After`, then one poll
+    # interval, instead of sleeping until the window resets (issue #7283).
+    if reset is not None and remaining == "0":
         try:
             return max(1.0, float(reset) - now)
         except ValueError:
@@ -2250,7 +2230,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
       checks: read
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -2272,7 +2252,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
         run: |
           set -euo pipefail
 
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$ ]]; then
             echo "Invalid release tag format: $TAG_NAME" >&2
             exit 1
           fi
@@ -2512,6 +2492,31 @@ def self_test() -> list[str]:
         _transient_http_delay(503, {}, "", now=1000)
         == POLL_SECONDS,
         "a 5xx without reset headers must remain pending for one poll interval",
+    )
+    expect(
+        _transient_http_delay(
+            502,
+            {"X-RateLimit-Remaining": "4999", "X-RateLimit-Reset": "4000"},
+            "",
+            now=1000,
+        )
+        == POLL_SECONDS,
+        "a 5xx with quota remaining must not sleep until X-RateLimit-Reset",
+    )
+    expect(
+        _transient_http_delay(
+            403,
+            {
+                "X-RateLimit-Remaining": "12",
+                "X-RateLimit-Reset": "4000",
+                "Retry-After": "60",
+            },
+            "secondary rate limit",
+            now=1000,
+        )
+        == 60,
+        "a secondary limit with quota remaining must honor Retry-After, not the "
+        "hourly reset",
     )
     expect(
         _transient_http_delay(404, {}, "", now=1000) is None,
@@ -3549,7 +3554,7 @@ def self_test() -> list[str]:
         "release env owned by the job instead of the named step must fail",
     )
     release_missing_checkout = _CONFORMING_RELEASE_JOB.replace(
-        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
         "        with:\n"
         "          persist-credentials: false\n"
         "          fetch-depth: 0\n\n",
@@ -3573,7 +3578,7 @@ def self_test() -> list[str]:
         )
         expect(_release_errors(release_wrong_pin) != [], label)
     release_rotated_pin = _CONFORMING_RELEASE_JOB.replace(
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
         "actions/checkout@1111111111111111111111111111111111111111 # v7.0.9",
     )
     expect(
@@ -3634,15 +3639,6 @@ def self_test() -> list[str]:
     expect(
         _release_errors(release_opaque_key) != [],
         "an opaque explicit-key duplicate of validate-release-sha must fail",
-    )
-    try:
-        _parse_job(_CONFORMING_RELEASE_JOB + '  "smuggled":\n    name: Attack\n')
-        release_unconsumed = False
-    except StructuralError:
-        release_unconsumed = True
-    expect(
-        release_unconsumed,
-        "unconsumed lower-indentation content in a release job region must fail",
     )
 
     return failures

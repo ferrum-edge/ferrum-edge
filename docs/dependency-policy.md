@@ -283,13 +283,13 @@ benchmark inputs stay otherwise stable.
 Run locally:
 
 ```bash
-cargo install --locked cargo-deny
+cargo install --locked cargo-deny --version 0.20.2
 cargo deny check advisories bans sources licenses   # the gate (root workspace)
-cargo deny --manifest-path ebpf/Cargo.toml \
-    check --allow advisory-not-detected --config deny.toml advisories bans sources licenses          # the gate (eBPF workspace)
+cargo deny --manifest-path ebpf/Cargo.toml --config deny.toml \
+    check --allow advisory-not-detected advisories bans sources licenses          # the gate (eBPF workspace)
 for manifest in $(python3 .github/scripts/standalone_cargo_manifests.py); do
-  cargo deny --manifest-path "$manifest" \
-    check --allow advisory-not-detected --config deny.toml advisories   # standalone workspaces
+  cargo deny --manifest-path "$manifest" --config deny.toml \
+    check --allow advisory-not-detected advisories   # standalone workspaces
 done
 ```
 
@@ -346,8 +346,8 @@ permanent by default.
 
 The token lives in a **comment**, not in the entry value, because cargo-deny's
 two schemas differ: an `[advisories.ignore]` table accepts a free-text `reason`
-field, while a `[licenses.exceptions]` entry does not — cargo-deny 0.19.9 (the
-pinned gate) and 0.20.2 both reject every key other than the crate spec plus
+field, while a `[licenses.exceptions]` entry does not — cargo-deny 0.20.2 (the
+pinned gate) and 0.19.9 both reject every key other than the crate spec plus
 `allow`
 (`error[unexpected-keys]: found 1 unexpected keys, expected: ["allow"]`). The
 convention is a `#` comment on the line immediately preceding the entry (a
@@ -501,7 +501,7 @@ of the vendor copy and must keep passing after retirement:
   (`test_*websocket_ping_*`).
 - The tungstenite / tokio-tungstenite fragment-accounting regressions live in
   the vendored crate (`protocol::tests::fragment_*`,
-  `protocol::tests::incomplete_message_*`) and in
+  `protocol::tests::incomplete_message_*`, run by the vendored-patch job) and in
   `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`, which repeats
   every vendored case through the public API and covers the
   `tokio-tungstenite` delegator (`async_delegator_*`).
@@ -628,7 +628,7 @@ the group must be ready — see the `Removal trigger` column).
    also runs.
 4. `git rm -r vendor/<crate>-<ver>-ferrum-patched/` (and `vendor/` if empty),
    then `git grep '<crate>-<ver>-ferrum-patched'` for remaining references
-   (CI steps in `.github/workflows/ci.yml`, `.github/scripts/`, `Dockerfile.test`).
+   (CI steps in `.github/workflows/ci.yml` and `.github/scripts/`).
 5. Move `docs/upstream-<crate>-patches/NNN-…/` to `…/_retired/NNN-…/` with a
    `STATUS.md` (merge commit + registry version), or delete per that crate's
    README.
@@ -726,8 +726,8 @@ blocking dependency audit when `Cargo.lock` changes.
 
 ## Base image pinning
 
-Production container images (`Dockerfile`, `Dockerfile.release`, and
-`Dockerfile.test`) must pin every external `FROM` base by registry digest, not
+Production container images (`Dockerfile`, `Dockerfile.release`,
+`Dockerfile.ebpf-tools-layer`, and `Dockerfile.iproute2-layer`) must pin every external `FROM` base by registry digest, not
 by a mutable tag alone. Write the reference as `repo:tag@sha256:…`, the same form
 `IPROUTE2_BASE` already uses: the digest decides which bytes are pulled and the
 tag stays in the reference as documentation. A Dockerfile comment is a WHOLE line
@@ -767,7 +767,7 @@ its first token or skipped.
 ### Container build inputs (enforcement and refresh)
 
 Every registry image reference in `Dockerfile`, `Dockerfile.release`,
-`Dockerfile.test`, `Dockerfile.ebpf-tools-layer`, and
+`Dockerfile.ebpf-tools-layer`, and
 `Dockerfile.iproute2-layer` — both `FROM <ref>` and the `ARG <NAME>=<ref>`
 defaults those `FROM ${VAR}` lines expand — carries an `@sha256:` digest.
 `Dockerfile.iproute2-layer`'s default `BASE_IMAGE` matches the source runtime
@@ -952,8 +952,6 @@ The rules for any action pin, whoever proposes it:
 2. The trailing version comment is informational. Keep it accurate for new
    uses. It is not part of any frozen surface, so Dependabot may rewrite it
    (`# v7.4.0` → `# v7.5.0`) or leave a major-only comment (`# v7`) alone.
-   Some guarded checkout sites still carry a historical `# v6` annotation on
-   the v7.0.1 SHA; an ordinary PR may now correct it.
 
 ### Automated action pin rotation
 
@@ -1074,7 +1072,7 @@ reachable on *either* revision stays in scope, so a pull request cannot drop the
 reachability edge and edit the file in the same commit. Newly reaching an
 already-Cross-sensitive script from a protected job is still rejected.
 
-#### Temporary generation transitions (`fips-build.yml`, CI jobs, `setup-rust-ci`)
+#### Generation transitions (`fips-build.yml`, CI jobs, `setup-rust-ci`)
 
 The verifier can admit an exact whole-file SHA-256 source→destination pair for
 a frozen surface, so one reviewed rewrite can pass the Cross surface scan. Each
@@ -1082,17 +1080,16 @@ pair is path- or job-bound, one-way, fail-closed, and decided entirely by the
 trusted base; anything else is scanned as an ordinary Cross surface change.
 Current admissions:
 
-- `fips-build.yml`: one transition for the issue #4018 memory mitigation on the
-  `fips-test-build` job (`FIPS_BUILD_ADMITTED_GENERATION_TRANSITION`). The
-  earlier #3889 admission was retired by #3943.
+- `fips-build.yml`: none. The #3889, #3950 and issue #4018 whole-file
+  admissions are spent and the verifier no longer carries the mechanism.
 - Cross-sensitive `ci.yml` jobs (`CI_JOB_GENERATION_TRANSITIONS`) and local
   composite actions (`LOCAL_ACTION_GENERATION_TRANSITIONS`): both tables are
   currently empty. Their pairs, including the `setup-rust-ci` #3889→#3911
   chain and the issue #6573 BoringCache retirement pairs, are spent and
   retired.
 
-Details and digests: `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
-transition", "Admitted CI job SHA-256 generation transitions", and "Admitted
+Details: `docs/ci_cd.md` → "`fips-build.yml` generation transitions (none
+open)", "Admitted CI job SHA-256 generation transitions", and "Admitted
 local-action generation transitions".
 
 ### Refreshing kind / kubectl / Helm versions and checksums
@@ -1120,18 +1117,12 @@ Versions and digests live as defaults on the
    path-filter on the composite action will exercise the new pins.
 
 `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the trusted
-revision before `uses:`, so a pull request that edits that action is rejected
-unless `verify_trusted_local_action.py` already admits that exact
-source→destination generation pair. Issue #3904's predecessor transition binds
-the current `action.yml`
-(`6ecb4bde09a0d3d456d6019c03ef1678c3903cbc0275bba31fde3e56f6e6ef08`,
-non-executable, sole governed file) moving to the PR #3910 cached-installer
-generation
-(`41dd4b9ae1b0ad74e021e2974afbcdac1a1bc0d856a166a57e94046e803d6cd9`, same path
-set and mode). Future installer edits need a new frozen pair, or must match the
-trusted tree byte for byte. Do not treat a working-tree digest or a mutable
-allowlist as admission. After #3910 is the trusted base, retire the predecessor
-constants so the old generation cannot remain an admitted source.
+revision before `uses:`, so a pull request that edits that action is rejected:
+`verify_trusted_local_action.py` admits only byte identity with the trusted
+tree. Issue #3904's one-way move to the PR #3910 cached-installer generation is
+spent and retired. A future installer edit (a version or checksum bump) is
+therefore reviewed direct-to-`main` work. Do not treat a working-tree digest or
+a mutable allowlist as admission.
 
 Never refresh a checksum by copying a digest from an unpinned adjacent path
 without official release provenance, and never pipe a remote install script to
@@ -1210,7 +1201,8 @@ Rules:
   resolved (`cargo tree -e normal,build --prefix none -f '{p}|{f}'`) for
   *both* profiles and
   fails on any surviving ring selection in the FIPS graph. It runs in the
-  required `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`.
+  `FIPS Feature Policy` job of `.github/workflows/fips-build.yml`, which the
+  required `FIPS Build & Test` aggregate needs and requires to succeed.
   The `normal,build` edge filter is load-bearing: test fixtures pin `ring` and
   `rustls/ring` as dev-dependencies so the suite can verify both profiles
   without those edges entering a shipped binary. Package-row feature output is

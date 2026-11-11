@@ -72,6 +72,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   federated) now follow the same key policy as plugin JWKS keys: the RSA public
   exponent must be odd and greater than 65536, and EC keys must use P-256 or
   P-384. (#7268)
+- CI: `Gateway API Conformance` now decides relevance with the trusted-base
+  path filter, so a pull request can no longer narrow its own filter to skip
+  the required conformance lab (GHSA-c57q-j5hg-w4vc).
+- CI: `FIPS Build & Test` now requires the `FIPS Feature Policy` audit to
+  succeed, so a pull request that breaks the ring/FIPS feature graph can no
+  longer merge green (GHSA-cgg3-3m23-23gx).
+- CI: the trusted Cross build policy now sees Cross dispatches behind wrapper
+  options such as `sudo -E`, `ionice -c 3`, `exec -a`, `stdbuf -o L` and
+  unknown options, and behind brace expansions that overflow its variant bound
+  (GHSA-q636-fxjc-3r78).
+- CI: the chart runtime-socket lint now renders every chart, including
+  `charts/ferrum-gateway`, so a template-built socket path in the gateway
+  chart is rejected (GHSA-4xcp-8c2m-g84j).
 
 ### Removed
 - **Plugin readers for metadata and record shapes no built-in writes**
@@ -232,6 +245,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The write-only per-session UDP request-size store and the
   `bench-udp-profile` `request_size_stores` counter that only counted it
   (#7173). The response amplification budget is unchanged.
+- CI: retired lanes for closed studies: pending-review cleanup, native cache
+  envelope / compiler store, release profile and platform studies, release
+  SBOM smoke, gRPC deadline A/B, stream profile, the H2 guard observation and
+  pin-check lanes with `tests/performance/multi_protocol/h2_guard/` (which
+  ends the `src/admin/mod.rs` hash re-pin), and the scale-benchmark
+  route-status and unit-scheduling workloads (#7279).
+- CI: dead verifier and report code, including `coverage_plan.py
+  --verify-artifacts`, unused constants and helpers, self-tests that only
+  exercised copies, and stale "PR CI" wording (#7282, #7283).
+- CI: spent generation admissions and dead contracts in the trusted CI
+  verifiers: the `coverage-merge` and `fips-build.yml` transitions, the
+  retired in-CI sanitizer `fuzz-smoke` generation, the
+  `setup-kubernetes-tools` transition, the retired Ambient `type=gha`
+  image-cache generation, the two-family `release.yml` image-family
+  generation with its transition and Cross-surface projection (the policy
+  now admits only the three-family shape), the dead `ci.yml` publication
+  contracts, and four runtime-cache checks only their self-test called
+  (#7281).
+- CI: the dead pull-request change detection in `performance-regression.yml`
+  (#7291).
+- `Dockerfile.test`, which could not build and no workflow used (#7296).
+- The dead `tests/performance/run_perf_test.sh` HTTP smoke harness, its
+  committed result files, `perf_config.yaml` and
+  `multi_protocol/run_all_protocol_tests.sh` (#7300).
+- Comparison report: the native-Kong label and advice, and the
+  `kong_native`/`envoy_native` metadata (#7306).
 - The unused `tracing-appender` dependency, with its `symlink` dependency,
   from `Cargo.toml` and the root, fuzz and mesh-benchmark lockfiles (#7295).
 
@@ -543,6 +582,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The buffered-request native HTTP/3 streaming path relays through the shared
   committed-response relay** (#7190). The copy of about 600 lines is removed,
   so future relay fixes apply to both paths at once.
+- CI: the Helm Chart job now installs `charts/ferrum-gateway` (file mode) into
+  its kind cluster and probes `/health` (#7293).
+- Release: every published image now passes the SQLite fresh-volume smoke
+  (`scripts/smoke_sqlite_volume.sh`) (#7307).
+- CI: `src/gateway_entry.rs`, which `cargo fmt` never visits because
+  `src/main.rs` `include!`s it, is now rustfmt-clean, and CI Plan fails on its
+  drift with `rustfmt --edition 2024 --check` (#7219).
+- CI: Fuzz Smoke, the native binary builds and the FIPS Cargo jobs no longer
+  install sccache; its local store was never persisted and measured 0–4 %
+  hits. The FIPS producer handoff carries `target/` only, and dispatch-only
+  benchmark caches are restore-only (`save-if: "false"`) (#7285).
 
 ### Fixed
 - An `api_chargeback_sink` with `clickhouse.tls.verify_hostname: false` and
@@ -2037,6 +2087,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `H3_NO_ERROR`** (#7188). Previously the receive half was dropped and quinn
   sent `STOP_SENDING(0)`. CONNECT-UDP faults halt it with the same code the
   send half resets with.
+- CI: a pull request that changed only `build/*.rs` (the modules `build.rs`
+  includes) or `clippy.toml` scheduled no compile, lint or test job and merged
+  green; the trusted planners now treat them as build and lint inputs, and
+  documentation-only trees (`comparison/`, `assets/`, compose files,
+  ClickHouse DDL, `Cross.toml`) no longer force the NodeWaypoint, FIPS and
+  image-smoke lanes (#7284).
+- CI: the release publication gate no longer sleeps until the hourly
+  `X-RateLimit-Reset` on a 5xx or secondary limit that still has API quota,
+  which could exhaust the release deadline (#7283).
+- CI: several verifier checks that could never fail now can: the coverage
+  unit-target set, "runs the verifier" checks the `--self-test` line
+  satisfied, `cache-on-failure`, every `ACTIONS_RUNTIME_TOKEN` export, and the
+  Multicluster Poller Partition artifact wiring. Each
+  summarize_mesh_baseline_results bad-metric fixture now fails for its own
+  defect (#7282).
+- CI: benchmark workflows piped the harness into `tee` without `pipefail`, so
+  a failed benchmark run stayed green; they now run every step under `bash -eo
+  pipefail`, and the payload-size benchmark defaults to the `release` profile
+  (#7286).
+- CI: the branch-pruning workflow deleted a merged or stale PR's branch by
+  name, losing new work pushed to a reused branch name; it now deletes only at
+  that PR's own tip, leases the delete to it and logs it (#7287).
+- CI: CI lab images were packaged on the mutable
+  `distroless/cc-debian13:nonroot` tag and never checked for a glibc mismatch;
+  they now use the Dockerfile's digest-pinned runtime base and fail early when
+  a binary needs a newer glibc. The Windows protoc download is now
+  checksum-verified (#7289).
+- Release: `release.yml` accepted prerelease-suffixed tags, published them as
+  normal releases and moved the stable `X.Y` image aliases; every tag check
+  now requires a stable `vMAJOR.MINOR.PATCH` tag (#7292).
+- CI: the vendored tungstenite fragment-accounting regressions now run in the
+  vendored-patch job (#7294).
+- CI: the cargo-deny gate moves to 0.20.2 with `--config` before `check`
+  (#7310).
+- Comparison benchmark: the E2E-TLS column compared different work, because
+  Envoy and KrakenD verified the backend certificate while Ferrum, Kong and
+  Tyk did not. Now no gateway verifies it (the test certificate is CA:TRUE,
+  which rustls rejects as an end entity). A failed key-auth gateway start now
+  skips that arm instead of aborting the run before the report (#7306).
+- Repository: `CODEOWNERS` now covers every `docs/upstream-*-patches/`
+  directory. The issue and PR templates link `SECURITY.md` and
+  `CONTRIBUTING.md` correctly and list every operating mode (#7309).
 
 ### Performance
 - **`ai_tool_governor` drains its live SSE buffer once per chunk**

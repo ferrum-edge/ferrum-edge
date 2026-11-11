@@ -347,7 +347,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        'runs-on: ubuntu-26.04' in text or "runs-on: ubuntu-26.04" in text,
+        "runs-on: ubuntu-26.04" in text,
         "workflow must document/use ubuntu-26.04 runner class",
         failures,
     )
@@ -580,8 +580,9 @@ def validate_scenarios_contract(text: str, failures: list[str]) -> None:
     )
 
 
-def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
-    """Required PR CI must run lightweight protocol-perf validators without benches."""
+def validate_performance_lane_contract(text: str, failures: list[str]) -> None:
+    """The out-of-band `performance-regression.yml` lane must run the lightweight
+    protocol-perf validators without benches."""
     performance_job = _PERFORMANCE_REGRESSION_JOB_RE.search(text)
     require(
         performance_job is not None,
@@ -609,9 +610,15 @@ def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
         "performance-regression.yml must run the protocol-perf workflow verifier self-test",
         failures,
     )
+    # Both former operands were the bare path, which the `--self-test` line
+    # already satisfies; match the contract invocation as its own line.
     require(
-        "verify_protocol_perf_regression_workflow.py\n" in text
-        or "verify_protocol_perf_regression_workflow.py" in text,
+        re.search(
+            r"(?m)^\s*python3 \.github/scripts/"
+            r"verify_protocol_perf_regression_workflow\.py\s*$",
+            text,
+        )
+        is not None,
         "performance-regression.yml must run repository-contract verification for protocol-perf",
         failures,
     )
@@ -626,20 +633,21 @@ def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
         "performance-regression.yml must syntax-check the protocol regression scenario harness",
         failures,
     )
-    # Ensure the static gate is not buried behind optional benchmark path filters.
+    # The static gate runs before any benchmark toolchain or build.
     checkout_idx = text.find("performance-regression:")
     static_idx = text.find("Verify protocol-perf contracts (static)")
-    detect_idx = text.find("Detect performance-sensitive changes")
+    benchmark_setup_idx = text.find("uses: ./.github/actions/setup-rust-ci")
     require(
-        checkout_idx != -1 and static_idx != -1 and detect_idx != -1,
-        "performance-regression.yml must contain performance-regression, static protocol-perf, and path detect steps",
+        checkout_idx != -1 and static_idx != -1 and benchmark_setup_idx != -1,
+        "performance-regression.yml must contain performance-regression, static protocol-perf, and "
+        "benchmark toolchain setup steps",
         failures,
     )
-    if checkout_idx != -1 and static_idx != -1 and detect_idx != -1:
+    if checkout_idx != -1 and static_idx != -1 and benchmark_setup_idx != -1:
         require(
-            checkout_idx < static_idx < detect_idx,
+            checkout_idx < static_idx < benchmark_setup_idx,
             "performance-regression.yml must run protocol-perf static contracts after checkout and before "
-            "optional benchmark path gating",
+            "the benchmark toolchain setup",
             failures,
         )
 
@@ -700,7 +708,7 @@ def validate_repository_contract(failures: list[str]) -> None:
 
     if CI_WORKFLOW_PATH.is_file():
         ci_workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
-        validate_pr_ci_contract(ci_workflow, failures)
+        validate_performance_lane_contract(ci_workflow, failures)
         validate_performance_regression_workspaces(ci_workflow, failures)
 
     if SETUP_RUST_CI_PATH.is_file():
@@ -760,7 +768,8 @@ def validate_repository_contract(failures: list[str]) -> None:
         )
         require(
             "protocol-perf" in ci_cd.lower() and "static" in ci_cd.lower(),
-            "docs/ci_cd.md must document protocol-perf static PR CI validation",
+            "docs/ci_cd.md must document the out-of-band `performance-regression.yml` "
+            "lane's static protocol-perf validation",
             failures,
         )
         require(
@@ -794,14 +803,15 @@ def validate_repository_contract(failures: list[str]) -> None:
             failures,
         )
         require(
-            "ci.yml" in runbook and "overhead" in runbook.lower(),
-            "runbook must preserve the lightweight PR overhead check",
+            "ci_overhead_bench.py" in runbook,
+            "runbook must document the daily HTTP/1 overhead check",
             failures,
         )
         require(
             "Performance Regression Check" in runbook
             or "protocol-perf contracts" in runbook.lower(),
-            "runbook must document PR CI static protocol-perf contract checks",
+            "runbook must document the out-of-band `performance-regression.yml` "
+            "lane's static protocol-perf contract checks",
             failures,
         )
         require(
@@ -809,7 +819,8 @@ def validate_repository_contract(failures: list[str]) -> None:
             and "workspaces" in runbook
             and "tests/performance/mesh" in runbook
             and ". -> target" in runbook,
-            "runbook must document PR CI mesh workspace rust-cache coverage",
+            "runbook must document the out-of-band `performance-regression.yml` "
+            "lane's mesh workspace rust-cache coverage",
             failures,
         )
 
@@ -831,7 +842,7 @@ jobs:
   regress:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust-ci
       - run: echo ci-release
       - run: python3 tests/performance/multi_protocol/run_protocol_regression_scenarios.py
@@ -839,7 +850,7 @@ jobs:
       - run: echo protocol_perf_budgets.json alert trends runner_health
       - run: python3 -I .github/scripts/latest_trusted_scheduled_runs.py --self-test
       - run: python3 -I .github/scripts/latest_trusted_scheduled_runs.py --workflow protocol-perf-regression.yml --current-sha "$CURRENT_SHA"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
 """
     validate_workflow_text(good, failures)
 
@@ -902,13 +913,13 @@ SIGHUP was not delivered
             f"self-test unexpectedly rejected good scenarios snippet: {good_scenario_failures}"
         )
 
-    pr_ci_good = """
+    lane_good = """
   performance-regression:
     name: Performance Regression Check
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Verify protocol-perf contracts (static)
@@ -917,28 +928,45 @@ SIGHUP was not delivered
           python3 .github/scripts/verify_protocol_perf_regression_workflow.py
           python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
           python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
-      - name: Detect performance-sensitive changes
-        run: echo detect
+      - uses: ./.github/actions/setup-rust-ci
 """
-    pr_ci_failures: list[str] = []
-    validate_pr_ci_contract(pr_ci_good, pr_ci_failures)
-    if pr_ci_failures:
+    lane_failures: list[str] = []
+    validate_performance_lane_contract(lane_good, lane_failures)
+    if lane_failures:
         failures.append(
-            f"self-test unexpectedly rejected good PR CI snippet: {pr_ci_failures}"
+            "self-test unexpectedly rejected a good performance-regression.yml "
+            f"snippet: {lane_failures}"
         )
 
-    pr_ci_bad_failures: list[str] = []
-    validate_pr_ci_contract(
+    self_test_only_failures: list[str] = []
+    validate_performance_lane_contract(
+        lane_good.replace(
+            "          python3 .github/scripts/verify_protocol_perf_regression_workflow.py\n",
+            "",
+            1,
+        ),
+        self_test_only_failures,
+    )
+    if not any("repository-contract" in item for item in self_test_only_failures):
+        failures.append(
+            "self-test expected a lane that only self-tests the protocol-perf "
+            "verifier to be rejected"
+        )
+
+    lane_bad_failures: list[str] = []
+    validate_performance_lane_contract(
         """
   performance-regression:
     steps:
-      - name: Detect performance-sensitive changes
-        run: echo detect
+      - uses: ./.github/actions/setup-rust-ci
 """,
-        pr_ci_bad_failures,
+        lane_bad_failures,
     )
-    if not any("static" in item for item in pr_ci_bad_failures):
-        failures.append("self-test expected missing protocol-perf static PR CI detection")
+    if not any("static" in item for item in lane_bad_failures):
+        failures.append(
+            "self-test expected the performance-regression.yml lane's missing "
+            "static protocol-perf checks to be detected"
+        )
 
     good_setup_rust_ci = """
 name: Setup Rust CI environment
@@ -958,7 +986,7 @@ runs:
   using: composite
   steps:
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}

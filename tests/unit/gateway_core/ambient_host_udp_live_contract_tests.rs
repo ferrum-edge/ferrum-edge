@@ -117,7 +117,9 @@ fn ambient_host_udp_live_workflow_is_unconditional_with_a_trusted_base_relevance
     );
     for complete_contract in [
         "AMBIENT_HOST_UDP_LIVE_JOB",
-        "AMBIENT_HOST_UDP_IMAGE_JOB",
+        "AMBIENT_REGISTRY_IMAGE_READ_JOB",
+        "AMBIENT_REGISTRY_IMAGE_WRITE_JOB",
+        "AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB",
         "AMBIENT_HOST_UDP_GATE_JOB",
         "AMBIENT_HOST_UDP_TOP_LEVEL_PERMISSIONS",
         "AMBIENT_HOST_UDP_FORBIDDEN_INHERITED_KEYS",
@@ -828,9 +830,9 @@ fn ambient_udp_lifecycle_image_is_a_first_class_trusted_release_family() {
 
     // 4. The digest name space is owned, and both the producing steps and the
     //    whole assembling job are frozen by the trusted cross-build policy's
-    //    admitted three-family generation (PR #3768). Ownership is expressed
+    //    release publication contract (PR #3768). Ownership is expressed
     //    through `RELEASE_TOOLS_DIGEST_PREFIX` rather than an inline literal so
-    //    the two-family base and the three-family adoption stay in sync.
+    //    the owner table and the self-tests name one prefix.
     assert!(
         policy.contains("RELEASE_TOOLS_DIGEST_PREFIX = \"docker-ebpf-tools-digest-\""),
         "the tools digest wildcard prefix must be named exactly once"
@@ -841,9 +843,12 @@ fn ambient_udp_lifecycle_image_is_a_first_class_trusted_release_family() {
          so no other job can inject a descriptor into the published manifest"
     );
     assert!(
-        policy.contains("RELEASE_THREE_FAMILY_DIGEST_ARTIFACT_OWNERS"),
-        "digest ownership for the tools family must live in the three-family \
-         adoption generation, not silently rewrite the two-family base"
+        policy.contains(
+            "        \"docker-ebpf-digest-\": (\"docker-ebpf\",),\n        \
+             RELEASE_TOOLS_DIGEST_PREFIX: (\"docker-ebpf\",),"
+        ),
+        "digest ownership for the tools family must sit in the release \
+         workflow's `DIGEST_ARTIFACT_OWNERS` entry beside the `-ebpf` name space"
     );
     for frozen in [
         "\"Build and push per-platform eBPF tools digest\": (",
@@ -851,7 +856,7 @@ fn ambient_udp_lifecycle_image_is_a_first_class_trusted_release_family() {
         "\"Download tools digests\": (",
         "DOCKER_EBPF_MANIFEST_TOOLS_DOWNLOAD_STEP",
         "\"steps\": RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS,",
-        "RELEASE_IMAGE_FAMILY_GENERATIONS",
+        "RELEASE_TOOLS_MANIFEST_JOB_NAME: RELEASE_TOOLS_MANIFEST_CLOSED_FIELDS,",
     ] {
         assert!(
             policy.contains(frozen),
