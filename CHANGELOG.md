@@ -485,7 +485,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / `backend_to_client`** (issue #7144). `ws_frame_logging` frame records and
   the `ws_rate_limiting` and `waf` WebSocket warnings used `client->backend` /
   `backend->client`, unlike the `ws_frame_logging` direction filter, its
-  disconnect records, stream summaries, metrics and traces.
+  disconnect records, stream summaries, metrics and traces. The WebSocket
+  relay's size-policy warnings (`ws_message_size_limiting`, the global message
+  limit, incomplete-message and permessage-deflate rejections) now use the
+  same spelling too.
 - `plugin_triggers.missing_decision_carriers` no longer counts instances whose
   trigger reads `consumer` or `auth_method` (issue #7144). Those are undecided
   by design on stream connections and before `authenticate`; their hooks still

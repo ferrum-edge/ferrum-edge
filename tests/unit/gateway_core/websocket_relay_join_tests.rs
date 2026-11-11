@@ -421,12 +421,12 @@ fn test_size_policy_rejections_use_explicit_error_classes() {
 
     for (direction_marker, end_marker, expected_class) in [
         (
-            "direction = \"client->backend\"",
+            "direction = \"client_to_backend\"",
             "Client -> backend forwarding completed",
             "ws_capacity_error_class(size, true)",
         ),
         (
-            "direction = \"backend->client\"",
+            "direction = \"backend_to_client\"",
             "Backend -> client forwarding completed",
             "ws_capacity_error_class(size, false)",
         ),

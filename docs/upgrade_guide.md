@@ -185,8 +185,10 @@ Leave `emit_metadata` at its default `true` if dashboards read those keys.
 
 ### WebSocket frame records spell `direction` like every other record (#7144)
 
-`ws_frame_logging` frame records (the `ws_frame_log` tracing target) and the
-`ws_rate_limiting` and `waf` WebSocket warnings now write `direction` as
+`ws_frame_logging` frame records (the `ws_frame_log` tracing target), the
+`ws_rate_limiting` and `waf` WebSocket warnings, and the WebSocket relay's
+size-policy warnings (`ws_message_size_limiting`, the global message limit,
+incomplete-message and permessage-deflate rejections) now write `direction` as
 `client_to_backend` / `backend_to_client`, the spelling the `ws_frame_logging`
 `direction` filter, its disconnect records, stream summaries, metrics and
 traces already used. They wrote `client->backend` / `backend->client` before.
