@@ -406,6 +406,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `cache_key_include_consumer` are removed.
   - `soap_ws_security`: identifies a SAML assertion by `ID` only, never by the
     SAML 1.x `AssertionID`.
+  - `ip_restriction`: the decision-neutral `mode` key is removed; an address
+    that fails both the allow and deny checks is reported as `IP address not
+    allowed`.
 - `openapi_validator`: `error_truncate_chars` now defaults to 256, the cap that
   was always enforced (issue #7114).
 - Plugin configs no longer carry dedicated "was removed" diagnostics for

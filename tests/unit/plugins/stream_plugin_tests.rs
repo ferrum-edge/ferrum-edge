@@ -248,11 +248,7 @@ fn test_tcp_only_plugins() {
 
 #[tokio::test]
 async fn test_ip_restriction_stream_connect_allowed() {
-    let plugin = make_plugin(
-        "ip_restriction",
-        json!({"allow": ["10.0.0.0/8"], "mode": "allow_first"}),
-    )
-    .unwrap();
+    let plugin = make_plugin("ip_restriction", json!({"allow": ["10.0.0.0/8"]})).unwrap();
 
     let mut ctx = StreamConnectionContext::new(
         "10.1.2.3".to_string(),
@@ -270,11 +266,7 @@ async fn test_ip_restriction_stream_connect_allowed() {
 
 #[tokio::test]
 async fn test_ip_restriction_stream_connect_denied() {
-    let plugin = make_plugin(
-        "ip_restriction",
-        json!({"allow": ["10.0.0.0/8"], "mode": "allow_first"}),
-    )
-    .unwrap();
+    let plugin = make_plugin("ip_restriction", json!({"allow": ["10.0.0.0/8"]})).unwrap();
 
     let mut ctx = StreamConnectionContext::new(
         "192.168.1.1".to_string(),

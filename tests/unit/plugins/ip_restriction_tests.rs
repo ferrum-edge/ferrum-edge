@@ -69,8 +69,7 @@ async fn allow_mode_ip_not_in_allow_list_is_rejected() {
 #[tokio::test]
 async fn deny_mode_ip_in_deny_list_is_rejected() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["192.168.1.100"],
-        "mode": "deny_first"
+        "deny": ["192.168.1.100"]
     }))
     .unwrap();
 
@@ -82,8 +81,7 @@ async fn deny_mode_ip_in_deny_list_is_rejected() {
 #[tokio::test]
 async fn deny_mode_ip_not_in_deny_list_passes() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["192.168.1.100"],
-        "mode": "deny_first"
+        "deny": ["192.168.1.100"]
     }))
     .unwrap();
 
@@ -121,8 +119,7 @@ async fn allow_mode_cidr_no_match_rejects() {
 #[tokio::test]
 async fn deny_mode_cidr_match_rejects() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["10.0.0.0/8"],
-        "mode": "deny_first"
+        "deny": ["10.0.0.0/8"]
     }))
     .unwrap();
 
@@ -134,8 +131,7 @@ async fn deny_mode_cidr_match_rejects() {
 #[tokio::test]
 async fn deny_mode_cidr_no_match_passes() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["10.0.0.0/8"],
-        "mode": "deny_first"
+        "deny": ["10.0.0.0/8"]
     }))
     .unwrap();
 
@@ -199,8 +195,7 @@ async fn ipv6_cidr_no_match_rejects() {
 #[tokio::test]
 async fn ipv6_cidr_deny_match_rejects() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["fe80::/10"],
-        "mode": "deny_first"
+        "deny": ["fe80::/10"]
     }))
     .unwrap();
 
@@ -231,17 +226,6 @@ async fn empty_deny_list_rejects_creation() {
     assert!(result.err().unwrap().contains("at least one"));
 }
 
-#[tokio::test]
-async fn empty_deny_list_deny_first_mode_rejects_creation() {
-    // Empty deny list with deny_first mode but no allow list — no rules, should fail.
-    let result = IpRestriction::new(&json!({
-        "deny": [],
-        "mode": "deny_first"
-    }));
-    assert!(result.is_err());
-    assert!(result.err().unwrap().contains("at least one"));
-}
-
 // ── Default config (no lists) ───────────────────────────────────────
 
 #[tokio::test]
@@ -259,12 +243,12 @@ async fn default_config_rejects_creation_for_any_ip() {
     assert!(result.is_err());
 }
 
-// ── Both allow and deny lists (deny takes precedence in every mode) ──
+// ── Both allow and deny lists (deny always takes precedence) ──
 
 #[tokio::test]
-async fn allow_first_deny_takes_precedence_when_ip_in_both_lists() {
-    // Deny rules override allow rules even in allow_first mode, matching the
-    // stream path and avoiding protocol-specific bypasses.
+async fn deny_takes_precedence_when_ip_in_both_lists() {
+    // Deny rules override allow rules, matching the stream path and avoiding
+    // protocol-specific bypasses.
     let plugin = IpRestriction::new(&json!({
         "allow": ["192.168.1.100"],
         "deny": ["192.168.1.100"]
@@ -277,22 +261,7 @@ async fn allow_first_deny_takes_precedence_when_ip_in_both_lists() {
 }
 
 #[tokio::test]
-async fn deny_first_deny_takes_precedence_when_ip_in_both_lists() {
-    // In deny_first mode: deny is checked first. If IP is in deny list, reject.
-    let plugin = IpRestriction::new(&json!({
-        "allow": ["192.168.1.100"],
-        "deny": ["192.168.1.100"],
-        "mode": "deny_first"
-    }))
-    .unwrap();
-
-    let mut ctx = create_context_with_ip("192.168.1.100");
-    let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_reject(result, Some(403));
-}
-
-#[tokio::test]
-async fn allow_first_with_both_lists_ip_only_in_allow() {
+async fn both_lists_ip_only_in_allow() {
     let plugin = IpRestriction::new(&json!({
         "allow": ["10.0.0.1"],
         "deny": ["192.168.1.100"]
@@ -305,7 +274,7 @@ async fn allow_first_with_both_lists_ip_only_in_allow() {
 }
 
 #[tokio::test]
-async fn allow_first_with_both_lists_ip_in_neither() {
+async fn both_lists_ip_in_neither() {
     let plugin = IpRestriction::new(&json!({
         "allow": ["10.0.0.1"],
         "deny": ["192.168.1.100"]
@@ -318,100 +287,41 @@ async fn allow_first_with_both_lists_ip_in_neither() {
     plugin_utils::assert_reject(result, Some(403));
 }
 
+// ── Fixed rejection order and the retired `mode` key (#6610, #7114) ──
+
+/// An address that is both outside the allow list and on the deny list is
+/// rejected as not allowed: the allow check reports first.
 #[tokio::test]
-async fn deny_first_with_both_lists_ip_only_in_allow() {
+async fn an_address_failing_both_checks_is_reported_as_not_allowed() {
     let plugin = IpRestriction::new(&json!({
-        "allow": ["10.0.0.1"],
-        "deny": ["192.168.1.100"],
-        "mode": "deny_first"
+        "allow": ["10.0.0.0/8"],
+        "deny": ["192.168.1.1"]
     }))
     .unwrap();
-
-    let mut ctx = create_context_with_ip("10.0.0.1");
-    let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_continue(result);
-}
-
-#[tokio::test]
-async fn deny_first_with_both_lists_ip_in_neither() {
-    let plugin = IpRestriction::new(&json!({
-        "allow": ["10.0.0.1"],
-        "deny": ["192.168.1.100"],
-        "mode": "deny_first"
-    }))
-    .unwrap();
-
-    // Not denied, but not in allow list -> rejected
-    let mut ctx = create_context_with_ip("172.16.0.1");
-    let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_reject(result, Some(403));
-}
-
-// ── `mode` is decision-neutral (issue #6610) ─────────────────────────
-
-/// `mode` never changes whether an address is admitted: deny always wins and a
-/// non-empty allow list always has to match. Pin that across every membership
-/// combination so a future change to `mode` semantics cannot loosen the policy
-/// unnoticed.
-#[tokio::test]
-async fn mode_never_changes_the_admission_decision() {
-    let lists = [
-        json!({"allow": ["10.0.0.0/8"], "deny": ["10.0.0.5"]}),
-        json!({"allow": ["10.0.0.0/8"]}),
-        json!({"deny": ["10.0.0.5"]}),
-    ];
-    for base in lists {
-        let mut allow_first = base.clone();
-        allow_first["mode"] = json!("allow_first");
-        let mut deny_first = base.clone();
-        deny_first["mode"] = json!("deny_first");
-        let plugins = [
-            IpRestriction::new(&base).unwrap(),
-            IpRestriction::new(&allow_first).unwrap(),
-            IpRestriction::new(&deny_first).unwrap(),
-        ];
-        // In allow and deny, allow only, deny only (outside allow), neither.
-        for ip in ["10.0.0.5", "10.0.0.6", "192.168.1.1"] {
-            let mut decisions = Vec::new();
-            for plugin in &plugins {
-                let mut ctx = create_context_with_ip(ip);
-                decisions.push(matches!(
-                    plugin.on_request_received(&mut ctx).await,
-                    PluginResult::Continue
-                ));
-            }
-            assert!(
-                decisions.windows(2).all(|pair| pair[0] == pair[1]),
-                "mode changed the decision for {ip} under {base}: {decisions:?}"
-            );
+    let mut ctx = create_context_with_ip("192.168.1.1");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(body, r#"{"error":"IP address not allowed"}"#);
         }
+        other => panic!("an address failing both checks must reject, got {other:?}"),
     }
 }
 
-/// The one observable effect of `mode`: which rejection an address that is
-/// both outside the allow list and on the deny list receives.
-#[tokio::test]
-async fn mode_only_selects_the_rejection_reason_for_an_address_failing_both_checks() {
-    for (mode, expected_body) in [
-        ("allow_first", r#"{"error":"IP address not allowed"}"#),
-        ("deny_first", r#"{"error":"IP address denied"}"#),
-    ] {
-        let plugin = IpRestriction::new(&json!({
-            "allow": ["10.0.0.0/8"],
-            "deny": ["192.168.1.1"],
-            "mode": mode
-        }))
-        .unwrap();
-        let mut ctx = create_context_with_ip("192.168.1.1");
-        match plugin.on_request_received(&mut ctx).await {
-            PluginResult::Reject {
-                status_code, body, ..
-            } => {
-                assert_eq!(status_code, 403, "{mode}");
-                assert_eq!(body, expected_body, "{mode}");
-            }
-            other => panic!("{mode} must reject, got {other:?}"),
-        }
+/// The retired `mode` key (issue #7114) is refused like any other unknown
+/// key, whatever its value.
+#[test]
+fn retired_mode_key_is_refused_as_an_unknown_key() {
+    for mode in [json!("allow_first"), json!("deny_first"), json!(null)] {
+        let error = IpRestriction::new(&json!({"allow": ["10.0.0.0/8"], "mode": mode}))
+            .err()
+            .expect("the retired mode key must be refused");
+        assert!(
+            error.contains("unknown configuration key(s): \"config.mode\""),
+            "{error}"
+        );
     }
 }
 
@@ -540,8 +450,7 @@ async fn allow_list_with_multiple_entries() {
 #[tokio::test]
 async fn deny_list_with_multiple_entries() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["10.0.0.1", "172.16.0.0/12"],
-        "mode": "deny_first"
+        "deny": ["10.0.0.1", "172.16.0.0/12"]
     }))
     .unwrap();
 
@@ -562,7 +471,7 @@ async fn deny_list_with_multiple_entries() {
 }
 
 #[tokio::test]
-async fn allow_first_stream_connect_matches_http_when_ip_in_both_lists() {
+async fn stream_connect_matches_http_when_ip_in_both_lists() {
     let plugin = IpRestriction::new(&json!({
         "allow": ["192.168.1.100"],
         "deny": ["192.168.1.100"]
@@ -592,8 +501,7 @@ fn invalid_allow_rule_rejects_creation() {
 #[test]
 fn invalid_deny_cidr_rule_rejects_creation() {
     let result = IpRestriction::new(&json!({
-        "deny": ["10.0.0.0/99"],
-        "mode": "deny_first"
+        "deny": ["10.0.0.0/99"]
     }));
 
     assert!(result.is_err());
@@ -603,17 +511,6 @@ fn invalid_deny_cidr_rule_rejects_creation() {
             .unwrap()
             .contains("invalid `deny` rule \"10.0.0.0/99\""),
     );
-}
-
-#[test]
-fn invalid_mode_rejects_creation() {
-    let result = IpRestriction::new(&json!({
-        "allow": ["10.0.0.0/8"],
-        "mode": "permit_first"
-    }));
-
-    assert!(result.is_err());
-    assert!(result.err().unwrap().contains("mode"));
 }
 
 #[test]
@@ -645,8 +542,7 @@ fn empty_rule_string_rejects_creation() {
 #[tokio::test]
 async fn ipv6_client_ip_with_zone_suffix_matches_deny_rule() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["fe80::/10"],
-        "mode": "deny_first"
+        "deny": ["fe80::/10"]
     }))
     .unwrap();
 
@@ -718,8 +614,7 @@ async fn ipv6_only_literal_decorations_do_not_broaden_ipv4_rules() {
 #[tokio::test]
 async fn ipv4_rule_matches_ipv4_mapped_ipv6_client() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["192.168.1.0/24"],
-        "mode": "deny_first"
+        "deny": ["192.168.1.0/24"]
     }))
     .unwrap();
 
@@ -731,8 +626,7 @@ async fn ipv4_rule_matches_ipv4_mapped_ipv6_client() {
 #[tokio::test]
 async fn deny_mode_ipv4_mapped_ipv6_exact_rule_rejects_ipv4_mapped_client() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["::ffff:192.168.1.100"],
-        "mode": "deny_first"
+        "deny": ["::ffff:192.168.1.100"]
     }))
     .unwrap();
 
@@ -744,8 +638,7 @@ async fn deny_mode_ipv4_mapped_ipv6_exact_rule_rejects_ipv4_mapped_client() {
 #[tokio::test]
 async fn deny_mode_ipv4_mapped_ipv6_cidr_rule_rejects_ipv4_mapped_client() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["::ffff:192.168.1.0/120"],
-        "mode": "deny_first"
+        "deny": ["::ffff:192.168.1.0/120"]
     }))
     .unwrap();
 
@@ -757,8 +650,7 @@ async fn deny_mode_ipv4_mapped_ipv6_cidr_rule_rejects_ipv4_mapped_client() {
 #[tokio::test]
 async fn deny_mode_ipv4_mapped_ipv6_exact_rule_rejects_canonicalized_ipv4_client() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["::ffff:192.168.1.100"],
-        "mode": "deny_first"
+        "deny": ["::ffff:192.168.1.100"]
     }))
     .unwrap();
 
@@ -770,8 +662,7 @@ async fn deny_mode_ipv4_mapped_ipv6_exact_rule_rejects_canonicalized_ipv4_client
 #[tokio::test]
 async fn deny_mode_ipv4_mapped_ipv6_cidr_rule_rejects_canonicalized_ipv4_client() {
     let plugin = IpRestriction::new(&json!({
-        "deny": ["::ffff:192.168.1.0/120"],
-        "mode": "deny_first"
+        "deny": ["::ffff:192.168.1.0/120"]
     }))
     .unwrap();
 
@@ -857,12 +748,11 @@ fn canonical_ipv4_rule_literals_remain_valid() {
 // rule and the allow-enforcement branch was skipped for an empty allow list.
 
 #[tokio::test]
-async fn deny_first_deny_only_rejects_unparseable_client_ip() {
-    // Classic "block these bad IPs" config: deny list, no allow list,
-    // deny_first mode. An unparseable IP previously fell through to Continue.
+async fn deny_only_rejects_unparseable_client_ip() {
+    // Classic "block these bad IPs" config: deny list, no allow list. An
+    // unparseable IP previously fell through to Continue.
     let plugin = IpRestriction::new(&json!({
-        "deny": ["10.0.0.0/8"],
-        "mode": "deny_first"
+        "deny": ["10.0.0.0/8"]
     }))
     .unwrap();
 
@@ -872,10 +762,9 @@ async fn deny_first_deny_only_rejects_unparseable_client_ip() {
 }
 
 #[tokio::test]
-async fn allow_first_deny_only_rejects_unparseable_client_ip() {
-    // Deny-only config in the default allow_first mode also failed open for
-    // Unknown because the allow-enforcement branch was guarded by a non-empty
-    // allow list.
+async fn deny_only_rejects_a_garbage_client_ip() {
+    // A deny-only config also failed open for Unknown because the
+    // allow-enforcement branch was guarded by a non-empty allow list.
     let plugin = IpRestriction::new(&json!({
         "deny": ["10.0.0.0/8"]
     }))
@@ -891,8 +780,7 @@ async fn empty_string_client_ip_is_rejected() {
     // An empty client IP is unparseable and must fail closed under a
     // deny-only config rather than silently pass.
     let plugin = IpRestriction::new(&json!({
-        "deny": ["10.0.0.0/8"],
-        "mode": "deny_first"
+        "deny": ["10.0.0.0/8"]
     }))
     .unwrap();
 
@@ -906,8 +794,7 @@ async fn unparseable_client_ip_rejected_on_stream_path() {
     // The stream (TCP/UDP) path goes through the same check_ip, so it must
     // also fail closed on an unparseable client IP under a deny-only config.
     let plugin = IpRestriction::new(&json!({
-        "deny": ["10.0.0.0/8"],
-        "mode": "deny_first"
+        "deny": ["10.0.0.0/8"]
     }))
     .unwrap();
 
@@ -937,8 +824,7 @@ async fn parseable_client_ip_not_affected_by_fail_closed_guard() {
     // pass under a deny-only config — the fail-closed branch must only trigger
     // for genuinely unparseable input.
     let plugin = IpRestriction::new(&json!({
-        "deny": ["10.0.0.0/8"],
-        "mode": "deny_first"
+        "deny": ["10.0.0.0/8"]
     }))
     .unwrap();
 
@@ -982,8 +868,7 @@ async fn ipv6_zero_cidr_allow_rejects_ipv4_client() {
 async fn ipv6_zero_cidr_deny_does_not_block_ipv4_client() {
     // `::/0` is IPv6-only, so it must not deny an IPv4 client.
     let plugin = IpRestriction::new(&json!({
-        "deny": ["::/0"],
-        "mode": "deny_first"
+        "deny": ["::/0"]
     }))
     .unwrap();
 
@@ -996,8 +881,7 @@ async fn ipv6_zero_cidr_deny_does_not_block_ipv4_client() {
 async fn ipv4_zero_cidr_deny_does_not_block_ipv6_client() {
     // The mirror case: `0.0.0.0/0` is IPv4-only, so it must not deny IPv6.
     let plugin = IpRestriction::new(&json!({
-        "deny": ["0.0.0.0/0"],
-        "mode": "deny_first"
+        "deny": ["0.0.0.0/0"]
     }))
     .unwrap();
 
@@ -1010,8 +894,7 @@ async fn ipv4_zero_cidr_deny_does_not_block_ipv6_client() {
 async fn zero_cidr_matches_same_family_client() {
     // Sanity: zero-length CIDR prefixes still match their own family.
     let plugin = IpRestriction::new(&json!({
-        "deny": ["0.0.0.0/0"],
-        "mode": "deny_first"
+        "deny": ["0.0.0.0/0"]
     }))
     .unwrap();
 
@@ -1088,17 +971,6 @@ fn null_and_malformed_rule_arrays_are_rejected() {
 }
 
 #[test]
-fn explicit_null_mode_is_rejected() {
-    let error = IpRestriction::new(&json!({
-        "allow": ["10.0.0.0/8"],
-        "mode": null
-    }))
-    .err()
-    .expect("null mode must not silently select allow_first");
-    assert!(error.contains("mode"));
-}
-
-#[test]
 fn one_empty_list_is_allowed_only_when_the_other_list_enforces_policy() {
     assert!(IpRestriction::new(&json!({"allow": [], "deny": ["192.0.2.0/24"]})).is_ok());
     assert!(IpRestriction::new(&json!({"allow": ["10.0.0.0/8"], "deny": []})).is_ok());
@@ -1132,8 +1004,7 @@ async fn ten_thousand_rule_miss_and_high_address_match_preserve_decisions() {
 #[tokio::test]
 async fn ten_thousand_rule_deny_miss_continues() {
     let plugin = IpRestriction::new(&json!({
-        "deny": sparse_ipv4_rules(10_000),
-        "mode": "deny_first"
+        "deny": sparse_ipv4_rules(10_000)
     }))
     .unwrap();
     let mut miss = create_context_with_ip("203.0.113.250");
@@ -1234,10 +1105,6 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({(canary): true}),
             &["unknown configuration key(s)", "`config`"],
-        ),
-        (
-            json!({"allow": ["127.0.0.1"], "mode": 8675309}),
-            &["`mode`", "`allow_first`", "`deny_first`"],
         ),
     ];
 
@@ -1417,23 +1284,21 @@ fn rejection_reason_metadata_key_is_allowlisted_for_logs() {
 async fn every_http_rejection_records_its_reason_in_metadata() {
     use ferrum_edge::plugins::ip_restriction::REJECTION_REASON_METADATA_KEY;
 
-    let allow_first = IpRestriction::new(&json!({
+    let both_lists = IpRestriction::new(&json!({
         "allow": ["10.0.0.0/8"],
         "deny": ["192.0.2.0/24"]
     }))
     .unwrap();
-    let deny_first = IpRestriction::new(&json!({
-        "allow": ["10.0.0.0/8"],
-        "deny": ["192.0.2.0/24"],
-        "mode": "deny_first"
+    let deny_only = IpRestriction::new(&json!({
+        "deny": ["192.0.2.0/24"]
     }))
     .unwrap();
 
     for (plugin, client_ip, expected) in [
-        (&allow_first, "not-an-ip", "unparseable_client_ip"),
-        (&allow_first, "192.0.2.1", "not_in_allow_list"),
-        (&allow_first, "203.0.113.9", "not_in_allow_list"),
-        (&deny_first, "192.0.2.1", "ip_denied"),
+        (&both_lists, "not-an-ip", "unparseable_client_ip"),
+        (&both_lists, "192.0.2.1", "not_in_allow_list"),
+        (&both_lists, "203.0.113.9", "not_in_allow_list"),
+        (&deny_only, "192.0.2.1", "ip_denied"),
     ] {
         let mut ctx = create_context_with_ip(client_ip);
         plugin_utils::assert_reject(plugin.on_request_received(&mut ctx).await, Some(403));
@@ -1447,7 +1312,7 @@ async fn every_http_rejection_records_its_reason_in_metadata() {
     }
 
     let mut admitted = create_context_with_ip("10.1.2.3");
-    plugin_utils::assert_continue(allow_first.on_request_received(&mut admitted).await);
+    plugin_utils::assert_continue(both_lists.on_request_received(&mut admitted).await);
     assert!(
         !admitted
             .metadata

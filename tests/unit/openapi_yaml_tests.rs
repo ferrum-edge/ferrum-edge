@@ -10623,7 +10623,7 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     for config in [
         json!({"allow": ["10.0.0.0/8"]}),
         json!({"allow": [], "deny": ["192.0.2.0/24"]}),
-        json!({"allow": ["2001:db8::/32"], "deny": [], "mode": "deny_first"}),
+        json!({"allow": ["2001:db8::/32"], "deny": []}),
         json!({"allow": ["0.0.0.0/0", "255.255.255.255/32"]}),
         json!({"allow": ["::/0", "2001:db8::1/128"]}),
         json!({"allow": ["::ffff:127.0.0.1/96", "::ffff:127.0.0.1/128"]}),
@@ -10652,6 +10652,7 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": null, "deny": ["192.0.2.0/24"]}),
         json!({"allow": ["10.0.0.0/8"], "deny": null}),
         json!({"allow": ["10.0.0.0/8"], "mode": null}),
+        json!({"allow": ["10.0.0.0/8"], "mode": "deny_first"}),
         json!({"allow": ["10.0.0.0/8"], "mod": "deny_first"}),
         json!({"alow": ["10.0.0.0/8"], "deny": ["192.0.2.0/24"]}),
         json!({"allow": "10.0.0.0/8"}),

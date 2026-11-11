@@ -176,6 +176,10 @@ config before upgrading:
 - **`soap_ws_security`**: a SAML assertion is identified by its SAML 2.0 `ID`
   attribute only; an assertion carrying only the SAML 1.x `AssertionID` is
   refused.
+- **`ip_restriction`**: remove `mode`. It never changed whether a request was
+  admitted (deny always wins, and a non-empty `allow` list always rejects
+  addresses outside it); an address that fails both checks is now always
+  reported as `IP address not allowed`, the former `allow_first` default.
 - **`openapi_validator`**: `error_truncate_chars` now defaults to `256`, the
   value that was always enforced; no action is needed.
 

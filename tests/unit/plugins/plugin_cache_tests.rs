@@ -378,13 +378,12 @@ fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
     for value in [json!(DIAGNOSTIC_VALUE), json!(918273641), json!(true)] {
         cases.push((
             "ip_restriction",
-            json!({"allow": ["127.0.0.1"], "mode": value}),
+            json!({"allow": value}),
             None,
             vec![
                 "config validation failed",
-                "`mode`",
-                "`allow_first`",
-                "`deny_first`",
+                "`allow`",
+                "must be an array of IP/CIDR strings",
             ],
             false,
         ));
@@ -569,18 +568,18 @@ fn cache_diagnostics_preserve_ordered_causes_after_adversarial_identities() {
         }))
         .unwrap(),
     );
-    let mut invalid_mode = make_plugin_config_with_json(
+    let mut invalid_allow = make_plugin_config_with_json(
         "second",
         "ip_restriction",
-        json!({"allow": ["127.0.0.1"], "mode": true}),
+        json!({"allow": true}),
         PluginScope::Global,
         None,
     );
     // A trigger forces concrete construction during candidate admission too;
     // an ordinary IP restriction is otherwise only a topology placeholder.
-    invalid_mode.trigger =
+    invalid_allow.trigger =
         Some(serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}})).unwrap());
-    let config = make_config(vec![], vec![triggered, invalid_mode]);
+    let config = make_config(vec![], vec![triggered, invalid_allow]);
     for error in [
         validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
             .expect_err("candidate admission must preserve both rejections"),
@@ -593,10 +592,10 @@ fn cache_diagnostics_preserve_ordered_causes_after_adversarial_identities() {
         let trigger = rendered
             .find("trigger: `path` regex is invalid or too large")
             .unwrap();
-        let mode = rendered
-            .find("`mode` must be `allow_first` or `deny_first`")
+        let allow = rendered
+            .find("`allow` must be an array of IP/CIDR strings")
             .unwrap();
-        assert!(trigger < mode, "{rendered}");
+        assert!(trigger < allow, "{rendered}");
     }
 }
 

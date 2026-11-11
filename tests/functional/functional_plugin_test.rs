@@ -624,8 +624,7 @@ async fn test_plugin_ip_restriction() {
             "proxy_id": "proxy-ip-deny",
             "enabled": true,
             "config": {
-                "allow": ["10.0.0.0/8"],
-                "mode": "allow_first"
+                "allow": ["10.0.0.0/8"]
             }
         })],
     )
@@ -646,8 +645,7 @@ async fn test_plugin_ip_restriction() {
             "proxy_id": "proxy-ip-allow",
             "enabled": true,
             "config": {
-                "allow": ["127.0.0.1"],
-                "mode": "allow_first"
+                "allow": ["127.0.0.1"]
             }
         })],
     )
@@ -668,8 +666,7 @@ async fn test_plugin_ip_restriction() {
             "proxy_id": "proxy-ip-deny-explicit",
             "enabled": true,
             "config": {
-                "deny": ["127.0.0.1"],
-                "mode": "deny_first"
+                "deny": ["127.0.0.1"]
             }
         })],
     )

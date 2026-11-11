@@ -135,8 +135,7 @@ fn deny_localhost_plugin_config() -> PluginConfig {
         plugin_name: "ip_restriction".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
-            "deny": ["127.0.0.1"],
-            "mode": "deny_first"
+            "deny": ["127.0.0.1"]
         }),
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),
@@ -156,8 +155,7 @@ fn allow_localhost_plugin_config() -> PluginConfig {
         plugin_name: "ip_restriction".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
-            "allow": ["127.0.0.1"],
-            "mode": "allow_first"
+            "allow": ["127.0.0.1"]
         }),
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),
