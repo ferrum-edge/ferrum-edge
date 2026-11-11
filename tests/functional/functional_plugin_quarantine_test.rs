@@ -36,7 +36,7 @@ const API_KEY: &str = "quarantine-fail-closed-key-0123456789";
 /// Accepted by `KeyAuth::new`.
 const VALID_KEY_AUTH: &str = r#"{"key_location":"header:X-API-Key"}"#;
 
-/// Refused by `KeyAuth::new`: `key_auth` rejects unknown configuration fields
+/// Refused by `KeyAuth::new`: `key_auth` rejects unknown configuration keys
 /// (`src/plugins/key_auth.rs`), so this is a stored row no serving mode can
 /// construct.
 const MALFORMED_KEY_AUTH: &str = r#"{"key_location":"header:X-API-Key","typo":true}"#;
@@ -440,8 +440,8 @@ async fn malformed_fail_closed_plugin_row_refuses_cold_start_without_backup() {
         output.contains("Config rejected: Plugin <redacted scalar>")
             && output.contains("plugin_config_id=<redacted scalar>")
             && output.contains("scope=Proxy")
-            && output.contains("key_auth: unknown configuration field(s): <redacted scalar>")
-            && output.contains("allowed fields are `key_location` and `hide_credentials`"),
+            && output
+                .contains("key_auth: `config`: unknown configuration key(s): <redacted scalar>"),
         "startup must retain the rejection and safe repair guidance; captured output was:\n{output}"
     );
     for withheld in [KEY_AUTH_PLUGIN_ID, PROXY_ID, API_KEY, "typo"] {

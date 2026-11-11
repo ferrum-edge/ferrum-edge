@@ -1,7 +1,8 @@
 //! Integration coverage for the RTDS runtime-overlay consumer dispatch.
 //!
 //! `MeshRuntimeState::record_applied_slice_with_token` fans an accepted slice's
-//! process-wide knobs out to header transformer gates and tracing log levels.
+//! process-wide knobs out to the response transformer gate map and tracing log
+//! levels. Request-transformer keys have no published store (issue #7152).
 //! Fault percentages are request-epoch-local and covered by fault
 //! materialization/generation tests.
 //! These tests install
@@ -16,7 +17,6 @@ use ferrum_edge::logging::{LogLevelReloader, log_level_reloader, set_log_level_r
 use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
-use ferrum_edge::plugins::request_transformer::runtime_overlay as request_gate;
 use ferrum_edge::plugins::response_transformer::runtime_overlay as response_gate;
 
 /// Process-global lock serialising every test that touches RTDS consumer
@@ -63,7 +63,6 @@ fn slice_install_fans_out_to_process_wide_consumers() {
     // corrupt assertions.
     let _guard = consumer_test_guard();
 
-    request_gate::reset_for_test();
     response_gate::reset_for_test();
 
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -90,13 +89,7 @@ fn slice_install_fans_out_to_process_wide_consumers() {
     let state = MeshRuntimeState::new();
     install_slice_with_overlay(&state, MeshRuntimeOverlay { fields });
 
-    // Request gate populated.
-    assert_eq!(
-        request_gate::current_gates().gate("consumer_e2e"),
-        Some(false)
-    );
-
-    // Response gate populated and independent from request gate.
+    // Response gate populated; the request-side key does not leak into it.
     assert_eq!(
         response_gate::current_gates().gate("consumer_e2e"),
         Some(true)
@@ -120,7 +113,6 @@ fn slice_install_fans_out_to_process_wide_consumers() {
     }
 
     // Clean up.
-    request_gate::reset_for_test();
     response_gate::reset_for_test();
 }
 
@@ -128,36 +120,36 @@ fn slice_install_fans_out_to_process_wide_consumers() {
 fn dropping_key_from_subsequent_slice_clears_transformer_value() {
     let _guard = consumer_test_guard();
 
-    request_gate::reset_for_test();
+    response_gate::reset_for_test();
 
     let state = MeshRuntimeState::new();
 
     // Slice 1 sets values.
     let mut fields = HashMap::new();
     fields.insert(
-        "ferrum.request_transformer.rolling.enabled".to_string(),
+        "ferrum.response_transformer.rolling.enabled".to_string(),
         RuntimeValue::Bool(false),
     );
     install_slice_with_overlay(&state, MeshRuntimeOverlay { fields });
-    assert_eq!(request_gate::current_gates().gate("rolling"), Some(false));
+    assert_eq!(response_gate::current_gates().gate("rolling"), Some(false));
 
     // Slice 2 has no overlay → the consumer must clear.
     install_slice_with_overlay(&state, MeshRuntimeOverlay::default());
-    assert_eq!(request_gate::current_gates().gate("rolling"), None);
+    assert_eq!(response_gate::current_gates().gate("rolling"), None);
 
-    request_gate::reset_for_test();
+    response_gate::reset_for_test();
 }
 
 #[test]
 fn rejected_slice_receive_does_not_mutate_consumer_values() {
     let _guard = consumer_test_guard();
 
-    request_gate::reset_for_test();
+    response_gate::reset_for_test();
 
     let state = MeshRuntimeState::new();
     let mut accepted_fields = HashMap::new();
     accepted_fields.insert(
-        "ferrum.request_transformer.stable.enabled".to_string(),
+        "ferrum.response_transformer.stable.enabled".to_string(),
         RuntimeValue::Bool(false),
     );
     install_slice_with_overlay(
@@ -166,11 +158,11 @@ fn rejected_slice_receive_does_not_mutate_consumer_values() {
             fields: accepted_fields,
         },
     );
-    assert_eq!(request_gate::current_gates().gate("stable"), Some(false));
+    assert_eq!(response_gate::current_gates().gate("stable"), Some(false));
 
     let mut rejected_fields = HashMap::new();
     rejected_fields.insert(
-        "ferrum.request_transformer.stable.enabled".to_string(),
+        "ferrum.response_transformer.stable.enabled".to_string(),
         RuntimeValue::Bool(true),
     );
     state.install_slice(MeshSlice {
@@ -183,10 +175,10 @@ fn rejected_slice_receive_does_not_mutate_consumer_values() {
     });
 
     assert_eq!(
-        request_gate::current_gates().gate("stable"),
+        response_gate::current_gates().gate("stable"),
         Some(false),
         "received-only slices must not update live RTDS consumers"
     );
 
-    request_gate::reset_for_test();
+    response_gate::reset_for_test();
 }

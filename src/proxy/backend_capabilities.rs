@@ -158,7 +158,6 @@ impl BackendCapabilitySnapshot {
     }
 
     /// Whether the key was vacant when the snapshot was taken.
-    #[allow(dead_code)] // Used by tests and external lib callers.
     #[inline]
     pub fn was_vacant(&self) -> bool {
         self.previous.is_none()
@@ -183,7 +182,6 @@ pub enum CapabilityCommitOutcome {
 }
 
 impl CapabilityCommitOutcome {
-    #[allow(dead_code)] // Used by tests and external lib callers.
     #[inline]
     pub fn is_committed(&self) -> bool {
         matches!(self, Self::Committed(_))
@@ -324,7 +322,6 @@ impl Default for BackendCapabilityRegistry {
 }
 
 impl BackendCapabilityRegistry {
-    #[allow(dead_code)] // Used by tests and external lib callers; binary uses sharded constructor.
     pub fn new() -> Self {
         Self::default()
     }
@@ -360,7 +357,6 @@ impl BackendCapabilityRegistry {
     /// read → probe → write sequence spans an await, so a blind write can
     /// overwrite a request-path downgrade learned during the probe. Use
     /// [`Self::snapshot_for_probe`] + [`Self::commit_probe`] there.
-    #[allow(dead_code)] // Used by tests and external lib callers; the refresh path commits.
     pub fn upsert(&self, key: String, record: BackendCapabilityRecord) {
         self.entries
             .entry(key)
@@ -437,7 +433,6 @@ impl BackendCapabilityRegistry {
         }
     }
 
-    #[allow(dead_code)] // Used by tests and external lib callers; the refresh path snapshots.
     pub fn get_by_key(&self, key: &str) -> Option<Arc<BackendCapabilityRecord>> {
         self.entries.get(key).map(|entry| entry.value().clone())
     }
@@ -586,7 +581,6 @@ pub fn capability_key_for_proxy_target(proxy: &Proxy, target: Option<&UpstreamTa
 
 /// Compute an owned capability key from a proxy that already reflects its
 /// target's host/port (i.e., a `BackendCapabilityProbeTarget.proxy`).
-#[allow(dead_code)] // Used by tests and library callers; binary hot paths use target-aware lookup.
 pub fn capability_key(proxy: &Proxy) -> String {
     capability_key_for_proxy_target(proxy, None)
 }
@@ -749,7 +743,6 @@ impl fmt::Debug for RefreshRole {
 }
 
 impl RefreshRole {
-    #[allow(dead_code)] // Public library/test inspection API; the binary target matches variants directly.
     pub fn is_runner(&self) -> bool {
         matches!(self, Self::Runner(_))
     }
@@ -836,7 +829,6 @@ fn observe_idle_wait_registered() {
 /// proxy hot path; the extra thread-local load is a no-op unless a test
 /// armed a hook.
 #[doc(hidden)]
-#[allow(dead_code)] // External library tests install this seam; the binary target never does.
 pub fn install_idle_wait_observe_hook(hook: Option<Arc<dyn Fn() + 'static>>) {
     AFTER_IDLE_WAIT_REGISTERED.with(|cell| {
         *cell.borrow_mut() = hook;
@@ -1029,7 +1021,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

@@ -1686,6 +1686,23 @@ enum ClientRelayStep {
     CapsuleFault(CapsuleDecodeError),
     /// The connected UDP socket is unusable (see [`UdpSendFault::Terminal`]).
     SocketUnusable,
+    /// The supervisor ended the session with this close (issue #7188). Halt
+    /// the receive half with the matching code instead of dropping it, which
+    /// would surface as `STOP_SENDING(0)` on a clean end.
+    SupervisorClose(StreamCloseKind),
+}
+
+/// The `STOP_SENDING` code that halts the client's request direction when the
+/// supervisor ends a tunnel (issue #7188): `H3_NO_ERROR` for a clean end, the
+/// same code the send half resets with otherwise. A close channel dropped
+/// without a verdict (the session future itself was dropped) is the internal
+/// failure arm, never a claim of an orderly end.
+pub fn receive_half_halt_code(close: Option<StreamCloseKind>) -> h3::error::Code {
+    match close {
+        Some(StreamCloseKind::Clean) => h3::error::Code::H3_NO_ERROR,
+        Some(StreamCloseKind::MessageError) => h3::error::Code::H3_MESSAGE_ERROR,
+        Some(StreamCloseKind::InternalError) | None => h3::error::Code::H3_INTERNAL_ERROR,
+    }
 }
 
 /// Key one resolved client identity for the per-client CONNECT-UDP tunnel cap.
@@ -2674,15 +2691,32 @@ async fn relay(
     let to_target_socket = Arc::clone(&socket);
     let to_target_activity = Arc::clone(&last_activity);
     let to_target_proxy_id = proxy.id.clone();
+    // The supervisor's close for the receive half (issue #7188). Teardown sends
+    // the close kind it decided, so this task halts the client's request
+    // direction with an explicit code instead of being aborted with the half
+    // still open (a drop is `STOP_SENDING(0)`, not an HTTP/3 code).
+    let (recv_halt_tx, mut recv_halt_rx) = tokio::sync::oneshot::channel::<StreamCloseKind>();
     // client → target: decode capsules off the CONNECT stream.
     let mut to_target = tokio::spawn(async move {
         let mut decoder = CapsuleDecoder::new(max_payload);
         loop {
             // The chunk `recv_data` yields captures `&mut h3_recv`, so the
             // decision it produces has to be a borrow-free value: the halt
-            // calls below need the receive half back.
-            let step = match h3_recv.recv_data().await {
-                Ok(Some(mut chunk)) => {
+            // calls below need the receive half back. Biased: a supervisor
+            // close that is already pending wins over more client data. The
+            // vendored h3-quinn keeps the stream owned during a cancelled
+            // read, so halting after one is sound
+            // (`stream_util::halt_request_body`).
+            let received = tokio::select! {
+                biased;
+                close = &mut recv_halt_rx => Err(close.ok()),
+                received = h3_recv.recv_data() => Ok(received),
+            };
+            let step = match received {
+                Err(close) => ClientRelayStep::SupervisorClose(
+                    close.unwrap_or(StreamCloseKind::InternalError),
+                ),
+                Ok(Ok(Some(mut chunk))) => {
                     relay_client_chunk(
                         &mut decoder,
                         &mut chunk,
@@ -2697,11 +2731,11 @@ async fn relay(
                 // a FIN on a capsule boundary is an EOF. RFC 9297 §3.3: a
                 // stream closed in the middle of a capsule is a malformed
                 // message, never a successful end of the capsule stream.
-                Ok(None) => match decoder.finish_stream() {
+                Ok(Ok(None)) => match decoder.finish_stream() {
                     Ok(()) => ClientRelayStep::ClientFin,
                     Err(error) => ClientRelayStep::CapsuleFault(error),
                 },
-                Err(error) => {
+                Ok(Err(error)) => {
                     debug!(
                         proxy_id = %to_target_proxy_id,
                         "H3 CONNECT-UDP client relay: stream error: {error}"
@@ -2730,6 +2764,12 @@ async fn relay(
                 ClientRelayStep::SocketUnusable => {
                     h3_recv.stop_sending(h3::error::Code::H3_INTERNAL_ERROR);
                     return SessionEnd::TargetSocketUnusable;
+                }
+                ClientRelayStep::SupervisorClose(close) => {
+                    // The supervisor already decided the session's outcome;
+                    // this return value is only joined for panic logging.
+                    h3_recv.stop_sending(receive_half_halt_code(Some(close)));
+                    return SessionEnd::ClientClosed;
                 }
             }
         }
@@ -3059,7 +3099,10 @@ async fn relay(
     // the capsule stream.
     let supervisor_verdict = end;
     if !to_target_finished {
-        to_target.abort();
+        // Halt the client's request direction with the code of the close the
+        // supervisor decided (issue #7188): `H3_NO_ERROR` for a clean end. The
+        // task is joined below, with an abort only as the bounded fallback.
+        let _ = recv_halt_tx.send(supervisor_verdict.close_kind());
     }
     // The oneshot carries the supervisor [`SessionEnd`], not only its
     // close-kind. If the send-half task consumes it, that is the outcome it
@@ -3106,11 +3149,21 @@ async fn relay(
         );
     }
     if !to_target_finished {
-        // Aborted above and never polled to completion, so joining it here is
-        // both safe and the point at which the receive half and the socket
-        // clone are provably gone. This relay owns no send half, so its panic
-        // does not change what the client saw — it is logged, not promoted.
-        join_panicked(to_target.await, RelayDirection::ClientToTarget, &proxy.id);
+        // Signalled above and never polled to completion, so joining it here
+        // is both safe and the point at which the receive half and the socket
+        // clone are provably gone. It halts as soon as it observes the signal;
+        // one still parked in a target send after `CLOSE_GRACE` is aborted and
+        // the cancellation awaited, so teardown stays bounded and never
+        // detaches it. This relay owns no send half, so its panic does not
+        // change what the client saw — it is logged, not promoted.
+        let joined = match tokio::time::timeout(CLOSE_GRACE, &mut to_target).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                to_target.abort();
+                to_target.await
+            }
+        };
+        join_panicked(joined, RelayDirection::ClientToTarget, &proxy.id);
     }
     end
 }

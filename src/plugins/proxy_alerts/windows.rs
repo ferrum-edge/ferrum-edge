@@ -427,7 +427,6 @@ impl WindowStore {
         }
     }
 
-    #[allow(dead_code)] // Rule evaluation uses the fused path; kept for tests.
     pub fn record_latency(
         &self,
         rule_id: u32,
@@ -508,7 +507,6 @@ impl WindowStore {
     /// Test-only hook proving established record/snapshot lookups are served
     /// from the lock-free snapshot rather than waiting on that mutex.
     #[doc(hidden)]
-    #[allow(dead_code)] // External test crate only.
     pub fn with_generation_writer_lock_for_test<R>(
         &self,
         rule_id: u32,
@@ -604,7 +602,6 @@ impl WindowStore {
 
     /// Whether any rule window currently holds a row for `proxy_id` under any
     /// ownership generation.
-    #[allow(dead_code)] // Used by external test crate and admin/debug helpers.
     pub fn contains_proxy(&self, proxy_id: &str) -> bool {
         self.by_rule.iter().any(|entry| {
             entry
@@ -615,7 +612,6 @@ impl WindowStore {
     }
 
     /// Whether any rule window holds a row for `(proxy_id, generation)`.
-    #[allow(dead_code)] // Used by external test crate.
     pub fn contains_proxy_generation(&self, proxy_id: &str, ownership_generation: u64) -> bool {
         self.by_rule.iter().any(|entry| {
             entry

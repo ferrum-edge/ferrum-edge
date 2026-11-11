@@ -22,8 +22,7 @@
 //! - `pool_config` — Connection pool configuration (global defaults + per-proxy overrides)
 
 // The fault-injection seam is driven by external tests through the lib target's
-// `_test_support` shim; the bin target recompiles this module without those
-// callers, so its installers would otherwise read as dead code there.
+// `_test_support` shim.
 #[allow(dead_code)]
 pub mod batch_atomicity;
 pub mod conf_file;
@@ -49,14 +48,13 @@ pub mod mongo_store;
 /// Shared namespace projection for `GatewayConfig` snapshots.
 pub mod namespace_filter;
 // The registry's fault-injection installer is driven by external tests through
-// the lib target; the bin target recompiles this module without that caller, so
-// it would otherwise read as dead code there.
+// the lib target's `_test_support` shim.
 #[allow(dead_code)]
 pub mod namespace_registry;
 pub mod plugin_trigger;
 pub mod policy_graph_scope;
 pub mod pool_config;
-#[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests, not the binary crate.
+#[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests
 pub mod public_env_inventory;
 /// In-process database-mode admin write live-apply coordinator (issue #3926).
 #[allow(dead_code)]

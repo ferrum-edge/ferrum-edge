@@ -359,6 +359,21 @@ fn ctx_with_content_type(method: &str, content_type: &str) -> RequestContext {
     ctx
 }
 
+/// Run the production redaction producer (`transform_response_body_with_context`)
+/// on a fresh request context, so the result reflects this body alone, with no
+/// prior inspection or redaction state.
+async fn transform_on_fresh_context(
+    plugin: &AiResponseGuard,
+    body: &[u8],
+    content_type: Option<&str>,
+    response_headers: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    plugin
+        .transform_response_body_with_context(&mut ctx, body, content_type, response_headers)
+        .await
+}
+
 fn ctx_without_content_type(method: &str) -> RequestContext {
     RequestContext::new(
         "127.0.0.1".to_string(),
@@ -625,9 +640,8 @@ async fn test_pii_detection_redact() {
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
 
     // transform_response_body actually redacts
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await;
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers).await;
     assert!(transformed.is_some());
     let transformed_str = String::from_utf8(transformed.unwrap()).unwrap();
     assert!(!transformed_str.contains("user@example.com"));
@@ -654,8 +668,7 @@ async fn test_all_mode_decodes_json_escaped_pii_for_redaction() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
 
-    let transformed = plugin
-        .transform_response_body(body, Some("application/json"), &headers)
+    let transformed = transform_on_fresh_context(&plugin, body, Some("application/json"), &headers)
         .await
         .expect("expected escaped email to be redacted");
     let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
@@ -827,8 +840,7 @@ async fn test_all_mode_redact_passes_when_residual_is_redactable() {
     );
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
 
-    let transformed = plugin
-        .transform_response_body(body, Some("application/json"), &headers)
+    let transformed = transform_on_fresh_context(&plugin, body, Some("application/json"), &headers)
         .await
         .expect("expected redacted body");
     let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
@@ -1224,14 +1236,14 @@ async fn test_json_event_stream_profile_stays_on_json_guard_path() {
             .await,
         PluginResult::Continue
     ));
-    let transformed = redact
-        .transform_response_body(
-            &body,
-            Some("application/json; profile=event-stream"),
-            &headers,
-        )
-        .await
-        .expect("profile parameter must not bypass JSON redaction");
+    let transformed = transform_on_fresh_context(
+        &redact,
+        &body,
+        Some("application/json; profile=event-stream"),
+        &headers,
+    )
+    .await
+    .expect("profile parameter must not bypass JSON redaction");
     let transformed = String::from_utf8(transformed).unwrap();
     assert!(!transformed.contains("alice@example.com"));
     assert!(transformed.contains("[REDACTED:pii:email]"));
@@ -1337,6 +1349,142 @@ fn test_invalid_config_shapes_rejected() {
     }
 }
 
+// ─── ScanMode::All — structural scalars are outside detection too (#7129) ─
+
+/// A chat completion whose only `phone_us`-shaped token is the Unix-seconds
+/// `created` timestamp at the root.
+fn completion_with_created(content: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1731196800,
+        "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]
+    }))
+    .unwrap()
+}
+
+fn sse_with_created(content: &str) -> Vec<u8> {
+    format!(
+        "data: {{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1731196800,\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{content:?}}}}}]}}\n\ndata: [DONE]\n\n"
+    )
+    .into_bytes()
+}
+
+/// Issue #7129: with `scan_fields: all`, `reject` / `warn` / `redact` agree on
+/// what counts. A root structural scalar that merely looks like PII (every
+/// OpenAI completion's `created` matches `phone_us`) is neither detected nor
+/// redacted, while the same pattern in content, or under a nested key of the
+/// same name, still is.
+#[tokio::test]
+async fn test_all_mode_detection_skips_root_structural_scalars() {
+    for (content_type, clean, dirty) in [
+        (
+            "application/json",
+            completion_with_created("Hello"),
+            completion_with_created("Call 212-555-0100"),
+        ),
+        (
+            "text/event-stream",
+            sse_with_created("Hello"),
+            sse_with_created("Call 212-555-0100"),
+        ),
+    ] {
+        let mut headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        for action in ["reject", "warn", "redact"] {
+            let plugin = make_plugin(json!({
+                "pii_patterns": ["phone_us"], "scan_fields": "all", "action": action
+            }));
+            let mut ctx = ctx_with_content_type("POST", content_type);
+            assert!(
+                matches!(
+                    plugin
+                        .on_response_body(&mut ctx, 200, &mut headers, &clean)
+                        .await,
+                    PluginResult::Continue
+                ),
+                "{content_type} {action}: a structural timestamp is not a finding"
+            );
+            assert!(
+                !ctx.metadata.contains_key("ai_response_guard_detected"),
+                "{content_type} {action}: {:?}",
+                ctx.metadata
+            );
+            // Nothing to redact: the exact bytes (and their validators) stay.
+            assert!(
+                plugin
+                    .transform_response_body_with_context(
+                        &mut ctx,
+                        &clean,
+                        Some(content_type),
+                        &headers
+                    )
+                    .await
+                    .is_none(),
+                "{content_type} {action}: a structural-only body must stay unchanged"
+            );
+
+            let mut ctx = ctx_with_content_type("POST", content_type);
+            let result = plugin
+                .on_response_body(&mut ctx, 200, &mut headers, &dirty)
+                .await;
+            match action {
+                "reject" => assert!(
+                    matches!(result, PluginResult::Reject { .. }),
+                    "{content_type}: content PII must still reject"
+                ),
+                _ => {
+                    assert!(matches!(result, PluginResult::Continue), "{content_type}");
+                    // warn records the finding; redact records the rewrite
+                    // it promised.
+                    let key = if action == "warn" {
+                        "ai_response_guard_detected"
+                    } else {
+                        "ai_response_guard_redacted"
+                    };
+                    assert!(
+                        ctx.metadata.contains_key(key),
+                        "{content_type} {action}: content PII must still be detected: {:?}",
+                        ctx.metadata
+                    );
+                }
+            }
+            if action == "redact" {
+                let redacted = plugin
+                    .transform_response_body_with_context(
+                        &mut ctx,
+                        &dirty,
+                        Some(content_type),
+                        &headers,
+                    )
+                    .await
+                    .expect("content PII is redacted");
+                let text = String::from_utf8(redacted).unwrap();
+                assert!(text.contains("[REDACTED:pii:phone_us]"), "{text}");
+                assert!(text.contains("1731196800"), "{text}");
+            }
+        }
+    }
+
+    // The carve-out is root-scalar only: a nested `created` is still content.
+    let nested = serde_json::to_vec(&json!({
+        "choices": [{"message": {"content": "ok"}}],
+        "metadata": {"created": 1731196800}
+    }))
+    .unwrap();
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["phone_us"], "scan_fields": "all", "action": "reject"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &nested)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
 // ─── ScanMode::All — structural keys are protected from redaction ─────
 
 fn ipv4_redact_plugin() -> AiResponseGuard {
@@ -1376,10 +1524,10 @@ async fn test_all_mode_does_not_redact_structural_keys() {
     let _ = plugin
         .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("expected redacted body when match present");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("expected redacted body when match present");
 
     let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
     assert_eq!(v["id"], "127.0.0.1", "structural id must be preserved");
@@ -1420,10 +1568,10 @@ async fn test_all_mode_uses_structured_redaction_when_choices_present() {
     let _ = plugin
         .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("expected transformation when match present");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("expected transformation when match present");
 
     let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
     assert_eq!(v["id"], "10.0.0.1");
@@ -1466,10 +1614,10 @@ async fn test_all_mode_redacts_sibling_fields_when_choices_present() {
     let _ = plugin
         .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("expected transformation when match present");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("expected transformation when match present");
 
     let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
 
@@ -1600,9 +1748,8 @@ async fn test_sse_pii_redaction() {
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
 
     // transform_response_body actually redacts
-    let transformed = plugin
-        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
-        .await;
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("text/event-stream"), &sse_headers()).await;
     let transformed = transformed.expect("expected redacted SSE body");
     let transformed_str = String::from_utf8(transformed).unwrap();
     assert!(
@@ -1639,10 +1786,10 @@ async fn test_sse_scan_all_decodes_escaped_pii_for_redaction() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
 
-    let transformed = plugin
-        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
-        .await
-        .expect("expected escaped email to be redacted");
+    let transformed =
+        transform_on_fresh_context(&plugin, body, Some("text/event-stream"), &sse_headers())
+            .await
+            .expect("expected escaped email to be redacted");
     let transformed_str = String::from_utf8(transformed).unwrap();
     assert!(transformed_str.contains("[REDACTED:pii:email]"));
     assert!(!transformed_str.contains("\\u0040"));
@@ -1929,10 +2076,10 @@ async fn test_sse_anthropic_tool_input_and_name_are_redacted_not_rejected() {
         "a rewritable Anthropic tool match must not hard-fail: {result:?}"
     );
 
-    let transformed = plugin
-        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
-        .await
-        .expect("expected redacted body");
+    let transformed =
+        transform_on_fresh_context(&plugin, body, Some("text/event-stream"), &sse_headers())
+            .await
+            .expect("expected redacted body");
     let out = String::from_utf8(transformed).unwrap();
     assert!(!out.contains("ann@corp.io"), "tool input must be redacted");
     assert!(!out.contains("mail_bob@corp.io"), "name must be redacted");
@@ -1989,10 +2136,10 @@ async fn test_sse_anthropic_redaction() {
     let _ = plugin
         .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
         .await;
-    let transformed = plugin
-        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
-        .await
-        .expect("expected redacted body");
+    let transformed =
+        transform_on_fresh_context(&plugin, body, Some("text/event-stream"), &sse_headers())
+            .await
+            .expect("expected redacted body");
     let out = String::from_utf8(transformed).unwrap();
     assert!(!out.contains("bob@corp.io"));
     assert!(out.contains("[REDACTED:pii:email]"));
@@ -2132,10 +2279,10 @@ async fn test_sse_gemini_function_call_is_redacted_not_rejected() {
         "a rewritable Gemini match must not hard-fail: {result:?}"
     );
 
-    let transformed = plugin
-        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
-        .await
-        .expect("expected redacted body");
+    let transformed =
+        transform_on_fresh_context(&plugin, body, Some("text/event-stream"), &sse_headers())
+            .await
+            .expect("expected redacted body");
     let out = String::from_utf8(transformed).unwrap();
     assert!(!out.contains("ann@corp.io"), "part text must be redacted");
     assert!(!out.contains("bob@corp.io"), "call name must be redacted");
@@ -2325,10 +2472,14 @@ async fn test_sse_scan_all_redaction() {
     let _ = plugin
         .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
         .await;
-    let transformed = plugin
-        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
-        .await
-        .expect("expected redacted body");
+    let transformed = transform_on_fresh_context(
+        &plugin,
+        body.as_bytes(),
+        Some("text/event-stream"),
+        &sse_headers(),
+    )
+    .await
+    .expect("expected redacted body");
     let out = String::from_utf8(transformed).unwrap();
     assert!(!out.contains("10.0.0.1"));
     assert!(!out.contains("8.8.8.8"));
@@ -2396,10 +2547,14 @@ async fn test_sse_redaction_preserves_non_content_frames() {
         serde_json::to_string(&frame2).unwrap()
     );
 
-    let transformed = plugin
-        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &HashMap::new())
-        .await
-        .expect("expected redacted body");
+    let transformed = transform_on_fresh_context(
+        &plugin,
+        body.as_bytes(),
+        Some("text/event-stream"),
+        &HashMap::new(),
+    )
+    .await
+    .expect("expected redacted body");
     let out = String::from_utf8(transformed).unwrap();
 
     // First frame (role-only) should still be present
@@ -2417,9 +2572,9 @@ async fn test_sse_no_redaction_returns_none() {
     }));
     let body = openai_sse_body(&["The weather is nice"]);
 
-    let transformed = plugin
-        .transform_response_body(&body, Some("text/event-stream"), &HashMap::new())
-        .await;
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("text/event-stream"), &HashMap::new())
+            .await;
     assert!(
         transformed.is_none(),
         "no modification expected when no PII present"
@@ -2437,9 +2592,9 @@ async fn test_sse_scan_all_no_match_returns_none() {
     }));
     let body = openai_sse_body(&["nothing sensitive here"]);
 
-    let transformed = plugin
-        .transform_response_body(&body, Some("text/event-stream"), &HashMap::new())
-        .await;
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("text/event-stream"), &HashMap::new())
+            .await;
     assert!(transformed.is_none());
 }
 
@@ -2457,10 +2612,14 @@ async fn test_sse_redaction_preserves_crlf_line_endings() {
         serde_json::to_string(&frame).unwrap()
     );
 
-    let transformed = plugin
-        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &HashMap::new())
-        .await
-        .expect("expected redacted body");
+    let transformed = transform_on_fresh_context(
+        &plugin,
+        body.as_bytes(),
+        Some("text/event-stream"),
+        &HashMap::new(),
+    )
+    .await
+    .expect("expected redacted body");
     let out = String::from_utf8(transformed).unwrap();
 
     // Every `data:` line we emitted must end with CRLF, not bare LF.
@@ -2494,10 +2653,14 @@ async fn test_sse_preserves_non_data_event_lines() {
         serde_json::to_string(&frame).unwrap()
     );
 
-    let transformed = plugin
-        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &HashMap::new())
-        .await
-        .expect("expected redacted body");
+    let transformed = transform_on_fresh_context(
+        &plugin,
+        body.as_bytes(),
+        Some("text/event-stream"),
+        &HashMap::new(),
+    )
+    .await
+    .expect("expected redacted body");
     let out = String::from_utf8(transformed).unwrap();
 
     assert!(out.contains(": keep-alive comment"));
@@ -2528,9 +2691,13 @@ async fn test_sse_oversize_body_is_not_transformed_after_rejection() {
     }
     assert!(body.len() > 64);
 
-    let transformed = plugin
-        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &HashMap::new())
-        .await;
+    let transformed = transform_on_fresh_context(
+        &plugin,
+        body.as_bytes(),
+        Some("text/event-stream"),
+        &HashMap::new(),
+    )
+    .await;
     assert!(
         transformed.is_none(),
         "oversize body must skip redaction (returned Some)"
@@ -2583,9 +2750,8 @@ async fn test_sse_cross_frame_pii_redact_fails_closed() {
         "residual cross-event content must be rejected"
     );
 
-    let transformed = plugin
-        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
-        .await;
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("text/event-stream"), &sse_headers()).await;
     assert!(
         transformed.is_none(),
         "a rejected cross-event response must not be transformed afterward"
@@ -2650,10 +2816,10 @@ async fn test_redaction_placeholder_dollar_sequence_emitted_literally() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("body should be redacted");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("body should be redacted");
     let s = String::from_utf8(transformed).unwrap();
     assert!(
         s.contains("[REDACTED:blocked_phrase:0]"),
@@ -2686,10 +2852,10 @@ async fn test_redaction_placeholder_dollar_one_not_reinjected() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("body should be redacted");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("body should be redacted");
     let s = String::from_utf8(transformed).unwrap();
     assert!(
         s.contains("[REDACTED:pii:email:$1]"),
@@ -2726,10 +2892,10 @@ async fn test_redaction_placeholder_dollar_literal_in_scan_all_walker() {
     let _ = plugin
         .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("body should be redacted");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("body should be redacted");
     let s = String::from_utf8(transformed).unwrap();
     assert!(
         s.contains("[REDACTED:blocked_phrase:0]"),
@@ -2769,10 +2935,10 @@ async fn test_all_mode_redacts_pii_nested_under_structural_key() {
     let _ = plugin
         .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("expected redaction when match present");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("expected redaction when match present");
     let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
 
     // Top-level scalar structural values are still preserved.
@@ -2832,10 +2998,10 @@ async fn test_all_mode_redacts_deeply_nested_pii_under_structural_key() {
     let _ = plugin
         .on_response_body(&mut ctx, 200, &mut headers, &body)
         .await;
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("expected redaction when match present");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("expected redaction when match present");
     let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
 
     assert_eq!(v["model"], "10.0.0.1", "top-level scalar model preserved");
@@ -2876,10 +3042,10 @@ async fn test_sse_scan_all_redacts_pii_nested_under_structural_key() {
             .await,
         PluginResult::Continue
     ));
-    let transformed = plugin
-        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
-        .await
-        .expect("expected redaction when nested PII present");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("text/event-stream"), &sse_headers())
+            .await
+            .expect("expected redaction when nested PII present");
     let s = String::from_utf8(transformed).unwrap();
     let data = s
         .lines()
@@ -2922,8 +3088,7 @@ async fn test_sse_scan_all_preserves_structural_only_match_without_rewrite() {
         PluginResult::Continue
     ));
     assert!(
-        plugin
-            .transform_response_body(body, Some("text/event-stream"), &sse_headers())
+        transform_on_fresh_context(&plugin, body, Some("text/event-stream"), &sse_headers())
             .await
             .is_none(),
         "a match confined to a preserved structural scalar must not rewrite the frame"
@@ -2962,10 +3127,14 @@ async fn test_sse_scan_all_unredactable_raw_bytes_fail_closed() {
             "unredactable SSE bytes did not fail closed: {body}"
         );
         assert!(
-            plugin
-                .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
-                .await
-                .is_none(),
+            transform_on_fresh_context(
+                &plugin,
+                body.as_bytes(),
+                Some("text/event-stream"),
+                &sse_headers()
+            )
+            .await
+            .is_none(),
             "unsafe SSE bytes must not produce a purportedly safe transform"
         );
     }
@@ -3005,10 +3174,14 @@ async fn test_sse_scan_all_duplicate_structural_members_fail_closed() {
             "duplicate structural member did not fail closed ({case}): {body}"
         );
         assert!(
-            plugin
-                .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
-                .await
-                .is_none(),
+            transform_on_fresh_context(
+                &plugin,
+                body.as_bytes(),
+                Some("text/event-stream"),
+                &sse_headers()
+            )
+            .await
+            .is_none(),
             "unsafe duplicate structural member produced a transform ({case})"
         );
     }
@@ -3042,8 +3215,7 @@ async fn test_sse_scan_all_duplicate_members_are_uninspectable_even_when_preserv
         Some("ambiguous_json_document")
     );
     assert!(
-        plugin
-            .transform_response_body(body, Some("text/event-stream"), &sse_headers())
+        transform_on_fresh_context(&plugin, body, Some("text/event-stream"), &sse_headers())
             .await
             .is_none(),
         "a preserved last structural scalar must leave the exact SSE bytes untouched"
@@ -3198,9 +3370,9 @@ fn test_unknown_root_and_nested_config_keys_are_rejected() {
         ),
     ] {
         let error = AiResponseGuard::new(&config).err().unwrap();
-        let (scope, key) = path.rsplit_once('.').unwrap();
+        let (scope, _key) = path.rsplit_once('.').unwrap();
         assert!(error.contains(&format!("`{scope}`")), "{error}");
-        assert!(error.contains(&format!("{key:?}")), "{error}");
+        assert!(error.contains(&format!("{path:?}")), "{error}");
     }
 }
 
@@ -3253,10 +3425,10 @@ async fn test_blocked_phrase_value_is_not_exposed_by_any_action() {
         "blocked_phrases": [secret_phrase],
         "action": "redact"
     }));
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("blocked phrase should be redacted");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("blocked phrase should be redacted");
     let transformed = String::from_utf8(transformed).unwrap();
     assert!(!transformed.contains(secret_phrase));
     assert!(transformed.contains("[REDACTED:blocked_phrase:0]"));
@@ -3375,8 +3547,7 @@ async fn test_oversized_non_json_error_body_is_bounded_for_every_action() {
         }
 
         assert!(
-            plugin
-                .transform_response_body(&body, Some("text/plain"), &headers)
+            transform_on_fresh_context(&plugin, &body, Some("text/plain"), &headers)
                 .await
                 .is_none(),
             "{action} must not scan or rewrite raw text above max_scan_bytes"
@@ -3436,8 +3607,7 @@ async fn test_non_json_scan_all_is_governed_and_redactable() {
             .await,
         PluginResult::Continue
     ));
-    let transformed = redact
-        .transform_response_body(body, Some("text/plain"), &headers)
+    let transformed = transform_on_fresh_context(&redact, body, Some("text/plain"), &headers)
         .await
         .expect("raw UTF-8 response should be redacted in scan-all mode");
     let transformed = String::from_utf8(transformed).unwrap();
@@ -3557,10 +3727,14 @@ async fn test_multiline_sse_event_redaction_uses_complete_event() {
         assert!(matches!(result, PluginResult::Continue));
         assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
 
-        let transformed = plugin
-            .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
-            .await
-            .expect("complete multiline SSE event should be rewritten");
+        let transformed = transform_on_fresh_context(
+            &plugin,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &sse_headers(),
+        )
+        .await
+        .expect("complete multiline SSE event should be rewritten");
         let transformed = String::from_utf8(transformed).unwrap();
         assert!(!transformed.contains("multi@example.com"));
         assert!(transformed.contains("[REDACTED:pii:email]"));
@@ -3635,10 +3809,14 @@ async fn test_sse_redaction_follows_cr_and_mixed_framing_and_leading_boms() {
             "{framing}: the stream must be recorded as redacted"
         );
 
-        let transformed = plugin
-            .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
-            .await
-            .expect("the SSE event should be rewritten");
+        let transformed = transform_on_fresh_context(
+            &plugin,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &sse_headers(),
+        )
+        .await
+        .expect("the SSE event should be rewritten");
         let transformed = String::from_utf8(transformed).unwrap();
         assert!(!transformed.contains("multi@example.com"), "{framing}");
         assert!(transformed.contains("[REDACTED:pii:email]"), "{framing}");
@@ -3704,10 +3882,10 @@ async fn test_common_buffered_output_shapes_are_detected_and_redacted() {
                 .await,
             PluginResult::Continue
         ));
-        let transformed = redact
-            .transform_response_body(&body, Some("application/json"), &headers)
-            .await
-            .unwrap_or_else(|| panic!("shape {index} was not redacted"));
+        let transformed =
+            transform_on_fresh_context(&redact, &body, Some("application/json"), &headers)
+                .await
+                .unwrap_or_else(|| panic!("shape {index} was not redacted"));
         let transformed = String::from_utf8(transformed).unwrap();
         assert!(
             !transformed.contains(secret),
@@ -3773,10 +3951,14 @@ async fn test_streaming_tool_and_responses_deltas_are_governed() {
                 .await,
             PluginResult::Continue
         ));
-        let transformed = redact
-            .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
-            .await
-            .expect("streamed output shape should be redacted");
+        let transformed = transform_on_fresh_context(
+            &redact,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &sse_headers(),
+        )
+        .await
+        .expect("streamed output shape should be redacted");
         let transformed = String::from_utf8(transformed).unwrap();
         assert!(!transformed.contains("tool@example.com"));
         assert!(transformed.contains("[REDACTED:pii:email]"));
@@ -3822,10 +4004,10 @@ async fn test_sse_scan_all_decodes_responses_arguments_and_preserves_json_scalar
             .await,
         PluginResult::Continue
     ));
-    let transformed = redact
-        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
-        .await
-        .expect("Responses arguments delta should be redacted");
+    let transformed =
+        transform_on_fresh_context(&redact, &body, Some("text/event-stream"), &sse_headers())
+            .await
+            .expect("Responses arguments delta should be redacted");
     let transformed = String::from_utf8(transformed).unwrap();
     let data = transformed
         .lines()
@@ -3866,8 +4048,7 @@ async fn test_representation_validators_removed_only_after_rewrite() {
     .unwrap();
     let clean_headers = original_headers.clone();
     assert!(
-        plugin
-            .transform_response_body(&clean, Some("application/json"), &clean_headers)
+        transform_on_fresh_context(&plugin, &clean, Some("application/json"), &clean_headers)
             .await
             .is_none()
     );
@@ -3883,8 +4064,7 @@ async fn test_representation_validators_removed_only_after_rewrite() {
         ("text/event-stream", sse_body.as_slice()),
     ] {
         assert!(
-            plugin
-                .transform_response_body(body, Some(content_type), &original_headers)
+            transform_on_fresh_context(&plugin, body, Some(content_type), &original_headers)
                 .await
                 .is_some()
         );
@@ -4065,10 +4245,10 @@ async fn test_refusal_content_is_scanned_and_redacted() {
                 .await,
             PluginResult::Continue
         ));
-        let transformed = redact
-            .transform_response_body(&body, Some("application/json"), &headers)
-            .await
-            .unwrap_or_else(|| panic!("refusal shape {index} was not redacted"));
+        let transformed =
+            transform_on_fresh_context(&redact, &body, Some("application/json"), &headers)
+                .await
+                .unwrap_or_else(|| panic!("refusal shape {index} was not redacted"));
         let transformed = String::from_utf8(transformed).unwrap();
         assert!(
             !transformed.contains(secret),
@@ -4135,10 +4315,10 @@ async fn test_escaped_tool_arguments_are_decoded_before_scanning() {
                 .await,
             PluginResult::Continue
         ));
-        let transformed = redact
-            .transform_response_body(&body, Some("application/json"), &headers)
-            .await
-            .unwrap_or_else(|| panic!("escaped argument shape {index} was not redacted"));
+        let transformed =
+            transform_on_fresh_context(&redact, &body, Some("application/json"), &headers)
+                .await
+                .unwrap_or_else(|| panic!("escaped argument shape {index} was not redacted"));
         let transformed = String::from_utf8(transformed).unwrap();
         assert!(transformed.contains("[REDACTED:pii:email]"));
         assert!(
@@ -4215,8 +4395,7 @@ async fn test_unrewritable_argument_keys_and_numeric_scalars_fail_closed() {
                 Some(&format!("pii:{pii_pattern}"))
             );
             assert!(
-                redact
-                    .transform_response_body(&body, Some("application/json"), &headers)
+                transform_on_fresh_context(&redact, &body, Some("application/json"), &headers)
                     .await
                     .is_none(),
                 "the transform must not rename a decoded key or rewrite a numeric JSON scalar"
@@ -4248,10 +4427,12 @@ async fn test_nested_argument_string_values_redact_with_valid_json_semantics() {
             PluginResult::Continue
         ));
 
-        let transformed = redact
-            .transform_response_body(&body, Some("application/json"), &headers)
-            .await
-            .unwrap_or_else(|| panic!("nested argument value was not redacted in {scan_fields}"));
+        let transformed =
+            transform_on_fresh_context(&redact, &body, Some("application/json"), &headers)
+                .await
+                .unwrap_or_else(|| {
+                    panic!("nested argument value was not redacted in {scan_fields}")
+                });
         let response: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
         let rewritten_arguments =
             response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
@@ -4307,10 +4488,10 @@ async fn test_sse_refusal_deltas_are_scanned_and_fail_closed_when_split() {
     let responses_single = "data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"no: sse-refuse@example.com\"}\n\ndata: [DONE]\n\n";
     for body in [chat_single.as_bytes(), responses_single.as_bytes()] {
         let redact = make_plugin(json!({"pii_patterns": ["email"], "action": "redact"}));
-        let transformed = redact
-            .transform_response_body(body, Some("text/event-stream"), &sse_headers())
-            .await
-            .expect("single-frame refusal should be redacted");
+        let transformed =
+            transform_on_fresh_context(&redact, body, Some("text/event-stream"), &sse_headers())
+                .await
+                .expect("single-frame refusal should be redacted");
         let transformed = String::from_utf8(transformed).unwrap();
         assert!(!transformed.contains("sse-refuse@example.com"));
         assert!(transformed.contains("[REDACTED:pii:email]"));
@@ -6076,8 +6257,7 @@ async fn test_plaintext_redaction_applies_every_pattern_pass_in_order() {
     headers.insert("content-type".to_string(), "text/plain".to_string());
 
     let body = b"mail user@example.com about the classified plan, cc ops@example.com";
-    let redacted = plugin
-        .transform_response_body(body, Some("text/plain"), &headers)
+    let redacted = transform_on_fresh_context(&plugin, body, Some("text/plain"), &headers)
         .await
         .expect("a matching plain-text body must be rewritten");
     let redacted = String::from_utf8(redacted).expect("redacted text is UTF-8");
@@ -6100,10 +6280,14 @@ async fn test_plaintext_redaction_leaves_a_clean_body_untouched() {
     headers.insert("content-type".to_string(), "text/plain".to_string());
 
     assert!(
-        plugin
-            .transform_response_body(b"nothing to see here", Some("text/plain"), &headers)
-            .await
-            .is_none(),
+        transform_on_fresh_context(
+            &plugin,
+            b"nothing to see here",
+            Some("text/plain"),
+            &headers
+        )
+        .await
+        .is_none(),
         "an unchanged redaction must not install a replacement"
     );
 }
@@ -6154,10 +6338,14 @@ async fn test_sse_redaction_is_assembled_eventwise_and_preserves_framing() {
         "data: {\"id\":\"1\",\"text\":\"hello\"}\n\n",
         "data: {\"id\":\"2\",\"text\":\"mail me at user@example.com\"}\n\n",
     );
-    let redacted = plugin
-        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &headers)
-        .await
-        .expect("an SSE body with PII must be rewritten");
+    let redacted = transform_on_fresh_context(
+        &plugin,
+        body.as_bytes(),
+        Some("text/event-stream"),
+        &headers,
+    )
+    .await
+    .expect("an SSE body with PII must be rewritten");
     let redacted = String::from_utf8(redacted).expect("redacted SSE is UTF-8");
 
     assert!(
@@ -6677,10 +6865,10 @@ async fn test_redact_mode_rewrites_bedrock_converse_output_message() {
     .unwrap();
     let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("expected a redacted Converse body");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("expected a redacted Converse body");
     let out = String::from_utf8(transformed).unwrap();
     assert!(!out.contains("123-45-6789"), "not redacted: {out}");
     assert!(out.contains("[REDACTED:pii:ssn]"), "no placeholder: {out}");
@@ -6925,14 +7113,14 @@ async fn test_content_mode_detection_and_redaction_cover_the_same_fields() {
         );
 
         let redactor = make_plugin(json!({"pii_patterns": ["ssn"], "action": "redact"}));
-        let redacted = redactor
-            .transform_response_body(
-                &raw,
-                Some("application/json"),
-                &HashMap::from([("content-type".to_string(), "application/json".to_string())]),
-            )
-            .await
-            .unwrap_or_else(|| panic!("`{label}` was detected but never rewritten"));
+        let redacted = transform_on_fresh_context(
+            &redactor,
+            &raw,
+            Some("application/json"),
+            &HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        )
+        .await
+        .unwrap_or_else(|| panic!("`{label}` was detected but never rewritten"));
         let redacted = String::from_utf8(redacted).unwrap();
         assert!(
             !redacted.contains(PII),
@@ -7182,10 +7370,10 @@ async fn test_sse_tgi_is_redacted_not_rejected() {
         "a rewritable TGI match must not hard-fail: {result:?}"
     );
 
-    let transformed = plugin
-        .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
-        .await
-        .expect("expected redacted body");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("text/event-stream"), &sse_headers())
+            .await
+            .expect("expected redacted body");
     let out = String::from_utf8(transformed).unwrap();
     assert!(!out.contains("ann@corp.io"), "not redacted: {out}");
     assert!(out.contains("[REDACTED:pii:email]"), "no placeholder");
@@ -7402,10 +7590,10 @@ async fn compounding_structured_redaction_fails_closed_within_budget() {
     for scan_fields in ["content", "all"] {
         let plugin = compounding_digit_policy(scan_fields);
         let small = chat_body(&["7".to_string()]);
-        let redacted = plugin
-            .transform_response_body(&small, Some("application/json"), &headers)
-            .await
-            .unwrap_or_else(|| panic!("{scan_fields}: a within-budget rewrite must succeed"));
+        let redacted =
+            transform_on_fresh_context(&plugin, &small, Some("application/json"), &headers)
+                .await
+                .unwrap_or_else(|| panic!("{scan_fields}: a within-budget rewrite must succeed"));
         let value: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
         assert_eq!(
             value["choices"][0]["message"]["content"],
@@ -7417,8 +7605,7 @@ async fn compounding_structured_redaction_fails_closed_within_budget() {
     for scan_fields in ["content", "all"] {
         let plugin = compounding_digit_policy(scan_fields);
         assert!(
-            plugin
-                .transform_response_body(&body, Some("application/json"), &headers)
+            transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
                 .await
                 .is_none(),
             "{scan_fields}: no partially redacted document may be produced"
@@ -7450,8 +7637,7 @@ async fn structured_redaction_budget_is_aggregate_across_strings_and_events() {
     // Control: two such strings (~25 KB of growth) redact normally.
     let two = chat_body(&vec![part.clone(); 2]);
     assert!(
-        plugin
-            .transform_response_body(&two, Some("application/json"), &json_headers)
+        transform_on_fresh_context(&plugin, &two, Some("application/json"), &json_headers)
             .await
             .is_some(),
         "two strings stay inside the allowance"
@@ -7459,8 +7645,7 @@ async fn structured_redaction_budget_is_aggregate_across_strings_and_events() {
 
     let six = chat_body(&vec![part.clone(); 6]);
     assert!(
-        plugin
-            .transform_response_body(&six, Some("application/json"), &json_headers)
+        transform_on_fresh_context(&plugin, &six, Some("application/json"), &json_headers)
             .await
             .is_none(),
         "combined growth across strings must exhaust the shared allowance"
@@ -7476,18 +7661,26 @@ async fn structured_redaction_budget_is_aggregate_across_strings_and_events() {
     // The same aggregate across buffered SSE events.
     let two_events = openai_sse_body(&[part.as_str(), part.as_str()]);
     assert!(
-        plugin
-            .transform_response_body(&two_events, Some("text/event-stream"), &sse_headers())
-            .await
-            .is_some(),
+        transform_on_fresh_context(
+            &plugin,
+            &two_events,
+            Some("text/event-stream"),
+            &sse_headers()
+        )
+        .await
+        .is_some(),
         "two events stay inside the allowance"
     );
     let six_events = openai_sse_body(&[part.as_str(); 6]);
     assert!(
-        plugin
-            .transform_response_body(&six_events, Some("text/event-stream"), &sse_headers())
-            .await
-            .is_none(),
+        transform_on_fresh_context(
+            &plugin,
+            &six_events,
+            Some("text/event-stream"),
+            &sse_headers()
+        )
+        .await
+        .is_none(),
         "combined growth across SSE events must exhaust the shared allowance"
     );
 }
@@ -7504,10 +7697,10 @@ async fn ordinary_expanding_redaction_still_succeeds() {
     .unwrap();
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
-        .await
-        .expect("a modest expansion redacts normally");
+    let transformed =
+        transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
+            .await
+            .expect("a modest expansion redacts normally");
     let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
     assert_eq!(
         value["choices"][0]["message"]["content"],
@@ -7536,8 +7729,7 @@ async fn runtime_zero_width_matches_are_refused_by_every_redaction_path() {
         if scan_fields == "all" {
             headers.insert("content-type".to_string(), "text/plain".to_string());
             assert!(
-                plugin
-                    .transform_response_body(b"hello world", Some("text/plain"), &headers)
+                transform_on_fresh_context(&plugin, b"hello world", Some("text/plain"), &headers)
                     .await
                     .is_none(),
                 "whole-body text redaction must refuse zero-width spans"
@@ -7546,8 +7738,7 @@ async fn runtime_zero_width_matches_are_refused_by_every_redaction_path() {
         headers.insert("content-type".to_string(), "application/json".to_string());
         let body = br#"{"choices":[{"message":{"content":"hello world"}}]}"#;
         assert!(
-            plugin
-                .transform_response_body(body, Some("application/json"), &headers)
+            transform_on_fresh_context(&plugin, body, Some("application/json"), &headers)
                 .await
                 .is_none(),
             "{scan_fields}: structured redaction must refuse zero-width spans"
@@ -7573,8 +7764,7 @@ async fn grow_then_shrink_redaction_across_many_fields_is_exact() {
     let body = chat_body(&contents);
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    let redacted = plugin
-        .transform_response_body(&body, Some("application/json"), &headers)
+    let redacted = transform_on_fresh_context(&plugin, &body, Some("application/json"), &headers)
         .await
         .expect("a shrinking rewrite spends no allowance");
     let value: serde_json::Value = serde_json::from_slice(&redacted).unwrap();
@@ -7608,8 +7798,7 @@ async fn tool_argument_serialization_growth_is_charged() {
     // Control: 18 matches. Leaf growth (~55 KB escaped) and the embedded
     // argument string (~64.5 KB once escaped again) both fit the 64 KiB floor.
     assert!(
-        plugin
-            .transform_response_body(&json_body(18), Some("application/json"), &headers)
+        transform_on_fresh_context(&plugin, &json_body(18), Some("application/json"), &headers)
             .await
             .is_some()
     );
@@ -7617,8 +7806,7 @@ async fn tool_argument_serialization_growth_is_charged() {
     // re-serialized argument document escapes it again (~71.7 KB), which only
     // the argument-serialization charge catches.
     assert!(
-        plugin
-            .transform_response_body(&json_body(20), Some("application/json"), &headers)
+        transform_on_fresh_context(&plugin, &json_body(20), Some("application/json"), &headers)
             .await
             .is_none(),
         "escaping growth of re-serialized arguments must be charged"
@@ -7632,14 +7820,12 @@ async fn tool_argument_serialization_growth_is_charged() {
         format!("data: {frame}\n\ndata: [DONE]\n\n").into_bytes()
     };
     assert!(
-        plugin
-            .transform_response_body(&sse(18), Some("text/event-stream"), &sse_headers())
+        transform_on_fresh_context(&plugin, &sse(18), Some("text/event-stream"), &sse_headers())
             .await
             .is_some()
     );
     assert!(
-        plugin
-            .transform_response_body(&sse(20), Some("text/event-stream"), &sse_headers())
+        transform_on_fresh_context(&plugin, &sse(20), Some("text/event-stream"), &sse_headers())
             .await
             .is_none(),
         "the SSE argument path charges the same serialization growth"
@@ -7760,10 +7946,14 @@ async fn refused_sse_rewrites_fail_closed_at_inspection() {
         PluginResult::Reject { .. }
     ));
     assert!(
-        budget_plugin
-            .transform_response_body(&body, Some("text/event-stream"), &sse_headers())
-            .await
-            .is_none()
+        transform_on_fresh_context(
+            &budget_plugin,
+            &body,
+            Some("text/event-stream"),
+            &sse_headers()
+        )
+        .await
+        .is_none()
     );
 
     let zero_width = make_plugin(json!({
@@ -7797,36 +7987,34 @@ async fn escaped_placeholder_growth_is_charged_for_completion_strings() {
     headers.insert("content-type".to_string(), "application/json".to_string());
     // 10 matches: ~30 KB escaped growth fits the 64 KiB floor.
     assert!(
-        plugin
-            .transform_response_body(
-                &chat_body(&["7".repeat(10)]),
-                Some("application/json"),
-                &headers
-            )
-            .await
-            .is_some()
+        transform_on_fresh_context(
+            &plugin,
+            &chat_body(&["7".repeat(10)]),
+            Some("application/json"),
+            &headers
+        )
+        .await
+        .is_some()
     );
     // 30 matches: 15 KB decoded growth, but ~92 KB once escaped.
     assert!(
-        plugin
-            .transform_response_body(
-                &chat_body(&["7".repeat(30)]),
-                Some("application/json"),
-                &headers
-            )
-            .await
-            .is_none()
+        transform_on_fresh_context(
+            &plugin,
+            &chat_body(&["7".repeat(30)]),
+            Some("application/json"),
+            &headers
+        )
+        .await
+        .is_none()
     );
     let sse = |count: usize| openai_sse_body(&[&"7".repeat(count)]);
     assert!(
-        plugin
-            .transform_response_body(&sse(10), Some("text/event-stream"), &sse_headers())
+        transform_on_fresh_context(&plugin, &sse(10), Some("text/event-stream"), &sse_headers())
             .await
             .is_some()
     );
     assert!(
-        plugin
-            .transform_response_body(&sse(30), Some("text/event-stream"), &sse_headers())
+        transform_on_fresh_context(&plugin, &sse(30), Some("text/event-stream"), &sse_headers())
             .await
             .is_none()
     );
@@ -8040,8 +8228,7 @@ async fn duplicate_member_with_escaped_pii_is_refused_by_enforcing_actions() {
         assert_eq!(rejected_metadata(&ctx), Some("ambiguous_json_document"));
         // The context-free transform is representation-safe on its own.
         assert!(
-            plugin
-                .transform_response_body(body, Some("application/json"), &json_headers())
+            transform_on_fresh_context(&plugin, body, Some("application/json"), &json_headers())
                 .await
                 .is_none()
         );

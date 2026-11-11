@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Userspace eBPF manager for the node-agent capture mode.
 //!
 //! This module owns the trait surface, shared types, and mock backend for
@@ -6,6 +5,12 @@
 //! The real aya-based loader lives behind
 //! `#[cfg(all(feature = "ebpf", target_os = "linux"))]`; default and non-Linux
 //! builds use `MockEbpfBackend` for lifecycle tests without kernel interaction.
+
+// The loader, the BPF map handles and the event consumer only exist with the
+// `ebpf` feature on Linux, so most userspace helpers are unreachable in every
+// other build. Allow that there and nowhere else: a Linux `ebpf` build reports
+// genuinely dead items (issue #7264).
+#![cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
 
 pub mod bpf_metrics;
 pub mod cgroup;
@@ -119,9 +124,6 @@ pub const BPF_MAP_SOCK_OPS_STATS: &str = "FERRUM_SOCK_OPS_STATS";
 /// Bounded accepted-socket set carrying the SK_SKB first-data hook.
 pub const BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS: &str = "FERRUM_ACCEPT_FIRST_BYTE_SOCKETS";
 
-/// Accept timestamp/correlation phase keyed by accepted socket cookie.
-pub const BPF_MAP_ACCEPT_FIRST_BYTE_STATE: &str = "FERRUM_ACCEPT_FIRST_BYTE_STATE";
-
 /// bpffs mount point every Ferrum pin lives under, inside the container.
 ///
 /// The pin paths below are fixed constants shared by the node-agent (writer)
@@ -205,76 +207,12 @@ impl std::fmt::Display for NodeAgentProxyMode {
     }
 }
 
-/// BPF map names that form the node-agent/proxy capture ABI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CaptureBpfMaps {
-    pub orig_dst4: &'static str,
-    pub orig_dst6: &'static str,
-    pub pod_ips: &'static str,
-    pub pod_ips6: &'static str,
-    pub node_ips: &'static str,
-    pub node_ips6: &'static str,
-    pub node_probe_ports: &'static str,
-    pub node_probe_ports6: &'static str,
-    pub pod_inbound_ports: &'static str,
-    pub pod_inbound_ports6: &'static str,
-    pub udp_reply_sources: &'static str,
-    pub udp_reply_sources6: &'static str,
-    pub udp_relay_cgroups: &'static str,
-    pub udp_reply_source_gate: &'static str,
-    pub bypass_uids: &'static str,
-    pub cidr_exclude4: &'static str,
-    pub cidr_exclude6: &'static str,
-    pub cidr_include4: &'static str,
-    pub cidr_include6: &'static str,
-    pub port_exclude: &'static str,
-    pub include_ports: &'static str,
-    pub capture_config: &'static str,
-}
-
-impl Default for CaptureBpfMaps {
-    fn default() -> Self {
-        Self {
-            orig_dst4: BPF_MAP_ORIG_DST4,
-            orig_dst6: BPF_MAP_ORIG_DST6,
-            pod_ips: BPF_MAP_POD_IPS,
-            pod_ips6: BPF_MAP_POD_IPS6,
-            node_ips: BPF_MAP_NODE_IPS,
-            node_ips6: BPF_MAP_NODE_IPS6,
-            node_probe_ports: BPF_MAP_NODE_PROBE_PORTS,
-            node_probe_ports6: BPF_MAP_NODE_PROBE_PORTS6,
-            pod_inbound_ports: BPF_MAP_POD_INBOUND_PORTS,
-            pod_inbound_ports6: BPF_MAP_POD_INBOUND_PORTS6,
-            udp_reply_sources: BPF_MAP_UDP_REPLY_SOURCES,
-            udp_reply_sources6: BPF_MAP_UDP_REPLY_SOURCES6,
-            udp_relay_cgroups: BPF_MAP_UDP_RELAY_CGROUPS,
-            udp_reply_source_gate: BPF_MAP_UDP_REPLY_SOURCE_GATE,
-            bypass_uids: BPF_MAP_BYPASS_UIDS,
-            cidr_exclude4: BPF_MAP_CIDR_EXCLUDE4,
-            cidr_exclude6: BPF_MAP_CIDR_EXCLUDE6,
-            cidr_include4: BPF_MAP_CIDR_INCLUDE4,
-            cidr_include6: BPF_MAP_CIDR_INCLUDE6,
-            port_exclude: BPF_MAP_PORT_EXCLUDE,
-            include_ports: BPF_MAP_INCLUDE_PORTS,
-            capture_config: BPF_MAP_CAPTURE_CONFIG,
-        }
-    }
-}
-
 /// Formal node-agent/proxy capture surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureContract {
     pub proxy_mode: NodeAgentProxyMode,
     pub outbound_capture_port: u16,
     pub hbone_redirect_port: u16,
-    pub unix_socket_path: String,
-    pub bpf_maps: CaptureBpfMaps,
-    /// Fail closed on captured IPv6 outbound (the `connect6` hook returns
-    /// `EPERM`) instead of redirecting it. This remains available as a safety
-    /// valve, but NodeWaypoint now keeps it disabled because the in-netns capture
-    /// manager opens an IPv6 pod-loopback listener and missing listeners fail
-    /// closed by connection refusal.
-    pub ipv6_outbound_deny: bool,
     pub node_waypoint_inbound_auth_mark: u32,
     /// Node capture interfaces that carry the tc **ingress** redirect
     /// classifier. Empty (the default) means the redirect is not installed and
@@ -378,7 +316,6 @@ impl CaptureContract {
         proxy_mode: NodeAgentProxyMode,
         outbound_capture_port: u16,
         hbone_redirect_port: u16,
-        unix_socket_path: impl Into<String>,
     ) -> Result<Self, String> {
         if outbound_capture_port == 0 {
             return Err("CaptureContract outbound_capture_port must be non-zero".to_string());
@@ -392,18 +329,10 @@ impl CaptureContract {
                     .to_string(),
             );
         }
-        let unix_socket_path = unix_socket_path.into();
-        if unix_socket_path.trim().is_empty() {
-            return Err("CaptureContract unix_socket_path must not be empty".to_string());
-        }
-
         Ok(Self {
             proxy_mode,
             outbound_capture_port,
             hbone_redirect_port,
-            unix_socket_path,
-            bpf_maps: CaptureBpfMaps::default(),
-            ipv6_outbound_deny: false,
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
             ingress_redirect_ifaces: Vec::new(),
             node_waypoint_ingress_redirect_mark: 0,
@@ -417,9 +346,6 @@ impl CaptureContract {
             proxy_mode: NodeAgentProxyMode::LocalPod,
             outbound_capture_port: OUTBOUND_CAPTURE_PORT,
             hbone_redirect_port: INBOUND_HBONE_PORT,
-            unix_socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
-            bpf_maps: CaptureBpfMaps::default(),
-            ipv6_outbound_deny: false,
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
             ingress_redirect_ifaces: Vec::new(),
             node_waypoint_ingress_redirect_mark: 0,
@@ -450,7 +376,6 @@ impl CaptureContract {
             (0, 0)
         };
         BpfCaptureConfig::new(self.outbound_capture_port, self.hbone_redirect_port)
-            .with_ipv6_outbound_deny(self.ipv6_outbound_deny)
             .with_node_waypoint_inbound_auth_mark(inbound_auth_mark)
             .with_node_waypoint_ingress_redirect_mark(ingress_redirect_mark)
             .with_node_waypoint_ingress_capture_port(ingress_capture_port)
@@ -671,12 +596,6 @@ impl NodeAgentMetrics {
     /// Idempotent — repeat calls with the same reason are no-ops.
     pub fn set_topology_degraded(&self, reason: &'static str) {
         self.topology_degraded_reason.store(Arc::new(Some(reason)));
-    }
-
-    /// Clear any prior degraded state. Intended for tests; the production
-    /// path sets the reason once at startup and never clears it.
-    pub fn clear_topology_degraded(&self) {
-        self.topology_degraded_reason.store(Arc::new(None));
     }
 
     /// Update the operator-visible capture state. Labels must come from
@@ -1211,11 +1130,6 @@ pub struct MockEbpfBackend {
     /// publication the node-agent could not apply is NOT recorded as converged
     /// and is retried, and that a failed retraction never reports success.
     pub fail_replace_udp_reply_sources: bool,
-    /// When `true`, the reply-source maps are treated as ABSENT from the loaded
-    /// program, mirroring `BpfMaps::replace_udp_reply_sources`: every generation,
-    /// including an empty withdrawal, is a hard error because both families
-    /// must be scanned and applied before it may be acknowledged.
-    pub udp_reply_source_maps_absent: bool,
     /// When `true`, the IPv4 half of the replacement succeeds and the operation
     /// then fails before IPv6, mirroring a partial family failure in the real
     /// remove-before-insert sequence. The generation must remain unacknowledged.
@@ -1224,12 +1138,6 @@ pub struct MockEbpfBackend {
     /// generation whose SENDER proof could not be applied is never acknowledged
     /// and never leaves the source proof authorized on its own.
     pub fail_replace_udp_relay_cgroups: bool,
-    /// Treat `FERRUM_UDP_RELAY_CGROUPS` as ABSENT from the loaded program.
-    /// Every generation, including an empty withdrawal, is then a hard error:
-    /// without that map the classifier has no sender proof to consult.
-    pub udp_relay_cgroup_map_absent: bool,
-    /// Treat the shared reply-source gate map as absent.
-    pub udp_reply_source_gate_absent: bool,
     /// Inject a hard failure while closing the shared gate. The mock leaves the
     /// previous value unchanged, matching a failed map update.
     pub fail_disable_udp_reply_sources: bool,
@@ -1463,12 +1371,6 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String> {
-        if self.udp_reply_source_gate_absent {
-            return Err(
-                "injected absent NodeWaypoint UDP reply-source gate; authorization cannot be fenced"
-                    .to_string(),
-            );
-        }
         if (!enabled && self.fail_disable_udp_reply_sources)
             || (enabled && self.fail_enable_udp_reply_sources)
         {
@@ -1489,12 +1391,6 @@ impl EbpfBackend for MockEbpfBackend {
                 "injected NodeWaypoint UDP reply-source publication failure for {} source(s)",
                 sources.len()
             ));
-        }
-        if self.udp_reply_source_maps_absent {
-            return Err(
-                "injected absent NodeWaypoint UDP reply-source maps; the set cannot be authorized"
-                    .to_string(),
-            );
         }
         if self.fail_replace_udp_reply_sources_after_ipv4 {
             let desired4: HashSet<(IpAddr, u16)> = sources
@@ -1534,13 +1430,6 @@ impl EbpfBackend for MockEbpfBackend {
                 "injected NodeWaypoint UDP relay cgroup publication failure for {} id(s)",
                 cgroup_ids.len()
             ));
-        }
-        if self.udp_relay_cgroup_map_absent {
-            return Err(
-                "injected absent NodeWaypoint UDP relay cgroup map; the sender proof cannot be \
-                 authorized"
-                    .to_string(),
-            );
         }
         let desired: HashSet<u64> = cgroup_ids.iter().copied().collect();
         self.udp_relay_cgroups.retain(|id| desired.contains(id));
@@ -1740,21 +1629,6 @@ impl EbpfBackend for MockEbpfBackend {
         if self.capture_config.is_none() {
             return Err("BPF capture config map not initialized".to_string());
         }
-        if require_sock_ops && self.udp_relay_cgroup_map_absent {
-            return Err(format!(
-                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_RELAY_CGROUPS}"
-            ));
-        }
-        if require_sock_ops && self.udp_reply_source_maps_absent {
-            return Err(format!(
-                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_REPLY_SOURCES}, {BPF_MAP_UDP_REPLY_SOURCES6}"
-            ));
-        }
-        if require_sock_ops && self.udp_reply_source_gate_absent {
-            return Err(format!(
-                "BPF ELF is missing required map(s) for the selected capture topology: {BPF_MAP_UDP_REPLY_SOURCE_GATE}"
-            ));
-        }
         if require_sock_ops && self.sock_ops_attached_cgroup_root.is_none() {
             return Err("SOCK_OPS identity bridge is not attached".to_string());
         }
@@ -1803,23 +1677,10 @@ mod tests {
 
     #[test]
     fn capture_contract_projects_bpf_config() {
-        let contract = CaptureContract::new(
-            NodeAgentProxyMode::NodeWaypoint,
-            16001,
-            16008,
-            "/tmp/ferrum.sock",
-        )
-        .unwrap();
+        let contract =
+            CaptureContract::new(NodeAgentProxyMode::NodeWaypoint, 16001, 16008).unwrap();
 
         assert_eq!(contract.proxy_mode, NodeAgentProxyMode::NodeWaypoint);
-        assert_eq!(contract.bpf_maps.capture_config, BPF_MAP_CAPTURE_CONFIG);
-        assert_eq!(contract.bpf_maps.node_ips, BPF_MAP_NODE_IPS);
-        assert_eq!(contract.bpf_maps.node_ips6, BPF_MAP_NODE_IPS6);
-        assert_eq!(contract.bpf_maps.node_probe_ports, BPF_MAP_NODE_PROBE_PORTS);
-        assert_eq!(
-            contract.bpf_maps.node_probe_ports6,
-            BPF_MAP_NODE_PROBE_PORTS6
-        );
         assert_eq!(
             contract.bpf_capture_config(),
             BpfCaptureConfig::new(16001, 16008)
@@ -1833,7 +1694,6 @@ mod tests {
             NodeAgentProxyMode::NodeWaypoint,
             OUTBOUND_CAPTURE_PORT,
             INBOUND_HBONE_PORT,
-            "/tmp/ferrum.sock",
         )
         .unwrap();
 
@@ -1898,13 +1758,7 @@ mod tests {
 
     #[test]
     fn capture_contract_disables_inbound_mark_for_local_pod() {
-        let contract = CaptureContract::new(
-            NodeAgentProxyMode::LocalPod,
-            16001,
-            16008,
-            "/tmp/ferrum.sock",
-        )
-        .unwrap();
+        let contract = CaptureContract::new(NodeAgentProxyMode::LocalPod, 16001, 16008).unwrap();
 
         assert_eq!(
             contract
@@ -1916,24 +1770,9 @@ mod tests {
 
     #[test]
     fn capture_contract_rejects_invalid_surface() {
-        assert!(
-            CaptureContract::new(NodeAgentProxyMode::LocalPod, 0, 15008, "/tmp/ferrum.sock")
-                .is_err()
-        );
-        assert!(
-            CaptureContract::new(NodeAgentProxyMode::LocalPod, 15001, 0, "/tmp/ferrum.sock")
-                .is_err()
-        );
-        assert!(
-            CaptureContract::new(
-                NodeAgentProxyMode::LocalPod,
-                15001,
-                15001,
-                "/tmp/ferrum.sock"
-            )
-            .is_err()
-        );
-        assert!(CaptureContract::new(NodeAgentProxyMode::LocalPod, 15001, 15008, "").is_err());
+        assert!(CaptureContract::new(NodeAgentProxyMode::LocalPod, 0, 15008).is_err());
+        assert!(CaptureContract::new(NodeAgentProxyMode::LocalPod, 15001, 0).is_err());
+        assert!(CaptureContract::new(NodeAgentProxyMode::LocalPod, 15001, 15001).is_err());
     }
 
     #[test]
@@ -2045,15 +1884,6 @@ mod tests {
         metrics.set_topology_degraded("kernel_too_old");
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.topology_degraded_reason, Some("kernel_too_old"));
-    }
-
-    #[test]
-    fn node_agent_metrics_clear_topology_degraded() {
-        let metrics = NodeAgentMetrics::default();
-        metrics.set_topology_degraded("bpffs_missing");
-        metrics.clear_topology_degraded();
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.topology_degraded_reason, None);
     }
 
     #[test]

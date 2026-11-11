@@ -167,7 +167,7 @@ fn test_unknown_config_fields_rejected_even_with_valid_policy() {
             .insert(typo.to_string(), json!("ignored"));
         let error = AiPromptShield::new(&config).err().unwrap();
         assert!(
-            error.contains("unknown config field") && error.contains(typo),
+            error.contains("unknown configuration key") && error.contains(typo),
             "unexpected error for {typo}: {error}"
         );
     }
@@ -3413,7 +3413,9 @@ fn test_custom_pattern_entries_reject_unknown_members() {
             .err()
             .unwrap_or_else(|| panic!("nested unknown member `{unknown}` must be fatal"));
         assert!(
-            err.contains("unknown config field") && err.contains(unknown),
+            err.contains("unknown configuration key")
+                && err.contains("`custom_patterns[0]`")
+                && err.contains(unknown),
             "error must name the offending field path, got: {err}"
         );
     }
@@ -3429,7 +3431,7 @@ fn test_custom_pattern_entries_reject_unknown_members() {
     .err()
     .unwrap_or_else(|| panic!("nested unknown member must be fatal"));
     assert!(
-        err.contains("`custom_patterns[1]` key \"note\""),
+        err.contains("`custom_patterns[1]`") && err.contains("\"custom_patterns[1].note\""),
         "error must carry the entry index, got: {err}"
     );
 

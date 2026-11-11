@@ -2253,7 +2253,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         }),
         "access_control" => json!({"allowed_consumers": ["testuser"]}),
         "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
-        "ip_restriction" => json!({"allow": ["0.0.0.0/0"], "mode": "allow_first"}),
+        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
         "correlation_id" => json!({"header_name": "x-request-id", "echo_downstream": true}),
         "request_transformer" => {
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})

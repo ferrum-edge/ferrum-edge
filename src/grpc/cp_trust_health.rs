@@ -1,8 +1,8 @@
 //! Observable, bounded CP/DP trust-bundle reload health (issue #3813).
 //!
 //! The file-backed CP/DP trust-bundle watcher deliberately keeps the last
-//! accepted verifier when a candidate is unreadable, malformed, times out, or
-//! fails multi-namespace scope validation. Retaining a known-good verifier
+//! accepted verifier when a candidate is unreadable, malformed, or times out.
+//! Retaining a known-good verifier
 //! through a transient failure is the right availability policy — but on its
 //! own it is also a silent, unbounded one: a credential an operator is trying
 //! to revoke stays an active authorization source for as long as every reload
@@ -128,14 +128,12 @@ pub enum TrustReloadFailure {
     /// The read did not complete inside the loader timeout — the shape of a
     /// FIFO, a carrier-less device, or a stalled network filesystem.
     ReadTimedOut,
-    /// A structurally valid candidate failed multi-namespace scope validation.
-    ScopeValidationFailed,
     /// The reload worker exited or panicked without being asked to stop.
     WorkerExited,
 }
 
 /// Every [`TrustReloadFailure`], in metric-render order.
-pub const TRUST_RELOAD_FAILURES: [TrustReloadFailure; 14] = [
+pub const TRUST_RELOAD_FAILURES: [TrustReloadFailure; 13] = [
     TrustReloadFailure::DocumentUnreadable,
     TrustReloadFailure::DocumentInvalid,
     TrustReloadFailure::MaterialUnreadable,
@@ -148,7 +146,6 @@ pub const TRUST_RELOAD_FAILURES: [TrustReloadFailure; 14] = [
     TrustReloadFailure::ReaderUnavailable,
     TrustReloadFailure::ReaderFailed,
     TrustReloadFailure::ReadTimedOut,
-    TrustReloadFailure::ScopeValidationFailed,
     TrustReloadFailure::WorkerExited,
 ];
 
@@ -170,7 +167,6 @@ impl TrustReloadFailure {
             Self::ReaderUnavailable => "reader_unavailable",
             Self::ReaderFailed => "reload_reader_failed",
             Self::ReadTimedOut => "reload_read_timed_out",
-            Self::ScopeValidationFailed => "scope_validation_failed",
             Self::WorkerExited => "worker_exited",
         }
     }
@@ -189,8 +185,7 @@ impl TrustReloadFailure {
             Self::ReaderUnavailable => 9,
             Self::ReaderFailed => 10,
             Self::ReadTimedOut => 11,
-            Self::ScopeValidationFailed => 12,
-            Self::WorkerExited => 13,
+            Self::WorkerExited => 12,
         }
     }
 
@@ -567,7 +562,6 @@ impl CpDpTrustReloadStatus {
     }
 
     /// Configured stall window: three poll intervals, floored at 60s.
-    #[allow(dead_code)] // Public library API exercised by the external integration-test crate.
     pub fn stall_after(&self) -> Duration {
         self.stall_after
     }
@@ -941,7 +935,6 @@ impl TrustStaleWatch {
 /// as 64 lowercase hex characters. Returns `None` when `status_hmac_key` is
 /// shorter than [`STATUS_HMAC_KEY_MIN_BYTES`]; an unkeyed digest is never
 /// substituted.
-#[allow(dead_code)] // Public library API exercised by the external integration-test crate.
 pub fn keyed_generation_id(status_hmac_key: &[u8], fingerprint: &[u8; 32]) -> Option<String> {
     let key = parse_status_hmac_key(status_hmac_key)?;
     Some(hmac_generation_id(&key, fingerprint))

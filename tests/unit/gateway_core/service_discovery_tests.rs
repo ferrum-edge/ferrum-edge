@@ -387,7 +387,8 @@ fn test_load_balancer_cache_update_targets_selection_works() {
     let cache = LoadBalancerCache::new(&config);
 
     // Select from old targets
-    let sel = cache.select_target("ferrum", "up", "key", None).unwrap();
+    let sel =
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "up", "key", None).unwrap();
     assert_eq!(sel.target.host, "old-host");
 
     // Update to new targets
@@ -400,7 +401,8 @@ fn test_load_balancer_cache_update_targets_selection_works() {
     );
 
     // Select from new targets
-    let sel = cache.select_target("ferrum", "up", "key", None).unwrap();
+    let sel =
+        LoadBalancerCache::select_target_from(&cache.load(), "ferrum", "up", "key", None).unwrap();
     assert_eq!(sel.target.host, "new-host");
     assert_eq!(sel.target.port, 9090);
 }
@@ -2505,9 +2507,14 @@ fn test_load_balancer_cache_update_targets_nonexistent_upstream() {
     // balancer after the upstream has been removed from config.
     assert!(cache.get_upstream("ferrum", "does-not-exist").is_none());
     assert!(
-        cache
-            .select_target("ferrum", "does-not-exist", "key", None)
-            .is_none()
+        LoadBalancerCache::select_target_from(
+            &cache.load(),
+            "ferrum",
+            "does-not-exist",
+            "key",
+            None
+        )
+        .is_none()
     );
 }
 
@@ -6623,10 +6630,14 @@ async fn consul_duplicate_registrations_publish_one_share_and_stable_snapshot() 
         installed = Some(upstream);
         let mut first = 0;
         for _ in 0..60 {
-            let selected = harness
-                .lb_cache
-                .select_target("ferrum", "dedup-consul", "request", None)
-                .unwrap();
+            let selected = LoadBalancerCache::select_target_from(
+                &harness.lb_cache.load(),
+                "ferrum",
+                "dedup-consul",
+                "request",
+                None,
+            )
+            .unwrap();
             first += usize::from(selected.target.host == "2001:db8::1");
         }
         assert_eq!(first, 30, "three registrations still get one RR share");
@@ -6640,9 +6651,14 @@ async fn consul_duplicate_registrations_publish_one_share_and_stable_snapshot() 
     let cache = LoadBalancerCache::new(&make_config_with_upstreams(vec![weighted]));
     let mut first = 0;
     for _ in 0..60 {
-        let selected = cache
-            .select_target("ferrum", "weighted", "request", None)
-            .unwrap();
+        let selected = LoadBalancerCache::select_target_from(
+            &cache.load(),
+            "ferrum",
+            "weighted",
+            "request",
+            None,
+        )
+        .unwrap();
         first += usize::from(selected.target.host == "2001:db8::1");
     }
     assert_eq!(first, 20, "the retained weights are 2:4, never summed");
@@ -6773,10 +6789,14 @@ async fn kubernetes_family_selection_and_duplicate_slices_publish_and_reload() {
             .apply_snapshot_from("kubernetes", discoverer.discover().await.unwrap())
             .await;
         assert_eq!(harness.lb_hosts(), vec!["10.0.0.1"]);
-        let selected = harness
-            .lb_cache
-            .select_target("ferrum", "kube-family", "request", None)
-            .unwrap();
+        let selected = LoadBalancerCache::select_target_from(
+            &harness.lb_cache.load(),
+            "ferrum",
+            "kube-family",
+            "request",
+            None,
+        )
+        .unwrap();
         assert_eq!(selected.target.host, "10.0.0.1");
         assert_eq!(selected.target.port, 8080);
         assert_eq!(selected.target.weight, 3);
@@ -6854,10 +6874,14 @@ async fn kubernetes_address_type_validation_and_ipv6_only_default() {
     assert_eq!(upstream.targets.len(), 2);
     assert_eq!(upstream.targets[0], make_target("2001:db8::2", 8080));
     assert_eq!(upstream.targets[1], make_target("2001:db8::2", 9090));
-    let selected = harness
-        .lb_cache
-        .select_target("ferrum", "v6-only", "request", None)
-        .unwrap();
+    let selected = LoadBalancerCache::select_target_from(
+        &harness.lb_cache.load(),
+        "ferrum",
+        "v6-only",
+        "request",
+        None,
+    )
+    .unwrap();
     assert_eq!(selected.target.host, "2001:db8::2");
     assert!(
         discoverer

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ferrum_edge::plugins::utils::handle_http_batch_response;
+use ferrum_edge::plugins::utils::handle_http_batch_response_redacted;
 use ferrum_edge::plugins::utils::sink_loss::{
     SinkLossReason, dropped_total, dropped_total_all_reasons,
 };
@@ -860,7 +860,7 @@ async fn non_retryable_4xx_records_batch_discard_once_per_record() {
             .body("")
             .unwrap()
             .into();
-        handle_http_batch_response(
+        handle_http_batch_response_redacted(
             "HTTP logging",
             "http_logging",
             records as usize,
@@ -881,7 +881,7 @@ async fn non_retryable_4xx_records_batch_discard_once_per_record() {
         .body("")
         .unwrap()
         .into();
-    handle_http_batch_response("HTTP logging", "http_logging", 5, Ok(response))
+    handle_http_batch_response_redacted("HTTP logging", "http_logging", 5, Ok(response))
         .await
         .expect("2xx remains success");
     assert_eq!(
@@ -896,7 +896,7 @@ async fn non_retryable_4xx_records_batch_discard_once_per_record() {
         .body("")
         .unwrap()
         .into();
-    handle_http_batch_response("HTTP logging", "http_logging", 3, Ok(response))
+    handle_http_batch_response_redacted("HTTP logging", "http_logging", 3, Ok(response))
         .await
         .expect_err("429 must remain retryable");
     assert_eq!(
@@ -1071,22 +1071,18 @@ fn startup_diagnostics_preserve_observability_root_context_and_suggestions() {
 
 #[test]
 fn startup_diagnostics_withhold_statsd_and_frame_logging_unknown_root_keys() {
-    for (plugin, allowed_key) in [
-        ("statsd_logging", "host"),
-        ("ws_frame_logging", "log_level"),
-    ] {
+    for plugin in ["statsd_logging", "ws_frame_logging"] {
         for key in ["CallerKey5594", "987654321", "'CallerKey5594`\"\\\n"] {
             let config = json!({key: {"payloadKey5594": ["payloadValue5594", 987654321]}});
             let error = ferrum_edge::plugins::validate_plugin_config(plugin, &config)
                 .expect_err("unknown keys must fail registered admission");
-            assert!(error.contains(&format!("{key:?}")), "{error}");
+            let qualified_key = format!("config.{key}");
+            assert!(error.contains(&format!("{qualified_key:?}")), "{error}");
             let rendered =
                 ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
             for visible in [
                 format!("{plugin}: `config`:"),
                 "unknown configuration key(s)".to_string(),
-                "allowed keys:".to_string(),
-                format!("`{allowed_key}`"),
             ] {
                 assert!(rendered.contains(&visible), "{rendered}");
             }

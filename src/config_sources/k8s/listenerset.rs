@@ -514,24 +514,19 @@ pub(crate) fn materialize_listenerset_mesh_services(
         let Some(policy) = acc.gateway_api_listener_policies.get(&key) else {
             continue;
         };
-        if !policy.materializable
-            || !policy.routes_materializable
-            || policy.conflict_reason.is_some()
-        {
+        // Invalid, unsupported-mode and conflicted listeners were already
+        // warned about at collection and are reported in ListenerSet status.
+        if !policy.spec_accepted || policy.conflict_reason.is_some() {
             continue;
         }
-        if policy.validation_error.is_some() {
-            continue;
-        }
-        if !listener_protocol_mode_is_supported(listener) {
-            continue;
-        }
-        if listener_requires_frontend_tls(listener)
-            && !listener_is_materializable(acc, object, listener)
-        {
+        // Fail closed on the stored post-admission policy, as the Gateway
+        // path does: `materializable` is false when frontend TLS material did
+        // not resolve, `routes_materializable` when a later admission step
+        // withdrew the listener's routes.
+        if !policy.materializable || !policy.routes_materializable {
             acc.warnings.push(format!(
-                "Gateway API ListenerSet {:?}/{:?} listener {:?} has unresolved TLS material and \
-                 will not be exposed",
+                "Gateway API ListenerSet {:?}/{:?} listener {:?} has unresolved TLS material or \
+                 was withdrawn at admission and will not be exposed",
                 object.metadata.namespace, object.metadata.name, listener_name
             ));
             continue;

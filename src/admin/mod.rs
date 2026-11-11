@@ -476,7 +476,9 @@ pub struct AdminState {
     /// Process-level OpenAPI external `$ref` gate and budgets (from EnvConfig).
     pub external_ref_policy: std::sync::Arc<crate::admin::api_specs::ExternalRefProcessPolicy>,
     /// Loader used when external `$ref` resolution is effectively enabled.
-    pub external_ref_loader: std::sync::Arc<crate::admin::api_specs::DefaultExternalDocumentLoader>,
+    /// Serving modes install [`crate::admin::api_specs::DefaultExternalDocumentLoader`];
+    /// tests substitute their own in-memory loader through the trait.
+    pub external_ref_loader: std::sync::Arc<dyn crate::admin::api_specs::ExternalDocumentLoader>,
     /// Database-mode coordinator that waits for the poll-loop reload to publish
     /// a covering `config_changes` watermark before admin mutations return 2xx
     /// (issue #3926). `None` in every other mode and in tests that do not run
@@ -965,10 +967,7 @@ fn note_read_only_rejection() {
     );
 }
 
-// Consumed only by the external `tests/` crates. `src/lib.rs` and `src/main.rs`
-// both declare the full module tree, so in the BIN target this has no caller and
-// `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+// Consumed only by the external `tests/` crates.
 #[doc(hidden)]
 pub fn reset_read_only_rejection_observability_for_test() {
     READ_ONLY_REJECTION_WARN_LAST_MS.store(0, Ordering::Relaxed);
@@ -1508,8 +1507,7 @@ impl http_body::Body for GuardedAdminBody {
 /// [`serve_admin_io`] does and collect its body, so tests can observe what the
 /// wrapper does once hyper takes the document (issue #5276).
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) async fn collect_guarded_admin_response_for_test(
     response: Response<Full<Bytes>>,
 ) -> Bytes {
@@ -1524,8 +1522,7 @@ pub(crate) async fn collect_guarded_admin_response_for_test(
 /// Wrap an admin response as [`serve_admin_io`] does, then drop it without
 /// polling its body: a connection that went away before writing the response.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn drop_guarded_admin_response_unpolled_for_test(response: Response<Full<Bytes>>) {
     let guard = AdminActivityGuard::new(Arc::new(AdminConnActivity::new()));
     drop(GuardedAdminBody::wrap_response(response, guard));
@@ -2544,9 +2541,7 @@ fn namespace_serving_block(state: &AdminState) -> serde_json::Value {
 /// the wire; this constant is the spelling used in `openapi.yaml` and the docs.
 ///
 /// Consumed by the external `tests/` crates (spec parity and response
-/// assertions); `src/main.rs` declares the same module tree, so in the BIN
-/// target it has no caller and `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+/// assertions).
 pub const NAMESPACE_UNSERVED_HEADER: &str = "X-Ferrum-Namespace-Unserved";
 
 /// Lowercase wire form of [`NAMESPACE_UNSERVED_HEADER`].
@@ -2706,9 +2701,7 @@ fn note_unserved_namespace_mutation(marker: &UnservedNamespaceMutation) {
 }
 
 /// Reset the issue #5447 warning bookkeeping. Consumed only by the external
-/// `tests/` crates; `src/main.rs` declares the same module tree, so in the BIN
-/// target this has no caller and `-D warnings` would reject it as dead code.
-#[allow(dead_code)]
+/// `tests/` crates.
 #[doc(hidden)]
 pub fn reset_unserved_namespace_observability_for_test() {
     unserved_namespace_warned().clear();
@@ -2720,7 +2713,6 @@ pub fn reset_unserved_namespace_observability_for_test() {
 /// Process-cumulative count of accepted admin mutations that targeted a
 /// namespace this process's data plane does not serve. Test-only observation of
 /// [`note_unserved_namespace_mutation`].
-#[allow(dead_code)]
 #[doc(hidden)]
 pub fn unserved_namespace_mutation_count_for_test() -> u64 {
     UNSERVED_NAMESPACE_MUTATION_COUNT.load(Ordering::Relaxed)
@@ -2729,7 +2721,6 @@ pub fn unserved_namespace_mutation_count_for_test() -> u64 {
 /// How many `WARN` lines [`note_unserved_namespace_mutation`] actually emitted.
 /// In-process tests capture no gateway logs, so this counter is the observable
 /// proof that the `(namespace, resource kind)` deduplication holds.
-#[allow(dead_code)]
 #[doc(hidden)]
 pub fn unserved_namespace_warn_emitted_count_for_test() -> u64 {
     UNSERVED_NAMESPACE_WARN_EMITTED.load(Ordering::Relaxed)
@@ -3304,7 +3295,9 @@ async fn handle_admin_request_inner(
                     "status": "connected",
                     "type": db.db_type()
                 });
-                if let Some(stats) = db.pool_stats() {
+                // Pool stats are authenticated detail (issue #7216): built
+                // only for the detailed tier, never for an anonymous probe.
+                if detailed && let Some(stats) = db.pool_stats() {
                     db_info["pool"] = serde_json::to_value(&stats).unwrap_or_else(|_| json!(null));
                 }
                 health_status["database"] = db_info;
@@ -3326,7 +3319,10 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        if let Some(db) = &state.db {
+        // Failover topology and admission fences are authenticated detail and
+        // change neither `status` nor `ready`, so they are built only for the
+        // detailed tier (issue #7216).
+        if detailed && let Some(db) = &state.db {
             let topology = db.failover_topology_status();
             if !topology.primary_active {
                 let mut failover = json!({
@@ -3356,31 +3352,29 @@ async fn handle_admin_request_inner(
 
             // Process-local mTLS DNS admission fences (issue #7031). Present
             // only while at least one namespace is fenced; authenticated
-            // detail tier only, like `failover_topology`. Built only for the
-            // detailed tier: the snapshot walks the store's fence registry, so
-            // unauthenticated (minimal) and tenant probes must never pay for
-            // it. Does not change `status`/`ready`: reconnect/failover stay
-            // available and only the fenced namespaces' admissions fail closed.
-            if detailed {
-                let fence = db.mtls_dns_admission_fence_status();
-                if fence.fenced() {
-                    let mut fence_info = json!({
-                        "fenced": true,
-                        "retained_fences": fence.retained_fences,
-                        "namespaces": fence.namespaces,
-                    });
-                    if let Some(since) = fence.oldest_retained_since_unix_ms {
-                        fence_info["oldest_retained_since_unix_ms"] = json!(since);
+            // detail tier only, like `failover_topology`. The snapshot walks
+            // the store's fence registry, so unauthenticated (minimal) and
+            // tenant probes must never pay for it. Does not change
+            // `status`/`ready`: reconnect/failover stay available and only the
+            // fenced namespaces' admissions fail closed.
+            let fence = db.mtls_dns_admission_fence_status();
+            if fence.fenced() {
+                let mut fence_info = json!({
+                    "fenced": true,
+                    "retained_fences": fence.retained_fences,
+                    "namespaces": fence.namespaces,
+                });
+                if let Some(since) = fence.oldest_retained_since_unix_ms {
+                    fence_info["oldest_retained_since_unix_ms"] = json!(since);
+                }
+                match health_status.get_mut("database") {
+                    Some(serde_json::Value::Object(map)) => {
+                        map.insert("mtls_dns_admission_fence".to_string(), fence_info);
                     }
-                    match health_status.get_mut("database") {
-                        Some(serde_json::Value::Object(map)) => {
-                            map.insert("mtls_dns_admission_fence".to_string(), fence_info);
-                        }
-                        _ => {
-                            health_status["database"] = json!({
-                                "mtls_dns_admission_fence": fence_info
-                            });
-                        }
+                    _ => {
+                        health_status["database"] = json!({
+                            "mtls_dns_admission_fence": fence_info
+                        });
                     }
                 }
             }
@@ -3618,18 +3612,21 @@ async fn handle_admin_request_inner(
             health_status["status"] = json!("degraded");
         }
 
-        // Report cached config availability for resilience visibility
-        if let Some(config) = state.cached_gateway_config() {
-            health_status["cached_config"] = json!({
-                "available": true,
-                "loaded_at": config.loaded_at.to_rfc3339(),
-                "proxy_count": config.proxies.len(),
-                "consumer_count": config.consumers.len(),
-            });
-        } else {
-            health_status["cached_config"] = json!({
-                "available": false
-            });
+        // Report cached config availability for resilience visibility.
+        // Authenticated detail only (issue #7216): it never changes `status`.
+        if detailed {
+            if let Some(config) = state.cached_gateway_config() {
+                health_status["cached_config"] = json!({
+                    "available": true,
+                    "loaded_at": config.loaded_at.to_rfc3339(),
+                    "proxy_count": config.proxies.len(),
+                    "consumer_count": config.consumers.len(),
+                });
+            } else {
+                health_status["cached_config"] = json!({
+                    "available": false
+                });
+            }
         }
 
         if (state.mode == "database" || state.mode == "cp")
@@ -3640,40 +3637,48 @@ async fn handle_admin_request_inner(
             // reload-latency signal only: a disconnected or degraded watcher
             // never forces `status: degraded`, because periodic polling remains
             // authoritative and keeps applying committed changes.
-            let change_stream = snapshot.change_stream.clone();
-            if let Some(degraded) = snapshot.degraded {
+            //
+            // A degraded poll loop degrades the coarse `status` for every
+            // tier; the `database_polling` object itself is authenticated
+            // detail and is built only for the detailed tier (issue #7216).
+            if snapshot.degraded.is_some() {
                 health_status["status"] = json!("degraded");
-                let mut polling = json!({
-                    "status": "degraded",
-                    "reason": degraded.reason,
-                    "resource_category": degraded.resource_category,
-                    "validation_category": degraded.validation_category,
-                    "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
-                    "current_backoff_bucket": degraded.current_backoff_bucket,
-                    "current_backoff_seconds": degraded.current_backoff_seconds,
-                    "escalated": degraded.escalated,
-                });
-                if let Some(at) = snapshot.last_poll_completed_at {
-                    polling["last_poll_completed_at"] = json!(at);
-                }
-                health_status["database_polling"] = polling;
-            } else {
-                let mut polling = json!({
-                    "status": "ok",
-                    "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
-                    "current_backoff_bucket": snapshot.current_backoff_bucket,
-                    "current_backoff_seconds": snapshot.current_backoff_seconds,
-                });
-                if let Some(at) = snapshot.last_poll_completed_at {
-                    polling["last_poll_completed_at"] = json!(at);
-                }
-                health_status["database_polling"] = polling;
             }
-            if let Some(change_stream) = change_stream
-                && let Ok(value) = serde_json::to_value(&change_stream)
-                && let Some(polling) = health_status.get_mut("database_polling")
-            {
-                polling["change_stream"] = value;
+            if detailed {
+                let change_stream = snapshot.change_stream.clone();
+                if let Some(degraded) = snapshot.degraded {
+                    let mut polling = json!({
+                        "status": "degraded",
+                        "reason": degraded.reason,
+                        "resource_category": degraded.resource_category,
+                        "validation_category": degraded.validation_category,
+                        "consecutive_identical_rejections": degraded.consecutive_identical_rejections,
+                        "current_backoff_bucket": degraded.current_backoff_bucket,
+                        "current_backoff_seconds": degraded.current_backoff_seconds,
+                        "escalated": degraded.escalated,
+                    });
+                    if let Some(at) = snapshot.last_poll_completed_at {
+                        polling["last_poll_completed_at"] = json!(at);
+                    }
+                    health_status["database_polling"] = polling;
+                } else {
+                    let mut polling = json!({
+                        "status": "ok",
+                        "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
+                        "current_backoff_bucket": snapshot.current_backoff_bucket,
+                        "current_backoff_seconds": snapshot.current_backoff_seconds,
+                    });
+                    if let Some(at) = snapshot.last_poll_completed_at {
+                        polling["last_poll_completed_at"] = json!(at);
+                    }
+                    health_status["database_polling"] = polling;
+                }
+                if let Some(change_stream) = change_stream
+                    && let Ok(value) = serde_json::to_value(&change_stream)
+                    && let Some(polling) = health_status.get_mut("database_polling")
+                {
+                    polling["change_stream"] = value;
+                }
             }
         }
 
@@ -3712,11 +3717,14 @@ async fn handle_admin_request_inner(
             health_status["config_rejected"] = json!(true);
         }
 
-        if state
-            .proxy_state
-            .as_ref()
-            .is_some_and(|ps| ps.config.load_full().mesh.is_some())
-            || state.mode == "mesh"
+        // Mesh egress-scope / config-stream detail never changes `status`, so
+        // it is built only for the detailed tier (issue #7216).
+        if detailed
+            && (state
+                .proxy_state
+                .as_ref()
+                .is_some_and(|ps| ps.config.load().mesh.is_some())
+                || state.mode == "mesh")
         {
             let egress_health = state
                 .mesh_runtime_state
@@ -5548,10 +5556,13 @@ async fn handle_admin_request_inner(
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
-        // Live-apply cursor status (issue #4139). Operator-gated like the
-        // other convergence/status surfaces: it discloses only change-log
-        // sequence numbers and topology epochs — no resource data — and is
-        // how a `?apply=async` bulk client proves its writes are live. Not
+        // Live-apply cursor status (issue #4139). Operator-gated, as the role
+        // table in `docs/admin_api.md` lists it, unlike the read-only viewer
+        // introspection routes (`/cluster`, `/mesh/config-drift`,
+        // `/mesh/slice-drift`, `/mesh/federation`; issue #7216). It discloses
+        // only change-log sequence numbers and topology epochs — no resource
+        // data — and is how a `?apply=async` bulk client proves its writes are
+        // live. Not
         // namespace-scoped: cursors are process-topology values, not
         // tenant-addressed resources (writes to non-served namespaces never
         // mint one).
@@ -5982,7 +5993,7 @@ async fn handle_mesh_config_drift_get(
             let proto = ps.env_config.mesh_config_protocol.as_str();
             let cp_url = ps
                 .env_config
-                .resolved_dp_cp_grpc_urls()
+                .dp_cp_grpc_urls
                 .first()
                 .cloned()
                 .unwrap_or_default();
@@ -6547,58 +6558,49 @@ async fn ensure_credential_unique(
     }
 }
 
+/// Run the requested consumer credential uniqueness checks against one
+/// candidate snapshot and answer the first failing kind (mTLS, then HMAC,
+/// then JWT) with `409`, or `503` when the snapshot cannot be loaded.
+async fn ensure_consumer_credential_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+    checks: crud::ConsumerCredentialChecks,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::consumer_credential_candidate_errors(db, namespace, consumer, checks).await {
+        Ok(found) => {
+            for errors in [found.mtls, found.hmac, found.jwt] {
+                if !errors.is_empty() {
+                    return Err(Box::new(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": errors.join("; ")}),
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn ensure_mtls_consumer_candidate(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
 ) -> Result<(), Box<Response<Full<Bytes>>>> {
-    match crud::mtls_consumer_candidate_errors(db, namespace, consumer).await {
-        Ok(errors) if errors.is_empty() => Ok(()),
-        Ok(errors) => Err(Box::new(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": errors.join("; ")}),
-        ))),
-        Err(error) => Err(Box::new(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &db_error_response(&error),
-        ))),
-    }
-}
-
-async fn ensure_hmac_consumer_candidate(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> Result<(), Box<Response<Full<Bytes>>>> {
-    match crud::hmac_consumer_candidate_errors(db, namespace, consumer).await {
-        Ok(errors) if errors.is_empty() => Ok(()),
-        Ok(errors) => Err(Box::new(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": errors.join("; ")}),
-        ))),
-        Err(error) => Err(Box::new(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &db_error_response(&error),
-        ))),
-    }
-}
-
-async fn ensure_jwt_consumer_candidate(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    consumer: &Consumer,
-) -> Result<(), Box<Response<Full<Bytes>>>> {
-    match crud::jwt_consumer_candidate_errors(db, namespace, consumer).await {
-        Ok(errors) if errors.is_empty() => Ok(()),
-        Ok(errors) => Err(Box::new(json_response(
-            StatusCode::CONFLICT,
-            &json!({"error": errors.join("; ")}),
-        ))),
-        Err(error) => Err(Box::new(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &db_error_response(&error),
-        ))),
-    }
+    ensure_consumer_credential_candidate(
+        db,
+        namespace,
+        consumer,
+        crud::ConsumerCredentialChecks {
+            mtls: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn persist_consumer_update(
@@ -6614,17 +6616,21 @@ async fn persist_consumer_update(
     // its credential index entries. Revalidate retained HMAC credentials even
     // when the requested mutation targets another credential type, so stale or
     // out-of-band duplicates fail before the datastore uniqueness backstop.
-    if !consumer.credential_entries("hmac_auth").is_empty()
-        && let Err(response) =
-            ensure_hmac_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
-    {
-        return *response;
-    }
     // Same for retained `jwt` secrets: a secret shared with another Consumer
-    // in the namespace lets either sign as the other.
-    if !consumer.credential_entries("jwt").is_empty()
-        && let Err(response) =
-            ensure_jwt_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
+    // in the namespace lets either sign as the other. Both checks share one
+    // candidate snapshot.
+    let retained_checks = crud::ConsumerCredentialChecks {
+        mtls: false,
+        hmac: !consumer.credential_entries("hmac_auth").is_empty(),
+        jwt: !consumer.credential_entries("jwt").is_empty(),
+    };
+    if let Err(response) = ensure_consumer_credential_candidate(
+        db.as_ref(),
+        &consumer.namespace,
+        &consumer,
+        retained_checks,
+    )
+    .await
     {
         return *response;
     }
@@ -6921,13 +6927,11 @@ impl MtlsDnsAdmissionHoldState {
     }
 
     // External tests reach these through the lib target's `_test_support`
-    // shim; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
+    // shim.
     pub(crate) fn mark_restore_cleared_for_test(&self) {
         self.set_restore_phase(MtlsDnsRestorePhase::Cleared);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn mark_restore_import_failed_for_test(&self) {
         self.set_restore_phase(MtlsDnsRestorePhase::ImportedWithErrors);
     }
@@ -7148,9 +7152,7 @@ pub(crate) fn mtls_dns_admission_unavailable_response() -> Response<Full<Bytes>>
     response
 }
 
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
     mutation_started: bool,
     outcome_settled: bool,
@@ -7170,9 +7172,7 @@ pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
 /// errors), the namespace lease reacquisition is cancelled while it waits
 /// behind another holder, and the request drops the restore guard it kept
 /// across that reacquisition. Returns the abandoned guard owner.
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 pub(crate) async fn abandon_restore_lost_lease_recovery_for_test(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,
@@ -7846,9 +7846,7 @@ fn intervening_clear_recovery_candidate(
 }
 
 #[doc(hidden)]
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 pub(crate) fn intervening_clear_recovery_candidate_for_test(
     snapshot: GatewayConfig,
     current: GatewayConfig,
@@ -8095,9 +8093,7 @@ fn plan_additive_rollback_api_specs(
 /// Test view of [`plan_additive_rollback_api_specs`]: the replayed spec ids, the
 /// skipped/cleared counts, and each replayed proxy's surviving ownership tag.
 #[doc(hidden)]
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this module without that caller.
-#[allow(dead_code)]
+// External tests reach this through the lib target's `_test_support` shim.
 #[allow(clippy::type_complexity)]
 pub(crate) fn plan_additive_rollback_api_specs_for_test(
     snapshot: GatewayConfig,
@@ -9230,8 +9226,7 @@ fn batch_ref_faults() -> std::sync::MutexGuard<'static, BatchRefFaultMap> {
 /// same parse the handler runs before any deletion, not the later semantic
 /// validation.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), serde_json::Error> {
     crate::util::json_object::from_json_object_slice::<RestorePayload>(body).map(|_| ())
 }
@@ -9241,8 +9236,7 @@ pub(crate) fn restore_envelope_admission_for_test(body: &[u8]) -> Result<(), ser
 /// Same object-only parse `POST /batch` maps to `400` with
 /// `{"error": "Invalid JSON body: …"}` — the restore envelope's error shape.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
     crate::util::json_object::from_json_object_slice::<BatchCreateRequest>(body).is_ok()
 }
@@ -9253,7 +9247,6 @@ pub(crate) fn batch_envelope_admits_for_test(body: &[u8]) -> bool {
 /// Test-only support for [`restore_envelope_field_names_for_test`] and
 /// [`batch_envelope_field_names_for_test`]; nothing in the serving paths
 /// constructs one.
-#[allow(dead_code)]
 #[derive(Default)]
 struct RestoreFieldNameCollector {
     fields: Vec<String>,
@@ -9300,8 +9293,7 @@ impl<'de> serde::Deserializer<'de> for &mut RestoreFieldNameCollector {
 /// `RestoreRequest.properties`, so adding a Rust member fails that test until
 /// the published schema describes it.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn restore_envelope_field_names_for_test() -> Vec<String> {
     serde_struct_field_names::<RestorePayload>()
 }
@@ -9313,13 +9305,11 @@ pub(crate) fn restore_envelope_field_names_for_test() -> Vec<String> {
 /// [`restore_envelope_field_names_for_test`] uses. The OpenAPI contract test
 /// asserts set-equality against `BatchCreateRequest.properties`.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn batch_envelope_field_names_for_test() -> Vec<String> {
     serde_struct_field_names::<BatchCreateRequest>()
 }
 
-#[allow(dead_code)]
 fn serde_struct_field_names<T>() -> Vec<String>
 where
     T: for<'de> Deserialize<'de>,
@@ -9335,8 +9325,7 @@ where
 /// for `namespace`. Keyed per namespace so tests sharing a process cannot
 /// perturb each other. Always clear the fault when the test finishes.
 ///
-/// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
+/// Reached through `_test_support`.
 pub(crate) fn set_batch_reference_check_fault(namespace: &str, detail: Option<&str>) {
     let mut faults = batch_ref_faults();
     match detail {
@@ -9958,49 +9947,60 @@ async fn handle_batch_create(
         .collect();
 
     for proxy in &batch.proxies {
-        if let Some(upstream_id) = proxy.upstream_id.as_deref()
-            && !batch_upstream_ids.contains(upstream_id)
-        {
-            match batch_reference_lookup(
-                namespace,
-                db.check_upstream_exists(upstream_id, namespace).await,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Upstream reads are namespace-predicated (issue #2122
-                    // DB-M1): an upstream in another namespace reports as
-                    // missing, so cross-namespace references are rejected
-                    // without disclosing other tenants' resources.
-                    validation_errors.push(format!(
-                        "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
-                        proxy.id, upstream_id, namespace
-                    ));
+        // One namespace-predicated read of a persisted upstream serves the
+        // existence, API-spec ownership and subset checks below.
+        let persisted_upstream = match proxy.upstream_id.as_deref() {
+            Some(upstream_id) if !batch_upstream_ids.contains(upstream_id) => {
+                match batch_reference_lookup(
+                    namespace,
+                    db.get_upstream(namespace, upstream_id).await,
+                ) {
+                    Ok(Some(upstream)) => Some(upstream),
+                    Ok(None) => {
+                        // Upstream reads are namespace-predicated (issue #2122
+                        // DB-M1): an upstream in another namespace reports as
+                        // missing, so cross-namespace references are rejected
+                        // without disclosing other tenants' resources.
+                        validation_errors.push(format!(
+                            "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
+                            proxy.id, upstream_id, namespace
+                        ));
+                        None
+                    }
+                    Err(response) => return Ok(response),
                 }
-                Err(response) => return Ok(response),
             }
+            _ => None,
+        };
+        // Same ownership rule as single-resource proxy admission (issue
+        // #7214): a spec-owned upstream may only back a proxy of the same
+        // spec. Batch strips `api_spec_id` from every submitted resource, so
+        // a batch proxy is never spec-owned and batch upstreams never are.
+        if let (Some(upstream_id), Some(owner_spec_id)) = (
+            proxy.upstream_id.as_deref(),
+            persisted_upstream
+                .as_ref()
+                .and_then(|upstream| upstream.api_spec_id.as_deref()),
+        ) {
+            validation_errors.push(format!(
+                "Proxy '{}' references upstream_id '{}' that is owned by api_spec '{}'; create a hand-managed upstream or update the owning API spec",
+                proxy.id, upstream_id, owner_spec_id
+            ));
         }
         if let (Some(upstream_id), Some(subset_name)) = (
             proxy.upstream_id.as_deref(),
             proxy.upstream_subset.as_deref(),
         ) {
-            let subset_exists = if let Some(upstream) = batch_upstreams.get(upstream_id) {
-                upstream
-                    .subsets
-                    .as_ref()
-                    .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
-            } else {
-                match batch_reference_lookup(
-                    namespace,
-                    db.get_upstream(namespace, upstream_id).await,
-                ) {
-                    Ok(Some(upstream)) => upstream
+            let subset_exists = batch_upstreams
+                .get(upstream_id)
+                .copied()
+                .or(persisted_upstream.as_ref())
+                .is_some_and(|upstream| {
+                    upstream
                         .subsets
                         .as_ref()
-                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name)),
-                    Ok(None) => false,
-                    Err(response) => return Ok(response),
-                }
-            };
+                        .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
+                });
             if !subset_exists {
                 validation_errors.push(format!(
                     "Proxy '{}' references upstream_subset '{}' that is not defined on upstream_id '{}'",
@@ -10078,6 +10078,48 @@ async fn handle_batch_create(
                     ));
                 }
                 Err(response) => return Ok(response),
+            }
+        }
+
+        // Single-resource `openapi_validator` precondition (issue #7214): the
+        // target proxy must carry an attached API spec. A proxy created by
+        // this batch never can (batch strips `api_spec_id`), so only a
+        // persisted target can satisfy it.
+        if plugin_config.plugin_name == "openapi_validator" {
+            if plugin_config.scope != PluginScope::Proxy {
+                validation_errors.push(format!(
+                    "PluginConfig '{}': openapi_validator requires scope 'proxy'",
+                    plugin_config.id
+                ));
+            } else {
+                match plugin_config.proxy_id.as_deref() {
+                    None => validation_errors.push(format!(
+                        "PluginConfig '{}': openapi_validator requires proxy_id",
+                        plugin_config.id
+                    )),
+                    Some(proxy_id) if batch_proxy_ids.contains(proxy_id) => {
+                        validation_errors.push(format!(
+                            "PluginConfig '{}': openapi_validator requires a proxy with an attached api_spec; proxy '{}' is created by this batch and cannot carry one",
+                            plugin_config.id, proxy_id
+                        ));
+                    }
+                    Some(proxy_id) => {
+                        match batch_reference_lookup(
+                            namespace,
+                            db.get_proxy(namespace, proxy_id).await,
+                        ) {
+                            Ok(Some(proxy)) if proxy.api_spec_id.is_none() => {
+                                validation_errors.push(format!(
+                                    "PluginConfig '{}': openapi_validator requires a proxy with an attached api_spec",
+                                    plugin_config.id
+                                ));
+                            }
+                            // A missing proxy is already reported above.
+                            Ok(_) => {}
+                            Err(response) => return Ok(response),
+                        }
+                    }
+                }
             }
         }
 

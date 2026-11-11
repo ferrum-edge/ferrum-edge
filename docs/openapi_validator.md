@@ -47,7 +47,7 @@ paths:
                     type: boolean
 ```
 
-The importer generates a proxy-scoped `openapi_validator` plugin, resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
+The importer generates a proxy-scoped `openapi_validator` plugin from the `get`, `put`, `post`, `delete`, `options`, `head`, `patch`, and `trace` operations (a document declaring the OpenAPI 3.2 `query` operation or `additionalOperations` is refused at import with HTTP 422 `UnsupportedOperationField`), resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
 This example validates `POST /orders`: the Paths key `/` is mounted under `listen_path: /orders`, and the Paths-key root yields the listen prefix itself.
 
@@ -211,7 +211,7 @@ The generated plugin config has this shape:
 | `error_response.response_status_code` | `502` | Status for blocked response validation errors. |
 | `error_response.unsupported_media_type_status_code` | `415` | Status for a nonempty request body that no media entry declared for the matched operation covers, including a body sent with no `Content-Type`. Separate from `request_status_code` so remapping schema failures does not also remap media-type refusals. |
 | `error_response.content_type` | `application/problem+json` | Content type for generated error bodies. |
-| `error_truncate_chars` | `1024` | Size bound for diagnostics; the effective cap is `min(error_truncate_chars, 256)`. See [Diagnostic confidentiality](#diagnostic-confidentiality). |
+| `error_truncate_chars` | `256` | Size bound for diagnostics; the effective cap is `min(error_truncate_chars, 256)`. See [Diagnostic confidentiality](#diagnostic-confidentiality). |
 
 ### Strict config admission
 

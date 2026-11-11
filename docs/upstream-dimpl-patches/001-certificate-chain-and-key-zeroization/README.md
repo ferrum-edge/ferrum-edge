@@ -10,14 +10,14 @@
 | Registry checksum | `ef7eed0cf766b110880acdd89a860061dee42ed5f64df0fa43c80203e4f60916` |
 | Upstream source commit | [`37bb0fa83f4167420729de5ea71c61852f82e9ed`](https://github.com/algesten/dimpl/commit/37bb0fa83f4167420729de5ea71c61852f82e9ed) |
 | License | MIT OR Apache-2.0 (both license files are retained in the vendor directory) |
-| Latest upstream audited | 0.7.2 (`ba6aa42b0c64c3e5311a2afad224b32db1ee129d21c63daaaf8ea747b846cdbc`) |
+| Latest upstream audited | 0.9.0 (`b2c7b707106416bb46237cf25b702975015079fc5fa8791232b639bc4619c2de`), re-audited 2026-11-10 with 0.8.0 (`df69b372e2de9011f8c22a58d1b5f5afa1752041bc5c0ae6b8a126aadaea5ed2`); see [Upstream re-audit](#upstream-re-audit) |
 | State | Applied through `vendor/dimpl-0.6.1-ferrum-patched` and `[patch.crates-io]` |
 | Upstream issue / PR | Deliberate fork — unfiled; governed by the [fork policy](../../dependency-policy.md#deliberate-fork-policy-and-sla) |
 | Owner | `@jeremyjpj0916` |
 
 ## Why the patch is required
 
-Published `dimpl` versions through 0.7.2 accept one local DER certificate and
+Published `dimpl` versions through 0.9.0 accept one local DER certificate and
 serialize only that certificate in DTLS 1.2 and 1.3. A configured
 leaf/intermediate bundle is therefore silently reduced to its leaf before the
 dependency sees it, and a peer that trusts only the root cannot build a path.
@@ -113,6 +113,33 @@ constructor and in each constructor's "Panics" section. Ferrum's loader
 (`src/dtls/mod.rs`) satisfies the prerequisite: it parses the key with the
 build-selected signing provider and with dimpl's key provider before
 returning a chain, so no Ferrum loader path reaches the constructor panic.
+
+## Upstream re-audit
+
+Re-audited 2026-11-10 against the retirement trigger (full-chain DTLS 1.2/1.3
+transport, peer-chain output, and drop-time key zeroization on every ownership
+path) for registry 0.8.0, which Ferrum already resolves as the `strict_dimpl`
+dev-dependency (`Cargo.lock` checksum
+`df69b372e2de9011f8c22a58d1b5f5afa1752041bc5c0ae6b8a126aadaea5ed2`), and for
+0.9.0, the newest upstream tag at the time
+(`b2c7b707106416bb46237cf25b702975015079fc5fa8791232b639bc4619c2de`).
+Neither meets it, so the fork stays:
+
+- **Chain transport: no.** `DtlsCertificate` is still
+  `{ certificate: Vec<u8>, private_key: Vec<u8> }` (`src/lib.rs`), one DER
+  certificate. DTLS 1.2 `get_client_certificate` (`src/dtls12/context.rs`)
+  pushes exactly one `Asn1Cert`, and the DTLS 1.3
+  `handshake_create_certificate` (`src/dtls13/client.rs`, and the server's
+  Certificate message) serializes a one-entry `certificate_list`.
+- **Key zeroization: no.** The private key is still a plain `Vec<u8>` that
+  `#[derive(Clone)]` copies; neither release depends on `zeroize` or clears
+  key bytes on drop.
+- **Peer-chain output:** both releases parse the peer's whole
+  `certificate_list`, but the local-chain and key-clearing gaps above already
+  fail the trigger.
+
+Re-audit when a release changes `DtlsCertificate` or the Certificate
+serializers.
 
 ## Provenance and audit artifacts
 

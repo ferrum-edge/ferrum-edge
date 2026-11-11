@@ -10,8 +10,8 @@ use super::plugin_utils::{create_test_context, normalize_compressed_request_for_
 ///
 /// This is the single process-wide lock, not a file-private one. These tests
 /// write `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION`, which
-/// the AWS secret-backend tests in `unit::secrets::aws_tests` read through the
-/// SDK's credential chain, so the two suites must serialize against each other.
+/// any other env-reading test in the binary could observe, so every suite that
+/// touches the process environment must serialize against this one.
 /// The guard also restores every variable it saved, so a fixture value — or a
 /// panicking assertion — cannot leak into a later test in the binary.
 use crate::unit::env_lock::EnvGuard;
@@ -292,7 +292,13 @@ fn test_unknown_fields_are_rejected_deterministically() {
         }),
         default_client(),
     ));
-    assert!(err.contains("forwad_body, z_future_field"), "got: {err}");
+    // Sorted, each qualified with its path, in one diagnostic.
+    assert!(
+        err.contains(
+            "\"config.forwad_body\" (did you mean `forward_body`?), \"config.z_future_field\""
+        ),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -6254,12 +6260,13 @@ fn sigv4_authorization_for(url: &str) -> String {
 #[parallel(serverless_env)]
 fn test_aws_sigv4_canonical_host_includes_a_nondefault_port() {
     use ferrum_edge::plugins::utils::aws_sigv4;
+    use ferrum_edge::plugins::utils::cert_hash::sha256_hex_lower;
 
     let authorization = sigv4_authorization_for(
         "http://127.0.0.1:59816/2015-03-31/functions/strict/invocations?Qualifier=%24LATEST",
     );
 
-    let payload_hash = aws_sigv4::sha256_hex(b"{}");
+    let payload_hash = sha256_hex_lower(b"{}");
     let canonical_headers = format!(
         "content-type:application/json\nhost:127.0.0.1:59816\nx-amz-content-sha256:{payload_hash}\nx-amz-date:20240115T120000Z\n"
     );
@@ -6268,7 +6275,7 @@ fn test_aws_sigv4_canonical_host_includes_a_nondefault_port() {
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n20240115T120000Z\n20240115/us-east-1/lambda/aws4_request\n{}",
-        aws_sigv4::sha256_hex(canonical_request.as_bytes())
+        sha256_hex_lower(canonical_request.as_bytes())
     );
     let signing_key = aws_sigv4::derive_signing_key(
         "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -6314,10 +6321,11 @@ fn test_aws_sigv4_canonical_host_omits_scheme_default_ports() {
 #[parallel(serverless_env)]
 fn test_aws_sigv4_canonical_host_brackets_ipv6_literals() {
     use ferrum_edge::plugins::utils::aws_sigv4;
+    use ferrum_edge::plugins::utils::cert_hash::sha256_hex_lower;
 
     let authorization =
         sigv4_authorization_for("http://[2001:db8::30]:4566/2015-03-31/f/invocations");
-    let payload_hash = aws_sigv4::sha256_hex(b"{}");
+    let payload_hash = sha256_hex_lower(b"{}");
     let canonical_headers = format!(
         "content-type:application/json\nhost:[2001:db8::30]:4566\nx-amz-content-sha256:{payload_hash}\nx-amz-date:20240115T120000Z\n"
     );
@@ -6326,7 +6334,7 @@ fn test_aws_sigv4_canonical_host_brackets_ipv6_literals() {
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n20240115T120000Z\n20240115/us-east-1/lambda/aws4_request\n{}",
-        aws_sigv4::sha256_hex(canonical_request.as_bytes())
+        sha256_hex_lower(canonical_request.as_bytes())
     );
     let signing_key = aws_sigv4::derive_signing_key(
         "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
@@ -6976,13 +6984,13 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         ),
         (
             json!({token: true}),
-            "serverless_function",
-            "unknown configuration field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"provider": null, token: null}),
-            "serverless_function",
-            "unknown configuration field",
+            "`config`",
+            "unknown configuration key(s)",
         ),
         (
             json!({"provider": token}),

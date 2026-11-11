@@ -19,7 +19,7 @@
 //!   receiving.
 //! - **Does NOT model**: per-direction TCP window stalls, kernel
 //!   `SO_SNDBUF` pressure, or traffic shapers with burst tolerance.
-//!   Those belong in a Phase-7 scenario catalog.
+//!   Model those inline in the test that needs them.
 
 use pin_project_lite::pin_project;
 use std::future::Future;

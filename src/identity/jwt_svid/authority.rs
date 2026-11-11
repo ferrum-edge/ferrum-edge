@@ -587,22 +587,14 @@ impl LocalJwtAuthority {
     }
 
     /// Whether this authority's active key was generated in-process rather than
-    /// loaded from configured material.
+    /// loaded from configured material. It discloses nothing about the key
+    /// itself.
     ///
-    /// Callers use this to refuse a posture that needs restart/HA continuity;
-    /// it discloses nothing about the key itself.
+    /// Only an **ephemeral** (dev/test) authority may generate a replacement
+    /// signing key in process ([`Self::rotate`]). Operator-configured material
+    /// is rotated externally, because an unpersisted random replacement would
+    /// diverge across replicas and be lost on restart — see the module docs.
     pub fn uses_ephemeral_key(&self) -> bool {
-        self.ephemeral_key
-    }
-
-    /// Whether this authority may generate a replacement signing key in
-    /// process.
-    ///
-    /// True only for an **ephemeral** (dev/test) authority. Operator-configured
-    /// material is rotated externally, because an unpersisted random
-    /// replacement would diverge across replicas and be lost on restart — see
-    /// the module docs.
-    pub fn allows_in_process_rotation(&self) -> bool {
         self.ephemeral_key
     }
 

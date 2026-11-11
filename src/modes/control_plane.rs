@@ -51,6 +51,7 @@ use crate::grpc::mesh_server::MeshGrpcServer;
 use crate::k8s_controller::{
     CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
 };
+use crate::modes::FullReloadReason;
 use crate::modes::file::ListenerJoinHandle;
 use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::startup_security;
@@ -1326,11 +1327,7 @@ async fn load_full_config_multi_with_sequence(
 
 /// External-test view of CP full-load sequencing without exposing the
 /// credential-bearing internal outcome type.
-///
-/// `#[allow(dead_code)]` because integration tests exercise this seam; the
-/// binary target does not construct it, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub struct CpFullLoadSequenceOutcomeForTest {
     pub config: GatewayConfig,
     pub sequences: HashMap<String, u64>,
@@ -1341,11 +1338,7 @@ pub struct CpFullLoadSequenceOutcomeForTest {
 /// Exercise the production full-load boundary orchestration from external
 /// integration tests with a scripted [`CpFullLoadSource`]. Runs at the
 /// maximum per-phase budget (the default SQL pool's and MongoDB's).
-///
-/// `#[allow(dead_code)]` because only external integration tests call this;
-/// the binary target does not, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn load_full_config_multi_with_sequence_for_test(
     db: &(impl CpFullLoadSource + ?Sized),
     namespaces: &[String],
@@ -1375,10 +1368,7 @@ pub async fn load_full_config_multi_with_sequence_for_test(
 /// External-test view of the CP multi-namespace incremental poll.
 ///
 /// Not `Debug`: `IncrementalResult` carries consumer credentials.
-/// `#[allow(dead_code)]` because only external integration tests construct
-/// it; the binary target does not, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub struct CpIncrementalMultiLoadOutcomeForTest {
     pub result: IncrementalResult,
     pub next_sequences: HashMap<String, u64>,
@@ -1387,11 +1377,7 @@ pub struct CpIncrementalMultiLoadOutcomeForTest {
 
 /// Exercise the production multi-namespace incremental poll from external
 /// integration tests with a scripted [`CpIncrementalLoadSource`].
-///
-/// `#[allow(dead_code)]` because only external integration tests call this;
-/// the binary target does not, and clippy runs with `-D warnings`.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub async fn load_incremental_config_multi_for_test(
     db: &(impl CpIncrementalLoadSource + ?Sized),
     namespaces: &[String],
@@ -2421,23 +2407,10 @@ pub async fn run(
             })?;
             // Warn (not fail) on a served namespace no credential can reach:
             // it is a real rollout gap, but refusing to start would make adding
-            // a tenant a two-step outage.
+            // a tenant a two-step outage. The reload worker repeats the same
+            // check on every accepted change.
             if let Some(namespaces) = cp_scope.explicit_namespaces() {
-                let bound = bundle.bound_namespaces();
-                let unreachable: Vec<&str> = namespaces
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|namespace| !bound.contains(namespace))
-                    .collect();
-                if !unreachable.is_empty() {
-                    warn!(
-                        "CP/DP trust bundle binds no verification credential to {} served \
-                         namespace(s): [{}]. Data planes in those namespaces cannot subscribe \
-                         until a credential is bound to them.",
-                        unreachable.len(),
-                        sanitize_startup_scalar(unreachable.join(", "))
-                    );
-                }
+                crate::grpc::cp_trust::warn_unbound_served_namespaces(&bundle, &namespaces);
             }
             // The legacy secret stays optional here: with a trust bundle
             // configured it is no longer an authorization input, and CP mode
@@ -2531,7 +2504,7 @@ pub async fn run(
             path,
             env_config.cp_dp_grpc_jwt_secret.clone(),
             cp_dp_verifier.clone(),
-            cp_scope.requires_namespace_claim_by_default(),
+            cp_scope.explicit_namespaces(),
             trust_reload_interval,
             trust_status,
             shutdown_tx.subscribe(),
@@ -2695,6 +2668,13 @@ pub async fn run(
     // for a later mutation to lazily spawn the worker. A process that receives
     // no new mutations still has to drain the backlog it inherited.
     crate::admin::audit::start_delivery(env_config.admin_audit_enabled, db.clone());
+    // Age retention must also reach namespaces that stop receiving audit
+    // events; insert-path pruning alone never revisits them.
+    let audit_retention_sweep_handle = crate::admin::audit::start_retention_sweep(
+        env_config.audit_retention_days,
+        db.clone(),
+        shutdown_tx.subscribe(),
+    );
 
     let admin_state = AdminState {
         db: Some(db.clone()),
@@ -2734,7 +2714,6 @@ pub async fn run(
             crate::admin::api_specs::DefaultExternalDocumentLoader {
                 egress: env_config.backend_allow_ips.clone(),
                 dns_cache: None,
-                fixtures: std::collections::HashMap::new(),
             },
         ),
         runtime_config_apply: None,
@@ -3344,7 +3323,7 @@ pub async fn run(
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
         let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
             Arc::new(tokio::sync::Mutex::new(None));
-        let mut force_full_reload = false;
+        let mut force_full_reload: Option<FullReloadReason> = None;
         let mut last_polled_namespaces = initial_polled_namespaces;
         let mut rejected_delta_tracker =
             CpRejectedDeltaTracker::new(rejected_delta_full_reload_threshold);
@@ -3381,7 +3360,8 @@ pub async fn run(
                             match db_poll.reconnect(&db_url_for_reconnect).await {
                                 Ok(_) => {
                                     last_db_ips = Some(ips);
-                                    force_full_reload = true;
+                                    force_full_reload =
+                                        Some(FullReloadReason::DnsReconnect);
                                     plugin_migrations_need_reconcile = true;
                                     db_available_poll.store(false, Ordering::Relaxed);
                                 }
@@ -3444,7 +3424,7 @@ pub async fn run(
                     // path in THIS tick rather than the next, and it is skipped
                     // when a full reload is already pending because that reload
                     // republishes trust anyway.
-                    if !force_full_reload {
+                    if force_full_reload.is_none() {
                         let trust_drifted = detect_gateway_trust_drift(
                             db_poll.as_ref(),
                             &nslist,
@@ -3452,11 +3432,12 @@ pub async fn run(
                         )
                         .await;
                         if !trust_drifted.is_empty() {
-                            force_full_reload = true;
+                            force_full_reload =
+                                Some(FullReloadReason::GatewayTrustDrift);
                         }
                     }
 
-                    if force_full_reload {
+                    if let Some(full_reload_reason) = force_full_reload {
                         match load_full_config_multi_with_sequence(
                             db_poll.as_ref(),
                             &nslist,
@@ -3474,7 +3455,7 @@ pub async fn run(
                                     &db_available_poll,
                                     poll_auto_apply_plugin_migrations,
                                     &mut plugin_migrations_need_reconcile,
-                                    "DB DNS reconnect",
+                                    full_reload_reason.migration_gate_context(),
                                 )
                                 .await
                                 {
@@ -3486,7 +3467,7 @@ pub async fn run(
                                     sequences,
                                 );
                                 last_polled_namespaces = nslist.clone();
-                                force_full_reload = false;
+                                force_full_reload = None;
                                 rejected_delta_tracker.record_accepted();
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 publish_cp_full_reload(
@@ -3512,10 +3493,13 @@ pub async fn run(
                                     &config_rejected_poll,
                                     &outcome.rejected_namespaces,
                                     &outcome.failed_namespaces,
-                                    "full reload after DB DNS reconnect",
+                                    full_reload_reason.reload_context(),
                                 )
                                 .await;
-                                debug!("Full config reload complete after DB DNS reconnect");
+                                debug!(
+                                    reason = full_reload_reason.as_label(),
+                                    "Full config reload complete"
+                                );
                             }
                             Err(e) => {
                                 if crate::modes::is_poll_validation_rejection(&e) {
@@ -3524,7 +3508,7 @@ pub async fn run(
                                         &db_available_poll,
                                         poll_auto_apply_plugin_migrations,
                                         &mut plugin_migrations_need_reconcile,
-                                        "validation-rejected full load after DB DNS reconnect",
+                                        full_reload_reason.rejected_load_context(),
                                     )
                                     .await
                                     {
@@ -3540,7 +3524,7 @@ pub async fn run(
                                         &db_available_poll,
                                         &config_rejected_poll,
                                         &e,
-                                        "full reload after DB DNS reconnect",
+                                        full_reload_reason.reload_context(),
                                     )
                                     .await;
                                     database_delta_poll_metrics_for_poll.record_poll_failure(
@@ -3548,7 +3532,8 @@ pub async fn run(
                                     );
                                 } else {
                                     error!(
-                                        "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying"
+                                        reason = full_reload_reason.as_label(),
+                                        "Authoritative primary full config reload failed; keeping existing config and retrying"
                                     );
                                     database_delta_poll_metrics_for_poll
                                         .record_config_source_unavailable(
@@ -3633,7 +3618,7 @@ pub async fn run(
                                     // `config_rejected` stuck with the tracker
                                     // reset and no escalation path.
                                     if config_rejected_poll.load(Ordering::Relaxed) {
-                                        force_full_reload = true;
+                                        force_full_reload = Some(FullReloadReason::StandingRejection);
                                     }
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
@@ -3901,7 +3886,7 @@ pub async fn run(
                                     // full reload the standing signal would
                                     // never clear.
                                     if config_rejected_poll.load(Ordering::Relaxed) {
-                                        force_full_reload = true;
+                                        force_full_reload = Some(FullReloadReason::StandingRejection);
                                     }
                                 }
                             }
@@ -4305,6 +4290,9 @@ pub async fn run(
     if let Some(handle) = db_tls_reload_handle {
         background_handles.push(handle);
     }
+    if let Some(handle) = audit_retention_sweep_handle {
+        background_handles.push(handle);
+    }
     if let Some(handle) = trust_bundle_reload_handle {
         background_handles.push(handle);
     }
@@ -4688,7 +4676,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,
@@ -5065,8 +5052,8 @@ mod tests {
             "both DNS pool reconnect and failover must reset the migration gate"
         );
         for context in [
-            "DB DNS reconnect",
-            "validation-rejected full load after DB DNS reconnect",
+            "full_reload_reason.migration_gate_context()",
+            "full_reload_reason.rejected_load_context()",
             "incremental load after pool reconnect",
             "full fallback load after pool reconnect",
             "validation-rejected full fallback load after pool reconnect",
@@ -5165,7 +5152,7 @@ mod tests {
         // reload rather than clearing the rejection tracker and leaving the
         // standing signal permanently stuck.
         let source = include_str!("control_plane.rs");
-        let marker = "if config_rejected_poll.load(Ordering::Relaxed) {\n                                        force_full_reload = true;";
+        let marker = "if config_rejected_poll.load(Ordering::Relaxed) {\n                                        force_full_reload = Some(FullReloadReason::StandingRejection);";
         assert!(
             source.matches(marker).count() >= 2,
             "empty-result and all-accepted incremental paths must force a full \

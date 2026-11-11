@@ -170,7 +170,8 @@
       },
       "regression_tests": [
         "tests/integration/connection_pool_tests.rs::test_connect_timeout_does_not_fragment_pool",
-        "tests/integration/connection_pool_tests.rs::test_pooled_client_exposes_per_request_connect_timeout"
+        "tests/integration/connection_pool_tests.rs::test_pooled_client_exposes_per_request_connect_timeout",
+        "tests/integration/connection_pool_tests.rs::test_per_request_connect_timeout_bounds_each_resolved_address"
       ]
     },
     {
@@ -716,7 +717,8 @@
         }
       },
       "regression_tests": [
-        "vendor/tokio-tungstenite-0.29.0-ferrum-patched (fragment accounting delegator)"
+        "tests/unit/gateway_core/websocket_fragment_metering_tests.rs::async_delegator_meters_fragments_through_split_stream",
+        "tests/unit/gateway_core/websocket_fragment_metering_tests.rs::async_delegator_forwards_incomplete_message_frame_bound"
       ]
     },
     {
@@ -741,8 +743,8 @@
         "trigger": "Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths.",
         "co_retirement_group": null,
         "compatible_release_test": {
-          "status": "not_started",
-          "notes": null
+          "status": "failed",
+          "notes": "Reviewed 2026-11-10: registry dimpl 0.8.0 (already resolved as the strict_dimpl dev-dependency) and 0.9.0 (newest upstream tag) still take one DER certificate in DtlsCertificate, serialize a one-entry certificate_list in DTLS 1.2 and 1.3, and keep the private key in a cloneable plain Vec<u8> with no zeroization. The retirement trigger is not met; see the patch README's Upstream re-audit section."
         }
       },
       "regression_tests": [

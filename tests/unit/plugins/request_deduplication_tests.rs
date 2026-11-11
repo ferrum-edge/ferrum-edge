@@ -3,6 +3,7 @@ use bytes::Bytes;
 use ferrum_edge::_test_support::{
     finalize_plugin_rejection_for_test, finalize_plugin_rejection_without_committed_hooks_for_test,
     finalized_response_replay_for_test, mark_query_credential_for_test,
+    request_deduplication_completed_redis_record_for_test,
     request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_execution_barriers_for_test,
@@ -6835,6 +6836,54 @@ fn redis_operation_record_rejects_malformed_current_version_shapes() {
             "malformed current record accepted: {malformed}"
         );
     }
+}
+
+/// Issue #7152: the published completed record embeds the admitted replay
+/// payload verbatim instead of rebuilding and re-serializing the response. The
+/// record must still read back as a valid current record whose replay is that
+/// exact payload, and the tombstone keeps its shape.
+#[test]
+fn completed_redis_record_embeds_the_admitted_payload_verbatim() {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let plugin = make_plugin(json!({ "max_entry_size_bytes": 4096 }));
+    let payload = request_deduplication_redis_payload_for_test(
+        &plugin,
+        201,
+        headers,
+        b"{\"ok\":true}",
+        TEST_PRESENTATION_DIGEST,
+    )
+    .expect("small Redis payload should be admitted");
+
+    let record = request_deduplication_completed_redis_record_for_test(
+        "test-fingerprint",
+        Some(payload.clone()),
+    )
+    .expect("completed record serializes");
+    assert!(request_deduplication_redis_record_payload_is_valid(&record));
+    let parsed: serde_json::Value = serde_json::from_slice(&record).expect("record JSON");
+    assert_eq!(parsed["record_version"], 1);
+    assert_eq!(parsed["state"], "completed");
+    assert_eq!(parsed["fingerprint"], "test-fingerprint");
+    assert!(parsed.get("owner_token").is_none());
+    let members: HashMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_slice(&record).expect("record members");
+    assert_eq!(
+        members["replay"].get().as_bytes(),
+        payload.as_slice(),
+        "the replay member must be the admitted payload byte for byte"
+    );
+
+    let tombstone = request_deduplication_completed_redis_record_for_test("test-fingerprint", None)
+        .expect("tombstone serializes");
+    assert_eq!(
+        tombstone,
+        br#"{"record_version":1,"state":"completed","fingerprint":"test-fingerprint"}"#
+    );
+    assert!(request_deduplication_redis_record_payload_is_valid(
+        &tombstone
+    ));
 }
 
 #[test]

@@ -688,11 +688,9 @@ fn test_policy_affecting_unknown_keys_are_rejected() {
         let err = BotDetection::new(&config)
             .err()
             .expect("unknown config key must be rejected");
-        assert!(err.contains("unknown config key"), "got: {err}");
+        assert!(err.contains("unknown configuration key"), "got: {err}");
         assert!(err.contains(typo), "got: {err}");
-        for &key in BOT_DETECTION_CONFIG_KEYS {
-            assert!(err.contains(key), "missing allowed key {key} in: {err}");
-        }
+        assert!(err.starts_with("bot_detection: `config`: "), "got: {err}");
     }
 }
 
@@ -1012,7 +1010,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let cases: &[(serde_json::Value, &[&str])] = &[
         (
             json!({(canary): true}),
-            &["unknown config key", "`blocked_patterns`"],
+            &["unknown configuration key(s)", "`config`"],
         ),
         (
             json!({"custom_response_code": 8675309}),

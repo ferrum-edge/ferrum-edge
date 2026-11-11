@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Runtime kernel detection for eBPF capability probing.
 //!
 //! The node agent checks kernel version and cgroup v2 availability before

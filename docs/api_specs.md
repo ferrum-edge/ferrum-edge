@@ -21,11 +21,13 @@ When you submit a spec, Ferrum Edge:
 | `swagger: "2.0"` | Swagger / OpenAPI 2.0 |
 | `openapi: "3.0.x"` | OpenAPI 3.0.x (any patch) |
 | `openapi: "3.1.x"` | OpenAPI 3.1.x |
-| `openapi: "3.2.x"` | OpenAPI 3.2.x |
+| `openapi: "3.2.x"` | OpenAPI 3.2.x, except the 3.2 Path Item fields `query` and `additionalOperations` (see below) |
 
 Pre-release suffixes are supported: `openapi: "3.2.0-rc1"` is accepted.
 
 Detection rule: `swagger: "2.0"` at the document root → Swagger 2.0. `openapi: "3.MINOR.PATCH[-suffix]"` → OpenAPI 3.x. Any other string (including `openapi: "4.0.0"`) → 400 `UnknownVersion`.
+
+The importer handles the `get`, `put`, `post`, `delete`, `options`, `head`, `patch`, and `trace` operations of a Path Item. A Path Item (under `paths`, under `components.pathItems`, or reached through a `$ref`) that declares the OpenAPI 3.2 `query` operation or `additionalOperations` is refused with HTTP 422 `UnsupportedOperationField`, naming the field (for example `paths./search.query`). Those operations are not silently ignored: the generated validator, the MCP bridge, schema indexing, and `operation_count` cannot represent them.
 
 ## Submission formats
 
@@ -277,6 +279,7 @@ The following are rejected with HTTP 422 (the `code` field of the error body is 
 - **Plugin `proxy_id` mismatch** (`PluginProxyIdMismatch`) — if `proxy_id` is set on a plugin, it must match the spec's proxy ID.
 - **Forbidden keys in plugin `config`** (`PluginContainsCredentials`) — the plugin `config` object is walked recursively. Any of the following keys at any nesting depth is rejected: `credentials`, `keyauth`, `basicauth`, `jwt`, `hmac`, `mtls`, `consumer`, `consumer_id`, `consumer_groups`, `consumers`. The one exception is an `openapi_validator` plugin's `bypass.consumers` (see [openapi_validator.md](openapi_validator.md)): those entries are configured identity selectors, not embedded consumer resources, so the root-level `consumers` list inside the `bypass` object is allowed while the walk still rejects the forbidden keys in the bypass object's other fields, inside the selector entries themselves, and everywhere else in the config.
 - **External `$ref`s without opt-in policy** — when process policy or `x-ferrum-external-refs` leave resolution disabled, external Path Item and schema `$ref`s fail closed with HTTP 422 `UnsupportedExternalRef`.
+- **OpenAPI 3.2 `query` / `additionalOperations`** (`UnsupportedOperationField`) — a Path Item declaring either field is refused; see [Supported OpenAPI versions](#supported-openapi-versions).
 
 The credential-key check walks the plugin's `config` *value*, not the plugin metadata, so a plugin named `jwt` is fine. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
 

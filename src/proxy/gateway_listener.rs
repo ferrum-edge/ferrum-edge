@@ -1120,9 +1120,6 @@ impl GatewayListenerManager {
 
     /// Ports with an active accept loop, for tests and diagnostics. Newly bound
     /// listeners remain absent until their config generation is admitted.
-    // The binary target re-declares these modules, so a `pub` item consumed
-    // only by `tests/` reads as dead code there.
-    #[allow(dead_code)]
     pub async fn active_ports(&self) -> Vec<u16> {
         self.listeners
             .lock()
@@ -1135,7 +1132,6 @@ impl GatewayListenerManager {
     /// The identity of the live listener on `port`, for tests that check a
     /// connection accepted under one listener generation is never routed
     /// under the next (issue #5921).
-    #[allow(dead_code)]
     pub async fn listener_identity(&self, port: u16) -> Option<GatewayListenerIdentity> {
         self.listeners
             .lock()
@@ -1145,7 +1141,6 @@ impl GatewayListenerManager {
     }
 
     /// `(port, bind_addr)` pairs currently owned by this manager.
-    #[allow(dead_code)]
     pub async fn active_binds(&self) -> Vec<(u16, IpAddr)> {
         self.listeners
             .lock()
@@ -1157,7 +1152,6 @@ impl GatewayListenerManager {
 
     /// Ports that currently have a live QUIC listener, for tests and
     /// diagnostics.
-    #[allow(dead_code)]
     pub async fn active_http3_ports(&self) -> Vec<u16> {
         self.listeners
             .lock()
@@ -1168,10 +1162,6 @@ impl GatewayListenerManager {
     }
 
     /// Most recent refusals / bind failures. Lock-free read.
-    // Same bin-target caveat as `active_ports`: this raw seam is consumed by
-    // `tests/` and external library callers. Production observability consumes
-    // the shared `GatewayListenerStatus` instead (issue #3810).
-    #[allow(dead_code)]
     pub fn bind_failures(&self) -> Arc<Vec<GatewayListenerBindFailure>> {
         self.bind_failures.load_full()
     }

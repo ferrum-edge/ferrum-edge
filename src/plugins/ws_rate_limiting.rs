@@ -16,7 +16,7 @@ use uuid::Uuid;
 use super::utils::rate_limit::{
     LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
     STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitKey, WsRateLimitOp,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_ws_frame_rate_bounds, validate_ws_frame_rate_params,
 };
 use super::{
@@ -121,7 +121,6 @@ pub struct WsRateLimiting {
 impl WsRateLimiting {
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
     }
@@ -285,7 +284,6 @@ impl WsRateLimiting {
     /// Charge one frame against the local token bucket at `now` and report
     /// whether it was admitted. Deterministic (no wall-clock sleep) mirror of
     /// the frame budget for stable-state coverage. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn charge_frame_locally_at_for_test(
         &self,
         connection_id: u64,
@@ -301,7 +299,6 @@ impl WsRateLimiting {
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_connection_at_for_test(&self, connection_id: u64, now: Instant) {
         let _ = self.limiter.check_local_at(
             WsRateLimitKey::Connection(connection_id),
@@ -312,7 +309,6 @@ impl WsRateLimiting {
 
     /// Attempt to seed one local/fallback key through the production atomic
     /// capacity gate. Returns false only for a previously unseen key at cap.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_connection_at_with_cap_for_test(
         &self,
         connection_id: u64,
@@ -357,18 +353,12 @@ impl WsRateLimiting {
         self.maybe_evict_at(now)
     }
 
-    /// Exercise the shared prune/enforce branch with a testable cap. Test-only.
+    /// Run the shared idle-state prune at `now`. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn apply_cleanup_branch_for_test(
-        &self,
-        now: Instant,
-        over_capacity: bool,
-        max_entries: usize,
-    ) {
-        apply_rate_limit_cleanup(&self.limiter, max_entries, now, over_capacity);
+    pub(crate) fn prune_stale_for_test(&self, now: Instant) {
+        self.limiter.prune_stale_at(now);
     }
 
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn contains_connection_for_test(&self, connection_id: u64) -> bool {
         self.limiter
             .contains_local_key(&WsRateLimitKey::Connection(connection_id))
@@ -475,8 +465,8 @@ impl WsRateLimiting {
         super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
         let dir_label = match direction {
-            WebSocketFrameDirection::ClientToBackend => "client->backend",
-            WebSocketFrameDirection::BackendToClient => "backend->client",
+            WebSocketFrameDirection::ClientToBackend => "client_to_backend",
+            WebSocketFrameDirection::BackendToClient => "backend_to_client",
         };
         // One bounded, low-cardinality warning per closed connection: this is
         // the terminal decision, not a per-frame event.
@@ -558,7 +548,7 @@ impl WsRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
+                self.limiter.prune_stale_at(now);
                 return self.limiter.tracked_keys_count() >= MAX_STATE_ENTRIES;
             }
             return true;
@@ -575,7 +565,7 @@ impl WsRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, false);
+                self.limiter.prune_stale_at(now);
             }
         }
 

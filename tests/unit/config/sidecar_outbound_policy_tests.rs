@@ -42,8 +42,33 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, MeshConfig, MeshSidecar, MeshSidecarEgress, OutboundTrafficPolicy, Workload,
     WorkloadPort, WorkloadSelector,
 };
+use ferrum_edge::modes::mesh::config_consumer::xds_client::{
+    XdsClientConfig, reverse_translate_xds_snapshot,
+};
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
-use ferrum_edge::xds::carrier::{MeshSliceCarrier, apply_carrier, build_slice_carriers};
+use ferrum_edge::xds::carrier::{MeshSliceCarrier, build_slice_carriers};
+use ferrum_edge::xds::translate_mesh_slice_to_snapshot;
+
+/// Rebuild `slice` through the DP's production xDS path (SotW accumulator and
+/// reverse translation) as the workload that requested it.
+fn rebuild_over_xds(slice: &MeshSlice) -> MeshSlice {
+    let config = XdsClientConfig {
+        cp_urls: Vec::new(),
+        node_id: slice.node_id.clone(),
+        cluster: String::new(),
+        namespace: slice.namespace.clone(),
+        workload_spiffe_id: slice.workload_spiffe_id.clone(),
+        waypoint_name: slice.waypoint_name.clone(),
+        ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
+        stream_channel_capacity: 1,
+        primary_retry_secs: 0,
+        connect_timeout_seconds: 0,
+        labels: slice.labels.clone(),
+    };
+    reverse_translate_xds_snapshot(&translate_mesh_slice_to_snapshot(slice), &config)
+        .expect("the DP rebuilds the xDS-carried slice")
+}
 use serde_json::{Value, json};
 
 // ── Kubernetes translation fixtures ───────────────────────────────────────
@@ -728,15 +753,8 @@ fn slice_round_trips_the_sidecar_policy_through_the_xds_carriers() {
         "the reserved ECDS resource name is part of the DP's decode binding"
     );
 
-    // Encode/decode exactly as the DP does, then apply onto a fresh slice.
-    let mut recovered = MeshSlice::default();
-    for carrier in &carriers {
-        let bytes = carrier.encode_value().expect("encode");
-        let decoded = MeshSliceCarrier::decode(carrier.type_url(), &bytes)
-            .expect("decode does not error")
-            .expect("a Ferrum slice carrier");
-        apply_carrier(&mut recovered, decoded);
-    }
+    // Rebuild through the DP's production xDS path.
+    let recovered = rebuild_over_xds(&native);
     assert_eq!(
         recovered.sidecar_outbound_traffic_policy, native.sidecar_outbound_traffic_policy,
         "an xDS-built slice must resolve the same workload-scoped policy"
@@ -763,10 +781,7 @@ fn absent_sidecar_policy_carrier_is_the_wire_form_of_inherit() {
         "no carrier is emitted when there is no workload-scoped override"
     );
 
-    let mut recovered = MeshSlice::default();
-    for carrier in &carriers {
-        apply_carrier(&mut recovered, carrier.clone());
-    }
+    let recovered = rebuild_over_xds(&inheriting);
     assert_eq!(recovered.sidecar_outbound_traffic_policy, None);
 }
 

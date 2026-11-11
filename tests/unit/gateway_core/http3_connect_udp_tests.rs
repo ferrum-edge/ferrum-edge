@@ -24,7 +24,7 @@ use ferrum_edge::http3::connect_udp::{
     classify_relay_join, classify_send_half_teardown, classify_udp_recv_error,
     classify_udp_send_error, destination_is_configured, dns_override_pin_unchanged,
     encode_udp_datagram_capsule, first_forbidden_capsule_protocol_field, parse_connect_udp_target,
-    reconcile_authorization_teardown, resolve_send_half_close_command,
+    receive_half_halt_code, reconcile_authorization_teardown, resolve_send_half_close_command,
     strip_forbidden_capsule_protocol_response_fields, validate_connect_udp_request_shape,
 };
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache, LoadBalancerCacheInner};
@@ -2408,6 +2408,20 @@ fn send_half_teardown_wires_the_joined_outcome_as_authoritative() {
         squeezed.contains("from_target.abort();(from_target.await,true)"),
         "CLOSE_GRACE expiry must abort then join the send-half task, never detach"
     );
+    // Issue #7188: the receive half is halted with the supervisor's close code,
+    // and an abort is only the bounded fallback after CLOSE_GRACE.
+    assert!(
+        squeezed.contains("let_=recv_halt_tx.send(supervisor_verdict.close_kind());"),
+        "teardown must hand the receive-half task the supervisor's close kind"
+    );
+    assert!(
+        squeezed.contains("h3_recv.stop_sending(receive_half_halt_code(Some(close)));"),
+        "the receive-half task must halt with an explicit code, never a bare drop"
+    );
+    assert!(
+        squeezed.contains("Err(_)=>{to_target.abort();to_target.await}"),
+        "CLOSE_GRACE expiry must abort then join the receive-half task, never detach"
+    );
     assert!(
         squeezed.contains("send_capsule_or_supervisor_close("),
         "a flow-control-stalled send_data must share a select with the supervisor close command"
@@ -2422,6 +2436,38 @@ fn send_half_teardown_wires_the_joined_outcome_as_authoritative() {
         ),
         "Quinn finish-on-drop must not present a clean FIN for an aborted stalled send half"
     );
+}
+
+#[test]
+fn the_receive_half_is_halted_with_the_code_of_the_supervisor_close() {
+    // Issue #7188: a clean end halts the client's request direction with
+    // `H3_NO_ERROR`, never the `STOP_SENDING(0)` a dropped half produces, and a
+    // fault halts it with the same code the send half resets with.
+    for end in EVERY_SESSION_END {
+        let expected = match end.close_kind() {
+            StreamCloseKind::Clean => h3::error::Code::H3_NO_ERROR,
+            StreamCloseKind::MessageError => h3::error::Code::H3_MESSAGE_ERROR,
+            StreamCloseKind::InternalError => h3::error::Code::H3_INTERNAL_ERROR,
+        };
+        assert!(
+            receive_half_halt_code(Some(end.close_kind())) == expected,
+            "{end:?} halts the receive half with the wrong code"
+        );
+    }
+    for clean in [
+        SessionEnd::Idle,
+        SessionEnd::Draining,
+        SessionEnd::RouteWithdrawn,
+        SessionEnd::RouteTargetPinChanged,
+        SessionEnd::RouteAuthorizationUnreconstructable,
+    ] {
+        assert!(receive_half_halt_code(Some(clean.close_kind())) == h3::error::Code::H3_NO_ERROR);
+    }
+    assert!(
+        receive_half_halt_code(None) == h3::error::Code::H3_INTERNAL_ERROR,
+        "a close channel dropped without a verdict never claims an orderly end"
+    );
+    assert!(h3::error::Code::H3_NO_ERROR.value() != 0);
 }
 
 #[test]

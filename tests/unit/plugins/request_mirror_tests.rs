@@ -4775,10 +4775,6 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
         );
         assert!(err.contains(typo), "error must name the typo: {err}");
         assert!(
-            err.contains("allowed keys"),
-            "error must list the allowed-key contract: {err}"
-        );
-        assert!(
             err.contains("did you mean"),
             "typo diagnostics should include a suggestion for {typo}: {err}"
         );
@@ -4786,9 +4782,6 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
             err.contains(canonical),
             "suggestion should name the canonical key {canonical}: {err}"
         );
-        for key in REQUEST_MIRROR_CONFIG_KEYS {
-            assert!(err.contains(key), "missing allowed key {key} in: {err}");
-        }
 
         let shared = validate_plugin_config("request_mirror", &config)
             .expect_err("shared admission must reject the same typo");
@@ -4803,7 +4796,7 @@ fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() 
         .err()
         .expect("arbitrary unknown key must be rejected");
     assert!(err.contains("zzz_arbitrary_unknown"), "got: {err}");
-    assert!(err.contains("allowed keys"), "got: {err}");
+    assert!(err.starts_with("request_mirror: `config`: "), "got: {err}");
 }
 
 #[test]
@@ -6611,7 +6604,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         ),
         (
             json!({"mirror_host": "example.com", token: true}),
-            "allowed keys",
+            "`config`",
             "unknown configuration key",
         ),
         (
@@ -7076,7 +7069,7 @@ fn credential_class_names_are_allowlistable() {
 /// are both withheld from the mirror while the primary request keeps them.
 #[tokio::test]
 async fn route_credential_locations_are_withheld_from_the_mirror() {
-    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+    use ferrum_edge::_test_support::set_request_headers_to_redact_for_test;
 
     let key_auth = create_plugin(
         "key_auth",
@@ -7088,7 +7081,7 @@ async fn route_credential_locations_are_withheld_from_the_mirror() {
     assert_eq!(route_headers, vec!["x-proof".to_string()]);
 
     let mut ctx = make_ctx_with_proxy();
-    set_replay_credential_headers_for_test(&mut ctx, route_headers);
+    set_request_headers_to_redact_for_test(&mut ctx, route_headers);
     let mut headers = HashMap::new();
     headers.insert("x-proof".to_string(), "live-api-key".to_string());
     headers.insert("x-custom".to_string(), "keep-me".to_string());
@@ -7139,7 +7132,7 @@ async fn route_credential_locations_are_withheld_from_the_mirror() {
 /// `Authorization`, `proof` query location) were then renamed by
 /// `request_transformer`, returning the context and outbound headers.
 async fn renamed_credential_request() -> (RequestContext, HashMap<String, String>) {
-    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+    use ferrum_edge::_test_support::set_request_headers_to_redact_for_test;
     use ferrum_edge::plugins::utils::token_extract::{
         TokenLocation, mark_present_query_credential_locations,
     };
@@ -7156,7 +7149,7 @@ async fn renamed_credential_request() -> (RequestContext, HashMap<String, String
     .expect("request_transformer plugin");
 
     let mut ctx = make_ctx_with_proxy();
-    set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+    set_request_headers_to_redact_for_test(&mut ctx, vec!["x-proof".to_string()]);
     ctx.headers
         .insert("x-proof".to_string(), "live-api-key".to_string());
     ctx.headers
@@ -7274,10 +7267,10 @@ async fn renamed_repeated_and_unregistered_credentials_are_withheld() {
 /// provenance when a later plugin copies or renames it.
 #[tokio::test]
 async fn plugin_installed_credential_values_keep_provenance() {
-    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+    use ferrum_edge::_test_support::set_request_headers_to_redact_for_test;
 
     let mut ctx = make_ctx_with_proxy();
-    set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+    set_request_headers_to_redact_for_test(&mut ctx, vec!["x-proof".to_string()]);
     let mut headers = HashMap::new();
     headers.insert("x-proof".to_string(), "upstream-session-u".to_string());
     headers.insert("x-debug".to_string(), "upstream-session-u".to_string());
@@ -7298,7 +7291,7 @@ async fn plugin_installed_credential_values_keep_provenance() {
 /// renamed credential still carries it.
 #[tokio::test]
 async fn transformer_introduced_and_chained_renames_keep_provenance() {
-    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+    use ferrum_edge::_test_support::set_request_headers_to_redact_for_test;
 
     let first = create_plugin(
         "request_transformer",
@@ -7323,7 +7316,7 @@ async fn transformer_introduced_and_chained_renames_keep_provenance() {
 
     let build = |first: Arc<dyn Plugin>, second: Arc<dyn Plugin>| async move {
         let mut ctx = make_ctx_with_proxy();
-        set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+        set_request_headers_to_redact_for_test(&mut ctx, vec!["x-proof".to_string()]);
         ctx.headers
             .insert("x-proof".to_string(), "live-api-key".to_string());
         ctx.set_raw_query_string("x=1".to_string());

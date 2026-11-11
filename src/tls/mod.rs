@@ -11,9 +11,8 @@
 //! from being MITMed via any public CA.
 //!
 //! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
-//! `FERRUM_TLS_MIN_VERSION`, and `FERRUM_TLS_KEY_EXCHANGE_GROUPS`
-//! (`FERRUM_TLS_CURVES` alias). Applied to both inbound listeners and
-//! outbound backend connections.
+//! `FERRUM_TLS_MIN_VERSION`, and `FERRUM_TLS_KEY_EXCHANGE_GROUPS`. Applied to
+//! both inbound listeners and outbound backend connections.
 
 pub mod acme;
 #[cfg(test)]
@@ -1111,7 +1110,6 @@ pub fn load_frontend_tls_candidate_from_paths(
 /// Existing path strings are parsed as [`CertSource::Path`]. Inline PEM is
 /// accepted without writing temporary files, and `file://` URIs share the same
 /// file loader.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources(
     cert_source: &CertSource,
@@ -1136,10 +1134,6 @@ pub fn load_tls_config_with_client_auth_from_sources(
     )
 }
 
-// Retained as the source-typed projection of the frontend loader. Live callers
-// go through `load_frontend_tls_candidate`, so the bin target sees this only
-// from `tests/`.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     cert_source: &CertSource,
@@ -2438,9 +2432,16 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        crate::fips::base_crypto_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        // rustls asks on every ClientHello. The base provider is fixed at
+        // compile time, so resolve its schemes once instead of building a
+        // provider (and its suite and group `Vec`s) per handshake.
+        static SCHEMES: std::sync::LazyLock<Vec<rustls::SignatureScheme>> =
+            std::sync::LazyLock::new(|| {
+                crate::fips::base_crypto_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            });
+        SCHEMES.clone()
     }
 }
 
@@ -2450,10 +2451,6 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// When `crls` is non-empty, CRL revocation checking is enabled with the shared
 /// policy in [`crl_policy`], the same one used by H1/H2 frontend mTLS, the mesh
 /// operator-CA path, backend server verification, SPIFFE, and DTLS.
-// Verifier-only projection. Production callers need the paired trust identity
-// and use `build_client_cert_verifier_candidate`, so the bin target sees this
-// only from `tests/`.
-#[allow(dead_code)]
 pub fn build_client_cert_verifier(
     ca_bundle_path: &str,
     crls: &[CertificateRevocationListDer<'static>],
@@ -2757,15 +2754,6 @@ mod tests {
         assert!(identity.is_svid_rotating());
     }
 
-    fn new_test_client_config() -> rustls::ClientConfig {
-        let provider = Arc::new(crate::fips::base_crypto_provider());
-        rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("default protocol versions")
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth()
-    }
-
     fn new_test_server_config() -> rustls::ServerConfig {
         let key_pair =
             rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
@@ -2787,25 +2775,6 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(certs, private_key)
             .expect("server cert")
-    }
-
-    #[test]
-    fn apply_client_session_resumption_compiles_and_runs() {
-        let mut config = new_test_client_config();
-        apply_client_session_resumption(&mut config, None, &[]);
-    }
-
-    #[test]
-    fn apply_client_session_resumption_with_policy() {
-        let policy = TlsPolicy {
-            protocol_versions: vec![&rustls::version::TLS13],
-            crypto_provider: Arc::new(crate::fips::base_crypto_provider()),
-            prefer_server_cipher_order: false,
-            session_cache_size: 123,
-            early_data_max_size: 0,
-        };
-        let mut config = new_test_client_config();
-        apply_client_session_resumption(&mut config, Some(&policy), &[]);
     }
 
     #[tokio::test]

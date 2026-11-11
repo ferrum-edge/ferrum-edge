@@ -92,7 +92,7 @@ fn shared_mesh_lists() -> Vec<(&'static str, Value)> {
         ("services", named()),
         ("mesh_policies", policy()),
         ("ext_authz_providers", provider()),
-        ("peer_authentications", named()),
+        ("peer_authentications", policy()),
         ("service_entries", service_entry()),
         ("request_authentications", policy()),
         (
@@ -128,7 +128,7 @@ fn mesh_config_and_slice_collection_elements_require_objects() {
         ("service_waypoint_bound_services", named()),
         ("ambient_udp_source_workloads", workload()),
         ("node_waypoint_capture_destinations", workload()),
-        ("node_waypoint_capture_peer_authentications", named()),
+        ("node_waypoint_capture_peer_authentications", policy()),
         ("node_waypoint_capture_mesh_policies", policy()),
         ("local_inbound_services", named()),
         ("local_inbound_workloads", workload()),

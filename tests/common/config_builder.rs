@@ -217,7 +217,6 @@ impl ConsumerBuilder {
     }
 
     /// Set a single credential entry for `cred_type`.
-    /// For multi-credential rotation, use [`Self::credentials_multi`].
     pub fn credential(mut self, cred_type: impl Into<String>, value: Value) -> Self {
         let credentials = self
             .inner
@@ -225,19 +224,6 @@ impl ConsumerBuilder {
             .or_insert_with(|| Value::Object(Map::new()));
         if let Value::Object(map) = credentials {
             map.insert(cred_type.into(), Value::Array(vec![value]));
-        }
-        self
-    }
-
-    /// Set multiple credential entries for `cred_type` (array form, for
-    /// rotation per `FERRUM_MAX_CREDENTIALS_PER_TYPE`).
-    pub fn credentials_multi(mut self, cred_type: impl Into<String>, values: Vec<Value>) -> Self {
-        let credentials = self
-            .inner
-            .entry("credentials".to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Value::Object(map) = credentials {
-            map.insert(cred_type.into(), Value::Array(values));
         }
         self
     }
@@ -534,17 +520,6 @@ mod tests {
             .build();
         assert_eq!(c["credentials"]["keyauth"][0]["key"], "secret");
         assert_eq!(c["credentials"]["basicauth"][0]["username"], "alice");
-    }
-
-    #[test]
-    fn consumer_builder_multi_credentials() {
-        let c = ConsumerBuilder::new("c1", "alice")
-            .credentials_multi("keyauth", vec![json!({"key": "k1"}), json!({"key": "k2"})])
-            .build();
-        let arr = c["credentials"]["keyauth"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["key"], "k1");
-        assert_eq!(arr[1]["key"], "k2");
     }
 
     #[test]

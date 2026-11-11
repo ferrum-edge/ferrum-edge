@@ -60,6 +60,9 @@ mesh:
   peer_authentications:
     - name: strict-default
       namespace: ferrum
+      scope:
+        kind: namespace
+        namespace: ferrum
       mtls_mode: strict
 "#;
 

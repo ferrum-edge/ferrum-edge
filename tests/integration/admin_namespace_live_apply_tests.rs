@@ -24,7 +24,7 @@ use ferrum_edge::admin::{
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
-use ferrum_edge::config::runtime_config_apply::RuntimeConfigApply;
+use ferrum_edge::config::runtime_config_apply::{LiveApplyCursor, RuntimeConfigApply};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -98,12 +98,11 @@ fn test_pool_config() -> DbPoolConfig {
 /// A poll-loop coordinator that serves `namespace` and has accepted nothing.
 /// A poll-loop coordinator pinned to the store's CURRENT topology epoch.
 ///
-/// `RuntimeConfigApply::with_timeout` pins epoch 0, but `DatabaseStore`
-/// initialises `topology_epoch` to 1. `prepare_live_apply_after_commit`
-/// captures the covering cursor at `db.config_topology_epoch()`, while
-/// `record_accepted` / `record_rejected` stamp the coordinator's own epoch —
-/// so an epoch-0 coordinator can never satisfy a waiter parked at epoch 1, and
-/// every outcome-recording test fell through to its own timeout instead.
+/// `DatabaseStore` initialises `topology_epoch` to 1 and
+/// `prepare_live_apply_after_commit` captures the covering cursor at
+/// `db.config_topology_epoch()`, so a coordinator at any other epoch can never
+/// satisfy a waiter, and every outcome-recording test would fall through to
+/// its own timeout instead.
 fn coordinator(namespace: &str, epoch: u64, timeout: Duration) -> Arc<RuntimeConfigApply> {
     Arc::new(RuntimeConfigApply::with_timeout_at_epoch(
         namespace, epoch, 0, timeout,
@@ -276,7 +275,10 @@ async fn rename_into_served_namespace_waits_for_poll_acceptance() {
     );
     assert!(covering >= 1, "rename must write upsert tombstones");
 
-    fx.apply.record_accepted(covering);
+    fx.apply.record_accepted_cursor(LiveApplyCursor::new(
+        fx.store.config_topology_epoch(),
+        covering,
+    ));
     let (status, body) = handle.await.expect("rename task");
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["name"], "served");
@@ -295,7 +297,10 @@ async fn rename_into_served_namespace_fails_closed_on_rejection() {
     );
     let covering = covering_watermark(&fx.store, "served").await;
     assert!(!handle.is_finished(), "rename must still be waiting");
-    fx.apply.record_rejected(covering);
+    fx.apply.record_rejected_cursor(LiveApplyCursor::new(
+        fx.store.config_topology_epoch(),
+        covering,
+    ));
 
     let (status, body) = handle.await.expect("rename task");
     assert_eq!(status, 503, "{body}");
@@ -359,7 +364,10 @@ async fn waiting_rename_releases_the_registry_admission_lease() {
     .expect("a concurrent create must not block behind the parked rename");
     assert_eq!(status, 201, "{body}");
 
-    fx.apply.record_accepted(covering);
+    fx.apply.record_accepted_cursor(LiveApplyCursor::new(
+        fx.store.config_topology_epoch(),
+        covering,
+    ));
     let (status, body) = rename.await.expect("rename task");
     assert_eq!(status, 200, "{body}");
 }
@@ -387,7 +395,11 @@ async fn registry_only_create_does_not_wait_for_runtime_apply() {
     )
     .await;
     assert_eq!(status, 201, "{body}");
-    assert_eq!(apply.accepted_sequence(), 0, "no generation was accepted");
+    assert_eq!(
+        apply.accepted_cursor().sequence,
+        0,
+        "no generation was accepted"
+    );
 }
 
 #[tokio::test]
@@ -466,7 +478,10 @@ async fn confirmed_cascade_delete_of_the_served_namespace_waits() {
         !handle.is_finished(),
         "a confirmed cascade of the served namespace must wait for poll acceptance"
     );
-    apply.record_accepted(covering);
+    apply.record_accepted_cursor(LiveApplyCursor::new(
+        store.config_topology_epoch(),
+        covering,
+    ));
     let (status, body) = handle.await.expect("delete task");
     assert_eq!(status, 204, "{body}");
 }

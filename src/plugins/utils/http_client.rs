@@ -1248,7 +1248,6 @@ fn accept_plugin_http_client(
 static PLUGIN_HTTP_CLIENT_BUILDS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of plugin `reqwest::Client` constructions so far in this process.
-#[allow(dead_code)] // exercised via external integration tests through the lib target
 pub(crate) fn plugin_http_client_builds() -> u64 {
     PLUGIN_HTTP_CLIENT_BUILDS.load(Ordering::Relaxed)
 }
@@ -1586,7 +1585,6 @@ impl PluginHttpClient {
     ///
     /// Useful for tests that need to verify slow-call logging behavior with
     /// a specific threshold.
-    #[allow(dead_code)] // Used by integration tests in tests/unit/plugins/
     pub fn from_pool_config_with_threshold(config: &PoolConfig, slow_threshold_ms: u64) -> Self {
         let mut client = Self::from_pool_config(config);
         client.slow_threshold = Duration::from_millis(slow_threshold_ms);
@@ -1762,7 +1760,6 @@ impl PluginHttpClient {
     /// retry settings, without a DNS cache.
     ///
     /// Useful for tests that need to verify retry behavior deterministically.
-    #[allow(dead_code)] // Used by integration tests in tests/unit/plugins/
     pub fn from_pool_config_with_settings(
         config: &PoolConfig,
         slow_threshold_ms: u64,
@@ -2237,7 +2234,6 @@ impl PluginHttpClient {
     /// (in nanoseconds) to `accumulator`. Used by plugins that make
     /// external HTTP calls during the request lifecycle so the gateway
     /// can report `latency_plugin_external_io_ms` in transaction logs.
-    #[allow(dead_code)] // Available for plugins to opt into; not yet called by built-in plugins
     pub async fn execute_tracked(
         &self,
         request: reqwest::RequestBuilder,

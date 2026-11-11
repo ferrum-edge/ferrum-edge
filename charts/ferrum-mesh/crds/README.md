@@ -28,12 +28,12 @@ helm template <release> ./charts/ferrum-mesh -n <namespace> \
   --set crds.install=true | kubectl apply --server-side -f -
 ```
 
-Existing clusters that still have the CRD from this directory must adopt it
-once. **Operator action:**
+Existing clusters that still have the CRD from this directory must let Helm
+take ownership of it once. **Operator action:**
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
-  --take-ownership --set crds.adoptExisting=true
+  --take-ownership
 ```
 
 See [`docs/upgrade_guide.md`](../../../docs/upgrade_guide.md).

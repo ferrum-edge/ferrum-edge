@@ -7573,7 +7573,7 @@ async fn drive_stream(
     {
         inspected = true;
         for chunk in chunks {
-            match inspector.on_chunk(chunk).await {
+            match inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await {
                 ResponseStreamAction::Forward(bytes) => forwarded.extend_from_slice(&bytes),
                 ResponseStreamAction::Terminate(_) => {
                     panic!("ai_rate_limiter must never truncate a committed response stream")
@@ -7931,7 +7931,7 @@ async fn a_never_ending_stream_forwards_incrementally_without_retaining_the_body
     let chunk = sse_frame(json!({"choices": [{"delta": {"content": "x".repeat(512)}}]}));
     let mut forwarded_total = 0usize;
     for _ in 0..(4 * 1024 * 1024 / chunk.len()) {
-        match inspector.on_chunk(&chunk).await {
+        match inspector.on_chunk(&Bytes::copy_from_slice(&chunk)).await {
             ResponseStreamAction::Forward(bytes) => {
                 assert_eq!(
                     bytes.len(),
@@ -8062,10 +8062,10 @@ async fn malformed_and_truncated_stream_frames_apply_the_policy_exactly_once() {
 //
 // Production attaches the limiter inspector through the shared factory, then
 // drives it via protocol-specific body seams:
-//   * H1/reqwest → byte chunks into `inspected_streaming_body`
+//   * H1/reqwest → `run_response_inspection` into `inspected_streaming_body`
 //   * direct H2 / native H3 → `run_proxy_body_response_inspection`
-// These tests reuse those harnesses (`inspected_byte_chunks_body_for_test` /
-// `inspected_proxy_body_for_test`) rather than standing up a server, and prove
+// These tests reuse those harnesses (`reqwest_inspected_response_body_for_test`
+// / `inspected_proxy_body_for_test`) rather than standing up a server, and prove
 // the attached `ai_rate_limiter` inspector is actually driven and terminally
 // reconciled — not merely that source wiring mentions the inspector.
 
@@ -8130,7 +8130,14 @@ async fn drive_gateway_stream_variant(
     let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
     let inspected = match variant {
         GatewayStreamBodyVariant::H1 => {
-            ferrum_edge::_test_support::inspected_byte_chunks_body_for_test(chunks, inspector)
+            // The production reqwest inspection task reads `'static` chunks.
+            let chunks: Vec<&'static [u8]> = chunks
+                .into_iter()
+                .map(|chunk| &*Box::leak(chunk.to_vec().into_boxed_slice()))
+                .collect();
+            ferrum_edge::_test_support::reqwest_inspected_response_body_for_test(
+                &chunks, inspector, 0,
+            )
         }
         GatewayStreamBodyVariant::H2 => {
             let frames = chunks
@@ -9193,9 +9200,9 @@ struct DeferCutAtBang {
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for DeferCutAtBang {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         let Some(at) = chunk.iter().position(|&byte| byte == b'!') else {
-            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+            return ResponseStreamAction::Forward(chunk.clone());
         };
         self.deferred = Some(Some(Bytes::from_static(b"CUT")));
         ResponseStreamAction::Forward(Bytes::copy_from_slice(&chunk[..at]))
@@ -9235,7 +9242,9 @@ async fn a_deferred_cut_ahead_of_the_limiter_charges_the_cleared_usage_once() {
     let cutter: Box<dyn ResponseStreamInspector> = Box::new(DeferCutAtBang { deferred: None });
     let inspectors = vec![cutter, limiter_inspector];
     let mut chain = chain_response_stream_inspectors(inspectors).expect("chain");
-    let ResponseStreamAction::Terminate(Some(sent)) = chain.on_chunk(&chunk).await else {
+    let ResponseStreamAction::Terminate(Some(sent)) =
+        chain.on_chunk(&Bytes::copy_from_slice(&chunk)).await
+    else {
         panic!("the deferred cut ends the stream");
     };
     let expected = [usage.as_slice(), &b"CUT"[..]].concat();

@@ -346,7 +346,6 @@ impl DeferredTransactionLogger {
     /// Retained as public API surface for external callers (tests and future
     /// non-streaming deferred-log sites). The production HTTP/gRPC streaming
     /// paths use `new_with_start_time` exclusively.
-    #[allow(dead_code)]
     pub fn new(
         summary: TransactionSummary,
         plugins: Arc<Vec<Arc<dyn Plugin>>>,

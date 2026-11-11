@@ -364,7 +364,11 @@ fn rejects_unknown_top_level_and_nested_hsts_keys_with_paths() {
         "unknown": true
     }))
     .unwrap_err();
-    assert!(err.contains("under `security_headers`: \"fram_options, unknown\""));
+    assert!(err.contains(
+        "security_headers: `security_headers`: unknown configuration key(s): \
+         \"security_headers.fram_options\" (did you mean `frame_options`?), \
+         \"security_headers.unknown\""
+    ));
 
     let err = SecurityHeaders::new(&json!({
         "hsts": {
@@ -374,7 +378,11 @@ fn rejects_unknown_top_level_and_nested_hsts_keys_with_paths() {
         }
     }))
     .unwrap_err();
-    assert!(err.contains("under `security_headers.hsts`: \"include_subdomain, unknown\""));
+    assert!(err.contains(
+        "security_headers: `security_headers.hsts`: unknown configuration key(s): \
+         \"security_headers.hsts.include_subdomain\" (did you mean `include_subdomains`?), \
+         \"security_headers.hsts.unknown\""
+    ));
 }
 
 #[test]

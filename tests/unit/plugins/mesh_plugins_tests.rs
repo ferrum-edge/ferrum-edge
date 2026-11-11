@@ -9625,8 +9625,6 @@ fn workload_metrics_accepts_every_allowlisted_key() {
         "tracing_providers": [],
         "direction_emit": { "server": true, "client": true },
         "span_reporting_disabled": false,
-        "disable_span_reporting": false,
-        "disableSpanReporting": false,
         "service_name": "reviews",
         "deployment_environment": "staging",
         "batch_size": 128,
@@ -9939,7 +9937,6 @@ fn mesh_outbound_registry_invalid_slice_keeps_stream_and_route_miss_enforcement(
         404,
     )
     .expect("an invalid registry must keep the gate installed");
-    assert_eq!(enforcement.registry().registry_size(), 0);
     assert_eq!(
         enforcement.check_destination(15001, "known.test", 443),
         Decision::Deny

@@ -193,7 +193,7 @@ fn successful_policy_info_withholds_external_selections_and_scalars() {
     let dir = tempfile::tempdir().unwrap();
     let fixtures = [
         ("FERRUM_TLS_CIPHER_SUITES", CIPHER),
-        ("FERRUM_TLS_CURVES", CURVE),
+        ("FERRUM_TLS_KEY_EXCHANGE_GROUPS", CURVE),
         ("FERRUM_TLS_MIN_VERSION", "1.2"),
         ("FERRUM_TLS_MAX_VERSION", "1.3"),
         ("FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER", "false"),

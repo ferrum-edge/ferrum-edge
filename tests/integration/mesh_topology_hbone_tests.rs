@@ -97,10 +97,10 @@ fn egress_gateway_topology_runs_mesh_internal_mtls_inbound() {
 
 #[test]
 fn topology_predicates_match_listener_plan_shape() {
-    // The convenience predicates on `MeshTopology` are used by listener
-    // spawning and admin endpoints — guard against a future drift
-    // where a topology starts terminating HBONE but `terminates_hbone()`
-    // still returns false.
+    // Listener spawning derives HBONE termination from `listener_plan()`;
+    // `is_waypoint()` drives slice filtering and admin dispatch. Guard both
+    // against drift: only Ambient and the two waypoints terminate HBONE, and
+    // only the waypoints are waypoints.
     for topology in [
         MeshTopology::Sidecar,
         MeshTopology::Ambient,
@@ -114,9 +114,12 @@ fn topology_predicates_match_listener_plan_shape() {
             .iter()
             .any(|l| l.kind == MeshListenerKind::HboneTermination);
         assert_eq!(
-            topology.terminates_hbone(),
             has_hbone,
-            "terminates_hbone() should align with listener plan for {topology:?}"
+            matches!(
+                topology,
+                MeshTopology::Ambient | MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint
+            ),
+            "HBONE termination listener for {topology:?}"
         );
         assert_eq!(
             topology.is_waypoint(),

@@ -297,8 +297,9 @@ pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMat
 /// serving. Deferring it instead would publish the route with no CORS
 /// ownership, letting a backend's own permissive CORS headers through.
 pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
+    // Projected entries never carry a compiled regex; `RegexPattern` is the
+    // only regex form `origin_matcher_spec_from_entry` returns.
     origin_matcher_spec_from_entry(origin).is_some_and(|spec| match spec {
-        OriginMatcherSpec::CompiledRegex(re) => origin_regex_matches_universality_probes(re),
         OriginMatcherSpec::RegexPattern(pattern) => compile_origin_regex(pattern)
             .is_ok_and(|re| origin_regex_matches_universality_probes(&re)),
         OriginMatcherSpec::WildcardSubdomain(_) => false,
@@ -1026,7 +1027,7 @@ impl CorsPlugin {
         let mut allow_credentials = bool_config(config, "allow_credentials", false)?;
         let allow_private_network = bool_config(config, "allow_private_network", false)?;
         let max_age = match object.get("max_age") {
-            Some(_) => Some(u64_config(config, "max_age", 86400)?),
+            Some(value) => Some(u64_value(value, "max_age")?),
             None if istio_semantics => None,
             None => Some(86400),
         };
@@ -2136,9 +2137,11 @@ fn split_raw_authority(origin: &str) -> Option<(&str, &str)> {
     Some(authority_and_path.split_at(authority_end))
 }
 
+/// `null` values are refused up front in [`CorsPlugin::new`], so an absent key
+/// is the only way to select `default`.
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
     match config.get(key) {
-        None | Some(Value::Null) => Ok(default),
+        None => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
             "cors: `{key}` must be a boolean, got: {other:?}",
@@ -2147,13 +2150,12 @@ fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String>
     }
 }
 
-fn u64_config(config: &Value, key: &str, default: u64) -> Result<u64, String> {
-    match config.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Number(value)) => value
+fn u64_value(value: &Value, key: &str) -> Result<u64, String> {
+    match value {
+        Value::Number(value) => value
             .as_u64()
             .ok_or_else(|| format!("cors: `{key}` must be a non-negative integer")),
-        Some(other) => Err(format!(
+        other => Err(format!(
             "cors: `{key}` must be a non-negative integer, got: {other:?}",
             other = other.to_string()
         )),

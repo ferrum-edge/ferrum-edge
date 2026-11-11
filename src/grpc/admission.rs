@@ -499,10 +499,6 @@ impl Default for CpGrpcAdmissionLimits {
 
 impl CpGrpcAdmissionLimits {
     /// True when any stream/node budget is configured as unbounded (`0`).
-    // Exercised only from the external `tests/` crate (permit-release and
-    // unbounded-posture assertions), so the `ferrum-edge` binary target
-    // reports it as dead code.
-    #[allow(dead_code)]
     pub fn has_unbounded_scope(&self) -> bool {
         self.max_total_streams == 0
             || self.max_streams_per_namespace == 0
@@ -630,19 +626,11 @@ impl CpGrpcAdmissionController {
     }
 
     /// Current total active ADS streams (both methods).
-    // Exercised only from the external `tests/` crate (permit-release and
-    // unbounded-posture assertions), so the `ferrum-edge` binary target
-    // reports it as dead code.
-    #[allow(dead_code)]
     pub fn active_streams(&self) -> usize {
         self.inner.total_streams.load(Ordering::Acquire)
     }
 
     /// Current distinct active node state keys.
-    // Exercised only from the external `tests/` crate (permit-release and
-    // unbounded-posture assertions), so the `ferrum-edge` binary target
-    // reports it as dead code.
-    #[allow(dead_code)]
     pub fn active_nodes(&self) -> usize {
         self.inner.active_nodes.load(Ordering::Acquire)
     }

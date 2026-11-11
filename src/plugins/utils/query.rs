@@ -57,25 +57,19 @@ fn decode_form_urlencoded_component_for_hpp(raw: &str) -> String {
         .into_owned()
 }
 
-/// Whether one decoded query name appears with conflicting decoded values.
+/// Whether one decoded query name appears with conflicting decoded values
+/// among pre-split, still-encoded pairs, so a caller can drop excluded pairs
+/// under each separator convention.
 ///
 /// The WAF parameter-pollution rule deliberately keeps this narrower
 /// predicate: it reports the concrete first/last-value differential, while an
-/// identical repeated value does not trigger that rule. Security-sensitive
-/// routing and delegated policy must use [`CanonicalQuery`] instead, because
-/// they also fail closed on identical duplicates, encoded aliases, literal
-/// plus, and invalid encodings.
-///
-/// Both separator conventions are judged: `&` only, and `&` plus `;` for
-/// backends that also split on `;` (issue #6579). `tenant=admin&x=;tenant=victim`
-/// has one `tenant` under the first and two conflicting ones under the second.
-pub fn has_conflicting_duplicate_query_key(raw_query: &str) -> bool {
-    has_conflicting_duplicate_among(raw_query.split('&'))
-        || (raw_query.contains(';') && has_conflicting_duplicate_among(raw_query.split(['&', ';'])))
-}
-
-/// [`has_conflicting_duplicate_query_key`] over pre-split, still-encoded
-/// pairs, so a caller can drop excluded pairs under each separator convention.
+/// identical repeated value does not trigger that rule. It judges both
+/// separator conventions, `&` only and `&` plus `;` for backends that also
+/// split on `;` (issue #6579): `tenant=admin&x=;tenant=victim` has one
+/// `tenant` under the first and two conflicting ones under the second.
+/// Security-sensitive routing and delegated policy must use [`CanonicalQuery`]
+/// instead, because they also fail closed on identical duplicates, encoded
+/// aliases, literal plus, and invalid encodings.
 pub fn has_conflicting_duplicate_among<'a>(pairs: impl IntoIterator<Item = &'a str>) -> bool {
     let mut seen: HashMap<String, String> = HashMap::new();
     for pair in pairs {

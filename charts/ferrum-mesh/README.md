@@ -100,12 +100,13 @@ helm template <release> ./charts/ferrum-mesh -n <namespace> \
 `crds.install=false` without that acknowledgement fails render.
 
 Existing clusters that installed this CRD from the former `crds/` directory
-must adopt it once. **Operator action** (`--take-ownership` needs a Helm
+must let Helm take ownership of it once (a plain `helm upgrade` fails on Helm's
+own ownership check). **Operator action** (`--take-ownership` needs a Helm
 3.17+ client):
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
-  --take-ownership --set crds.adoptExisting=true
+  --take-ownership
 ```
 
 Independent `ferrum-mesh` releases in one cluster share this cluster-scoped

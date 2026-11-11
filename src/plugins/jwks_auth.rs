@@ -16,9 +16,9 @@ use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::auth_flow::{
-    self, AuthMechanism, CredentialRejection, ExtractedCredential, VerifyOutcome,
-    commit_authentication_attempt, credential_deadline_from_claims,
-    external_identity_realm_authority, nonblank_identity, refine_external_identity_realm_authority,
+    self, CredentialRejection, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
+    credential_deadline_from_claims, external_identity_realm_authority, nonblank_identity,
+    refine_external_identity_realm_authority,
 };
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
@@ -382,7 +382,6 @@ const PROVIDER_FIELDS: &[&str] = &[
     "discovery_url",
     "jwks",
     "issuer",
-    "audience",
     "audiences",
     "from_headers",
     "from_params",
@@ -404,25 +403,6 @@ const PROVIDER_FIELDS: &[&str] = &[
     "dpop_replay_max_entries",
     "jwks_max_stale_seconds",
     "clock_skew_seconds",
-];
-
-/// Provider fields removed by the shared replay-authority migration, with the
-/// replacement named explicitly. Rejected rather than ignored: a config that
-/// still carries `dpop_jti_ttl_secs` was written believing it controls how long
-/// a proof stays single-use, and silently dropping it would leave that operator
-/// with an unexamined retention contract.
-const REMOVED_PROVIDER_FIELDS: &[(&str, &str)] = &[
-    (
-        "dpop_jti_ttl_secs",
-        "replay retention is no longer configurable — every marker is retained for a fixed \
-         horizon that dominates the widest admissible clock skew, so no reload can shorten the \
-         protection of an already-admitted proof",
-    ),
-    (
-        "dpop_jti_cache_max_entries",
-        "renamed to `dpop_replay_max_entries`; it now bounds a process replay lane that never \
-         evicts an unexpired marker (at capacity the request is refused instead)",
-    ),
 ];
 
 impl Drop for JwksAuth {
@@ -482,7 +462,6 @@ impl JwksAuth {
     /// a process readiness dependency or arms a Redis recovery task. Live
     /// readiness is published from
     /// [`crate::plugins::Plugin::commit_background_tasks`].
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         Self::new_with_config_id(config, http_client, None)
     }
@@ -505,7 +484,12 @@ impl JwksAuth {
                 config = config.to_string()
             )
         })?;
-        reject_unknown_fields(config_obj, &root_config_fields(), "config")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            &root_config_fields(),
+            "jwks_auth: `config`: ",
+        )?;
 
         // A blank id would collapse every jwks_auth config in a namespace onto
         // one replay domain; fail closed rather than merge them.
@@ -669,8 +653,12 @@ impl JwksAuth {
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
-            reject_removed_provider_fields(prov_obj, idx)?;
-            reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
+            crate::util::unknown_keys::reject_unknown_keys(
+                prov_obj,
+                &format!("provider[{idx}]"),
+                PROVIDER_FIELDS,
+                &format!("jwks_auth: `provider[{idx}]`: "),
+            )?;
 
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
             let discovery_endpoint = parse_url_field(prov_obj, "discovery_url", idx)?;
@@ -1181,7 +1169,6 @@ impl JwksAuth {
 
     /// Eagerly fetch JWKS keys for all providers that have stores ready.
     /// Called by tests to pre-populate key stores before assertions.
-    #[allow(dead_code)]
     pub async fn warmup_jwks(&self) {
         for prov in &self.providers {
             let guard = prov.jwks_store.load();
@@ -1206,7 +1193,6 @@ impl JwksAuth {
     /// Live remote JWKS stores backing this plugin's providers. Test-only
     /// visibility for the unknown-`kid` on-demand refetch contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn remote_jwks_stores_for_test(&self) -> Vec<Arc<JwksKeyStore>> {
         self.providers
             .iter()
@@ -1227,7 +1213,6 @@ impl JwksAuth {
     /// Test-only visibility for default-contract regressions and for proving
     /// a reloaded generation enforces its own admitted cap.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_lane_capacities(&self) -> Vec<Option<usize>> {
         self.providers
             .iter()
@@ -1242,7 +1227,6 @@ impl JwksAuth {
     /// Per-provider replay-authority modes (`None` when DPoP is not required).
     /// Test-only visibility for scope/reload contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_modes(&self) -> Vec<Option<&'static str>> {
         self.providers
             .iter()
@@ -1253,7 +1237,6 @@ impl JwksAuth {
     /// Whether any provider's shared Redis recovery checker has been armed.
     /// Test support for proving construction stays detached until commit.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn shared_replay_recovery_started_for_test(&self) -> bool {
         self.providers.iter().any(|provider| {
             provider
@@ -1267,7 +1250,6 @@ impl JwksAuth {
     /// "equivalent reload / equivalent replica converge, distinct policies
     /// isolate" contracts.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn dpop_replay_domain_markers(&self, jkt: &str, jti: &str) -> Vec<Option<[u8; 32]>> {
         self.providers
             .iter()
@@ -1280,12 +1262,7 @@ impl JwksAuth {
             .collect()
     }
 
-    fn resolve_identity(
-        &self,
-        claims: &Value,
-        provider: &JwksProvider,
-        _consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
+    fn resolve_identity(&self, claims: &Value, provider: &JwksProvider) -> VerifyOutcome {
         let effective_identity_claim = provider
             .consumer_identity_claim
             .as_deref()
@@ -1431,13 +1408,6 @@ impl JwksAuth {
         self.sender_constrained_issuers
             .iter()
             .any(|constrained| constrained == issuer)
-    }
-
-    /// Try to validate a token against all configured providers.
-    async fn validate_token(&self, token: &str) -> Result<(Value, usize), (u16, &'static str)> {
-        let provider_indices: Vec<usize> = (0..self.providers.len()).collect();
-        self.validate_token_for_providers(token, &provider_indices)
-            .await
     }
 
     /// Check required_scopes and required_roles for a matched provider.
@@ -1696,11 +1666,7 @@ impl JwksAuth {
         );
     }
 
-    async fn authenticate_request(
-        &self,
-        ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
-    ) -> PluginResult {
+    async fn authenticate_request(&self, ctx: &mut RequestContext) -> PluginResult {
         let credential = self.extract_jwks_credential(ctx);
 
         match credential {
@@ -1807,7 +1773,7 @@ impl JwksAuth {
                 match commit_authentication_attempt(
                     ctx,
                     attempt,
-                    self.resolve_identity(&claims, provider, consumer_index),
+                    self.resolve_identity(&claims, provider),
                     "jwks_auth",
                     true,
                 ) {
@@ -1963,90 +1929,13 @@ impl JwksAuth {
     }
 }
 
-#[async_trait]
-impl AuthMechanism for JwksAuth {
-    fn mechanism_name(&self) -> &'static str {
-        "jwks_auth"
-    }
-
-    fn authentication_challenge(&self) -> &'static str {
-        self.advertised_challenge
-    }
-
+impl JwksAuth {
+    /// `WWW-Authenticate` challenge for a rejected bearer credential, with the
+    /// RFC 6750 §3.1 `error` code.
     fn rejection_challenge(&self, rejection: CredentialRejection) -> &'static str {
         match rejection {
             CredentialRejection::InvalidFormat => auth_flow::BEARER_INVALID_REQUEST_CHALLENGE,
             CredentialRejection::InvalidCredential => auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
-        }
-    }
-
-    fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        match self.extract_jwks_credential(ctx) {
-            JwksExtractedCredential::Missing => ExtractedCredential::Missing,
-            JwksExtractedCredential::InvalidFormat(body) => {
-                ExtractedCredential::InvalidFormat(body)
-            }
-            JwksExtractedCredential::BearerToken {
-                token,
-                dpop_scheme: false,
-                ..
-            } => ExtractedCredential::BearerToken(token),
-            // This mechanism path runs no sender-constraint check, so a
-            // `DPoP`-scheme presentation must not reach it as a plain bearer
-            // token. The plugin's own `authenticate` is the only entry point
-            // that validates and claims the proof.
-            JwksExtractedCredential::BearerToken {
-                dpop_scheme: true, ..
-            } => ExtractedCredential::Missing,
-        }
-    }
-
-    async fn verify(
-        &self,
-        credential: ExtractedCredential,
-        consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
-        let ExtractedCredential::BearerToken(token) = credential else {
-            return VerifyOutcome::NotApplicable;
-        };
-
-        let (claims, provider_idx) = match self.validate_token(&token).await {
-            Ok(result) => result,
-            Err((status, body)) => {
-                return if status == 403 {
-                    VerifyOutcome::Forbidden(body.to_string())
-                } else {
-                    VerifyOutcome::InvalidFormat(body.to_string())
-                };
-            }
-        };
-
-        let provider = &self.providers[provider_idx];
-        if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
-            return if status == 403 {
-                VerifyOutcome::Forbidden(body)
-            } else {
-                VerifyOutcome::Invalid(body)
-            };
-        }
-
-        // This generic mechanism path is not a production entry point — the
-        // plugin's own `authenticate` is — and it cannot stage the provider's
-        // identity-realm authority. It therefore never yields an external
-        // identity, which would otherwise commit under a mechanism-only realm
-        // shared by every provider: only a mapped Consumer survives here.
-        match self.resolve_identity(&claims, provider, consumer_index) {
-            VerifyOutcome::Success {
-                consumer,
-                credential_deadline,
-                ..
-            } => VerifyOutcome::Success {
-                consumer,
-                external_identity: None,
-                external_identity_header: None,
-                credential_deadline,
-            },
-            other => other,
         }
     }
 }
@@ -2221,9 +2110,11 @@ impl super::Plugin for JwksAuth {
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
-        consumer_index: &ConsumerIndex,
+        _consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        self.authenticate_request(ctx, consumer_index).await
+        // External claims are scoped to the provider that verified them; a
+        // verified identity is never resolved to a gateway Consumer.
+        self.authenticate_request(ctx).await
     }
 
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
@@ -2728,32 +2619,6 @@ fn default_dpop_redis_key_prefix(namespace: &str, plugin_config_id: &str) -> Str
     prefix
 }
 
-/// Reject provider fields the shared replay authority removed, naming the
-/// replacement. See [`REMOVED_PROVIDER_FIELDS`].
-fn reject_removed_provider_fields(config: &Map<String, Value>, idx: usize) -> Result<(), String> {
-    for (removed, guidance) in REMOVED_PROVIDER_FIELDS {
-        if config.contains_key(*removed) {
-            return Err(format!(
-                "jwks_auth: `provider[{idx}].{removed}` was removed — {guidance}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn reject_unknown_fields(
-    config: &Map<String, Value>,
-    allowed: &[&str],
-    context: &str,
-) -> Result<(), String> {
-    for field in config.keys() {
-        if !allowed.contains(&field.as_str()) {
-            return Err(format!("jwks_auth: unknown field {field:?} in `{context}`"));
-        }
-    }
-    Ok(())
-}
-
 fn optional_u64(
     config: &Map<String, Value>,
     field: &str,
@@ -3151,16 +3016,7 @@ fn parse_audiences(
     config: &Map<String, Value>,
     provider_idx: usize,
 ) -> Result<Vec<String>, String> {
-    let legacy_audience = optional_non_empty_string(config, "audience", provider_idx)?;
-    let mut audiences = parse_string_array(config, "audiences", provider_idx)?;
-
-    if let Some(audience) = legacy_audience
-        && !audiences.iter().any(|known| known == &audience)
-    {
-        audiences.push(audience);
-    }
-
-    Ok(audiences)
+    parse_string_array(config, "audiences", provider_idx)
 }
 
 fn parse_string_array(
@@ -3217,10 +3073,11 @@ fn parse_token_locations(
                     header = header.to_string()
                 )
             })?;
-            reject_unknown_fields(
+            crate::util::unknown_keys::reject_unknown_keys(
                 object,
-                &["name", "prefix"],
                 &format!("provider[{provider_idx}].from_headers[{idx}]"),
+                &["name", "prefix"],
+                &format!("jwks_auth: `provider[{provider_idx}].from_headers[{idx}]`: "),
             )?;
             let name_value = object.get("name").ok_or_else(|| {
                 format!(

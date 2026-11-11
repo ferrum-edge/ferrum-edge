@@ -381,7 +381,6 @@ pub fn abort_reload() -> Result<(), String> {
 /// scope it to cover both their writes (begin/register/commit) and any
 /// `lookup_named` assertions that follow the commit.
 #[doc(hidden)]
-#[allow(dead_code)]
 #[must_use = "drop the guard to release the reload-bracket serializer"]
 pub fn lock_for_tests() -> ReloadBracketTestGuard {
     enter_bracket();
@@ -451,7 +450,6 @@ pub fn registered_names() -> Vec<String> {
 /// Does NOT touch the thread-local bracket keeper — tests holding
 /// `lock_for_tests()` continue to own the serializer across this call.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn reset_for_tests() {
     let mut state = write_lock();
     state.schemas.clear();

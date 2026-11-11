@@ -441,9 +441,7 @@ executable/configuration prose, including Markdown. Its historical
 "Benches deferred (not yet implemented)" section is **not** the current
 backlog source of truth and must remain unchanged. Live suite status and the
 published `mesh-hbone-e2e` / `mesh-dns-e2e` baseline pointers are documented
-here (and in
-[`docs/backlog/issue_2110_register.md`](backlog/issue_2110_register.md))
-instead of rewriting that protected README.
+here instead of rewriting that protected README.
 
 ## Related surfaces
 

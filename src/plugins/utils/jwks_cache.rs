@@ -36,7 +36,7 @@
 //! latest completed union, not an eventually convergent one.
 
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock, TryLockError};
@@ -303,7 +303,6 @@ impl LateActiveRequirement {
     /// reconciliation finds the reconciliation gate already held, immediately
     /// before it blocks on it. Lets external tests observe contention.
     #[doc(hidden)]
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn register_with_gate_contended_hook_for_test(
         jwks_uri: &str,
         requirement: JwksRefreshRequirement,
@@ -574,7 +573,6 @@ fn schedule_trust_health_watch(next_watch: Option<Instant>) {
 
 /// Current watcher generation for external regression tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn trust_health_watch_generation_for_test() -> u64 {
     TRUST_HEALTH_WATCH_GENERATION.load(Ordering::Acquire)
 }
@@ -713,7 +711,6 @@ pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefr
 /// computed the active union and before it applies it, while the
 /// reconciliation gate is held. Lets external tests force an interleaving.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn retain_active_requirements_with_after_snapshot_hook_for_test(
     active_requirements: &HashMap<String, JwksRefreshRequirement>,
     hook: &dyn Fn(),
@@ -807,36 +804,6 @@ fn acquire_reconcile_gate(on_contended: Option<&dyn Fn()>) -> MutexGuard<'static
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
-}
-
-/// Remove JWKS cache entries whose URIs are not in `active_uris`.
-///
-/// Lower-level test-only helper: it decides activity from a bare URI set and
-/// deliberately ignores both the committed requirement map and late
-/// contributions. Production reconciliation goes through
-/// [`retain_active_requirements`] / [`reconcile_active_requirements`].
-///
-/// Aborts the background refresh task for each removed entry so leaked tokio
-/// tasks don't accumulate across config reloads. Stores still owned by a
-/// retired plugin generation are reaped after their final external owner
-/// drops. External unit tests use this lower-level helper to exercise
-/// retirement independently from refresh-interval reconciliation.
-#[allow(dead_code)] // exercised by external unit tests
-pub fn retain_active_uris(active_uris: &HashSet<String>) {
-    let cache = global_cache();
-    cache.retain(|uri, entry| {
-        if active_uris.contains(uri) {
-            // Cancel a reaper scheduled by an older publication if this URI is
-            // active again in the newly committed plugin generation.
-            entry.active.store(true, Ordering::Release);
-            entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
-            true
-        } else {
-            entry.active.store(false, Ordering::Release);
-            retain_retired_entry(uri, entry)
-        }
-    });
-    republish_trust_health();
 }
 
 fn retain_retired_entry(uri: &str, entry: &JwksCacheEntry) -> bool {
@@ -992,7 +959,6 @@ pub fn retire_jwks_store_if_unreferenced(jwks_uri: &str) {
 
 /// Return the current interval and task generation for diagnostics and tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_refresh_state(jwks_uri: &str) -> Option<(Duration, u64)> {
     global_cache().get(jwks_uri).map(|entry| {
         (
@@ -1004,7 +970,6 @@ pub fn cached_refresh_state(jwks_uri: &str) -> Option<(Duration, u64)> {
 
 /// Return the shared store for a URI without creating or reviving an entry.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_store(jwks_uri: &str) -> Option<Arc<JwksKeyStore>> {
     global_cache()
         .get(jwks_uri)
@@ -1013,7 +978,6 @@ pub fn cached_store(jwks_uri: &str) -> Option<Arc<JwksKeyStore>> {
 
 /// Return whether the entry is in the active set, for lifecycle tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_active(jwks_uri: &str) -> Option<bool> {
     global_cache()
         .get(jwks_uri)
@@ -1022,7 +986,6 @@ pub fn cached_active(jwks_uri: &str) -> Option<bool> {
 
 /// Return the current strict shared-store policy for diagnostics and tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_requirement(jwks_uri: &str) -> Option<JwksRefreshRequirement> {
     global_cache()
         .get(jwks_uri)
@@ -1105,7 +1068,6 @@ pub fn render_prometheus() -> String {
 
 /// Return reaper-scheduling state for lifecycle tests.
 #[doc(hidden)]
-#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_reaper_generation(jwks_uri: &str) -> Option<u64> {
     global_cache()
         .get(jwks_uri)
@@ -1113,7 +1075,6 @@ pub fn cached_reaper_generation(jwks_uri: &str) -> Option<u64> {
 }
 
 /// Clear the global JWKS cache. Used in tests to isolate state between runs.
-#[allow(dead_code)]
 pub fn clear_jwks_cache() {
     if let Some(cache) = JWKS_CACHE.get() {
         // Abort all background refresh tasks before clearing

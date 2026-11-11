@@ -44,6 +44,7 @@ use super::utils::introspection_cache::{
 use super::utils::oauth_client_auth::{self, BasicCredentialsError, PrivateKeyDecodeError};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
+use super::utils::session_cookie::contains_unresolved_env_placeholder;
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
     extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
@@ -296,8 +297,9 @@ impl Oauth2Introspection {
                 config = config.to_string()
             )
         })?;
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             config_obj,
+            "config",
             &[
                 "providers",
                 "scope_claim",
@@ -307,7 +309,7 @@ impl Oauth2Introspection {
                 "allow_provider_fanout",
                 "max_concurrent_introspections",
             ],
-            "oauth2_introspection",
+            "oauth2_introspection: `config`: ",
         )?;
         let allow_provider_fanout =
             optional_top_level_bool(config_obj, "allow_provider_fanout", "oauth2_introspection")?
@@ -361,8 +363,9 @@ impl Oauth2Introspection {
                     prov_cfg = prov_cfg.to_string()
                 )
             })?;
-            reject_unknown_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 prov_obj,
+                &format!("provider[{idx}]"),
                 &[
                     "introspection_endpoint",
                     "discovery_url",
@@ -390,7 +393,7 @@ impl Oauth2Introspection {
                     "discovery_refresh_interval_secs",
                     "accept_mtls_bound_tokens",
                 ],
-                &format!("oauth2_introspection: `provider[{idx}]`"),
+                &format!("oauth2_introspection: `provider[{idx}]`: "),
             )?;
 
             let endpoint = parse_url_field(prov_obj, "introspection_endpoint", idx)?;
@@ -646,7 +649,6 @@ impl Oauth2Introspection {
     /// Per provider, how many discovery attempts the background worker has
     /// fully processed (`0` for a provider without `discovery_url`). Lets
     /// external tests wait for a refresh outcome instead of sleeping.
-    #[allow(dead_code)] // exercised by external unit tests
     pub fn completed_discovery_attempts(&self) -> Vec<u64> {
         self.providers
             .iter()
@@ -1834,10 +1836,11 @@ fn parse_client_auth(
         })?,
         None => Map::new(),
     };
-    reject_unknown_keys(
+    crate::util::unknown_keys::reject_unknown_keys(
         &auth,
+        &format!("provider[{provider_idx}].client_auth"),
         &CLIENT_AUTH_STRING_FIELDS,
-        &format!("oauth2_introspection: `provider[{provider_idx}].client_auth`"),
+        &format!("oauth2_introspection: `provider[{provider_idx}].client_auth`: "),
     )?;
     // Every accepted `client_auth` key is a string, whether or not the selected
     // method reads it. Type-checking the whole object here — instead of only
@@ -1915,11 +1918,7 @@ fn parse_client_auth(
                     "oauth2_introspection: `provider[{provider_idx}].client_auth.client_id` is required"
                 )
             })?;
-            let client_secret = required_auth_string(
-                &auth,
-                "client_secret",
-                provider_idx,
-            )?;
+            let client_secret = required_client_secret(&auth, provider_idx)?;
             Ok(ClientAuth::Basic {
                 authorization: oauth_basic_authorization_header(&client_id, &client_secret)?,
             })
@@ -1930,11 +1929,7 @@ fn parse_client_auth(
                     "oauth2_introspection: `provider[{provider_idx}].client_auth.client_id` is required"
                 )
             })?,
-            client_secret: SecretString(required_auth_string(
-                &auth,
-                "client_secret",
-                provider_idx,
-            )?),
+            client_secret: SecretString(required_client_secret(&auth, provider_idx)?),
         }),
         "private_key_jwt" => {
         let client_id = client_id.ok_or_else(|| {
@@ -2028,6 +2023,24 @@ fn required_auth_string(
     Ok(raw.to_string())
 }
 
+/// `client_auth.client_secret`, refused when it holds a `${NAME}` placeholder.
+/// Plugin config is never environment-expanded, so such a value would be sent
+/// to the provider verbatim and every introspection call would fail with no
+/// admission error pointing at the cause (issue #7275).
+fn required_client_secret(
+    auth: &Map<String, Value>,
+    provider_idx: usize,
+) -> Result<String, String> {
+    let secret = required_auth_string(auth, "client_secret", provider_idx)?;
+    if contains_unresolved_env_placeholder(&secret) {
+        return Err(format!(
+            "oauth2_introspection: `provider[{provider_idx}].client_auth.client_secret` contains \
+             an unresolved `${{NAME}}` placeholder; plugin config values are literal"
+        ));
+    }
+    Ok(secret)
+}
+
 fn oauth_basic_authorization_header(
     client_id: &str,
     client_secret: &str,
@@ -2078,10 +2091,11 @@ fn parse_token_locations(
                     "oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}]` must be an object"
                 )
             })?;
-            reject_unknown_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 object,
+                &format!("provider[{provider_idx}].from_headers[{idx}]"),
                 &["name", "prefix"],
-                &format!("oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}]`"),
+                &format!("oauth2_introspection: `provider[{provider_idx}].from_headers[{idx}]`: "),
             )?;
             let raw_name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
                 format!(
@@ -2131,17 +2145,6 @@ fn optional_claim_path(
         Some(value) => parse_claim_path_value(field, value, plugin),
         None => Ok(default_value.to_string()),
     }
-}
-
-fn reject_unknown_keys(
-    object: &Map<String, Value>,
-    allowed: &[&str],
-    path: &str,
-) -> Result<(), String> {
-    if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(format!("{path} contains unknown field {unknown:?}"));
-    }
-    Ok(())
 }
 
 fn optional_top_level_bool(

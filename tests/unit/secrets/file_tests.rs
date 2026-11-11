@@ -1,7 +1,15 @@
-use ferrum_edge::secrets::file::{read_secret, read_secret_detached, resolve_ref};
+use ferrum_edge::secrets::file::read_secret_detached;
 use std::io::Write;
 
-use crate::unit::env_lock::EnvGuard;
+/// Drive the production `_FILE` reader ([`read_secret_detached`]) to completion
+/// from a synchronous test.
+fn read_secret(path: &str, key: &str) -> Result<String, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(read_secret_detached(path, key))
+}
 
 #[test]
 fn file_secret_reads_use_detached_os_thread_not_spawn_blocking() {
@@ -159,24 +167,4 @@ fn read_secret_rejects_oversized_file_without_leaking_value() {
     assert!(err.contains("exceeds the maximum"));
     assert!(!err.contains(path), "path leaked: {err}");
     assert!(!err.contains(&"Z".repeat(16)), "value leaked: {err}");
-}
-
-#[test]
-fn resolve_ref_returns_none_when_not_set() {
-    let _env = EnvGuard::new(&[]);
-    assert!(resolve_ref("FERRUM_TEST_SECRET_NOT_SET_XYZ_99999").is_none());
-}
-
-#[test]
-fn resolve_ref_returns_path_when_set() {
-    let env = EnvGuard::new(&[]);
-
-    let key = "FERRUM_TEST_SECRET_FILE_REF_12345";
-    let file_key = format!("{}_FILE", key);
-    env.set(&file_key, "/run/secrets/db_password");
-    assert_eq!(
-        resolve_ref(key),
-        Some("/run/secrets/db_password".to_string())
-    );
-    env.unset(&file_key);
 }

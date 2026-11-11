@@ -1219,10 +1219,7 @@ impl NetnsBackend for ProxyNetnsBackend {
             run_accept_loop(
                 listener,
                 Arc::new(state),
-                ListenerTlsSource::Static {
-                    tls_config: None,
-                    record_mesh_mtls_metric: false,
-                },
+                ListenerTlsSource::Static { tls_config: None },
                 conn_semaphore,
                 stop_rx,
                 mesh_direction,

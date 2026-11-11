@@ -6,7 +6,7 @@ the authoritative source for every `FERRUM_*` setting named anywhere else.
 
 Repository-root companions: [README.md](../README.md),
 [FEATURES.md](../FEATURES.md), [ARCHITECTURE.md](../ARCHITECTURE.md),
-[PRODUCTION_READINESS.md](../PRODUCTION_READINESS.md), [SECURITY.md](../SECURITY.md),
+[SECURITY.md](../SECURITY.md),
 [CONTRIBUTING.md](../CONTRIBUTING.md), [CHANGELOG.md](../CHANGELOG.md),
 [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md), [WEBSOCKET.md](../WEBSOCKET.md),
 [CONFORMANCE.md](../CONFORMANCE.md), [openapi.yaml](../openapi.yaml).
@@ -18,6 +18,7 @@ Repository-root companions: [README.md](../README.md),
 | [hardening.md](hardening.md) | **Production hardening checklist** — every surface, the setting that secures it, and the "never in production" list |
 | [threat_model.md](threat_model.md) | **Threat model** — trust boundaries, attacker capabilities, controls, and documented residuals |
 | [support_policy.md](support_policy.md) | **Support, versioning, and deprecation policy** — what a version number promises today and after 1.0 |
+| [deliberate_decisions.md](deliberate_decisions.md) | **Deliberate decisions** — trade-offs made on purpose (bounded UDP amplification, strict admin `aud`, expired-CRL refusal, `panic = "abort"`, ...) and the tests that pin them |
 | [configuration.md](configuration.md) | The complete `FERRUM_*` environment variable reference and file-mode config format |
 
 ## Operator
@@ -142,7 +143,6 @@ Contributing to Ferrum Edge itself.
 | [plans/mesh_multicluster_lifecycle_adr.md](plans/mesh_multicluster_lifecycle_adr.md) | ADR: mesh multicluster lifecycle |
 | [plans/node_waypoint_transport_adr.md](plans/node_waypoint_transport_adr.md) | ADR: NodeWaypoint secured transport |
 | [plans/test_framework_scripted_backends.md](plans/test_framework_scripted_backends.md) | Scripted-backend test framework record |
-| [backlog/issue_2110_register.md](backlog/issue_2110_register.md) | Historical deferral register for issue #2110 |
 
 ## Dated reports
 

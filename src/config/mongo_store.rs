@@ -1141,67 +1141,6 @@ mod inner {
         }
     }
 
-    /// Step labels for the standalone-mongod (no-replica-set) `delete_proxy`
-    /// path, in execution order. Documented as data so the order can be
-    /// regression-tested without a running MongoDB server.
-    pub(super) const DELETE_PROXY_SEQUENTIAL_ORDER: &[&str] = &[
-        "delete_proxy_document",
-        "delete_proxy_scoped_plugin_configs",
-        "cleanup_orphaned_proxy_group_plugins",
-    ];
-
-    /// Step labels for the standalone-mongod (no-replica-set)
-    /// `replace_api_spec_bundle` delete phase, in execution order. The proxy
-    /// document is removed first so any later partial failure leaves no live
-    /// route with missing plugin/upstream dependencies.
-    pub(super) const REPLACE_API_SPEC_STANDALONE_DELETE_ORDER: &[&str] = &[
-        "delete_proxy_document",
-        "delete_spec_owned_plugin_configs",
-        "delete_spec_owned_upstreams",
-        "delete_api_spec_document",
-    ];
-
-    /// Step labels for the standalone-mongod (no-replica-set)
-    /// `delete_api_spec` path, in execution order. The proxy document is removed
-    /// first for the same runtime-safety reason as `delete_proxy`.
-    pub(super) const DELETE_API_SPEC_STANDALONE_ORDER: &[&str] = &[
-        "delete_proxy_document",
-        "delete_spec_owned_plugin_configs",
-        "delete_proxy_scoped_plugin_configs",
-        "cleanup_orphaned_proxy_group_plugins",
-        "delete_spec_owned_upstreams",
-        "delete_api_spec_document",
-    ];
-
-    /// Step labels for standalone-mongod api-spec bundle inserts/reinserts.
-    /// Dependency documents are created before the proxy document so polling can
-    /// never observe a live proxy that points at missing plugin/upstream docs.
-    pub(super) const API_SPEC_STANDALONE_INSERT_ORDER: &[&str] = &[
-        "insert_upstream_document",
-        "insert_plugin_config_documents",
-        "insert_proxy_document",
-        "insert_api_spec_document",
-    ];
-
-    /// Step labels for compensating rollback after a partial standalone insert.
-    /// The proxy is removed before plugin/upstream dependencies so rollback
-    /// failures preserve a runtime-safe route if the proxy cannot be deleted.
-    pub(super) const COMPENSATE_BUNDLE_INSERT_ORDER: &[&str] = &[
-        "delete_api_spec_document",
-        "delete_proxy_document",
-        "delete_plugin_config_documents",
-        "delete_upstream_document",
-    ];
-
-    /// Step labels for the standalone-mongod (no-replica-set) `update_proxy`
-    /// path, in execution order. Cleanup runs after the replace because the
-    /// new proxy.plugins array determines which proxy_group plugin_configs
-    /// are still referenced.
-    pub(super) const UPDATE_PROXY_SEQUENTIAL_ORDER: &[&str] = &[
-        "replace_proxy_document",
-        "cleanup_orphaned_proxy_group_plugins",
-    ];
-
     /// Topology label passed to Mongo reconnect publication test hooks
     /// (issue #3001).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2196,7 +2135,6 @@ mod inner {
         /// Builds a driver `Client` against empty hosts (no live MongoDB). Used
         /// by external unit tests through `_test_support` to prove Admin /
         /// admission publication gating without network I/O.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub fn new_unconnected_for_test(failover_urls: Vec<String>) -> Result<Self, anyhow::Error> {
             let settings = MongoConnSettings {
                 database_name: "test".to_string(),
@@ -2251,7 +2189,6 @@ mod inner {
 
         /// Publish a synthetic connection bundle through the production
         /// publication helper (Admin + admission fail-fast gates).
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub async fn try_publish_reconnected_bundle_for_test(
             &self,
             database_name: &str,
@@ -2275,7 +2212,6 @@ mod inner {
 
         /// Admission-generation read pin used by external tests to simulate an
         /// in-flight mTLS DNS admission without talking to MongoDB.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub async fn acquire_connection_generation_pin_for_test(
             &self,
         ) -> tokio::sync::OwnedRwLockReadGuard<()> {
@@ -2283,7 +2219,6 @@ mod inner {
         }
 
         /// Active database name from the published connection bundle.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub fn published_database_name_for_test(&self) -> String {
             self.db().name().to_string()
         }
@@ -3301,7 +3236,6 @@ mod inner {
         /// Test seam: retain a fence for `namespace` exactly as an uncertain
         /// single-call guard's Drop does, handing over a real generation read
         /// pin so tests can prove the pin is released while the fence stays.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub async fn retain_mtls_dns_admission_fence_for_test(&self, namespace: &str, owner: &str) {
             let generation_guard = self.connection_generation.clone().read_owned().await;
             self.admission_fences.retain(
@@ -3316,7 +3250,6 @@ mod inner {
         /// Test seam: register a live multi-step persistent pin (holding the
         /// generation read pin). `uncertain` marks a borrowed mutation whose
         /// outcome is unknown; `false` models a settled owner about to release.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub async fn insert_persistent_admission_pin_for_test(
             &self,
             namespace: &str,
@@ -3339,7 +3272,6 @@ mod inner {
 
         /// Test seam: the fail-closed fence gate admission runs under its
         /// generation read pin (no I/O).
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub fn ensure_mtls_dns_admission_unfenced_for_test(
             &self,
             namespace: &str,
@@ -3350,7 +3282,6 @@ mod inner {
         /// Test seam: apply one exit-probe outcome to every retained fence on
         /// `namespace` through the production decision. Returns how many
         /// entries were cleared.
-        #[allow(dead_code)] // exercised via external unit tests through the lib target
         pub fn apply_mtls_dns_admission_fence_probe_for_test(
             &self,
             namespace: &str,
@@ -9746,33 +9677,23 @@ mod inner {
         mut doc: Document,
     ) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
         doc.remove("_id");
-        match doc.remove("ts") {
-            Some(Bson::DateTime(ts)) => {
-                let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
-                    .ok_or_else(|| anyhow::anyhow!("audit event ts is outside chrono range"))?;
-                doc.insert("ts", ts.to_rfc3339());
-            }
-            Some(other) => {
-                doc.insert("ts", other);
-            }
-            None => {}
-        }
-        let diff = match doc.remove("diff") {
-            Some(Bson::String(diff_json)) => Some(serde_json::from_str(&diff_json)?),
-            Some(other) => {
-                doc.insert("diff", other);
-                None
-            }
-            None => Some(serde_json::Value::Object(serde_json::Map::new())),
+        // `audit_event_to_doc` is the only writer: `ts` is always a BSON
+        // DateTime and `diff` always JSON text. Build-out keeps no decoders
+        // for other shapes (issue #7218).
+        let Some(Bson::DateTime(ts)) = doc.remove("ts") else {
+            anyhow::bail!("audit event ts must be a BSON DateTime");
         };
-        if diff.is_some() {
-            doc.insert("diff", Bson::Document(Document::new()));
-        }
+        let ts = DateTime::<Utc>::from_timestamp_millis(ts.timestamp_millis())
+            .ok_or_else(|| anyhow::anyhow!("audit event ts is outside chrono range"))?;
+        doc.insert("ts", ts.to_rfc3339());
+        let Some(Bson::String(diff_json)) = doc.remove("diff") else {
+            anyhow::bail!("audit event diff must be JSON text");
+        };
+        let diff: serde_json::Value = serde_json::from_str(&diff_json)?;
+        doc.insert("diff", Bson::Document(Document::new()));
 
         let mut event: crate::admin::audit::AuditEvent = mongodb::bson::from_document(doc)?;
-        if let Some(diff) = diff {
-            event.diff = diff;
-        }
+        event.diff = diff;
         Ok(event)
     }
 
@@ -9785,31 +9706,11 @@ mod inner {
         snapshot_projected: bool,
     ) -> Result<ApiSpec, anyhow::Error> {
         doc.remove("_id");
+        // `api_spec_to_doc` writes both blobs as BSON Binary; build-out keeps
+        // no decoder for the retired integer-array shape (issue #7218).
         let spec_content = match doc.remove("spec_content") {
             Some(Bson::Binary(binary)) => binary.bytes,
-            Some(Bson::Array(values)) => {
-                let mut bytes = Vec::with_capacity(values.len());
-                for value in values {
-                    let byte = match value {
-                        Bson::Int32(v) if (0..=u8::MAX as i32).contains(&v) => v as u8,
-                        Bson::Int64(v) if (0..=u8::MAX as i64).contains(&v) => v as u8,
-                        other => {
-                            anyhow::bail!(
-                                "api_specs.spec_content array contains non-byte value: {:?}",
-                                other
-                            );
-                        }
-                    };
-                    bytes.push(byte);
-                }
-                bytes
-            }
-            Some(other) => {
-                anyhow::bail!(
-                    "api_specs.spec_content has unexpected BSON type: {:?}",
-                    other
-                );
-            }
+            Some(_) => anyhow::bail!("api_specs.spec_content has an unexpected BSON type"),
             None => anyhow::bail!("api_specs.spec_content missing"),
         };
         let external_ref_snapshot = match doc.remove("external_ref_snapshot") {
@@ -9822,27 +9723,6 @@ mod inner {
                 Some(binary.bytes)
             }
             Some(Bson::Null) | None => None,
-            Some(Bson::Array(values)) => {
-                if values.len()
-                    > crate::admin::api_specs::external_refs::MAX_EXTERNAL_REF_SNAPSHOT_COMPRESSED_BYTES
-                {
-                    anyhow::bail!("api_specs.external_ref_snapshot exceeds size limit");
-                }
-                let mut bytes = Vec::with_capacity(values.len());
-                for value in values {
-                    let byte = match value {
-                        Bson::Int32(v) if (0..=u8::MAX as i32).contains(&v) => v as u8,
-                        Bson::Int64(v) if (0..=u8::MAX as i64).contains(&v) => v as u8,
-                        _ => {
-                            anyhow::bail!(
-                                "api_specs.external_ref_snapshot array contains a non-byte value"
-                            );
-                        }
-                    };
-                    bytes.push(byte);
-                }
-                Some(bytes)
-            }
             Some(_) => {
                 anyhow::bail!("api_specs.external_ref_snapshot has an unexpected BSON type");
             }
@@ -14535,7 +14415,10 @@ mod inner {
             self.write_conditional_namespace(restore, mode).await
         }
 
-        async fn batch_create_proxies(
+        // MongoDB embeds plugin references in the proxy document, so there is
+        // no separate association write to skip: the SQL backend's
+        // "without plugins" split exists only for its junction table.
+        async fn batch_create_proxies_without_plugins(
             &self,
             proxies: &[Proxy],
             mode: &BatchConfigWriteMode,
@@ -14600,7 +14483,7 @@ mod inner {
                         })
                         .await
                         .map_err(anyhow::Error::new)
-                        .context("batch_create_proxies transaction failed")?;
+                        .context("batch proxy insert transaction failed")?;
                     let namespaces: HashSet<String> = proxies
                         .iter()
                         .map(|proxy| proxy.namespace.clone())
@@ -14657,17 +14540,6 @@ mod inner {
             .await?;
             Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
-        }
-
-        async fn batch_create_proxies_without_plugins(
-            &self,
-            proxies: &[Proxy],
-            mode: &BatchConfigWriteMode,
-        ) -> Result<usize, anyhow::Error> {
-            // In MongoDB, plugins are embedded in the proxy document, so this
-            // is the same as batch_create_proxies. The distinction only matters
-            // for the SQL backend where plugin associations are in a junction table.
-            self.batch_create_proxies(proxies, mode).await
         }
 
         async fn batch_attach_proxy_plugins(
@@ -18053,6 +17925,10 @@ mod inner {
         async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
             MongoStore::prune_audit_events(self, namespace).await
         }
+
+        async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+            MongoStore::prune_expired_audit_events(self).await
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -18087,6 +17963,46 @@ mod inner {
         pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
             self.prune_audit_events_with_mode(namespace, /* force_max_rows */ true)
                 .await
+        }
+
+        /// Periodic age-retention sweep across every namespace that holds
+        /// audit rows (parity with SQL; see
+        /// [`DatabaseBackend::prune_expired_audit_events`]). Namespaces are
+        /// walked one seek at a time on the `{namespace, ts, id}` index.
+        pub async fn prune_expired_audit_events(&self) -> Result<u64, anyhow::Error> {
+            let Some(days) = self.audit_retention.retention_days else {
+                return Ok(0);
+            };
+            let start = std::time::Instant::now();
+            let mut deleted = 0u64;
+            let mut previous: Option<String> = None;
+            loop {
+                let filter = match previous.as_deref() {
+                    None => doc! {},
+                    Some(after) => doc! { "namespace": { "$gt": after } },
+                };
+                let options = FindOptions::builder()
+                    .sort(doc! { "namespace": 1 })
+                    .limit(Some(1))
+                    .projection(doc! { "_id": 0, "namespace": 1 })
+                    .build();
+                let audit_events = self.audit_events();
+                let mut cursor = audit_events.find(filter).with_options(options).await?;
+                if !cursor.advance().await? {
+                    break;
+                }
+                let doc = cursor.deserialize_current()?;
+                let namespace = doc
+                    .get("namespace")
+                    .and_then(Bson::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("audit_events row missing string namespace"))?
+                    .to_string();
+                deleted =
+                    deleted.saturating_add(self.prune_audit_events_by_age(&namespace, days).await?);
+                previous = Some(namespace);
+            }
+            self.check_slow_query("prune_expired_audit_events", start);
+            Ok(deleted)
         }
 
         async fn prune_audit_events_with_mode(
@@ -19102,6 +19018,32 @@ mod inner {
         }
 
         #[test]
+        fn decoders_refuse_shapes_no_writer_produces() {
+            // Issue #7218: build-out keeps no decoders for retired shapes.
+            let mut audit = doc! {
+                "_id": "event-1",
+                "ts": "2026-05-18T01:00:00Z",
+                "diff": "{}",
+            };
+            let Err(error) = doc_to_audit_event(audit.clone()) else {
+                panic!("a string audit ts must be refused");
+            };
+            assert!(error.to_string().contains("BSON DateTime"));
+            audit.insert("ts", Bson::DateTime(BsonDateTime::from_millis(0)));
+            audit.insert("diff", Bson::Document(Document::new()));
+            let Err(error) = doc_to_audit_event(audit) else {
+                panic!("a document audit diff must be refused");
+            };
+            assert!(error.to_string().contains("JSON text"));
+
+            let legacy_spec = doc! { "_id": "ferrum:spec-1", "spec_content": [1_i32, 2_i32] };
+            let Err(error) = doc_to_api_spec(legacy_spec) else {
+                panic!("an integer-array spec_content must be refused");
+            };
+            assert!(error.to_string().contains("unexpected BSON type"));
+        }
+
+        #[test]
         fn api_spec_doc_stores_spec_content_as_bson_binary() {
             let now = chrono::Utc::now();
             let spec = ApiSpec {
@@ -19258,7 +19200,6 @@ mod inner {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
@@ -19491,7 +19432,6 @@ mod inner {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
@@ -19585,7 +19525,6 @@ mod inner {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
@@ -19810,7 +19749,6 @@ mod inner {
                 pool_http2_max_concurrent_streams: None,
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
-                pool_max_requests_per_connection: None,
                 pool_http1_max_pending_requests: None,
                 upstream_id: Some("my-upstream".to_string()),
                 upstream_subset: None,
@@ -20328,29 +20266,6 @@ mod inner {
         // -------------------------------------------------------------------
 
         #[test]
-        fn delete_proxy_sequential_order_proxy_first() {
-            assert_eq!(
-                DELETE_PROXY_SEQUENTIAL_ORDER,
-                &[
-                    "delete_proxy_document",
-                    "delete_proxy_scoped_plugin_configs",
-                    "cleanup_orphaned_proxy_group_plugins",
-                ],
-                "delete_proxy must delete the proxy document BEFORE its plugin_configs \
-                 so a partial failure can't leave a dangling-reference proxy in the DB"
-            );
-        }
-
-        #[test]
-        fn delete_proxy_sequential_order_first_step_is_proxy() {
-            assert_eq!(
-                DELETE_PROXY_SEQUENTIAL_ORDER.first().copied(),
-                Some("delete_proxy_document"),
-                "delete_proxy MUST start by removing the proxy document"
-            );
-        }
-
-        #[test]
         fn delete_proxy_standalone_implementation_deletes_proxy_before_plugins() {
             let source = include_str!("mongo_store.rs");
             let standalone_start = source
@@ -20419,35 +20334,6 @@ mod inner {
         }
 
         #[test]
-        fn update_proxy_sequential_order_replace_then_cleanup() {
-            assert_eq!(
-                UPDATE_PROXY_SEQUENTIAL_ORDER,
-                &[
-                    "replace_proxy_document",
-                    "cleanup_orphaned_proxy_group_plugins",
-                ],
-                "update_proxy must replace the proxy document BEFORE cleaning up \
-                 orphan proxy_group plugin_configs so the cleanup observes the new \
-                 plugins.plugin_config_id references"
-            );
-        }
-
-        #[test]
-        fn replace_api_spec_standalone_delete_order_proxy_first() {
-            assert_eq!(
-                REPLACE_API_SPEC_STANDALONE_DELETE_ORDER,
-                &[
-                    "delete_proxy_document",
-                    "delete_spec_owned_plugin_configs",
-                    "delete_spec_owned_upstreams",
-                    "delete_api_spec_document",
-                ],
-                "standalone replace_api_spec_bundle must delete the proxy before \
-                 dependencies so partial failures leave no live dangling route"
-            );
-        }
-
-        #[test]
         fn replace_api_spec_standalone_implementation_deletes_proxy_before_plugins() {
             let source = include_str!("mongo_store.rs");
             let standalone_start = source
@@ -20493,23 +20379,6 @@ mod inner {
         }
 
         #[test]
-        fn delete_api_spec_standalone_order_proxy_first() {
-            assert_eq!(
-                DELETE_API_SPEC_STANDALONE_ORDER,
-                &[
-                    "delete_proxy_document",
-                    "delete_spec_owned_plugin_configs",
-                    "delete_proxy_scoped_plugin_configs",
-                    "cleanup_orphaned_proxy_group_plugins",
-                    "delete_spec_owned_upstreams",
-                    "delete_api_spec_document",
-                ],
-                "standalone delete_api_spec must delete the proxy before \
-                 plugin cleanup so partial failures stay runtime-safe"
-            );
-        }
-
-        #[test]
         fn delete_api_spec_standalone_implementation_deletes_proxy_before_plugins() {
             let source = include_str!("mongo_store.rs");
             let delete_api_spec_start = source
@@ -20532,21 +20401,6 @@ mod inner {
                 proxy_delete < plugin_cleanup,
                 "standalone delete_api_spec must remove the proxy before \
                  deleting plugin_configs"
-            );
-        }
-
-        #[test]
-        fn api_spec_standalone_insert_order_dependencies_before_proxy() {
-            assert_eq!(
-                API_SPEC_STANDALONE_INSERT_ORDER,
-                &[
-                    "insert_upstream_document",
-                    "insert_plugin_config_documents",
-                    "insert_proxy_document",
-                    "insert_api_spec_document",
-                ],
-                "standalone api-spec bundle writes must create dependencies before \
-                 the proxy document becomes pollable"
             );
         }
 
@@ -20597,20 +20451,6 @@ mod inner {
                 plugin_insert < proxy_insert,
                 "standalone replace_api_spec_bundle must reinsert plugin_configs before \
                  the proxy so a partial reinsert cannot expose a proxy with missing plugins"
-            );
-        }
-
-        #[test]
-        fn compensate_bundle_insert_order_proxy_before_dependencies() {
-            assert_eq!(
-                COMPENSATE_BUNDLE_INSERT_ORDER,
-                &[
-                    "delete_api_spec_document",
-                    "delete_proxy_document",
-                    "delete_plugin_config_documents",
-                    "delete_upstream_document",
-                ],
-                "compensating rollback must remove the proxy before dependencies"
             );
         }
 
@@ -20875,7 +20715,7 @@ pub use inner::{
 // timeout-precedence application, identity reservation rollback/release
 // accounting, and the incremental `config_changes` decoder. Everything else
 // stays module-private in `inner`.
-#[allow(unused_imports)] // The binary target has no `_test_support` consumer.
+#[allow(unused_imports)] // Only `_test_support` names some of these re-exports.
 pub(crate) use inner::{
     MongoConfigChangeOp, MongoConfigChangeRecord, apply_mongo_timeout_overrides,
     consumer_identity_adoption_failure_release_values, decode_mongo_config_change_record,

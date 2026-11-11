@@ -4,10 +4,10 @@
 //! authentication. Supports exact IPs, CIDR notation, and IPv6.
 //!
 //! The decision is fixed: a deny match always rejects, and a non-empty allow
-//! list rejects every address outside it. The deprecated `mode` key
-//! (`allow_first` / `deny_first`) never changes whether a request is admitted
-//! (issue #6610). It only picks which rejection body and log reason an address
-//! that is both outside the allow list and on the deny list receives.
+//! list rejects every address outside it. An address that is both outside the
+//! allow list and on the deny list is reported as `not_in_allow_list` (issue
+//! #6610). The retired `mode` key is refused like any other unknown key
+//! (issue #7114).
 //!
 //! Rules are compiled on the cold path into sorted, merged numeric intervals.
 //! Request matching is allocation-free, lock-free, and O(log n) in the number
@@ -41,7 +41,7 @@ use tracing::debug;
 
 use super::{Plugin, PluginResult, RequestContext};
 
-const CONFIG_KEYS: &[&str] = &["allow", "deny", "mode"];
+const CONFIG_KEYS: &[&str] = &["allow", "deny"];
 
 /// Metadata key stamped on every `ip_restriction` rejection, carrying one of
 /// `unparseable_client_ip`, `not_in_allow_list`, or `ip_denied`.
@@ -107,21 +107,6 @@ impl Rejection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    AllowFirst,
-    DenyFirst,
-}
-
-impl Mode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AllowFirst => "allow_first",
-            Self::DenyFirst => "deny_first",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IpFamily {
     V4,
     V6,
@@ -133,13 +118,6 @@ struct ParsedRule {
     family: IpFamily,
     start: u128,
     end: u128,
-}
-
-impl ParsedRule {
-    fn matches(self, client_ip: IpAddr) -> bool {
-        let (family, value) = ip_key(client_ip);
-        self.family == family && self.start <= value && value <= self.end
-    }
 }
 
 /// Immutable lookup index built at plugin construction/reload.
@@ -186,7 +164,6 @@ impl IpRangeSet {
 pub struct IpRestriction {
     allow: IpRangeSet,
     deny: IpRangeSet,
-    mode: Mode,
 }
 
 impl IpRestriction {
@@ -194,14 +171,12 @@ impl IpRestriction {
         let object = config
             .as_object()
             .ok_or_else(|| "ip_restriction: config must be an object".to_string())?;
-        if let Some(unknown) = object
-            .keys()
-            .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
-        {
-            return Err(format!(
-                "ip_restriction: unknown configuration field {unknown:?}; allowed fields: `allow`, `deny`, `mode`"
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            CONFIG_KEYS,
+            "ip_restriction: `config`: ",
+        )?;
 
         let allow = IpRangeSet::compile(Self::parse_rule_list(object, "allow")?);
         let deny = IpRangeSet::compile(Self::parse_rule_list(object, "deny")?);
@@ -211,21 +186,8 @@ impl IpRestriction {
             );
         }
 
-        let mode = match object.get("mode") {
-            None => Mode::AllowFirst,
-            Some(Value::String(mode)) if mode == "allow_first" => Mode::AllowFirst,
-            Some(Value::String(mode)) if mode == "deny_first" => Mode::DenyFirst,
-            Some(other) => {
-                return Err(format!(
-                    "ip_restriction: `mode` must be `allow_first` or `deny_first`, got: {other:?}",
-                    other = other.to_string()
-                ));
-            }
-        };
-
         debug!(
             plugin = "ip_restriction",
-            mode = mode.as_str(),
             allow_intervals = allow.v4.len() + allow.v6.len(),
             allow_ipv4_intervals = allow.v4.len(),
             allow_ipv6_intervals = allow.v6.len(),
@@ -235,7 +197,7 @@ impl IpRestriction {
             "compiled IP restriction policy"
         );
 
-        Ok(Self { allow, deny, mode })
+        Ok(Self { allow, deny })
     }
 
     /// Check a context-cached, canonical client IP against the compiled policy.
@@ -244,27 +206,13 @@ impl IpRestriction {
             return Some(Rejection::UnparseableClientIp);
         };
 
-        // Both arms reject exactly the same addresses (deny wins, then the
-        // allow list must match); `mode` only orders the two checks, which
-        // decides the reported reason for an address that fails both.
-        let not_allowed = || !self.allow.is_empty() && !self.allow.contains(client_ip);
-        match self.mode {
-            Mode::AllowFirst => {
-                if not_allowed() {
-                    return Some(Rejection::NotInAllowList);
-                }
-                if self.deny.contains(client_ip) {
-                    return Some(Rejection::IpDenied);
-                }
-            }
-            Mode::DenyFirst => {
-                if self.deny.contains(client_ip) {
-                    return Some(Rejection::IpDenied);
-                }
-                if not_allowed() {
-                    return Some(Rejection::NotInAllowList);
-                }
-            }
+        // An address outside a non-empty allow list is reported as such even
+        // when the deny list also names it; either way it is rejected.
+        if !self.allow.is_empty() && !self.allow.contains(client_ip) {
+            return Some(Rejection::NotInAllowList);
+        }
+        if self.deny.contains(client_ip) {
+            return Some(Rejection::IpDenied);
         }
         None
     }
@@ -524,17 +472,4 @@ fn is_canonical_ipv4_literal(literal: &str, ipv4: std::net::Ipv4Addr) -> bool {
         }
     }
     parts.next().is_none()
-}
-
-/// Check if an IP address matches one exact-IP/CIDR rule.
-///
-/// This string-based API is preserved for external callers and tests. Runtime
-/// plugin hooks use the context-cached typed client IP and compiled range set.
-#[allow(dead_code)]
-pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
-    let client_ip = crate::util::client_identity::parse_canonical_client_ip(client_ip);
-    match (client_ip, parse_rule(rule)) {
-        (Some(client_ip), Some(rule)) => rule.matches(client_ip),
-        _ => false,
-    }
 }

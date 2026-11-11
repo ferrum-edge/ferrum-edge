@@ -88,7 +88,6 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -2868,6 +2867,40 @@ async fn frontend_dtls_publish_records_generation_without_listeners() {
     assert_eq!(overload.frontend_dtls_reload.last_outcome, "accepted");
 }
 
+/// A rejected owner-scoped NodeWaypoint DTLS candidate is visible on
+/// `/overload` in its own slot and leaves the ordinary operator slot untouched
+/// (issue #7186).
+#[tokio::test]
+async fn rejected_mesh_node_waypoint_dtls_candidate_is_reported_on_overload() {
+    let manager = create_manager(empty_config());
+    let overload = manager.overload_snapshot();
+    assert_eq!(overload.mesh_node_waypoint_dtls_reload.last_outcome, "none");
+    assert_eq!(overload.mesh_node_waypoint_dtls_reload.generation, 0);
+
+    manager.record_mesh_node_waypoint_dtls_candidate_failure();
+
+    let overload = manager.overload_snapshot();
+    assert_eq!(
+        overload.mesh_node_waypoint_dtls_reload.last_outcome,
+        "rejected"
+    );
+    assert!(
+        overload
+            .mesh_node_waypoint_dtls_reload
+            .last_failure_unix
+            .is_some()
+    );
+    assert_eq!(overload.mesh_node_waypoint_dtls_reload.generation, 0);
+    assert_eq!(overload.frontend_dtls_reload.last_outcome, "none");
+    assert_eq!(overload.frontend_dtls_reload.last_failure_unix, None);
+
+    let json = serde_json::to_value(&overload).expect("overload snapshot serializes");
+    assert_eq!(
+        json["mesh_node_waypoint_dtls_reload"]["last_outcome"],
+        "rejected"
+    );
+}
+
 /// Mesh PeerAuthentication live reload still swaps the shared TCP+TLS slot, but
 /// that path must not seed the ordinary `FERRUM_DTLS_*` generation when no DTLS
 /// listener exists.
@@ -3376,7 +3409,6 @@ fn nw_udp_destination_route(ip: &str, port: u16, service: &str) -> NodeWaypointU
             ferrum_edge::modes::mesh::node_waypoint_udp_proxy_id(&namespace, service, port)
                 .expect("test service names are admitted Kubernetes identities"),
         ),
-        false,
     )
 }
 

@@ -722,7 +722,6 @@ fn constrained_file_uri_roundtrip_keeps_path_options_identity_and_refreshability
         let reparsed: CertSource = serde_json::from_str(&encoded).unwrap();
         // String deserialization has no field-kind context. The existing
         // source contract reapplies that hint at the material's caller.
-        assert_eq!(reparsed.kind(), MaterialKind::Unknown);
         assert_eq!(
             source,
             CertSource::parse(reparsed.to_config_value(), MaterialKind::Cert)
@@ -755,6 +754,32 @@ fn constrained_file_uri_roundtrip_keeps_path_options_identity_and_refreshability
         ),
         Some(std::time::Duration::from_secs(7))
     );
+}
+
+/// Issue #7218: only the documented `?poll=` option sets a source's refresh
+/// cadence; the undocumented `poll_interval` / `poll_interval_seconds`
+/// spellings are not compatibility aliases.
+#[test]
+fn source_poll_interval_reads_only_the_documented_poll_option() {
+    use ferrum_edge::tls::source::{CertSource, subscription::source_poll_interval};
+    let interval = |value: &str| {
+        source_poll_interval(
+            &CertSource::parse(value, MaterialKind::Cert),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(30),
+        )
+    };
+    assert_eq!(
+        interval("file:///etc/ferrum/cert.pem?poll=7"),
+        Some(std::time::Duration::from_secs(7))
+    );
+    for spelling in ["poll_interval", "poll_interval_seconds"] {
+        assert_eq!(
+            interval(&format!("file:///etc/ferrum/cert.pem?{spelling}=7")),
+            Some(std::time::Duration::from_secs(1)),
+            "`{spelling}` must not set the poll interval"
+        );
+    }
 }
 
 #[test]

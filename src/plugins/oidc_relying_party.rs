@@ -44,7 +44,9 @@ use super::utils::log_helpers::redacted_endpoint_url_str;
 use super::utils::oauth_client_auth::{self, PrivateKeyDecodeError};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
-use super::utils::session_cookie::reject_published_session_secret;
+use super::utils::session_cookie::{
+    contains_unresolved_env_placeholder, reject_published_session_secret,
+};
 use super::utils::socket_host::is_loopback_ip_literal_host;
 use super::{PluginResult, RequestContext};
 
@@ -941,7 +943,12 @@ impl OidcRelyingParty {
                 config = config.to_string()
             )
         })?;
-        reject_unknown_fields(config_obj, CONFIG_FIELDS, "config")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_obj,
+            "config",
+            CONFIG_FIELDS,
+            "oidc_relying_party: `config`: ",
+        )?;
         let providers = config_obj
             .get("providers")
             .and_then(Value::as_array)
@@ -957,12 +964,22 @@ impl OidcRelyingParty {
         let provider_obj = providers[0]
             .as_object()
             .ok_or_else(|| "oidc_relying_party: `provider[0]` must be an object".to_string())?;
-        reject_unknown_fields(provider_obj, PROVIDER_FIELDS, "provider[0]")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            provider_obj,
+            "provider[0]",
+            PROVIDER_FIELDS,
+            "oidc_relying_party: `provider[0]`: ",
+        )?;
         let session_obj = config_obj
             .get("session")
             .and_then(Value::as_object)
             .ok_or_else(|| "oidc_relying_party: `session` object is required".to_string())?;
-        reject_unknown_fields(session_obj, SESSION_FIELDS, "session")?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            session_obj,
+            "session",
+            SESSION_FIELDS,
+            "oidc_relying_party: `session`: ",
+        )?;
         let behavior_obj =
             match config_obj.get("behavior") {
                 Some(Value::Null) | None => None,
@@ -971,13 +988,23 @@ impl OidcRelyingParty {
                 })?),
             };
         if let Some(behavior_obj) = behavior_obj {
-            reject_unknown_fields(behavior_obj, BEHAVIOR_FIELDS, "behavior")?;
+            crate::util::unknown_keys::reject_unknown_keys(
+                behavior_obj,
+                "behavior",
+                BEHAVIOR_FIELDS,
+                "oidc_relying_party: `behavior`: ",
+            )?;
         }
         if let Some(client_auth) = provider_obj.get("client_auth") {
             let client_auth = client_auth.as_object().ok_or_else(|| {
                 "oidc_relying_party: `provider[0].client_auth` must be an object".to_string()
             })?;
-            reject_unknown_fields(client_auth, CLIENT_AUTH_FIELDS, "provider[0].client_auth")?;
+            crate::util::unknown_keys::reject_unknown_keys(
+                client_auth,
+                "provider[0].client_auth",
+                CLIENT_AUTH_FIELDS,
+                "oidc_relying_party: `provider[0].client_auth`: ",
+            )?;
         }
 
         let issuer = validate_url_string(
@@ -1308,17 +1335,31 @@ impl OidcRelyingParty {
         // lowercase, a host-only entry binds the scheme's default port, and an
         // explicit `host:443` / `host:80` names that same default port
         // (PR6833-SOL-4). Anything that is not a bare authority is refused.
-        let callback_scheme = Url::parse(&redirect_uri)
-            .map_err(|e| format!("oidc_relying_party: `redirect_uri` is invalid: {e}"))?
-            .scheme()
-            .to_string();
-        let trusted_redirect_hosts =
+        let callback_url = Url::parse(&redirect_uri)
+            .map_err(|e| format!("oidc_relying_party: `redirect_uri` is invalid: {e}"))?;
+        let callback_scheme = callback_url.scheme().to_string();
+        let mut trusted_redirect_hosts =
             parse_behavior_string_array(behavior_obj, "trusted_redirect_hosts")?
                 .iter()
                 .map(|entry| normalize_trusted_redirect_origin(entry, &callback_scheme))
                 .collect::<Result<Vec<_>, _>>()?;
         if post_login_redirect_param.is_some() && trusted_redirect_hosts.is_empty() {
             return Err("oidc_relying_party: `behavior.trusted_redirect_hosts` is required when `post_login_redirect_param` is set".to_string());
+        }
+        // The callback's own origin is always a trusted post-login target
+        // (issue #7147): the browser is already on it, so returning there
+        // cannot widen the open-redirect surface, and without it a deep link
+        // sealed under the minimal config would always be discarded for
+        // `post_login_default_path`. Same `host:effective-port` form as the
+        // explicit entries.
+        if let (Some(host), Some(port)) = (
+            callback_url.host_str(),
+            callback_url.port_or_known_default(),
+        ) {
+            let callback_origin = format!("{host}:{port}");
+            if !trusted_redirect_hosts.contains(&callback_origin) {
+                trusted_redirect_hosts.push(callback_origin);
+            }
         }
         let refresh_skew_secs =
             optional_behavior_u64(behavior_obj, "refresh_skew_secs", DEFAULT_REFRESH_SKEW_SECS)?;
@@ -2908,9 +2949,6 @@ impl OidcRelyingParty {
         Ok(value)
     }
 
-    // Reached only through the lib target's `_test_support` shim by external
-    // unit tests; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
     pub(crate) fn sealed_refresh_session_cookie_for_tests(
         &self,
         claims: Value,
@@ -2927,7 +2965,6 @@ impl OidcRelyingParty {
         self.seal_session_cookie(&payload)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn sealed_session_cookie_for_tests(
         &self,
         claims: Value,
@@ -2938,7 +2975,6 @@ impl OidcRelyingParty {
         self.seal_session_cookie(&payload)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn sealed_due_refresh_session_cookie_for_tests(
         &self,
         claims: Value,
@@ -2983,7 +3019,6 @@ impl OidcRelyingParty {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn open_session_cookie_for_tests(&self, cookie: &str) -> Option<Value> {
         let cookie_pair = cookie.split(';').next()?;
         let (_, value) = cookie_pair.split_once('=')?;
@@ -2991,7 +3026,6 @@ impl OidcRelyingParty {
         serde_json::to_value(payload).ok()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn session_state_from_set_cookie_for_tests(
         &self,
         set_cookie: &str,
@@ -3012,9 +3046,6 @@ impl OidcRelyingParty {
     /// Whether the discovery task published a document within `wait`, without
     /// consuming the plugin. A refused document is retried with backoff, so
     /// the task itself never ends on refusal.
-    // Reached only through the lib target's `_test_support` shim by external
-    // unit tests; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
     pub(crate) async fn discovery_published_within_for_tests(&self, wait: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
@@ -3028,9 +3059,6 @@ impl OidcRelyingParty {
         }
     }
 
-    // Reached only through the lib target's `_test_support` shim by external
-    // unit tests; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
     pub(crate) async fn resolved_discovery_endpoints_for_tests(
         mut self,
     ) -> Option<(Option<String>, Option<String>)> {
@@ -3196,7 +3224,8 @@ impl OidcRelyingParty {
     /// `behavior.trusted_redirect_hosts` entry by host *and* effective port —
     /// an entry without a port admits only the scheme's default port, and
     /// `host:port` admits exactly that port (`host:443` is the same origin as
-    /// `host` under `https`). Anything else lands on
+    /// `host` under `https`). The `redirect_uri`'s own origin is always in that
+    /// list (added at construction). Anything else lands on
     /// `behavior.post_login_default_path`.
     fn sanitize_redirect(&self, original: &str) -> String {
         let fallback = || self.behavior.post_login_default_path.clone();
@@ -3912,10 +3941,10 @@ fn parse_client_auth(
     let kid_field = optional_client_auth_string(&auth, "private_key_jwt_kid")?;
     match method {
         "client_secret_basic" => Ok(OidcClientAuth::Basic {
-            client_secret: SecretString(required_string(&auth, "client_secret", "client_auth")?),
+            client_secret: SecretString(required_client_secret(&auth)?),
         }),
         "client_secret_post" => Ok(OidcClientAuth::Post {
-            client_secret: SecretString(required_string(&auth, "client_secret", "client_auth")?),
+            client_secret: SecretString(required_client_secret(&auth)?),
         }),
         "private_key_jwt" => {
             let pem = required_string(&auth, "private_key_pem", "client_auth")?;
@@ -4038,22 +4067,6 @@ fn apply_verify_outcome(
             PluginResult::Continue
         }
     }
-}
-
-fn reject_unknown_fields(
-    config: &Map<String, Value>,
-    allowed: &[&str],
-    scope: &str,
-) -> Result<(), String> {
-    if let Some(field) = config
-        .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
-    {
-        return Err(format!(
-            "oidc_relying_party: unknown field {field:?} in `{scope}`"
-        ));
-    }
-    Ok(())
 }
 
 fn session_context_seed(
@@ -4210,6 +4223,23 @@ fn behavior_usize(
         ));
     }
     usize::try_from(raw).map_err(|_| format!("oidc_relying_party: `behavior.{field}` is too large"))
+}
+
+/// `client_auth.client_secret`, refused when it holds a `${NAME}` placeholder.
+/// Plugin config is never environment-expanded, so such a value would be sent
+/// to the provider verbatim and every token exchange would fail with no
+/// admission error pointing at the cause (issue #7275). The session secrets
+/// already refuse the same shape in `reject_published_session_secret`.
+fn required_client_secret(auth: &Map<String, Value>) -> Result<String, String> {
+    let secret = required_string(auth, "client_secret", "client_auth")?;
+    if contains_unresolved_env_placeholder(&secret) {
+        return Err(
+            "oidc_relying_party: `client_auth.client_secret` contains an unresolved `${NAME}` \
+             placeholder; plugin config values are literal"
+                .to_string(),
+        );
+    }
+    Ok(secret)
 }
 
 fn required_string(
@@ -5471,8 +5501,8 @@ fn apply_discovery_endpoint_overrides(
 /// External coverage seams for the issue #4761 discovery endpoint overrides.
 ///
 /// Reached only through the lib target's `_test_support` shim by external unit
-/// tests; `src/main.rs` re-declares modules without that bridge, so the module
-/// is unused in the binary target — hence the module-scoped `allow(dead_code)`.
+/// tests; the module-scoped `allow(dead_code)` covers seams that shim does not
+/// re-export.
 /// Nothing here is on a request path.
 #[allow(dead_code)]
 #[doc(hidden)]
@@ -5521,8 +5551,8 @@ pub(crate) mod discovery_test_seams {
 /// External coverage seams for the issue #4640 refresh single-flight registry.
 ///
 /// Reached only through the lib target's `_test_support` shims by external unit
-/// tests; `src/main.rs` re-declares modules without that bridge, so the module
-/// is unused in the binary target — hence the module-scoped `allow(dead_code)`.
+/// tests; the module-scoped `allow(dead_code)` covers seams those shims do not
+/// re-export.
 /// Nothing here is on a request path.
 #[allow(dead_code)]
 #[doc(hidden)]

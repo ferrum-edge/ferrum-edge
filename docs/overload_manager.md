@@ -198,6 +198,14 @@ pre-handshake cap. The value is a diagnostic mirror of the DTLS demux counter
 and can lag the exact in-server counter by a single increment/decrement window,
 so treat it as operational telemetry rather than an admission-control source.
 
+Two bounded, redacted DTLS material reload slots sit beside it:
+`stream_listeners.frontend_dtls_reload` (the ordinary `FERRUM_DTLS_*` operator
+slot) and `stream_listeners.mesh_node_waypoint_dtls_reload` (the owner-scoped
+mesh NodeWaypoint DTLS slot). Each reports `generation`,
+`last_swapped_listeners`, `last_success_unix`, `last_failure_unix`, and a
+fixed-cardinality `last_outcome` (`none`, `accepted`, `rejected`); a rejected
+mesh PeerAuthentication candidate appears only in the mesh slot.
+
 Mitigation knobs:
 - `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
 - `FERRUM_UDP_MAX_SESSIONS` caps total UDP/DTLS sessions per proxy, including DTLS peers still in handshake.

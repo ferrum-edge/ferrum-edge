@@ -31,6 +31,9 @@ mesh:
   peer_authentications:
     - name: mesh-strict
       namespace: ferrum
+      scope:
+        kind: namespace
+        namespace: ferrum
       mtls_mode: strict
   # Access logging is disabled in EVERY arm (Envoy access_log: [] too) so
   # the benchmark measures mesh data-plane cost, not per-request log

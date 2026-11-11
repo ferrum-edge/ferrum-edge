@@ -1655,9 +1655,11 @@ fn find_primary_config(
                 // before it. Malformed files that sort before the generated
                 // target remain fatal because the container runtime would pick
                 // them before Ferrum's chain.
+                // The parser error is not logged: it can quote bytes from a
+                // file another installer wrote. The path is enough to find it.
                 tracing::warn!(
                     path = %path.display(),
-                    error = %error,
+                    reason = "not valid CNI configuration JSON",
                     "Skipping unparseable CNI config while searching for the primary to chain"
                 );
                 continue;

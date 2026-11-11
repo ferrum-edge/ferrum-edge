@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **A VirtualService that derives another VirtualService's route id is refused,
+  not silently shadowed** (GHSA-qw5p-g8jx-pmv8). Route proxy and weighted-split
+  upstream ids are now claimed per VirtualService. A later VirtualService in
+  the same namespace whose name folds onto an owned id (`my.app` / `my-app`, or
+  `a` `http[1]` match 0 / `a-1` `http[0]`) reports `FerrumAccepted=False`
+  naming the owner. It no longer reports accepted while its route is dropped or
+  its upstream replaces the owner's backends. **Operator action:** rename one
+  of any two VirtualServices whose status now reports the collision.
+- Stock xDS: a cluster with no pinned peer identity can no longer publish
+  endpoints under a sibling cluster's pinned identity when both resolve to the
+  same service port. (#7270)
+- When `FERRUM_FIPS_MODE=enforce` is on, JWT-SVID authorities (local and
+  federated) now follow the same key policy as plugin JWKS keys: the RSA public
+  exponent must be odd and greater than 65536, and EC keys must use P-256 or
+  P-384. (#7268)
+
 ### Removed
 - **Plugin readers for metadata and record shapes no built-in writes**
   (#7115). `ai_transcript_audit` no longer exports the pre-namespace
@@ -26,6 +43,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Remove any dashboard panel or alert that queries it. Required-version skew
   is still visible as a waiting state through `convergence.version_skew` on
   the JWT-authenticated `GET /mesh/config-drift`.
+- **BREAKING — `pool_max_requests_per_connection` is removed** (issue #7218).
+  The proxy field and the upstream
+  `port_overrides[].http_max_requests_per_connection` carrier were accepted and
+  persisted but never applied. Documents that still set them are refused as
+  unknown fields, the column is gone from the `V001` baseline (rebuild the
+  database), and the ConfigSync build revision is bumped, so CP and DP must be
+  upgraded together.
+- **BREAKING — `FERRUM_TLS_CURVES` is no longer read** (issue #7218). Use
+  `FERRUM_TLS_KEY_EXCHANGE_GROUPS`.
+- **BREAKING — undocumented TLS source option spellings are ignored**
+  (issue #7218). Only `?poll=` sets a source's refresh cadence (not
+  `poll_interval` / `poll_interval_seconds`), and only `key_type=` selects a
+  PKCS#11 key type (not `type=`).
+- **BREAKING — restore refuses retired `api_specs` shapes** (issue #7218).
+  `POST /restore` accepts only `api_specs.section_version: "2"` and a 64-hex
+  `resource_hash`.
+- **MongoDB no longer decodes stored shapes no current writer produces**
+  (#7218). Integer-array API-spec blobs, string audit timestamps and non-string
+  audit diffs are refused instead of being silently converted.
+- **The MySQL stale identity collation startup warning is removed** (#7218).
+  Build-out databases are created from the current `V001` baseline, which
+  already declares `utf8mb4_0900_bin`.
+- **The external `$ref` loader no longer carries a test-only fixtures map**
+  (#7220). It was consulted before the file jail and SSRF screening; tests now
+  inject documents through their own loader.
+- **Test-only production helpers removed** (#7220). Removed
+  `DatabaseBackend::batch_create_proxies`, the `GatewayTrustPublication`
+  snapshot/delta helpers and second encoder, the `GatewayConfig` JWT credential
+  wrappers, the epoch-implicit `RuntimeConfigApply` / `PreparedLiveApply`
+  conveniences, `notifications::dispatch` and `templating::unknown_variables`.
+  Production code used none of them.
+- Removed unwired runtime code: the `date_cache` module (hyper already caches
+  the `Date` header), the `TCP_INFO` BDP helpers, the never-fed adaptive-buffer
+  jitter tier, `ConfigDelta::affected_routes`, `ConnectionPool::clear`, the
+  superseded load-balancer selectors without the subset tier, and
+  `PluginCapabilities::HAS_AUTH_PLUGINS`. Also removed eleven unused crate-root
+  re-exports (`compress_gzip`, `decompress_gzip_capped`, `sha256_hex`,
+  `ApiSpec`, `AuthMode`, `BackendTlsConfig`, `DispatchKind`, `SpecFormat`,
+  `build_backend_url`, `build_backend_url_with_target`, `RouteMatch`) (#7221)
+- **`PRODUCTION_READINESS.md` and the #2110 backlog register** (#7278). Both
+  were frozen records of the removed launch-readiness gate. The live
+  "Deliberate decisions" list now lives in `docs/deliberate_decisions.md`.
+- Dead test infrastructure:
+  - the unused scenario catalog (`tests/scenarios/`), the `ScriptedDtlsBackend`
+    test fixture, the `TruncatedStream` network wrapper and its proxy knobs;
+  - unused scaffolding setters and constructors;
+  - the unsourced `tests/k8s/lib/kind.sh` (issue #7300).
+- **`FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` and NodeWaypoint
+  cgroup-bound identity enrollment** (#7246). No enrollment path ever supplied
+  a cgroup path, so the sweep never had work. The idle identity GC
+  (`FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS`) is the only identity GC.
+- **The native DestinationRule
+  `connection_pool_http.max_requests_per_connection` field** (#7243). It was
+  never populated or read; Istio `maxRequestsPerConnection` remains reported as
+  deferred.
+- **`MeshTopology::terminates_hbone`** and the unreachable file-rebuild SPIFFE
+  staging path (#7239). The topology conformance row now checks the runtime
+  listener plan.
+- **The legacy `ipv6_outbound_deny` capture flag** (issue #7254). Nothing set
+  it; it is removed from the node-agent capture contract, the eBPF
+  `BpfCaptureConfig` layout and the `connect6` program.
+- **Unreachable and test-only mesh code** (issue #7248):
+  - the one-shot federation poller (`spawn_federation_poller`); tests now drive
+    `FederationPollerManager`
+  - the test-only `evaluate_metric_tag_cel`
+  - the unreachable decoded-JWT length check and ECDS/RTDS decode-failure
+    branches
+  - a no-op `borrow_and_update`
+  - accessors kept "for future admin tooling"
+- **The node-agent iptables fallback's unreachable UDP capture warning and UDP
+  cleanup** (issue #7254). UDP capture is enabled only for Ambient, which
+  refuses the fallback.
+- Unused internal surface (issues #7258, #7263, #7264):
+  - The unread `args` map on the CNI binary-to-node-agent RPC and its bounds;
+    an `args` key is now refused.
+  - `CaptureContract`'s unused socket path and BPF map-name table.
+  - `capture::EbpfPlan` and its shell kernel gate, which had no caller.
+  - Several unreachable Kubernetes translator branches.
+- The unconfigurable Kubernetes PSAT and federated JWT-SVID workload attestors,
+  and the Unix attestor's never-reachable binary-hash selector. (#7267)
+- The internal single-key secret resolution path (`secrets::resolve_secret` and
+  the per-provider `resolve_ref` helpers). Startup resolution and direct
+  provider references are unchanged. (#7269)
+- `api_chargeback_sink`: removed the test-only whole-artifact spool decoder and
+  the never-read spool marker `generation` fields. The decode test helper now
+  uses the bounded streaming reader that replay uses (issue #7112).
+- **Version-1 spool layout readers in `api_chargeback_sink`** (#7115). The sink
+  no longer accepts the 16-character owner tag, the pre-attribution
+  `<name>.ndjson.tmp` temps or bare `.rejected` files. It no longer scans
+  `<spool.dir>/<node>/<YYYYMMDD>/` for unbound records. Only the full owner tag
+  binds a record, and the unbound count covers sibling owner namespaces only.
+- **Test-only entry points in plugin modules and `plugins::utils`**
+  (#7120, #7121). Removed: `handle_http_batch_response` (use
+  `handle_http_batch_response_redacted`), `BatchingLogger::try_send` (use
+  `try_send_outcome`), the `body_transform` string-path helpers,
+  `has_conflicting_duplicate_query_key`, `jwks_cache::retain_active_uris`,
+  `RedisRateLimitClient::sub_bucket`, `ip_restriction::ip_matches`, the
+  duplicate `statsd_logging` packers (replaced by the shared
+  `UdpDatagramPacker`), `jwks_auth`'s unreachable `AuthMechanism`
+  implementation and `grpc_deadline`'s `before_proxy` fallback preflight.
+- **Context-free plugin body hooks and the `x-grpc-web-mode` header**
+  (#7119, #7120). `grpc_web` no longer implements the context-free
+  request/response body hooks or sets `x-grpc-web-mode` in `before_proxy`; the
+  name stays reserved and stripped. `ai_response_guard` drops its context-free
+  `transform_response_body` and `on_final_response_body` overrides; the
+  authoritative client-visible phase still decides every response.
+  `ai_transcript_audit` requires the request-owned stream handoff and drops its
+  unused live-map fallback.
+- **`ai_federation` dead endpoint code** (#7125).
+  `ProviderType::default_base_url`, with arms no caller could reach, and the
+  duplicate `ResolvedProvider.base_url` field are removed. Anthropic and Cohere
+  read their endpoint from the shared provider URL template.
+- **BREAKING — `mcp_gateway` `discovery.hide_denied_items` is removed**
+  (issue #7136). It duplicated `policy.hide_denied_tools`: a denied tool was
+  listed only when both were `false`, so changing either alone did nothing, and
+  it never applied to prompts or resources. The key is now rejected as unknown;
+  use `policy.hide_denied_tools: false` to list denied tools.
+- `mcp_aggregate_sse`'s unused direct-publication delivery path
+  (`publish_encoded`, the deliverable `reserve_encoded` / commit pair,
+  single-phase `post_attached_response`, `has_listener`, `reap_idle`, and the
+  `retention_overflow` reason) is deleted (issue #7138). Only tests used it,
+  and combined with the shipped POST-attached path it could drop an unpolled
+  event.
+- **BREAKING — `tcp_connection_throttle` no longer accepts
+  `cleanup_interval_seconds`** (issue #7152). Its background sweep is gone;
+  counters are always removed inline when their last connection releases.
+  Configs that still set the field are refused at admission.
+- Unused library items: the generic-reader PROXY protocol parsers
+  `read_proxy_header` / `read_proxy_header_accepting` (use
+  `read_proxy_header_accepting_tcp`), `unix_backend::{dial_unix_h2c_sender,
+  admit_and_connect}`, `try_acquire_per_ip_websocket_session` (use
+  `_with_prefix`), the `dns_cache` parameter of the native gRPC dispatch entry
+  points, and the unreachable kTLS receive-buffer pinning helpers
+  (#7172, #7173).
+- **The never-read `UdpProxyMetrics` `datagrams_in` / `bytes_in` counters**
+  (#7186). The remaining listener-local UDP counters are documented as
+  internal, not exported.
+- The write-only per-session UDP request-size store and the
+  `bench-udp-profile` `request_size_stores` counter that only counted it
+  (#7173). The response amplification budget is unchanged.
 
 ### Changed
 - **ferrum-mesh chart: values now reach the workload they name, once**
@@ -131,6 +288,207 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at startup, so forwarding the injector's value could only be a no-op or
   stop every injected sidecar from starting. Pin the CP CA with
   `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` instead, which is still forwarded.
+- ACME order types use challenge-neutral names: `AcmeOrderInput`,
+  `AcmeOrderRecord::new`, and the client's `AcmeChallenge`,
+  `PreparedAcmeOrder`, `CompleteAcmeOrderConfig` and `CompletedAcmeOrder`. The
+  `…TlsAlpn01…`/`…Dns01…` aliases are removed (#7225)
+- `ferrum-edge validate`'s namespace-filter mismatch now reports how many
+  namespaces the document resources use. Its hint points at the resources'
+  `namespace` fields, because namespace names are withheld from rendered
+  diagnostics. The `docs/cli.md` failure samples now show the real `ERROR` log
+  record (#7229)
+- **BREAKING — `dp` mode refuses `FERRUM_DP_CP_GRPC_TOKEN_FILE`**
+  (issue #7273). A stock DP sends a random per-process `node_id`, and
+  `ConfigSync.Subscribe` requires the token's `sub` to equal it, so a DP
+  configured with an externally issued token passed `ferrum-edge validate` and
+  startup and then looped on `PERMISSION_DENIED` without ever receiving config
+  (the token file also won over a configured secret). `validate` and `run` now
+  refuse the token file in `dp` mode, and `FERRUM_CP_DP_GRPC_JWT_SECRET` is
+  always required there. The `ferrum-gateway` chart drops `dp.cpGrpcTokenFile`,
+  and `grpc.jwtSecret` is always required in `dp` mode. Give each DP a
+  per-tenant secret plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID`. Mesh nodes keep the
+  token-file option.
+- **BREAKING — OAuth `client_secret` placeholders are refused** (issue #7275).
+  `oauth2_introspection` and `oidc_relying_party` refuse a
+  `client_auth.client_secret` that contains an unresolved `${NAME}`
+  placeholder, for `client_secret_basic` and `client_secret_post`, as the OIDC
+  session secrets already did. Plugin config is never environment-expanded, so
+  such a value was sent to the provider verbatim and every introspection or
+  token exchange failed. The error names the field and never echoes the value.
+- **BREAKING — ferrum-mesh `ambient.inboundPort`, `ambient.outboundPort` and
+  `ambient.hbonePort` removed** (issue #7297). They only declared container
+  ports; the proxy never listened on them. The ambient `outbound`, `inbound`
+  and `hbone` container ports are now derived from the listen address the proxy
+  binds: `ambient.env.FERRUM_MESH_OUTBOUND_LISTEN_ADDR` / `_INBOUND_` /
+  `_HBONE_`, or the binary defaults 127.0.0.1:15001, 0.0.0.0:15006 and
+  0.0.0.0:15008. A port of 0 omits the container port, and a malformed address
+  fails the render. Set a non-default port in `ambient.env`; see
+  docs/upgrade_guide.md.
+- **BREAKING — ferrum-mesh `crds.adoptExisting` removed** (issue #7299). Helm's
+  own ownership check refuses an unmanaged `UDPResponseAmplificationPolicy`
+  CRD, and `helm upgrade --take-ownership` alone adopts one left by the former
+  `crds/` directory.
+- **BREAKING — `correlation_id` metadata is no longer a request-ID fallback**
+  (issue #7303). `ai_tool_governor` approval requests and `ws_frame_logging`
+  disconnect records read private canonical correlation state, then the
+  `request_id` metadata key only. A custom plugin must publish its request ID
+  as `request_id`.
+- ferrum-gateway chart: `helm template` no longer fails the SleepAction check
+  under Helm's default Kubernetes version (1.20.0), which is not a real
+  cluster. An explicit `--kube-version` below 1.29 still fails, as in
+  ferrum-mesh (issue #7299).
+- `openapi.yaml` `info.version` now tracks the crate version (0.9.20,
+  previously frozen at 0.2.0); a unit test keeps them equal, and releases bump
+  both (#7304).
+- `mesh_authz`, `workload_metrics` and the injected
+  `_effective_mesh_authz_baggage_gates` share one `MeshTrustedHboneAssertors`
+  OpenAPI schema. It now matches the runtime parser: Unicode whitespace is
+  trimmed, values that are blank after trimming are refused, a `null`
+  `asserts`/`scope` counts as absent, `asserts` entries must be `spiffe://`
+  IDs, and a non-SPIFFE value containing `://` is refused (#7304).
+- The rate-limiting, GraphQL, gRPC method router, AI rate limiter, WebSocket
+  and UDP rate-limiting `redis_key_prefix` schemas no longer advertise a
+  `{FERRUM_NAMESPACE}:…` placeholder `default`, which a default-filling client
+  would have written literally; the descriptions still give the derived default
+  (#7304).
+- A `UDPRoute` whose parentRef names a Gateway in another namespace is now
+  admitted when that listener's `allowedRoutes.namespaces` permits it, and
+  materializes in the Gateway's namespace (source-bound ids, weighted upstream
+  included), as `TCPRoute`/`TLSRoute` already did. Previously it was refused
+  (#7305).
+- **BREAKING — PeerAuthentication applicability is `scope` only** (issue
+  #7243). Native, file and xDS PeerAuthentication now carries the same `scope`
+  as every other mesh policy resource and is always written with `scope`. A
+  policy without `scope`, or one carrying the earlier `selector` member, is
+  refused (missing `scope`, unknown field `selector`); ConfigSync protocol
+  revision 4 carries the new shape. **Operator action:** write `scope` (`kind:
+  namespace` / `workload_selector` / `mesh_wide`) in native mesh documents.
+- **BREAKING — `FERRUM_ACME_AUTO_RENEW_ENABLED=true` is refused outside
+  `database`, `file` and `dp` modes** (issue #7251). Only those modes run the
+  ACME renewal scheduler, so `mesh`, `cp`, `injector`, `node_agent` and
+  `migrate` used to accept the flag and silently never renew.
+  `EnvConfig::validate` and `ferrum-edge validate` now refuse it there; mesh's
+  operator frontend TLS is static input that a renewal could never reach. See
+  the upgrade guide.
+- **The node-agent exits nonzero when its CNI listener stops serving**
+  (issue #7253). With the chained conflist installed, a dead listener fails
+  every pod creation on the node. The agent used to log one error and stay up
+  and Ready; it now runs its normal cleanup and exits for a supervisor restart,
+  in eBPF and iptables-fallback mode alike. A second node-agent generation that
+  finds a live owner holding the CNI socket lock (a rolling-restart overlap) no
+  longer gives up: it waits and takes the socket over once that owner exits.
+- **Full config reloads in database and CP mode are labelled with their cause**
+  (issue #7252). Logs, the change-log `trigger` and the `config_rejected` lines
+  say DNS reconnect, gateway trust drift or standing rejection, instead of
+  always "DB DNS reconnect".
+- The node-agent now requires every Ferrum BPF map in the loaded ELF and
+  refuses to start if one is missing or has the wrong type, instead of booting
+  with older-ELF fallbacks (the ELF ships in the same image). (#7266)
+- Mesh startup now fails when a `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` entry
+  exists but resolves through a symlink (for example `/var/run/app` where
+  `/var/run` links to `/run`), because every dial would otherwise be refused.
+  Configure the canonical directory. (#7269)
+- Stock xDS: a service VIP is now taken only from `OUTBOUND` listeners, and a
+  second CDS cluster that resolves to an already-claimed service port is
+  refused with `duplicate_service_port_cluster`. (#7270)
+- **BREAKING — removed plugin config compatibility shapes** (issue #7114).
+  Under the build-out policy these alternate spellings and deprecated options
+  are gone, and each one now fails config load as an unknown key or value. Each
+  change has a section in the upgrade guide:
+  - `hmac_auth`: `signing_profile: ferrum-hmac-v1` and
+    `allow_unsafe_replayable_v1` are removed, `replay_scope` is required for
+    every profile, and the `replay_authority.legacy_unsafe_profile_accepted`
+    runtime counter is gone.
+  - `workload_metrics`: the `disable_span_reporting` / `disableSpanReporting`
+    and Lightstep `accessTokenEnv` spellings are removed.
+  - `jwks_auth`: the provider `audience` spelling is removed.
+  - `mcp_gateway`: the `allow_immediately` / `expose` / `startup` aliases are
+    removed.
+  - `ai_semantic_firewall`: `privacy.log_raw_text` is removed.
+  - `response_caching`: `cache_key_include_query` /
+    `cache_key_include_consumer` are removed.
+  - `soap_ws_security`: identifies a SAML assertion by `ID` only, never by the
+    SAML 1.x `AssertionID`.
+  - `ip_restriction`: the decision-neutral `mode` key is removed; an address
+    that fails both the allow and deny checks is reported as `IP address not
+    allowed`.
+- `openapi_validator`: `error_truncate_chars` now defaults to 256, the cap that
+  was always enforced (issue #7114).
+- Plugin configs no longer carry dedicated "was removed" diagnostics for
+  retired keys. The generic unknown-key rejection reports them:
+  `access_control` `allowed_ips`/`blocked_ips`, `compression`
+  `disable_on_etag`, `loki_logging` `include_listen_path_label`, `hmac_auth`
+  `require_digest`, `ldap_auth` `consumer_mapping`, `jwks_auth`
+  `dpop_jti_ttl_secs`/`dpop_jti_cache_max_entries`, and the `rate_limiting`
+  root window fields (issue #7113).
+- **BREAKING — custom response-stream inspectors take `&Bytes`** (issue #7117).
+  `ResponseStreamInspector::on_chunk` now receives `chunk: &bytes::Bytes`
+  instead of `&[u8]`, so a custom inspector must update its signature. An
+  inspector that forwards the chunk unchanged should return
+  `Forward(chunk.clone())`. See the upgrade guide.
+- **BREAKING — `mcp_gateway` `observability.emit_metadata: false` now
+  suppresses every descriptive `mcp.*` key** (issue #7136).
+  `mcp.route_decision` on synthetic and refused responses,
+  `mcp.session.downstream`, `mcp.protocol_version`,
+  `mcp.protocol_version_negotiated` and the `mcp.sse.*` tokens were recorded
+  regardless of the flag. The `mcp.bridge.*` outcome keys and the argument keys
+  (governed by `log_argument_hash` / `log_raw_arguments`) are still always
+  recorded.
+- **BREAKING — WebSocket frame records write `direction` as `client_to_backend`
+  / `backend_to_client`** (issue #7144). `ws_frame_logging` frame records and
+  the `ws_rate_limiting` and `waf` WebSocket warnings used `client->backend` /
+  `backend->client`, unlike the `ws_frame_logging` direction filter, its
+  disconnect records, stream summaries, metrics and traces.
+- `plugin_triggers.missing_decision_carriers` no longer counts instances whose
+  trigger reads `consumer` or `auth_method` (issue #7144). Those are undecided
+  by design on stream connections and before `authenticate`; their hooks still
+  run. A sustained nonzero value now always means a summary or session path is
+  not stamping the carrier.
+- WAF `FE-XPATH-001` now requires XPath syntax (a predicate close with a path
+  union, an explicit axis, or a quote-break into an XPath-only function such as
+  `name()`), and `FE-HEADER-002` fires only when `X-HTTP-Method-Override` names
+  a different method than the request (issue #7143). A bare `' or '1'='1` is
+  scored once, by the SQLi rules, instead of High + Medium.
+- WAF IP exemptions match the request's canonical client address, so an
+  IPv4-mapped `::ffff:a.b.c.d` caller is treated as the IPv4 caller it is and
+  is not covered by an IPv6-only exemption such as `::/0` (issue #7143). WAF
+  config readers share one implementation, so the same mistake gets the same
+  diagnostic everywhere.
+- `proxy_alerts` rule diagnostics carry the `proxy_alerts:` / `` `rules[N]` ``
+  prefix once instead of repeating it in three spellings (issue #7141).
+- `oidc_relying_party` now treats the `redirect_uri`'s own origin (scheme, host
+  and effective port) as a trusted post-login redirect target, so a deep link
+  survives login under the minimal configuration without listing the gateway's
+  own host in `behavior.trusted_redirect_hosts` (#7147).
+- `response_transformer` body rewrites now preserve backend JSON number lexemes
+  byte for byte (out-of-range integers, high-precision decimals, `1.50`,
+  `2.5e-3`, `-0`), matching `request_transformer`; only values a rule writes
+  are re-spelled (#7149).
+- Unknown plugin configuration keys are now reported by one shared diagnostic
+  in 39 more plugins: every unknown key is listed, sorted and path-qualified,
+  with a spelling suggestion when one is close. Messages that used to list
+  every allowed key no longer do (#7151).
+- `/metrics`: service-discovery task health, compression codec admission, the
+  admin audit pipeline, UDP amplification, gateway trust bundles, the admin and
+  CP gRPC connection limiters, and the node agent are rendered on every scrape
+  instead of being held in the render cache for up to
+  `render_cache_ttl_seconds` (#7145).
+- **The UDP placement reader parses `FERRUM_K8S_NODE_UID` as the preflight
+  does** (#7191). A set but empty or malformed value now resolves no node
+  identity, so every proof-requiring Ambient UDP placement branch refuses it.
+  It no longer silently falls back to the node-agent's published identity file.
+- **H1/H2 uploads to a native HTTP/3 backend are classified by typed evidence**
+  (#7187). The `413` comes from a typed `BodyTooLarge` fault. Only typed proof
+  the client left (a reset or GOAWAY it sent, or a broken connection) is the
+  `499` client abort. Any other read failure, and an HTTP/2 stream that ended
+  without `END_STREAM`, is a `400` malformed upload, as on the other
+  relayed-upload paths.
+- **`/overload` reports the mesh NodeWaypoint DTLS reload status** (#7186) as
+  `stream_listeners.mesh_node_waypoint_dtls_reload`, beside the operator slot,
+  so a rejected mesh PeerAuthentication candidate is visible.
+- **The buffered-request native HTTP/3 streaming path relays through the shared
+  committed-response relay** (#7190). The copy of about 600 lines is removed,
+  so future relay fixes apply to both paths at once.
 
 ### Fixed
 - **`body_validator` response-side rejections no longer describe the upstream
@@ -1321,6 +1679,296 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop: `ai_federation_circuit_open_skips` per skip, and the committed
   provider's `_last_provider`, `_last_state` and
   `ai_federation_circuit_half_open_probes`.
+- OpenAPI 3.2 documents whose Path Items declare the `query` operation or
+  `additionalOperations` are refused at import with HTTP 422
+  `UnsupportedOperationField` instead of being accepted with those operations
+  silently ignored by the generated validator and MCP bridge (#7201).
+- CP/DP trust-bundle reload now warns, like startup, when the reloaded bundle
+  binds no credential to a served namespace; the never-emitted
+  `scope_validation_failed` reload reason and its metric series are removed
+  (#7203).
+- DNS failed-retry lookups are bounded by the same 15 s wall-clock timeout as
+  background refresh; a timeout advances error backoff instead of stalling the
+  retry cycle (#7204).
+- SQL config loads reject proxy, upstream, consumer, plugin and API-spec rows
+  whose columns fail to decode or hold unknown `auth_mode` /
+  `response_body_mode` / `spec_format` values, instead of defaulting them (port
+  80, plaintext listener, `single` auth, dropped priority, ...); the last good
+  config stays live (#7192).
+- ACME order preparation skips authorizations the CA already validated and
+  fails closed on terminal ones, so a reused valid authorization no longer
+  orphans the new order; orders whose authorizations were all valid resume
+  without a challenge (#7195).
+- Admin audit spool instances are locked before they become visible on Unix, so
+  processes starting together on one spool root can no longer claim each
+  other's directories; a DB-less audit loss is no longer reported as a shutdown
+  (#7200).
+- **Mid-session stream failures no longer read as connect failures** (#7213).
+  The boxed-error substring fallback now follows the connect-phase rule the
+  typed classifier already applied. After the connect phase, "timed out" is
+  `read_write_timeout`, "refused" and TLS wording are `connection_reset`, and
+  port-exhaustion text is no longer `port_exhaustion`. The WebSocket session
+  errno exceptions and response-body `EADDRNOTAVAIL` follow the same rule. UDP
+  session receive/send failures are classified from the typed error rather than
+  its message, so an ICMP port-unreachable on a connected UDP socket is
+  reported as `connection_reset` in stream summaries and metrics.
+- **`POST /batch` enforces API-spec ownership and the `openapi_validator`
+  precondition** (#7214). A batch proxy can no longer attach an upstream owned
+  by an API spec. An `openapi_validator` plugin config now needs a persisted
+  proxy with an attached API spec, so one targeting a proxy created in the same
+  batch is refused, as single-resource writes already did.
+- **Unauthenticated `/health` probes no longer compute discarded detail**
+  (#7216). Pool statistics, failover topology, cached-config counts,
+  database-polling detail and mesh state are built only for the authenticated
+  detail tier.
+- **`FERRUM_AUDIT_RETENTION_DAYS` now ages out idle namespaces** (#7220). Audit
+  rows were pruned only when their namespace received a new audit event, so a
+  namespace that went quiet kept rows past the configured age indefinitely.
+  Database and CP modes now also run a background sweep about once an hour
+  (jittered ±25%) that applies age retention to every namespace holding audit
+  rows, on SQL and MongoDB. A large backlog drains over successive sweeps, at
+  most 8000 rows per namespace per sweep. The row cap stays insert-driven.
+- The io_uring TCP splice relay now waits for socket readiness, or the nearest
+  timeout deadline, instead of waking every millisecond while idle. This
+  removes about 1,000 wake-ups per second per idle stream and up to 1 ms of
+  first-byte latency after a quiet period (#7226)
+- Mesh SPIFFE peer verifiers no longer rebuild their trust stores and re-warn
+  on every handshake while a rejected trust candidate is published. The
+  skip-verify `NoVerifier` no longer builds a crypto provider per handshake
+  (#7224)
+- TLS source URIs re-encode `&`, `=`, `%`, `+`, `#` and space in query options
+  when rendered for export, admin output and pool keys. Such option values now
+  round-trip, and distinct option maps no longer share a pool key (#7227)
+- Unusable ACME order finalization material is reported as
+  `UnusableFinalizationMaterial` with HTTP 400 on every Admin path. It was
+  previously a 500 "failed to parse ACME certificate store" (#7229)
+- `ferrum.conf` `FERRUM_FILE_CONFIG_PATH` and the CLI share a single file-mode
+  inference implementation (#7221)
+- ferrum-mesh: `ca.enabled=true` now fails `helm template` when `ca.env` would
+  bind plaintext CP gRPC on a non-loopback address with no TLS cert/key paths
+  and no `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`. The CA pod previously rendered
+  and then exited at startup. The development example sets the opt-in
+  (issue #7298).
+- ferrum-gateway chart: loopback binds are parsed instead of prefix-matched, so
+  an expanded IPv6 loopback such as `0:0:0:0:0:0:0:1` is refused for
+  `admin.service`, `metrics.serviceMonitor` and `cp.service` like `::1`
+  (issue #7299).
+- ferrum-gateway chart: a null `terminationGracePeriodSeconds` now fails the
+  render instead of leaving the pod on Kubernetes' 30s default (issue #7299).
+- The vendored reqwest connector again applies the per-request connect timeout
+  to its TCP connector, which spreads it across resolved addresses. A backend
+  name whose first address black-holes now falls over to the next address
+  within the budget instead of failing the whole connect (#7308).
+- **Identity guardrail flags use the shared boolean rule** (#7237).
+  `FERRUM_MESH_PRODUCTION_MODE`, `FERRUM_MESH_ALLOW_NO_CA`,
+  `FERRUM_MESH_ALLOW_STATIC_ID`, `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY` and
+  `FERRUM_MESH_CA_BOOTSTRAP_DEV` accept `true`/`false`/`1`/`0` (trimmed,
+  case-insensitive; blank is unset). Any other value now fails `ferrum-edge
+  validate` and startup in every mode instead of reading as `false`. **Operator
+  action:** `1` now enables `FERRUM_MESH_ALLOW_STATIC_ID` and
+  `FERRUM_MESH_CA_BOOTSTRAP_DEV` (both remain refused under production mode).
+- **`ambient-udp-preflight` reads `FERRUM_K8S_NODE_NAME` from the environment
+  only** (#7237), like the NodeWaypoint UDP listeners. A `ferrum.conf` value is
+  ignored.
+- **xDS data planes take services only from the Ferrum Services carrier**
+  (#7244). A control plane that sends Ferrum-shaped CDS/EDS names but no
+  carriers no longer produces protocol-less, policy-less name-only services.
+- **Remote-discovery poll failures name their cause** (#7245). The warning
+  carries a fixed `failure` class (`connect`, `timeout`, `subscribe_failed`,
+  `update_rejected`, `revision_rejected`, …) and a bounded `reason`, never the
+  remote control plane's error text.
+- **`duration > N` access-log filters are strict** (#7245). Telemetry
+  `response.duration > N` compiles to the new `latency_above_ms` expression
+  atom (fractional milliseconds), so a 1000.4 ms request matches `> 1000`.
+  `stdout_logging` `filter.expression` accepts the new `op`.
+- **ServiceEntry `workloadSelector` is reported as deferred** (#7243). It was
+  carried but never used for endpoint selection. Status now lists
+  `spec.workloadSelector` in `deferred_fields`.
+- **Mesh DNS answers echo the client's QNAME case** (issue #7249). Locally
+  answered responses re-encoded the lower-cased name in the question section
+  and shared one cached template across case variants, so DNS 0x20 resolvers
+  (for example unbound `use-caps-for-id`) discarded them.
+- **Gateway API routes accept the full `backendRefs[].weight` range**
+  (issue #7256). HTTPRoute, GRPCRoute, TCPRoute and TLSRoute refused weights
+  above 65,535 even though the CRD admits up to 1,000,000, so the whole route
+  was skipped. They now use the same parser as UDPRoute, and HTTP/gRPC backend
+  sets are scaled to fit Ferrum's 65,535 target limit. A UDP
+  Gateway/ListenerSet listener is now a UDP mesh service instead of an
+  HTTP-family one, and a `GRPCS` listener is classified like `HTTPS`.
+- **The Istio translator refuses malformed fields and reports unenforced ones**
+  (issue #7257). A VirtualService `retryOn` token that is neither an Istio
+  retry policy nor an HTTP status code 100-599, an `http[].route[]` entry
+  without a `destination`, and a ServiceEntry with an unknown `location` or
+  `resolution`, a `ports[]` entry without an integer `number`, a non-integer
+  endpoint port, or an endpoint with neither `address` nor `network` now refuse
+  the resource (`FerrumAccepted=False`) instead of being dropped. Valid Istio
+  settings Ferrum does not enforce are listed in
+  `status.ferrum.translation.deferred_fields`: unsupported `retryOn` policies,
+  `perTryTimeout`, `retryRemoteLocalities`, Telemetry
+  `metrics[]`/`accessLogging[]` entries after the first, and network-only
+  ServiceEntry endpoints. `DNS_ROUND_ROBIN` now resolves like `DNS` instead of
+  `NONE`.
+- **A ListenerSet listener whose TLS material does not resolve is now warned
+  about** (issue #7258), as a Gateway listener is. The ServiceEntry UDP status
+  entry now states the conditions external UDP egress needs instead of calling
+  it out of scope.
+- **A watch scope that can never list no longer makes every scope relist every
+  5 seconds** (issue #7259). Demand-driven evidence refreshes now back off,
+  from 5 s up to 300 s per scope, while they fail to advance the mesh config
+  revision, and return to 5 s once it advances.
+- **Gateway API route and policy status writes refuse a missing
+  `resourceVersion`** (issue #7261). An empty token used to send an unguarded
+  merge patch over other controllers' `status.parents`/`ancestors`, and a
+  missing one counted as success. Both now fail the status batch so the object
+  retries, as the server-side-apply path already did.
+- **`ferrum-cni` lifecycle commands print the installer's diagnostics**
+  (issue #7263). `install`, `uninstall`, `await-cleanup` and `rollback-watch`
+  now log to stderr (`RUST_LOG` overrides the `info` default), so ignored
+  ownership manifests and skipped neighbour CNI configs are visible.
+- **SOCK_OPS bypass-reason metrics no longer lose decisions after a node-agent
+  restart** (issue #7264). After a pin rotation, the consumer adopted the new
+  map generation's counts as its baseline, so decisions made before it noticed
+  the rotation were never published. Pod cgroup discovery on the kubelet.slice
+  layout now stops at the first match.
+- `api_chargeback`: Admin, CP and config-load validation no longer create the
+  process-global `/charges` registry. The first accepted generation now sizes
+  the registry with the node's configured shard count, not the validation
+  client's auto count (issue #7109).
+- `api_chargeback_sink`: spool replay ticks run on Tokio's blocking pool. The
+  directory walks, namespace lock, preflight decodes and dead-letter fsyncs no
+  longer block a runtime worker, and an overrun tick is not followed by
+  catch-up ticks (issue #7111).
+- `api_chargeback_sink`: snapshot charges whose record hook runs after the
+  generation closed admission are now counted on
+  `chargeback_sink_snapshot_late_charges_dropped_total` instead of being
+  dropped silently (issue #7112).
+- `api_chargeback_sink`: the ClickHouse INSERT body goes through the single
+  JSONEachRow funnel instead of a duplicated `_refs` copy. Spool replay reuses
+  the live delivery client, so a custom-TLS sink reads its TLS files and logs
+  its TLS warnings once (issue #7112).
+- **`a2a_gateway` stream counters survive a client disconnect** (#7116). A
+  `message/stream` or `tasks/resubscribe` stream that ends without the backend
+  finishing now still writes `a2a.stream_events`, `a2a.task_id`,
+  `a2a.context_id` and `a2a.task_state` for the events it completed.
+  `a2a_gateway` and `ai_tool_governor` now hand stream state to the terminal
+  hook through the request-owned handoff instead of per-instance maps, so a
+  cancelled terminal hook no longer leaves an entry behind until reload.
+- **`ai_response_guard` `scan_fields: all` no longer flags root structural
+  fields** (#7129). Detection now applies the same top-level `STRUCTURAL_KEYS`
+  exception that redaction and the residual re-scan use. The decoded pass skips
+  those scalar values, and the raw contextual pass scans the body with them
+  masked. A Unix-seconds `created` no longer matches `phone_us`: `reject` stops
+  returning 502 for every chat completion, `warn` stops recording a finding on
+  every response, and a body whose only matches are structural passes through
+  unchanged with its validators.
+- **`ai_stream_router` Gemini streams tolerate a missing final blank line**
+  (#7128). A final SSE event without its blank-line terminator is now
+  transcoded, as on Anthropic routes, instead of failing the whole stream with
+  "malformed trailing data". An unreadable trailing event still fails with that
+  diagnostic.
+- **Caches no longer key on the gateway-minted `traceparent`** (#7130).
+  `otel_tracing` (or a trace-enabled `workload_metrics`) forwards a
+  `traceparent` with a fresh gateway span id on every request, so
+  `ai_semantic_cache` and `response_caching` could never hit on a traced route.
+  The value the trace owner minted is now recorded privately and omitted from
+  both caches' keys while it is forwarded unchanged. A client `traceparent`
+  that reaches the origin unchanged, or a rewritten one, is still part of the
+  key.
+- **`ai_federation` streaming claims stay retry-safe after a pre-wire failure**
+  (#7125). A claimed stream marked the provider operation completed before it
+  checked for a transport failure, so a dispatch that never reached the
+  provider was not retryable under `request_deduplication`. Only a provider
+  response or an ambiguous failure now marks it completed, as on the buffered
+  path.
+- `mcp_aggregate_sse`: a POST-attached commit no longer moves a listener that
+  is still replaying from `Last-Event-ID` past the older events it asked for
+  (issue #7138).
+- The `compression` plugin rationale in the plugin catalog now names zstd
+  (#7152).
+- gRPC-Web clients on HTTP/1.1 and HTTP/2 now receive gRPC-Web framing (status
+  in a body trailer frame) from every gateway refusal: the PeerAuthentication
+  transport mismatch, terminal request-body read failures, egress denials,
+  oversized uploads (split, buffered, declared and streaming) and
+  response-build fallbacks in the native gRPC path (#7155).
+- Gateway-internal `500`/`502` exits now write a transaction log and diagnostic
+  record under their own phases: `invalid_backend_path` (HTTP/1.1, HTTP/2,
+  WebSocket, HTTP/3), `websocket_upgrade_unavailable` and the native HTTP/3
+  `mesh_transport_dispatch_required` (#7156, #7157).
+- Inbound HBONE relay-synthesis refusals are logged under the gateway's serving
+  namespace (`FERRUM_NAMESPACE`) instead of the resource default (#7158).
+- After a retry rotates targets, transaction summaries attribute mesh metadata,
+  the native-gRPC `backend_resolved_ip` (now the load-balanced target, bounded
+  by the RPC deadline) and the native HTTP/3
+  `backend_target`/`backend_resolved_ip` to the attempt that answered (#7159).
+- HTTP/1.1 and HTTP/2 request bodies refused while buffered before
+  authenticate, authorize, before_proxy or dispatch (`413`, `408`, `503`) now
+  run reject-path `after_proxy` hooks and response-header policy and are logged
+  under `request_body_refused_before_*` phases. The pre-dispatch `413` is no
+  longer a bare response. Every early collector publishes the same empty-body
+  views (#7163).
+- The request `Via` received-protocol on the HBONE, Unix-socket, sidecar
+  mesh-mTLS and direct HTTP/2 pools now follows the client's HTTP version
+  instead of the pool's (#7165).
+- HTTP/1.1 and HTTP/2 responses on the process-global proxy ports no longer
+  advertise `Alt-Svc: h3` when no QUIC listener is running
+  (`FERRUM_ENABLE_HTTP3=true` without frontend TLS material, or
+  `FERRUM_PROXY_HTTPS_PORT=0`); the header appears once the HTTP/3 listener has
+  started (#7168).
+- Backend capability probes now cover the rule destinations of
+  `mesh_route_dispatch` instances scoped Global or ProxyGroup, so native HTTP/3
+  and direct HTTP/2 can engage for those routes; previously only Proxy-scoped
+  instances were probed (#7168).
+- Mesh UDP capture (host-network and per-pod-netns), NodeWaypoint UDP Service
+  steering and HBONE UDP relay socket setup no longer run blocking
+  `iptables`/`setns`/registry work on proxy runtime worker threads, and host
+  capture shutdown can now be bounded by the drain budget (#7170).
+- **A gRPC deadline terminal is no longer mistaken for backend data**: when the
+  response pump fired an authorization or client RPC deadline while an ordinary
+  backend DATA frame was on its way up, that frame could be logged as the
+  deadline terminal, skip the gRPC message counter, and reach a gRPC-Web client
+  unencoded. The terminal is now identified by a flag only the emitting adapter
+  sets (#7177).
+- **HTTP/1.1 pipelining: a malformed `Content-Length` no longer fails the
+  requests queued ahead of it**: a non-numeric or overflowing value (not only
+  conflicting values) now stops framing observation without failing earlier
+  pipelined requests with `HTTP/1 request framing could not be verified`; the
+  malformed request itself is still refused (#7179).
+- **gRPC over HBONE retries no longer reuse a dying nested connection**: after
+  a pre-wire cancel or an HTTP/2 protocol NACK, the pooled nested HTTP/2
+  carrier is evicted so the retry opens or picks another (#7180).
+- **DestinationRule `maxConcurrentStreams` now bounds CONNECT streams per HBONE
+  / mesh CONNECT connection**: the cap was part of the pool key but was applied
+  only as the peer-initiated stream limit; the pool now widens at it (#7181).
+- **gRPC and direct HTTP/2 pools no longer hide a failing new connection behind
+  an existing one**: only a `maxConnections` refusal falls back to an
+  already-established shard; TLS, ALPN and connect failures are reported,
+  including to capability probes (#7181).
+- **Idle HBONE and Sidecar mesh-mTLS connections are closed after `idleTimeout`
+  even when the destination gets no further traffic**: a periodic sweep now
+  evicts them and releases their DestinationRule `maxConnections` slots
+  (#7182).
+- **The inbound HBONE byte-stream relay reports failed backend dials to passive
+  health**, so DestinationRule `outlierDetection` can eject a dead target
+  through it (#7183).
+- **Captured mesh raw-TCP relays now count stream errors and TCP resets** on
+  the inbound fast path (no stream plugins) and on captured egress (#7183).
+- **Host-network Ambient UDP capture no longer stops every pod's UDP egress
+  while one departing pod's gate close is unacknowledged**: only the departing
+  pod and pods not yet captured are held closed; pods whose capture is live
+  keep their egress (#7184).
+- **Typed L4 `stream_match` refusals and inspected-prefix forward failures**
+  (#7185). An L4 route-policy refusal is now `dispatch_policy_rejected` /
+  `gateway_policy` / `unknown`. A backend that fails the first-bytes forward is
+  `backend_error` / `backend_to_client`, classified post-wire. Log wording is
+  unchanged.
+- **Frontend-DTLS sessions report backend failures** (#7186). A backend receive
+  error, or the end of the backend DTLS association, is now recorded as a
+  backend error with a class instead of a graceful close. A client-to-backend
+  send error drops that datagram and keeps the session, as on plain UDP.
+- **Clean H3 WebSocket and CONNECT-UDP endings halt the request direction with
+  `H3_NO_ERROR`** (#7188). Previously the receive half was dropped and quinn
+  sent `STOP_SENDING(0)`. CONNECT-UDP faults halt it with the same code the
+  send half resets with.
 
 ### Performance
 - **`ai_tool_governor` drains its live SSE buffer once per chunk**
@@ -1413,6 +2061,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request authority (two or three allocations) on every HTTP request before
   the policy loop, even when no rule constrains `hosts` / `notHosts`. It is
   now normalized on the first rule that does. Decisions are unchanged.
+- DP and mesh clients rebuild CP/DP gRPC TLS material, and stage a
+  FULL_SNAPSHOT's frontend TLS certificates, on the blocking pool instead of a
+  Tokio worker; gRPC health probes build their TLS client once per probe spawn
+  instead of every tick (#7205).
+- Proxy hot paths: no passive health success-counter write per response, no
+  circuit-breaker key allocation without a breaker, one copy per accepted DTLS
+  datagram (none for refused ones), stack cmsg buffers for UDP GSO/pktinfo
+  sends, and `FERRUM_POOL_SHARD_AMOUNT`-sized gateway-wide health and
+  adaptive-buffer maps (#7207).
+- CP snapshot filtering clones only the subscriber's namespace, and mesh slice
+  drift reconciliation projects outside the registry lock (#7208).
+- Admin and validation write paths: one plugin validation client per sweep,
+  single reads in API-spec PUT, per-proxy association lookups, one
+  change-sequence lock per batch/clear transaction, one candidate snapshot for
+  consumer credential checks, and no proxy scan for upstream updates that keep
+  every subset (#7209).
+- **Mesh DNS allocates less per query** (issue #7249). QNAMEs are decoded into
+  a stack buffer and lower-cased in place, upstream reply matching no longer
+  allocates, and a response-cache hit no longer collects a filtered record Vec.
+- **The node-agent's Node UID revalidation runs off the pod/CNI loop**
+  (issue #7254). Its up-to-10 s Kubernetes GET no longer stalls pod events, CNI
+  calls and readiness timers during an API-server brown-out.
+- **Cold-path mesh and identity work is done once** (issue #7250):
+  - xDS NACK rollback restores only the replaced type instead of cloning the
+    whole accumulator
+  - ECDS/RTDS resources are decoded once
+  - remote-cluster endpoint snapshots share entries by `Arc`
+  - the slice content digest is computed once per received slice
+  - the Sidecar egress-scope snapshot reuses the slice's narrowed set
+  - the Workload API memoizes JWT authority admission per identical authority
+    set
+- `api_chargeback_sink`: snapshot mode looks up an existing identity with a key
+  borrowed from the request summary and builds the owned key only for a new
+  identity (issue #7112).
+- **Fewer per-request lookups in plugin dispatch** (#7117). The built-in
+  response-body production table is precomputed. Terminal logging decides
+  whether to build the mesh RED key from a plugin capability instead of
+  matching plugin names. Chained response-stream inspectors no longer copy each
+  chunk before the first inspector.
+- **No per-chunk copy for observing stream inspectors** (#7117).
+  Response-stream inspectors now share each chunk's buffer. `a2a_gateway`,
+  `ai_rate_limiter`, `ai_token_metrics`, `ai_transcript_audit`, the `sse`
+  pass-through, `ai_tool_governor`'s bypass and `ai_semantic_firewall` in
+  detect mode no longer copy each chunk to forward it unchanged.
+- **`ai_federation` parses the `tools` list once per request** (#7125).
+  Admission returns borrowed tool views that every provider translation reuses.
+  Schemas are no longer cloned up to four times per request.
+- **`ai_semantic_firewall` copies and hashes less** (#7132). `before_proxy` no
+  longer clones the buffered request body (up to 10 MiB) to hash it. The final
+  request and response hooks reuse the digest their unchanged-body check
+  computed instead of hashing the same bytes twice. Segment de-duplication and
+  embedding inputs borrow the extracted text instead of copying it.
+- `mcp_gateway` (issue #7137):
+  - `tools/list` serializes the catalog's shared schemas in place instead of
+    deep-cloning them per request.
+  - Upstream list paging counts item bytes without serializing each item to a
+    buffer and no longer clones items.
+  - The upstream SSE reader no longer rescans the whole buffer on every chunk.
+- `proxy_alerts` looks up a channel by indexing a dense `Vec` instead of
+  probing a `HashMap` per sample (issue #7141).
+- `/metrics` exposition writes each line straight into the output buffer
+  instead of formatting a temporary string first (#7145).
+- `workload_metrics` scans the backend trace headers once per request in
+  `before_proxy` and no longer rewrites an unchanged `trace_sampled` entry
+  (#7146).
+- `loki_logging` shares interned label sets instead of cloning the label map
+  for every entry; `graphql` parses the request envelope once without copying
+  the body; `request_deduplication` serializes each published replay once
+  (#7152).
+- Removed per-request work from proxy hot paths: the circuit-breaker key is
+  built only for proxies with a breaker; the idle-read timer is armed lazily;
+  native HTTP/3 TLS lookups no longer clone the proxy per request; mesh
+  dispatches derive their authorization plan once; the HBONE source
+  credential's leaf deadline is cached per SVID; and the NodeWaypoint relay
+  mark no longer re-reads `FERRUM_MESH_TOPOLOGY` per CONNECT (#7166).
+- TCP stream connections no longer clone the proxy's retry, DNS-override,
+  upstream, port-override and circuit-breaker settings per accepted connection,
+  and the Linux splice relay no longer allocates five shared counters per
+  connection (#7167).
+- UDP and DTLS session setup no longer clones the whole proxy configuration per
+  new session, and the pending-session cap check no longer locks every map
+  shard for each datagram from an unknown source (#7167).
+- Config publications with many mesh relay upstreams no longer scan every
+  upstream per relay upstream, and route-content change detection no longer
+  deep-clones every HTTP proxy (#7168).
+- **Two fewer relaxed atomic updates per relayed DTLS datagram and per UDP
+  listener batch** (#7186), from removing the unread counters.
 
 ## [0.9.20] - 2026-11-02
 

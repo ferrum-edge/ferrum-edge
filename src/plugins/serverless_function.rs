@@ -626,27 +626,19 @@ impl ServerlessFunction {
             .as_object()
             .ok_or_else(|| "serverless_function: config must be an object".to_string())?;
 
-        let mut unknown_fields: Vec<&str> = config_object
-            .keys()
-            .map(String::as_str)
-            .filter(|key| !ALLOWED_CONFIG_FIELDS.contains(key))
-            .collect();
-        unknown_fields.sort_unstable();
-        if !unknown_fields.is_empty() {
-            return Err(format!(
-                "serverless_function: unknown configuration field(s): {:?}",
-                unknown_fields.join(", ")
-            ));
-        }
-        if let Some((key, _)) = config_object.iter().find(|(_, value)| value.is_null()) {
-            // Only schema-authored names may enter the trusted backtick span.
-            let field = ALLOWED_CONFIG_FIELDS
-                .iter()
-                .copied()
-                .find(|field| *field == key.as_str())
-                .ok_or_else(|| {
-                    format!("serverless_function: unknown configuration field(s): {key:?}")
-                })?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            ALLOWED_CONFIG_FIELDS,
+            "serverless_function: `config`: ",
+        )?;
+        // Every key is known by now, so the null field is named from the
+        // schema-authored list: only those names may enter the backtick span.
+        if let Some(field) = ALLOWED_CONFIG_FIELDS
+            .iter()
+            .copied()
+            .find(|field| config_object.get(*field).is_some_and(Value::is_null))
+        {
             let is_required = field == "provider"
                 || (field == "function_url"
                     && matches!(
@@ -3680,9 +3672,11 @@ fn build_native_grpc_terminate_response(
     }
 
     // Never collect/sort/join an unbounded inventory of unknown names solely for
-    // logging. serde_json::Map iterates in sorted key order, so the first
-    // sample slots are deterministic; only a bounded sample plus a count is
-    // rendered, and each name fragment is escaped/capped.
+    // logging. serde_json::Map iterates in a fixed order for a given body (the
+    // `preserve_order` feature is enabled transitively, by `bson`, so that is
+    // document order), so the first sample slots are deterministic; only a
+    // bounded sample plus a count is rendered, and each name fragment is
+    // escaped/capped.
     if let Some(detail) = unknown_grpc_terminate_fields_detail(
         object
             .keys()
@@ -4005,15 +3999,7 @@ pub mod test_helpers {
                 .filter(|s| !s.is_empty())
                 .map(String::from),
         };
-        aws_sigv4::sign_request(
-            &config,
-            "lambda",
-            "POST",
-            url,
-            "application/json",
-            payload,
-            now,
-        )
+        sign_lambda_request(&config, url, payload, now)
     }
 
     /// Serving-node construction with `fetcher` standing in for the AWS SDK

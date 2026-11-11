@@ -56,8 +56,6 @@ use crate::util::backoff::{
 pub(crate) const FEDERATION_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
 #[cfg(test)]
 const FEDERATION_BACKOFF_MAX_SECS: u64 = BACKOFF_MAX_SECS;
-#[allow(dead_code)]
-pub(crate) const DEFAULT_FEDERATION_MAX_STALE_SECONDS: u64 = 3600;
 
 /// Hard cap on federation response body size. A real SPIFFE bundle is
 /// kilobytes — even a generous JWKS with several authorities fits well
@@ -619,18 +617,7 @@ pub struct FederationPollerConfig {
 }
 
 impl FederationPollerConfig {
-    /// Returns `None` when the poller should be disabled (interval 0 or no
-    /// federated remote clusters configured).
-    #[allow(dead_code)]
-    pub fn from_env(interval_seconds: u64, timeout_seconds: u64, fail_open: bool) -> Option<Self> {
-        Self::from_env_with_max_stale(
-            interval_seconds,
-            timeout_seconds,
-            fail_open,
-            DEFAULT_FEDERATION_MAX_STALE_SECONDS,
-        )
-    }
-
+    /// Returns `None` when the poller should be disabled (interval 0).
     pub fn from_env_with_max_stale(
         interval_seconds: u64,
         timeout_seconds: u64,
@@ -647,12 +634,6 @@ impl FederationPollerConfig {
             fail_open,
         })
     }
-}
-
-/// Holds the spawned tasks so callers can join during graceful shutdown.
-#[allow(dead_code)] // Integration tests call this through the lib crate; the bin target does not.
-pub struct FederationPollerHandles {
-    pub tasks: Vec<JoinHandle<()>>,
 }
 
 /// Resolve the polling-target list from a [`MultiClusterConfig`]. Remote
@@ -708,66 +689,6 @@ fn poll_targets_for_multi_cluster(
     targets
 }
 
-/// Spawn the federation poller. Returns `None` when the poller is disabled or
-/// there are no configured federation endpoints; otherwise returns the spawned
-/// task handles. The caller-supplied `store` is shared with the mesh runtime
-/// so successful polls are observable by the slice-apply path immediately.
-#[allow(dead_code)] // Integration tests call this through the lib crate; the bin target does not.
-pub fn spawn_federation_poller(
-    multi_cluster: Option<&MultiClusterConfig>,
-    config: Option<FederationPollerConfig>,
-    http_client: PluginHttpClient,
-    store: FederationStore,
-    shutdown_rx: watch::Receiver<bool>,
-) -> Option<FederationPollerHandles> {
-    let config = config?;
-    let multi_cluster = multi_cluster?;
-    let targets = poll_targets_for_multi_cluster(multi_cluster);
-    if targets.is_empty() {
-        debug!(
-            "No remote clusters with federation_endpoint configured; federation poller disabled"
-        );
-        return None;
-    }
-    let mut tasks = Vec::with_capacity(targets.len());
-    for target in targets {
-        let task_store = store.clone();
-        let task_config = config.clone();
-        let task_client = http_client.clone();
-        let task_shutdown = shutdown_rx.clone();
-        let cluster_name = target.cluster_name.clone();
-        let trust_domain = target.trust_domain.clone();
-        let endpoint = target.endpoint.clone();
-        let endpoint_for_logs = sanitize_endpoint_for_logging(&endpoint);
-        info!(
-            cluster = %sanitize_startup_scalar(&cluster_name),
-            trust_domain = %sanitize_startup_scalar(&trust_domain),
-            endpoint = %sanitize_startup_scalar(&endpoint_for_logs),
-            poll_interval_seconds = %sanitize_startup_scalar(task_config.poll_interval.as_secs()),
-            max_stale_seconds = %sanitize_startup_scalar(format!("{:?}", task_config.max_stale_age.map(|age| age.as_secs()))),
-            fail_open = %sanitize_startup_scalar(task_config.fail_open),
-            "Spawning SPIFFE federation poller"
-        );
-        // Register a generation token so the poll task's install is gated by it
-        // (parity with the manager / RemoteEndpointStore). This one-shot startup
-        // path never calls remove(), so the token simply stays current.
-        let task_generation = store.register(&cluster_name);
-        let handle = tokio::spawn(async move {
-            poll_federation_loop(
-                target,
-                task_store,
-                task_config,
-                task_client,
-                task_shutdown,
-                task_generation,
-            )
-            .await;
-        });
-        tasks.push(handle);
-    }
-    Some(FederationPollerHandles { tasks })
-}
-
 /// One running federation poller tracked by [`FederationPollerManager`].
 struct RunningFederationPoller {
     target: RemoteClusterPollTarget,
@@ -777,11 +698,9 @@ struct RunningFederationPoller {
 
 /// Reconciles SPIFFE federation pollers against the latest mesh slice.
 ///
-/// The one-shot [`spawn_federation_poller`] starts pollers from a single startup
-/// slice and never sees later changes. This manager instead reconciles on every
-/// slice update (mirroring `RemoteDiscoveryManager` for endpoint discovery): it
-/// starts pollers for federation endpoints **added** after startup, aborts
-/// pollers for clusters that are **removed** (or whose endpoint changed), and —
+/// The manager reconciles on every slice update (mirroring
+/// `RemoteDiscoveryManager` for endpoint discovery): it starts pollers for
+/// federation endpoints **added** after startup, aborts pollers for clusters that are **removed** (or whose endpoint changed), and —
 /// critically — calls [`FederationStore::remove_cluster`] for a withdrawn
 /// cluster so a once-fetched federated bundle stops being overlaid onto every
 /// slice apply once the last poller for that trust domain is gone (and stops
@@ -1395,21 +1314,6 @@ mod tests {
             }],
             east_west_gateways: Vec::new(),
         };
-        let (_, shutdown_rx) = watch::channel(true);
-        let handles = spawn_federation_poller(
-            Some(&multi_cluster),
-            Some(config.clone()),
-            PluginHttpClient::default(),
-            store.clone(),
-            shutdown_rx,
-        )
-        .unwrap();
-        assert_eq!(handles.tasks.len(), 1);
-        // Retire before yielding: these startup-emission assertions need no
-        // remote endpoint or background network request.
-        for handle in handles.tasks {
-            handle.abort();
-        }
         let mut manager =
             FederationPollerManager::new(Some(config), PluginHttpClient::default(), store.clone());
         manager.reconcile(Some(&multi_cluster));
@@ -1444,7 +1348,7 @@ mod tests {
         let output = logs.output();
         assert_eq!(
             output.matches("poll_interval_seconds=").count(),
-            2,
+            1,
             "{output}"
         );
         for field in [
@@ -2121,14 +2025,12 @@ mod tests {
 
     #[test]
     fn config_from_env_disables_when_interval_zero() {
-        assert!(FederationPollerConfig::from_env(0, 30, false).is_none());
-        let cfg = FederationPollerConfig::from_env(60, 10, true).expect("enabled");
+        assert!(FederationPollerConfig::from_env_with_max_stale(0, 30, false, 3600).is_none());
+        let cfg =
+            FederationPollerConfig::from_env_with_max_stale(60, 10, true, 3600).expect("enabled");
         assert_eq!(cfg.poll_interval, Duration::from_secs(60));
         assert_eq!(cfg.request_timeout, Duration::from_secs(10));
-        assert_eq!(
-            cfg.max_stale_age,
-            Some(Duration::from_secs(DEFAULT_FEDERATION_MAX_STALE_SECONDS))
-        );
+        assert_eq!(cfg.max_stale_age, Some(Duration::from_secs(3600)));
         assert!(cfg.fail_open);
 
         let cfg =

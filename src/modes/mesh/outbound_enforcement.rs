@@ -139,11 +139,9 @@ impl MeshOutboundEnforcement {
 
     /// Construct directly from a pre-built [`OutboundRegistry`].
     ///
-    /// Useful for tests / admin tooling / future code paths that build
-    /// the registry by some path other than a [`MeshSlice`]
-    /// (`Self::from_slice` is the production caller). Mirrors the same
-    /// port-list normalisation that `from_slice` applies.
-    #[allow(dead_code)] // Public API; exercised by tests and reserved for admin tooling.
+    /// For callers that build the registry by some path other than a
+    /// [`MeshSlice`] (`Self::from_slice` is the production caller). Mirrors the
+    /// same port-list normalisation that `from_slice` applies.
     pub fn from_registry(
         namespace: impl Into<String>,
         outbound_listen_ports: Vec<u16>,
@@ -154,7 +152,6 @@ impl MeshOutboundEnforcement {
 
     /// Like [`Self::from_registry`] but with an explicit HTTP reject status
     /// for outbound-capture route-miss evaluation.
-    #[allow(dead_code)] // Public API; exercised by route-miss coverage.
     pub fn from_registry_with_reject_status(
         namespace: impl Into<String>,
         outbound_listen_ports: Vec<u16>,
@@ -173,8 +170,8 @@ impl MeshOutboundEnforcement {
         }
     }
 
-    #[allow(dead_code)] // Admin / debug surface; reserved for future introspection.
-    pub fn outbound_listen_ports(&self) -> &[u16] {
+    #[cfg(test)]
+    fn outbound_listen_ports(&self) -> &[u16] {
         &self.outbound_listen_ports
     }
 
@@ -253,12 +250,6 @@ impl MeshOutboundEnforcement {
         crate::plugins::prometheus_metrics::global_registry()
             .record_mesh_outbound_registry_decision(&self.namespace, DENIED_HOST_BUCKET, "deny");
         Some(self.reject_status)
-    }
-
-    /// Borrow the inner registry for admin / debug paths.
-    #[allow(dead_code)]
-    pub fn registry(&self) -> &OutboundRegistry {
-        &self.registry
     }
 }
 

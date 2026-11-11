@@ -129,7 +129,11 @@ fn test_reject_unknown_top_level_field() {
     }))
     .err()
     .unwrap();
-    assert_eq!(err, "fault_injection: unknown `config` field \"deplay\"");
+    assert_eq!(
+        err,
+        "fault_injection: `config`: unknown configuration key(s): \"config.deplay\" \
+         (did you mean `delay`?)"
+    );
 }
 
 #[test]
@@ -139,7 +143,10 @@ fn test_reject_unknown_abort_field() {
     }))
     .err()
     .unwrap();
-    assert_eq!(err, "fault_injection: unknown `abort` field \"why\"");
+    assert_eq!(
+        err,
+        "fault_injection: `abort`: unknown configuration key(s): \"abort.why\""
+    );
 }
 
 #[test]
@@ -2000,7 +2007,7 @@ mod blast_radius {
             ),
             (
                 json!({ "match": { "headers": { "x-chaos-test": "1" }, "methods": ["GET"] } }),
-                "unknown `match` field",
+                "`match`: unknown configuration key(s)",
             ),
             (
                 json!({ "match": { "headers": { "bad header": "1" } } }),

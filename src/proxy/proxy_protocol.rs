@@ -62,7 +62,7 @@ pub enum ProxyProtocolResult {
 
 /// Which PROXY protocol versions one listener accepts.
 ///
-/// Stream proxies accept either version ([`read_proxy_header`]). The
+/// Stream proxies accept either version ([`AcceptedProxyVersions::Any`]). The
 /// process-global HTTP/HTTPS listeners can be pinned to one version
 /// (`FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP` / `_HTTPS` = `v1` / `v2`), in which
 /// case a header of the other version is refused exactly like a malformed one.
@@ -148,69 +148,22 @@ const V1_MAX_LEN: usize = 109;
 const V2_INET_ADDR_LEN: usize = 12;
 const V2_INET6_ADDR_LEN: usize = 36;
 
-/// Parse the PROXY protocol header from `stream`.
+/// Parse the PROXY protocol header from a raw [`TcpStream`], accepting only
+/// the `accepted` versions.
 ///
 /// Reads just enough bytes to auto-detect v1 vs v2. On success returns the
 /// forwarded address pair (or `NoAddress` for LOCAL / UNKNOWN). On error the
 /// caller must close the connection immediately — do not continue relaying.
 ///
-/// The `timeout` is applied to the entire read. A `None` timeout means
-/// the default 5-second safety timeout is used.
-pub async fn read_proxy_header<R>(
-    stream: &mut R,
-    timeout_secs: Option<u64>,
-) -> Result<ProxyProtocolResult, ProxyProtocolError>
-where
-    R: AsyncRead + Unpin,
-{
-    read_proxy_header_accepting(stream, timeout_secs, AcceptedProxyVersions::Any).await
-}
-
-/// [`read_proxy_header`] restricted to the `accepted` PROXY versions.
-///
 /// The version is decided from the first six bytes, before any
 /// version-specific bytes are consumed, so a refused version never reads past
-/// the signature prefix. The header-size caps and the whole-read timeout are
-/// the same as [`read_proxy_header`]'s.
-pub async fn read_proxy_header_accepting<R>(
-    stream: &mut R,
-    timeout_secs: Option<u64>,
-    accepted: AcceptedProxyVersions,
-) -> Result<ProxyProtocolResult, ProxyProtocolError>
-where
-    R: AsyncRead + Unpin,
-{
-    let secs = timeout_secs.unwrap_or(5);
-    let fut = parse_proxy_header(stream, accepted);
-    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(ProxyProtocolError::Timeout),
-    }
-}
-
-async fn parse_proxy_header<R>(
-    stream: &mut R,
-    accepted: AcceptedProxyVersions,
-) -> Result<ProxyProtocolResult, ProxyProtocolError>
-where
-    R: AsyncRead + Unpin,
-{
-    let (version, prefix) = read_signature_prefix(stream, accepted).await?;
-    match version {
-        // PROXY v1 text format: "PROXY <PROTO> <SRC> <DST> <SRC_PORT> <DST_PORT>\r\n"
-        HeaderVersion::V1 => parse_v1(stream, &prefix).await,
-        // PROXY v2 binary format: 12-byte signature then 4-byte fixed header.
-        HeaderVersion::V2 => parse_v2(stream, &prefix).await,
-    }
-}
-
-/// [`read_proxy_header_accepting`] for a raw [`TcpStream`].
+/// the signature prefix. A v1 line is located with `peek` and then consumed
+/// with `read_exact` of exactly the header length (typically one peek and one
+/// read). Bytes after the header are never consumed, so the TLS ClientHello or
+/// the first HTTP byte stays in the socket for the next reader.
 ///
-/// Identical outcomes, caps, and timeout; the only difference is that a v1
-/// line is located with `peek` and then consumed with `read_exact` of exactly
-/// the header length (typically one peek and one read) instead of one read per
-/// byte. Bytes after the CRLF are never consumed, so the TLS ClientHello or the
-/// first HTTP byte stays in the socket for the next reader.
+/// The `timeout` is applied to the entire read. A `None` timeout means
+/// the default 5-second safety timeout is used.
 pub async fn read_proxy_header_accepting_tcp(
     stream: &mut TcpStream,
     timeout_secs: Option<u64>,
@@ -270,37 +223,9 @@ where
 
 // ── v1 parser ────────────────────────────────────────────────────────────────
 
-async fn parse_v1<R>(
-    stream: &mut R,
-    prefix: &[u8; 6],
-) -> Result<ProxyProtocolResult, ProxyProtocolError>
-where
-    R: AsyncRead + Unpin,
-{
-    // We already consumed "PROXY " (6 bytes). Read remaining bytes one-by-one
-    // until CRLF, capped at V1_MAX_LEN total (including the consumed prefix).
-    // A generic reader cannot peek, so one byte per read is the only way to
-    // never consume past the CRLF; `TcpStream` callers use `parse_v1_peek`.
-    let mut line = [0u8; V1_MAX_LEN];
-    line[..prefix.len()].copy_from_slice(prefix);
-    let mut filled = prefix.len();
-    loop {
-        if filled >= V1_MAX_LEN {
-            return Err(ProxyProtocolError::V1TooLong);
-        }
-        stream.read_exact(&mut line[filled..filled + 1]).await?;
-        filled += 1;
-        // Check for CRLF terminator
-        if line[filled - 2] == b'\r' && line[filled - 1] == b'\n' {
-            break;
-        }
-    }
-    // `line[..filled]` now contains "PROXY ...\r\n". Strip trailing CRLF.
-    parse_v1_bytes(&line[..filled - 2])
-}
-
-/// [`parse_v1`] for a raw `TcpStream`: same cap, errors, and first-CRLF
-/// termination, without a syscall per byte.
+/// Read a PROXY v1 line (after its 6-byte prefix) from a raw `TcpStream`,
+/// capped at `V1_MAX_LEN` and ending at the first CRLF, without a syscall per
+/// byte.
 ///
 /// Each round peeks whatever is buffered (up to the remaining cap). When the
 /// peeked bytes contain the CRLF, exactly the bytes through it are consumed
@@ -308,7 +233,7 @@ where
 /// terminator and so belongs to the header: those bytes are consumed before
 /// peeking again, which also makes the next peek wait for new data instead of
 /// returning the same buffered bytes in a busy loop. A peer that closes before
-/// the CRLF gets the same `UnexpectedEof` I/O error as the byte-wise reader.
+/// the CRLF gets an `UnexpectedEof` I/O error.
 async fn parse_v1_peek(
     stream: &mut TcpStream,
     prefix: &[u8; 6],

@@ -136,7 +136,6 @@ fn proxy_for_test() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -166,7 +165,7 @@ fn proxy_for_test() -> Proxy {
 }
 
 /// In-process HBONE peer: SPIFFE-mTLS + raw `h2` server that advertises a
-/// configurable `SETTINGS_MAX_CONCURRENT_STREAMS`, answers every CONNECT with
+/// configurable `SETTINGS_MAX_CONCURRENT_STREAMS` (or none), answers every CONNECT with
 /// `200` and echoes the tunnel bytes, and tracks the number of open CONNECT
 /// streams on each accepted connection (in accept order — the same order the
 /// pool appends entries under one key).
@@ -181,7 +180,7 @@ struct Peer {
 }
 
 impl Peer {
-    async fn start(server_slot: SharedSvidBundle, max_concurrent_streams: u32) -> Self {
+    async fn start(server_slot: SharedSvidBundle, max_concurrent_streams: Option<u32>) -> Self {
         let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind peer");
@@ -225,11 +224,11 @@ impl Peer {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
-                    let mut h2 = match h2::server::Builder::new()
-                        .max_concurrent_streams(max_concurrent_streams)
-                        .handshake(tls)
-                        .await
-                    {
+                    let mut builder = h2::server::Builder::new();
+                    if let Some(max_concurrent_streams) = max_concurrent_streams {
+                        builder.max_concurrent_streams(max_concurrent_streams);
+                    }
+                    let mut h2 = match builder.handshake(tls).await {
                         Ok(h2) => h2,
                         Err(_) => return,
                     };
@@ -315,6 +314,16 @@ struct Fixture {
 
 impl Fixture {
     async fn new(width: usize, peer_max_streams: u32) -> Self {
+        Self::build(width, Some(peer_max_streams), None).await
+    }
+
+    /// `peer_max_streams: None` makes the peer advertise no stream cap;
+    /// `proxy_stream_cap` is the proxy's (DestinationRule) `maxConcurrentStreams`.
+    async fn build(
+        width: usize,
+        peer_max_streams: Option<u32>,
+        proxy_stream_cap: Option<u32>,
+    ) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let td = TrustDomain::new("cluster.local").expect("trust domain");
         let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
@@ -341,9 +350,11 @@ impl Fixture {
             gateway_slot,
             4,
         );
+        let mut proxy = proxy_for_test();
+        proxy.pool_http2_max_concurrent_streams = proxy_stream_cap;
         Self {
             pool,
-            proxy: proxy_for_test(),
+            proxy,
             peer,
             workload_id,
         }
@@ -419,6 +430,25 @@ async fn stream_cap_saturation_widens_the_pool() {
     for tunnel in held.iter_mut() {
         echo_round_trip(tunnel).await;
     }
+}
+
+/// Issue #7181: the proxy's `maxConcurrentStreams` is in the outer pool key, so
+/// it must also bound CONNECT streams per carrier. Against a peer that
+/// advertises no cap of its own (so `h2` itself allows unlimited streams after
+/// SETTINGS), the configured cap is the only bound, and the pool must widen at
+/// it instead of piling every tunnel onto one connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_stream_cap_bounds_connect_streams_per_connection() {
+    let fixture = Fixture::build(4, None, Some(2)).await;
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        let mut tunnel = fixture.open_ok().await;
+        echo_round_trip(&mut tunnel).await;
+        held.push(tunnel);
+    }
+    fixture.peer.wait_for_active(&[2, 2, 1]).await;
+    assert_eq!(fixture.peer.accepted(), 3);
+    assert_eq!(fixture.pool.pool_size(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]

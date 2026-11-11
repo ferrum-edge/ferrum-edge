@@ -3,7 +3,8 @@
 //! This module provides a reusable SigV4 implementation for any AWS service.
 //! Used by `serverless_function` (Lambda) and `ai_federation` (Bedrock).
 
-use crate::fips::approved::{HmacSha256, Sha256};
+use super::cert_hash::sha256_hex_lower;
+use crate::fips::approved::HmacSha256;
 use url::Url;
 
 /// AWS credentials and region for SigV4 signing.
@@ -143,13 +144,6 @@ fn canonical_signed_host(parsed_url: &Url) -> Result<String, String> {
     }
 }
 
-/// SHA-256 hash of data, returned as lowercase hex.
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
-}
-
 /// HMAC-SHA256 keyed hash.
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     let mut mac = HmacSha256::new_from_slice(key)
@@ -205,7 +199,7 @@ pub fn sign_request(
     let canonical_uri = uri_encode(parsed_url.path(), false);
     let canonical_querystring = canonical_query_string(parsed_url.query().unwrap_or(""));
 
-    let payload_hash = sha256_hex(payload);
+    let payload_hash = sha256_hex_lower(payload);
 
     // Canonical headers (must be sorted alphabetically by header name).
     // When a session token is present, x-amz-security-token is included.
@@ -246,7 +240,7 @@ pub fn sign_request(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
         amz_date,
         credential_scope,
-        sha256_hex(canonical_request.as_bytes())
+        sha256_hex_lower(canonical_request.as_bytes())
     );
 
     let signing_key = derive_signing_key(

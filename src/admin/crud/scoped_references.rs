@@ -343,8 +343,6 @@ pub(crate) const REVIEWED_NON_MATERIAL_FIELDS: &[(&str, &str)] = &[
     ("request_termination", "trigger.path_prefix"),
     ("request_transformer", "rules[].key"),
     ("request_transformer", "rules[].new_key"),
-    ("response_caching", "cache_key_include_query"),
-    ("response_caching", "cache_key_include_consumer"),
     ("response_mock", "rules[].path"),
     ("response_transformer", "rules[].key"),
     ("response_transformer", "rules[].new_key"),

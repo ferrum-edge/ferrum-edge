@@ -2201,9 +2201,17 @@ async fn test_retry_field_is_written_once_at_the_start_of_a_genuine_stream() {
         .await
         .expect("a genuine event stream gets the retry inspector");
 
-    let first = forwarded(inspector.on_chunk(b"id: 7\ndata: a\n\n").await);
+    let first = forwarded(
+        inspector
+            .on_chunk(&Bytes::from_static(b"id: 7\ndata: a\n\n"))
+            .await,
+    );
     assert_eq!(first, b"retry: 2500\nid: 7\ndata: a\n\n");
-    let second = forwarded(inspector.on_chunk(b"data: b\n\n").await);
+    let second = forwarded(
+        inspector
+            .on_chunk(&Bytes::from_static(b"data: b\n\n"))
+            .await,
+    );
     assert_eq!(second, b"data: b\n\n");
     let end = forwarded(inspector.on_end().await);
     assert!(end.is_empty(), "nothing is held at the end");
@@ -2217,9 +2225,13 @@ async fn test_retry_field_is_written_ahead_of_a_split_backend_bom() {
         .await
         .expect("inspector");
 
-    let held = forwarded(inspector.on_chunk(&[0xEF]).await);
+    let held = forwarded(inspector.on_chunk(&Bytes::copy_from_slice(&[0xEF])).await);
     assert!(held.is_empty(), "a possible BOM prefix is held");
-    let released = forwarded(inspector.on_chunk(b"\xBB\xBFdata: a\n\n").await);
+    let released = forwarded(
+        inspector
+            .on_chunk(&Bytes::from_static(b"\xBB\xBFdata: a\n\n"))
+            .await,
+    );
     assert_eq!(released, b"retry: 2500\ndata: a\n\n");
 }
 
@@ -2230,8 +2242,8 @@ async fn test_retry_field_releases_non_bom_bytes_and_empty_streams() {
     let mut inspector = genuine_stream_inspector(json!({"retry_ms": 2500}))
         .await
         .expect("inspector");
-    assert!(forwarded(inspector.on_chunk(&[0xEF]).await).is_empty());
-    let released = forwarded(inspector.on_chunk(b"x").await);
+    assert!(forwarded(inspector.on_chunk(&Bytes::copy_from_slice(&[0xEF])).await).is_empty());
+    let released = forwarded(inspector.on_chunk(&Bytes::from_static(b"x")).await);
     assert_eq!(released, b"retry: 2500\n\xEFx");
 
     let mut empty = genuine_stream_inspector(json!({"retry_ms": 2500}))
@@ -2332,7 +2344,11 @@ async fn test_retry_inspector_still_attaches_to_identity_coded_streams() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, content_type_of(&headers))
         .expect("identity bytes are the text an EventSource parses");
-    let first = forwarded(inspector.on_chunk(b"data: a\n\n").await);
+    let first = forwarded(
+        inspector
+            .on_chunk(&Bytes::from_static(b"data: a\n\n"))
+            .await,
+    );
     assert_eq!(first, b"retry: 2500\ndata: a\n\n");
 }
 

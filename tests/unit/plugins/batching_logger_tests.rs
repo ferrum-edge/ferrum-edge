@@ -6,8 +6,8 @@ use ferrum_edge::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, DeferredBatchingLogger, LoggerHooks,
     MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
     MAX_BUFFER_CAPACITY, RetryPolicy, TrySendOutcome, build_batch_config,
-    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
-    wait_until_committed,
+    handle_http_batch_response_redacted, parse_custom_headers, parse_http_endpoint,
+    validate_batch_config, wait_until_committed,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
@@ -342,7 +342,7 @@ async fn handle_http_batch_response_classifies_retryable_and_discarded_statuses(
             .unwrap()
             .into();
         assert!(
-            handle_http_batch_response("batching_logger_http", "", 3, Ok(response))
+            handle_http_batch_response_redacted("batching_logger_http", "", 3, Ok(response))
                 .await
                 .is_ok(),
             "expected status {status} to be accepted or discarded without retry"
@@ -360,7 +360,7 @@ async fn handle_http_batch_response_classifies_retryable_and_discarded_statuses(
             .body("")
             .unwrap()
             .into();
-        let err = handle_http_batch_response("batching_logger_http", "", 3, Ok(response))
+        let err = handle_http_batch_response_redacted("batching_logger_http", "", 3, Ok(response))
             .await
             .expect_err("expected retryable status to be returned as an error");
         assert!(
@@ -396,8 +396,8 @@ async fn try_send_batch_threshold_triggers_flush() {
 
     logger.commit();
 
-    logger.try_send(1);
-    logger.try_send(2);
+    logger.try_send_outcome(1);
+    logger.try_send_outcome(2);
 
     wait_for_flush(&notify).await;
     assert_eq!(*flushed.lock().unwrap(), vec![vec![1, 2]]);
@@ -461,7 +461,7 @@ async fn flush_timer_does_not_burst_missed_ticks_after_a_slow_flush() {
             .is_ok()
     );
     logger.commit();
-    assert!(logger.try_send(1));
+    assert!(logger.try_send_outcome(1).as_bool());
 
     timeout(Duration::from_secs(60), third_flush.notified())
         .await
@@ -560,7 +560,7 @@ async fn oversized_batch_size_is_capped_before_flush_loop() {
     logger.commit();
 
     for value in 0..MAX_BATCH_SIZE {
-        logger.try_send(value);
+        logger.try_send_outcome(value);
     }
 
     timeout(Duration::from_secs(1), notify.notified())
@@ -591,7 +591,7 @@ async fn interval_timer_flushes_partial_batch() {
 
     logger.commit();
 
-    logger.try_send(7);
+    logger.try_send_outcome(7);
 
     wait_for_flush(&notify).await;
     assert_eq!(*flushed.lock().unwrap(), vec![vec![7]]);
@@ -624,7 +624,7 @@ async fn retry_policy_retries_failed_flushes() {
 
     logger.commit();
 
-    logger.try_send(9);
+    logger.try_send_outcome(9);
 
     wait_for_flush(&notify).await;
     assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 3);
@@ -650,7 +650,7 @@ async fn exhausted_retries_log_and_drop_batch() {
 
         logger.commit();
 
-        logger.try_send(1);
+        logger.try_send_outcome(1);
         wait_for_flush(&notify).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -682,7 +682,7 @@ async fn dropping_logger_drains_remaining_entries() {
 
     logger.commit();
 
-    logger.try_send(42);
+    logger.try_send_outcome(42);
     drop(logger);
 
     wait_for_flush(&notify).await;
@@ -703,9 +703,9 @@ async fn full_channel_warns_once_per_rate_limit_window() {
 
         logger.commit();
 
-        logger.try_send(1);
+        logger.try_send_outcome(1);
         for value in 2..10 {
-            logger.try_send(value);
+            logger.try_send_outcome(value);
         }
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -746,8 +746,8 @@ async fn high_water_hook_fires_without_overflow_hook() {
 
     logger.commit();
 
-    assert!(logger.try_send(1));
-    assert!(!logger.try_send(2));
+    assert!(logger.try_send_outcome(1).as_bool());
+    assert!(!logger.try_send_outcome(2).as_bool());
     assert_eq!(high_water_hits.load(Ordering::Relaxed), 1);
 }
 
@@ -783,7 +783,7 @@ async fn without_overflow_hook_high_water_still_uses_full_capacity() {
     logger.commit();
 
     // Park the flush worker on the first item.
-    assert!(logger.try_send(0));
+    assert!(logger.try_send_outcome(0).as_bool());
     for _ in 0..10_000 {
         if logger.queue_depth() == 0 {
             break;
@@ -798,7 +798,7 @@ async fn without_overflow_hook_high_water_still_uses_full_capacity() {
 
     for value in 1..=10 {
         assert!(
-            logger.try_send(value),
+            logger.try_send_outcome(value).as_bool(),
             "slot {value} of configured capacity 10 must remain usable without an overflow hook"
         );
     }
@@ -812,7 +812,7 @@ async fn without_overflow_hook_high_water_still_uses_full_capacity() {
         "crossing 80% must still emit high-water telemetry"
     );
     assert!(
-        !logger.try_send(11),
+        !logger.try_send_outcome(11).as_bool(),
         "the item past configured capacity must follow the full-buffer drop path"
     );
 }
@@ -871,8 +871,8 @@ async fn try_send_outcome_distinguishes_accepted_vs_rejected_overflow() {
     );
     assert_eq!(rejected.load(Ordering::Relaxed), 1);
     assert!(
-        !logger.try_send(4),
-        "compatibility try_send remains false for non-channel outcomes"
+        !logger.try_send_outcome(4).as_bool(),
+        "as_bool() stays false for non-channel outcomes"
     );
 }
 
@@ -913,8 +913,8 @@ async fn try_send_outcome_distinguishes_buffer_full_from_worker_unavailable() {
         "post-close admission must be WorkerUnavailable, never BufferFull"
     );
     assert!(
-        !closed.try_send(10),
-        "compatibility try_send remains false after close"
+        !closed.try_send_outcome(10).as_bool(),
+        "as_bool() stays false after close"
     );
 }
 
@@ -976,7 +976,7 @@ async fn single_attempt_flush_shares_arc_batch_without_record_clone() {
 
     logger.commit();
 
-    logger.try_send(CloneTracked::new(11, 64 * 1024, Arc::clone(&clone_count)));
+    logger.try_send_outcome(CloneTracked::new(11, 64 * 1024, Arc::clone(&clone_count)));
 
     wait_for_flush(&notify).await;
     assert_eq!(clone_count.load(Ordering::Relaxed), 0);
@@ -1019,7 +1019,7 @@ async fn retries_share_one_arc_batch_without_record_clones() {
 
     logger.commit();
 
-    logger.try_send(CloneTracked::new(22, 128 * 1024, Arc::clone(&clone_count)));
+    logger.try_send_outcome(CloneTracked::new(22, 128 * 1024, Arc::clone(&clone_count)));
 
     wait_for_flush(&notify).await;
     assert_eq!(attempts.load(Ordering::Relaxed), 3);
@@ -1069,11 +1069,15 @@ async fn large_multi_record_batch_retries_without_record_clones() {
     logger.commit();
 
     for value in 1..=4 {
-        assert!(logger.try_send(CloneTracked::new(
-            value,
-            32 * 1024,
-            Arc::clone(&clone_count)
-        )));
+        assert!(
+            logger
+                .try_send_outcome(CloneTracked::new(
+                    value,
+                    32 * 1024,
+                    Arc::clone(&clone_count)
+                ))
+                .as_bool()
+        );
     }
 
     wait_for_flush(&notify).await;
@@ -1105,7 +1109,7 @@ async fn terminal_failure_without_fallback_discards_shared_batch_without_clones(
     );
 
     logger.commit();
-    logger.try_send(CloneTracked::new(7, 48 * 1024, Arc::clone(&clone_count)));
+    logger.try_send_outcome(CloneTracked::new(7, 48 * 1024, Arc::clone(&clone_count)));
     wait_for_flush(&notify).await;
     // Allow the final warn/drop path to settle after the last attempt notifies.
     tokio::task::yield_now().await;
@@ -1156,7 +1160,7 @@ async fn terminal_failure_with_fallback_receives_shared_batch_without_clones() {
     );
 
     logger.commit();
-    logger.try_send(CloneTracked::new(42, 96 * 1024, Arc::clone(&clone_count)));
+    logger.try_send_outcome(CloneTracked::new(42, 96 * 1024, Arc::clone(&clone_count)));
     wait_for_flush(&notify).await;
 
     assert_eq!(attempts.load(Ordering::Relaxed), 3);
@@ -1191,8 +1195,16 @@ async fn close_after_commit_drains_shared_batch_without_record_clones() {
     );
 
     logger.commit();
-    assert!(logger.try_send(CloneTracked::new(1, 16 * 1024, Arc::clone(&clone_count))));
-    assert!(logger.try_send(CloneTracked::new(2, 16 * 1024, Arc::clone(&clone_count))));
+    assert!(
+        logger
+            .try_send_outcome(CloneTracked::new(1, 16 * 1024, Arc::clone(&clone_count)))
+            .as_bool()
+    );
+    assert!(
+        logger
+            .try_send_outcome(CloneTracked::new(2, 16 * 1024, Arc::clone(&clone_count)))
+            .as_bool()
+    );
 
     let closed = timeout(Duration::from_secs(1), logger.close_and_await())
         .await
@@ -1243,7 +1255,7 @@ fn deferred_batching_logger_default_is_unstarted() {
     let logger = DeferredBatchingLogger::<u32>::default();
     assert!(!logger.is_started());
     assert!(logger.get().is_none());
-    assert!(!logger.try_send(1));
+    assert!(!logger.try_send_outcome(1).as_bool());
 }
 
 /// Uncommitted close must abort the dormant worker instead of draining it.
@@ -1258,7 +1270,7 @@ async fn batching_logger_close_and_await_aborts_when_uncommitted() {
             async move { Ok(()) }
         },
     );
-    assert!(logger.try_send(9));
+    assert!(logger.try_send_outcome(9).as_bool());
     assert!(
         logger.close_and_await().await,
         "uncommitted close_and_await must abort and report success"

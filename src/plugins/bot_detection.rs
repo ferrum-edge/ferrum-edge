@@ -60,7 +60,12 @@ impl BotDetection {
                 BOT_DETECTION_CONFIG_KEYS.join("`, `")
             )
         })?;
-        reject_unknown_config_keys(config)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config,
+            "config",
+            BOT_DETECTION_CONFIG_KEYS,
+            "bot_detection: `config`: ",
+        )?;
 
         let blocked_patterns =
             parse_pattern_list(config, "blocked_patterns", Some(default_blocked_patterns()))?;
@@ -97,19 +102,6 @@ impl BotDetection {
             headers: HashMap::new(),
         }
     }
-}
-
-fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String> {
-    if let Some(unknown) = config
-        .keys()
-        .find(|key| !BOT_DETECTION_CONFIG_KEYS.contains(&key.as_str()))
-    {
-        return Err(format!(
-            "bot_detection: unknown config key {unknown:?}; allowed keys: `{}`",
-            BOT_DETECTION_CONFIG_KEYS.join("`, `")
-        ));
-    }
-    Ok(())
 }
 
 fn default_blocked_patterns() -> Vec<&'static str> {

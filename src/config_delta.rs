@@ -26,24 +26,6 @@ use std::collections::{HashMap, HashSet};
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream};
 
-/// Summary of routing changes affected by proxy adds, removals, or modifications.
-///
-/// Path-keyed routes and host-only routes use different cache keys, so callers
-/// that need targeted invalidation can inspect them separately.
-#[allow(dead_code)]
-#[derive(Debug, Default, Clone)]
-pub struct AffectedRoutes {
-    pub listen_paths: Vec<String>,
-    pub host_only_hosts: Vec<String>,
-}
-
-#[allow(dead_code)]
-impl AffectedRoutes {
-    pub fn is_empty(&self) -> bool {
-        self.listen_paths.is_empty() && self.host_only_hosts.is_empty()
-    }
-}
-
 /// Identifies which resources changed between two config snapshots.
 ///
 /// Used by request-epoch builders to decide which pre-computed inners can be
@@ -254,59 +236,6 @@ impl ConfigDelta {
         }
 
         ids
-    }
-
-    /// Collect routing identities affected by proxy changes.
-    #[allow(dead_code)]
-    pub fn affected_routes(&self, old_config: &GatewayConfig) -> AffectedRoutes {
-        let mut listen_paths = Vec::new();
-        let mut host_only_hosts = Vec::new();
-
-        let record =
-            |listen_paths: &mut Vec<String>, host_only_hosts: &mut Vec<String>, p: &Proxy| {
-                if p.dispatch_kind.is_stream() {
-                    return;
-                }
-
-                match p.listen_path.as_deref() {
-                    Some(path) => listen_paths.push(path.to_string()),
-                    None => host_only_hosts.extend(p.hosts.iter().cloned()),
-                }
-            };
-
-        for p in &self.added_proxies {
-            record(&mut listen_paths, &mut host_only_hosts, p);
-        }
-
-        let old_proxy_map: HashMap<ResourceKey<'_>, &Proxy> = old_config
-            .proxies
-            .iter()
-            .map(|p| (resource_key(p), p))
-            .collect();
-
-        for key in &self.removed_proxy_ids {
-            if let Some(p) = old_proxy_map.get(&key.as_key()) {
-                record(&mut listen_paths, &mut host_only_hosts, p);
-            }
-        }
-
-        for p in &self.modified_proxies {
-            record(&mut listen_paths, &mut host_only_hosts, p);
-            if let Some(old_proxy) = old_proxy_map.get(&resource_key(p)) {
-                let routing_changed = old_proxy.dispatch_kind.is_stream()
-                    != p.dispatch_kind.is_stream()
-                    || old_proxy.listen_path != p.listen_path
-                    || old_proxy.hosts != p.hosts;
-                if routing_changed {
-                    record(&mut listen_paths, &mut host_only_hosts, old_proxy);
-                }
-            }
-        }
-
-        AffectedRoutes {
-            listen_paths,
-            host_only_hosts,
-        }
     }
 }
 
@@ -673,14 +602,6 @@ mod tests {
         proxy
     }
 
-    fn stream_proxy(id: &str, updated_at: DateTime<Utc>) -> Proxy {
-        let mut proxy = proxy(id, None, &[], &[], updated_at);
-        proxy.backend_scheme = Some(BackendScheme::Tcp);
-        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
-        proxy.listen_port = Some(9000);
-        proxy
-    }
-
     fn plugin_config(
         id: &str,
         scope: PluginScope,
@@ -876,34 +797,5 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
         assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")));
-    }
-
-    #[test]
-    fn affected_routes_collects_old_and_new_http_identities_and_skips_streams() {
-        let old = config(
-            vec![
-                proxy("path", Some("/old"), &[], &[], ts(10)),
-                proxy("host", None, &["old.example"], &[], ts(10)),
-                stream_proxy("stream", ts(10)),
-            ],
-            vec![],
-        );
-        let new = config(
-            vec![
-                proxy("path", Some("/new"), &[], &[], ts(11)),
-                proxy("added-host", None, &["new.example"], &[], ts(10)),
-                stream_proxy("stream", ts(11)),
-            ],
-            vec![],
-        );
-
-        let delta = ConfigDelta::compute(&old, &new);
-        let mut affected = delta.affected_routes(&old);
-        affected.listen_paths.sort();
-        affected.host_only_hosts.sort();
-
-        assert_eq!(affected.listen_paths, vec!["/new", "/old"]);
-        assert_eq!(affected.host_only_hosts, vec!["new.example", "old.example"]);
-        assert!(!affected.is_empty());
     }
 }

@@ -19,3 +19,16 @@ pub mod mesh_enrollment;
 pub mod sharding;
 pub mod unix_socket;
 pub mod unknown_keys;
+
+/// Value of one ASCII hexadecimal digit, or `None` when `byte` is not one.
+///
+/// Shared by the admin percent-decoders (backup `resources` filters and API
+/// spec `$ref` fragments) so both accept exactly the same escapes.
+pub(crate) const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}

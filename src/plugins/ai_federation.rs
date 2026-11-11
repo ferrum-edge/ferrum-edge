@@ -236,25 +236,6 @@ impl ProviderType {
         }
     }
 
-    /// Default base URL for each provider.
-    fn default_base_url(self) -> &'static str {
-        match self {
-            Self::OpenAi => "https://api.openai.com/v1/chat/completions",
-            Self::Anthropic => "https://api.anthropic.com/v1/messages",
-            Self::Mistral => "https://api.mistral.ai/v1/chat/completions",
-            Self::Xai => "https://api.x.ai/v1/chat/completions",
-            Self::DeepSeek => "https://api.deepseek.com/v1/chat/completions",
-            Self::MetaLlama => "https://api.llama.com/v1/chat/completions",
-            Self::HuggingFace => "https://router.huggingface.co/v1/chat/completions",
-            Self::Cohere => "https://api.cohere.com/v2/chat",
-            // These providers have dynamic URLs built from config fields
-            Self::GoogleGemini => "https://generativelanguage.googleapis.com",
-            Self::GoogleVertex => "https://aiplatform.googleapis.com",
-            Self::AzureOpenAi => "https://openai.azure.com",
-            Self::AwsBedrock => "https://bedrock-runtime.amazonaws.com",
-        }
-    }
-
     /// Whether this provider uses the OpenAI request/response format natively.
     fn is_openai_compatible(self) -> bool {
         matches!(
@@ -646,10 +627,6 @@ struct ResolvedProvider {
     /// the response-stream inspector, which outlives every borrow of the plugin
     /// instance (it is driven by a detached body task).
     circuit: Option<Arc<ProviderCircuit>>,
-    /// Operator-supplied URL override. Used directly by Anthropic and Cohere
-    /// dispatch paths that build their own URLs without going through
-    /// `url_template`.
-    base_url: Option<String>,
     /// Pre-computed URL template — built once at config-load time so
     /// per-request URL construction is one `String` concatenation, not a
     /// multi-arg `format!()` call. Provider-specific config (azure_*,
@@ -1325,7 +1302,29 @@ fn build_url_template(
             }
         }
 
-        pt => UrlTemplate::Static(Arc::from(pt.default_base_url())),
+        // Providers with one fixed public endpoint. These literals are static
+        // `https://` strings; only an operator `base_url` (handled above) needs
+        // the SSRF validation in `validate_base_url`.
+        ProviderType::OpenAi => {
+            UrlTemplate::Static(Arc::from("https://api.openai.com/v1/chat/completions"))
+        }
+        ProviderType::Anthropic => {
+            UrlTemplate::Static(Arc::from("https://api.anthropic.com/v1/messages"))
+        }
+        ProviderType::Mistral => {
+            UrlTemplate::Static(Arc::from("https://api.mistral.ai/v1/chat/completions"))
+        }
+        ProviderType::Xai => UrlTemplate::Static(Arc::from("https://api.x.ai/v1/chat/completions")),
+        ProviderType::DeepSeek => {
+            UrlTemplate::Static(Arc::from("https://api.deepseek.com/v1/chat/completions"))
+        }
+        ProviderType::MetaLlama => {
+            UrlTemplate::Static(Arc::from("https://api.llama.com/v1/chat/completions"))
+        }
+        ProviderType::HuggingFace => UrlTemplate::Static(Arc::from(
+            "https://router.huggingface.co/v1/chat/completions",
+        )),
+        ProviderType::Cohere => UrlTemplate::Static(Arc::from("https://api.cohere.com/v2/chat")),
     };
     Ok(template)
 }
@@ -1416,7 +1415,12 @@ impl AiFederation {
             .as_object()
             .ok_or_else(|| "ai_federation: config must be an object".to_string())?;
         reject_unsupported_streaming_config(config, "config", true)?;
-        reject_unknown_config_keys(config_object, "config", AI_FEDERATION_CONFIG_KEYS)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            config_object,
+            "config",
+            AI_FEDERATION_CONFIG_KEYS,
+            "ai_federation: `config`: ",
+        )?;
         let streaming = parse_streaming_policy(config)?;
 
         let providers_val = config
@@ -1445,10 +1449,11 @@ impl AiFederation {
                 .as_object()
                 .ok_or_else(|| format!("ai_federation: `providers[{i}]` must be an object"))?;
             reject_unsupported_streaming_config(pv, &format!("provider[{i}]"), false)?;
-            reject_unknown_config_keys(
+            crate::util::unknown_keys::reject_unknown_keys(
                 provider_object,
                 &format!("provider[{i}]"),
                 AI_FEDERATION_PROVIDER_KEYS,
+                &format!("ai_federation: `provider[{i}]`: "),
             )?;
 
             let name = optional_str(pv, "name")?
@@ -1572,11 +1577,11 @@ impl AiFederation {
             let base_url = optional_str(pv, "base_url")?.map(String::from);
             let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
 
-            // SSRF guard: validate operator-supplied base_url before storing
-            // it. Provider `default_base_url` literals are static `https://`
-            // strings and are inherently safe (covered by inspection — see
-            // `ProviderType::default_base_url`); only the operator override
-            // needs runtime validation.
+            // SSRF guard: validate operator-supplied base_url before it becomes
+            // the provider's URL template. The built-in endpoints in
+            // `build_url_template` are static `https://` literals and are
+            // inherently safe; only the operator override needs runtime
+            // validation.
             if let Some(ref url) = base_url {
                 validate_base_url(&name, url, allow_plaintext, &backend_allow_ips)?;
             }
@@ -1633,7 +1638,6 @@ impl AiFederation {
                 read_timeout,
                 max_response_body_bytes,
                 circuit,
-                base_url,
                 url_template,
                 ambient_endpoint_scope,
             });
@@ -1737,27 +1741,6 @@ const AI_FEDERATION_PROVIDER_KEYS: &[&str] = &[
 const PROVIDER_CIRCUIT_KEYS: &[&str] =
     &["failure_threshold", "cooldown_seconds", "success_threshold"];
 
-fn reject_unknown_config_keys(
-    object: &serde_json::Map<String, Value>,
-    scope: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    let mut unknown = object
-        .keys()
-        .filter(|key| !allowed.contains(&key.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort();
-    Err(format!(
-        "ai_federation: `{scope}` contains unknown field(s): {:?}; allowed fields: `{}`",
-        unknown.join(", "),
-        allowed.join("`, `")
-    ))
-}
-
 fn validate_provider_field_types(provider: &Value) -> Result<(), String> {
     for field in [
         "api_key",
@@ -1806,10 +1789,11 @@ fn parse_provider_circuit(
     let object = value.as_object().ok_or_else(|| {
         format!("ai_federation: provider {name:?} `circuit_breaker` must be an object")
     })?;
-    reject_unknown_config_keys(
+    crate::util::unknown_keys::reject_unknown_keys(
         object,
         "config.providers[].circuit_breaker",
         PROVIDER_CIRCUIT_KEYS,
+        "ai_federation: `config.providers[].circuit_breaker`: ",
     )?;
 
     let failure_threshold = u32::try_from(optional_u64(value, "failure_threshold")?.unwrap_or(3))
@@ -1918,7 +1902,12 @@ fn parse_streaming_policy(config: &Value) -> Result<StreamingPolicy, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "ai_federation: `streaming` must be an object".to_string())?;
-    reject_unknown_config_keys(object, "streaming", AI_FEDERATION_STREAMING_KEYS)?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        "streaming",
+        AI_FEDERATION_STREAMING_KEYS,
+        "ai_federation: `streaming`: ",
+    )?;
 
     let enabled = optional_bool(value, "enabled")?.unwrap_or(false);
     let max_event_bytes = match optional_u64(value, "max_event_bytes")? {
@@ -2682,10 +2671,13 @@ fn request_wants_streaming(openai_body: &Value) -> bool {
     openai_body["stream"].as_bool() == Some(true)
 }
 
+/// Validate the client's OpenAI Chat Completions request and return its parsed
+/// `tools` list, which the caller hands to every provider translation so the
+/// list is parsed once per request.
 fn validate_openai_request(
     openai_body: &Value,
     allow_dropped_non_text_parts: bool,
-) -> Result<(), String> {
+) -> Result<Option<Vec<OpenAiTool<'_>>>, String> {
     let object = openai_body
         .as_object()
         .ok_or("ai_federation: request body must be a JSON object")?;
@@ -2765,14 +2757,14 @@ fn validate_openai_request(
         }
     }
 
-    parse_openai_tools(openai_body)?;
-    validate_openai_tool_choice(openai_body)?;
+    let tools = parse_openai_tools(openai_body)?;
+    validate_openai_tool_choice(openai_body, tools.as_deref())?;
     normalized_stop_sequences(openai_body)?;
     openai_max_output_tokens(openai_body)?;
     for field in ["temperature", "top_p"] {
         openai_sampling_number(openai_body, field)?;
     }
-    Ok(())
+    Ok(tools)
 }
 
 fn validate_openai_content_parts(
@@ -3008,7 +3000,44 @@ fn parse_provider_tool_calls<'a>(
     Ok(parsed)
 }
 
-fn parse_openai_tools(openai_body: &Value) -> Result<Option<Vec<Value>>, String> {
+/// One validated OpenAI `tools[]` entry, borrowed from the request body.
+///
+/// Validation and every provider translation share one parse of the tool
+/// list (issue #7125): nothing here copies a tool schema, so the only clone of
+/// `parameters` is the one a translator writes into its native request.
+struct OpenAiTool<'a> {
+    name: &'a str,
+    description: Option<&'a str>,
+    /// `None` when the client omitted `parameters`; translators substitute
+    /// the empty object schema.
+    parameters: Option<&'a Value>,
+}
+
+impl OpenAiTool<'_> {
+    fn name_value(&self) -> Value {
+        Value::String(self.name.to_string())
+    }
+
+    fn parameters_value(&self) -> Value {
+        self.parameters
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "properties": {} }))
+    }
+
+    /// Insert `name` and (when present) `description` into a native tool
+    /// object.
+    fn insert_name_and_description(&self, native: &mut serde_json::Map<String, Value>) {
+        native.insert("name".to_string(), self.name_value());
+        if let Some(description) = self.description {
+            native.insert(
+                "description".to_string(),
+                Value::String(description.to_string()),
+            );
+        }
+    }
+}
+
+fn parse_openai_tools(openai_body: &Value) -> Result<Option<Vec<OpenAiTool<'_>>>, String> {
     let Some(value) = openai_body.get("tools") else {
         return Ok(None);
     };
@@ -3046,32 +3075,32 @@ fn parse_openai_tools(openai_body: &Value) -> Result<Option<Vec<Value>>, String>
         }
         let description = match function.get("description") {
             None => None,
-            Some(Value::String(value)) => Some(value.clone()),
+            Some(Value::String(value)) => Some(value.as_str()),
             Some(_) => {
                 return Err(format!(
                     "ai_federation: tools[{index}].function.description must be a string"
                 ));
             }
         };
-        let parameters = function
-            .get("parameters")
-            .cloned()
-            .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-        if !parameters.is_object() {
+        let parameters = function.get("parameters");
+        if parameters.is_some_and(|parameters| !parameters.is_object()) {
             return Err(format!(
                 "ai_federation: tools[{index}].function.parameters must be an object"
             ));
         }
-        parsed.push(json!({
-            "name": name,
-            "description": description,
-            "parameters": parameters,
-        }));
+        parsed.push(OpenAiTool {
+            name,
+            description,
+            parameters,
+        });
     }
     Ok(Some(parsed))
 }
 
-fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
+fn validate_openai_tool_choice(
+    openai_body: &Value,
+    tools: Option<&[OpenAiTool<'_>]>,
+) -> Result<(), String> {
     let Some(choice) = openai_body.get("tool_choice") else {
         return Ok(());
     };
@@ -3093,14 +3122,11 @@ fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
         ),
     }?;
 
-    let tools = parse_openai_tools(openai_body)?;
     if choice.as_str() != Some("none") && tools.is_none() {
         return Err("ai_federation: tool_choice requires a non-empty tools array".to_string());
     }
     if let Some(name) = named_choice
-        && !tools
-            .as_ref()
-            .is_some_and(|tools| tools.iter().any(|tool| tool["name"].as_str() == Some(name)))
+        && !tools.is_some_and(|tools| tools.iter().any(|tool| tool.name == name))
     {
         return Err(format!(
             "ai_federation: named tool_choice {name:?} does not match any declared tool"
@@ -3544,9 +3570,14 @@ fn translated_generation_controls(
 }
 
 /// Translate an OpenAI Chat Completions request to the provider's native format.
+///
+/// `tools` is the list [`validate_openai_request`] already parsed from
+/// `openai_body`; OpenAI-compatible providers and Cohere forward the client's
+/// `tools` unchanged and ignore it.
 fn translate_request(
     provider: &ResolvedProvider,
     openai_body: &Value,
+    tools: Option<&[OpenAiTool<'_>]>,
     resolved_model: &str,
 ) -> Result<TranslatedRequest, String> {
     match provider.provider_type {
@@ -3559,11 +3590,15 @@ fn translate_request(
         | ProviderType::HuggingFace => {
             translate_openai_compatible(provider, openai_body, resolved_model)
         }
-        ProviderType::Anthropic => translate_to_anthropic(provider, openai_body, resolved_model),
-        ProviderType::GoogleGemini | ProviderType::GoogleVertex => {
-            translate_to_gemini(provider, openai_body, resolved_model)
+        ProviderType::Anthropic => {
+            translate_to_anthropic(provider, openai_body, tools, resolved_model)
         }
-        ProviderType::AwsBedrock => translate_to_bedrock(provider, openai_body, resolved_model),
+        ProviderType::GoogleGemini | ProviderType::GoogleVertex => {
+            translate_to_gemini(provider, openai_body, tools, resolved_model)
+        }
+        ProviderType::AwsBedrock => {
+            translate_to_bedrock(provider, openai_body, tools, resolved_model)
+        }
         ProviderType::Cohere => translate_to_cohere(provider, openai_body, resolved_model),
     }
 }
@@ -4388,6 +4423,7 @@ fn openai_content_to_bedrock_blocks(
 fn translate_to_anthropic(
     provider: &ResolvedProvider,
     openai_body: &Value,
+    tools: Option<&[OpenAiTool<'_>]>,
     resolved_model: &str,
 ) -> Result<TranslatedRequest, String> {
     let messages = openai_body["messages"]
@@ -4502,20 +4538,14 @@ fn translate_to_anthropic(
     if let Some(stop) = normalized_stop_sequences(openai_body)? {
         body["stop_sequences"] = stop;
     }
-    if let Some(tools) = parse_openai_tools(openai_body)? {
+    if let Some(tools) = tools {
         body["tools"] = Value::Array(
             tools
-                .into_iter()
+                .iter()
                 .map(|tool| {
                     let mut native = serde_json::Map::new();
-                    native.insert("name".to_string(), tool["name"].clone());
-                    if let Some(description) = tool["description"].as_str() {
-                        native.insert(
-                            "description".to_string(),
-                            Value::String(description.to_string()),
-                        );
-                    }
-                    native.insert("input_schema".to_string(), tool["parameters"].clone());
+                    tool.insert_name_and_description(&mut native);
+                    native.insert("input_schema".to_string(), tool.parameters_value());
                     Value::Object(native)
                 })
                 .collect(),
@@ -4537,10 +4567,7 @@ fn translate_to_anthropic(
         body["tool_choice"] = choice;
     }
 
-    let url = provider
-        .base_url
-        .clone()
-        .unwrap_or_else(|| ProviderType::Anthropic.default_base_url().to_string());
+    let url = build_provider_url(provider, resolved_model);
     let headers = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("anthropic-version".to_string(), "2023-06-01".to_string()),
@@ -4579,6 +4606,7 @@ fn anthropic_tool_choice(openai_body: &Value) -> Result<Option<Value>, String> {
 fn translate_to_gemini(
     provider: &ResolvedProvider,
     openai_body: &Value,
+    tools: Option<&[OpenAiTool<'_>]>,
     resolved_model: &str,
 ) -> Result<TranslatedRequest, String> {
     let messages = openai_body["messages"]
@@ -4736,19 +4764,13 @@ fn translate_to_gemini(
         body["generationConfig"] = Value::Object(gen_config);
     }
 
-    if let Some(tools) = parse_openai_tools(openai_body)? {
+    if let Some(tools) = tools {
         let declarations = tools
-            .into_iter()
+            .iter()
             .map(|tool| {
                 let mut declaration = serde_json::Map::new();
-                declaration.insert("name".to_string(), tool["name"].clone());
-                if let Some(description) = tool["description"].as_str() {
-                    declaration.insert(
-                        "description".to_string(),
-                        Value::String(description.to_string()),
-                    );
-                }
-                declaration.insert("parameters".to_string(), tool["parameters"].clone());
+                tool.insert_name_and_description(&mut declaration);
+                declaration.insert("parameters".to_string(), tool.parameters_value());
                 Value::Object(declaration)
             })
             .collect::<Vec<_>>();
@@ -4785,6 +4807,7 @@ fn gemini_tool_choice(openai_body: &Value) -> Result<Option<Value>, String> {
 fn translate_to_bedrock(
     provider: &ResolvedProvider,
     openai_body: &Value,
+    tools: Option<&[OpenAiTool<'_>]>,
     resolved_model: &str,
 ) -> Result<TranslatedRequest, String> {
     let messages = openai_body["messages"]
@@ -4899,23 +4922,17 @@ fn translate_to_bedrock(
     }
 
     let tool_choice = bedrock_tool_choice(openai_body)?;
-    match (parse_openai_tools(openai_body)?, tool_choice) {
+    match (tools, tool_choice) {
         (_, BedrockToolChoice::Disabled) => {}
         (Some(tools), BedrockToolChoice::Enabled(choice)) => {
             let native_tools = tools
-                .into_iter()
+                .iter()
                 .map(|tool| {
                     let mut spec = serde_json::Map::new();
-                    spec.insert("name".to_string(), tool["name"].clone());
-                    if let Some(description) = tool["description"].as_str() {
-                        spec.insert(
-                            "description".to_string(),
-                            Value::String(description.to_string()),
-                        );
-                    }
+                    tool.insert_name_and_description(&mut spec);
                     spec.insert(
                         "inputSchema".to_string(),
-                        json!({ "json": tool["parameters"].clone() }),
+                        json!({ "json": tool.parameters_value() }),
                     );
                     json!({ "toolSpec": Value::Object(spec) })
                 })
@@ -5052,14 +5069,23 @@ fn translate_to_cohere(
         body["stop_sequences"] = stop;
     }
 
-    let url = provider
-        .base_url
-        .clone()
-        .unwrap_or_else(|| ProviderType::Cohere.default_base_url().to_string());
+    let url = build_provider_url(provider, resolved_model);
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
     let body_bytes = serialize_translated_request(&body, "Cohere")?;
 
     Ok((url, headers, body_bytes))
+}
+
+/// Record that a provider operation has a committed (or possibly executed)
+/// outcome: the request is no longer retry-safe, so the release-on-commit
+/// marker is replaced with the non-replayable external-operation marker that
+/// `request_deduplication` and `ai_semantic_cache` consume.
+fn mark_external_operation_completed(ctx: &mut RequestContext) {
+    ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+    ctx.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
 }
 
 /// Build the provider-specific URL by rendering the pre-computed template.
@@ -7473,7 +7499,7 @@ impl ResponseStreamInspector for FederationSseGuard {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
@@ -7628,7 +7654,7 @@ impl ResponseStreamInspector for FederationImmediateStreamError {
         ResponseStreamInspectorStage::Normalize
     }
 
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &Bytes) -> ResponseStreamAction {
         self.take()
     }
 
@@ -8701,13 +8727,6 @@ impl Plugin for AiFederation {
             "ai_federation_status".to_string(),
             response_status.to_string(),
         );
-        // The provider produced response headers, so the billable operation has
-        // a committed outcome. Same marker discipline as the buffered path.
-        ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
-        ctx.metadata.insert(
-            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
-            "true".to_string(),
-        );
 
         // A response proxy core authored for a provider TRANSPORT failure (the
         // dispatch timed out, was reset, or was refused before any provider
@@ -8719,6 +8738,15 @@ impl Plugin for AiFederation {
         // metadata. Gateway-local refusals and client disconnects
         // (`client_side_no_backend_signal`) stay neutral.
         if let Some(class) = ctx.last_backend_dispatch_error_class() {
+            // No provider header arrived, so this is not a committed provider
+            // outcome. Same marker discipline as the buffered path's
+            // `ProviderCallFailureKind`: a request that never reached the wire
+            // stays retry-safe, while one the provider may have executed is
+            // marked completed so `request_deduplication` cannot re-run it under
+            // the same idempotency key (issue #7125).
+            if ctx.backend_dispatch_state() == super::BackendDispatchState::AmbiguousFailure {
+                mark_external_operation_completed(ctx);
+            }
             // Mirrors proxy core's own pre-header decision exactly. A route
             // deadline that expired while the provider held the attempt is
             // charged to the backend (`RouteDeadlineExpiry::charged_to_backend`)
@@ -8735,6 +8763,10 @@ impl Plugin for AiFederation {
             // neutral release instead of being scored by its synthetic status.
             return PluginResult::Continue;
         }
+
+        // The provider produced response headers, so the billable operation has
+        // a committed outcome. Same marker discipline as the buffered path.
+        mark_external_operation_completed(ctx);
 
         if !(200..300).contains(&response_status) {
             // Same circuit rule as the buffered path: a configured fallback
@@ -9096,19 +9128,24 @@ impl Plugin for AiFederation {
             );
         }
 
-        let deferred_non_text_validation_error =
+        // Admission parses the `tools` list once; every provider translation
+        // in the failover loop below reuses it (issue #7125).
+        let (deferred_non_text_validation_error, openai_tools) =
             match validate_openai_request(&openai_body, false) {
-                Ok(()) => None,
+                Ok(tools) => (None, tools),
                 Err(strict_message) => {
-                    if let Err(message) = validate_openai_request(&openai_body, true) {
-                        return self.openai_error_response(
-                            400,
-                            &message,
-                            "invalid_request_error",
-                            None,
-                            Some("invalid_request"),
-                        );
-                    }
+                    let tools = match validate_openai_request(&openai_body, true) {
+                        Ok(tools) => tools,
+                        Err(message) => {
+                            return self.openai_error_response(
+                                400,
+                                &message,
+                                "invalid_request_error",
+                                None,
+                                Some("invalid_request"),
+                            );
+                        }
+                    };
                     if !matching_providers.iter().any(|provider| {
                         provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
                     }) {
@@ -9120,7 +9157,7 @@ impl Plugin for AiFederation {
                             Some("invalid_request"),
                         );
                     }
-                    Some(strict_message)
+                    (Some(strict_message), tools)
                 }
             };
 
@@ -9264,7 +9301,12 @@ impl Plugin for AiFederation {
                 );
             }
 
-            let translated = match translate_request(provider, &openai_body, &resolved_model) {
+            let translated = match translate_request(
+                provider,
+                &openai_body,
+                openai_tools.as_deref(),
+                &resolved_model,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     warn_sampled!(
@@ -9311,11 +9353,7 @@ impl Plugin for AiFederation {
                     // internal marker only after the final client-visible
                     // response is committed and publishes a non-replayable
                     // tombstone for an idempotency-key retry.
-                    ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
-                    ctx.metadata.insert(
-                        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
-                        "true".to_string(),
-                    );
+                    mark_external_operation_completed(ctx);
                     response
                 }
                 Err(failure) => {
@@ -9325,11 +9363,7 @@ impl Plugin for AiFederation {
                         // Both must suppress an independent client retry under
                         // the same idempotency key even when provider fallback
                         // itself is disabled.
-                        ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
-                        ctx.metadata.insert(
-                            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
-                            "true".to_string(),
-                        );
+                        mark_external_operation_completed(ctx);
                     }
                     if let Some(circuit) = &provider.circuit {
                         if failure.circuit_failure {
@@ -10070,7 +10104,7 @@ pub mod test_helpers {
         }
 
         pub async fn on_chunk(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
-            match self.guard.on_chunk(chunk).await {
+            match self.guard.on_chunk(&Bytes::copy_from_slice(chunk)).await {
                 ResponseStreamAction::Forward(bytes) => (bytes.to_vec(), false),
                 ResponseStreamAction::Terminate(bytes) => {
                     (bytes.map(|b| b.to_vec()).unwrap_or_default(), true)
@@ -10259,7 +10293,7 @@ pub mod test_helpers {
     /// tool calls/results, tools, stop) every federated request passes before
     /// translation.
     pub fn validate_openai_request_test(openai_body: &Value) -> Result<(), String> {
-        validate_openai_request(openai_body, false)
+        validate_openai_request(openai_body, false).map(|_| ())
     }
 
     pub fn translate_request_test(
@@ -10315,11 +10349,13 @@ pub mod test_helpers {
             read_timeout: Duration::from_secs(60),
             max_response_body_bytes: DEFAULT_MAX_PROVIDER_RESPONSE_BYTES,
             circuit: None,
-            base_url,
             url_template,
             ambient_endpoint_scope: None,
         };
-        translate_request(&provider, openai_body, model)
+        // Translators take the tool list admission parsed; parse it here so a
+        // direct translation still refuses a malformed `tools` array.
+        let tools = parse_openai_tools(openai_body)?;
+        translate_request(&provider, openai_body, tools.as_deref(), model)
     }
 
     /// Expose the multimodal `translate`-mode policy gate for tests.
@@ -10349,7 +10385,6 @@ pub mod test_helpers {
             read_timeout: Duration::from_secs(60),
             max_response_body_bytes: DEFAULT_MAX_PROVIDER_RESPONSE_BYTES,
             circuit: None,
-            base_url: None,
             url_template: UrlTemplate::Static(Arc::from("https://example.test/")),
             ambient_endpoint_scope: None,
         };

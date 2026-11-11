@@ -181,15 +181,11 @@ pub fn record_accepted(plugin: &str, records: u64) {
 }
 
 /// Cumulative records lost by `plugin` for `reason` since process start.
-// Read by the external unit-test crate; the binary target compiles this module
-// separately and cannot observe those callers.
-#[allow(dead_code)]
 pub fn dropped_total(plugin: &str, reason: SinkLossReason) -> u64 {
     DROPPED[plugin_index(plugin)][reason.index()].load(Ordering::Relaxed)
 }
 
 /// Cumulative records lost by `plugin` across every reason.
-#[allow(dead_code)] // See `dropped_total`.
 pub fn dropped_total_all_reasons(plugin: &str) -> u64 {
     let index = plugin_index(plugin);
     SinkLossReason::ALL
@@ -199,7 +195,6 @@ pub fn dropped_total_all_reasons(plugin: &str) -> u64 {
 }
 
 /// Cumulative records admitted by `plugin` since process start.
-#[allow(dead_code)] // See `dropped_total`.
 pub fn accepted_total(plugin: &str) -> u64 {
     ACCEPTED[plugin_index(plugin)].load(Ordering::Relaxed)
 }

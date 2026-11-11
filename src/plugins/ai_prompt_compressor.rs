@@ -444,19 +444,12 @@ impl AiPromptCompressor {
         let object = config
             .as_object()
             .ok_or_else(|| "ai_prompt_compressor: config must be an object".to_string())?;
-        let mut unknown: Vec<&str> = object
-            .keys()
-            .map(String::as_str)
-            .filter(|key| !CONFIG_FIELDS.contains(key))
-            .collect();
-        if !unknown.is_empty() {
-            unknown.sort_unstable();
-            return Err(format!(
-                "ai_prompt_compressor: unknown config field(s): {:?} (allowed: `{}`)",
-                unknown.join(", "),
-                CONFIG_FIELDS.join("`, `")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            CONFIG_FIELDS,
+            "ai_prompt_compressor: `config`: ",
+        )?;
 
         let compress_roles: HashSet<String> = match optional_string_vec(config, "compress_roles")? {
             Some(roles) => {
@@ -1714,9 +1707,6 @@ fn may_contain_marker_start(body: &[u8]) -> bool {
             .any(|window| window.starts_with(b"\\u003") && window[5].eq_ignore_ascii_case(&b'c'))
 }
 
-// External tests reach this through the lib target's `_test_support` shim;
-// the bin target recompiles this plugin module without that caller.
-#[allow(dead_code)]
 pub(crate) fn preserve_marker_sanitizer_work_for_test(
     body: &[u8],
     tags: &(String, String),

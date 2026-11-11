@@ -98,6 +98,7 @@ mod unit {
         mod serverless_function_tests;
         mod sink_loss_metric_tests;
         mod soap_ws_security_tests;
+        mod socket_endpoint_tests;
         mod spec_expose_tests;
         mod spiffe_identity_tests;
         mod sse_tests;
@@ -107,12 +108,10 @@ mod unit {
         mod stream_plugin_tests;
         mod synthetic_response_tests;
         mod tcp_connection_throttle_tests;
-        mod tcp_endpoint_tests;
         mod tcp_logging_tests;
         mod transaction_debugger_tests;
         mod transaction_log_schema_tests;
         mod transaction_summary_tests;
-        mod udp_endpoint_tests;
         mod udp_logging_tests;
         mod udp_rate_limiting_tests;
         mod validation_diagnostics_tests;

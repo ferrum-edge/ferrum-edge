@@ -111,13 +111,8 @@ fn v4_requirements() -> TopologyRequirements {
 fn node_waypoint_config() -> NodeAgentConfig {
     let mut capture_config = CaptureConfig::explicit(15006, 15001);
     capture_config.mode = CaptureMode::Ebpf;
-    let mut capture_contract = CaptureContract::new(
-        NodeAgentProxyMode::NodeWaypoint,
-        15001,
-        15008,
-        "/run/ferrum/node-agent.sock",
-    )
-    .expect("valid NodeWaypoint capture contract");
+    let mut capture_contract = CaptureContract::new(NodeAgentProxyMode::NodeWaypoint, 15001, 15008)
+        .expect("valid NodeWaypoint capture contract");
     capture_contract.ingress_redirect_ifaces = vec!["eth0".to_string()];
     capture_contract.node_waypoint_ingress_redirect_mark = NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
     capture_contract.ingress_capture_port = 15006;

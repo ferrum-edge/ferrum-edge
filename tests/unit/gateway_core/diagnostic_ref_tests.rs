@@ -1436,6 +1436,37 @@ async fn rejection_log_funnel_records_the_rejecting_phase_and_plugin() {
     assert_eq!(rejection.phase, "other");
 }
 
+// Issues #7156 / #7157: the gateway-authored invalid-backend-path and missing
+// WebSocket upgrade 500s and the native-H3 mesh dispatch-required 502 are
+// logged under their own compiled-in phases, never `other`.
+#[tokio::test]
+async fn internal_error_exits_record_their_own_rejection_phase() {
+    for phase in [
+        ferrum_edge::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+        ferrum_edge::diagnostic_ref::WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE,
+        ferrum_edge::diagnostic_ref::MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE,
+    ] {
+        let slot = DiagnosticSlot::shared();
+        let ctx = context_with_slot(&slot);
+        log_rejection(&ctx, 500, phase).await;
+        let rejection = slot.rejection().expect("rejection recorded");
+        assert_eq!(rejection.source, DiagnosticRejectionSource::Gateway);
+        assert_eq!(rejection.phase, phase);
+    }
+    assert_eq!(
+        ferrum_edge::diagnostic_ref::INVALID_BACKEND_PATH_PHASE,
+        "invalid_backend_path"
+    );
+    assert_eq!(
+        ferrum_edge::diagnostic_ref::WEBSOCKET_UPGRADE_UNAVAILABLE_PHASE,
+        "websocket_upgrade_unavailable"
+    );
+    assert_eq!(
+        ferrum_edge::diagnostic_ref::MESH_TRANSPORT_DISPATCH_REQUIRED_PHASE,
+        "mesh_transport_dispatch_required"
+    );
+}
+
 // Outside `all` mode a `4xx` rejection can never carry a reference (it has no
 // `X-Gateway-Error`), so the funnel does no rejection bookkeeping for it.
 #[tokio::test]

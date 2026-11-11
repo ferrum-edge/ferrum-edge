@@ -1148,6 +1148,9 @@ impl Plugin for OtelTracing {
             }
         };
 
+        // Both arms above built this value with a fresh gateway span id, so
+        // it is gateway-minted per-request state (issue #7130).
+        ctx.stage_gateway_minted_traceparent(traceparent.clone());
         ctx.metadata
             .insert(TRACEPARENT_HEADER.to_string(), traceparent);
         ctx.claim_gateway_trace_owner(GatewayTraceOwner::OtelTracing);
@@ -1931,7 +1934,6 @@ pub(crate) struct TraceMaterializationProbe {
 /// queue does, then materializes one export body while those reservations are
 /// still held, so an external test can pin that the body is charged, released on
 /// drop, and refused rather than materialized when the ceiling is exhausted.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_trace_batch_materialization_for_test(
     ceiling: &'static RetainedByteCeiling,
     span_count: usize,
@@ -1997,7 +1999,6 @@ pub(crate) fn probe_trace_batch_materialization_for_test(
     }
 }
 
-#[allow(dead_code)] // reached only from the probe above
 fn probe_span_for_test(index: usize, attribute_bytes: usize) -> SpanData {
     SpanData {
         trace_id: format!("{index:032x}"),
@@ -3829,10 +3830,13 @@ pub(crate) fn build_traceparent(
     traceparent
 }
 
+/// Returns whether this call minted the `traceparent` it left in `metadata`
+/// (a fresh root, or the header's trace id under a fresh span id); false when
+/// existing trace metadata was kept as is.
 pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
     metadata: &mut HashMap<String, String, MS>,
     headers: &HashMap<String, String>,
-) {
+) -> bool {
     if metadata.contains_key("trace_id") && metadata.contains_key("span_id") {
         if !metadata.contains_key("trace_sampled") {
             let sampled = metadata
@@ -3845,7 +3849,7 @@ pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
                 if sampled { "true" } else { "false" }.to_string(),
             );
         }
-        return;
+        return false;
     }
 
     if let Some(existing) = header_value_case_insensitive(headers, TRACEPARENT_HEADER)
@@ -3872,7 +3876,7 @@ pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
                 if sampled { "01" } else { "00" },
             ),
         );
-        return;
+        return true;
     }
 
     let generated = OtelTracing::generate_trace_context(true);
@@ -3880,6 +3884,7 @@ pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
     metadata.insert("span_id".to_string(), generated.span_id);
     metadata.insert("trace_sampled".to_string(), "true".to_string());
     metadata.insert(TRACEPARENT_HEADER.to_string(), generated.traceparent);
+    true
 }
 
 /// Return true only when metadata carries an affirmative sampling decision.

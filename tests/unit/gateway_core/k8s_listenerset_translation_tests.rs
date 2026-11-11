@@ -2380,6 +2380,16 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
             .iter()
             .any(|service| service.name == "listenerset-7-tls-set-https")
     }));
+    // The withdrawn listener is named in a warning, as a Gateway listener is.
+    assert!(
+        translation.warnings.iter().any(|warning| {
+            warning.contains("ListenerSet")
+                && warning.contains("\"https\"")
+                && warning.contains("will not be exposed")
+        }),
+        "unresolved ListenerSet TLS material must be warned about: {:?}",
+        translation.warnings
+    );
 
     let mut grant = object(
         "ReferenceGrant",

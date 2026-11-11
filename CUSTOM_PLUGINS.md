@@ -887,7 +887,7 @@ struct SseInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for SseInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         let mut scan = Vec::with_capacity(self.tail.len() + chunk.len());
         scan.extend_from_slice(&self.tail);
         scan.extend_from_slice(chunk);
@@ -946,7 +946,7 @@ The proxy drives inspectors on reqwest, direct HTTP/2, and native HTTP/3 respons
 
 The `ResponseStreamInspector` action contract is:
 
-- `on_chunk(&mut self, chunk)` receives each decoded body chunk. `Forward(bytes)` releases those bytes now; `Forward(Bytes::new())` emits nothing and means the inspector is holding data in its own accumulator. `Terminate(None)` ends the body, while `Terminate(Some(bytes))` emits the final bytes and then ends it.
+- `on_chunk(&mut self, chunk: &Bytes)` receives each decoded body chunk as a shared buffer. `Forward(bytes)` releases those bytes now, and an inspector that only observes returns `Forward(chunk.clone())`, which shares the buffer instead of copying it; `Forward(Bytes::new())` emits nothing and means the inspector is holding data in its own accumulator. `Terminate(None)` ends the body, while `Terminate(Some(bytes))` emits the final bytes and then ends it.
 - `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`. A later inspector is also flushed at an earlier inspector's deferred cut through `flush_before_cut(&mut self)`, whose default calls `on_end`; override it when a cut must discard an unfinished unit instead of governing or releasing it.
 - `on_downstream_terminated()` is also called on inspectors after the owner of a deferred cut, after they have been flushed, so they can record that the stream ended with a cut or discard state that is no longer client-visible.
 - Response headers are already committed before either hook runs. `Terminate` can only truncate the in-flight response; it cannot change the HTTP status, replace headers, or retract previously forwarded bytes.

@@ -19,8 +19,8 @@ use super::{AdminState, PaginationParams};
 use crate::tls::acme::{AcmeCertificateRecord, AcmeError, AcmeIssuedCertificateInput};
 #[cfg(feature = "acme")]
 use crate::tls::acme::{
-    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput,
-    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
+    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeOrderFinalization, AcmeOrderInput,
+    AcmeOrderRecord, AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
 };
 use crate::tls::managed::{ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord};
 
@@ -801,7 +801,7 @@ pub(super) async fn handle_finalize_acme_order(
                 ));
             }
         };
-        let complete_config = crate::tls::acme::client::CompleteAcmeHttp01OrderConfig {
+        let complete_config = crate::tls::acme::client::CompleteAcmeOrderConfig {
             directory_url: order.directory_url.clone(),
             account_credentials_json: crate::tls::source::SecretString::new(
                 account_credentials_json,
@@ -813,6 +813,7 @@ pub(super) async fn handle_finalize_acme_order(
             ),
             dns_cache,
             finalization,
+            no_challenges_provisioned: !order.has_challenge_records(),
         };
         let challenge_type = match acme_order_challenge_type(&order) {
             Ok(challenge_type) => challenge_type,
@@ -2311,7 +2312,7 @@ async fn acme_order_record_from_request(
     }
 
     Ok((
-        AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        AcmeOrderRecord::new(AcmeOrderInput {
             id,
             certificate_id,
             domains: prepared.domains,
@@ -2399,7 +2400,11 @@ fn acme_order_challenge_type(order: &AcmeOrderRecord) -> Result<AcmeChallengeTyp
         }
         challenge_type = Some(AcmeChallengeType::Dns01);
     }
-    challenge_type.ok_or_else(|| "ACME order does not contain any challenges".to_string())
+    // No challenge records: every authorization was already valid when the
+    // order was prepared (issue #7195), so none needs answering and the
+    // completion type is immaterial — completion refuses any pending
+    // authorization for such an order.
+    Ok(challenge_type.unwrap_or(AcmeChallengeType::Http01))
 }
 
 /// Mirror an order's account credentials into the shared account store.
@@ -3071,7 +3076,7 @@ mod tests {
         finalization: Option<AcmeOrderFinalization>,
         domains: Vec<String>,
     ) -> AcmeOrderRecord {
-        let mut order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        let mut order = AcmeOrderRecord::new(AcmeOrderInput {
             id: "edge-order".to_string(),
             certificate_id: Some("edge-cert".to_string()),
             domains: domains.clone(),
@@ -3126,6 +3131,36 @@ mod tests {
             !rejected.contains("PRIVATE KEY") && !rejected.contains("not-base64"),
             "admin preflight must stay content-free: {rejected}"
         );
+    }
+
+    /// Unusable finalization material is one content-free failure with one
+    /// status wherever it surfaces: the store refuses to write it with
+    /// `UnusableFinalizationMaterial`, which the Admin API reports as 400,
+    /// the same status as Admin finalize of a stored order.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn unusable_finalization_material_is_one_content_free_400() {
+        let domains = vec!["example.com".to_string()];
+        let corrupt: AcmeOrderFinalization = serde_json::from_value(serde_json::json!({
+            "key_pem": "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+            "csr_der_base64": "!!!not-base64!!!",
+        }))
+        .expect("deserialize");
+        let mut order = sample_finalize_order(None, domains);
+        order.finalization = Some(corrupt);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::tls::acme::AcmeOrderStore::open(dir.path()).expect("order store");
+        let error = store
+            .upsert_order(order, true)
+            .expect_err("corrupt material must not be storable");
+        assert!(matches!(error, AcmeError::UnusableFinalizationMaterial(_)));
+        let rendered = error.to_string();
+        assert!(rendered.contains("finalization material is missing or unusable"));
+        assert!(
+            !rendered.contains("PRIVATE KEY") && !rendered.contains("not-base64"),
+            "the diagnostic must stay content-free"
+        );
+        assert_eq!(acme_error_response(error).status(), StatusCode::BAD_REQUEST);
     }
 
     /// Issue #7199: the delete guard matches the referenced record id exactly,

@@ -103,8 +103,8 @@ struct OrderedLogPlugin {
 
 #[async_trait]
 impl ResponseStreamInspector for PassthroughInspector {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(chunk.clone())
     }
 }
 
@@ -309,8 +309,9 @@ async fn direct_terminal_dispatch_reaches_log_sinks() {
     assert_eq!(delivered[0].response_status_code, 200);
 }
 
-/// Records the mesh key terminal delivery precomputes. Named like the built-in
-/// so `log_with_mirror` computes the key for it.
+/// Records the mesh key terminal delivery precomputes. It declares
+/// `uses_mesh_request_key` like the built-in consumers, so `log_with_mirror`
+/// computes the key for it.
 struct MeshKeyCapture {
     keys: Arc<Mutex<Vec<Option<MeshRequestKey>>>>,
 }
@@ -319,6 +320,10 @@ struct MeshKeyCapture {
 impl Plugin for MeshKeyCapture {
     fn name(&self) -> &str {
         "workload_metrics"
+    }
+
+    fn uses_mesh_request_key(&self) -> bool {
+        true
     }
 
     async fn log_with_mesh_key(
@@ -1475,7 +1480,7 @@ struct HoldingResponseInspector {
 
 #[async_trait]
 impl ResponseStreamInspector for HoldingResponseInspector {
-    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, _chunk: &Bytes) -> ResponseStreamAction {
         self.saw_backend_chunk.notify_one();
         std::future::pending::<ResponseStreamAction>().await
     }
@@ -2642,7 +2647,7 @@ async fn terminal_hook_ai_usage_export_reaches_the_logged_summary() {
     let mut inspector =
         create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
             .expect("ai_token_metrics observes a 2xx SSE stream");
-    match inspector.on_chunk(body).await {
+    match inspector.on_chunk(&Bytes::copy_from_slice(body)).await {
         ResponseStreamAction::Forward(bytes) => assert_eq!(&bytes[..], body),
         ResponseStreamAction::Terminate(_) => panic!("observer must not truncate"),
     }

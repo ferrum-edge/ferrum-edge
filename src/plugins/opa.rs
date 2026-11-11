@@ -282,7 +282,12 @@ impl Opa {
         let object = config
             .as_object()
             .ok_or_else(|| "opa: config must be a JSON object".to_string())?;
-        reject_unknown_keys(object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            OPA_CONFIG_KEYS,
+            "opa: `config`: ",
+        )?;
 
         let (decision_url, redacted_decision_url, decision_hostname) =
             parse_decision_endpoint(object)?;
@@ -1476,15 +1481,6 @@ fn parse_fail_open(object: &Map<String, Value>) -> Result<bool, String> {
         (None, Some(value)) => Ok(!value),
         (None, None) => Ok(false),
     }
-}
-
-fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
-    for key in object.keys() {
-        if !OPA_CONFIG_KEYS.contains(&key.as_str()) {
-            return Err(format!("opa: unknown config key {key:?}"));
-        }
-    }
-    Ok(())
 }
 
 fn parse_decision_pointer(object: &Map<String, Value>) -> Result<Vec<String>, String> {

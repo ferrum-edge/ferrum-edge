@@ -17,7 +17,7 @@ partial work or hand unfinished implementation back to the controller. Perform c
 review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke
 any agent-dispatch skill or script, including `astra-agents`, `sol-agents`, `luna-agents`,
 `opus-agents`, `fable-5-1-agents`, `grok-agents`, `muse-agents`, `composer-agents`, `qwen-agents`,
-`deepseek-pro-agents`, `deepseek-flash-agents`, `opencode-agents`,
+`deepseek-pro-agents`, `deepseek-flash-agents`, `opencode-laguna-agents`,
 `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI workers. Do not
 manually spawn nested workers. Codex-managed automatic delegation is permitted only at explicitly
 selected `ultra` effort. The orchestrator selected this model and reasoning effort deliberately.

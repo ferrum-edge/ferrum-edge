@@ -143,35 +143,6 @@ static JITTER_SEED: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
         .unwrap_or(0xA5A5_A5A5_A5A5_A5A5)
 });
 
-/// Fan `notification` out to every channel in `targets`.
-///
-/// Legacy helper for non-plugin callers. Uses process-global metrics and a
-/// one-shot anonymous generation so tasks still participate in shutdown drain.
-#[allow(dead_code)]
-pub fn dispatch(
-    notification: Arc<Notification>,
-    targets: &[Arc<NotificationChannel>],
-    sem: &Arc<Semaphore>,
-    http: &PluginHttpClient,
-    log_source: &'static str,
-) {
-    let generation = DispatchGeneration::new(0);
-    let extras = Arc::new(std::collections::HashMap::new());
-    for channel in targets {
-        let _ = dispatch_one(
-            Arc::clone(&notification),
-            Arc::clone(&extras),
-            Arc::clone(channel),
-            Arc::clone(sem),
-            http.clone(),
-            Arc::clone(&generation),
-            DeliveryRetryPolicy::DEFAULT,
-            log_source,
-            None,
-        );
-    }
-}
-
 /// Attempt to acquire a permit and spawn one channel delivery.
 ///
 /// Returns `false` when the semaphore was exhausted, the generation rejected
@@ -211,7 +182,6 @@ pub fn dispatch_one(
                 invoke_delivery_callback(
                     cb,
                     DispatchSettle::Abandoned(AbandonReason::Backpressure),
-                    channel_type,
                 );
             }
             return false;

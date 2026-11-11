@@ -248,12 +248,10 @@ const META_GRPC_WEB_UNFRAMED_ERROR_ENTITY: &str = "grpc_web.unframed_error_entit
 /// `grpc_web.instance.{id}.mode`.
 const INSTANCE_META_PREFIX: &str = "grpc_web.instance.";
 
-/// Internal proxy header injected by the translation owner's `before_proxy` so
-/// the legacy `transform_request_body` path (no request context) can identify
-/// text vs binary mode. Production buffering uses
-/// [`Plugin::transform_request_body_with_context`], which reads owner-scoped
-/// metadata instead of this shared header. Always stripped on ingress so a
-/// client cannot spoof it; hop-by-hop removal also drops it before the backend.
+/// Reserved internal header name. The plugin never emits it: translation mode
+/// lives in owner-scoped metadata. The name stays reserved (stripped on ingress
+/// here and in the proxy's reserved-header set, refused as a request trailer) so
+/// a client-supplied copy can never reach a backend or look like gateway state.
 const HEADER_GRPC_WEB_MODE: &str = "x-grpc-web-mode";
 const APPLICATION_GRPC_WEB: &str = "application/grpc-web";
 const APPLICATION_GRPC_WEB_TEXT: &str = "application/grpc-web-text";
@@ -402,8 +400,7 @@ fn binary_frames_are_complete(data: &[u8], trailer_frame_allowed: bool) -> bool 
 /// been split off by [`split_request_trailer_frame`] and staged as native
 /// HTTP/2 request trailers, so a `0x80`/`0x81` byte still present here is a
 /// duplicate, misordered, or unclaimable trailer frame and is rejected rather
-/// than forwarded as message bytes. The legacy no-context hook has nowhere to
-/// stage trailers and therefore rejects every trailer frame outright.
+/// than forwarded as message bytes.
 /// A compressed DATA frame is valid only when the request declares one
 /// non-identity `grpc-encoding`; uncompressed frames remain legal when an
 /// encoding is declared because compression is selected per message.
@@ -2060,7 +2057,6 @@ pub(crate) fn request_was_translated(ctx: &RequestContext) -> bool {
 /// have used). On Accept failure the request Content-Type canonical form is
 /// retained so other gateway errors still have a browser-safe shape; the
 /// `grpc_web` plugin itself fails closed with `406` when translation is enabled.
-#[allow(dead_code)] // Called through `_test_support` in special test-hook builds.
 pub(crate) fn retain_client_content_type_for_errors(ctx: &mut RequestContext, content_type: &str) {
     if !is_grpc_web_content_type(content_type) {
         return;
@@ -4131,7 +4127,6 @@ fn trailing_trailer_suffix_start(data: &[u8]) -> Option<usize> {
 ///
 /// Single O(n) scan: identify the contiguous trailer-frame suffix at EOS and
 /// truncate once. Malformed streams leave `data` untouched and return `false`.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
     let Some(start) = trailing_trailer_suffix_start(data) else {
         return false;
@@ -4590,13 +4585,10 @@ impl Plugin for GrpcWebPlugin {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        // Always strip the internal mode marker from inbound headers so a client
-        // cannot spoof it. The translation owner re-injects it in `before_proxy`
-        // only after confirming a genuine gRPC-Web request via the content-type.
-        // Without this, a client could send a non-gRPC-Web request with
-        // `x-grpc-web-mode: text` and trigger base64-decode of the body in
-        // `transform_request_body`, which the gateway would then forward in
-        // mangled form.
+        // Always strip the reserved mode header from inbound headers. The
+        // plugin keeps translation mode in owner-scoped metadata and never
+        // emits this header, so a client-supplied copy is never gateway state
+        // and must not reach the backend.
         ctx.headers.remove(HEADER_GRPC_WEB_MODE);
 
         let Some(content_type) = ctx.headers.get("content-type") else {
@@ -4703,14 +4695,12 @@ impl Plugin for GrpcWebPlugin {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only the translation owner injects shared request staging. Followers
-        // must not rewrite headers or plant `x-grpc-web-mode` (that shared
-        // marker would otherwise collide across instances).
+        // Only the translation owner rewrites the outgoing request headers.
         if !self.is_translation_owner(ctx) {
             return PluginResult::Continue;
         }
 
-        let Some(mode) = self.owned_translation_mode(ctx).map(str::to_string) else {
+        if self.owned_translation_mode(ctx).is_none() {
             debug!(
                 plugin = "grpc_web",
                 instance = %self.instance_id_str,
@@ -4720,7 +4710,7 @@ impl Plugin for GrpcWebPlugin {
             // without the owner's translation would hand the backend an
             // undecoded, unvalidated gRPC-Web envelope.
             return invalid_grpc_web_request(ERR_TRANSLATION_STATE_INVALID);
-        };
+        }
 
         // Ensure outgoing content-type is native gRPC, keeping the request's
         // message-format suffix (`+json`, a custom codec) that
@@ -4732,60 +4722,10 @@ impl Plugin for GrpcWebPlugin {
         headers.insert("content-type".to_string(), native_ct);
         ctx.plugin_state_mut().grpc_web_translated = true;
 
-        // Compatibility marker for the legacy no-context transform path.
-        // Production uses `transform_request_body_with_context` + metadata.
-        headers.insert(HEADER_GRPC_WEB_MODE.to_string(), mode);
-
         // Remove headers that are gRPC-Web specific and shouldn't reach the backend
         headers.remove("x-grpc-web");
 
         PluginResult::Continue
-    }
-
-    async fn transform_request_body(
-        &self,
-        body: &[u8],
-        _content_type: Option<&str>,
-        request_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
-        // Legacy path without request context: honor the owner-injected mode
-        // marker only. Multi-instance production traffic uses
-        // `transform_request_body_with_context`, which gates on ownership and
-        // the once-decoded flag.
-        let is_text = request_headers
-            .get(HEADER_GRPC_WEB_MODE)
-            .is_some_and(|m| m == "text");
-
-        if !is_text || body.is_empty() {
-            return None;
-        }
-
-        // Base64 decode — gRPC-Web text mode uses standard base64 and may
-        // concatenate independently padded flush segments.
-        // On failure, return the raw body unchanged; on_final_request_body will
-        // reject it with a 400 after validating gRPC framing.
-        match decode_grpc_web_text_body(body) {
-            Some(decoded) => {
-                debug!(
-                    plugin = "grpc_web",
-                    instance = %self.instance_id_str,
-                    original_len = body.len(),
-                    decoded_len = decoded.len(),
-                    "Base64-decoded gRPC-Web text request body"
-                );
-                Some(decoded)
-            }
-            None => {
-                debug!(
-                    plugin = "grpc_web",
-                    instance = %self.instance_id_str,
-                    "Failed to base64-decode gRPC-Web text request body"
-                );
-                // Return None to pass through; on_final_request_body will catch
-                // the invalid framing and reject with 400.
-                None
-            }
-        }
     }
 
     async fn transform_request_body_with_context(
@@ -4822,8 +4762,7 @@ impl Plugin for GrpcWebPlugin {
             return None;
         }
 
-        // Decode from owner-scoped metadata, not the shared `x-grpc-web-mode`
-        // staging header — siblings must never collide on that header.
+        // Decode from owner-scoped metadata so sibling instances never collide.
         let decoded = if is_text {
             match decode_grpc_web_text_body(body) {
                 Some(decoded) => {
@@ -4930,25 +4869,6 @@ impl Plugin for GrpcWebPlugin {
             self.instance_id_str.clone(),
         );
         Some(output)
-    }
-
-    async fn on_final_request_body(
-        &self,
-        headers: &HashMap<String, String>,
-        body: &[u8],
-    ) -> PluginResult {
-        // Legacy path: validate when the owner-injected mode marker names a
-        // recognized gRPC-Web transport. Production uses the owner-scoped
-        // context path below.
-        let Some(mode) = headers.get(HEADER_GRPC_WEB_MODE).map(String::as_str) else {
-            return PluginResult::Continue;
-        };
-        if mode != "text" && mode != "binary" {
-            return PluginResult::Continue;
-        }
-
-        validate_grpc_web_request_frames(body, headers)
-            .map_or_else(invalid_grpc_web_request, |()| PluginResult::Continue)
     }
 
     async fn on_final_request_body_with_context(
@@ -5141,30 +5061,6 @@ impl Plugin for GrpcWebPlugin {
         }
 
         PluginResult::Continue
-    }
-
-    async fn transform_response_body(
-        &self,
-        body: &[u8],
-        content_type: Option<&str>,
-        response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
-        // Legacy/no-context path used by focused framing unit tests. Production
-        // buffering calls `transform_response_body_with_context`, which enforces
-        // owner + exactly-once translation and applies backend-trailer provenance.
-        self.transform_grpc_web_response_body(
-            body,
-            content_type,
-            response_headers,
-            TrailerFrameProvenance {
-                http_status: None,
-                trailer_name_allowlist: None,
-                shadowed_trailers: None,
-                policy_state: None,
-            },
-            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
-        )
-        .into_option()
     }
 
     async fn transform_response_body_with_context(

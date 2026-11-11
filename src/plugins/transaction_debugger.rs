@@ -482,18 +482,12 @@ impl TransactionDebugger {
             "transaction_debugger",
             SchemaCapabilities::TRANSACTION_DEBUGGER,
         )?;
-        let mut unknown_keys: Vec<&str> = object
-            .keys()
-            .map(String::as_str)
-            .filter(|key| !TRANSACTION_DEBUGGER_CONFIG_KEYS.contains(key))
-            .collect();
-        if !unknown_keys.is_empty() {
-            unknown_keys.sort_unstable();
-            return Err(format!(
-                "transaction_debugger: unknown configuration keys at `config`: {:?}",
-                unknown_keys.join(", ")
-            ));
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            TRANSACTION_DEBUGGER_CONFIG_KEYS,
+            "transaction_debugger: `config`: ",
+        )?;
 
         let mut extra_redacted_headers =
             optional_header_names(config, "redacted_headers")?.unwrap_or_default();
@@ -585,7 +579,6 @@ impl TransactionDebugger {
     }
 
     /// The compiled diagnostic projection, if one is configured.
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub fn schema(&self) -> Option<&Arc<SummarySchema>> {
         self.schema.as_ref()
     }
@@ -595,7 +588,6 @@ impl TransactionDebugger {
     /// Test seam: the production path writes the result into a `tracing` event,
     /// which external tests cannot inspect without a subscriber.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub fn project_http_for_tests(&self, summary: &TransactionSummary) -> Option<String> {
         let schema = self.schema.as_ref().filter(|s| s.applies_to_http())?;
         Self::render(
@@ -610,7 +602,6 @@ impl TransactionDebugger {
     /// Project one stream terminal diagnostic exactly as `on_stream_disconnect`
     /// would. Test seam; see [`Self::project_http_for_tests`].
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub fn project_stream_for_tests(&self, summary: &StreamTransactionSummary) -> Option<String> {
         let schema = self.schema.as_ref().filter(|s| s.applies_to_stream())?;
         Self::render(
@@ -625,7 +616,6 @@ impl TransactionDebugger {
     /// Project one WebSocket terminal diagnostic exactly as `on_ws_disconnect`
     /// would. Test seam; see [`Self::project_http_for_tests`].
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub fn project_ws_for_tests(&self, summary: &WsDisconnectContext) -> Option<String> {
         let schema = self
             .schema
@@ -664,31 +654,26 @@ impl TransactionDebugger {
     }
 
     /// Whether bounded request-body capture is enabled.
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn log_request_body(&self) -> bool {
         self.log_request_body
     }
 
     /// Whether bounded response-body capture is enabled.
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn log_response_body(&self) -> bool {
         self.log_response_body
     }
 
     /// Effective request-body capture budget in bytes.
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn max_request_body_bytes(&self) -> usize {
         self.max_request_body_bytes
     }
 
     /// Effective response-body capture budget in bytes.
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn max_response_body_bytes(&self) -> usize {
         self.max_response_body_bytes
     }
 
     /// Whether over-cap `text/plain` / form bodies render a redacted prefix.
-    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn capture_body_prefix(&self) -> bool {
         self.capture_body_prefix
     }

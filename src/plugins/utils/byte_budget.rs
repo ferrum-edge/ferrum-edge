@@ -64,8 +64,6 @@ impl RetainedByteCeiling {
 
     /// Install an exact ceiling with no clamping. Test-only: saturation
     /// coverage needs ceilings far below the production minimum.
-    // The binary target never calls this; external unit tests do.
-    #[allow(dead_code)]
     pub fn set_max_unclamped_for_test(&self, max_bytes: usize) {
         self.max.store(max_bytes, Ordering::Release);
     }
@@ -122,9 +120,6 @@ static PROCESS_CEILING: RetainedByteCeiling =
     RetainedByteCeiling::new(PROCESS_MAX_RETAINED_BYTES_DEFAULT);
 
 /// Handle on the process-wide ceiling.
-// The binary target reaches the ceiling through the wrappers below; external
-// tests use this handle directly.
-#[allow(dead_code)]
 pub fn process_ceiling() -> &'static RetainedByteCeiling {
     &PROCESS_CEILING
 }
@@ -289,7 +284,6 @@ impl ProcessByteReservation {
 
     /// Bytes still held by this reservation.
     // Read by external unit tests only.
-    #[allow(dead_code)]
     pub fn reserved(&self) -> usize {
         self.bytes.load(Ordering::Acquire)
     }
@@ -370,8 +364,6 @@ impl GrowableProcessReservation {
     }
 
     /// Bytes currently charged by this reservation.
-    // Read by external unit tests only; the binary target cannot observe them.
-    #[allow(dead_code)]
     pub fn held(&self) -> usize {
         self.held.load(Ordering::Acquire)
     }
@@ -468,8 +460,6 @@ impl ByteBudget {
     /// External tests pass their own leaked ceiling so saturation and
     /// byte-accounting assertions stay exact while other tests in the same
     /// binary run concurrently.
-    // The binary target uses the named constructors; external unit tests use this.
-    #[allow(dead_code)]
     pub fn with_ceiling(
         plugin_name: &'static str,
         max_bytes: usize,
@@ -493,9 +483,6 @@ impl ByteBudget {
         self.used_bytes.load(Ordering::Acquire)
     }
 
-    // Read by external unit tests; the binary target compiles this shared
-    // module separately and cannot observe those callers.
-    #[allow(dead_code)]
     pub fn drops_total(&self) -> u64 {
         self.drops.load(Ordering::Relaxed)
     }
@@ -830,9 +817,7 @@ impl ReservedPayload {
 
     /// Companion to [`ReservedPayload::len`], required by
     /// `clippy::len_without_is_empty`. No sink needs it — every caller either
-    /// measures the payload or hands it to delivery — so it is dead in the
-    /// binary target, which does not compile the `_test_support` wrappers.
-    #[allow(dead_code)]
+    /// measures the payload or hands it to delivery.
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -845,7 +830,6 @@ impl ReservedPayload {
 /// reservation; this probe exists so the undersized-charge refusal stays
 /// covered without opening a runtime-visible API.
 #[doc(hidden)]
-#[allow(dead_code)] // external unit tests only
 pub fn probe_preallocated_payload_capacity_guard_for_tests(
     ceiling: &'static RetainedByteCeiling,
 ) -> Result<(), String> {

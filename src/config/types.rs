@@ -1025,16 +1025,6 @@ pub struct UpstreamPortOverride {
     /// `http_idle_timeout_ms` (HTTP pool idle; 0 is rejected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_idle_timeout_seconds: Option<u64>,
-    /// Legacy carrier for DestinationRule
-    /// `connectionPool.http.maxRequestsPerConnection`.
-    ///
-    /// New translation does not populate this field, and
-    /// `resolve_effective_proxy_for_target` intentionally ignores any legacy
-    /// carried value because Ferrum has no backend close-after-N-requests
-    /// runtime behavior. K8s status reports the DR field as deferred instead of
-    /// presenting this as effective policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_max_requests_per_connection: Option<u32>,
     /// Per-port HTTP idle-timeout mapped from DestinationRule
     /// `connectionPool.http.idleTimeout` (milliseconds). Projected onto the
     /// per-target effective proxy's `pool_idle_timeout_seconds` (whole
@@ -1175,7 +1165,6 @@ pub struct ResolvedPortOverride {
     pub max_connections: Option<u32>,
     pub tcp_keepalive: Option<TcpKeepaliveCfg>,
     pub tcp_idle_timeout_seconds: Option<u64>,
-    pub http_max_requests_per_connection: Option<u32>,
     pub http_idle_timeout_ms: Option<u64>,
     /// Destination-wide active-request cap (`http2MaxRequests`).
     pub http2_max_requests: Option<u32>,
@@ -1217,7 +1206,6 @@ impl ResolvedPortOverride {
             max_connections: value.max_connections,
             tcp_keepalive: value.tcp_keepalive.clone(),
             tcp_idle_timeout_seconds: value.tcp_idle_timeout_seconds,
-            http_max_requests_per_connection: value.http_max_requests_per_connection,
             http_idle_timeout_ms: value.http_idle_timeout_ms,
             http2_max_requests: value.http2_max_requests,
             h2_max_concurrent_streams: value.h2_max_concurrent_streams,
@@ -1241,7 +1229,6 @@ impl ResolvedPortOverride {
             && self.max_connections.is_none()
             && self.tcp_keepalive.is_none()
             && self.tcp_idle_timeout_seconds.is_none()
-            && self.http_max_requests_per_connection.is_none()
             && self.http_idle_timeout_ms.is_none()
             && self.http2_max_requests.is_none()
             && self.h2_max_concurrent_streams.is_none()
@@ -1249,39 +1236,6 @@ impl ResolvedPortOverride {
             && self.h2_upgrade_policy.is_none()
             && self.max_retries.is_none()
             && self.http1_max_pending_requests.is_none()
-    }
-
-    /// Field-by-field materialization of inherited `connectionPool.http`
-    /// fields from a proxy fallback onto an explicit per-port entry.
-    ///
-    /// For each supported `connectionPool.http` field, the per-port value wins
-    /// when set; otherwise the fallback's value is inherited. This mirrors
-    /// Ferrum's documented field-level merge. Inherited top-level/subset values
-    /// are carried separately on `Proxy.dispatch_port_override_fallback`.
-    /// Runtime dispatch resolves the same field precedence directly through
-    /// borrowed references so it does not clone this structure per request; an
-    /// unrelated per-port field (e.g. `connectTimeout`/`tls`) therefore does not
-    /// wipe an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
-    ///
-    /// Only `connectionPool.http` fields are merged; the fallback only ever
-    /// carries those (it is built solely from the DR top-level
-    /// `connectionPool.http` block), so non-`connectionPool.http` fields
-    /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
-    /// this per-port entry already has them.
-    pub fn seed_connection_pool_http_from_fallback(&mut self, fallback: &ResolvedPortOverride) {
-        self.http_max_requests_per_connection = self
-            .http_max_requests_per_connection
-            .or(fallback.http_max_requests_per_connection);
-        self.http_idle_timeout_ms = self.http_idle_timeout_ms.or(fallback.http_idle_timeout_ms);
-        self.http2_max_requests = self.http2_max_requests.or(fallback.http2_max_requests);
-        self.h2_max_concurrent_streams = self
-            .h2_max_concurrent_streams
-            .or(fallback.h2_max_concurrent_streams);
-        self.h2_upgrade_policy = self.h2_upgrade_policy.or(fallback.h2_upgrade_policy);
-        self.max_retries = self.max_retries.or(fallback.max_retries);
-        self.http1_max_pending_requests = self
-            .http1_max_pending_requests
-            .or(fallback.http1_max_pending_requests);
     }
 
     /// Overlay the subset-inheritable HTTP connection-pool fields onto this
@@ -2826,7 +2780,6 @@ impl BackendScheme {
     /// True when this uses HTTP-family transport (HTTP/1.1, HTTP/2, HTTP/3,
     /// gRPC, WebSocket — determined per-request from `HttpFlavor`).
     #[inline]
-    #[allow(dead_code)]
     pub fn is_http_family(&self) -> bool {
         matches!(self, Self::Http | Self::Https)
     }
@@ -2938,7 +2891,6 @@ impl DispatchKind {
     }
 
     #[inline]
-    #[allow(dead_code)] // part of public API, exercised via re-export + tests
     pub fn is_tls_backend(&self) -> bool {
         matches!(self, Self::HttpsPool | Self::TcpTls | Self::UdpDtls)
     }
@@ -3305,16 +3257,6 @@ pub struct Proxy {
     /// (always H2) or HBONE/mesh-mTLS transport selection.
     #[serde(skip)]
     pub h2_upgrade_policy: Option<H2UpgradePolicy>,
-    /// Deprecated proxy-level `maxRequestsPerConnection` carrier.
-    /// Reqwest/hyper do not expose a stable close-after-N-requests builder knob
-    /// for the shared backend client pool, so this direct proxy field is
-    /// admitted for backward compatibility but has no live runtime effect.
-    /// DestinationRule translation no longer projects into this field; K8s
-    /// status reports DR `connectionPool.http.maxRequestsPerConnection` as
-    /// deferred instead.
-    /// `None` (default) = no configured cap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pool_max_requests_per_connection: Option<u64>,
     /// Istio DestinationRule `connectionPool.http.http1MaxPendingRequests`. The
     /// honestly reinterpreted cap on concurrent in-flight requests on the
     /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
@@ -5423,17 +5365,6 @@ impl GatewayConfig {
             .collect()
     }
 
-    /// Validate only the cross-Consumer `jwt` secret constraint.
-    pub fn validate_unique_jwt_credentials(&self) -> Result<(), Vec<String>> {
-        let duplicates = self.jwt_credential_uniqueness_errors();
-
-        if duplicates.is_empty() {
-            Ok(())
-        } else {
-            Err(duplicates)
-        }
-    }
-
     /// Validate the cross-Consumer `jwt` secret constraint for collisions that
     /// involve one of `consumer_ids`. Admin candidate checks use this narrower
     /// surface so a pre-existing duplicate between two other Consumers (which
@@ -5457,16 +5388,6 @@ impl GatewayConfig {
         } else {
             Err(duplicates)
         }
-    }
-
-    /// Fail-closed handling of Consumer `jwt` credential policy at full-load
-    /// time, for a snapshot judged on its own (no earlier generation).
-    ///
-    /// See [`Self::quarantine_invalid_jwt_credentials_against`]; this is
-    /// that function with an empty history, returning only the messages.
-    pub fn quarantine_invalid_jwt_credentials(&mut self) -> Vec<String> {
-        self.quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default())
-            .messages
     }
 
     /// Fail-closed handling of Consumer `jwt` credential policy at full-load
@@ -9219,14 +9140,6 @@ impl Proxy {
                 MAX_POOL_SQL_INTEGER_VALUE, v
             ));
         }
-        if let Some(v) = self.pool_max_requests_per_connection
-            && v > MAX_POOL_SQL_INTEGER_VALUE
-        {
-            errors.push(format!(
-                "`pool_max_requests_per_connection` must be between 0 and {} (got \"{}\")",
-                MAX_POOL_SQL_INTEGER_VALUE, v
-            ));
-        }
 
         // HTTP/3 connections per backend
         if let Some(v) = self.pool_http3_connections_per_backend
@@ -10337,21 +10250,6 @@ impl Upstream {
                 tls.normalize_fields();
             }
         }
-    }
-
-    /// Resolve the effective backend connect timeout for a request destined to
-    /// `port`. Per-port `port_overrides[port].connect_timeout_ms` wins over
-    /// `proxy_default_ms` (the Proxy's own `backend_connect_timeout_ms`).
-    ///
-    /// No dispatch path calls this today (only tests do); the mesh pools read
-    /// the per-port override themselves. `0` from either source means
-    /// "disabled".
-    #[inline]
-    pub fn effective_connect_timeout_ms(&self, port: u16, proxy_default_ms: u64) -> u64 {
-        self.port_overrides
-            .get(&port)
-            .and_then(|ovr| ovr.connect_timeout_ms)
-            .unwrap_or(proxy_default_ms)
     }
 
     /// Validate all fields of an upstream for correctness and safe lengths.

@@ -662,7 +662,6 @@ fn source_proxy() -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: Some(UPSTREAM_ID.to_string()),
         upstream_subset: None,
@@ -1561,6 +1560,50 @@ async fn a_nested_h2_sender_that_received_goaway_is_retired_and_never_reissued()
     );
     assert_eq!(fx.peer.connects(), 2);
     assert_eq!(fx.app.accepts(), 2);
+}
+
+/// Issue #7180: a dispatch that saw a pre-wire cancel or protocol NACK on a
+/// pooled carrier retires it through its lease, so a retry is never handed the
+/// same carrier while it still reports open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nested_h2_carrier_retired_by_its_lease_is_never_reissued() {
+    let fx = fixture(AppBehaviour::H2c { goaway_after: 0 }, true).await;
+    let parts = fx.identity.parts(HboneInnerProtocol::H2);
+
+    let mut nested = open_fresh_h2(&fx).await;
+    let first_lease = publish_fresh_h2(&fx, &parts, &nested);
+    assert_eq!(
+        send_rpc(&mut nested.sender).await.expect("first rpc"),
+        StatusCode::OK
+    );
+    drop(first_lease);
+    let reused = fx
+        .pool
+        .inner_pool()
+        .checkout_h2(&parts)
+        .expect("the published carrier is shared");
+    assert!(
+        !reused.sender.is_closed(),
+        "the carrier is still open when the dispatch retires it"
+    );
+    let evictions_before = fx.pool.inner_pool().stats().evictions;
+
+    reused.lease.retire_carrier();
+
+    assert!(
+        fx.pool.inner_pool().checkout_h2(&parts).is_none(),
+        "a retired carrier must not be handed to the retry"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().pooled_connections(),
+        0,
+        "the retired carrier leaves the pool"
+    );
+    assert_eq!(
+        fx.pool.inner_pool().stats().evictions,
+        evictions_before + 1,
+        "retirement is accounted as one eviction"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2971,5 +3014,34 @@ async fn a_publication_that_retires_nothing_does_not_fence_outstanding_leases() 
         before,
         "a publication that withdraws nothing must not fence every outstanding \
          lease and force a reconnect storm"
+    );
+}
+
+/// Issue #7166: the gateway leaf's credential deadline is derived once per
+/// SVID snapshot with the identity and fingerprint, not re-parsed (and
+/// re-anchored on the wall clock) per request. Two resolutions of the same
+/// snapshot report the same monotonic instant, and that instant is a real,
+/// future `notAfter` bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_source_credential_deadline_is_derived_once_per_svid_snapshot() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ids = identities();
+    let pool = source_pool(ids.gateway);
+    let first = pool
+        .source_credential_identity()
+        .expect("the gateway SVID resolves a source credential identity");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let second = pool
+        .source_credential_identity()
+        .expect("the same snapshot resolves again");
+    assert_eq!(first.fingerprint, second.fingerprint);
+    let deadline = first
+        .leaf_deadline
+        .expect("a freshly issued leaf has a representable notAfter");
+    assert!(deadline > tokio::time::Instant::now());
+    assert_eq!(
+        second.leaf_deadline,
+        Some(deadline),
+        "the cached deadline must not be re-derived from the wall clock per request"
     );
 }

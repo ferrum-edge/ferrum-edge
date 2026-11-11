@@ -267,7 +267,6 @@ impl ConfFile {
     }
 
     /// Returns true if the conf file has no values (either empty or not loaded).
-    #[allow(dead_code)] // Used by integration/unit tests via the lib crate
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }

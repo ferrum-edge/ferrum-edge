@@ -605,7 +605,7 @@ fn unknown_security_control_fields_are_rejected() {
         let error = JwksAuth::new(&config, default_client())
             .err()
             .expect("unknown field must fail closed");
-        assert!(error.contains("unknown field"), "got: {error}");
+        assert!(error.contains("unknown configuration key"), "got: {error}");
     }
 }
 
@@ -2305,7 +2305,7 @@ async fn test_jwks_auth_validates_with_audience() {
         &json!({
             "providers": [{
                 "jwks_uri": jwks_uri,
-                "audience": "my-api"
+                "audiences": ["my-api"]
             }]
         }),
         default_client(),
@@ -2321,6 +2321,22 @@ async fn test_jwks_auth_validates_with_audience() {
         .insert("authorization".to_string(), format!("Bearer {}", token));
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
+}
+
+/// Issue #7114: a provider takes only `audiences`; the singular `audience`
+/// spelling (formerly merged into it) is an unknown field.
+#[test]
+fn provider_singular_audience_is_an_unknown_field() {
+    let error = JwksAuth::new(
+        &json!({"providers": [{"jwks": {"keys": []}, "audience": "my-api"}]}),
+        default_client(),
+    )
+    .map(|_| ())
+    .expect_err("singular audience must be rejected");
+    assert!(
+        error.contains("unknown configuration key") && error.contains("audience"),
+        "{error}"
+    );
 }
 
 const GENERIC_JWKS_401: &str = r#"{"error":"Invalid or unrecognized JWT"}"#;
@@ -5163,16 +5179,12 @@ async fn claimed_dpop_proof_cannot_move_across_replay_authorities_on_reorder_or_
     );
 }
 
-/// The removed retention/capacity knobs are rejected with their replacement
-/// named, rather than silently ignored — a config still carrying
-/// `dpop_jti_ttl_secs` was written believing it controls how long a proof stays
-/// single-use.
+/// The former retention/capacity knobs are rejected, never silently ignored:
+/// the closed provider key set reports them as unknown fields (no dedicated
+/// removed-key diagnostic, issue #7113).
 #[test]
-fn removed_dpop_replay_knobs_are_rejected_with_guidance() {
-    for (removed, expected) in [
-        ("dpop_jti_ttl_secs", "fixed horizon"),
-        ("dpop_jti_cache_max_entries", "dpop_replay_max_entries"),
-    ] {
+fn former_dpop_replay_knobs_are_rejected_as_unknown_fields() {
+    for removed in ["dpop_jti_ttl_secs", "dpop_jti_cache_max_entries"] {
         let mut provider = json!({
             "jwks": {"keys": []},
             "require_dpop": true,
@@ -5181,10 +5193,10 @@ fn removed_dpop_replay_knobs_are_rejected_with_guidance() {
         provider[removed] = json!(300);
         let error = JwksAuth::new(&json!({"providers": [provider]}), default_client())
             .map(|_| ())
-            .expect_err("a removed replay knob must be rejected");
+            .expect_err("a former replay knob must be rejected");
         assert!(
-            error.contains(removed) && error.contains(expected),
-            "diagnostic should name the removal and its replacement: {error}"
+            error.contains("unknown configuration key") && error.contains(removed),
+            "diagnostic should name the unknown field: {error}"
         );
     }
 }
@@ -5770,7 +5782,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
     let cases: &[(serde_json::Value, &[&str])] = &[
         (
             json!({"providers": [{(canary): true}]}),
-            &["`provider[0]`", "unknown field"],
+            &["`provider[0]`", "unknown configuration key(s)"],
         ),
         (
             json!({"providers": [{"jwks": {"keys": []}, "audiences": [8675309]}]}),

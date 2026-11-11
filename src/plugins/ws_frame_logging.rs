@@ -66,7 +66,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fips::backend::rand::SecureRandom;
 use async_trait::async_trait;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tracing::callsite::{DefaultCallsite, Identifier};
 use tracing::field::FieldSet;
@@ -95,7 +95,6 @@ pub const MAX_PAYLOAD_PREVIEW_BYTES: u64 = 65_536;
 /// Default `log_level` when omitted. Healthy per-frame records remain
 /// informational; construction emits an actionable warning when the active
 /// filter (including the gateway default `warn`) suppresses them.
-#[allow(dead_code)] // Used by external unit tests that verify OpenAPI/default parity.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Accepted `direction` values, in documentation order.
@@ -325,7 +324,12 @@ impl WsFrameLogging {
         let Some(object) = config.as_object() else {
             return Err("ws_frame_logging: config must be a JSON object".to_string());
         };
-        reject_unknown_keys(object)?;
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            WS_FRAME_LOGGING_CONFIG_KEYS,
+            "ws_frame_logging: `config`: ",
+        )?;
 
         let plugin_id: Box<str> = match plugin_config_id {
             None => UNATTRIBUTED_PLUGIN_ID.into(),
@@ -539,19 +543,16 @@ impl WsFrameLogging {
     }
 
     /// Configured tracing level label (`trace`/`debug`/`info`/`warn`).
-    #[allow(dead_code)] // Used by external unit tests; the binary uses the parsed enum directly.
     pub fn configured_log_level(&self) -> &'static str {
         self.config.log_level.as_str()
     }
 
     /// Leading payload bytes folded into fingerprints when previews are enabled.
-    #[allow(dead_code)] // Used by external unit tests; runtime reads the field directly.
     pub fn payload_preview_bytes(&self) -> usize {
         self.config.payload_preview_bytes
     }
 
     /// Plugin-config resource id stamped on every record as `plugin_id`.
-    #[allow(dead_code)] // Used by external unit tests; runtime reads the field directly.
     pub fn plugin_id(&self) -> &str {
         &self.config.plugin_id
     }
@@ -671,8 +672,8 @@ impl WsFrameLogging {
         outcome: &'static str,
     ) {
         let dir_label = match direction {
-            WebSocketFrameDirection::ClientToBackend => "client->backend",
-            WebSocketFrameDirection::BackendToClient => "backend->client",
+            WebSocketFrameDirection::ClientToBackend => "client_to_backend",
+            WebSocketFrameDirection::BackendToClient => "backend_to_client",
         };
         let plugin_id: &str = &self.config.plugin_id;
         match self.config.log_level {
@@ -761,22 +762,6 @@ fn splitmix64(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
-}
-
-fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .filter(|key| !WS_FRAME_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "ws_frame_logging: `config`: unknown configuration key(s): {unknown:?}; allowed keys: `{}`",
-        WS_FRAME_LOGGING_CONFIG_KEYS.join("`, `")
-    ))
 }
 
 /// Render a keyed, non-reversible payload fingerprint string.
@@ -1001,7 +986,6 @@ impl Plugin for WsFrameLogging {
         let correlation_id = ctx
             .metadata
             .get(super::REQUEST_ID_METADATA_KEY)
-            .or_else(|| ctx.metadata.get("correlation_id"))
             .map(String::as_str)
             .unwrap_or("-");
         let plugin_id: &str = &self.config.plugin_id;

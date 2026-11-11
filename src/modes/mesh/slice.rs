@@ -1714,7 +1714,7 @@ impl MeshSlice {
         {
             (
                 mesh_service_identities(&mesh.services),
-                visible_service_entry_hosts(mesh, effective_namespace, &effective_labels),
+                visible_service_entry_hosts(mesh, effective_namespace),
             )
         } else {
             (BTreeSet::new(), BTreeMap::new())
@@ -1970,9 +1970,7 @@ impl MeshSlice {
         let service_entries: Vec<ServiceEntry> = mesh
             .service_entries
             .iter()
-            .filter(|entry| {
-                service_entry_applies_to_workload(entry, effective_namespace, &effective_labels)
-            })
+            .filter(|entry| service_entry_applies_to_workload(entry, effective_namespace))
             .flat_map(|entry| {
                 let Some(sidecar) = applicable_sidecar else {
                     return vec![entry.clone()];
@@ -2151,8 +2149,15 @@ impl MeshSlice {
             build_sidecar_egress_scope_snapshot(EgressScopeBuildContext {
                 mesh,
                 sidecar,
+                // Outside dry-run this Sidecar IS `applicable_sidecar`, so the
+                // slice's own narrowed services, ServiceEntries and
+                // DestinationRules are exactly the set the snapshot reports.
+                admitted: (!sidecar_dry_run).then_some(AdmittedEgressScope {
+                    services: &services,
+                    service_entries: &service_entries,
+                    destination_rules: &destination_rules,
+                }),
                 workload_namespace: effective_namespace,
-                workload_labels: &effective_labels,
                 cluster_domain: &cluster_domain,
                 mesh_service_identities: &mesh_service_identities,
                 service_entry_hosts: &service_entry_hosts,
@@ -2947,11 +2952,21 @@ fn insert_known_destination<'a>(
     }
 }
 
-struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
+/// The egress-narrowed resources the slice build already admitted for the
+/// same Sidecar, reused by the scope snapshot instead of a second pass.
+struct AdmittedEgressScope<'a> {
+    services: &'a [MeshService],
+    service_entries: &'a [ServiceEntry],
+    destination_rules: &'a [MeshDestinationRule],
+}
+
+struct EgressScopeBuildContext<'a> {
     mesh: &'a MeshConfig,
     sidecar: ResolvedSidecarEgress<'a>,
+    /// `Some` when `sidecar` is the slice's applied Sidecar (not dry-run):
+    /// the snapshot then reports the slice's own admitted set verbatim.
+    admitted: Option<AdmittedEgressScope<'a>>,
     workload_namespace: &'a str,
-    workload_labels: &'a L,
     cluster_domain: &'a str,
     mesh_service_identities: &'a BTreeSet<(String, String)>,
     service_entry_hosts: &'a BTreeMap<String, ServiceEntryHostOwner>,
@@ -2959,64 +2974,73 @@ struct EgressScopeBuildContext<'a, L: WorkloadLabels + ?Sized> {
     dry_run: bool,
 }
 
-fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
-    ctx: EgressScopeBuildContext<'_, L>,
+fn build_sidecar_egress_scope_snapshot(
+    ctx: EgressScopeBuildContext<'_>,
 ) -> MeshEgressScopeSnapshot {
     let EgressScopeBuildContext {
         mesh,
         sidecar,
+        admitted,
         workload_namespace,
-        workload_labels,
         cluster_domain,
         mesh_service_identities,
         service_entry_hosts,
         sidecar_enforced,
         dry_run,
     } = ctx;
-    let scoped_services: Vec<MeshService> = mesh
-        .services
-        .iter()
-        .filter_map(|service| narrow_service_ports(service, sidecar, cluster_domain))
-        .collect();
-    let scoped_service_entries: Vec<ServiceEntry> = mesh
-        .service_entries
-        .iter()
-        .filter(|entry| {
-            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
-        })
-        .flat_map(|entry| narrow_service_entry_ports(entry, sidecar))
-        .collect();
+    let (scoped_services, scoped_service_entries, scoped_destination_rules) = match admitted {
+        Some(admitted) => (
+            admitted.services.to_vec(),
+            admitted.service_entries.to_vec(),
+            admitted.destination_rules.to_vec(),
+        ),
+        None => {
+            let services: Vec<MeshService> = mesh
+                .services
+                .iter()
+                .filter_map(|service| narrow_service_ports(service, sidecar, cluster_domain))
+                .collect();
+            let service_entries: Vec<ServiceEntry> = mesh
+                .service_entries
+                .iter()
+                .filter(|entry| service_entry_applies_to_workload(entry, workload_namespace))
+                .flat_map(|entry| narrow_service_entry_ports(entry, sidecar))
+                .collect();
+            // The operator-facing egress-scope snapshot must report the SAME
+            // admitted set the live slice serves, so it runs the one shared
+            // admission pass (`exportTo` visibility → lookup tier → egress
+            // scope → tier resolution) rather than its own copy of the
+            // namespace rule (issues #2465, #2469).
+            let destination_rule_scope = DestinationRuleScope {
+                client_namespace: workload_namespace,
+                root_namespace: mesh.istio_root_namespace.as_str(),
+                cluster_domain,
+                mesh_service_identities,
+                service_entry_hosts,
+            };
+            let destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
+                mesh.destination_rules.iter(),
+                &destination_rule_scope,
+                |_dr, resource_namespace, host_candidates| {
+                    let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
+                    sidecar_egress_includes_service(
+                        sidecar.namespace,
+                        sidecar.egress,
+                        resource_namespace,
+                        &host_refs,
+                        None,
+                    )
+                },
+            );
+            (services, service_entries, destination_rules)
+        }
+    };
     let scoped_workloads: Vec<Workload> = mesh
         .workloads
         .iter()
         .filter(|workload| workload.namespace == workload_namespace)
         .cloned()
         .collect();
-    // The operator-facing egress-scope snapshot must report the SAME admitted
-    // set the live slice serves, so it runs the one shared admission pass
-    // (`exportTo` visibility → lookup tier → egress scope → tier resolution)
-    // rather than its own copy of the namespace rule (issues #2465, #2469).
-    let destination_rule_scope = DestinationRuleScope {
-        client_namespace: workload_namespace,
-        root_namespace: mesh.istio_root_namespace.as_str(),
-        cluster_domain,
-        mesh_service_identities,
-        service_entry_hosts,
-    };
-    let scoped_destination_rules: Vec<MeshDestinationRule> = admit_destination_rules(
-        mesh.destination_rules.iter(),
-        &destination_rule_scope,
-        |_dr, resource_namespace, host_candidates| {
-            let host_refs: Vec<&str> = host_candidates.iter().map(String::as_str).collect();
-            sidecar_egress_includes_service(
-                sidecar.namespace,
-                sidecar.egress,
-                resource_namespace,
-                &host_refs,
-                None,
-            )
-        },
-    );
 
     let baseline_local_services = mesh
         .services
@@ -3040,11 +3064,19 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         .iter()
         .map(destination_rule_scope_resource)
         .collect();
+    let service_resources: Vec<MeshEgressScopeResource> = scoped_services
+        .iter()
+        .map(|service| mesh_service_scope_resource(service, cluster_domain))
+        .collect();
+    let service_entry_resources: Vec<MeshEgressScopeResource> = scoped_service_entries
+        .iter()
+        .map(service_entry_scope_resource)
+        .collect();
     let scope_slice = MeshSlice {
         namespace: workload_namespace.to_string(),
         workloads: scoped_workloads,
-        services: scoped_services.clone(),
-        service_entries: scoped_service_entries.clone(),
+        services: scoped_services,
+        service_entries: scoped_service_entries,
         destination_rules: scoped_destination_rules,
         outbound_traffic_policy: mesh.outbound_traffic_policy,
         ..MeshSlice::default()
@@ -3060,14 +3092,8 @@ fn build_sidecar_egress_scope_snapshot<L: WorkloadLabels + ?Sized>(
         sidecar_denied_destination_rules: baseline_local_destination_rules
             .saturating_sub(admitted_local_destination_rules),
         destination_rules: destination_rule_resources,
-        services: scoped_services
-            .iter()
-            .map(|service| mesh_service_scope_resource(service, cluster_domain))
-            .collect(),
-        service_entries: scoped_service_entries
-            .iter()
-            .map(service_entry_scope_resource)
-            .collect(),
+        services: service_resources,
+        service_entries: service_entry_resources,
         known_destinations: scope_slice.build_known_destinations(cluster_domain),
     }
 }
@@ -3161,17 +3187,14 @@ pub(crate) enum ServiceEntryHostOwner {
 /// Index the hosts of every ServiceEntry visible to this workload by their
 /// owning (declaring) namespace. Narrowing only; the ownership rules live in
 /// [`index_service_entry_host_owners`].
-fn visible_service_entry_hosts<L: WorkloadLabels + ?Sized>(
+fn visible_service_entry_hosts(
     mesh: &MeshConfig,
     workload_namespace: &str,
-    workload_labels: &L,
 ) -> BTreeMap<String, ServiceEntryHostOwner> {
     let visible: Vec<&ServiceEntry> = mesh
         .service_entries
         .iter()
-        .filter(|entry| {
-            service_entry_applies_to_workload(entry, workload_namespace, workload_labels)
-        })
+        .filter(|entry| service_entry_applies_to_workload(entry, workload_namespace))
         .collect();
     index_service_entry_host_owners(visible)
 }
@@ -4756,29 +4779,21 @@ fn proxy_config_scope_tier(pc: &MeshProxyConfig) -> u8 {
 
 /// Classify a [`PeerAuthentication`] into a scope tier for precedence ordering.
 fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
-    if let Some(scope) = &pa.scope {
-        return match scope {
-            PolicyScope::MeshWide => PeerAuthScope::MeshWide,
-            PolicyScope::Namespace { .. } => PeerAuthScope::Namespace,
-            PolicyScope::WorkloadSelector { .. } if pa.has_workload_selector() => {
-                PeerAuthScope::WorkloadSelector
-            }
-            // Defensive normalization for native/file slices: an empty
-            // selector is a namespace default when namespace-constrained and a
-            // mesh default when it has no namespace constraint.
-            PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() => {
-                PeerAuthScope::MeshWide
-            }
-            PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
-            // TargetRefs is AuthorizationPolicy-only; never classify PeerAuth.
-            PolicyScope::TargetRefs { .. } => PeerAuthScope::Namespace,
-        };
-    }
-
-    if pa.has_workload_selector() {
-        PeerAuthScope::WorkloadSelector
-    } else {
-        PeerAuthScope::Namespace
+    match &pa.scope {
+        PolicyScope::MeshWide => PeerAuthScope::MeshWide,
+        PolicyScope::Namespace { .. } => PeerAuthScope::Namespace,
+        PolicyScope::WorkloadSelector { .. } if pa.has_workload_selector() => {
+            PeerAuthScope::WorkloadSelector
+        }
+        // Defensive normalization for native/file slices: an empty selector is
+        // a namespace default when namespace-constrained and a mesh default
+        // when it has no namespace constraint.
+        PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() => {
+            PeerAuthScope::MeshWide
+        }
+        PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
+        // TargetRefs is AuthorizationPolicy-only; never classify PeerAuth.
+        PolicyScope::TargetRefs { .. } => PeerAuthScope::Namespace,
     }
 }
 
@@ -4788,21 +4803,16 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
 /// not match is authoritatively non-applicable (namespace is never ambiguous), so
 /// it must not force a more-restrictive mTLS mode for an unrelated namespace.
 fn peer_auth_selector_namespace_matches(pa: &PeerAuthentication, proxy_namespace: &str) -> bool {
-    let selector_namespace = match &pa.scope {
-        Some(PolicyScope::WorkloadSelector { selector }) => selector.namespace.as_deref(),
-        _ => pa
-            .selector
-            .as_ref()
-            .and_then(|selector| selector.namespace.as_deref()),
-    };
-    // A scope-form selector with no explicit selector namespace is mesh-wide for
-    // namespace purposes; the legacy `pa.selector` form additionally requires the
-    // policy's own namespace to match the workload (Istio scopes a bare selector
-    // to the policy namespace).
-    match (&pa.scope, selector_namespace) {
-        (_, Some(ns)) => ns == proxy_namespace,
-        (Some(PolicyScope::WorkloadSelector { .. }), None) => true,
-        (Some(_), None) | (None, None) => pa.namespace == proxy_namespace,
+    // A selector with no explicit namespace is mesh-wide for namespace
+    // purposes (Istio root-namespace selectors).
+    match &pa.scope {
+        PolicyScope::WorkloadSelector { selector } => selector
+            .namespace
+            .as_deref()
+            .is_none_or(|namespace| namespace == proxy_namespace),
+        PolicyScope::MeshWide | PolicyScope::Namespace { .. } | PolicyScope::TargetRefs { .. } => {
+            pa.namespace == proxy_namespace
+        }
     }
 }
 
@@ -4811,15 +4821,7 @@ fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
     namespace: &str,
     labels: &L,
 ) -> bool {
-    if let Some(scope) = &pa.scope {
-        return scope_applies_to_workload(scope, namespace, labels);
-    }
-
-    pa.namespace == namespace
-        && pa
-            .selector
-            .as_ref()
-            .is_none_or(|selector| workload_selector_matches(selector, namespace, labels))
+    scope_applies_to_workload(&pa.scope, namespace, labels)
 }
 
 /// Effective inbound mTLS mode a single PeerAuthentication yields for `port`: a
@@ -5270,10 +5272,26 @@ mod tests {
         PeerAuthentication {
             name: name.into(),
             namespace: namespace.into(),
-            scope: None,
-            selector,
+            scope: peer_auth_test_scope(namespace, selector),
             mtls_mode: MtlsMode::Strict,
             port_overrides: HashMap::new(),
+        }
+    }
+
+    /// The scope a test PeerAuthentication in `namespace` gets: the namespace
+    /// default without a selector, otherwise those labels in `namespace` (or
+    /// the selector's own namespace when it names one).
+    fn peer_auth_test_scope(namespace: &str, selector: Option<WorkloadSelector>) -> PolicyScope {
+        match selector {
+            Some(selector) => PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    namespace: selector.namespace.or_else(|| Some(namespace.to_string())),
+                    labels: selector.labels,
+                },
+            },
+            None => PolicyScope::Namespace {
+                namespace: namespace.to_string(),
+            },
         }
     }
 
@@ -5549,11 +5567,12 @@ mod tests {
         PeerAuthentication {
             name: name.into(),
             namespace: "default".into(),
-            scope: None,
-            selector: Some(WorkloadSelector {
-                labels: HashMap::from([(key.to_string(), value.to_string())]),
-                namespace: None,
-            }),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([(key.to_string(), value.to_string())]),
+                    namespace: Some("default".into()),
+                },
+            },
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }
@@ -5677,10 +5696,12 @@ mod tests {
         // ambiguous), so the policy genuinely does not apply to this workload.
         // Only LABEL divergence within this namespace is escalated fail-closed.
         let mut pa = selector_peer_auth("other-ns-strict", "role", "api", MtlsMode::Strict);
-        pa.selector = Some(WorkloadSelector {
-            labels: HashMap::from([("role".to_string(), "api".to_string())]),
-            namespace: Some("other-namespace".to_string()),
-        });
+        pa.scope = PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some("other-namespace".to_string()),
+            },
+        };
         let slice = MeshSlice {
             namespace: "default".into(),
             labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
@@ -7135,8 +7156,7 @@ mod tests {
         PeerAuthentication {
             name: name.to_string(),
             namespace: namespace.to_string(),
-            scope: None,
-            selector,
+            scope: peer_auth_test_scope(namespace, selector),
             mtls_mode: mode,
             port_overrides,
         }
@@ -7148,17 +7168,10 @@ mod tests {
         scope: PolicyScope,
         mode: MtlsMode,
     ) -> PeerAuthentication {
-        let selector = match &scope {
-            PolicyScope::WorkloadSelector { selector } => Some(selector.clone()),
-            PolicyScope::MeshWide
-            | PolicyScope::Namespace { .. }
-            | PolicyScope::TargetRefs { .. } => None,
-        };
         PeerAuthentication {
             name: name.to_string(),
             namespace: namespace.to_string(),
-            scope: Some(scope),
-            selector,
+            scope,
             mtls_mode: mode,
             port_overrides: HashMap::new(),
         }

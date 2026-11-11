@@ -60,7 +60,6 @@ const ALLOWED_ISSUER_MISMATCH: &str = "Certificate issuer does not match any all
 /// (issue #4359). `None` is the fail-closed inverted-interval case used by
 /// `CertValidityWindow::from_certificate`. Reached through `_test_support`;
 /// the binary target has no consumer.
-#[allow(dead_code)]
 pub(crate) fn cert_is_valid_at_unix(
     not_before_unix: i64,
     not_after_unix: i64,
@@ -72,7 +71,6 @@ pub(crate) fn cert_is_valid_at_unix(
 
 /// Parse a leaf DER into the same Unix bounds `evaluate_client_cert` retains.
 /// Reached through `_test_support`; the binary target has no consumer.
-#[allow(dead_code)]
 pub(crate) fn cert_validity_unix_bounds_from_der(der: &[u8]) -> Option<(i64, i64)> {
     let (_, cert) = X509Certificate::from_der(der).ok()?;
     let window = CertValidityWindow::from_certificate(&cert)?;
@@ -217,13 +215,12 @@ impl IssuerFilter {
                 val = val.to_string()
             )
         })?;
-        for key in obj.keys() {
-            if !matches!(key.as_str(), "cn" | "o" | "ou" | "ca_certificate_pem") {
-                return Err(format!(
-                    "mtls_auth: `{context}` contains unsupported issuer field {key:?}"
-                ));
-            }
-        }
+        crate::util::unknown_keys::reject_unknown_keys(
+            obj,
+            context,
+            &["cn", "o", "ou", "ca_certificate_pem"],
+            &format!("mtls_auth: `{context}`: "),
+        )?;
         let ca_certificate_pem = string_field(obj, "ca_certificate_pem", context)?.ok_or_else(|| {
             format!(
                 "mtls_auth: `{context}.ca_certificate_pem` is required to cryptographically pin the issuer"
@@ -968,17 +965,16 @@ fn validate_top_level_keys(config: &Value) -> Result<(), String> {
     let obj = config
         .as_object()
         .ok_or_else(|| "mtls_auth: config must be an object".to_string())?;
-    for key in obj.keys() {
-        if !matches!(
-            key.as_str(),
-            "cert_field" | "allowed_issuers" | "allowed_ca_fingerprints_sha256"
-        ) {
-            return Err(format!(
-                "mtls_auth: config contains unsupported field {key:?}"
-            ));
-        }
-    }
-    Ok(())
+    crate::util::unknown_keys::reject_unknown_keys(
+        obj,
+        "config",
+        &[
+            "cert_field",
+            "allowed_issuers",
+            "allowed_ca_fingerprints_sha256",
+        ],
+        "mtls_auth: `config`: ",
+    )
 }
 
 fn string_field(

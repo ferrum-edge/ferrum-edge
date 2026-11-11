@@ -3,13 +3,6 @@
 use std::env;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Check if the `{key}_VAULT` env var is set and non-empty.
-/// Returns the Vault path reference (e.g. `secret/data/gateway#field`) if so.
-pub fn resolve_ref(key: &str) -> Option<String> {
-    let vault_key = format!("{}_VAULT", key);
-    env::var(&vault_key).ok().filter(|s| !s.is_empty())
-}
-
 /// Opt-in that lets `VAULT_ADDR` use plaintext `http` for a non-loopback host.
 ///
 /// Read from the process environment only, like `VAULT_ADDR` and `VAULT_TOKEN`

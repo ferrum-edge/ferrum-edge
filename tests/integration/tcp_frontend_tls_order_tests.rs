@@ -100,7 +100,6 @@ fn tcp_tls_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &[Strin
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -136,8 +135,7 @@ fn deny_localhost_plugin_config() -> PluginConfig {
         plugin_name: "ip_restriction".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
-            "deny": ["127.0.0.1"],
-            "mode": "deny_first"
+            "deny": ["127.0.0.1"]
         }),
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),
@@ -157,8 +155,7 @@ fn allow_localhost_plugin_config() -> PluginConfig {
         plugin_name: "ip_restriction".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config: json!({
-            "allow": ["127.0.0.1"],
-            "mode": "allow_first"
+            "allow": ["127.0.0.1"]
         }),
         scope: PluginScope::Proxy,
         proxy_id: Some(PROXY_ID.to_string()),

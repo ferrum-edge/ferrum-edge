@@ -1278,19 +1278,7 @@ pub(crate) fn lookup_namespaced_upstream<'a>(
 }
 
 impl LoadBalancerCacheInner {
-    /// Access the balancers map for custom code that needs direct HashMap access.
-    ///
-    /// Prefer the typed accessors [`LoadBalancerCache::get_hash_on_strategy_from`]
-    /// and [`LoadBalancerCache::select_target_from`] when possible — they cover
-    /// the standard hot-path use cases without exposing internal structure.
-    #[allow(dead_code)] // Public API used by custom plugins
-    #[inline]
-    pub fn balancers(&self) -> &HashMap<String, Arc<LoadBalancer>> {
-        &self.balancers
-    }
-
     /// Access the upstream index for custom code that needs direct lookup.
-    #[allow(dead_code)] // Public API used by custom plugins
     #[inline]
     pub fn upstreams(&self) -> &HashMap<String, Arc<Upstream>> {
         &self.upstreams
@@ -1636,37 +1624,11 @@ impl LoadBalancerCache {
         })
     }
 
-    /// Get the pre-parsed hash-on strategy for an upstream.
-    /// Returns `HashOnStrategy::Ip` if the upstream is not found.
-    pub fn get_hash_on_strategy(&self, namespace: &str, upstream_id: &str) -> HashOnStrategy {
-        let inner = self.inner.load();
-        Self::get_hash_on_strategy_from(&inner, namespace, upstream_id)
-    }
-
-    /// Select a target from the upstream, filtering out unhealthy targets.
-    ///
-    /// Returns a [`TargetSelection`] indicating whether the target came from
-    /// the healthy pool or is a degraded-mode fallback (all targets unhealthy).
-    ///
-    /// When `health` is provided, targets appearing in either the active
-    /// unhealthy map (upstream-wide probe failures) or the passive unhealthy
-    /// map (per-proxy traffic failures) are filtered out.
-    pub fn select_target(
-        &self,
-        namespace: &str,
-        upstream_id: &str,
-        ctx_key: &str,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<TargetSelection> {
-        let inner = self.inner.load();
-        Self::select_target_from(&inner, namespace, upstream_id, ctx_key, health)
-    }
-
     /// Load the balancers map once and return a guard for multiple lookups.
     ///
-    /// Use this when you need both `get_hash_on_strategy()` and `select_target()`
-    /// for the same upstream -- saves one `ArcSwap::load()` atomic operation per
-    /// request by loading the balancers map once and reusing the guard.
+    /// Pass the guard to the `*_from` accessors (for example
+    /// [`Self::get_hash_on_strategy_from`] and [`Self::select_target_from`]) so
+    /// one request pays for one `ArcSwap::load()`.
     #[inline]
     pub fn load(&self) -> arc_swap::Guard<Arc<LoadBalancerCacheInner>> {
         self.inner.load()
@@ -1682,20 +1644,6 @@ impl LoadBalancerCache {
         snapshot
             .balancer(namespace, upstream_id)
             .map(|b| b.hash_on_strategy.clone())
-            .unwrap_or(HashOnStrategy::Ip)
-    }
-
-    /// Get the pre-parsed hash-on strategy for a per-port override.
-    #[inline]
-    pub fn get_hash_on_strategy_for_port_from(
-        snapshot: &LoadBalancerCacheInner,
-        namespace: &str,
-        upstream_id: &str,
-        port: u16,
-    ) -> HashOnStrategy {
-        snapshot
-            .balancer(namespace, upstream_id)
-            .map(|b| b.hash_on_strategy_for_port(port))
             .unwrap_or(HashOnStrategy::Ip)
     }
 
@@ -2162,27 +2110,6 @@ impl LoadBalancerCache {
             .and_then(|u| u.health_checks.as_ref())
             .and_then(|hc| hc.passive.as_ref())
             .and_then(|p| p.max_ejection_percent)
-    }
-
-    #[inline]
-    pub fn max_ejection_percent_for_port_from(
-        snapshot: &LoadBalancerCacheInner,
-        namespace: &str,
-        upstream_id: &str,
-        proxy: &Proxy,
-        port: u16,
-    ) -> Option<u8> {
-        if Self::has_port_override_state_from(snapshot, namespace, upstream_id, port)
-            && let Some(port_passive) = proxy
-                .dispatch_port_overrides
-                .as_ref()
-                .and_then(|overrides| overrides.get(&port))
-                .and_then(|override_config| override_config.passive_health_check.as_ref())
-        {
-            return port_passive.max_ejection_percent;
-        }
-
-        Self::max_ejection_percent_from(snapshot, namespace, upstream_id)
     }
 
     /// Resolve the passive-health `maxEjectionPercent` cap for a dispatch using
@@ -4210,10 +4137,7 @@ impl LoadBalancer {
     ///
     /// Crate-private test seam (routed through `_test_support`): lets coverage
     /// assert distinct construction-time phases without depending on OS thread →
-    /// shard assignment. The library target exposes this through `_test_support`;
-    /// the binary target compiles this module without that bridge, so the helper
-    /// is intentionally unused there.
-    #[allow(dead_code)]
+    /// shard assignment.
     pub(crate) fn selection_counter_phases_for_test(&self) -> [u64; 16] {
         std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
     }
@@ -6198,14 +6122,6 @@ impl LoadBalancer {
         self.port_overrides.contains_key(&port)
     }
 
-    #[inline]
-    fn hash_on_strategy_for_port(&self, port: u16) -> HashOnStrategy {
-        self.port_overrides
-            .get(&port)
-            .map(|state| state.hash_on_strategy.clone())
-            .unwrap_or_else(|| self.hash_on_strategy.clone())
-    }
-
     /// Dispatch to the algorithm-specific selector using a pre-computed bitset.
     /// No heap allocation on any code path.
     fn select_with_bitset(
@@ -6846,21 +6762,6 @@ impl LoadBalancer {
         )
     }
 
-    pub fn select_excluding_from_subset(
-        &self,
-        ctx_key: &str,
-        subset_name: &str,
-        exclude: &UpstreamTarget,
-        health: Option<&HealthContext<'_>>,
-    ) -> Option<Arc<UpstreamTarget>> {
-        self.select_filtered_from_subset(
-            ctx_key,
-            subset_name,
-            RetryCandidateFilter::excluding(exclude),
-            health,
-        )
-    }
-
     /// Retry-only eligibility-aware selection inside a named subset lane.
     pub fn select_filtered_from_subset(
         &self,
@@ -7044,7 +6945,7 @@ impl LoadBalancer {
         // drop excluded (previously tried) target(s) from it BEFORE sizing the
         // ejection cap, so the cap's denominator and readmission budget evaluate
         // over the actual retry candidates rather than spending the budget on
-        // an excluded target (see `select_excluding_from_subset`).
+        // an excluded target (see `select_filtered_from_subset`).
         let strict_scope = self.subset_port_mask(subset_target_indices, &port_state.target_indices);
         let (candidate_mask, locality_scope) = split_retry_candidate_and_locality_scope_bitset(
             &self.targets,

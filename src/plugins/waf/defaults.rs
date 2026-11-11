@@ -48,6 +48,17 @@ const SQLI_BOOLEAN_TAUTOLOGY: &str = r#"(?i)(?:\bor\b(?:\s|/\*(?s:.){0,64}?\*/)+
 const SQLI_STACKED_STATEMENT: &str =
     r"(?i);(?:\s|/\*(?s:.){0,64}?\*/)*(?:drop|insert|update|delete|alter)\b";
 
+/// XPath-only injection syntax, claimed by `FE-XPATH-001` in decoded query
+/// values: a quote that closes a predicate and unions a new path
+/// (`'] | //user/*`), an explicit XPath axis (`descendant::node()`), or a
+/// quote-break into a boolean on an XPath-only function (`' or name()='a`,
+/// `' and string-length(name(/*[1]))=4`). XPath is case-sensitive, so the
+/// pattern is too. `parent::`, `self::` and `namespace::` are left out because
+/// PHP (`parent::__construct`) and Rust (`Self::new`) write them as code, and
+/// functions SQL also has (`count`, `substring`, `contains`) are left out so a
+/// SQL payload is not reported twice.
+const XPATH_INJECTION_SYNTAX: &str = r#"(?:['"]\s*\]\s*\|\s*/|\b(?:ancestor|ancestor-or-self|attribute|child|descendant|descendant-or-self|following|following-sibling|preceding|preceding-sibling)::|['"]\s*(?:or|and)\s+(?:name|local-name|namespace-uri|string-length|starts-with|normalize-space|position|last|text|node)\s*\()"#;
+
 /// High-confidence query prototype-pollution tokens. Query keys and values
 /// each get a rule because they are separate WAF targets; every mirror runs
 /// after bounded query-component decoding.
@@ -422,7 +433,11 @@ pub fn default_rules() -> Vec<WafRule> {
         r("FE-CMD-003", "Shell substitution expression", "command_injection", Severity::Medium, RuleTarget::BodyText, r"(?:`[^`]{1,200}`|\$\([^)]{1,200}\))"),
         r("FE-LDAP-001", "LDAP wildcard injection", "ldap_injection", Severity::Medium, RuleTarget::QueryValues, r"(?i)\*\)\s*\(\s*uid\s*=\s*\*"),
         r("FE-LDAP-002", "LDAP OR injection", "ldap_injection", Severity::Medium, RuleTarget::BodyText, r"(?i)\(\|\s*\(\s*uid\s*=\s*\*\s*\)\s*\)"),
-        r("FE-XPATH-001", "XPath tautology", "xpath_injection", Severity::Medium, RuleTarget::QueryValues, r#"(?i)['"]\s+or\s+['"]?1['"]?\s*=\s*['"]?1"#),
+        // XPath syntax a SQL payload never carries. A bare quoted tautology
+        // (`' or '1'='1`) is not XPath-specific: `FE-SQLI-002` / `FE-SQLI-009`
+        // already claim it, and matching it here too scored one tautology as
+        // two independent signals.
+        r("FE-XPATH-001", "XPath predicate or axis injection", "xpath_injection", Severity::Medium, RuleTarget::QueryValues, XPATH_INJECTION_SYNTAX),
         r("FE-XPATH-002", "XPath function probe", "xpath_injection", Severity::Low, RuleTarget::BodyText, r"(?i)\b(?:count|string-length)\s*\("),
         r("FE-SSTI-001", "Template expression marker", "ssti", Severity::High, RuleTarget::BodyText, r"(?:\{\{[^}]{1,200}\}\}|\$\{[^}]{1,200}\}|<%[^%]{1,200}%>)"),
         r("FE-XSS-001", "Script tag", "xss", Severity::High, RuleTarget::QueryValues, r"(?i)<\s*script\b"),
@@ -446,7 +461,11 @@ pub fn default_rules() -> Vec<WafRule> {
         r("FE-SSRF-001", "Cloud metadata or private IP URL", "ssrf", Severity::High, RuleTarget::BodyText, SSRF_METADATA_OR_PRIVATE_IP),
         r("FE-SSRF-002", "Dangerous URL scheme", "ssrf", Severity::High, RuleTarget::BodyText, SSRF_DANGEROUS_SCHEME),
         r("FE-HEADER-001", "Header control character", "header_anomaly", Severity::Medium, RuleTarget::HeaderValues(None), r"[\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"),
-        r("FE-HEADER-002", "HTTP method override header", "header_anomaly", Severity::Low, RuleTarget::HeaderNames, r"(?i)^x-http-method-override$"),
+        // Special-only: `scan_method_override_special` records it when
+        // `X-HTTP-Method-Override` names a different method than the request.
+        // A header-name pattern would fire on every override, including one
+        // that restates the request method, and make the special inert.
+        r("FE-HEADER-002", "HTTP method override header", "header_anomaly", Severity::Low, RuleTarget::HeaderNames, r"$^"),
         r("FE-COOKIE-001", "Cookie control character", "cookie_attack", Severity::Medium, RuleTarget::Cookies, r"[\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"),
         r("FE-COOKIE-002", "Session fixation cookie name", "cookie_attack", Severity::Low, RuleTarget::Cookies, r"(?i)\b(?:jsessionid|phpsessid|asp\.net_sessionid)\s*="),
         r("FE-HPP-001", "Conflicting duplicate query key", "parameter_pollution", Severity::Medium, RuleTarget::FullUrl, r"$^"),
@@ -591,8 +610,8 @@ pub fn default_rules() -> Vec<WafRule> {
             // comment tokens, shell substitution, any-URL-in-param, JWT-shaped
             // response tokens, SQLSTATE in request bodies. The broad SSTI
             // marker is superseded at level 1 by FE-SSTI-002/003.
-            "FE-SSTI-001" | "FE-SQLI-004" | "FE-SQLI-004-B" | "FE-SQLI-005"
-            | "FE-CMD-003" | "FE-RFI-001" | "FE-DATA-LEAK-005" => {
+            // (`FE-SQLI-004` / `-B` are declared at level 2 with `rp`.)
+            "FE-SSTI-001" | "FE-SQLI-005" | "FE-CMD-003" | "FE-RFI-001" | "FE-DATA-LEAK-005" => {
                 rule.paranoia_min = rule.paranoia_min.max(2)
             }
             // Very loud / low signal: bare XPath function probe.

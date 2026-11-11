@@ -175,8 +175,7 @@ fn peer_auth_workload_selector_scope() {
         "selector": {"matchLabels": {"app": "api"}},
         "mtls": {"mode": "STRICT"}
     }));
-    let scope = pa.scope.expect("scope emitted");
-    match scope {
+    match pa.scope {
         PolicyScope::WorkloadSelector { selector } => {
             assert_eq!(selector.labels.get("app").map(String::as_str), Some("api"));
         }

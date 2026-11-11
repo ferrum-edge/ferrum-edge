@@ -213,13 +213,11 @@ pub struct ReplySourceGeneration {
 
 impl ReplySourceGeneration {
     /// The publishing process's token. Diagnostics only; never a credential.
-    #[allow(dead_code)] // Diagnostic/test accessor; the token is compared as a whole.
     pub fn owner(&self) -> &str {
         &self.owner
     }
 
     /// Monotonic position within [`Self::owner`].
-    #[allow(dead_code)] // Diagnostic/test accessor.
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
@@ -229,7 +227,6 @@ impl ReplySourceGeneration {
     /// Active-empty (a bound headless/VIP-less listener) is true; a true
     /// withdrawal is false. Part of canonical identity: an active-empty ↔
     /// inactive-empty transition is a new generation.
-    #[allow(dead_code)] // Diagnostic/test accessor.
     pub fn active(&self) -> bool {
         self.active
     }
@@ -695,7 +692,6 @@ impl RegistryDirReplySourcePublisher {
     ///
     /// `false` for both an accepted identity and an absent one; the two absent
     /// cases are what this distinguishes.
-    #[allow(dead_code)] // Diagnostic/test accessor.
     pub fn relay_pod_uid_rejected(&self) -> bool {
         self.relay_pod_uid_rejected
     }

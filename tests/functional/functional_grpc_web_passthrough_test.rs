@@ -377,6 +377,86 @@ async fn grpc_web_passthrough_and_translation_on_h1_and_h2_frontends() {
     }
 }
 
+/// Issue #7155: a gateway-authored refusal in the native-gRPC branch answers a
+/// gRPC-Web client in gRPC-Web framing on the H1 and H2 frontends: HTTP `200`,
+/// a gRPC-Web content type, and the status in a body trailer frame, never a
+/// native `application/grpc` Trailers-Only head whose `grpc-status` header a
+/// browser cannot read. A declared `Content-Length` over
+/// `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` is refused before any dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_web_oversized_upload_refusal_uses_grpc_web_framing() {
+    let (_backend, port) =
+        spawn_h2c_backend("application/grpc-web+proto", passthrough_binary_body()).await;
+    let config = json!({
+        "version": "1",
+        "proxies": [
+            route("oversize-h1", port, json!([])),
+            route("oversize-h2", port, json!([])),
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(to_file_mode_yaml(&config))
+        .log_level("info")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", "64")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let base = harness.proxy_base_url().to_string();
+
+    let h1 = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h1 client");
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h2c client");
+    let oversized = frame(0x00, &[0x5a; 256]);
+
+    for (client, suffix) in [(&h1, "h1"), (&h2, "h2")] {
+        let (_, headers, body) = post_grpc_web(
+            client,
+            &format!("{base}/oversize-{suffix}/echo.Echo/Unary"),
+            "application/grpc-web+proto",
+            oversized.clone(),
+        )
+        .await;
+        assert!(
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/grpc-web")),
+            "{suffix}: the refusal must be gRPC-Web: {headers:?}"
+        );
+        assert!(
+            !headers.contains_key("grpc-status"),
+            "{suffix}: gRPC-Web carries the status in the body, not a header: {headers:?}"
+        );
+        let trailers = trailer_frames(&body);
+        assert_eq!(trailers.len(), 1, "{suffix}: exactly one trailer frame");
+        let trailer = String::from_utf8_lossy(&trailers[0]).into_owned();
+        let status = trailer.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("grpc-status")
+                .then(|| value.trim().to_string())
+        });
+        assert_eq!(
+            status.as_deref(),
+            Some("8"),
+            "{suffix}: RESOURCE_EXHAUSTED in the trailer frame: {trailer:?}"
+        );
+    }
+}
+
 /// A backend whose final frame is a COMPRESSED trailer frame (flag `0x81`):
 /// its status is on the wire, but the gateway cannot read it.
 fn compressed_trailer_body() -> Vec<u8> {

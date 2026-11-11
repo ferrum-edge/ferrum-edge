@@ -38,7 +38,6 @@ tests/
 │
 ├── common/                       # Shared helpers (gateway harness, echo servers, ...)
 ├── scaffolding/                  # Protocol backends/clients, port registry, harness
-├── scenarios/                    # Catalog of scripted failure modes
 ├── support/                      # Tracing/diagnostic capture helpers
 ├── scripts/                      # Setup scripts (e.g. setup_db_tls.sh)
 │
@@ -81,9 +80,9 @@ contract for mesh semantic coverage. `cargo test --test conformance_tests --
 `target/conformance/coverage.json` plus `target/conformance/coverage.md` (a
 multi-threaded run can emit an incomplete matrix).
 
-Kubernetes live suites should source helpers from `tests/k8s/lib/`:
+Kubernetes live suites create and load their kind clusters in their own
+`run.sh`, and source shared helpers from `tests/k8s/lib/`:
 
-- `kind.sh` for disposable kind clusters and shared diagnostics.
 - `spire.sh` for the common SPIRE install/readiness/diagnostics flow.
 - `live_assertions.sh` for `live-assertions.json` files keyed by stable
   assertion IDs from the GA contract.

@@ -79,7 +79,7 @@ pub struct PublishedTrustBundle {
 }
 
 /// A JWT signing authority published by the CA for JWT-SVID validation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedJwtAuthority {
     pub trust_domain: TrustDomain,
     pub key_id: String,

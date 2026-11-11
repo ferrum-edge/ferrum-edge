@@ -2614,10 +2614,6 @@ fn unique_ldap_attribute_value(
 }
 
 fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String> {
-    if config.contains_key("consumer_mapping") {
-        return Err("ldap_auth: `consumer_mapping` was removed; see the upgrade guide".to_string());
-    }
-
     const KNOWN_KEYS: &[&str] = &[
         "ldap_url",
         "failover_ldap_urls",
@@ -2647,12 +2643,12 @@ fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String>
         "service_connection_max_age_seconds",
         "hide_credentials",
     ];
-    for key in config.keys() {
-        if !KNOWN_KEYS.contains(&key.as_str()) {
-            return Err(format!("ldap_auth: unknown config key {key:?}"));
-        }
-    }
-    Ok(())
+    crate::util::unknown_keys::reject_unknown_keys(
+        config,
+        "config",
+        KNOWN_KEYS,
+        "ldap_auth: `config`: ",
+    )
 }
 
 fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> {

@@ -156,6 +156,73 @@ const WORKLOAD_METADATA_VAL: &str = "true";
 /// braces, so no future field mutation can reopen an unbounded CA fan-out.
 const MAX_FEDERATED_TRUST_DOMAINS: usize = MAX_JWT_BUNDLE_TRUST_DOMAINS - 1;
 
+/// The last JWT authority set admitted for each trust domain, with the JWKS
+/// document admission produced.
+///
+/// [`jwt_svid::validate_published_authorities`] is a pure function of
+/// `(trust domain, authority set)` but costs real work per key (PEM/DER parse,
+/// key-type and size checks, and an on-curve proof per EC key). Every
+/// `ValidateJWTSVID` call and every `FetchJWTBundles` push re-collects the
+/// CA's sets, which change only on rotation, so an identical set reuses its
+/// earlier verdict. Only ADMITTED sets are stored (a refused set is re-checked
+/// every time), and a hit requires the whole set to be equal, so a rotated,
+/// added or removed key always takes the full gate again. Bounded by the
+/// configured trust domains (local plus at most
+/// [`MAX_FEDERATED_TRUST_DOMAINS`]).
+#[derive(Default)]
+struct JwtAuthorityAdmissionMemo {
+    admitted: std::sync::Mutex<HashMap<TrustDomain, AdmittedJwtAuthorities>>,
+}
+
+struct AdmittedJwtAuthorities {
+    authorities: Vec<PublishedJwtAuthority>,
+    jwks: Vec<u8>,
+}
+
+impl JwtAuthorityAdmissionMemo {
+    /// Admit `authorities` for `trust_domain`, returning their JWKS document.
+    fn admit(
+        &self,
+        trust_domain: &TrustDomain,
+        authorities: &[PublishedJwtAuthority],
+    ) -> Result<Vec<u8>, JwtSvidError> {
+        if let Some(jwks) = self.cached_jwks(trust_domain, authorities) {
+            return Ok(jwks);
+        }
+        let jwks = jwt_svid::validate_published_authorities(trust_domain, authorities)?;
+        let mut admitted = self
+            .admitted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admitted.len() >= MAX_JWT_BUNDLE_TRUST_DOMAINS && !admitted.contains_key(trust_domain) {
+            admitted.clear();
+        }
+        admitted.insert(
+            trust_domain.clone(),
+            AdmittedJwtAuthorities {
+                authorities: authorities.to_vec(),
+                jwks: jwks.clone(),
+            },
+        );
+        Ok(jwks)
+    }
+
+    fn cached_jwks(
+        &self,
+        trust_domain: &TrustDomain,
+        authorities: &[PublishedJwtAuthority],
+    ) -> Option<Vec<u8>> {
+        let admitted = self
+            .admitted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        admitted
+            .get(trust_domain)
+            .filter(|entry| entry.authorities == authorities)
+            .map(|entry| entry.jwks.clone())
+    }
+}
+
 /// Workload API service implementation. Held as an `Arc` and cloned per RPC.
 pub struct WorkloadApiService {
     pub attestors: Vec<Arc<dyn Attestor>>,
@@ -181,6 +248,8 @@ pub struct WorkloadApiService {
     /// quota (issue #3758). `None` for a service constructed directly — the
     /// listener always attaches one, so the served surface is never unbounded.
     rpc_admission: Option<RpcAdmission>,
+    /// Shared with every `FetchJWTBundles` push task.
+    jwt_admission: Arc<JwtAuthorityAdmissionMemo>,
 }
 
 impl WorkloadApiService {
@@ -201,6 +270,7 @@ impl WorkloadApiService {
             jwt_svid_ttl_secs: DEFAULT_JWT_SVID_TTL_SECS,
             service_shutdown: None,
             rpc_admission: None,
+            jwt_admission: Arc::default(),
         }
     }
 
@@ -221,6 +291,7 @@ impl WorkloadApiService {
             jwt_svid_ttl_secs: DEFAULT_JWT_SVID_TTL_SECS,
             service_shutdown: None,
             rpc_admission: None,
+            jwt_admission: Arc::default(),
         }
     }
 
@@ -385,9 +456,8 @@ impl WorkloadApiService {
         SpiffeWorkloadApiServer::new(self)
     }
 
-    /// Extract `PeerInfo` from a tonic request: the bearer token from the
-    /// `authorization` metadata header (Bearer scheme) plus, on a Unix-socket
-    /// transport, the kernel-supplied `SO_PEERCRED` pid/uid/gid.
+    /// Extract `PeerInfo` from a tonic request: on a Unix-socket transport, the
+    /// kernel-supplied `SO_PEERCRED` pid/uid/gid.
     ///
     /// Peer credentials come from `UdsConnectInfo`, which tonic populates from
     /// the accepted socket itself — they are kernel-attested and cannot be
@@ -395,23 +465,21 @@ impl WorkloadApiService {
     /// not fatal here: it simply means no `SO_PEERCRED`-based attestor applies,
     /// and the attestor chain decides.
     fn peer_info_from_request<T>(req: &Request<T>) -> PeerInfo {
-        let mut info = PeerInfo::default();
-        if let Some(auth) = req.metadata().get("authorization")
-            && let Ok(s) = auth.to_str()
-        {
-            info.bearer_token = parse_authorization_header(s);
-        }
         #[cfg(unix)]
         if let Some(connect_info) = req
             .extensions()
             .get::<tonic::transport::server::UdsConnectInfo>()
             && let Some(cred) = connect_info.peer_cred
         {
-            info.pid = cred.pid();
-            info.uid = Some(cred.uid());
-            info.gid = Some(cred.gid());
+            return PeerInfo {
+                pid: cred.pid(),
+                uid: Some(cred.uid()),
+                gid: Some(cred.gid()),
+            };
         }
-        info
+        #[cfg(not(unix))]
+        let _ = req;
+        PeerInfo::default()
     }
 
     fn validate_workload_metadata<T>(req: &Request<T>) -> Result<(), Status> {
@@ -590,8 +658,8 @@ impl WorkloadApiService {
     /// one that actually publishes authorities.
     ///
     /// **Every** domain's complete authority set is admitted through
-    /// [`jwt_svid::validate_published_authorities`] here, before it is returned
-    /// to either RPC. That is the single place the documented authority bounds
+    /// [`jwt_svid::validate_published_authorities`] here (via the per-set
+    /// [`JwtAuthorityAdmissionMemo`]), before it is returned to either RPC. That is the single place the documented authority bounds
     /// (count cap, trust-domain binding, duplicate `kid`, key-id / PEM / DER /
     /// key-type / key-size constraints, total JWKS size) are enforced, so
     /// `ValidateJWTSVID` and `FetchJWTBundles` cannot disagree about what is
@@ -612,6 +680,7 @@ impl WorkloadApiService {
     /// closed rather than being silently dropped from the trusted set.
     async fn collect_jwt_authorities(
         ca: &Arc<dyn CertificateAuthority>,
+        admission: &JwtAuthorityAdmissionMemo,
         trust_domain: &TrustDomain,
         federated_trust_domains: &[TrustDomain],
     ) -> Result<BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>>, Status> {
@@ -626,7 +695,9 @@ impl WorkloadApiService {
                 "the active identity backend publishes no JWT authority for this trust domain",
             )));
         }
-        jwt_svid::validate_published_authorities(trust_domain, &local).map_err(jwt_svid_status)?;
+        admission
+            .admit(trust_domain, &local)
+            .map_err(jwt_svid_status)?;
         bundles.insert(trust_domain.clone(), local);
 
         // Bounded by the ITERATION, not by how many bundles came back: counting
@@ -643,7 +714,8 @@ impl WorkloadApiService {
             }
             match ca.jwt_authorities(federated).await {
                 Ok(authorities) if !authorities.is_empty() => {
-                    jwt_svid::validate_published_authorities(federated, &authorities)
+                    admission
+                        .admit(federated, &authorities)
                         .map_err(jwt_svid_status)?;
                     bundles.insert(federated.clone(), authorities);
                 }
@@ -670,16 +742,22 @@ impl WorkloadApiService {
     /// has already refused that case.
     async fn build_jwt_bundles_response_static(
         ca: &Arc<dyn CertificateAuthority>,
+        admission: &JwtAuthorityAdmissionMemo,
         trust_domain: &TrustDomain,
         federated_trust_domains: &[TrustDomain],
     ) -> Result<JwtBundlesResponse, Status> {
         let authorities =
-            Self::collect_jwt_authorities(ca, trust_domain, federated_trust_domains).await?;
+            Self::collect_jwt_authorities(ca, admission, trust_domain, federated_trust_domains)
+                .await?;
         let mut bundles = HashMap::with_capacity(authorities.len());
         for (domain, published) in &authorities {
             // A malformed authority is refused before publication rather than
-            // shipped to workloads as trust material.
-            let jwks = jwt_svid::jwks_document(published).map_err(jwt_svid_status)?;
+            // shipped to workloads as trust material. Collection just admitted
+            // this exact set, so this is the memoized document, not a second
+            // admission pass.
+            let jwks = admission
+                .admit(domain, published)
+                .map_err(jwt_svid_status)?;
             bundles.insert(domain.to_string(), jwks);
         }
         if bundles.is_empty() {
@@ -717,34 +795,6 @@ impl WorkloadApiService {
             bundles.insert(td.to_string(), bundle_concat);
         }
         Ok(bundles)
-    }
-}
-
-/// Parse an `authorization` header value into the bare bearer token.
-///
-/// RFC 6750 §2.1: the Bearer scheme name is case-insensitive. We accept
-/// `Bearer`, `bearer`, `BEARER`, etc. If the value carries no scheme word
-/// (no whitespace separator), the entire trimmed value is treated as the
-/// raw token — preserving the existing behaviour for callers that hand in
-/// a bare token string. If the scheme is present but not Bearer (e.g.
-/// `Basic xyz`), the entire value is also passed through as-is so the
-/// downstream attestor chain sees the original metadata; no attestor
-/// today recognises non-Bearer schemes, so they reject the resulting
-/// "token" with `NotApplicable` / `Failed`.
-fn parse_authorization_header(raw: &str) -> Option<String> {
-    // Strip leading whitespace only — preserve trailing whitespace so that
-    // an input like `"Bearer "` (scheme word with no token) splits on the
-    // delimiter and resolves to an empty token (returned as `None`)
-    // instead of being collapsed to the bare string `"Bearer"`.
-    let leading_trimmed = raw.trim_start();
-    let token = match leading_trimmed.split_once(|c: char| c.is_ascii_whitespace()) {
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer") => rest.trim(),
-        _ => leading_trimmed.trim_end(),
-    };
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
     }
 }
 
@@ -1008,6 +1058,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         // JWT authorities" rather than "unsupported".
         let initial = Self::build_jwt_bundles_response_static(
             &self.ca,
+            &self.jwt_admission,
             &self.trust_domain,
             &self.federated_trust_domains,
         )
@@ -1015,6 +1066,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let mut last_published = Self::jwt_bundles_fingerprint(&initial);
 
         let ca = Arc::clone(&self.ca);
+        let admission = Arc::clone(&self.jwt_admission);
         let td = self.trust_domain.clone();
         let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
@@ -1034,8 +1086,13 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                 {
                     return;
                 }
-                match Self::build_jwt_bundles_response_static(&ca, &td, &federated_trust_domains)
-                    .await
+                match Self::build_jwt_bundles_response_static(
+                    &ca,
+                    &admission,
+                    &td,
+                    &federated_trust_domains,
+                )
+                .await
                 {
                     Ok(resp) => {
                         let fingerprint = Self::jwt_bundles_fingerprint(&resp);
@@ -1083,16 +1140,19 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         let bundles = Self::collect_jwt_authorities(
             &self.ca,
+            &self.jwt_admission,
             &self.trust_domain,
             &self.federated_trust_domains,
         )
         .await?;
 
+        // `collect_jwt_authorities` admitted every set in `bundles`.
         let validated =
-            jwt_svid::validate_jwt_svid(&req.svid, &req.audience, &bundles).map_err(|e| {
-                debug!(reason = %e, "ValidateJWTSVID rejected a token");
-                jwt_svid_status(e)
-            })?;
+            jwt_svid::validate_jwt_svid_against_admitted(&req.svid, &req.audience, &bundles)
+                .map_err(|e| {
+                    debug!(reason = %e, "ValidateJWTSVID rejected a token");
+                    jwt_svid_status(e)
+                })?;
 
         Ok(Response::new(ValidateJwtsvidResponse {
             spiffe_id: validated.spiffe_id.to_string(),
@@ -1102,90 +1162,40 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 }
 
 #[cfg(test)]
-mod authz_parse_tests {
-    use super::parse_authorization_header;
+mod jwt_admission_memo_tests {
+    use super::JwtAuthorityAdmissionMemo;
+    use crate::identity::jwt_svid::{
+        JwtSvidSigner as _, LocalJwtAuthority, LocalJwtAuthorityConfig,
+    };
+    use crate::identity::spiffe::TrustDomain;
 
     #[test]
-    fn strips_canonical_bearer_prefix() {
-        assert_eq!(
-            parse_authorization_header("Bearer eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
+    fn admitted_sets_are_memoized_and_any_change_takes_the_full_gate() {
+        let td = TrustDomain::new("td.test").expect("trust domain");
+        let signer = LocalJwtAuthority::new(
+            LocalJwtAuthorityConfig::new(td.clone()).allowing_ephemeral_key(),
+        )
+        .expect("signer");
+        let authorities = signer.authorities();
+        let memo = JwtAuthorityAdmissionMemo::default();
 
-    #[test]
-    fn strips_lowercase_bearer_prefix() {
-        // RFC 6750 §2.1: Bearer scheme is case-insensitive.
-        assert_eq!(
-            parse_authorization_header("bearer eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
+        assert!(memo.cached_jwks(&td, &authorities).is_none());
+        let jwks = memo.admit(&td, &authorities).expect("admitted");
+        assert_eq!(memo.cached_jwks(&td, &authorities), Some(jwks.clone()));
+        assert_eq!(memo.admit(&td, &authorities).expect("memoized"), jwks);
 
-    #[test]
-    fn strips_uppercase_bearer_prefix() {
-        assert_eq!(
-            parse_authorization_header("BEARER eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
+        // A changed set misses and is refused by the full gate; a refused set
+        // is never stored, and the last admitted set stays memoized.
+        let mut changed = authorities.clone();
+        changed[0].key_id = "bad\nkid".to_string();
+        assert!(memo.cached_jwks(&td, &changed).is_none());
+        assert!(memo.admit(&td, &changed).is_err());
+        assert!(memo.cached_jwks(&td, &changed).is_none());
+        assert_eq!(memo.cached_jwks(&td, &authorities), Some(jwks));
 
-    #[test]
-    fn strips_mixed_case_bearer_prefix() {
-        assert_eq!(
-            parse_authorization_header("BeArEr eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn handles_extra_whitespace_after_scheme() {
-        assert_eq!(
-            parse_authorization_header("bearer    eyJhbGciOiJI   "),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn handles_tab_separator() {
-        // Some clients use a tab between scheme and token. RFC 7230 allows
-        // any HTAB or SP between scheme and credentials.
-        assert_eq!(
-            parse_authorization_header("bearer\teyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn passes_through_raw_token_with_no_scheme() {
-        // Bare token (no whitespace) — keep as-is.
-        assert_eq!(
-            parse_authorization_header("eyJhbGciOiJI"),
-            Some("eyJhbGciOiJI".to_string())
-        );
-    }
-
-    #[test]
-    fn passes_through_non_bearer_scheme_unchanged() {
-        // Non-Bearer schemes (e.g. Basic) flow through unchanged so the
-        // downstream attestor chain rejects them with NotApplicable rather
-        // than the server stripping a scheme it does not recognise.
-        assert_eq!(
-            parse_authorization_header("Basic dXNlcjpwYXNz"),
-            Some("Basic dXNlcjpwYXNz".to_string())
-        );
-    }
-
-    #[test]
-    fn returns_none_for_empty_value() {
-        assert_eq!(parse_authorization_header(""), None);
-        assert_eq!(parse_authorization_header("   "), None);
-    }
-
-    #[test]
-    fn returns_none_for_bearer_with_no_token() {
-        // Just "Bearer" with no token after — strip leaves empty.
-        assert_eq!(parse_authorization_header("Bearer "), None);
-        assert_eq!(parse_authorization_header("bearer   "), None);
+        // One domain's admitted set never answers for another domain.
+        let other = TrustDomain::new("other.test").expect("trust domain");
+        assert!(memo.cached_jwks(&other, &authorities).is_none());
+        assert!(memo.admit(&other, &authorities).is_err());
     }
 }

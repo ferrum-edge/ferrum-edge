@@ -282,7 +282,6 @@ impl DiscoverySnapshot {
     }
 
     /// Provider-normalized targets (before shared host/egress admission).
-    #[allow(dead_code)] // exercised by external tests; dead in the binary target
     pub fn targets(&self) -> &[UpstreamTarget] {
         &self.targets
     }
@@ -293,7 +292,6 @@ impl DiscoverySnapshot {
     }
 
     /// Admission policy carried with this snapshot.
-    #[allow(dead_code)] // exercised by external unit tests; dead in the binary target
     pub fn admission_policy(&self) -> SnapshotAdmissionPolicy {
         self.admission_policy
     }
@@ -1061,7 +1059,6 @@ async fn supervise_discovery_task(
 }
 
 /// Handle to a supervised task started through the test seam below.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub struct SupervisedTaskForTest {
     /// Cancel signal; sending `true` ends supervision cleanly.
     pub cancel_tx: tokio::sync::watch::Sender<bool>,
@@ -1081,7 +1078,6 @@ pub struct SupervisedTaskForTest {
 /// restart/withdraw behavior cannot drift from production. Panic-restart
 /// coverage is unwind-only (issue #4166).
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn spawn_supervised_discovery_task_for_test(
     upstream_namespace: &str,
     upstream_id: &str,
@@ -1138,7 +1134,7 @@ pub fn spawn_supervised_discovery_task_for_test(
 /// Cancellation, shutdown, and generation replacement are therefore observed at
 /// an exact point instead of racing a live poller's timer, which is what makes
 /// the lifecycle-versus-expiry contract testable deterministically.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+#[allow(dead_code)] // reached from the external test crate
 pub struct StalenessExpiryProbeForTest {
     ctx: Arc<DiscoveryTaskContext>,
     state: DiscoveryLoopState,
@@ -1152,7 +1148,7 @@ pub struct StalenessExpiryProbeForTest {
     pub generation: u64,
 }
 
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+#[allow(dead_code)] // reached from the external test crate
 impl StalenessExpiryProbeForTest {
     /// Raise this task's cancel signal, as a config reconcile or manager stop
     /// does before it registers a replacement.
@@ -1185,7 +1181,6 @@ impl StalenessExpiryProbeForTest {
 
 /// Build a [`StalenessExpiryProbeForTest`] over the production expiry path.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn staleness_expiry_probe_for_test(
     upstream_namespace: &str,
     upstream_id: &str,
@@ -1515,7 +1510,7 @@ enum PreparationOutcome {
 /// time — closing a semaphore is invisible to the paused clock, so a sleep
 /// poll can auto-advance to exhaustion while the poller stays parked with no
 /// timer, or while it is in real DNS warmup off the timer wheel.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+#[allow(dead_code)] // reached from the external test crate
 pub struct PublicationPreparationHold {
     generation: u64,
     released: AtomicBool,
@@ -1525,7 +1520,7 @@ pub struct PublicationPreparationHold {
     passed: AtomicU64,
 }
 
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
+#[allow(dead_code)] // reached from the external test crate
 impl PublicationPreparationHold {
     fn new(generation: u64) -> Self {
         let (released_tx, _) = tokio::sync::watch::channel(false);
@@ -1659,7 +1654,6 @@ static PUBLICATION_PREPARATION_HOLD: std::sync::RwLock<Option<Arc<PublicationPre
 /// Replacing an existing hold releases the previous generation's waiters so a
 /// crashed or overlapping test cannot leave publication parked forever, but the
 /// previous holder still owns its `Arc` and cannot clear this newer slot.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn hold_discovery_publication_preparation_for_test() -> Arc<PublicationPreparationHold> {
     let generation = NEXT_PUBLICATION_PREPARATION_HOLD_GENERATION.fetch_add(1, Ordering::SeqCst);
     let hold = Arc::new(PublicationPreparationHold::new(generation));
@@ -1679,7 +1673,6 @@ pub fn hold_discovery_publication_preparation_for_test() -> Arc<PublicationPrepa
 /// [`clear_discovery_publication_preparation_hold_generation_for_test`] from a
 /// holder that still knows its generation, so a stale Drop cannot steal a
 /// newer test's slot.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn clear_discovery_publication_preparation_hold_for_test() {
     let previous = PUBLICATION_PREPARATION_HOLD
         .write()
@@ -1696,7 +1689,6 @@ pub fn clear_discovery_publication_preparation_hold_for_test() {
 /// or release a newer test's hold. The stale holder still calls
 /// [`PublicationPreparationHold::release`] on its own `Arc` to unblock
 /// waiters that parked on that older generation.
-#[allow(dead_code)] // reached from the external test crate; dead in the bin target
 pub fn clear_discovery_publication_preparation_hold_generation_for_test(generation: u64) {
     let taken = PUBLICATION_PREPARATION_HOLD
         .write()

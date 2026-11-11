@@ -7589,20 +7589,20 @@ async fn external_ref_put_failure_and_delete_preserve_last_good_snapshot_lifecyc
         allowed_origins: vec!["https://schemas.example.com:443".to_string()],
         ..Default::default()
     });
-    let mut loader = ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default();
-    loader.fixtures.insert(
+    let mut loader = ferrum_edge::admin::api_specs::MapExternalDocumentLoader::default();
+    loader.docs.insert(
         FIRST_URI.to_string(),
         br#"{"type":"object","required":["first"],"properties":{"first":{"type":"string"}}}"#
             .to_vec(),
     );
-    loader.fixtures.insert(
+    loader.docs.insert(
         SECOND_URI.to_string(),
         br#"{"type":"object","required":["second"],"properties":{"second":{"type":"integer"}}}"#
             .to_vec(),
     );
     // The fixture is deterministic and performs no I/O, but its nested file
     // reference is outside the effective policy and must fail closed.
-    loader.fixtures.insert(
+    loader.docs.insert(
         REJECTED_URI.to_string(),
         br#"{"$ref":"file:///outside-policy.json"}"#.to_vec(),
     );

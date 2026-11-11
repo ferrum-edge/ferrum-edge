@@ -1450,7 +1450,6 @@ impl AiSemanticCache {
     /// envelope and run it through L2 hit admission, modelling an entry
     /// persisted under an older header policy. Returns the status and headers
     /// a hit would serve, or `None` when admission refuses the entry.
-    #[allow(dead_code)]
     pub(crate) fn admit_sealed_redis_hit_for_tests(
         &self,
         redis_key: &str,
@@ -1459,8 +1458,10 @@ impl AiSemanticCache {
         body: &[u8],
     ) -> Option<(u16, HashMap<String, String>)> {
         let entry = self.seal_redis_entry(redis_key, status_code, headers, body)?;
-        let hit = self.admit_redis_hit(entry, redis_key)?;
-        Some((hit.status_code, hit.headers))
+        match self.classify_redis_hit(entry, redis_key) {
+            RedisHitVerdict::Admit(hit) => Some((hit.status_code, hit.headers)),
+            RedisHitVerdict::NotFresh | RedisHitVerdict::Invalid => None,
+        }
     }
 
     /// Seal an authenticated JSON envelope as a writer whose clock is
@@ -1468,7 +1469,6 @@ impl AiSemanticCache {
     /// replica, then classify it the way a Redis lookup does. Returns
     /// `"admit"`, `"miss"` (authentic but not fresh: never quarantined), or
     /// `"quarantine"`.
-    #[allow(dead_code)]
     pub(crate) fn redis_hit_verdict_for_tests(
         &self,
         redis_key: &str,
@@ -1933,7 +1933,7 @@ impl AiSemanticCache {
     /// to [`MAX_REDIS_VALUE_BYTES_HARD_CAP`] so checked Redis index conversion
     /// never sees a saturating `usize::MAX` cap. The exact per-entry limit is
     /// re-checked against `max_entry_size_bytes` on the decoded body in
-    /// [`Self::admit_redis_hit`].
+    /// [`Self::classify_redis_hit`].
     fn redis_value_byte_cap(&self) -> usize {
         let expanded = self
             .max_entry_size_bytes
@@ -1943,18 +1943,9 @@ impl AiSemanticCache {
         expanded.min(MAX_REDIS_VALUE_BYTES_HARD_CAP)
     }
 
-    /// Re-apply the full store-side admission contract to a Redis hit before
-    /// replaying it.
-    ///
-    /// Redis is untrusted storage shared across gateway versions and other
-    /// writers. Successful deserialization is not proof of a value this gateway
-    /// wrote: a tampered, stale, foreign, or cross-version entry must not let
-    /// the gateway emit an oversized, non-JSON, wrong-status, or unsanitized
-    /// (cookie/auth-bearing) response. Authenticity is verified with an HMAC
-    /// bound to the full cached status/header/body envelope and the Redis
-    /// namespace/key context before any other admission check. Returns the
-    /// sanitized response to serve, or `None` when any invariant fails (see
-    /// [`Self::classify_redis_hit`] for which refusals quarantine).
+    /// Inline-test view of [`Self::classify_redis_hit`]: the sanitized
+    /// response to serve, or `None` for any refusal.
+    #[cfg(test)]
     fn admit_redis_hit(
         &self,
         entry: SerializableCacheEntry,
@@ -1966,7 +1957,16 @@ impl AiSemanticCache {
         }
     }
 
-    /// Classify a Redis envelope for replay.
+    /// Re-apply the full store-side admission contract to a Redis hit before
+    /// replaying it, and classify the envelope.
+    ///
+    /// Redis is untrusted storage shared across gateway versions and other
+    /// writers. Successful deserialization is not proof of a value this gateway
+    /// wrote: a tampered, stale, foreign, or cross-version entry must not let
+    /// the gateway emit an oversized, non-JSON, wrong-status, or unsanitized
+    /// (cookie/auth-bearing) response. Authenticity is verified with an HMAC
+    /// bound to the full cached status/header/body envelope and the Redis
+    /// namespace/key context before any other admission check.
     ///
     /// Authenticity is decided first. Only an inauthentic, cross-version, or
     /// store-inadmissible envelope is [`RedisHitVerdict::Invalid`] (and
@@ -2285,7 +2285,6 @@ impl AiSemanticCache {
     /// Returns the peak `cache_budget.used()` observed while the previous
     /// published generation and the candidate rebuild lease overlapped (when
     /// both were non-zero).
-    #[allow(dead_code)]
     pub(crate) async fn rebuild_vector_index_for_tests(&self) -> usize {
         let Some(semantic) = self.semantic.as_ref() else {
             return self.cache_budget.used();
@@ -2350,7 +2349,6 @@ impl AiSemanticCache {
     }
 
     /// Published HNSW generation bytes currently charged to `cache_budget`.
-    #[allow(dead_code)]
     pub(crate) fn vector_snapshot_accounted_bytes_for_tests(&self) -> usize {
         self.vector_index
             .load_full()
@@ -2359,7 +2357,6 @@ impl AiSemanticCache {
     }
 
     /// Aggregate retained-byte budget usage (entries + vector generations).
-    #[allow(dead_code)]
     pub(crate) fn cache_budget_used_for_tests(&self) -> usize {
         self.cache_budget.used()
     }
@@ -2367,7 +2364,6 @@ impl AiSemanticCache {
     /// Force a rebuild reservation attempt that cannot fit, then confirm the
     /// candidate lease is not retained. Returns whether the budget rejected
     /// the reservation (and dirty was re-armed).
-    #[allow(dead_code)]
     pub(crate) async fn force_vector_rebuild_budget_failure_for_tests(&self) -> bool {
         let Some(semantic) = self.semantic.as_ref() else {
             return false;
@@ -2409,14 +2405,12 @@ impl AiSemanticCache {
 
     /// Whether the semantic vector snapshot is marked dirty. Used to prove
     /// same-key replacement still dirties when embeddings are gained or lost.
-    #[allow(dead_code)]
     pub(crate) fn vector_index_dirty_for_tests(&self) -> bool {
         self.vector_index_dirty.load(Ordering::Relaxed)
     }
 
     /// Clear the dirty flag without rebuilding so tests can assert a subsequent
     /// store re-dirties the index.
-    #[allow(dead_code)]
     pub(crate) fn clear_vector_index_dirty_for_tests(&self) {
         self.vector_index_dirty.store(false, Ordering::Release);
     }
@@ -2424,7 +2418,6 @@ impl AiSemanticCache {
     /// Hold or release the detached rebuild guard so tests can observe the
     /// dirtying side effect without racing the asynchronous rebuild that
     /// normally consumes the flag immediately.
-    #[allow(dead_code)]
     pub(crate) fn set_vector_index_rebuild_blocked_for_tests(&self, blocked: bool) {
         self.vector_index_rebuild_running
             .store(blocked, Ordering::Release);
@@ -2432,7 +2425,6 @@ impl AiSemanticCache {
 
     /// Backdate every retained entry past TTL so a forced cleanup pass expires
     /// them without sleeping on the wall clock.
-    #[allow(dead_code)]
     pub(crate) fn expire_all_entries_for_tests(&self) {
         let age = self.ttl.saturating_add(Duration::from_secs(1));
         let past = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
@@ -2441,17 +2433,21 @@ impl AiSemanticCache {
         }
     }
 
-    /// Bypass the cleanup throttle and run `cleanup_expired` immediately.
-    #[allow(dead_code)]
+    /// Bypass the cleanup throttle and run one cleanup sweep synchronously,
+    /// so the sweep has completed by the time this returns (the production
+    /// hot path schedules it through [`Self::signal_cleanup_if_due`]).
     pub(crate) fn force_cleanup_for_tests(&self) {
         self.last_cleanup.store(u64::MAX, Ordering::Relaxed);
-        self.cleanup_expired();
+        if self.try_claim_cleanup_interval()
+            && Self::run_cleanup(&self.cache, self.ttl, self.max_entries)
+        {
+            self.mark_vector_index_dirty();
+        }
     }
 
     /// Install (or clear) a callback that runs after byte-budget admission and
     /// before insert. Used by external tests to park concurrent stores that
     /// have already reserved leases.
-    #[allow(dead_code)]
     pub(crate) fn set_store_post_admit_hook_for_tests(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
@@ -2603,18 +2599,6 @@ impl AiSemanticCache {
             .map(|(_, removed)| removed)
     }
 
-    /// Synchronous cleanup used only by the external test crate's
-    /// `force_cleanup_for_tests`, which wants the sweep to have completed by the
-    /// time it returns (the production hot path uses [`Self::signal_cleanup_if_due`]).
-    fn cleanup_expired(&self) {
-        if !self.try_claim_cleanup_interval() {
-            return;
-        }
-        if Self::run_cleanup(&self.cache, self.ttl, self.max_entries) {
-            self.mark_vector_index_dirty();
-        }
-    }
-
     /// Retain an admitted response locally and, when configured, in Redis,
     /// under the byte budget.
     async fn publish_retained_response(&self, pending: PendingSemanticCacheStore) {
@@ -2736,7 +2720,6 @@ impl AiSemanticCache {
 
     /// Whether lifecycle maintenance workers have been staged. External tests
     /// observe activation rollback / reload drop behavior.
-    #[allow(dead_code)]
     pub(crate) fn maintenance_staged_for_tests(&self) -> bool {
         self.maintenance
             .lock()
@@ -2745,13 +2728,11 @@ impl AiSemanticCache {
     }
 
     /// Whether [`Plugin::commit_background_tasks`] has released maintenance.
-    #[allow(dead_code)]
     pub(crate) fn maintenance_committed_for_tests(&self) -> bool {
         self.maintenance_committed.load(Ordering::Acquire)
     }
 
     /// Count of lifecycle JoinHandles currently retained (0 after drop/abort).
-    #[allow(dead_code)]
     pub(crate) fn maintenance_handle_count_for_tests(&self) -> usize {
         self.maintenance
             .lock()
@@ -2760,14 +2741,12 @@ impl AiSemanticCache {
     }
 
     /// Notify the cleanup worker without claiming the interval (test scheduling).
-    #[allow(dead_code)]
     pub(crate) fn notify_cleanup_for_tests(&self) {
         self.cleanup_signal.notify_one();
     }
 
     /// Override the singleflight follower/admission wait used by external
     /// timeout tests. Pass `None` to restore the production default.
-    #[allow(dead_code)]
     pub(crate) fn set_singleflight_wait_override_for_tests(&self, wait: Option<Duration>) {
         let ms = wait
             .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -2778,7 +2757,6 @@ impl AiSemanticCache {
 
     /// Exercise the production quarantine-delete outcome handler with a
     /// synthetic Redis `DEL` result (no network).
-    #[allow(dead_code)]
     pub(crate) fn apply_redis_quarantine_delete_outcome_for_tests(
         &self,
         cache_key: &str,
@@ -2789,7 +2767,6 @@ impl AiSemanticCache {
     }
 
     /// Whether the local Redis quarantine suppressor is active for `cache_key`.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_suppressed_for_tests(&self, cache_key: &str) -> bool {
         // Read-only probe: do not bump the suppression counter.
         matches!(
@@ -2799,41 +2776,34 @@ impl AiSemanticCache {
     }
 
     /// Force-expire a quarantine marker so TTL recovery can be tested without sleep.
-    #[allow(dead_code)]
     pub(crate) fn expire_redis_quarantine_for_tests(&self, cache_key: &str) {
         if let Some(mut entry) = self.redis_quarantine.entries.get_mut(cache_key) {
             entry.expires_at = Instant::now() - Duration::from_secs(1);
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_len_for_tests(&self) -> usize {
         self.redis_quarantine.len()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_delete_failures_for_tests(&self) -> u64 {
         self.redis_quarantine.delete_failures_total()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_suppressions_for_tests(&self) -> u64 {
         self.redis_quarantine.suppressions_total()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_cap_for_tests(&self) -> usize {
         self.redis_quarantine.max_entries
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_ttl_for_tests(&self) -> Duration {
         self.redis_quarantine.ttl
     }
 
     /// Hot-path suppressor probe that increments the suppression counter when
     /// active (mirrors production lookup behavior).
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_is_suppressed_for_tests(&self, cache_key: &str) -> bool {
         self.redis_quarantine
             .is_suppressed(cache_key, Instant::now())
@@ -2841,7 +2811,6 @@ impl AiSemanticCache {
 
     /// Fingerprint reconsideration helper: same poison stays suppressed; a
     /// replaced fingerprint clears the marker so the new value can be admitted.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_matches_active_for_tests(
         &self,
         cache_key: &str,
@@ -2851,28 +2820,23 @@ impl AiSemanticCache {
             .matches_active(cache_key, fingerprint, Instant::now())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_fingerprint_content_for_tests(data: &[u8]) -> [u8; 32] {
         redis_quarantine_fingerprint_content(data)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_fingerprint_oversized_for_tests(length: usize) -> [u8; 32] {
         redis_quarantine_fingerprint_oversized(length)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_fingerprint_empty_for_tests() -> [u8; 32] {
         redis_quarantine_fingerprint_empty()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn clear_redis_quarantine_for_tests(&self, cache_key: &str) {
         self.redis_quarantine.clear(cache_key);
     }
 
     /// Exercise the production per-key in-flight quarantine claim.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_try_claim_for_tests(
         &self,
         cache_key: &str,
@@ -2883,7 +2847,6 @@ impl AiSemanticCache {
     }
 
     /// Currently available dedicated quarantine dial permits.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_dial_permits_for_tests(&self) -> usize {
         self.redis_quarantine_dials.available_permits()
     }
@@ -2891,7 +2854,6 @@ impl AiSemanticCache {
     /// Hold every dedicated quarantine dial permit for the caller's scope so a
     /// test can drive the exhaustion path. Permits release when the returned
     /// vector drops.
-    #[allow(dead_code)]
     pub(crate) fn redis_quarantine_hold_all_dials_for_tests(
         &self,
     ) -> Vec<tokio::sync::SemaphorePermit<'_>> {
@@ -2904,7 +2866,6 @@ impl AiSemanticCache {
 
     /// Exercise the production quarantine path (permit gate included) without a
     /// real Redis read.
-    #[allow(dead_code)]
     pub(crate) async fn quarantine_invalid_redis_entry_for_tests(
         &self,
         redis: &RedisRateLimitClient,
@@ -6447,8 +6408,7 @@ mod tests {
     /// Force cleanup to run regardless of the cooldown gate by resetting the
     /// gate to the "never cleaned" sentinel before the call.
     fn force_cleanup(plugin: &AiSemanticCache) {
-        plugin.last_cleanup.store(u64::MAX, Ordering::Relaxed);
-        plugin.cleanup_expired();
+        plugin.force_cleanup_for_tests();
     }
 
     #[test]

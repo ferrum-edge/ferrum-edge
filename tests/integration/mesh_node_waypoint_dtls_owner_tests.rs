@@ -19,8 +19,8 @@ use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::config::{
-    AppProtocol, MeshService, MtlsMode, PeerAuthentication, ServicePort, Workload, WorkloadRef,
-    WorkloadSelector,
+    AppProtocol, MeshService, MtlsMode, PeerAuthentication, PolicyScope, ServicePort, Workload,
+    WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::modes::mesh::{
@@ -128,8 +128,9 @@ fn namespace_peer_auth(
     PeerAuthentication {
         name: "default".to_string(),
         namespace: DEFAULT_NAMESPACE.to_string(),
-        scope: None,
-        selector: None,
+        scope: PolicyScope::Namespace {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+        },
         mtls_mode: mode,
         port_overrides,
     }
@@ -272,11 +273,12 @@ async fn strict_dtls_without_client_ca_rejects_the_complete_candidate() {
             PeerAuthentication {
                 name: "coap-permissive".to_string(),
                 namespace: DEFAULT_NAMESPACE.to_string(),
-                scope: None,
-                selector: Some(WorkloadSelector {
-                    labels: HashMap::from([("app".to_string(), "coap".to_string())]),
-                    namespace: None,
-                }),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "coap".to_string())]),
+                        namespace: Some(DEFAULT_NAMESPACE.to_string()),
+                    },
+                },
                 mtls_mode: MtlsMode::Strict,
                 port_overrides: HashMap::from([(PERMISSIVE_PORT, MtlsMode::Permissive)]),
             },

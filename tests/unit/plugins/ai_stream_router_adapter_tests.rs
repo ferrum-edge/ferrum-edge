@@ -94,7 +94,9 @@ fn sse(events: &[Value]) -> String {
 async fn drive(inspector: &mut dyn ResponseStreamInspector, body: &str, chunk: usize) -> String {
     let mut output = Vec::new();
     for part in body.as_bytes().chunks(chunk) {
-        let action = inspector.on_chunk(part).await;
+        let action = inspector
+            .on_chunk(&bytes::Bytes::copy_from_slice(part))
+            .await;
         let terminal = matches!(action, ResponseStreamAction::Terminate(_));
         output.extend(bytes(action));
         if terminal {
@@ -103,7 +105,14 @@ async fn drive(inspector: &mut dyn ResponseStreamInspector, body: &str, chunk: u
     }
     output.extend(bytes(inspector.on_end().await));
     assert!(bytes(inspector.on_end().await).is_empty());
-    assert!(bytes(inspector.on_chunk(b"data: {}\n\n").await).is_empty());
+    assert!(
+        bytes(
+            inspector
+                .on_chunk(&bytes::Bytes::from_static(b"data: {}\n\n"))
+                .await
+        )
+        .is_empty()
+    );
     String::from_utf8(output).unwrap()
 }
 
@@ -170,7 +179,11 @@ async fn synthetic_stream_and_tool_ids_are_random_and_distinct_without_clock_rac
     let mut outputs = vec![Vec::new(); inspectors.len()];
     for part in body.as_bytes().chunks(3) {
         for (inspector, output) in inspectors.iter_mut().zip(&mut outputs) {
-            output.extend(bytes(inspector.on_chunk(part).await));
+            output.extend(bytes(
+                inspector
+                    .on_chunk(&bytes::Bytes::copy_from_slice(part))
+                    .await,
+            ));
         }
     }
     let mut completion_ids = HashSet::new();
@@ -339,13 +352,21 @@ async fn anthropic_finish_waits_for_stop_and_matches_buffered_mapping() {
             let before_stop = sse(&events);
             let mut output = Vec::new();
             for part in before_stop.as_bytes().chunks(chunk_size) {
-                output.extend(bytes(inspector.on_chunk(part).await));
+                output.extend(bytes(
+                    inspector
+                        .on_chunk(&bytes::Bytes::copy_from_slice(part))
+                        .await,
+                ));
             }
             let before_stop_out = std::str::from_utf8(&output).unwrap();
             assert!(reasons(before_stop_out).is_empty(), "{before_stop_out}");
             events.push(json!({"type": "message_stop"}));
             let stop = sse(&events[events.len() - 1..]);
-            output.extend(bytes(inspector.on_chunk(stop.as_bytes()).await));
+            output.extend(bytes(
+                inspector
+                    .on_chunk(&bytes::Bytes::copy_from_slice(stop.as_bytes()))
+                    .await,
+            ));
             output.extend(bytes(inspector.on_end().await));
             let out = String::from_utf8(output).unwrap();
             assert_eq!(out.matches("data: [DONE]").count(), 1, "{out}");

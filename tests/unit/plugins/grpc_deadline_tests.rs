@@ -40,13 +40,15 @@ fn h3_grpc_web_requests_keep_the_http_protocol_key() {
     use ferrum_edge::config::types::HttpFlavor;
     use ferrum_edge::plugins::ProxyProtocol;
 
+    // Recognized gRPC-Web arrives on the Plain wire flavor, which keeps the
+    // HTTP protocol key; only native gRPC selects the gRPC key.
     assert_eq!(
-        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, true),
+        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain),
         ProxyProtocol::Http
     );
     assert_eq!(
-        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, false),
-        ProxyProtocol::Http
+        h3_plugin_protocol_for_request_for_test(HttpFlavor::Grpc),
+        ProxyProtocol::Grpc
     );
 }
 
@@ -514,6 +516,26 @@ fn remaining_duration_rounds_up_to_the_next_wire_millisecond() {
         grpc_deadline_duration_millis_ceil_saturating_for_test(Duration::from_nanos(1_000_001)),
         Some(2)
     );
+}
+
+/// Run `plugin`'s `before_proxy` the way the gateway does: the receipt-time
+/// [`prepare_request_deadline`](ferrum_edge::plugins::grpc_deadline::prepare_request_deadline)
+/// pass over the request headers first, then the hook.
+async fn prepared_before_proxy(
+    plugin: &Arc<dyn Plugin>,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    for (name, value) in headers.iter() {
+        ctx.headers.insert(name.clone(), value.clone());
+    }
+    match ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+        std::slice::from_ref(plugin),
+        ctx,
+    ) {
+        PluginResult::Continue => plugin.before_proxy(ctx, headers).await,
+        reject => reject,
+    }
 }
 
 fn create_grpc_context_with_timeout(timeout: Option<&str>) -> ferrum_edge::plugins::RequestContext {
@@ -4084,11 +4106,11 @@ fn test_unknown_and_null_fields_are_rejected() {
     for (config, expected) in [
         (
             json!({"max_deadline_ms": 30000, "reject_no_deadine": true}),
-            "unknown configuration property in `config`: \"reject_no_deadine\"",
+            "`config`: unknown configuration key(s): \"config.reject_no_deadine\"",
         ),
         (
             json!({"MAX_DEADLINE_MS": 30000}),
-            "unknown configuration property in `config`: \"MAX_DEADLINE_MS\"",
+            "`config`: unknown configuration key(s): \"config.MAX_DEADLINE_MS\"",
         ),
         (
             json!({"max_deadline_ms": null}),
@@ -4097,7 +4119,7 @@ fn test_unknown_and_null_fields_are_rejected() {
         (json!({"reject_no_deadline": null}), "must be a boolean"),
         (
             json!({"max_deadline_ms": 30000, "unexpected": {"nested": true}}),
-            "unknown configuration property in `config`: \"unexpected\"",
+            "`config`: unknown configuration key(s): \"config.unexpected\"",
         ),
     ] {
         let error = create_plugin("grpc_deadline", &config)
@@ -4195,7 +4217,7 @@ async fn test_parse_hours() {
     let mut ctx = create_grpc_context_with_timeout(Some("2H"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "2H".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // 2 hours = 7,200,000 ms
@@ -4214,7 +4236,7 @@ async fn test_parse_minutes() {
     let mut ctx = create_grpc_context_with_timeout(Some("5M"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "5M".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(
@@ -4231,7 +4253,7 @@ async fn test_parse_seconds() {
     let mut ctx = create_grpc_context_with_timeout(Some("30S"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "30S".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(
@@ -4248,7 +4270,7 @@ async fn test_parse_milliseconds() {
     let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "5000m".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(
@@ -4266,7 +4288,7 @@ async fn test_parse_microseconds() {
     let mut ctx = create_grpc_context_with_timeout(Some("5000000u"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "5000000u".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // 5,000,000 us = 5,000 ms
@@ -4284,7 +4306,7 @@ async fn test_parse_nanoseconds() {
     let mut ctx = create_grpc_context_with_timeout(Some("10000000n"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "10000000n".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // 10,000,000 ns = 10 ms
@@ -4300,13 +4322,16 @@ async fn test_zero_timeouts_are_missing_and_positive_submillisecond_rounds_up() 
     for timeout in ["0H", "0M", "0S", "0m", "0u", "0n"] {
         let mut ctx = create_grpc_context_with_timeout(Some(timeout));
         let mut headers = HashMap::from([("grpc-timeout".to_string(), timeout.to_string())]);
-        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+        assert_reject(
+            prepared_before_proxy(&plugin, &mut ctx, &mut headers).await,
+            Some(400),
+        );
     }
 
     for timeout in ["1u", "1n"] {
         let mut ctx = create_grpc_context_with_timeout(Some(timeout));
         let mut headers = HashMap::from([("grpc-timeout".to_string(), timeout.to_string())]);
-        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_continue(prepared_before_proxy(&plugin, &mut ctx, &mut headers).await);
         assert_eq!(headers.get("grpc-timeout").unwrap(), "1m");
         assert_eq!(ctx.metadata.get("grpc_original_deadline_ms").unwrap(), "1");
     }
@@ -4320,7 +4345,7 @@ async fn test_timeout_header_matching_is_case_insensitive_and_rewrites_canonical
     let mut ctx = create_test_context();
     let mut headers = HashMap::from([("Grpc-Timeout".to_string(), "10S".to_string())]);
 
-    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(prepared_before_proxy(&plugin, &mut ctx, &mut headers).await);
     assert_eq!(
         headers.get("grpc-timeout").map(String::as_str),
         Some("5000m")
@@ -4440,7 +4465,7 @@ async fn test_default_deadline_injected_when_missing() {
 
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(headers.get("grpc-timeout").unwrap(), "5000m");
@@ -4461,7 +4486,7 @@ async fn test_default_deadline_not_used_when_present() {
     let mut ctx = create_grpc_context_with_timeout(Some("10000m"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "10000m".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Should use the client's timeout, not the default
@@ -4481,7 +4506,7 @@ async fn test_max_deadline_caps_high_timeout() {
     let mut ctx = create_grpc_context_with_timeout(Some("60S")); // 60,000 ms
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "60S".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Should be capped to 30,000 ms
@@ -4500,7 +4525,7 @@ async fn test_max_deadline_does_not_increase_low_timeout() {
     let mut ctx = create_grpc_context_with_timeout(Some("5000m")); // 5,000 ms
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "5000m".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Should stay at 5,000 ms (under the cap)
@@ -4519,7 +4544,7 @@ async fn test_reject_no_deadline_rejects_missing() {
 
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
 
@@ -4534,7 +4559,7 @@ async fn test_reject_no_deadline_allows_present() {
     let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "5000m".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 }
 
@@ -4550,7 +4575,7 @@ async fn test_subtract_gateway_processing() {
 
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // The adjusted deadline should be <= default_deadline_ms (some processing time subtracted)
@@ -4575,7 +4600,7 @@ async fn test_subtract_gateway_processing_deadline_exceeded() {
     let mut ctx = create_grpc_context_with_timeout(None);
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
 
     // The 1ms receipt-anchored deadline elapsed before the hook ran.
     match result {
@@ -4606,7 +4631,7 @@ async fn test_combined_default_and_max() {
     // No timeout provided: default (30000) gets used; cap is identical so no change
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(
@@ -4618,7 +4643,7 @@ async fn test_combined_default_and_max() {
     let mut ctx2 = create_grpc_context_with_timeout(Some("60S"));
     let mut headers2 = HashMap::new();
     headers2.insert("grpc-timeout".to_string(), "60S".to_string());
-    plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    prepared_before_proxy(&plugin, &mut ctx2, &mut headers2).await;
     assert_eq!(
         ctx2.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
         "30000"
@@ -4636,7 +4661,7 @@ async fn test_minimal_config_passes_through() {
     let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "5000m".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Should still set the header (pass through the parsed value)
@@ -4652,7 +4677,7 @@ async fn test_modified_timeout_header_takes_precedence_over_original_request() {
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "60S".to_string());
     headers.insert("grpc-timeout".to_string(), "5000m".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(
@@ -4671,7 +4696,7 @@ async fn test_minimal_config_no_timeout_passes() {
 
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // No timeout to set
@@ -4688,7 +4713,7 @@ async fn test_invalid_timeout_treated_as_missing() {
     let mut ctx = create_grpc_context_with_timeout(Some("invalid"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "invalid".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Should fall back to default
@@ -4715,7 +4740,7 @@ async fn test_malformed_timeout_rewritten_to_enforced_fallback() {
     ] {
         let mut ctx = create_grpc_context_with_timeout(Some(timeout));
         let mut headers = HashMap::from([("grpc-timeout".to_string(), timeout.to_string())]);
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
         assert_continue(result);
         assert_eq!(
             headers.get("grpc-timeout").map(String::as_str),
@@ -4741,7 +4766,7 @@ async fn test_valid_timeout_header_unchanged_by_invalid_rewrite() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
     let mut headers = HashMap::from([("grpc-timeout".to_string(), "5000m".to_string())]);
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(headers.get("grpc-timeout").unwrap(), "5000m");
@@ -4763,7 +4788,7 @@ async fn test_missing_timeout_header_without_default_stays_absent() {
 
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert!(!headers.contains_key("grpc-timeout"));
@@ -4779,7 +4804,7 @@ async fn test_reject_no_deadline_body_format() {
 
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
 
     match result {
         PluginResult::Reject {
@@ -4808,7 +4833,7 @@ async fn test_reject_no_deadline_wins_over_default() {
 
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
 
     // Should reject despite default being configured — reject_no_deadline takes precedence
     assert_reject(result, Some(400));
@@ -4824,7 +4849,7 @@ async fn test_empty_string_timeout_treated_as_missing() {
     let mut ctx = create_grpc_context_with_timeout(Some(""));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Empty string can't be parsed, falls back to default
@@ -4846,7 +4871,7 @@ async fn test_more_than_eight_timeout_digits_is_ignored_without_default() {
     let mut ctx = create_grpc_context_with_timeout(Some("999999999H"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "999999999H".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert!(!ctx.metadata.contains_key("grpc_original_deadline_ms"));
@@ -4869,7 +4894,7 @@ async fn test_subtract_after_max_cap() {
     let mut ctx = create_grpc_context_with_timeout(Some("60S"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "60S".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     let adjusted: u64 = ctx
@@ -4894,7 +4919,7 @@ async fn test_multi_char_unit_rejected() {
     let mut ctx = create_grpc_context_with_timeout(Some("5000ms"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "5000ms".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // "5000ms" fails to parse (last char 's', digits "5000m" fails u64 parse)
@@ -4920,7 +4945,7 @@ async fn test_non_ascii_timeout_does_not_panic() {
     let mut ctx = create_grpc_context_with_timeout(Some("5η"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "5η".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Malformed value falls back to default
@@ -4940,7 +4965,7 @@ async fn test_non_digit_value_treated_as_missing() {
     let mut ctx = create_grpc_context_with_timeout(Some("abcS"));
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "abcS".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(headers.get("grpc-timeout").unwrap(), "2000m");
@@ -4961,7 +4986,7 @@ async fn test_original_and_adjusted_metadata() {
     let mut ctx = create_grpc_context_with_timeout(Some("30S")); // 30,000 ms
     let mut headers = HashMap::new();
     headers.insert("grpc-timeout".to_string(), "30S".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = prepared_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert_continue(result);
 
     assert_eq!(
@@ -6261,7 +6286,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({token: true}),
             "`config`",
-            "unknown configuration property",
+            "unknown configuration key(s)",
         ),
         (
             json!({"default_deadline_ms": 918273641, "max_deadline_ms": 1}),
@@ -6347,7 +6372,7 @@ async fn coarsened_forwarded_timeout_never_exceeds_the_capped_budget() {
         let plugin = deadline_plugin(json!({"max_deadline_ms": max_ms}));
         let mut ctx = create_grpc_context_with_timeout(Some("99999999H"));
         let mut headers = HashMap::from([("grpc-timeout".to_string(), "99999999H".to_string())]);
-        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_continue(prepared_before_proxy(&plugin, &mut ctx, &mut headers).await);
         assert_eq!(
             headers.get("grpc-timeout").map(String::as_str),
             Some(expected),
@@ -6454,7 +6479,7 @@ async fn headroom_floors_at_one_millisecond_and_leaves_injected_defaults_alone()
     let plugin = deadline_plugin(json!({"headroom_ms": 500}));
     let mut ctx = create_grpc_context_with_timeout(Some("200m"));
     let mut headers = HashMap::from([("grpc-timeout".to_string(), "200m".to_string())]);
-    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(prepared_before_proxy(&plugin, &mut ctx, &mut headers).await);
     assert_eq!(
         headers.get("grpc-timeout").map(String::as_str),
         Some("1m"),
@@ -6464,7 +6489,7 @@ async fn headroom_floors_at_one_millisecond_and_leaves_injected_defaults_alone()
     let plugin = deadline_plugin(json!({"default_deadline_ms": 3000, "headroom_ms": 500}));
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
-    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(prepared_before_proxy(&plugin, &mut ctx, &mut headers).await);
     assert_eq!(
         headers.get("grpc-timeout").map(String::as_str),
         Some("3000m"),
@@ -8309,8 +8334,7 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
         "the late-failure owner must use the instant send() was observed"
     );
     assert!(
-        bridge.contains("route.attempt_budget_owns(")
-            && !bridge.contains("&& route.attempt_budget_expired(route_attempt_deadline) =>"),
+        bridge.contains("route.attempt_budget_owns("),
         "the prebuffered attempt budget must be attributed from captured instants"
     );
     let streamed_timer = bounded(

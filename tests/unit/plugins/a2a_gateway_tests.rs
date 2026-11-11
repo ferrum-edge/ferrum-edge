@@ -4040,7 +4040,7 @@ async fn streaming_jsonrpc_inspector_extracts_multichunk_sse_terminal_metadata()
         b"\n\r\n",
     ];
     for chunk in chunks {
-        let action = inspector.on_chunk(chunk).await;
+        let action = inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await;
         let ResponseStreamAction::Forward(forwarded) = action else {
             panic!("observe-only A2A inspector must never terminate a stream");
         };
@@ -4099,7 +4099,7 @@ async fn streaming_jsonrpc_termination_before_inspector_end_does_not_emit_metada
             .expect("detected 2xx A2A SSE response should attach an inspector");
     let chunk = b"data: {\"result\":{\"taskId\":\"task-9\"}}\n\n";
     assert!(matches!(
-        inspector.on_chunk(chunk).await,
+        inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await,
         ResponseStreamAction::Forward(_)
     ));
 
@@ -4111,6 +4111,47 @@ async fn streaming_jsonrpc_termination_before_inspector_end_does_not_emit_metada
 
     let end = inspector.on_end().await;
     assert!(matches!(end, ResponseStreamAction::Forward(ref bytes) if bytes.is_empty()));
+}
+
+/// Issue #7116: a client disconnect ends the stream without `on_end`; the
+/// inspector still reports the events it completed before it was dropped.
+#[tokio::test]
+async fn streaming_jsonrpc_disconnect_reports_partial_observation() {
+    let plugin = plugin(json!({}));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&plugin)];
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-stream",
+        "method": "message/stream"
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("detected 2xx A2A SSE response should attach an inspector");
+    let complete = b"data: {\"jsonrpc\":\"2.0\",\"result\":{\"taskId\":\"task-9\"}}\n\n";
+    let cut_off = b"data: {\"jsonrpc\":\"2.0\",\"result\":{\"taskId\":\"task-10\"}}";
+    for chunk in [&complete[..], &cut_off[..]] {
+        assert!(matches!(
+            inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await,
+            ResponseStreamAction::Forward(_)
+        ));
+    }
+    drop(inspector);
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(0))
+        .await;
+    assert_eq!(
+        ctx.metadata.get("a2a.stream_events").map(String::as_str),
+        Some("1"),
+        "only the event completed before the disconnect is counted"
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.task_id").map(String::as_str),
+        Some("task-9")
+    );
 }
 
 #[tokio::test]
@@ -4130,7 +4171,7 @@ async fn streaming_jsonrpc_observation_omits_absent_optional_metadata() {
             .expect("detected 2xx A2A SSE response should attach an inspector");
     let chunk = b"data: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
     assert!(matches!(
-        inspector.on_chunk(chunk).await,
+        inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await,
         ResponseStreamAction::Forward(_)
     ));
     let end = inspector.on_end().await;
@@ -4181,7 +4222,7 @@ async fn streaming_jsonrpc_inspector_forwards_incomplete_event_without_holding()
         create_response_stream_inspector(&plugins, &mut ctx, 206, Some("TEXT/EVENT-STREAM"))
             .expect("detected 2xx A2A SSE response should attach an inspector");
     let partial = b"data: {\"result\":{\"status\":{\"state\":\"work";
-    let action = inspector.on_chunk(partial).await;
+    let action = inspector.on_chunk(&Bytes::copy_from_slice(partial)).await;
     let ResponseStreamAction::Forward(forwarded) = action else {
         panic!("observe-only A2A inspector must never terminate a stream");
     };
@@ -5330,7 +5371,9 @@ async fn streamed_task_metadata_uses_the_same_bounds_without_changing_bytes() {
     );
     let mut forwarded = Vec::new();
     for chunk in event.as_bytes().chunks(5) {
-        let ResponseStreamAction::Forward(bytes) = inspector.on_chunk(chunk).await else {
+        let ResponseStreamAction::Forward(bytes) =
+            inspector.on_chunk(&Bytes::copy_from_slice(chunk)).await
+        else {
             panic!("must forward");
         };
         forwarded.extend_from_slice(&bytes);
@@ -6209,9 +6252,9 @@ struct DeferCutAtBang {
 
 #[async_trait::async_trait]
 impl ResponseStreamInspector for DeferCutAtBang {
-    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+    async fn on_chunk(&mut self, chunk: &Bytes) -> ResponseStreamAction {
         let Some(at) = chunk.iter().position(|&byte| byte == b'!') else {
-            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+            return ResponseStreamAction::Forward(chunk.clone());
         };
         self.deferred = Some(Some(Bytes::from_static(b"CUT")));
         ResponseStreamAction::Forward(Bytes::copy_from_slice(&chunk[..at]))
@@ -6253,7 +6296,9 @@ async fn streaming_jsonrpc_observation_behind_a_deferred_cut_counts_the_cleared_
     });
     let cleared = format!("data: {event}\n\n");
     let chunk = format!("{cleared}!data: [cut]\n\n");
-    let action = chain.on_chunk(chunk.as_bytes()).await;
+    let action = chain
+        .on_chunk(&Bytes::copy_from_slice(chunk.as_bytes()))
+        .await;
     let ResponseStreamAction::Terminate(Some(sent)) = action else {
         panic!("the deferred cut ends the stream");
     };

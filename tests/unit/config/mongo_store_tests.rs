@@ -369,7 +369,7 @@ fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
         "create_plugin_config(&self, pc: &PluginConfig)",
         "update_plugin_config_inner(",
         "delete_plugin_config_inner(",
-        "batch_create_proxies(",
+        "batch_create_proxies_without_plugins(",
         "batch_create_plugin_configs(",
         "submit_api_spec_bundle(",
         "delete_api_spec(&self, namespace: &str, id: &str)",
@@ -1020,7 +1020,7 @@ fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
     }
 
     for method_name in [
-        "batch_create_proxies(",
+        "batch_create_proxies_without_plugins(",
         "batch_create_upstreams(",
         "batch_create_consumers(",
         "batch_create_plugin_configs(",
@@ -1643,9 +1643,15 @@ fn health_builds_admission_fence_snapshot_only_in_the_detailed_tier() {
         "exactly one admin call site may snapshot mTLS DNS admission fences"
     );
     let at = ADMIN_SOURCE.find(call).expect("fence snapshot call site");
+    // Issue #7216 moved the gate up to the whole failover/fence block.
+    let gate = "if detailed && let Some(db) = &state.db {";
+    let gate_at = ADMIN_SOURCE[..at]
+        .rfind(gate)
+        .expect("the fence snapshot must follow the `detailed` database-detail gate");
+    let gated = &ADMIN_SOURCE[gate_at + gate.len()..at];
     assert!(
-        ADMIN_SOURCE[..at].ends_with("if detailed {\n                let fence = "),
-        "the fence snapshot must be the first statement of an `if detailed` block"
+        gated.matches('{').count() >= gated.matches('}').count(),
+        "the fence snapshot must stay inside the `if detailed` block"
     );
     let health = ADMIN_SOURCE
         .find("if path == \"/health\" || path == \"/status\" {")

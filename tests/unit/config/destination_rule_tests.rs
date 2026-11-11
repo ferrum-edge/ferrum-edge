@@ -3,7 +3,7 @@
 //! - PassiveHealthCheck new fields serde
 //! - Upstream subset validation (duplicate names, empty labels, max count)
 //! - Proxy upstream_subset validation
-//! - pool_max_requests_per_connection serde
+//! - retired pool_max_requests_per_connection is refused
 
 use ferrum_edge::config::types::{
     GatewayConfig, H2UpgradePolicy, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
@@ -482,23 +482,13 @@ fn passive_health_check_zero_ejection_percent_passes() {
     );
 }
 
-// ── pool_max_requests_per_connection serde ────────────────────────────────────
+// ── retired pool_max_requests_per_connection ──────────────────────────────────
 
+/// Issue #7218: the no-op `pool_max_requests_per_connection` compatibility
+/// field is removed, and `Proxy` refuses unknown fields, so a document that
+/// still carries it is rejected instead of silently persisting a dead knob.
 #[test]
-fn proxy_pool_max_requests_defaults_to_none() {
-    let json = r#"{
-        "id": "p1",
-        "listen_path": "/test",
-        "backend_host": "localhost",
-        "backend_port": 8080
-    }"#;
-
-    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_str(json).unwrap();
-    assert!(proxy.pool_max_requests_per_connection.is_none());
-}
-
-#[test]
-fn proxy_pool_max_requests_round_trip() {
+fn proxy_rejects_retired_pool_max_requests_per_connection() {
     let json = r#"{
         "id": "p1",
         "listen_path": "/test",
@@ -507,28 +497,13 @@ fn proxy_pool_max_requests_round_trip() {
         "pool_max_requests_per_connection": 1000
     }"#;
 
-    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_str(json).unwrap();
-    assert_eq!(proxy.pool_max_requests_per_connection, Some(1000));
-
-    let back_json = serde_json::to_string(&proxy).unwrap();
-    assert!(back_json.contains("\"pool_max_requests_per_connection\":1000"));
-}
-
-#[test]
-fn proxy_pool_max_requests_zero_means_unlimited() {
-    let json = r#"{
-        "id": "p1",
-        "listen_path": "/test",
-        "backend_host": "localhost",
-        "backend_port": 8080,
-        "pool_max_requests_per_connection": 0
-    }"#;
-
-    let proxy: Proxy = serde_json::from_str(json).unwrap();
-    assert_eq!(proxy.pool_max_requests_per_connection, Some(0));
+    let error = serde_json::from_str::<Proxy>(json)
+        .expect_err("the retired field must be an unknown field");
     assert!(
-        proxy.validate_fields().is_ok(),
-        "0 is Istio's explicit unlimited value and should validate"
+        error
+            .to_string()
+            .contains("pool_max_requests_per_connection"),
+        "{error}"
     );
 }
 

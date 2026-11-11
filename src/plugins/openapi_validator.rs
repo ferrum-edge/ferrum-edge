@@ -66,7 +66,9 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// (with amplification checks off), so an arbitrary 64-bit value would let a
 /// small compressed body inflate without a meaningful bound.
 const MAX_BODY_BYTES_CEILING: usize = 64 * 1024 * 1024;
-const DEFAULT_ERROR_TRUNCATE_CHARS: usize = 1024;
+/// Default `error_truncate_chars`: the compiled-in [`MAX_DIAGNOSTIC_CHARS`]
+/// ceiling, so the default is the value actually enforced (issue #7114).
+const DEFAULT_ERROR_TRUNCATE_CHARS: usize = MAX_DIAGNOSTIC_CHARS;
 /// Upper bound on stacked `Content-Encoding` layers decoded for validation.
 /// Matches the shared content-coding decoder used elsewhere in the gateway.
 const MAX_CONTENT_CODINGS: usize = 4;
@@ -754,10 +756,6 @@ pub struct OpenapiValidator {
     /// instance's whole lifetime.
     ops_by_method: Vec<(String, OperationBucket)>,
     has_any_request_schema: bool,
-    /// At least one operation declares `request_required`. Presence enforcement
-    /// is independent of any declared media type, so a document that declares a
-    /// required body with an empty content map still has to buffer.
-    has_any_required_request_body: bool,
     has_any_response_schema: bool,
     bypass_paths: Option<RegexSet>,
     bypass_methods: HashSet<String>,
@@ -856,13 +854,11 @@ impl OpenapiValidator {
 
         let mut grouped_ops: AHashMap<String, Vec<(String, OperationEntry)>> = AHashMap::new();
         let mut has_any_request_schema = false;
-        let mut has_any_required_request_body = false;
         let mut has_any_response_schema = false;
         let mut has_any_parameters = false;
         for (index, operation) in operations.iter().enumerate() {
             let parsed = parse_operation(operation, index, schema_draft)?;
             has_any_request_schema |= parsed.entry.has_request_schema();
-            has_any_required_request_body |= parsed.entry.request_required;
             has_any_response_schema |= parsed.entry.has_response_schema();
             has_any_parameters |= !parsed.entry.parameters.is_empty();
             grouped_ops
@@ -914,7 +910,6 @@ impl OpenapiValidator {
             ));
         }
         if !has_any_request_schema
-            && !has_any_required_request_body
             && !has_any_response_schema
             && !has_any_parameters
             && !fail_on_unknown_operation
@@ -992,7 +987,6 @@ impl OpenapiValidator {
             response_content_types,
             ops_by_method,
             has_any_request_schema,
-            has_any_required_request_body,
             has_any_response_schema,
             bypass_paths,
             bypass_methods,
@@ -1010,7 +1004,6 @@ impl OpenapiValidator {
     /// External-test seam: `(cached schema-type nodes, request-time fallback computes)`.
     /// Cached nodes are populated once per registered schema during compile;
     /// fallback computes must stay zero for registered form/multipart conversion.
-    #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn schema_type_cache_stats_for_test(&self) -> (usize, usize) {
         let mut cached_nodes = 0usize;
         let mut fallback_computes = 0usize;
@@ -1323,12 +1316,6 @@ impl OpenapiValidator {
         validator_for_content_type(&operation.request_validators, content_type)
     }
 
-    /// Whether this operation carries anything for the request contract to
-    /// enforce: a declared media schema, or a declared presence requirement.
-    fn operation_has_request_contract(operation: &OperationEntry) -> bool {
-        operation.has_request_schema() || operation.request_required
-    }
-
     /// Record that THIS instance took its request-contract decision in the
     /// client phase, so its backend-final fallback stays inert. Keyed by the
     /// process-unique instance ID: sibling instances never share the entry.
@@ -1391,8 +1378,10 @@ impl OpenapiValidator {
         // has taken no request-contract decision and must remain eligible for
         // the backend-final fallback if a later before_proxy rewrite selects
         // one of its request-contract operations.
+        // `request_required` is refused without a request-body schema, so an
+        // operation without one has no request contract at all.
         let operation = matched.entry;
-        if !Self::operation_has_request_contract(operation) {
+        if !operation.has_request_schema() {
             return PluginResult::Continue;
         }
         self.mark_decided(ctx, phase);
@@ -1410,11 +1399,6 @@ impl OpenapiValidator {
             } else {
                 PluginResult::Continue
             };
-        }
-        if !operation.has_request_schema() {
-            // Presence-only declaration: a nonempty body satisfies it and the
-            // document declares no media entry to select.
-            return PluginResult::Continue;
         }
         let content_type = header_value(headers, "content-type");
         if validator_for_content_type(&operation.request_validators, content_type).is_none() {
@@ -1663,9 +1647,7 @@ impl Plugin for OpenapiValidator {
     }
 
     fn requires_request_body_buffering(&self) -> bool {
-        self.active()
-            && self.validate_request
-            && (self.has_any_request_schema || self.has_any_required_request_body)
+        self.active() && self.validate_request && self.has_any_request_schema
     }
 
     /// The client contract is decided before `before_proxy`, so the buffer has
@@ -1700,7 +1682,7 @@ impl Plugin for OpenapiValidator {
             return false;
         }
         self.operation_for_context(ctx)
-            .is_some_and(|matched| Self::operation_has_request_contract(matched.entry))
+            .is_some_and(|matched| matched.entry.has_request_schema())
     }
 
     async fn validate_client_request_body_contract(
@@ -3634,7 +3616,6 @@ fn charged_decode_failure(error: ChargedDecodeError) -> MediaFailure {
 /// and call `inspect` while the decoded body (and its charge) is still alive,
 /// as validation does. `Err(None)` is the capacity refusal;
 /// `Err(Some(detail))` a violation.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn decode_body_for_test<R>(
     content_encoding: Option<&str>,
     body: &[u8],

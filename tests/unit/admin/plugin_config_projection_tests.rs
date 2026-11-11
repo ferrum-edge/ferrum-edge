@@ -1980,7 +1980,7 @@ fn identity_provider_endpoints_are_projected_in_the_admitted_nested_shape() {
             "providers": [{
                 "issuer": "https://auth.example.com/",
                 "jwks_uri": "https://auth.example.com/jwks/jwks-path-canary?tenant=jwks-query-canary",
-                "audience": "edge"
+                "audiences": ["edge"]
             }]
         }),
     );
@@ -1991,7 +1991,7 @@ fn identity_provider_endpoints_are_projected_in_the_admitted_nested_shape() {
     );
     // Safe-value controls: the identifiers an operator reads a provider back by.
     assert_eq!(provider["issuer"], "https://auth.example.com/");
-    assert_eq!(provider["audience"], "edge");
+    assert_eq!(provider["audiences"], json!(["edge"]));
     assert_no_canaries(&projected, &["jwks-path-canary", "jwks-query-canary"]);
 
     let projected = project(

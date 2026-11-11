@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use ferrum_edge::plugins::utils::{
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, HttpBatchDrainOutcome,
-    PluginHttpClient, drain_http_batch_response_body, handle_http_batch_response,
+    PluginHttpClient, drain_http_batch_response_body, handle_http_batch_response_redacted,
+    redacted_endpoint_url_str,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -163,8 +164,14 @@ async fn shared_helper_reuses_http11_connection_across_successful_batches() {
             .expect("plugin HTTP client")
             .post(&url)
             .body("[]");
-        let result = client.execute(req, "http_batch_drain_test").await;
-        handle_http_batch_response("http_batch_drain_test", "", 1, result)
+        let result = client
+            .execute_redacted(
+                req,
+                "http_batch_drain_test",
+                &redacted_endpoint_url_str(&url),
+            )
+            .await;
+        handle_http_batch_response_redacted("http_batch_drain_test", "", 1, result)
             .await
             .expect("2xx with drained ACK must succeed");
     }
@@ -195,32 +202,34 @@ async fn shared_helper_reuses_http11_connection_across_retryable_then_success() 
     let url = format!("http://{addr}/ingest");
 
     let first = client
-        .execute(
+        .execute_redacted(
             client
                 .get()
                 .expect("plugin HTTP client")
                 .post(&url)
                 .body("[]"),
             "http_batch_drain_retry",
+            &redacted_endpoint_url_str(&url),
         )
         .await;
-    let err = handle_http_batch_response("http_batch_drain_retry", "", 1, first)
+    let err = handle_http_batch_response_redacted("http_batch_drain_retry", "", 1, first)
         .await
         .expect_err("503 must remain retryable");
     assert!(err.contains("503"), "{err}");
     assert!(err.contains("response body drained"), "{err}");
 
     let second = client
-        .execute(
+        .execute_redacted(
             client
                 .get()
                 .expect("plugin HTTP client")
                 .post(&url)
                 .body("[]"),
             "http_batch_drain_retry",
+            &redacted_endpoint_url_str(&url),
         )
         .await;
-    handle_http_batch_response("http_batch_drain_retry", "", 1, second)
+    handle_http_batch_response_redacted("http_batch_drain_retry", "", 1, second)
         .await
         .expect("follow-up 200 must succeed");
 
@@ -274,17 +283,19 @@ async fn shared_helper_rejects_oversized_advertised_content_length_without_block
     let (addr, server) = spawn_oversized_content_length_server().await;
     let client = PluginHttpClient::default();
     let started = Instant::now();
+    let url = format!("http://{addr}/oversized");
     let live = client
-        .execute(
+        .execute_redacted(
             client
                 .get()
                 .expect("plugin HTTP client")
-                .post(format!("http://{addr}/oversized"))
+                .post(&url)
                 .body("[]"),
             "http_batch_drain_cl",
+            &redacted_endpoint_url_str(&url),
         )
         .await;
-    handle_http_batch_response("http_batch_drain_cl", "", 1, live)
+    handle_http_batch_response_redacted("http_batch_drain_cl", "", 1, live)
         .await
         .expect("2xx remains success even when the ACK body is oversized");
     assert!(
@@ -372,29 +383,22 @@ async fn transport_error_does_not_echo_endpoint_url() {
         drop(socket);
     });
 
-    let result = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("client")
-        .post(format!(
-            "http://{addr}/ingest/path-secret?api_key=query-secret"
-        ))
-        .body("[]")
-        .send()
+    let url = format!("http://{addr}/ingest/path-secret?api_key=query-secret");
+    let client = PluginHttpClient::default();
+    let result = client
+        .execute_redacted(
+            client
+                .get()
+                .expect("plugin HTTP client")
+                .post(&url)
+                .body("[]"),
+            "http_batch_url_redaction",
+            &redacted_endpoint_url_str(&url),
+        )
         .await;
-    let error = result
-        .as_ref()
-        .expect_err("a closed connection must fail the request");
-    assert!(
-        !error.is_timeout(),
-        "request must fail on the closed connection: {error}"
-    );
-    assert!(
-        error.to_string().contains("query-secret"),
-        "precondition: reqwest's own Display carries the URL: {error}"
-    );
+    assert!(result.is_err(), "a closed connection must fail the request");
 
-    let err = handle_http_batch_response("http_batch_url_redaction", "", 1, result)
+    let err = handle_http_batch_response_redacted("http_batch_url_redaction", "", 1, result)
         .await
         .expect_err("transport error must be reported");
     assert!(err.contains("batch failed"), "{err}");

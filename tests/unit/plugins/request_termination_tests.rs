@@ -1184,7 +1184,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({"trigger": {token: true}}),
             "`trigger`",
-            "unknown config key",
+            "unknown configuration key",
         ),
         (
             json!({"status_code": 918273641}),

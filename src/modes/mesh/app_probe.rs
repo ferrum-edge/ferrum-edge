@@ -829,14 +829,9 @@ pub struct AppProbeServer {
 }
 
 impl AppProbeServer {
-    /// Build with the default admission budgets.
-    ///
-    /// `#[allow(dead_code)]` for the same reason `ConnLimiter::unlimited`
-    /// carries it: the binary target compiles this module tree separately from
-    /// the library, and only the external test suites reach this constructor —
-    /// the running sidecar always goes through
+    /// Build with the default admission budgets. Only the external test
+    /// suites reach this constructor — the running sidecar always goes through
     /// [`AppProbeServer::from_env_with_admission`] with configured budgets.
-    #[allow(dead_code)]
     pub fn new(targets: BTreeMap<String, AppProbeSpec>) -> Self {
         Self::with_admission(targets, Arc::new(AppProbeAdmission::default()))
     }
@@ -883,12 +878,9 @@ impl AppProbeServer {
         Some((container, probe_field, spec))
     }
 
-    /// Serve one kubelet request, returning only the status.
-    ///
-    /// `#[allow(dead_code)]` for the binary-target reason above: the served
+    /// Serve one kubelet request, returning only the status. The served
     /// connection needs the body and the close disposition, so production goes
     /// through [`AppProbeServer::handle_request_detailed`].
-    #[allow(dead_code)]
     pub async fn handle_request(&self, method: &Method, path: &str) -> StatusCode {
         self.handle_request_detailed(method, path).await.status
     }

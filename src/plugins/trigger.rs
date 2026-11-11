@@ -120,8 +120,9 @@ pub struct PluginTriggerCarrierCounters {
     /// Contextless hooks that RAN because no decision was carried for the
     /// instance. Backward compatible by design. Identity-reading triggers are
     /// undecided by design on stream connections and on HTTP requests that end
-    /// at or before `authenticate`, so they count here too; without them, a
-    /// sustained nonzero rate means a summary/session path is not stamping the
+    /// at or before `authenticate`, so they are NOT counted
+    /// ([`PluginTriggerGate::missing_carrier_is_expected`]); a sustained
+    /// nonzero rate therefore means a summary/session path is not stamping the
     /// carrier.
     pub missing_decision_carriers: u64,
 }
@@ -177,6 +178,25 @@ impl PluginTriggerGate {
     /// Whether the compiled predicate reads authenticated identity.
     pub fn reads_authenticated_identity(&self) -> bool {
         self.compiled.reads_authenticated_identity()
+    }
+
+    /// Whether a contextless hook can legitimately find NO carried decision
+    /// for this instance.
+    ///
+    /// An identity-reading trigger (`consumer` / `auth_method`) is undecided
+    /// by design wherever identity is not known yet: on every stream connection
+    /// ([`Self::admits_stream`]) and on an HTTP request that ends at or before
+    /// `authenticate` ([`TriggerPhase::PreAuth`]). Its missing carrier is the
+    /// documented fail-open path, not a stamping bug, so it is not counted in
+    /// `missing_decision_carriers`; the hook still runs either way.
+    pub fn missing_carrier_is_expected(&self) -> bool {
+        self.compiled.reads_authenticated_identity()
+    }
+
+    fn record_missing_carrier_unless_expected(&self) {
+        if !self.missing_carrier_is_expected() {
+            record_missing_carrier();
+        }
     }
 
     /// First HTTP-only field the predicate reads (`method`, `path`, `host`,
@@ -266,7 +286,7 @@ impl PluginTriggerGate {
                 decision
             }
             None => {
-                record_missing_carrier();
+                self.record_missing_carrier_unless_expected();
                 true
             }
         }
@@ -300,7 +320,7 @@ impl PluginTriggerGate {
                 decision
             }
             None => {
-                record_missing_carrier();
+                self.record_missing_carrier_unless_expected();
                 true
             }
         }
@@ -322,7 +342,7 @@ impl PluginTriggerGate {
                 decision
             }
             None => {
-                record_missing_carrier();
+                self.record_missing_carrier_unless_expected();
                 true
             }
         }

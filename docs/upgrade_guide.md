@@ -28,6 +28,172 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### ferrum-mesh chart value removals (#7297, #7299)
+
+Two `charts/ferrum-mesh` values are removed. The values schema rejects them, so
+an install or upgrade that still sets them fails at `helm template`.
+
+- `ambient.inboundPort`, `ambient.outboundPort` and `ambient.hbonePort` only
+  declared container ports; the proxy never listened on them (#7297). The
+  `outbound`, `inbound` and `hbone` container ports are now derived from the
+  listen addresses the proxy binds. **Operator action:** move a non-default
+  port into `ambient.env` as `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` (default
+  `127.0.0.1:15001`), `FERRUM_MESH_INBOUND_LISTEN_ADDR` (default
+  `0.0.0.0:15006`) or `FERRUM_MESH_HBONE_LISTEN_ADDR` (default
+  `0.0.0.0:15008`), and delete the `*Port` value.
+- `crds.adoptExisting` was a confirmation flag for adopting the
+  `UDPResponseAmplificationPolicy` CRD installed by the former `crds/`
+  directory (#7299). Helm's own ownership check already refuses an unmanaged
+  CRD, and `helm upgrade --take-ownership` adopts it. **Operator action:** drop
+  `--set crds.adoptExisting=...`; keep `--take-ownership` for a one-time
+  adoption.
+
+### Helm renders that would not run now fail (#7298, #7299)
+
+These inputs used to render cleanly and then fail on the cluster. They now
+fail `helm template` / `helm upgrade` with the fix in the message.
+
+- `ferrum-mesh` with `ca.enabled=true`: the CA Deployment runs
+  `FERRUM_MODE=cp` from `ca.env`, which refuses a non-loopback plaintext CP
+  gRPC bind at startup (#7298). **Operator action:** set
+  `ca.env.FERRUM_CP_GRPC_TLS_CERT_PATH` and `ca.env.FERRUM_CP_GRPC_TLS_KEY_PATH`
+  (and mount them), bind a loopback `ca.env.FERRUM_CP_GRPC_LISTEN_ADDR`, or set
+  `ca.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"` for development.
+- `ferrum-gateway` with a null `terminationGracePeriodSeconds`: that rendered an
+  empty field, leaving the pod on Kubernetes' 30s default (#7299). **Operator
+  action:** set an integer at least the minimum the error names.
+- `ferrum-gateway` with `admin.service.enabled=true` or
+  `metrics.serviceMonitor.enabled=true` and an `admin.bindAddress` that is
+  loopback in another spelling (for example `0:0:0:0:0:0:0:1`), or
+  `cp.service.enabled=true` with such a `cp.grpcBindAddress`: loopback is now
+  parsed, not prefix-matched, so the Service is refused as unreachable
+  (#7299). **Operator action:** bind a routable address such as `0.0.0.0` or
+  `::`.
+
+`ferrum-gateway` no longer fails the SleepAction check under `helm template`'s
+default Kubernetes version (1.20.0), which is not a real cluster; an explicit
+`--kube-version` below 1.29 still fails, as in `ferrum-mesh`.
+
+### `correlation_id` metadata is no longer a request-ID fallback (#7303)
+
+`ai_tool_governor` approval requests and `ws_frame_logging` disconnect records
+read the request ID from private canonical correlation state (the built-in
+`correlation_id` plugin), then from the `request_id` transaction metadata key.
+They no longer fall back to a `correlation_id` metadata key. **Operator
+action:** a custom plugin that publishes a request ID for these consumers must
+write it to `request_id` (`ferrum_edge::plugins::REQUEST_ID_METADATA_KEY`).
+
+### `pool_max_requests_per_connection` is removed (#7218)
+
+The proxy field `pool_max_requests_per_connection` and the upstream
+`port_overrides[].http_max_requests_per_connection` carrier were accepted and
+persisted but never applied (Ferrum has no close-after-N-requests runtime).
+Both are removed: a proxy or upstream document that still sets them is refused
+as an unknown field by the Admin API, `POST /batch`, `POST /restore` and file
+mode, and the `proxies.pool_max_requests_per_connection` column is gone from
+the `V001` baseline (a database that already applied the old baseline is
+refused at startup; rebuild it as described in
+[Build-Out database upgrade](#build-out-database-upgrade-postgresql-mysql-sqlite-mongodb)).
+Delete the field from configs and backups before upgrading. The ConfigSync
+build identity revision is bumped, so CP and DP must be upgraded together.
+
+### Restore refuses `api_specs` section version `"1"` and empty `resource_hash` (#7218)
+
+`POST /restore` now accepts only `api_specs.section_version: "2"` (what every
+current `GET /backup` writes) and requires each item's `resource_hash` to be
+64 lowercase hex characters (every spec writer records it). A backup taken
+with an older build that carries section version `"1"` or an empty
+`resource_hash` is refused with `400`; take a fresh `GET /backup` from the
+running deployment before upgrading.
+
+### Undocumented TLS source option spellings are no longer read (#7218)
+
+A TLS material source URI sets its refresh cadence only with the documented
+`?poll=` option; the undocumented `poll_interval` and `poll_interval_seconds`
+spellings are now ignored, so such a source uses the default cadence. A
+`pkcs11://` key source selects its key type only with `key_type`; a `type`
+option is now ignored. Rename those options before upgrading.
+
+### `FERRUM_TLS_CURVES` is no longer read (#7218)
+
+`FERRUM_TLS_CURVES` was a compatibility alias of
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS`. The alias is removed under the build-out
+policy, so a value set only through `FERRUM_TLS_CURVES` (including its
+`_FILE` / secret-manager suffixes) is now ignored and the default groups
+(`X25519,secp256r1`) apply. Rename the variable to
+`FERRUM_TLS_KEY_EXCHANGE_GROUPS` before upgrading.
+
+### `mcp_gateway`: `discovery.hide_denied_items` is removed; `emit_metadata` gates every `mcp.*` key (#7136)
+
+`discovery.hide_denied_items` duplicated `policy.hide_denied_tools`: a denied
+tool was listed only when both were `false`, so changing either one alone did
+nothing. It is now an unknown key and fails config load. Delete it, and set
+`policy.hide_denied_tools: false` where denied tools should be listed.
+
+`observability.emit_metadata: false` now also suppresses the `mcp.*` keys some
+paths recorded regardless of the flag: `mcp.route_decision` on synthetic and
+refused responses, `mcp.session.downstream`, `mcp.protocol_version`,
+`mcp.protocol_version_negotiated`, and the `mcp.sse.*` delivery tokens. Only
+`mcp.bridge.upstream_status` / `mcp.bridge.gateway_error` and the argument keys
+(governed by `log_argument_hash` / `log_raw_arguments`) are still recorded.
+Leave `emit_metadata` at its default `true` if dashboards read those keys.
+
+### WebSocket frame records spell `direction` like every other record (#7144)
+
+`ws_frame_logging` frame records (the `ws_frame_log` tracing target) and the
+`ws_rate_limiting` and `waf` WebSocket warnings now write `direction` as
+`client_to_backend` / `backend_to_client`, the spelling the `ws_frame_logging`
+`direction` filter, its disconnect records, stream summaries, metrics and
+traces already used. They wrote `client->backend` / `backend->client` before.
+Update any log query, alert or parser that matches the arrow spelling.
+
+### Plugin config: deprecated options and alias spellings removed (#7114)
+
+Each of these was a compatibility shape with no producer that needs it. Each
+is now an unknown key or value and fails config load like any other; edit the
+config before upgrading:
+
+- **`hmac_auth` `signing_profile: ferrum-hmac-v1`** and
+  **`allow_unsafe_replayable_v1`** are gone. Every client must sign
+  `ferrum-hmac-v2` (with a fresh `nonce` per request) or `rfc9421`, and every
+  `hmac_auth` config needs `replay_scope` (`process`, or `shared` with
+  `sync_mode: redis`). `/metrics/runtime` no longer reports
+  `replay_authority.legacy_unsafe_profile_accepted`.
+- **`workload_metrics`**: use `span_reporting_disabled` (not
+  `disable_span_reporting` / `disableSpanReporting`) and, for a Lightstep
+  provider, `access_token_env` (not `accessTokenEnv`). Istio `Telemetry` and
+  `meshConfig` translation is unchanged.
+- **`jwks_auth`**: a provider's singular `audience` is gone; list the value in
+  `audiences`.
+- **`mcp_gateway`**: `discovery.on_new_tool` / `on_schema_change` accept only
+  `allow` or `hide_until_configured` (not `allow_immediately` / `expose`), and
+  `sessions.initialize_upstreams` / `servers.<id>.initialize_strategy` accept
+  only `lazy` or `passthrough` (not `startup`, which behaved as `lazy`).
+- **`ai_semantic_firewall`**: remove `privacy.log_raw_text`.
+- **`response_caching`**: remove `cache_key_include_query` and
+  `cache_key_include_consumer`. The query and the caller partition are always
+  part of the key, as before; the in-memory keyspace is rebuilt on the reload.
+- **`soap_ws_security`**: a SAML assertion is identified by its SAML 2.0 `ID`
+  attribute only; an assertion carrying only the SAML 1.x `AssertionID` is
+  refused.
+- **`ip_restriction`**: remove `mode`. It never changed whether a request was
+  admitted (deny always wins, and a non-empty `allow` list always rejects
+  addresses outside it); an address that fails both checks is now always
+  reported as `IP address not allowed`, the former `allow_first` default.
+- **`openapi_validator`**: `error_truncate_chars` now defaults to `256`, the
+  value that was always enforced; no action is needed.
+
+### `tcp_connection_throttle`: `cleanup_interval_seconds` removed (#7152)
+
+The `tcp_connection_throttle` background sweep and its
+`cleanup_interval_seconds` field are gone. A counter entry is created at one
+connection and removed by the release that takes it to zero, under the same
+map entry guard, so the sweep never had a zero-count entry to remove. The
+field is now an unknown key: a config that still sets it, including
+`cleanup_interval_seconds: 0`, is refused at admission and fails file-mode
+startup. Delete the field before upgrading; connection accounting is
+unchanged.
+
 ### `workload_metrics`: custom tags cannot reuse gateway metadata names (#7092)
 
 A `workload_metrics` `custom_tags`, `custom_header_tags` or `custom_env_tags`
@@ -53,6 +219,29 @@ silently to `RS256` / no `kid`; it now fails config load with
 ``oidc_relying_party: `client_auth.<field>` must be a string``. Replace such a
 value with the intended string (for example `"ES384"` instead of `["ES384"]`)
 or remove it before upgrading.
+
+### OAuth `client_secret` placeholders are refused (#7275)
+
+`oauth2_introspection` (`providers[].client_auth.client_secret`) and
+`oidc_relying_party` (`client_auth.client_secret`) now refuse a value that
+contains an unresolved `${NAME}` placeholder, for example
+`"${OIDC_CLIENT_SECRET}"`. Plugin config is never environment-expanded, so such
+a value was sent to the provider verbatim and every introspection or token
+exchange failed. Substitute the real secret (for example with your deployment
+tooling) before applying the config. Other text containing `${` is unaffected.
+
+### `dp` mode refuses `FERRUM_DP_CP_GRPC_TOKEN_FILE` (#7273)
+
+A stock DP (`FERRUM_MODE=dp`) now fails `ferrum-edge validate` and startup when
+`FERRUM_DP_CP_GRPC_TOKEN_FILE` is set, with or without
+`FERRUM_CP_DP_GRPC_JWT_SECRET`, and always requires the secret. The DP sends a
+random per-process `node_id`, and `ConfigSync.Subscribe` requires the token's
+`sub` to equal it, so such a DP started cleanly and then looped on
+`PERMISSION_DENIED` without ever receiving config. The `ferrum-gateway` chart
+no longer has `dp.cpGrpcTokenFile`, and `grpc.jwtSecret` is always required in
+`dp` mode. Before upgrading, remove the token file from DP deployments and give
+each DP its own per-tenant secret plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID`
+(`grpc.jwtKeyId` in the chart). Mesh nodes keep the token-file option.
 
 ### Repeated `Content-Type` and gateway-asserted request headers (#7064)
 
@@ -92,6 +281,43 @@ A non-null `anthropic_version` on an `openai`, `openai_compatible`,
 `default_max_tokens` already was. No other provider type sends the header, so
 the value never had an effect. Remove it from those providers (or set it to
 `null`) before upgrading.
+
+### Custom plugins: `ResponseStreamInspector::on_chunk` takes `&Bytes` (#7117)
+
+`ResponseStreamInspector::on_chunk` now receives the chunk as a shared buffer,
+`chunk: &bytes::Bytes`, instead of `&[u8]`. A custom inspector that implements
+it no longer compiles until its signature is updated. The body usually needs
+no other change, because `&Bytes` dereferences to `&[u8]`. An inspector that
+forwards the chunk unchanged should return `Forward(chunk.clone())`, which
+shares the buffer, rather than `Forward(Bytes::copy_from_slice(chunk))`. See
+[Inspect while streaming](../CUSTOM_PLUGINS.md#inspect-while-streaming).
+
+### ACME auto-renew is refused outside database, file and dp modes (#7251)
+
+`FERRUM_ACME_AUTO_RENEW_ENABLED=true` is now refused at startup and by
+`ferrum-edge validate` in `mesh`, `cp`, `injector`, `node_agent` and `migrate`
+modes. None of them runs the ACME renewal scheduler, so the flag used to be
+accepted and certificates silently stopped renewing. Remove the flag from those
+processes' configuration (a configuration shared with a dp or file process
+must set it per process) and renew their `acme://` material out of band, or
+serve it from a database, file or dp process that runs the scheduler.
+
+### PeerAuthentication requires `scope` (#7243)
+
+A native, file-source or xDS-carried `PeerAuthentication` must now carry
+`scope`, like every other mesh policy resource (`kind: namespace` with
+`namespace`, `kind: workload_selector` with `selector`, or `kind: mesh_wide`).
+The earlier scope-less form is refused: a policy without `scope` fails as
+missing a required field, and the legacy `selector` member fails as an unknown
+field, with or without a `scope` beside it. Rewrite each policy before
+upgrading:
+
+- no `selector`, or one with no labels: `scope: {kind: namespace, namespace: <policy namespace>}`;
+- a labelled `selector`: `scope: {kind: workload_selector, selector: {labels: ..., namespace: <policy namespace>}}`.
+
+Policies translated from Istio `PeerAuthentication` objects need no change. The
+ConfigSync protocol revision is 4, so a CP and DP from different builds refuse
+each other at `Subscribe` and never exchange the earlier form.
 
 Per-release sections below are written when a release is cut. Changes already
 on `main` but not yet released, including breaking ones, are listed under
@@ -3800,14 +4026,15 @@ not cascade-deleted. `crds.install=false` without
 `crds.skipInstallAcknowledged=true` fails render.
 
 A CRD that already exists from the former `crds/` directory is not in the Helm
-release. The first upgrade to this chart fails closed unless you adopt it.
+release. The first upgrade to this chart fails on Helm's ownership check unless
+Helm takes ownership of it.
 
 **Operator action:** before the first `helm upgrade` to this chart version on a
 cluster that already has `udpresponseamplificationpolicies.gateway.ferrum.io`:
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
-  --take-ownership --set crds.adoptExisting=true
+  --take-ownership
 ```
 
 `--take-ownership` was added in Helm 3.17.0, so this adoption step needs a
@@ -3818,8 +4045,10 @@ hand.
 Adoption keeps the CRD in the cluster and leaves its existing policy
 objects untouched. The chart renders the CRD with
 `helm.sh/resource-policy: keep`, so a later uninstall still does not delete
-it. After adoption, leave `crds.install=true` and drop `crds.adoptExisting`.
-Do not set `crds.install=false` to silence the error.
+it. After adoption, leave `crds.install=true`. Do not set `crds.install=false`
+to silence the error. (The chart's former `crds.adoptExisting` confirmation
+value was removed; see [#7299](#ferrum-mesh-chart-value-removals-7297-7299)
+below.)
 
 ### Enabled mesh injector requires a webhook CA trust source (issue [#4433](https://github.com/ferrum-edge/ferrum-edge/issues/4433))
 

@@ -78,7 +78,7 @@ fn active_consumed_keys_survive_capacity_pressure() {
     }
     assert_eq!(backend.tracked_keys_count(), max_entries);
 
-    backend.enforce_capacity(1, now);
+    backend.prune_stale_at(now);
     assert_eq!(backend.tracked_keys_count(), max_entries);
     for idx in 0..max_entries {
         assert!(backend.contains_local_key(&format!("active:{idx}")));
@@ -263,7 +263,7 @@ fn plugin_parity_active_keys_survive_and_unseen_deny() {
     assert!(h.seed_rate_limiting_with_cap("rl:a", now, cap));
     assert!(h.seed_rate_limiting_with_cap("rl:b", now, cap));
     assert!(!h.seed_rate_limiting_with_cap("rl:c", now, cap));
-    h.rate_limiting_apply_branch(now, true, 1);
+    h.rate_limiting_prune_stale(now);
     assert_eq!(h.rate_limiting_tracked(), Some(2));
     assert!(h.rate_limiting_contains("rl:a"));
     assert!(h.rate_limiting_contains("rl:b"));
@@ -271,28 +271,28 @@ fn plugin_parity_active_keys_survive_and_unseen_deny() {
     assert!(h.seed_ai_with_cap("ai:a", now, cap));
     assert!(h.seed_ai_with_cap("ai:b", now, cap));
     assert!(!h.seed_ai_with_cap("ai:c", now, cap));
-    h.ai_apply_branch(now, true, 1);
+    h.ai_prune_stale(now);
     assert_eq!(h.ai_tracked(), Some(2));
     assert!(h.ai_contains("ai:a"));
 
     assert!(h.seed_graphql_with_cap("gql:a", now, cap));
     assert!(h.seed_graphql_with_cap("gql:b", now, cap));
     assert!(!h.seed_graphql_with_cap("gql:c", now, cap));
-    h.graphql_apply_branch(now, true, 1);
+    h.graphql_prune_stale(now);
     assert_eq!(h.graphql_tracked(), Some(2));
     assert!(h.graphql_contains("gql:a"));
 
     assert!(h.seed_grpc_with_cap("grpc:a", now, cap));
     assert!(h.seed_grpc_with_cap("grpc:b", now, cap));
     assert!(!h.seed_grpc_with_cap("grpc:c", now, cap));
-    h.grpc_apply_branch(now, true, 1);
+    h.grpc_prune_stale(now);
     assert_eq!(h.grpc_tracked(), Some(2));
     assert!(h.grpc_contains("grpc:a"));
 
     assert!(h.seed_ws_with_cap(1, now, cap));
     assert!(h.seed_ws_with_cap(2, now, cap));
     assert!(!h.seed_ws_with_cap(3, now, cap));
-    h.ws_apply_branch(now, true, 1);
+    h.ws_prune_stale(now);
     assert_eq!(h.ws_tracked(), Some(2));
     assert!(h.ws_contains(1));
 

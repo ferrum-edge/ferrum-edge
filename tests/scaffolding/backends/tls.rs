@@ -41,33 +41,22 @@ pub struct TlsConfig {
     pub key_pem: String,
     /// ALPN protocols to advertise, in server preference order. Empty = no ALPN.
     pub alpn: Vec<Vec<u8>>,
-    /// Delay inserted after the TCP accept and before starting the TLS
-    /// handshake. Useful for timeout tests where the gateway must give up
-    /// before the TLS handshake completes.
-    pub handshake_delay: Duration,
 }
 
 impl TlsConfig {
     /// Shorthand: build a `TlsConfig` with the given cert and key PEM and no
-    /// ALPN, no handshake delay, no client-auth.
+    /// ALPN and no client-auth.
     pub fn new(cert_pem: impl Into<String>, key_pem: impl Into<String>) -> Self {
         Self {
             cert_pem: cert_pem.into(),
             key_pem: key_pem.into(),
             alpn: Vec::new(),
-            handshake_delay: Duration::ZERO,
         }
     }
 
     /// Advertise the provided ALPN protocols (byte vectors, e.g. `b"h2".to_vec()`).
     pub fn with_alpn(mut self, alpn: Vec<Vec<u8>>) -> Self {
         self.alpn = alpn;
-        self
-    }
-
-    /// Delay before starting the TLS handshake.
-    pub fn with_handshake_delay(mut self, delay: Duration) -> Self {
-        self.handshake_delay = delay;
         self
     }
 
@@ -143,7 +132,6 @@ impl ScriptedTlsBackendBuilder {
 
         let steps = self.steps;
         let mode = self.mode;
-        let handshake_delay = self.tls.handshake_delay;
         let listener = self.listener;
         let acceptor_task = acceptor;
 
@@ -162,9 +150,6 @@ impl ScriptedTlsBackendBuilder {
                             ExecutionMode::RepeatEachConnection => {
                                 let track = state_conn.clone();
                                 let jh = tokio::spawn(async move {
-                                    if handshake_delay > Duration::ZERO {
-                                        tokio::time::sleep(handshake_delay).await;
-                                    }
                                     let tls_stream = match acceptor.accept(tcp).await {
                                         Ok(s) => s,
                                         Err(e) => {
@@ -205,9 +190,6 @@ impl ScriptedTlsBackendBuilder {
                                 if conn_index == 0 {
                                     let track = state_conn.clone();
                                     let jh = tokio::spawn(async move {
-                                        if handshake_delay > Duration::ZERO {
-                                            tokio::time::sleep(handshake_delay).await;
-                                        }
                                         let tls_stream = match acceptor.accept(tcp).await {
                                             Ok(s) => s,
                                             Err(e) => {

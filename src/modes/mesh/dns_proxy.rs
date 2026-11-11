@@ -44,6 +44,9 @@ const DNS_UPSTREAM_ID_ALLOC_ATTEMPTS: usize = 16;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
 const DNS_TCP_WRITE_TIMEOUT_SECS: u64 = 5;
 const DNS_MAX_NAME_POINTER_JUMPS: u32 = 16;
+/// Longest dotted presentation form of a DNS name (255 wire bytes minus the
+/// root label and the leading length byte).
+const DNS_MAX_NAME_TEXT_LEN: usize = 254;
 pub const DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
@@ -76,8 +79,14 @@ struct DnsQuery {
     id: u16,
     /// Original flags from the query (we copy RD etc.).
     flags: u16,
-    /// Normalized hostname: lowercase, trailing dot stripped.
+    /// Normalized hostname: lowercase, trailing dot stripped. Lookup and
+    /// cache-key identity.
     name: Arc<str>,
+    /// QNAME exactly as the client spelled it (case preserved). Every locally
+    /// built response copies it back into the question section (RFC 1035
+    /// §7.3): 0x20-randomising resolvers compare it byte-for-byte. Shares
+    /// `name`'s allocation when the query is already lower-case.
+    question_name: Arc<str>,
     /// Query type (1 = A, 28 = AAAA).
     qtype: u16,
     /// Query class (1 = IN).
@@ -1050,59 +1059,36 @@ fn evaluate_dns_query(
 
     match table.resolve_normalized(&query.name) {
         Some(records) => {
-            // Filter by query type: A gets IPv4, AAAA gets IPv6
-            let filtered: Vec<&IpAddr> = records
-                .ips
-                .iter()
-                .filter(|ip| {
-                    matches!(
-                        (query.qtype, **ip),
-                        (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_))
-                    )
-                })
-                .collect();
-
-            if filtered.is_empty() {
-                // Have the name but no matching record type -- return empty (not NXDOMAIN)
-                let response = if cacheable_response {
-                    let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
-                    table.cached_mesh_response(cache_key, &query, || {
-                        build_dns_empty_response(&query, records.authoritative, max_response_size)
-                    })
-                } else {
-                    build_dns_empty_response(&query, records.authoritative, max_response_size)
-                };
-                DnsDecision::Respond(response)
+            // A gets IPv4, AAAA gets IPv6; a name with no record of the asked
+            // family answers empty (not NXDOMAIN). The family filter runs
+            // inside the builder, so a cache hit allocates only the response.
+            let build = || {
+                build_dns_response(
+                    &query,
+                    records.ips,
+                    ttl,
+                    records.authoritative,
+                    max_response_size,
+                )
+            };
+            let response = if cacheable_response {
+                let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
+                table.cached_mesh_response(cache_key, &query, build)
             } else {
-                let response = if cacheable_response {
-                    let cache_key = DnsResponseCacheKey::from_query(&query, ttl, max_response_size);
-                    table.cached_mesh_response(cache_key, &query, || {
-                        build_dns_response(
-                            &query,
-                            &filtered,
-                            ttl,
-                            records.authoritative,
-                            max_response_size,
-                        )
-                    })
-                } else {
-                    build_dns_response(
-                        &query,
-                        &filtered,
-                        ttl,
-                        records.authoritative,
-                        max_response_size,
-                    )
-                };
-                trace!(
-                    name = %query.name,
-                    qtype = query.qtype,
-                    answers = filtered.len(),
-                    authoritative = records.authoritative,
-                    "DNS query resolved from mesh table"
-                );
-                DnsDecision::Respond(response)
-            }
+                build()
+            };
+            trace!(
+                name = %query.name,
+                qtype = query.qtype,
+                answers = records
+                    .ips
+                    .iter()
+                    .filter(|ip| dns_record_matches_qtype(query.qtype, ip))
+                    .count(),
+                authoritative = records.authoritative,
+                "DNS query resolved from mesh table"
+            );
+            DnsDecision::Respond(response)
         }
         None => {
             // Not a mesh name -- forward to upstream
@@ -1546,7 +1532,8 @@ fn upstream_response_matches_pending_query(response: &[u8], pending: &DnsQuery) 
         return false;
     }
 
-    let Some((name, offset)) = parse_dns_name(response, DNS_HEADER_SIZE) else {
+    let mut name_buf = [0u8; DNS_MAX_NAME_TEXT_LEN];
+    let Some((name_len, offset)) = decode_dns_name(response, DNS_HEADER_SIZE, &mut name_buf) else {
         return false;
     };
     if offset + 4 > response.len() {
@@ -1556,7 +1543,7 @@ fn upstream_response_matches_pending_query(response: &[u8], pending: &DnsQuery) 
     let qtype = u16::from_be_bytes([response[offset], response[offset + 1]]);
     let qclass = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
 
-    *normalize_dns_name(&name) == *pending.name
+    name_buf[..name_len].eq_ignore_ascii_case(pending.name.as_bytes())
         && qtype == pending.qtype
         && qclass == pending.qclass
 }
@@ -1626,9 +1613,11 @@ fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
         return None;
     }
 
-    // Parse QNAME (label-encoded)
-    let (name, offset) = parse_dns_name(packet, DNS_HEADER_SIZE)?;
-    if name.is_empty() {
+    // Parse QNAME (label-encoded) into a stack buffer: the only heap
+    // allocations for an admitted query are the final shared names below.
+    let mut name_buf = [0u8; DNS_MAX_NAME_TEXT_LEN];
+    let (name_len, offset) = decode_dns_name(packet, DNS_HEADER_SIZE, &mut name_buf)?;
+    if name_len == 0 {
         return None;
     }
 
@@ -1640,11 +1629,6 @@ fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
     let qtype = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
     let qclass = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
     let question_end = offset + 4;
-
-    let normalized = normalize_dns_name(&name);
-    if normalized.is_empty() {
-        return None;
-    }
 
     let mut additional_offset = question_end;
     let mut opt_record = None;
@@ -1673,7 +1657,7 @@ fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
                 return None;
             }
             udp_payload_size = usize::from(record_class);
-            opt_record = Some(packet[record_start..record_end].to_vec());
+            opt_record = Some(&packet[record_start..record_end]);
         }
         additional_offset = record_end;
     }
@@ -1681,24 +1665,41 @@ fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
         return None;
     }
 
+    // A decoded name never carries a trailing dot (labels are joined with
+    // '.'), so lower-casing is the whole normalization.
+    let name_bytes = &mut name_buf[..name_len];
+    let question_name: Arc<str> = Arc::from(std::str::from_utf8(name_bytes).ok()?);
+    let name: Arc<str> = if name_bytes.iter().any(u8::is_ascii_uppercase) {
+        name_bytes.make_ascii_lowercase();
+        Arc::from(std::str::from_utf8(name_bytes).ok()?)
+    } else {
+        Arc::clone(&question_name)
+    };
+
     Some(DnsQuery {
         id,
         flags,
-        name: Arc::from(normalized.as_str()),
+        name,
+        question_name,
         qtype,
         qclass,
-        opt_record: opt_record.map(|v| Arc::from(v.into_boxed_slice())),
+        opt_record: opt_record.map(Arc::<[u8]>::from),
         udp_payload_size,
     })
 }
 
-/// Parse a DNS label-encoded name starting at `offset`. Returns the
-/// decoded name and the byte position immediately after it.
+/// Decode a DNS label-encoded name starting at `start` into `buf` as dotted
+/// text, case preserved. Returns the decoded length and the byte position
+/// immediately after the name. No heap allocation.
 ///
 /// Supports pointer compression (0xC0xx) for completeness but the
 /// question section of standard queries does not use pointers.
-fn parse_dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
-    let mut name = String::with_capacity(64);
+fn decode_dns_name(
+    packet: &[u8],
+    start: usize,
+    buf: &mut [u8; DNS_MAX_NAME_TEXT_LEN],
+) -> Option<(usize, usize)> {
+    let mut name_len = 0usize;
     let mut offset = start;
     let mut return_offset = None;
     // Compression-pointer loop guard. Between pointer jumps the offset strictly
@@ -1757,23 +1758,33 @@ fn parse_dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
             return None;
         }
 
-        if !name.is_empty() {
-            name.push('.');
-        }
-        // DNS labels are case-insensitive; we normalize in the caller
-        for &byte in &packet[offset..offset + len] {
-            if !is_valid_dns_label_byte(byte) {
-                return None;
-            }
-            name.push(byte as char);
-        }
-        if name.len() + 1 > 255 {
+        let label = &packet[offset..offset + len];
+        if !label.iter().copied().all(is_valid_dns_label_byte) {
             return None;
         }
+        let separator = usize::from(name_len != 0);
+        let next_len = name_len + separator + len;
+        if next_len + 1 > 255 {
+            return None;
+        }
+        if separator == 1 {
+            buf[name_len] = b'.';
+        }
+        // DNS labels are case-insensitive; callers normalize as they need.
+        buf[name_len + separator..next_len].copy_from_slice(label);
+        name_len = next_len;
         offset += len;
     }
 
-    Some((name, return_offset.unwrap_or(offset)))
+    Some((name_len, return_offset.unwrap_or(offset)))
+}
+
+/// Owned-string form of [`decode_dns_name`] for tests that inspect names.
+#[cfg(test)]
+fn parse_dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut buf = [0u8; DNS_MAX_NAME_TEXT_LEN];
+    let (len, offset) = decode_dns_name(packet, start, &mut buf)?;
+    Some((String::from_utf8(buf[..len].to_vec()).ok()?, offset))
 }
 
 fn skip_dns_name(packet: &[u8], start: usize) -> Option<usize> {
@@ -1847,17 +1858,26 @@ fn is_valid_dns_label_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
 }
 
-/// Build a DNS response with answer records.
+/// Whether `ip` answers a query of `qtype` (A gets IPv4, AAAA gets IPv6).
+fn dns_record_matches_qtype(qtype: u16, ip: &IpAddr) -> bool {
+    matches!(
+        (qtype, ip),
+        (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_))
+    )
+}
+
+/// Build a DNS response carrying every record in `records` of the queried
+/// family. With none, it is the empty (NODATA) response.
 fn build_dns_response(
     query: &DnsQuery,
-    answers: &[&IpAddr],
+    records: &[IpAddr],
     ttl: u32,
     authoritative: bool,
     max_response_size: usize,
 ) -> Vec<u8> {
     let mut response = Vec::with_capacity(max_response_size.min(DNS_MAX_UDP_PACKET_SIZE));
     write_dns_response_header(&mut response, query, 0, authoritative, false, 0, 0);
-    encode_dns_name(&query.name, &mut response).expect("parsed DNS names are encodable");
+    encode_dns_name(&query.question_name, &mut response).expect("parsed DNS names are encodable");
     response.extend_from_slice(&query.qtype.to_be_bytes());
     response.extend_from_slice(&query.qclass.to_be_bytes());
 
@@ -1865,17 +1885,17 @@ fn build_dns_response(
     let mut answer_count = 0u16;
     let mut truncated = false;
 
-    for ip in answers.iter().take(u16::MAX as usize) {
+    for ip in records
+        .iter()
+        .filter(|ip| dns_record_matches_qtype(query.qtype, ip))
+    {
         let record_len = dns_answer_record_len(ip);
-        if response.len() + record_len + opt_len > max_response_size {
+        if answer_count == u16::MAX || response.len() + record_len + opt_len > max_response_size {
             truncated = true;
             break;
         }
         write_dns_answer_record(&mut response, ip, ttl);
-        answer_count = answer_count.saturating_add(1);
-    }
-    if answers.len() > usize::from(answer_count) {
-        truncated = true;
+        answer_count += 1;
     }
 
     let arcount = append_opt_record(query, &mut response, max_response_size);
@@ -1899,7 +1919,7 @@ fn build_dns_empty_response(
 ) -> Vec<u8> {
     let mut response = Vec::with_capacity(max_response_size.min(DNS_UDP_SAFE_PACKET_SIZE));
     write_dns_response_header(&mut response, query, 0, authoritative, false, 0, 0);
-    encode_dns_name(&query.name, &mut response).expect("parsed DNS names are encodable");
+    encode_dns_name(&query.question_name, &mut response).expect("parsed DNS names are encodable");
     response.extend_from_slice(&query.qtype.to_be_bytes());
     response.extend_from_slice(&query.qclass.to_be_bytes());
     let arcount = append_opt_record(query, &mut response, max_response_size);
@@ -1915,7 +1935,7 @@ fn build_dns_error_response(
 ) -> Vec<u8> {
     let mut response = Vec::with_capacity(max_response_size.min(DNS_UDP_SAFE_PACKET_SIZE));
     write_dns_response_header(&mut response, query, 0, authoritative, false, rcode, 0);
-    encode_dns_name(&query.name, &mut response).expect("parsed DNS names are encodable");
+    encode_dns_name(&query.question_name, &mut response).expect("parsed DNS names are encodable");
     response.extend_from_slice(&query.qtype.to_be_bytes());
     response.extend_from_slice(&query.qclass.to_be_bytes());
     let arcount = append_opt_record(query, &mut response, max_response_size);
@@ -1959,11 +1979,15 @@ fn clear_response_transaction_id(response: &mut [u8]) {
     }
 }
 
+/// One cached template serves every case variant of a name (the cache keys on
+/// the normalized name), so each response re-stamps the transaction id, the
+/// client's own QNAME spelling, and its OPT record.
 fn response_from_cached_template(template: &[u8], query: &DnsQuery) -> Vec<u8> {
     let mut response = template.to_vec();
     if response.len() >= 2 {
         response[..2].copy_from_slice(&query.id.to_be_bytes());
     }
+    write_question_name_case(&mut response, &query.question_name);
     if let Some(opt_record) = query.opt_record.as_ref()
         && response.len() >= DNS_HEADER_SIZE
         && u16::from_be_bytes([response[10], response[11]]) > 0
@@ -1973,6 +1997,21 @@ fn response_from_cached_template(template: &[u8], query: &DnsQuery) -> Vec<u8> {
         response[opt_offset..].copy_from_slice(opt_record);
     }
     response
+}
+
+/// Overwrite the label bytes of the question QNAME at offset 12 with `name`'s
+/// spelling. Case variants encode to identical label lengths, so the layout is
+/// unchanged; any length disagreement leaves the response untouched.
+fn write_question_name_case(response: &mut [u8], name: &str) {
+    let mut position = DNS_HEADER_SIZE;
+    for label in name.split('.') {
+        let end = position + 1 + label.len();
+        if end > response.len() || usize::from(response[position]) != label.len() {
+            return;
+        }
+        response[position + 1..end].copy_from_slice(label.as_bytes());
+        position = end;
+    }
 }
 
 fn write_dns_response_header(
@@ -2200,6 +2239,70 @@ mod tests {
             &not_a_response,
             &pending
         ));
+
+        // Name comparison is case-insensitive in both directions.
+        let mixed_pending =
+            parse_dns_query(&build_a_query("ExAmPlE.com")).expect("mixed-case query parses");
+        assert!(upstream_response_matches_pending_query(
+            &matching,
+            &mixed_pending
+        ));
+        let upper_response = build_response_question("EXAMPLE.COM", QTYPE_A);
+        assert!(upstream_response_matches_pending_query(
+            &upper_response,
+            &pending
+        ));
+    }
+
+    #[test]
+    fn parse_dns_query_keeps_client_spelling_and_shares_lowercase_names() {
+        let mixed = parse_dns_query(&build_a_query("Api.Example.COM")).expect("parses");
+        assert_eq!(&*mixed.name, "api.example.com");
+        assert_eq!(&*mixed.question_name, "Api.Example.COM");
+
+        let lower = parse_dns_query(&build_a_query("api.example.com")).expect("parses");
+        assert!(
+            Arc::ptr_eq(&lower.name, &lower.question_name),
+            "an already-normalized QNAME must not allocate a second name"
+        );
+    }
+
+    /// RFC 1035 §7.3 / 0x20 resolvers: the question in a locally answered
+    /// response is the client's own QNAME bytes, including on a cache hit for
+    /// a template built from a different case variant.
+    #[test]
+    fn local_answers_echo_each_clients_qname_case_through_the_cache() {
+        let slice = MeshSlice {
+            service_entries: vec![test_service_entry(vec!["*.example.com"], vec!["10.0.0.1"])],
+            ..MeshSlice::default()
+        };
+        let table = ArcSwap::from_pointee(DnsResolutionTable::from_mesh_slice(&slice));
+
+        for (spelling, qtype) in [
+            ("Api.Example.COM", QTYPE_A),
+            ("aPI.eXAMPLE.com", QTYPE_A),
+            ("api.example.com", QTYPE_A),
+            ("API.EXAMPLE.COM", QTYPE_AAAA),
+            ("api.Example.com", QTYPE_AAAA),
+            ("Api.Example.Com", QTYPE_TXT),
+            ("aPi.ExAmPlE.cOm", QTYPE_TXT),
+        ] {
+            let packet = build_query_packet(spelling, qtype);
+            let response = match evaluate_dns_query(&packet, &table, 60, DnsResponseSizing::Udp) {
+                DnsDecision::Respond(response) => response,
+                DnsDecision::Forward(_) => panic!("mesh-owned name must not forward"),
+                DnsDecision::Drop => panic!("valid DNS query must not drop"),
+            };
+            let question_end = packet.len();
+            assert_eq!(
+                &response[DNS_HEADER_SIZE..question_end],
+                &packet[DNS_HEADER_SIZE..question_end],
+                "question section must echo {spelling:?} byte-for-byte"
+            );
+            let ancount = u16::from_be_bytes([response[6], response[7]]);
+            assert_eq!(ancount, u16::from(qtype == QTYPE_A), "{spelling:?}");
+        }
+        assert_eq!(table.load().response_cache_len(), 3);
     }
 
     struct ScriptedEntropy {
@@ -2875,7 +2978,7 @@ mod tests {
         let packet = build_a_query("api.example.com");
         let query = parse_dns_query(&packet).unwrap();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let response = build_dns_response(&query, &[&ip], 60, true, DNS_UDP_SAFE_PACKET_SIZE);
+        let response = build_dns_response(&query, &[ip], 60, true, DNS_UDP_SAFE_PACKET_SIZE);
 
         // Verify header
         assert_eq!(response[0..2], query.id.to_be_bytes());
@@ -2898,7 +3001,7 @@ mod tests {
         let packet = build_aaaa_query("ipv6.example.com");
         let query = parse_dns_query(&packet).unwrap();
         let ip: IpAddr = "::1".parse().unwrap();
-        let response = build_dns_response(&query, &[&ip], 120, true, DNS_UDP_SAFE_PACKET_SIZE);
+        let response = build_dns_response(&query, &[ip], 120, true, DNS_UDP_SAFE_PACKET_SIZE);
 
         let ancount = u16::from_be_bytes([response[6], response[7]]);
         assert_eq!(ancount, 1);
@@ -2915,8 +3018,7 @@ mod tests {
         let query = parse_dns_query(&packet).unwrap();
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
-        let response =
-            build_dns_response(&query, &[&ip1, &ip2], 60, true, DNS_UDP_SAFE_PACKET_SIZE);
+        let response = build_dns_response(&query, &[ip1, ip2], 60, true, DNS_UDP_SAFE_PACKET_SIZE);
 
         let ancount = u16::from_be_bytes([response[6], response[7]]);
         assert_eq!(ancount, 2);
@@ -2929,8 +3031,7 @@ mod tests {
         let ips: Vec<IpAddr> = (1..=20)
             .map(|octet| IpAddr::V4(Ipv4Addr::new(10, 0, 0, octet)))
             .collect();
-        let answer_refs: Vec<&IpAddr> = ips.iter().collect();
-        let response = build_dns_response(&query, &answer_refs, 60, true, 96);
+        let response = build_dns_response(&query, &ips, 60, true, 96);
         let flags = u16::from_be_bytes([response[2], response[3]]);
         let ancount = u16::from_be_bytes([response[6], response[7]]);
         assert!(flags & FLAGS_TC != 0);
@@ -2943,7 +3044,7 @@ mod tests {
         let packet = build_query_with_opt("edns.example.com", QTYPE_A, 1232);
         let query = parse_dns_query(&packet).unwrap();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let response = build_dns_response(&query, &[&ip], 60, true, 1232);
+        let response = build_dns_response(&query, &[ip], 60, true, 1232);
         let arcount = u16::from_be_bytes([response[10], response[11]]);
         assert_eq!(arcount, 1);
         assert!(response.ends_with(query.opt_record.as_ref().unwrap()));
@@ -2954,7 +3055,7 @@ mod tests {
         let packet = build_a_query("api.external.com");
         let query = parse_dns_query(&packet).unwrap();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let response = build_dns_response(&query, &[&ip], 60, false, DNS_UDP_SAFE_PACKET_SIZE);
+        let response = build_dns_response(&query, &[ip], 60, false, DNS_UDP_SAFE_PACKET_SIZE);
         let flags = u16::from_be_bytes([response[2], response[3]]);
         assert_eq!(flags & FLAGS_AA, 0);
         assert!(flags & FLAGS_RA != 0);

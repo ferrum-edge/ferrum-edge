@@ -562,7 +562,6 @@ struct NumericSvidRetirement {
 }
 
 impl BackendTlsConfigCache {
-    #[allow(dead_code)] // Used by focused tests with default shard sizing.
     pub fn new() -> Self {
         Self::default()
     }
@@ -625,17 +624,14 @@ impl BackendTlsConfigCache {
         self.prebuild_failures.retain(|key, _| live.contains(key));
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn len(&self) -> usize {
         self.configs.len()
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn is_empty(&self) -> bool {
         self.configs.is_empty()
     }
 
-    #[allow(dead_code)] // exercised from unit tests
     pub fn contains_key(&self, key: &str) -> bool {
         self.configs.contains_key(key)
     }
@@ -811,7 +807,6 @@ impl BackendTlsConfigCache {
     }
 
     /// Number of single-flight builds currently in flight.
-    #[allow(dead_code)] // exercised from unit tests
     pub fn pending_builds(&self) -> usize {
         self.pending.len()
     }
@@ -825,7 +820,6 @@ impl BackendTlsConfigCache {
 
     /// Whether the last prebuild of `key` failed, so config publications skip
     /// it until a build succeeds or a [`Self::clear`].
-    #[allow(dead_code)] // exercised from unit tests
     pub fn is_prebuild_skipped(&self, key: &str) -> bool {
         self.prebuild_failures.contains_key(key)
     }
@@ -1077,7 +1071,6 @@ pub fn backend_tls_pool_key_has_svid_field(key: &str) -> bool {
 /// (tests and ad-hoc inspection). Production hot paths build a single
 /// `SvidGenerationMatcher::new(generation)` and pass it into
 /// `pool.invalidate_matching` to avoid per-key segment allocation.
-#[allow(dead_code)]
 pub fn backend_tls_pool_key_has_svid_generation(key: &str, svid_generation: u64) -> bool {
     SvidGenerationMatcher::new(svid_generation).matches(key)
 }
@@ -2063,7 +2056,6 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
-            pool_max_requests_per_connection: None,
             pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,

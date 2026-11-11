@@ -146,12 +146,16 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                         {
                             "name": "default-strict",
                             "namespace": "default",
+                            "scope": {"kind": "mesh_wide"},
                             "mtls_mode": "strict"
                         },
                         {
                             "name": "api-ports",
                             "namespace": "default",
-                            "selector": {"labels": {"app": "api"}},
+                            "scope": {
+                                "kind": "workload_selector",
+                                "selector": {"labels": {"app": "api"}, "namespace": "default"}
+                            },
                             "mtls_mode": "strict",
                             // Keys are typed ports, so a probe key is refused.
                             "port_overrides": {"8080": "permissive"}
@@ -213,7 +217,7 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
             "mesh_policies[].scope.selector.labels",
             "mesh_policies[].rules[].to[].headers",
             "mesh_slice.request_authentications[].scope.selector.labels",
-            "mesh_slice.peer_authentications[].selector.labels",
+            "mesh_slice.peer_authentications[].scope.selector.labels",
         ]),
         "mesh_route_dispatch" => PluginConfigContract::closed(vec![
             json!({

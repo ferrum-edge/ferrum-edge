@@ -29,7 +29,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     publish_dead_letter_payload_with_identity_for_tests, reconcile_active_spool_usage_for_tests,
     render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
-    serialize_json_each_row, serialize_json_each_row_projected, set_spool_walk_hook_for_tests,
+    replay_spool_tick_off_worker_for_tests, serialize_json_each_row,
+    serialize_json_each_row_projected, set_spool_walk_hook_for_tests,
     set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     spool_index_entry_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
@@ -553,6 +554,60 @@ fn grpc_snapshot_bounds_non_standard_terminal_status_cardinality() {
     assert_eq!(events[0].http_status_code, Some(200));
     assert_eq!(events[0].grpc_status, Some(u32::MAX));
     assert_eq!(events[0].call_count, 2);
+}
+
+/// Issue #7112: a repeat charge for a live snapshot identity is found with a
+/// key borrowed from the request summary — including digest-bounded fields
+/// and optional metadata dimensions — so it refreshes the entry the owned key
+/// was stored under instead of creating a second identity.
+#[test]
+fn snapshot_refresh_finds_the_identity_with_a_borrowed_key() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.08,
+        charge_total: 0.08,
+        ..ChargeComputation::default()
+    };
+    let long_consumer = "c".repeat(4096);
+    let mut summary = grpc_summary("borrowed-key", "0");
+    summary.namespace = "n".repeat(4096);
+    summary
+        .metadata
+        .insert("consumer_name".to_string(), "Alice".to_string());
+    summary
+        .metadata
+        .insert("route_id".to_string(), "route-a".to_string());
+    let mut other_route = summary.clone();
+    other_route
+        .metadata
+        .insert("route_id".to_string(), "route-b".to_string());
+
+    accumulator.record_http_for_test(&summary, &long_consumer, charge);
+    accumulator.record_http_for_test(&summary, &long_consumer, charge);
+    accumulator.record_http_for_test(&other_route, &long_consumer, charge);
+    assert_eq!(accumulator.total_call_count_for_tests(), 3);
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-borrowed")
+        .unwrap();
+    events.sort_by(|a, b| a.route_id.cmp(&b.route_id));
+    assert_eq!(events.len(), 2, "one identity per route");
+    assert_eq!(events[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(events[0].call_count, 2, "the repeat refreshed one identity");
+    assert_eq!(events[0].consumer_name.as_deref(), Some("Alice"));
+    assert!(
+        events[0].consumer_id.len() < long_consumer.len(),
+        "the over-long consumer is digest-bounded in the key"
+    );
+    assert_eq!(events[1].route_id.as_deref(), Some("route-b"));
+    assert_eq!(events[1].call_count, 1);
 }
 
 #[tokio::test]
@@ -1429,10 +1484,7 @@ fn disk_owned_bytes(root: &Path) -> u64 {
                 continue;
             }
             let is_temp = name.ends_with(".tmp")
-                && (name.contains(".write-")
-                    || name.ends_with(".ndjson.tmp")
-                    || name.ends_with(".ndjson.zst.tmp")
-                    || name.ends_with(".rejected.meta.tmp"));
+                && (name.contains(".write-") || name.ends_with(".rejected.meta.tmp"));
             let owned = name.ends_with(".inflight")
                 || is_temp
                 || name.ends_with(".ndjson.corrupt")
@@ -1442,7 +1494,6 @@ fn disk_owned_bytes(root: &Path) -> u64 {
                 || ((name.ends_with(".ndjson.zst") || name.ends_with(".ndjson"))
                     && !name.ends_with(".tmp")
                     && !name.ends_with(".corrupt")
-                    && !name.ends_with(".rejected")
                     && !name.ends_with(".meta")
                     && !name.ends_with(".inflight"));
             if owned {
@@ -1655,12 +1706,17 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
     assert_eq!(stats.bytes, encoded_len);
 }
 
+/// A record-write temp another process left behind:
+/// `<data-name>.write-<process_tag>-<generation>.tmp`.
+const FOREIGN_PROCESS_STALE_TEMP: &str =
+    "00000000000000000000000001.ndjson.write-foreignprocess-1.tmp";
+
 #[test]
 fn spool_reconciles_stale_tmp_files_at_startup() {
     let temp = tempfile::tempdir().unwrap();
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; 4096]).unwrap();
 
     let settings = SpoolSettings {
@@ -1692,7 +1748,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let encoded_len = encoded_event_len(&event, SpoolCompression::None);
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
 
     // Construct without going through for_tests' reconcile by using a second
@@ -2720,7 +2776,7 @@ fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
     let temp = tempfile::tempdir().unwrap();
     let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    let stale_tmp = day.join(FOREIGN_PROCESS_STALE_TEMP);
     fs::write(&stale_tmp, vec![0u8; 128]).unwrap();
 
     // Remove directory write bits so unlink of the planted temp fails. Startup
@@ -6401,42 +6457,41 @@ fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
     assert_eq!(replayable, vec![record]);
 }
 
+/// Issue #7115: only the full owner tag binds a record. A record whose name
+/// carries a truncated (16-character) tag is not this identity's record.
 #[test]
-fn version_one_spool_replays_legacy_owner_tags() {
+fn truncated_owner_tag_records_are_not_replayed() {
     let temp = tempfile::tempdir().unwrap();
     let settings = spool_settings(temp.path(), 1024 * 1024);
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let current_record = spool
-        .write_events(&[sample_event("evt-legacy-owner-tag")])
+        .write_events(&[sample_event("evt-truncated-owner-tag")])
         .unwrap();
     let current_tag = spool.owner_tag_for_tests();
-    let legacy_tag = &current_tag[..16];
+    let truncated_tag = &current_tag[..16];
 
-    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
-    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
-    assert_eq!(meta["version"], json!(1));
-    meta["owner_tag"] = json!(legacy_tag);
-    fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
-
-    let legacy_name = current_record
+    let truncated_name = current_record
         .file_name()
         .unwrap()
         .to_string_lossy()
-        .replace(current_tag, legacy_tag);
-    let legacy_record = current_record.with_file_name(legacy_name);
-    fs::rename(&current_record, &legacy_record).unwrap();
+        .replace(current_tag, truncated_tag);
+    let truncated_record = current_record.with_file_name(truncated_name);
+    fs::rename(&current_record, &truncated_record).unwrap();
 
-    assert_eq!(
-        spool.list_replayable_spool_files_for_tests().unwrap(),
-        vec![legacy_record.clone()],
-        "version-1 records with the original 16-character tag remain replayable"
+    assert!(
+        spool
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "a truncated owner tag must not make a record replayable"
     );
-    let claim = spool
-        .claim_replay_file_for_tests(&legacy_record)
-        .unwrap()
-        .expect("a legacy-tagged record remains claimable by its digest owner");
-    assert!(claim.exists());
-    assert!(!legacy_record.exists());
+    assert!(
+        spool
+            .claim_replay_file_for_tests(&truncated_record)
+            .is_err(),
+        "a truncated owner tag must not make a record claimable"
+    );
+    assert!(truncated_record.exists());
 }
 
 #[test]
@@ -6838,9 +6893,7 @@ fn admission_eviction_never_unlinks_a_fresh_peer_process_temp() {
 fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
-    let bomb =
-        encode_spool_bytes_without_content_size_for_tests(&bomb_plain, SpoolCompression::Zstd)
-            .unwrap();
+    let bomb = zstd_frame_within_ratio_window(&bomb_plain, false);
     assert!(
         bomb.len() < 4096,
         "the fixture must exercise a high compression ratio"
@@ -6851,17 +6904,48 @@ fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
         .err()
         .unwrap_or_else(|| panic!("a high-ratio archive must not expand without bound"));
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 
     // A record within the expansion allowance still decodes normally.
-    let ok_plain = vec![b'\n'; 512 * 1024];
+    let (ok_plain, ok_rows) = compressible_json_rows(512 * 1024);
     let ok = encode_spool_bytes_for_tests(&ok_plain, SpoolCompression::Zstd).unwrap();
     let ok_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB4.ndjson.zst");
     fs::write(&ok_path, &ok).unwrap();
     let decoded = decode_spool_file_for_tests(&ok_path).unwrap();
-    assert_eq!(decoded.len(), ok_plain.len());
+    assert_eq!(decoded, ok_rows);
+}
+
+/// A zstd frame whose back-reference window (1 MiB) fits the window replay
+/// grants a frame at the ratio floor, so the bounded streaming reader refuses an
+/// oversized frame by its decoded-byte bound rather than by its window cap.
+/// `declare_size` records the decompressed size in the frame header.
+fn zstd_frame_within_ratio_window(bytes: &[u8], declare_size: bool) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+    encoder.window_log(20).unwrap();
+    if declare_size {
+        encoder
+            .set_pledged_src_size(Some(bytes.len() as u64))
+            .unwrap();
+    }
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Highly compressible JSONEachRow rows totalling about `total_bytes`, as the
+/// spool file bytes (trailing newline) and as the rows the bounded streaming
+/// reader yields (joined by `\n`).
+fn compressible_json_rows(total_bytes: usize) -> (Vec<u8>, String) {
+    const ROW_PAD: usize = 64 * 1024;
+    let rows: Vec<String> = (0..total_bytes.div_ceil(ROW_PAD))
+        .map(|index| format!(r#"{{"row":{index},"pad":"{}"}}"#, "a".repeat(ROW_PAD)))
+        .collect();
+    let joined = rows.join("\n");
+    let mut file = joined.clone().into_bytes();
+    file.push(b'\n');
+    (file, joined)
 }
 
 #[test]
@@ -7690,18 +7774,19 @@ async fn replay_outcomes_delivered_permanent_and_claim_cleanup() {
 }
 
 #[test]
-fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
+fn orphaned_namespaces_are_reported_but_never_replayed() {
     let temp = tempfile::tempdir().unwrap();
     let spec = test_owner_spec("node-a");
     let root = SpoolManager::namespace_root_path_for_tests(temp.path(), &spec).unwrap();
     let plugin_dir = root.parent().unwrap().to_path_buf();
     let node_dir = plugin_dir.parent().unwrap().to_path_buf();
 
-    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/<ULID>.ndjson`.
-    let legacy_day = node_dir.join("20260101");
-    fs::create_dir_all(&legacy_day).unwrap();
-    let legacy = legacy_day.join("00000000000000000000000000.ndjson");
-    fs::write(&legacy, b"{\"event_id\":\"legacy\"}\n").unwrap();
+    // A day directory directly under the node (no owner namespace) is not a
+    // layout this format writes; it is neither reported nor touched.
+    let stray_day = node_dir.join("20260101");
+    fs::create_dir_all(&stray_day).unwrap();
+    let stray = stray_day.join("00000000000000000000000000.ndjson");
+    fs::write(&stray, b"{\"event_id\":\"stray\"}\n").unwrap();
 
     // A namespace orphaned by a destination change.
     let orphan_ns = plugin_dir.join("o00000000000000000000000000000000");
@@ -7713,7 +7798,7 @@ fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
     let settings = spool_settings(temp.path(), 1024 * 1024);
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let (files, namespaces) = spool.unbound_record_counts_for_tests();
-    assert_eq!(files, 2, "both unbound records must be reported");
+    assert_eq!(files, 1, "only the orphaned namespace's record is reported");
     assert_eq!(namespaces, 1, "the orphaned namespace must be reported");
     let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
     assert!(
@@ -7723,7 +7808,10 @@ fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
 
     // Writing under the new identity leaves the unbound records untouched.
     spool.write_events(&[sample_event("evt-new")]).unwrap();
-    assert!(legacy.exists(), "legacy records must never be deleted");
+    assert!(
+        stray.exists(),
+        "records outside the namespace are never deleted"
+    );
     assert!(orphan.exists(), "orphaned records must never be deleted");
 }
 
@@ -8022,6 +8110,51 @@ fn snapshot_cardinality_overflow_bounds_entries_and_preserves_protocol_dimension
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].protocol, "tcp");
     assert_eq!(events[1].protocol, "ws");
+}
+
+/// Issue #7112: a billable record hook that runs after its snapshot generation
+/// closed admission (a request that outlived a reload or shutdown) cannot be
+/// accumulated or spooled, so it is counted instead of vanishing silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_charges_after_admission_closes_are_counted() {
+    use ferrum_edge::_test_support::api_chargeback_sink_finalize_snapshot_for_test;
+
+    const LATE: &str = "chargeback_sink_snapshot_late_charges_dropped_total";
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("late-charge-spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let mut config = valid_config(&spool_dir);
+    config["mode"] = json!("snapshot");
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let before = prometheus_counter(&render_prometheus(), LATE);
+    plugin.log(&billable_summary("admitted-charge")).await;
+    assert_eq!(
+        prometheus_counter(&render_prometheus(), LATE),
+        before,
+        "an admitted charge is accumulated, not counted as late"
+    );
+
+    assert!(
+        api_chargeback_sink_finalize_snapshot_for_test(&plugin)
+            .await
+            .is_some(),
+        "finalization closes snapshot admission"
+    );
+    plugin.log(&billable_summary("late-charge")).await;
+    plugin.log(&billable_summary("late-charge-2")).await;
+    assert_eq!(
+        prometheus_counter(&render_prometheus(), LATE),
+        before + 2,
+        "every billable hook after admission closed is counted"
+    );
+    drop(plugin);
 }
 
 #[tokio::test]
@@ -12762,6 +12895,37 @@ fn insert_url_carries_params_but_redacted_form_does_not() {
     assert!(!redacted.contains("INSERT"));
 }
 
+/// Issue #7112: spool replay reuses the live delivery client, so activating a
+/// custom-TLS sink builds one dedicated ClickHouse client — its TLS files are
+/// read and its insecure-TLS warning is logged once, not once per pool.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn custom_tls_sink_builds_one_clickhouse_client_for_delivery_and_replay() {
+    const WARNING: &str = "ClickHouse TLS hostname verification is disabled";
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://clickhouse.example:8443");
+    // reqwest's rustls backend only disables hostname verification together
+    // with a pinned CA or with certificate verification off; this test needs
+    // no CA file, so it turns both off.
+    config["clickhouse"]["tls"] = json!({ "verify_hostname": false, "insecure_skip_verify": true });
+    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum")
+        .expect("custom-TLS sink with spool");
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    plugin
+        .start_background_tasks()
+        .expect("activate custom-TLS sink");
+    drop(guard);
+
+    assert_eq!(
+        logs.contents().matches(WARNING).count(),
+        1,
+        "one dedicated client serves live delivery and spool replay"
+    );
+    drop(plugin);
+}
+
 /// The custom-TLS (`Dedicated`) client path classifies its transport failure
 /// rather than rendering the `reqwest::Error`, so the INSERT URL cannot reach a
 /// log line or the returned replay error.
@@ -13374,19 +13538,16 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
     // them, and the clamp must still fail closed on a high-ratio bomb.
     let temp = tempfile::tempdir().unwrap();
 
-    let plain = vec![b'\n'; 512 * 1024];
-    let legacy =
-        encode_spool_bytes_without_content_size_for_tests(&plain, SpoolCompression::Zstd).unwrap();
+    let (plain, rows) = compressible_json_rows(512 * 1024);
+    let legacy = zstd_frame_within_ratio_window(&plain, false);
     let legacy_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC1.ndjson.zst");
     fs::write(&legacy_path, &legacy).unwrap();
     let decoded = decode_spool_file_for_tests(&legacy_path)
         .expect("a frame without a content size must still decode");
-    assert_eq!(decoded.len(), plain.len());
+    assert_eq!(decoded, rows);
 
     let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
-    let bomb =
-        encode_spool_bytes_without_content_size_for_tests(&bomb_plain, SpoolCompression::Zstd)
-            .unwrap();
+    let bomb = zstd_frame_within_ratio_window(&bomb_plain, false);
     let bomb_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC2.ndjson.zst");
     fs::write(&bomb_path, &bomb).unwrap();
     let err = decode_spool_file_for_tests(&bomb_path)
@@ -13395,7 +13556,7 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
             panic!("the ratio clamp must still bound a header-less high-ratio archive")
         });
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 }
@@ -13427,7 +13588,7 @@ fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
     // must not let a planted high-ratio archive bypass the ratio limit.
     let temp = tempfile::tempdir().unwrap();
     let plain = vec![b'\n'; 2 * 1024 * 1024];
-    let encoded = encode_spool_bytes_without_ratio_padding_for_tests(&plain).unwrap();
+    let encoded = zstd_frame_within_ratio_window(&plain, true);
     let ratio_bound = spool_decompression_limit_for_tests(encoded.len() as u64);
     assert!(
         ratio_bound < plain.len() as u64,
@@ -13441,7 +13602,7 @@ fn a_declared_zstd_size_cannot_bypass_the_decompression_ratio_limit() {
         .err()
         .unwrap_or_else(|| panic!("a declared size must not bypass the decompression-ratio limit"));
     assert!(
-        err.contains("decompression bound"),
+        err.contains("decoded-byte bound"),
         "unexpected error: {err}"
     );
 }
@@ -14845,6 +15006,145 @@ async fn cancelled_replay_releases_its_claim_for_the_next_generation() {
         String::from_utf8_lossy(&requests[0].body).contains("evt-cancelled-replay"),
         "the replayed row must keep its original event_id"
     );
+    assert!(!record.exists(), "a delivered artifact leaves the spool");
+}
+
+/// Issue #7111: a replay tick's synchronous spool work (listing, claim,
+/// streaming preflight, dead-letter publication) runs on the blocking pool, so
+/// another task on a one-worker runtime keeps making progress while the tick
+/// is held inside that work.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn replay_tick_synchronous_work_leaves_the_runtime_worker_free() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = Arc::new(test_spool(&temp));
+    let record = spool
+        .write_events(&[sample_event("evt-off-worker-replay")])
+        .unwrap();
+
+    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
+    let (progress_tx, progress_rx) = mpsc::channel::<()>();
+    let progress_rx = Mutex::new(progress_rx);
+    let entered = Arc::new(AtomicBool::new(false));
+    let progressed = Arc::new(AtomicBool::new(false));
+    let entered_hook = Arc::clone(&entered);
+    let progressed_hook = Arc::clone(&progressed);
+    let _clear = ClearReplayHookOnDrop;
+    set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
+        if point != SpoolReplayHookPoint::AfterStreamingPreflight
+            || !claimed.starts_with(&namespace_root)
+        {
+            return;
+        }
+        entered_hook.store(true, Ordering::Release);
+        // Hold the tick inside its synchronous section until a task that
+        // needs the runtime's only worker reports progress.
+        let reported = progress_rx
+            .lock()
+            .expect("progress receiver")
+            .recv_timeout(Duration::from_secs(10))
+            .is_ok();
+        progressed_hook.store(reported, Ordering::Release);
+    })));
+
+    let probe_entered = Arc::clone(&entered);
+    let probe = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !probe_entered.load(Ordering::Acquire) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let _ = progress_tx.send(());
+    });
+    let uri = server.uri();
+    let tick_spool = Arc::clone(&spool);
+    let tick =
+        tokio::spawn(async move { replay_spool_tick_off_worker_for_tests(tick_spool, &uri).await });
+
+    tick.await
+        .expect("replay tick task")
+        .expect("replay tick delivers the record");
+    probe.await.expect("progress probe task");
+    assert!(
+        entered.load(Ordering::Acquire),
+        "the tick must reach its synchronous streaming preflight"
+    );
+    assert!(
+        progressed.load(Ordering::Acquire),
+        "another task on the runtime's only worker must run while the tick is inside synchronous spool work"
+    );
+    assert!(!record.exists(), "a delivered artifact leaves the spool");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// Aborting the production replay task (what a retiring generation does) while
+/// the off-worker tick awaits its POST still releases the claim back to the
+/// durable replayable name: the cancellation reaches the blocking-pool tick at
+/// its next await.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_off_worker_replay_tick_releases_its_claim() {
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+        .mount(&slow)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = Arc::new(test_spool(&temp));
+    let record = spool
+        .write_events(&[sample_event("evt-cancelled-off-worker-replay")])
+        .unwrap();
+
+    let uri = slow.uri();
+    let tick_spool = Arc::clone(&spool);
+    let tick =
+        tokio::spawn(async move { replay_spool_tick_off_worker_for_tests(tick_spool, &uri).await });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while slow
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the replay tick must reach its delivery POST"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    tick.abort();
+    let _ = tick.await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !record.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "a cancelled off-worker tick must release its claim back to the durable replayable name"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        spool
+            .list_owned_spool_files_for_tests()
+            .unwrap()
+            .iter()
+            .all(|path| !path.to_string_lossy().ends_with(".inflight")),
+        "no stranded in-flight claim may remain after cancellation"
+    );
+
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&healthy)
+        .await;
+    replay_spool_once_for_tests(&spool, &healthy.uri())
+        .await
+        .expect("the released artifact must replay once ClickHouse recovers");
+    assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
     assert!(!record.exists(), "a delivered artifact leaves the spool");
 }
 

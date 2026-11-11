@@ -59,7 +59,11 @@
 //!   canonically encoded — is not an RSA modulus.
 //! - an **RSA public exponent** must be odd and at least 3, within a bounded
 //!   encoding. `0` and `1` are not exponents and an even value cannot be coprime
-//!   with φ(n); real keys are 65537.
+//!   with φ(n); real keys are 65537. While `FERRUM_FIPS_MODE=enforce` is in
+//!   effect the exponent is additionally held to the `crate::fips::keys` JWKS
+//!   rule (odd and greater than 65536), and an EC curve to its approved set, so
+//!   a federated or configured authority meets the same key policy as every
+//!   plugin JWKS signing key.
 //! - externally supplied RSA `n` / `e` must additionally be **canonical**
 //!   unsigned big-endian (RFC 7518 §6.3.1) — no leading zero octet. DER
 //!   re-encoding would otherwise normalize a non-canonical member silently and
@@ -943,8 +947,34 @@ fn spki_der_from_pem(pem: &str) -> Result<Vec<u8>, JwtSvidError> {
 }
 
 /// Decompose an SPKI DER document into JWK members and the algorithms its key
-/// type is allowed to have signed with.
+/// type is allowed to have signed with, under this process's FIPS mode.
 fn jwk_public_key(spki_der: &[u8]) -> Result<JwkPublicKey, JwtSvidError> {
+    jwk_public_key_for_profile(spki_der, crate::fips::is_enforcing())
+}
+
+/// Admit a JWT authority's SPKI PEM public key exactly as admission does while
+/// `FERRUM_FIPS_MODE=enforce` is in effect, regardless of this process's mode.
+///
+/// Every admission path ([`authorities_from_jwks`], [`jwks_document`],
+/// [`validate_published_authorities`], [`decoding_key_for_authority`]) applies
+/// this rule automatically when FIPS mode is enforced; this entry point exists
+/// so the enforced rule can be exercised on a build that cannot enforce.
+pub fn check_authority_public_key_fips_enforced(public_key_pem: &str) -> Result<(), JwtSvidError> {
+    let spki_der = spki_der_from_pem(public_key_pem)?;
+    jwk_public_key_for_profile(&spki_der, true).map(|_| ())
+}
+
+/// [`jwk_public_key`] with the FIPS profile made explicit.
+///
+/// While FIPS mode is enforced, a JWT authority is held to the same key policy
+/// as every other JWKS signing key (`crate::fips::keys`): an RSA public
+/// exponent must be odd and greater than 65536, and an EC key must name an
+/// approved curve. The default-profile floor (odd, at least 3) is the RFC 8017
+/// minimum, which SP 800-56B / FIPS 186-5 raise for an approved key.
+fn jwk_public_key_for_profile(
+    spki_der: &[u8],
+    fips_enforcing: bool,
+) -> Result<JwkPublicKey, JwtSvidError> {
     let (rest, spki) = SubjectPublicKeyInfo::from_der(spki_der).map_err(|_| {
         JwtSvidError::InvalidAuthority("JWT authority public key is not a valid SPKI document")
     })?;
@@ -975,6 +1005,13 @@ fn jwk_public_key(spki_der: &[u8]) -> Result<JwkPublicKey, JwtSvidError> {
             // the curve at all. Prove it does before the key is published or
             // used to build a verifier.
             check_ec_point_on_curve(&curve, data)?;
+            if fips_enforcing
+                && crate::fips::keys::check_jwk_ec_curve_enforced(curve.jwk_name).is_err()
+            {
+                return Err(JwtSvidError::InvalidAuthority(
+                    "JWT authority EC curve is not admitted while FIPS mode is enforced",
+                ));
+            }
             let (x, y) = data[1..].split_at(curve.coordinate_bytes);
             Ok(JwkPublicKey {
                 kty: "EC",
@@ -992,6 +1029,14 @@ fn jwk_public_key(spki_der: &[u8]) -> Result<JwkPublicKey, JwtSvidError> {
             let exponent = strip_leading_zeros(rsa.exponent);
             check_rsa_modulus(modulus)?;
             check_rsa_exponent(exponent)?;
+            if fips_enforcing
+                && crate::fips::keys::check_jwk_rsa_public_key_enforced(modulus, exponent).is_err()
+            {
+                return Err(JwtSvidError::InvalidAuthority(
+                    "JWT authority RSA public key is not admitted while FIPS mode is enforced; \
+                     the public exponent must be odd and greater than 65536",
+                ));
+            }
             Ok(JwkPublicKey {
                 kty: "RSA",
                 members: vec![

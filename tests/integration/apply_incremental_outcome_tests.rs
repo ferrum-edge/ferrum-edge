@@ -103,7 +103,6 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
@@ -1875,7 +1874,8 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
         panic!("misspelled ip_restriction allow list must reject reload");
     };
     assert!(errors.iter().any(|error| {
-        error.contains("ip_restriction") && error.contains("unknown configuration field \"alow\"")
+        error.contains("ip_restriction")
+            && error.contains("unknown configuration key(s): \"config.alow\"")
     }));
     assert_eq!(
         state.config.load().plugin_configs[0].config,

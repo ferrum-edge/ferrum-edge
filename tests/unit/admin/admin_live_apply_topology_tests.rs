@@ -24,7 +24,7 @@ use ferrum_edge::admin::{
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::runtime_config_apply::{
-    LiveApplyFailure, LiveApplyMode, RuntimeConfigApply,
+    LiveApplyCursor, LiveApplyFailure, LiveApplyMode, RuntimeConfigApply,
 };
 use ferrum_edge::config::types::{Proxy, default_namespace};
 use http_body_util::{BodyExt, Full};
@@ -148,15 +148,15 @@ async fn prepare_is_noop_without_coordinator_or_served_namespace() {
         .prepare_live_apply_after_commit(&default_namespace(), 0)
         .await
         .expect("no coordinator must skip the sequence read");
-    assert!(prepared.is_noop());
+    assert_eq!(prepared.covering_cursor(), None);
 
-    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch("ferrum", 0, 0));
     let served = live_apply_state(db, Some(apply));
     let other = served
         .prepare_live_apply_after_commit("other", 0)
         .await
         .expect("unserved namespace must skip the sequence read");
-    assert!(other.is_noop());
+    assert_eq!(other.covering_cursor(), None);
 }
 
 #[tokio::test]
@@ -173,7 +173,7 @@ async fn covering_watermark_is_max_sequence_not_an_exact_row() {
         "two durable writes must produce a covering watermark of at least 2, got {covering}"
     );
 
-    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch("ferrum", 0, 0));
     let topology_epoch = store.config_topology_epoch();
     let db: Arc<dyn DatabaseBackend> = Arc::new(store);
     let state = live_apply_state(db, Some(apply));
@@ -181,7 +181,10 @@ async fn covering_watermark_is_max_sequence_not_an_exact_row() {
         .prepare_live_apply_after_commit(&default_namespace(), topology_epoch)
         .await
         .expect("sequence read on the pinned store");
-    assert_eq!(prepared.covering_sequence(), Some(covering));
+    assert_eq!(
+        prepared.covering_cursor(),
+        Some(LiveApplyCursor::new(topology_epoch, covering))
+    );
 }
 
 #[tokio::test]
@@ -192,7 +195,7 @@ async fn sequence_unavailable_returns_applied_false() {
         .await
         .unwrap();
     database_store_set_latest_change_sequence_fault_for_test(&store, true);
-    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch("ferrum", 0, 0));
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let state = live_apply_state(db, Some(apply));
 
@@ -216,7 +219,7 @@ async fn sequence_unavailable_returns_applied_false() {
 #[tokio::test]
 async fn active_coordinator_without_database_store_fails_closed() {
     let (store, _primary, _failover, _tmp) = sqlite_pair().await;
-    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch("ferrum", 0, 0));
     let db: Arc<dyn DatabaseBackend> = Arc::new(store);
     let state = AdminState {
         db: None,
@@ -309,8 +312,8 @@ async fn captured_sequence_fails_closed_after_pinned_topology_is_replaced() {
         .await
         .expect("sequence query while pin is held");
     assert_eq!(
-        prepared.covering_sequence(),
-        Some(primary_covering),
+        prepared.covering_cursor(),
+        Some(LiveApplyCursor::new(primary_epoch, primary_covering)),
         "covering watermark must come from the pinned primary, not a stale failover pool"
     );
     assert!(
@@ -360,7 +363,7 @@ async fn complete_releases_pin_and_fails_when_reconnect_replaces_topology() {
         .await
         .unwrap();
     let ns = default_namespace();
-    let apply = Arc::new(RuntimeConfigApply::new("ferrum", 0));
+    let apply = Arc::new(RuntimeConfigApply::at_epoch("ferrum", 0, 0));
     let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
     let state = live_apply_state(db, Some(apply.clone()));
 

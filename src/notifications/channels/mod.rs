@@ -4,7 +4,7 @@
 //! payload shape (or, for the email channel, an RFC 5322 message). The
 //! [`NotificationChannel`] enum provides a uniform
 //! `dispatch` surface so callers can hand a list of `Arc<NotificationChannel>`
-//! to [`crate::notifications::dispatch::dispatch`] without caring which
+//! to [`crate::notifications::dispatch::dispatch_one`] without caring which
 //! transport each one uses.
 
 use std::collections::HashMap;

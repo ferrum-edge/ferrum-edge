@@ -526,7 +526,7 @@ split-debuginfo = "unpacked"
 # including a background poller or accept loop — terminates the process.
 # Background-task supervisors still handle non-panic unexpected exits.
 # Operators must run a process supervisor (systemd, Kubernetes). See
-# PRODUCTION_READINESS.md ("Deliberate decisions") and docs/ci_cd.md.
+# docs/deliberate_decisions.md and docs/ci_cd.md.
 [profile.release]
 opt-level = 3
 lto = "fat"             # fat LTO: full cross-crate inlining for maximum hot-path perf

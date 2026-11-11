@@ -16,10 +16,9 @@ Closing tracker for the Phase-8 gap-fill continuation: [#2032](https://github.co
 | Surface | Location |
 |---|---|
 | Ports / certs / harness | `tests/scaffolding/{ports,certs,harness,matrix,mod}.rs` |
-| Scripted backends | `tests/scaffolding/backends/` (`tcp`, `tls`, `http1`, `http2`, `http3`, `grpc`, `udp`, `dtls`, plus QUIC helpers) |
+| Scripted backends | `tests/scaffolding/backends/` (`tcp`, `tls`, `http1`, `http2`, `http3`, `grpc`, `udp`, plus QUIC helpers) |
 | Clients | `tests/scaffolding/clients/` |
-| Network simulation | `tests/scaffolding/network/` (`latency`, `bandwidth`, `truncate`, `proxy`) |
-| Scenario catalog | `tests/scenarios/catalog.rs` |
+| Network simulation | `tests/scaffolding/network/` (`latency`, `bandwidth`, `proxy`) |
 | Functional coverage | `tests/functional/scripted_backend_*.rs`, plus capability/retry/overload/plugin-network suites that consume the scaffolding |
 
 Current patterns: file-backed child stdout/stderr capture with null stdin;
@@ -43,10 +42,10 @@ retry. See [Functional Testing Guide](../functional_testing.md#subprocess-harnes
 | 1 — TCP / TLS / HTTP/1.1 | Scripted backends + certs/ports/harness | **Implemented** (`tests/scaffolding/backends/{tcp,tls,http1}.rs`, `scripted_backend_tests.rs`) |
 | 2 — HTTP/2 (+ gRPC framing) | Frame-level H2 control | **Implemented** (`backends/http2.rs`, `backends/grpc.rs`, `scripted_backend_h2_tests.rs`) |
 | 3 — HTTP/3 / QUIC | QUIC refuse/close + H3 scripts | **Implemented** (`backends/http3.rs`, QUIC helpers, `scripted_backend_h3_tests.rs`) |
-| 4 — UDP / DTLS | Per-datagram scripting | **Implemented** (`backends/udp.rs`, `backends/dtls.rs`, `scripted_backend_udp_tests.rs`) |
-| 5 — Network simulation | Latency / bandwidth / truncate wrappers | **Implemented** (`tests/scaffolding/network/`, `scripted_backend_network_sim_tests.rs`) |
+| 4 — UDP / DTLS | Per-datagram scripting | **Implemented** (`backends/udp.rs`, `scripted_backend_udp_tests.rs`; DTLS frontends use the gateway's own `ferrum_edge::dtls` server/client) |
+| 5 — Network simulation | Latency / bandwidth wrappers | **Implemented** (`tests/scaffolding/network/`, `scripted_backend_network_sim_tests.rs`) |
 | 6 — Cross-protocol matrix macro | `gateway_matrix!` | **Implemented** (`tests/scaffolding/matrix.rs`, `scripted_backend_matrix_tests.rs`) |
-| 7 — Scenario catalog | Shared failure scripts | **Implemented** (`tests/scenarios/catalog.rs`) |
+| 7 — Scenario catalog | Shared failure scripts | **Removed** (#7300): no test used it; scripted-backend tests build their scripts inline |
 | 8 — Capability / retry / overload / plugin-network gap-fill | Close review-flagged scenarios | **Implemented** (continuation closed in #2032; suites under `functional_capability_registry_test`, `functional_retry_test`, `functional_overload_test`, `functional_plugins_network_test`, plus scripted streaming-latency coverage) |
 
 `HarnessMode::InProcess` is live: `tests/scaffolding/harness.rs` calls

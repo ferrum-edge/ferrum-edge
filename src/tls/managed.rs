@@ -266,7 +266,6 @@ impl ManagedTlsStore {
 
     /// As [`Self::open`], with an explicit material ceiling (the record ceiling
     /// still comes from the environment).
-    #[allow(dead_code)] // External unit tests; production uses open.
     pub fn open_with_material_limit(
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,
@@ -320,7 +319,6 @@ impl ManagedTlsStore {
     }
 
     /// Configured logical record admission ceiling.
-    #[allow(dead_code)] // External unit tests call this through the library target.
     pub fn max_records(&self) -> usize {
         self.max_records
     }
@@ -329,7 +327,6 @@ impl ManagedTlsStore {
     ///
     /// Non-secret; exposed so operators and tests can observe that a write
     /// committed and that another instance's write became visible.
-    #[allow(dead_code)]
     pub fn store_version(&self) -> Result<u64, ManagedTlsError> {
         Ok(self.file.version()?)
     }
@@ -412,7 +409,6 @@ impl ManagedTlsStore {
         })
     }
 
-    #[allow(dead_code)] // External unit tests; production uses material_with_limit.
     pub fn material(
         &self,
         identifier: &str,

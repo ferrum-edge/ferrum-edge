@@ -42,8 +42,39 @@ use crate::proxy::response_watchdog::{
 /// bounded class that wrapper will publish. Neither carries credential material.
 #[derive(Clone)]
 struct StreamAuthDeadlineState {
+    /// Set when the bound fired, by the adapter OR by the gateway-owned pump
+    /// from another task. Health-neutral classification only: see
+    /// [`ClientGrpcDeadlineState::fired`].
     fired: Arc<AtomicBool>,
+    /// Set only by the adapter itself when it emits its terminal: see
+    /// [`ClientGrpcDeadlineState::terminal_emitted`].
+    terminal_emitted: Arc<AtomicBool>,
     termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+}
+
+/// Client RPC deadline state carried on a client-visible response body.
+#[derive(Clone)]
+struct ClientGrpcDeadlineState {
+    /// Set when the client RPC deadline fired: by the adapter
+    /// ([`TotalDeadlineBody`]) on the polling task, or by the gateway-owned
+    /// response pump / settled-response watchdog from ANOTHER task. It can
+    /// therefore flip between the adapter returning an ordinary backend frame
+    /// and a reader loading it, so it drives health-neutral classification
+    /// only, never "this frame is the gateway's terminal".
+    fired: Arc<AtomicBool>,
+    /// Set ONLY by [`TotalDeadlineBody::emit_deadline_terminal`], on the
+    /// polling task and before it returns the synthesized terminal. The one
+    /// positive identification of that frame (issue #7177).
+    terminal_emitted: Arc<AtomicBool>,
+}
+
+impl ClientGrpcDeadlineState {
+    fn new() -> Self {
+        Self {
+            fired: Arc::new(AtomicBool::new(false)),
+            terminal_emitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 pub(crate) type BoxError = ProxyBodyError;
@@ -84,10 +115,10 @@ pub struct ProxyBody {
     _backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>,
     backend_admission_outcome: Option<DeferredBackendAdmissionOutcome>,
     backend_dispatch_outcome: Option<DeferredBackendDispatchOutcome>,
-    /// Set by absolute client-RPC deadline wrappers when they synthesize the
-    /// terminal deadline frame (or abort after partial DATA). Deferred backend
-    /// accounting uses this signal to keep a client-chosen expiry neutral.
-    client_grpc_deadline_fired: Option<Arc<AtomicBool>>,
+    /// Shared with the absolute client-RPC deadline wrapper. Its `fired` flag
+    /// keeps a client-chosen expiry neutral in deferred backend accounting;
+    /// its `terminal_emitted` flag identifies the synthesized terminal frame.
+    client_grpc_deadline: Option<ClientGrpcDeadlineState>,
     /// The client RPC deadline's gateway-owned response pump, held HERE — on
     /// the body hyper owns — rather than by the adapter that reads it, so its
     /// post-deadline transport-close grace survives an outer authorization
@@ -660,26 +691,10 @@ impl http_body::Body for GrpcWebStreamingBody {
                     // already have produced a body-framed gRPC-Web terminal status.
                     // Preserve it verbatim (especially text mode, which is already
                     // base64-encoded) and expose its status to the outer deferred
-                    // logger. The authorization deadline is checked first so an
-                    // expired credential is reported as `UNAUTHENTICATED` rather
-                    // than a client-chosen `DEADLINE_EXCEEDED`.
-                    let inner_auth_deadline_fired = this
-                        .inner
-                        .stream_auth_deadline
-                        .as_ref()
-                        .is_some_and(|state| state.fired.load(Ordering::Acquire));
-                    let inner_deadline_fired = inner_auth_deadline_fired
-                        || this
-                            .inner
-                            .client_grpc_deadline_fired
-                            .as_ref()
-                            .is_some_and(|flag| flag.load(Ordering::Acquire));
-                    if inner_deadline_fired {
-                        let terminal_status = if inner_auth_deadline_fired {
-                            crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED
-                        } else {
-                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED
-                        };
+                    // logger. Keyed on the wrapper's own emission, not on `fired`,
+                    // which the response pump can set while an ordinary backend
+                    // frame is on its way up (issue #7177).
+                    if let Some(terminal_status) = this.inner.emitted_deadline_terminal_status() {
                         if !this.charge_output(data.len()) {
                             return Poll::Ready(Some(Err(response_body_too_large_error())));
                         }
@@ -770,22 +785,10 @@ struct GrpcWebPassthroughBody {
 
 impl GrpcWebPassthroughBody {
     /// Status of a gateway terminal that a deadline wrapper below this relay
-    /// has selected, or `None` while the backend still owns the stream. The
+    /// has emitted, or `None` while the backend still owns the stream. The
     /// authorization deadline wins over a client-chosen deadline.
     fn gateway_terminal_status(&self) -> Option<u32> {
-        if self
-            .inner
-            .stream_auth_deadline
-            .as_ref()
-            .is_some_and(|state| state.fired.load(Ordering::Acquire))
-        {
-            return Some(crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED);
-        }
-        self.inner
-            .client_grpc_deadline_fired
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-            .then_some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
+        self.inner.emitted_deadline_terminal_status()
     }
 }
 
@@ -911,7 +914,7 @@ impl ProxyBody {
             _backend_admission_permits: None,
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
-            client_grpc_deadline_fired: None,
+            client_grpc_deadline: None,
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
@@ -960,7 +963,7 @@ impl ProxyBody {
             _backend_admission_permits: None,
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
-            client_grpc_deadline_fired: None,
+            client_grpc_deadline: None,
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
@@ -1030,7 +1033,7 @@ impl ProxyBody {
         max_response_body_size_bytes: usize,
     ) -> Self {
         let mut inner = self;
-        let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
+        let client_grpc_deadline = inner.client_grpc_deadline.clone();
         let stream_auth_deadline = inner.stream_auth_deadline.clone();
         let logger = inner.logger.take();
         let backend_admission_permits = inner._backend_admission_permits.take();
@@ -1053,7 +1056,7 @@ impl ProxyBody {
         body._backend_admission_permits = backend_admission_permits;
         body.backend_admission_outcome = backend_admission_outcome;
         body.backend_dispatch_outcome = backend_dispatch_outcome;
-        body.client_grpc_deadline_fired = client_grpc_deadline_fired;
+        body.client_grpc_deadline = client_grpc_deadline;
         body.stream_auth_deadline = stream_auth_deadline;
         body.grpc_web_terminal_status = Some(terminal_status);
         body.logger = logger;
@@ -1084,7 +1087,7 @@ impl ProxyBody {
         let mut inner = self;
         let grpc_messages = inner.grpc_messages.take();
         inner.grpc_scanner = None;
-        let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
+        let client_grpc_deadline = inner.client_grpc_deadline.clone();
         let stream_auth_deadline = inner.stream_auth_deadline.clone();
         let logger = inner.logger.take();
         let backend_admission_permits = inner._backend_admission_permits.take();
@@ -1110,7 +1113,7 @@ impl ProxyBody {
         body._backend_admission_permits = backend_admission_permits;
         body.backend_admission_outcome = backend_admission_outcome;
         body.backend_dispatch_outcome = backend_dispatch_outcome;
-        body.client_grpc_deadline_fired = client_grpc_deadline_fired;
+        body.client_grpc_deadline = client_grpc_deadline;
         body.stream_auth_deadline = stream_auth_deadline;
         body.grpc_web_terminal_status = Some(terminal_status);
         body.grpc_web_passthrough_status = Some(observed_status);
@@ -1389,25 +1392,25 @@ impl ProxyBody {
             );
             Frame::data(Bytes::from(response.body))
         });
-        let fired = Arc::new(AtomicBool::new(false));
+        let state = ClientGrpcDeadlineState::new();
         let deadline = ClientGrpcResponseDeadline::new(deadline, closer);
         let placeholder = ProxyBodyKind::Full(Full::default());
         let previous = std::mem::replace(&mut self.kind, placeholder);
         let (kind, pump) = match previous {
             ProxyBodyKind::Stream(body) => {
                 let (timed, pump) =
-                    client_grpc_deadline_body(body, deadline, deadline_frame, Arc::clone(&fired));
+                    client_grpc_deadline_body(body, deadline, deadline_frame, &state);
                 (ProxyBodyKind::Stream(Box::pin(timed)), pump)
             }
             ProxyBodyKind::Tracked(body) => {
                 let (timed, pump) =
-                    client_grpc_deadline_body(body, deadline, deadline_frame, Arc::clone(&fired));
+                    client_grpc_deadline_body(body, deadline, deadline_frame, &state);
                 (ProxyBodyKind::Stream(Box::pin(timed)), pump)
             }
             full @ ProxyBodyKind::Full(_) => (full, None),
         };
         self.kind = kind;
-        self.client_grpc_deadline_fired = Some(fired);
+        self.client_grpc_deadline = Some(state);
         self.retain_client_grpc_deadline_pump(pump);
         self
     }
@@ -1499,12 +1502,35 @@ impl ProxyBody {
 
     fn with_client_grpc_deadline_state(
         mut self,
-        fired: Arc<AtomicBool>,
+        state: ClientGrpcDeadlineState,
         pump: Option<ResponsePumpGuard>,
     ) -> Self {
-        self.client_grpc_deadline_fired = Some(fired);
+        self.client_grpc_deadline = Some(state);
         self.retain_client_grpc_deadline_pump(pump);
         self
+    }
+
+    /// The gRPC status of the terminal a deadline adapter below this body has
+    /// EMITTED, or `None` while the backend still owns the stream. The
+    /// authorization deadline wins over a client-chosen deadline.
+    ///
+    /// Reads the adapters' `terminal_emitted` flags, never `fired`: the
+    /// gateway-owned response pump stores `fired` from another task, so a
+    /// claim landing between the adapter returning an ordinary backend DATA
+    /// frame and this load would otherwise take that frame for the
+    /// gateway's terminal (issue #7177).
+    fn emitted_deadline_terminal_status(&self) -> Option<u32> {
+        if self
+            .stream_auth_deadline
+            .as_ref()
+            .is_some_and(|state| state.terminal_emitted.load(Ordering::Acquire))
+        {
+            return Some(crate::proxy::grpc_proxy::grpc_status::UNAUTHENTICATED);
+        }
+        self.client_grpc_deadline
+            .as_ref()
+            .is_some_and(|state| state.terminal_emitted.load(Ordering::Acquire))
+            .then_some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
     }
 
     /// Bound this client-visible response body by the accepted credential's
@@ -1631,6 +1657,7 @@ impl ProxyBody {
             Frame::data(Bytes::from(response.body))
         });
         let fired = Arc::new(AtomicBool::new(false));
+        let terminal_emitted = Arc::new(AtomicBool::new(false));
         // The adapter and the gateway-owned watchdog settle through ONE latch,
         // so the pair records exactly one fixed-cardinality termination for this
         // stream whichever of them fires first — including when the caller
@@ -1658,7 +1685,8 @@ impl ProxyBody {
                     terminal,
                     Some(auth_latch),
                 )
-                .with_authorization_terminal_owner(owner);
+                .with_authorization_terminal_owner(owner)
+                .reporting_terminal_emission(Arc::clone(&terminal_emitted));
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
             ProxyBodyKind::Tracked(body) => {
@@ -1680,7 +1708,8 @@ impl ProxyBody {
                     terminal,
                     Some(auth_latch),
                 )
-                .with_authorization_terminal_owner(owner);
+                .with_authorization_terminal_owner(owner)
+                .reporting_terminal_emission(Arc::clone(&terminal_emitted));
                 ProxyBodyKind::Stream(Box::pin(bounded))
             }
             full @ ProxyBodyKind::Full(_) => full,
@@ -1688,6 +1717,7 @@ impl ProxyBody {
         if matches!(self.kind, ProxyBodyKind::Stream(_)) {
             self.stream_auth_deadline = Some(StreamAuthDeadlineState {
                 fired,
+                terminal_emitted,
                 termination: deadline.termination,
             });
         }
@@ -1764,7 +1794,7 @@ impl ProxyBody {
             _backend_admission_permits: None,
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
-            client_grpc_deadline_fired: None,
+            client_grpc_deadline: None,
             client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
@@ -2049,9 +2079,9 @@ impl http_body::Body for ProxyBody {
             .filter(|state| state.fired.load(Ordering::Acquire))
             .map(|state| state.termination);
         let client_deadline_fired = this
-            .client_grpc_deadline_fired
+            .client_grpc_deadline
             .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
+            .is_some_and(|state| state.fired.load(Ordering::Acquire))
             || auth_deadline_termination.is_some();
         let grpc_web_terminal_status = this
             .grpc_web_terminal_status
@@ -2077,12 +2107,14 @@ impl http_body::Body for ProxyBody {
                 }
                 let is_trailers = frame.trailers_ref().is_some();
                 // A client-deadline wrapper emits gRPC-Web terminal metadata as
-                // an encoded DATA frame rather than native HTTP trailers. The
-                // shared fired flag is set before that frame is returned, and a
-                // partial-body expiry returns an error instead, so this signal
-                // uniquely identifies the successful terminal deadline frame.
+                // an encoded DATA frame rather than native HTTP trailers. Only
+                // the wrapper's own emission identifies that frame: the shared
+                // `fired` flag can be stored by the response pump from another
+                // task after the wrapper returned an ordinary backend DATA
+                // frame (issue #7177). A partial-body expiry returns an error
+                // instead, so emission plus DATA is the terminal frame.
                 let is_grpc_web_deadline_terminal =
-                    client_deadline_fired && frame.data_ref().is_some();
+                    frame.data_ref().is_some() && this.emitted_deadline_terminal_status().is_some();
                 let is_grpc_web_streaming_terminal =
                     grpc_web_terminal_status.is_some() && frame.data_ref().is_some();
                 if !is_grpc_web_deadline_terminal
@@ -2272,9 +2304,9 @@ impl Drop for ProxyBody {
             .filter(|state| state.fired.load(Ordering::Acquire))
             .map(|state| state.termination);
         let client_deadline_fired = self
-            .client_grpc_deadline_fired
+            .client_grpc_deadline
             .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
+            .is_some_and(|state| state.fired.load(Ordering::Acquire))
             || auth_deadline_termination.is_some();
         if let Some(logger) = self.logger.take() {
             let bytes = self.bytes_streamed.load(Ordering::Relaxed);
@@ -2424,16 +2456,12 @@ impl Drop for ProxyBody {
 // -- SyncBody wrapper ---------------------------------------------------------
 
 pin_project! {
-    /// Wraps a body that already implements `Send + Sync` so that the
-    /// `Sync` bound is preserved through `pin_project!`'s synthesized
-    /// generics, enabling use with `reqwest::Body::wrap()` (which requires
-    /// `Send + Sync + 'static`).
+    /// Wraps a request body handed to `reqwest::Body::wrap()` (which requires
+    /// `Send + Sync + 'static`) and drops inbound request trailer frames.
     ///
-    /// The wrapper itself adds no extra concurrency capability beyond what
-    /// `B` already provides — it is a thin `#[pin]`-projected newtype. The
-    /// `unsafe impl Sync` below delegates the `Sync` claim to `B` at
-    /// compile time via the `B: Send + Sync` bound; there is no runtime
-    /// invariant required.
+    /// The wrapper is a thin `#[pin]`-projected newtype, so `Send`/`Sync` are
+    /// the compiler's auto-trait derivation from `B`: no `unsafe impl` is
+    /// needed or wanted.
     ///
     /// Use [`reqwest::Body::wrap_stream`] instead if `B` is `Send` but
     /// `!Sync`. That path loses the `size_hint()` from the underlying body
@@ -2445,14 +2473,6 @@ pin_project! {
         inner: B,
     }
 }
-
-// SAFETY: The bound `B: Send + Sync` makes this `Sync` claim a compile-time
-// delegation to the inner body. `SyncBody<B>` is a transparent newtype over
-// `B` (one `#[pin]`-projected field, no interior mutability of its own), so
-// `&SyncBody<B>` exposes only `&B`'s API surface, which is `Sync`-safe by
-// the bound. No runtime invariant (such as "polled from a single task") is
-// required for soundness.
-unsafe impl<B: Send + Sync> Sync for SyncBody<B> {}
 
 /// How a [`ReplayableRequestBody`] reaches the backend transport.
 enum ReplayableUploadSource {
@@ -3796,7 +3816,6 @@ impl http_body::Body for DirectH1RequestBody {
 ///
 /// Reached only through `crate::_test_support`, which the binary target does
 /// not compile, so it is dead code there.
-#[allow(dead_code)]
 pub(crate) fn poll_upload_cancel_once(
     cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> UploadCancelSignal {
@@ -5082,7 +5101,6 @@ impl<S: FrameSource> Coalescing<S> {
     ///
     /// Reached only through `crate::_test_support`, so the issue #5040
     /// laziness contract is asserted on the production adapter.
-    #[allow(dead_code)]
     pub(crate) fn buffer_state_name(&self) -> &'static str {
         self.buffer.state_name()
     }
@@ -5371,12 +5389,12 @@ impl<B> IdleReadTimeoutBody<B> {
     /// `H3FrameSource`: the deadline resets on backend progress and a fired
     /// deadline collapses to a clean EOS while only optional trailers remain.
     /// See the `progress` field.
+    ///
+    /// The deadline starts unarmed: the first inner `Pending` is always a
+    /// `false -> true` edge of `waiting`, which arms it, so a response whose
+    /// frames are all ready never allocates the boxed `Sleep` (issue #7166).
     fn with_progress(inner: B, timeout_ms: u64, progress: Option<Arc<H3ReadProgress>>) -> Self {
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .map(tokio::time::sleep_until)
-            .map(Box::pin);
         let last_progress_epoch = progress
             .as_ref()
             .map(|p| p.epoch.load(Ordering::Acquire))
@@ -5384,7 +5402,7 @@ impl<B> IdleReadTimeoutBody<B> {
         Self {
             inner,
             timeout,
-            deadline,
+            deadline: None,
             done: false,
             waiting: false,
             progress,
@@ -5579,6 +5597,12 @@ struct TotalDeadlineBody<B> {
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     deadline_frame: Option<Frame<Bytes>>,
     deadline_fired: Arc<AtomicBool>,
+    /// Set only by [`Self::emit_deadline_terminal`], so a reader above can tell
+    /// this adapter's synthesized terminal from an ordinary frame even when
+    /// another task stores `deadline_fired` concurrently (issue #7177). `None`
+    /// where no reader needs it (the route request deadline, whose terminal is
+    /// always an error).
+    terminal_emitted: Option<Arc<AtomicBool>>,
     terminal: DeadlineTerminal,
     /// Shared once-only termination latch for this request. Present only for
     /// the authorization-lifetime regime, where the request-upload body may be
@@ -5707,6 +5731,7 @@ impl<B> TotalDeadlineBody<B> {
             deadline: deadline.map(tokio::time::sleep_until).map(Box::pin),
             deadline_frame,
             deadline_fired,
+            terminal_emitted: None,
             terminal,
             auth_latch,
             authorization_terminal: None,
@@ -5725,6 +5750,13 @@ impl<B> TotalDeadlineBody<B> {
         );
         self.deadline = None;
         self.authorization_terminal = Some(owner);
+        self
+    }
+
+    /// Publish on `flag` that THIS adapter emitted its terminal. Set on the
+    /// polling task before the terminal is returned, and by nothing else.
+    fn reporting_terminal_emission(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.terminal_emitted = Some(flag);
         self
     }
 
@@ -5748,6 +5780,9 @@ impl<B> TotalDeadlineBody<B> {
         self.done = true;
         self.deadline = None;
         self.deadline_fired.store(true, Ordering::Release);
+        if let Some(emitted) = self.terminal_emitted.as_ref() {
+            emitted.store(true, Ordering::Release);
+        }
         // The `done` guard makes this reachable at most once per body. The
         // shared latch additionally makes it at most once per REQUEST: a
         // bidirectional stream whose request-upload body is racing the same
@@ -6232,7 +6267,7 @@ fn client_grpc_deadline_body<B>(
     body: B,
     deadline: ClientGrpcResponseDeadline,
     deadline_frame: Option<Frame<Bytes>>,
-    fired: Arc<AtomicBool>,
+    state: &ClientGrpcDeadlineState,
 ) -> (
     TotalDeadlineBody<ClientGrpcDeadlineSource<B>>,
     Option<ResponsePumpGuard>,
@@ -6253,7 +6288,7 @@ where
             };
             let ReadAheadEnd::Complete(terminal_error) = end else {
                 let owned = ReadAheadBody::new(frames, None, Some(body));
-                return pumped_client_grpc_deadline_body(owned, at, closer, deadline_frame, fired);
+                return pumped_client_grpc_deadline_body(owned, at, closer, deadline_frame, state);
             };
             // The upstream reached its own terminal: settle the response from
             // memory under the pump's terminal owner and completion rule. The
@@ -6268,7 +6303,7 @@ where
             let watchdog = (!settled.completion_claimed()).then(|| {
                 crate::proxy::response_watchdog::rpc_deadline_settled_watchdog(
                     owner.clone(),
-                    Arc::clone(&fired),
+                    Arc::clone(&state.fired),
                     closer,
                 )
             });
@@ -6277,9 +6312,10 @@ where
                 // No timer here: the shared terminal owner settles the bound.
                 None,
                 deadline_frame,
-                fired,
+                Arc::clone(&state.fired),
             )
-            .with_authorization_terminal_owner(owner);
+            .with_authorization_terminal_owner(owner)
+            .reporting_terminal_emission(Arc::clone(&state.terminal_emitted));
             (timed, watchdog)
         }
         _ => (
@@ -6287,8 +6323,9 @@ where
                 http_body_util::Either::Left(http_body_util::Either::Left(body)),
                 Some(at),
                 deadline_frame,
-                fired,
-            ),
+                Arc::clone(&state.fired),
+            )
+            .reporting_terminal_emission(Arc::clone(&state.terminal_emitted)),
             None,
         ),
     }
@@ -6301,7 +6338,7 @@ fn pumped_client_grpc_deadline_body<B>(
     at: tokio::time::Instant,
     closer: AuthorizationConnectionCloser,
     deadline_frame: Option<Frame<Bytes>>,
-    fired: Arc<AtomicBool>,
+    state: &ClientGrpcDeadlineState,
 ) -> (
     TotalDeadlineBody<ClientGrpcDeadlineSource<B>>,
     Option<ResponsePumpGuard>,
@@ -6313,7 +6350,7 @@ where
     let (pumped, pump) = AuthorizationCancellableBody::for_client_rpc_deadline(
         owned,
         at,
-        Arc::clone(&fired),
+        Arc::clone(&state.fired),
         Some(closer),
     );
     let owner = pumped.terminal_owner();
@@ -6322,9 +6359,10 @@ where
         // No timer here: the pump's shared terminal owner settles it.
         None,
         deadline_frame,
-        fired,
+        Arc::clone(&state.fired),
     )
-    .with_authorization_terminal_owner(owner);
+    .with_authorization_terminal_owner(owner)
+    .reporting_terminal_emission(Arc::clone(&state.terminal_emitted));
     (timed, Some(pump))
 }
 
@@ -7040,10 +7078,10 @@ where
     B: http_body::Body<Data = Bytes, Error = BoxError> + Send + Unpin + 'static,
 {
     if let Some(deadline) = total_deadline {
-        let fired = Arc::new(AtomicBool::new(false));
-        let (timed, pump) = client_grpc_deadline_body(body, deadline, None, Arc::clone(&fired));
+        let state = ClientGrpcDeadlineState::new();
+        let (timed, pump) = client_grpc_deadline_body(body, deadline, None, &state);
         let held = FlushBeforeTerminalError::new(timed);
-        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_state(fired, pump)
+        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_state(state, pump)
     } else {
         wrap_idle_read_timeout_and_error_hold(body, read_timeout_ms)
     }
@@ -7153,11 +7191,11 @@ where
     // terminal-error flush hold wraps each branch outermost, outside the
     // deadline.
     if let Some(deadline) = total_deadline {
-        let fired = Arc::new(AtomicBool::new(false));
-        let (timed, pump) = client_grpc_deadline_body(direct, deadline, None, Arc::clone(&fired));
+        let state = ClientGrpcDeadlineState::new();
+        let (timed, pump) = client_grpc_deadline_body(direct, deadline, None, &state);
         let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
         let held = FlushBeforeTerminalError::new(stripped);
-        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_state(fired, pump)
+        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_state(state, pump)
     } else if read_timeout_ms > 0 {
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
         let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
@@ -8820,18 +8858,10 @@ mod tests {
 
     // --- SyncBody trait-bound assertions -------------------------------------
     //
-    // The `unsafe impl<B: Send + Sync> Sync for SyncBody<B>` claim below is
-    // future-proofed by these compile-time assertions. They will fail to
-    // build if either:
-    //   1. The bound on `SyncBody`'s `Sync` impl is loosened back to just
-    //      `B: Send` AND a future caller wraps a `!Sync` body (latent UB).
-    //   2. A current call-site type (`SizeLimitedIncoming`, `CountingIncoming`)
-    //      gains a `!Sync` field, breaking the assumption that all current
-    //      callers happen to satisfy the tighter bound.
-    //
-    // The negative case is enforced by a `must_be_sync<T: Sync>` helper that
-    // would refuse to monomorphize over a `!Sync` body. See `phantom_not_sync`
-    // below for the local witness type used by the tests.
+    // `SyncBody` is `Sync` only through auto-trait derivation from its inner
+    // body. This compile-time assertion fails to build if a current call-site
+    // type (`SizeLimitedIncoming`, `CountingIncoming`) gains a `!Sync` field,
+    // which `reqwest::Body::wrap()` would then refuse.
     fn must_be_sync<T: Sync>() {}
     fn must_be_send<T: Send>() {}
 
@@ -8879,28 +8909,6 @@ mod tests {
             0,
             "dropping the body must release the per-IP slot exactly once"
         );
-    }
-
-    /// A `Send`-but-`!Sync` witness body. Used purely for compile-time
-    /// negative tests below — the inclusion of a `Cell<()>` field makes
-    /// the type `!Sync` while leaving it `Send`.
-    ///
-    /// If the `Sync` bound on `SyncBody` is ever loosened to `B: Send`,
-    /// `must_be_sync::<SyncBody<NotSyncBody>>()` would compile, signaling
-    /// the latent unsoundness has returned.
-    struct NotSyncBody {
-        _marker: std::cell::Cell<()>,
-    }
-
-    impl http_body::Body for NotSyncBody {
-        type Data = Bytes;
-        type Error = BoxError;
-        fn poll_frame(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-            Poll::Ready(None)
-        }
     }
 
     #[test]
@@ -9096,10 +9104,9 @@ mod tests {
 
         let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
         let mut body = IdleReadTimeoutBody::new(inner, u64::MAX);
-        assert_eq!(
+        assert!(
             body.deadline.is_none(),
-            overflows,
-            "deadline must be None exactly when the platform `Instant` range overflows",
+            "the deadline is armed lazily, on the first backend-read wait",
         );
 
         // Polling a pending inner must stay live (Pending) without panicking on
@@ -9128,12 +9135,24 @@ mod tests {
     #[tokio::test]
     async fn idle_read_timeout_representable_deadline_arms_live_timer() {
         // A normal, representable timeout must still arm a live deadline so the
-        // idle-read watchdog continues to bound stalled backends.
+        // idle-read watchdog continues to bound stalled backends. It is armed on
+        // the first backend-read wait, not at construction (issue #7166), so an
+        // all-ready response never allocates the timer.
         let inner = Coalescing::new(MockSource::new(vec![MockStep::Pending]), 100, None);
-        let body = IdleReadTimeoutBody::new(inner, 1_000);
+        let mut body = IdleReadTimeoutBody::new(inner, 1_000);
+        assert!(
+            body.deadline.is_none(),
+            "construction must not allocate the deadline",
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Pending
+        ));
         assert!(
             body.deadline.is_some(),
-            "a representable timeout must arm a live deadline",
+            "a representable timeout must arm a live deadline on the first wait",
         );
     }
 
@@ -9274,32 +9293,141 @@ mod tests {
         );
     }
 
-    #[test]
-    fn not_sync_body_is_indeed_send_but_not_sync() {
-        // Sanity: confirm the witness type has the expected trait shape.
-        // (`NotSyncBody` is `Send` because `Cell<()>` is `Send`, but `!Sync`.)
-        must_be_send::<NotSyncBody>();
-        // The next line would refuse to compile — it is the negative test:
-        //
-        //     must_be_sync::<NotSyncBody>();
-        //     must_be_sync::<SyncBody<NotSyncBody>>();
-        //
-        // Both are commented out. Uncommenting them will produce
-        // `the trait bound `std::cell::Cell<()>: Sync` is not satisfied`,
-        // which is the desired guarantee: the tightened bound on the
-        // `unsafe impl Sync for SyncBody<B>` block correctly refuses to
-        // synthesize `Sync` for a `!Sync` inner body.
+    /// Yields its DATA frames and, in the same poll, stores the shared deadline
+    /// `fired` flag: the response pump claiming the bound after the deadline
+    /// adapter's re-observe and before a reader above loads the flag (issue
+    /// #7177). The adapter itself never emits a terminal here.
+    struct FiresWhileYieldingBody {
+        frames: VecDeque<Bytes>,
+        fired: Arc<AtomicBool>,
     }
 
-    /// Compile-fail witness: forcibly attempting `SyncBody<NotSyncBody>: Sync`
-    /// must NOT compile. Gated under `#[cfg(any())]` so it is parsed for
-    /// syntactic correctness but never actually monomorphized — the gate
-    /// keeps the test in source as documentation of the bound's intent
-    /// without breaking `cargo test`. Flip the gate to `#[cfg(test)]` (or
-    /// remove it) to manually verify the bound's negative case: it should
-    /// produce `the trait bound `std::cell::Cell<()>: Sync` is not satisfied`.
-    #[cfg(any())]
-    fn _compile_fail_sync_body_over_not_sync() {
-        must_be_sync::<SyncBody<NotSyncBody>>();
+    impl http_body::Body for FiresWhileYieldingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            let this = self.get_mut();
+            match this.frames.pop_front() {
+                Some(data) => {
+                    this.fired.store(true, Ordering::Release);
+                    Poll::Ready(Some(Ok(Frame::data(data))))
+                }
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    /// A client RPC deadline body whose adapter forwards `frames` untouched
+    /// while the shared `fired` flag is set from "another task" each time.
+    fn racing_client_deadline_body(frames: Vec<Bytes>) -> ProxyBody {
+        let state = ClientGrpcDeadlineState::new();
+        let inner = FiresWhileYieldingBody {
+            frames: frames.into(),
+            fired: Arc::clone(&state.fired),
+        };
+        let timed = TotalDeadlineBody::with_deadline_frame(
+            inner,
+            None,
+            Some(Frame::data(Bytes::from_static(b"gateway-terminal"))),
+            Arc::clone(&state.fired),
+        )
+        .reporting_terminal_emission(Arc::clone(&state.terminal_emitted));
+        ProxyBody::streaming(Box::pin(timed)).with_client_grpc_deadline_state(state, None)
+    }
+
+    #[tokio::test]
+    async fn concurrent_deadline_claim_leaves_backend_data_encoded_for_grpc_web() {
+        let message = Bytes::from_static(b"\x00\x00\x00\x00\x02hi");
+        let mut body = racing_client_deadline_body(vec![message.clone()]).into_grpc_web_streaming(
+            "application/grpc-web-text",
+            200,
+            None,
+            false,
+            0,
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("the backend DATA frame must be released");
+        };
+        assert_eq!(
+            frame.data_ref().expect("DATA frame"),
+            &crate::plugins::grpc_web::encode_streaming_data(message, true),
+            "a backend frame is translated, never forwarded raw as the deadline terminal"
+        );
+        let Poll::Ready(Some(Ok(trailer))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("the stream must continue to its own terminal trailer frame");
+        };
+        assert!(
+            trailer.data_ref().is_some(),
+            "gRPC-Web trailer frame in DATA"
+        );
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_deadline_claim_still_counts_the_backend_grpc_message() {
+        let message = Bytes::from_static(b"\x00\x00\x00\x00\x02hi");
+        let messages = Arc::new(AtomicU64::new(0));
+        let mut body = racing_client_deadline_body(vec![message.clone()])
+            .with_grpc_message_counter(Arc::clone(&messages));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("the backend DATA frame must be released");
+        };
+        assert_eq!(frame.data_ref().expect("DATA frame"), &message);
+        assert_eq!(
+            messages.load(Ordering::Acquire),
+            1,
+            "a backend message is scanned even when the pump fired concurrently"
+        );
+    }
+
+    #[tokio::test]
+    async fn emitted_deadline_terminal_is_still_recognised_for_grpc_web() {
+        // The positive case: the adapter's own terminal is forwarded verbatim
+        // as the gRPC-Web deadline terminal.
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before now is representable");
+        let state = ClientGrpcDeadlineState::new();
+        let timed = TotalDeadlineBody::with_deadline_frame(
+            FiresWhileYieldingBody {
+                frames: VecDeque::new(),
+                fired: Arc::clone(&state.fired),
+            },
+            Some(deadline),
+            Some(Frame::data(Bytes::from_static(b"gateway-terminal"))),
+            Arc::clone(&state.fired),
+        )
+        .reporting_terminal_emission(Arc::clone(&state.terminal_emitted));
+        let mut body = ProxyBody::streaming(Box::pin(timed))
+            .with_client_grpc_deadline_state(state, None)
+            .into_grpc_web_streaming("application/grpc-web-text", 200, None, false, 0);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("an elapsed deadline must emit its terminal");
+        };
+        assert_eq!(
+            frame.data_ref().expect("DATA frame").as_ref(),
+            b"gateway-terminal",
+            "the adapter's terminal frame is forwarded verbatim"
+        );
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 }

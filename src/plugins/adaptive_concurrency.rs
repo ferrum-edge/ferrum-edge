@@ -203,15 +203,12 @@ fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig
         "shadow_mode",
         "expose_headers",
     ];
-    if let Some(unknown) = object
-        .keys()
-        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
-    {
-        return Err(format!(
-            "adaptive_concurrency: unknown config key {unknown:?}; allowed keys: `{}`",
-            ALLOWED_KEYS.join("`, `")
-        ));
-    }
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        "config",
+        ALLOWED_KEYS,
+        "adaptive_concurrency: `config`: ",
+    )?;
 
     let min_limit = optional_u64(object, "min_limit")?.unwrap_or(1);
     let initial_limit = optional_u64(object, "initial_limit")?.unwrap_or(32);

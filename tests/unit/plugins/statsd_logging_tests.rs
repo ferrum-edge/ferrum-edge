@@ -12,11 +12,10 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     StreamTransactionSummary, WsDisconnectContext, plugin_failure_policy,
     statsd_logging::{
-        MAX_UDP_PAYLOAD, STATSD_LOGGING_CONFIG_KEYS, StatsdLogging, bounded_grpc_status_tag,
-        for_each_udp_datagram, format_http_metrics, format_ws_metrics, http_body_outcome,
-        http_grpc_status_tag, is_valid_timer_sample, pack_udp_datagrams,
-        render_http_under_budget_for_test, sanitize_namespace_tag_value, sanitize_tag_value,
-        validate_tag_key,
+        MAX_UDP_PAYLOAD, STATSD_LOGGING_CONFIG_KEYS, StatsdLogging, UdpDatagramPacker,
+        bounded_grpc_status_tag, format_http_metrics, format_ws_metrics, http_body_outcome,
+        http_grpc_status_tag, is_valid_timer_sample, render_http_under_budget_for_test,
+        sanitize_namespace_tag_value, sanitize_tag_value, validate_tag_key,
     },
     validate_plugin_config,
 };
@@ -469,12 +468,9 @@ async fn test_statsd_logging_rejects_one_character_misspellings_of_every_key() {
         assert!(err.contains("unknown configuration key"), "got: {err}");
         assert!(err.contains(typo), "error must name the typo key: {err}");
         assert!(
-            err.contains("allowed keys"),
-            "error must list the allowed-key contract: {err}"
+            err.contains(&format!("did you mean `{canonical}`?")),
+            "error must suggest the intended key: {err}"
         );
-        for key in STATSD_LOGGING_CONFIG_KEYS {
-            assert!(err.contains(key), "missing allowed key {key} in: {err}");
-        }
 
         let shared = validate_plugin_config("statsd_logging", &config)
             .expect_err("shared admission must reject the same typo");
@@ -1155,11 +1151,11 @@ async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
     }
 
     let over = "m".repeat(MAX_UDP_PAYLOAD + 1);
-    let (dgrams, dropped) = pack_udp_datagrams(&over, MAX_UDP_PAYLOAD);
+    let (dgrams, dropped) = pack_udp_datagrams(&over);
     assert_eq!(dropped, 1);
     assert!(dgrams.is_empty());
     let exact = "e".repeat(MAX_UDP_PAYLOAD);
-    let (dgrams, dropped) = pack_udp_datagrams(&exact, MAX_UDP_PAYLOAD);
+    let (dgrams, dropped) = pack_udp_datagrams(&exact);
     assert_eq!(dropped, 0);
     assert_eq!(dgrams[0].len(), MAX_UDP_PAYLOAD);
 }
@@ -1489,30 +1485,31 @@ async fn test_statsd_logging_failed_reserve_does_not_take_lease() {
     );
 }
 
+/// Pack `payload` with the packer production delivery uses.
+fn pack_udp_datagrams(payload: &str) -> (Vec<String>, usize) {
+    let mut packer = UdpDatagramPacker::new(MAX_UDP_PAYLOAD);
+    let mut datagrams: Vec<String> = payload
+        .lines()
+        .filter_map(|line| packer.push_line(line))
+        .collect();
+    let (last, dropped) = packer.finish();
+    datagrams.extend(last);
+    assert!(datagrams.iter().all(|d| d.len() <= MAX_UDP_PAYLOAD));
+    (datagrams, dropped)
+}
+
 #[test]
-fn test_statsd_logging_for_each_udp_datagram_stays_mtu_safe() {
+fn test_statsd_logging_udp_datagram_packer_stays_mtu_safe() {
     // Each line fits independently, while the pair plus delimiter exceeds the
-    // 1452-byte payload ceiling and therefore must visit two datagrams.
+    // 1452-byte payload ceiling and therefore must produce two datagrams.
     let line_a = "a".repeat(800);
     let line_b = "b".repeat(800);
-    let payload = format!("{line_a}\n{line_b}");
-    let mut seen = Vec::new();
-    let dropped = for_each_udp_datagram(&payload, MAX_UDP_PAYLOAD, |datagram| {
-        assert!(datagram.len() <= MAX_UDP_PAYLOAD);
-        seen.push(datagram.to_string());
-    });
+    let (seen, dropped) = pack_udp_datagrams(&format!("{line_a}\n{line_b}"));
     assert_eq!(dropped, 0);
-    assert_eq!(seen.len(), 2);
-    assert_eq!(seen[0], line_a);
-    assert_eq!(seen[1], line_b);
+    assert_eq!(seen, vec![line_a, line_b]);
 
     let over = "x".repeat(MAX_UDP_PAYLOAD + 8);
-    let mixed = format!("short:1|c\n{over}\nother:1|c");
-    let mut kept = Vec::new();
-    let dropped = for_each_udp_datagram(&mixed, MAX_UDP_PAYLOAD, |datagram| {
-        assert!(datagram.len() <= MAX_UDP_PAYLOAD);
-        kept.push(datagram.to_string());
-    });
+    let (kept, dropped) = pack_udp_datagrams(&format!("short:1|c\n{over}\nother:1|c"));
     assert_eq!(dropped, 1);
     let joined = kept.join("\n");
     assert!(joined.contains("short:1|c"));

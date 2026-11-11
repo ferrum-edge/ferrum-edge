@@ -48,7 +48,7 @@ proxies:
 
 The adaptive setting controls the hyper/reqwest backend HTTP/2 pools. HBONE uses a separate raw-`h2` window policy: when adaptive is enabled, it raises its initial stream and connection windows to at least 16 MiB and 64 MiB respectively; it does not enable hyper/reqwest BDP probing or its PING/SETTINGS behavior.
 
-`pool_max_requests_per_connection` is accepted on proxies for backward compatibility, but it is currently a no-op at runtime. The shared reqwest/hyper HTTP client pool does not expose a stable per-connection request cap, so Ferrum validates and persists the field without applying it. DestinationRule `connectionPool.http.maxRequestsPerConnection` no longer projects into this proxy field; it is reported as deferred in Istio status instead. Values must be between 0 and 2,147,483,647; `0` preserves Istio's explicit unlimited value, and omitting the field preserves Ferrum's current unlimited behavior.
+Ferrum has no per-connection request cap (close-after-N-requests): the shared reqwest/hyper HTTP client pool does not expose a stable knob for it, so no proxy field carries one. DestinationRule `connectionPool.http.maxRequestsPerConnection` is reported as deferred in Istio status.
 
 ## Configuration Reference
 

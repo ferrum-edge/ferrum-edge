@@ -140,7 +140,7 @@ Validation passed.
    - Shared runtime admission, including plugin security composition (such as duplicate effective `correlation_id` headers) and `tcp_connection_throttle` attachment compatibility
    - TLS certificate path existence checks
    - Upstream reference validation
-   - Namespace filter summary: the active `FERRUM_NAMESPACE` (default `ferrum`) and post-filter resource counts. When the document contains at least one namespaced resource and zero resources survive namespace filtering, `validate` fails closed with **exit code 1** and a diagnostic naming the active namespace, the namespaces present in the document, and the counts. `--allow-empty-namespace` downgrades that case to a warning and exit 0. An empty document (no namespaced resources) is not a mismatch. Filtering itself is unchanged.
+   - Namespace filter summary: the active `FERRUM_NAMESPACE` (default `ferrum`) and post-filter resource counts. When the document contains at least one namespaced resource and zero resources survive namespace filtering, `validate` fails closed with **exit code 1** and a diagnostic carrying the post-filter counts and the number of namespaces the document resources use. Like every other supplied value, the namespace names are withheld from the rendered diagnostic (see [Diagnostic redaction](#diagnostic-redaction)); the active namespace is on the report's `Namespace:` line. `--allow-empty-namespace` downgrades that case to a warning and exit 0. An empty document (no namespaced resources) is not a mismatch. Filtering itself is unchanged.
 3. **Startup security** (env-level TLS/CIDR/metrics surfaces shared with `run`) — side-effect-free loaders that `serve()` also uses, so `validate` cannot report success for configs that refuse to start. Mode-scoped:
    - TLS policy (`TlsPolicy::from_env_config`) and CRLs (`FERRUM_TLS_CRL_FILE_PATH`) for file/database/cp/dp/mesh, and for `node_agent` when admin HTTPS security intent applies (complete HTTPS that would bind, or explicit nonzero HTTPS intent)
    - Strict `FERRUM_ADMIN_ALLOWED_CIDRS` and `FERRUM_METRICS_ALLOWED_CIDRS` / metrics bearer policy; node-agent validates these when any admin surface is active (plaintext HTTP or complete HTTPS), matching `run`
@@ -226,13 +226,15 @@ Mesh runtime: OK
 Validation passed.
 ```
 
-On failure:
+On failure, the report printed so far stays on stdout and the failure is one
+`ERROR` log record on stderr (JSON, like every other log record), whose message
+is `Validation error: ` followed by the rendered cause chain:
 
 ```
 Settings (ferrum.conf): OK
   Mode: File
   Namespace: ferrum
-Error: Spec validation failed: Configuration file not found: /nonexistent.yaml
+{"timestamp":"…","level":"ERROR","fields":{"message":"Validation error: Spec validation failed: Configuration file not found: <redacted scalar>"},"target":"ferrum_edge"}
 ```
 
 A namespace-filter mismatch (document resources in `ferrum`, `FERRUM_NAMESPACE=other-ns`) looks like:
@@ -246,7 +248,7 @@ Spec (/etc/ferrum/resources.yaml): OK
   Consumers: 0
   Upstreams: 0
   Plugin configs: 0
-Error: namespace filter mismatch: active namespace 'other-ns' left 0 surviving resources (proxies=0, consumers=0, upstreams=0, plugin_configs=0); document namespaces: ferrum. Set FERRUM_NAMESPACE to a namespace present in the document, or pass --allow-empty-namespace to accept an empty filtered document.
+{"timestamp":"…","level":"ERROR","fields":{"message":"Validation error: namespace filter mismatch: active namespace <redacted scalar> left 0 surviving resources (proxies=0, consumers=0, upstreams=0, plugin_configs=0); the document resources use 1 namespace(s): <redacted scalar>. Set FERRUM_NAMESPACE to the namespace in the `namespace` fields of the document resources, or pass --allow-empty-namespace to accept an empty filtered document."},"target":"ferrum_edge"}
 ```
 
 That failure uses **exit code 1**, the same code as other validation failures.
@@ -262,7 +264,7 @@ Spec (/etc/ferrum/resources.yaml): OK
   Consumers: 0
   Upstreams: 0
   Plugin configs: 0
-Error: Startup security validation failed: Invalid TLS configuration: ...
+{"timestamp":"…","level":"ERROR","fields":{"message":"Validation error: Startup security validation failed: Invalid TLS configuration: …"},"target":"ferrum_edge"}
 ```
 
 ### Diagnostic redaction

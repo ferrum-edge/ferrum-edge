@@ -438,16 +438,13 @@ pub mod pricing {
                 "{plugin_name}: `bandwidth_pricing` must be an object"
             ));
         }
-        let allowed = ["price_per_byte_sent", "price_per_byte_received"];
         if let Some(obj) = value.as_object() {
-            for key in obj.keys() {
-                if !allowed.contains(&key.as_str()) {
-                    return Err(format!(
-                        "{plugin_name}: unknown key {key:?} in `bandwidth_pricing` \
-                         (allowed: `price_per_byte_sent`, `price_per_byte_received`)"
-                    ));
-                }
-            }
+            crate::util::unknown_keys::reject_unknown_keys(
+                obj,
+                "bandwidth_pricing",
+                &["price_per_byte_sent", "price_per_byte_received"],
+                &format!("{plugin_name}: `bandwidth_pricing`: "),
+            )?;
         }
         let price_sent = match value.get("price_per_byte_sent") {
             Some(v) => {
@@ -472,16 +469,13 @@ pub mod pricing {
                 "{plugin_name}: `stream_connection_pricing` must be an object"
             ));
         }
-        let allowed = ["price_per_connection"];
         if let Some(obj) = value.as_object() {
-            for key in obj.keys() {
-                if !allowed.contains(&key.as_str()) {
-                    return Err(format!(
-                        "{plugin_name}: unknown key {key:?} in `stream_connection_pricing` \
-                         (allowed: `price_per_connection`)"
-                    ));
-                }
-            }
+            crate::util::unknown_keys::reject_unknown_keys(
+                obj,
+                "stream_connection_pricing",
+                &["price_per_connection"],
+                &format!("{plugin_name}: `stream_connection_pricing`: "),
+            )?;
         }
         match value.get("price_per_connection") {
             Some(v) => optional_non_negative_f64(

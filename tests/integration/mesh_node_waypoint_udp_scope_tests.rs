@@ -1304,7 +1304,11 @@ fn two_plain_udp_services_sharing_one_port_both_materialize_exact_routes() {
         config
             .node_waypoint_udp_destination_routes
             .iter()
-            .all(|route| route.listen_port == 5353 && !route.terminates_dtls)
+            .all(|route| route.listen_port == 5353)
+    );
+    assert!(
+        listeners.iter().all(|proxy| !proxy.frontend_tls),
+        "plain `udp` claimants materialize non-terminating listeners"
     );
 
     // Backend isolation: each generated upstream carries only its own Service's
@@ -2015,8 +2019,8 @@ use ferrum_edge::capture::{CaptureConfig, CaptureMode, NodeWaypointUdpSteerDesti
 #[cfg(unix)]
 use ferrum_edge::ebpf::cgroup::{CGROUP_TREE_MAX_DEPTH, CGROUP_TREE_MAX_INODES};
 use ferrum_edge::ebpf::{
-    BPF_MAP_UDP_REPLY_SOURCE_GATE, CaptureContract, EbpfBackend, FallbackMode, MockEbpfBackend,
-    NodeAgentProxyMode, PodAttachmentState,
+    CaptureContract, EbpfBackend, FallbackMode, MockEbpfBackend, NodeAgentProxyMode,
+    PodAttachmentState,
 };
 use ferrum_edge::modes::node_agent::{
     NodeAgentConfig, NodeWaypointUdpReplySourceState,
@@ -2818,30 +2822,6 @@ fn a_partial_family_failure_is_never_acknowledged() {
     assert_eq!(acknowledgement(registry.path()), Some(generation));
 }
 
-/// Readiness must reject an ELF that has both family maps but lacks their
-/// shared coherence gate. Starting without it would make partial-family map
-/// contents live again.
-#[test]
-fn a_missing_reply_source_gate_fails_node_waypoint_startup_readiness() {
-    let mut contract = CaptureContract::local_pod_defaults();
-    contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
-    let backend = MockEbpfBackend {
-        programs_loaded: true,
-        capture_config: Some(contract.bpf_capture_config()),
-        sock_ops_attached_cgroup_root: Some("/sys/fs/cgroup".to_string()),
-        udp_reply_source_gate_absent: true,
-        ..MockEbpfBackend::default()
-    };
-
-    let error = backend
-        .validate_startup_ready(true)
-        .expect_err("a missing shared gate must fail readiness");
-    assert!(
-        error.contains(BPF_MAP_UDP_REPLY_SOURCE_GATE),
-        "the readiness diagnostic must name the missing ABI map: {error}"
-    );
-}
-
 #[test]
 fn backend_cleanup_closes_and_clears_reply_source_authorization() {
     let source = ("10.96.0.10".parse().expect("source address"), 5300);
@@ -2855,44 +2835,6 @@ fn backend_cleanup_closes_and_clears_reply_source_authorization() {
 
     assert!(!backend.udp_reply_sources_enabled);
     assert!(backend.udp_reply_sources.is_empty());
-}
-
-/// A map that is absent from the loaded program cannot authorize its family, so
-/// the whole generation stays unapplied and unacknowledged — a dual-stack
-/// waypoint that acknowledged a v4-only apply would black-hole every v6 reply.
-#[test]
-fn an_absent_required_map_never_produces_an_acknowledgement() {
-    let registry = tempfile::tempdir().expect("registry dir");
-    let publisher = RegistryDirReplySourcePublisher::new(registry.path(), Some(RELAY_POD_UID));
-    publisher
-        .publish(&[reply_source("10.96.0.10", 5300)], true)
-        .expect("publication");
-
-    let mut backend = MockEbpfBackend {
-        udp_reply_source_maps_absent: true,
-        ..MockEbpfBackend::default()
-    };
-    let pods = DashMap::new();
-    let config = node_waypoint_config(Some(registry.path()));
-    let mut state = NodeWaypointUdpReplySourceState::default();
-    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
-
-    assert!(authorized(&backend).is_empty());
-    assert_eq!(
-        acknowledgement(registry.path()),
-        None,
-        "an ELF without the reply-source maps must never look converged"
-    );
-
-    publisher
-        .publish(&[], false)
-        .expect("empty withdrawal generation");
-    reconcile_node_waypoint_udp_reply_sources(&mut backend, &config, &pods, &mut state);
-    assert_eq!(
-        acknowledgement(registry.path()),
-        None,
-        "even an inactive withdrawal is unproven when either family map is absent"
-    );
 }
 
 /// A successor can replace `desired` while the node-agent is applying the

@@ -866,7 +866,7 @@ Post-routing method-filter responses and native-gRPC gateway errors also apply t
 
 If `on_response_body`, the shared representation gate, or a body-transform deadline has already selected a gateway-authored terminal response, the remaining presentation/protocol transforms may still run to preserve the client's wire shape, but `on_final_response_body` is skipped. A final validator or storage hook must never reinterpret the gateway's error payload and replace the first fail-closed decision. `on_response_committed` still observes the response that will actually be sent.
 
-`on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins can key bounded shared inspector state by `ctx.response_stream_id()`, remove it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; for example, `ai_tool_governor` writes streamed dry-run decisions before transaction logging. `request_deduplication` uses the same hook to release an ordinary non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error). When the stream sits behind a declared completed external operation — a terminate-mode `serverless_function` that may already have executed before `on_error: continue` fell through to the stream, or a plugin that marked `ferrum:external_operation_completed` — the hook instead publishes a durable non-replayable 409 completion tombstone (locally, and in Redis through the fenced ownership transition) on both clean and interrupted terminations. That closes the gap where an already-charged operation became re-executable the moment the raw in-flight lease expired: a same-key retry is refused for `max(ttl_seconds, inflight_ttl_seconds)`, never merely for `inflight_ttl_seconds` and never for less.
+`on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins pass inspector state to this hook through the request-owned `ctx.response_stream_handoff()` under a per-instance key (from `allocate_response_stream_handoff_id()`), take it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; the handoff drops with the request context if the hook is cancelled. For example, `ai_tool_governor` writes streamed dry-run decisions and `a2a_gateway` its stream counters before transaction logging. `request_deduplication` uses the same hook to release an ordinary non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error). When the stream sits behind a declared completed external operation — a terminate-mode `serverless_function` that may already have executed before `on_error: continue` fell through to the stream, or a plugin that marked `ferrum:external_operation_completed` — the hook instead publishes a durable non-replayable 409 completion tombstone (locally, and in Redis through the fenced ownership transition) on both clean and interrupted terminations. That closes the gap where an already-charged operation became re-executable the moment the raw in-flight lease expired: a same-key retry is refused for `max(ttl_seconds, inflight_ttl_seconds)`, never merely for `inflight_ttl_seconds` and never for less.
 
 ### Synthetic-response completion contract
 
@@ -1752,15 +1752,14 @@ The authenticated `GET /metrics/runtime` snapshot additionally carries three
 They have no labels at all: no trigger input, route, identity, header value,
 plugin-controlled string, or secret can reach them.
 
-`missing_decision_carriers` also counts instances whose decision is undecided
-by design. A trigger that reads `consumer` or `auth_method` is never decided at
-or before the authentication boundary: it does not gate stream connections at
-all, so a mixed-protocol plugin with such a trigger counts one missing carrier
-on every TCP/UDP/DTLS disconnect and flow, and an HTTP request that ends at or
-before `authenticate` (an authentication refusal, an early termination) counts
-one for its terminal `log`. A steady nonzero rate is therefore expected on a
-deployment with identity-reading triggers. Without them, a sustained nonzero
-rate means some summary or session path is not stamping the carrier.
+`missing_decision_carriers` does not count instances whose decision is
+undecided by design. A trigger that reads `consumer` or `auth_method` is never
+decided at or before the authentication boundary: it does not gate stream
+connections at all, and an HTTP request that ends at or before `authenticate`
+(an authentication refusal, an early termination) never reaches its decision.
+Such an instance's hooks still run on those paths, but the absent carrier is
+not counted, so a sustained nonzero rate always means some summary or session
+path is not stamping the carrier.
 
 ## Priority Bands
 
@@ -2355,7 +2354,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
 | `response_caching` | ✓ | | | | | HTTP-only response cache lookup and store |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
-| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
+| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli, zstd) |
 | `ai_prompt_compressor` | ✓ | | | | | HTTP-only JSON prompt compression; native gRPC wire frames are not rewritten |
 | `ai_federation` | ✓ | | | | | HTTP-only; routes final OpenAI JSON bodies to providers, normalizes bounded responses, and relays committed provider SSE incrementally |
 | `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |

@@ -109,7 +109,6 @@ fn proxy_for_upstream(id: &str, upstream_id: &str, updated_at: DateTime<Utc>) ->
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
-        pool_max_requests_per_connection: None,
         pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,

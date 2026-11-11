@@ -15,8 +15,8 @@ use ferrum_edge::_test_support::{
     response_caching_shard_amount_for_test, response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     retry_response_decision_context_for_test, run_after_proxy_hooks_for_test,
-    run_after_proxy_hooks_reject_for_test, set_replay_credential_headers_for_test,
-    set_replay_request_body_empty_proven_for_test, set_request_wire_protocol_for_test,
+    run_after_proxy_hooks_reject_for_test, set_replay_request_body_empty_proven_for_test,
+    set_request_headers_to_redact_for_test, set_request_wire_protocol_for_test,
     set_response_presentation_policy_digest_for_test, stamp_original_response_metadata_for_test,
 };
 use ferrum_edge::config::types::{Consumer, HttpWireTransport};
@@ -363,8 +363,6 @@ fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
         ("vary_by_headers", "vary_by_header"),
         ("ignore_request_headers", "ignore_request_header"),
         ("anonymous_caller_scope", "anonymous_caller_scop"),
-        ("cache_key_include_consumer", "cache_key_include_consumr"),
-        ("cache_key_include_query", "cache_key_include_quer"),
         ("respect_cache_control", "respect_cache_contro"),
         ("respect_no_cache", "respect_no_cach"),
         ("cacheable_status_codes", "cacheable_status_code"),
@@ -450,6 +448,23 @@ fn test_multiple_unknown_root_keys_are_sorted_and_path_qualified() {
     );
 }
 
+/// The legacy key toggles only salted the key digest; they are unknown keys
+/// now (issue #7114).
+#[test]
+fn test_legacy_cache_key_toggles_are_unknown_keys() {
+    for key in ["cache_key_include_query", "cache_key_include_consumer"] {
+        let mut config = json!({});
+        config[key] = json!(true);
+        let error = ResponseCaching::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("`{key}` must be rejected"));
+        assert!(
+            error.contains("unknown configuration key"),
+            "{key}: {error}"
+        );
+    }
+}
+
 #[test]
 fn test_recognized_field_null_and_type_behavior_is_preserved() {
     ResponseCaching::new(&json!({
@@ -459,8 +474,6 @@ fn test_recognized_field_null_and_type_behavior_is_preserved() {
         "max_total_size_bytes": null,
         "respect_cache_control": null,
         "respect_no_cache": null,
-        "cache_key_include_query": null,
-        "cache_key_include_consumer": null,
         "add_cache_status_header": null,
         "invalidate_on_unsafe_methods": null
     }))
@@ -3352,13 +3365,10 @@ async fn test_x_cache_status_disabled() {
 
 #[tokio::test]
 async fn test_consumer_keyed_caching() {
-    let plugin = plugin_with_config(json!({
-        "cache_key_include_consumer": true
-    }));
+    let plugin = default_plugin();
 
-    // Authenticated principals require RFC 9111 §3.5 shared-cache opt-in.
-    // `cache_key_include_consumer` only partitions keys; it cannot authorize
-    // storage (see `test_consumer_key_partition_does_not_override_shared_cache_admission`).
+    // Authenticated principals require RFC 9111 §3.5 shared-cache opt-in;
+    // the caller partition isolates keys but does not authorize storage.
     let mut public_response = HashMap::new();
     public_response.insert(
         "cache-control".to_string(),
@@ -3393,9 +3403,7 @@ async fn test_consumer_keyed_caching() {
 
 #[tokio::test]
 async fn test_consumer_keyed_caching_uses_authenticated_identity_fallback() {
-    let plugin = plugin_with_config(json!({
-        "cache_key_include_consumer": true
-    }));
+    let plugin = default_plugin();
 
     let mut public_response = HashMap::new();
     public_response.insert(
@@ -3467,10 +3475,8 @@ async fn test_different_raw_queries_different_cache() {
 // === Complete backend-visible query partition ===
 
 #[tokio::test]
-async fn legacy_query_toggle_cannot_exclude_backend_visible_query() {
-    let plugin = plugin_with_config(json!({
-        "cache_key_include_query": false
-    }));
+async fn backend_visible_query_is_always_bound() {
+    let plugin = default_plugin();
 
     // Cache with ?page=1
     let mut ctx1 = make_ctx_with_query("GET", "/api/items", &[("page", "1")]);
@@ -3483,15 +3489,14 @@ async fn legacy_query_toggle_cannot_exclude_backend_visible_query() {
         .on_final_response_body(&mut ctx1, 200, &rh, b"same-data")
         .await;
 
-    // The legacy toggle still rotates the keyspace, but it cannot authorize
-    // cross-query replay when the origin receives and may vary on the query.
+    // The origin receives, and may vary on, the query: no replay across it.
     let mut ctx2 = make_ctx_with_query("GET", "/api/items", &[("page", "2")]);
     ctx2.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
     let mut h2 = HashMap::new();
     let result = plugin.before_proxy(&mut ctx2, &mut h2).await;
     assert!(
         matches!(result, PluginResult::Continue),
-        "a different backend-visible query must miss even when the legacy flag is false"
+        "a different backend-visible query must miss"
     );
 }
 
@@ -4219,27 +4224,30 @@ fn test_parse_http_date_accepts_all_rfc9110_formats() {
 /// saturating subtraction floors at 0 instead.
 #[test]
 fn test_sub_total_size_saturates_instead_of_wrapping() {
-    use ferrum_edge::_test_support::response_caching_sub_total_size as sub;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use ferrum_edge::_test_support::{
+        response_caching_adjust_total_size_for_test as adjust,
+        response_caching_current_total_size_for_test as total,
+    };
 
-    let total = AtomicUsize::new(100);
+    let plugin = default_plugin();
+    adjust(&plugin, 100, 0);
+    assert_eq!(total(&plugin), 100);
 
     // Subtracting more than the current total must floor at 0, not wrap.
-    sub(&total, 250);
+    adjust(&plugin, 0, 250);
     assert_eq!(
-        total.load(Ordering::Relaxed),
+        total(&plugin),
         0,
         "underflow must saturate at 0, not wrap to usize::MAX"
     );
 
     // Subtracting from 0 stays at 0.
-    sub(&total, 10);
-    assert_eq!(total.load(Ordering::Relaxed), 0);
+    adjust(&plugin, 0, 10);
+    assert_eq!(total(&plugin), 0);
 
     // Normal subtraction still works.
-    total.store(100, Ordering::Relaxed);
-    sub(&total, 40);
-    assert_eq!(total.load(Ordering::Relaxed), 60);
+    adjust(&plugin, 100, 40);
+    assert_eq!(total(&plugin), 60);
 }
 
 /// Finding #62: under many concurrent stores plus interleaved invalidations
@@ -4393,8 +4401,6 @@ fn public_response_headers() -> HashMap<String, String> {
 async fn run_two_instance_store_isolation(a_first: bool) {
     let query_instance = plugin_with_config(json!({
         "ttl_seconds": 60,
-        "cache_key_include_query": true,
-        "cache_key_include_consumer": false,
         "vary_by_headers": [],
         "cacheable_methods": ["GET", "HEAD"],
         "cacheable_status_codes": [200],
@@ -4402,8 +4408,6 @@ async fn run_two_instance_store_isolation(a_first: bool) {
     }));
     let consumer_vary_instance = plugin_with_config(json!({
         "ttl_seconds": 60,
-        "cache_key_include_query": false,
-        "cache_key_include_consumer": true,
         "vary_by_headers": ["x-tenant"],
         "cacheable_methods": ["GET", "HEAD"],
         "cacheable_status_codes": [200, 404],
@@ -4450,9 +4454,11 @@ async fn run_two_instance_store_isolation(a_first: bool) {
         .get(&staging_key(second, "cache_base_key"))
         .cloned()
         .expect("second instance staged base key");
-    assert_ne!(
+    // The base key binds only the request and caller partitions, not instance
+    // config; each instance's staging namespace (below) keeps them apart.
+    assert_eq!(
         first_base, second_base,
-        "distinct query/consumer/Vary policies must stage independent base keys"
+        "the same request stages the same base key under each instance's namespace"
     );
     assert_ne!(
         staging_key(first, "cache_status"),
@@ -4802,8 +4808,7 @@ async fn reload_generations_do_not_share_staging_namespaces() {
     let _policy_guard = response_cache_replay_policy_guard();
     let generation_one = plugin_with_config(json!({
         "ttl_seconds": 60,
-        "vary_by_headers": ["x-tenant"],
-        "cache_key_include_query": true
+        "vary_by_headers": ["x-tenant"]
     }));
     let mut ctx = make_ctx_with_raw_query("GET", "/reload", "v=1");
     ctx.headers
@@ -4828,7 +4833,6 @@ async fn reload_generations_do_not_share_staging_namespaces() {
     let generation_two = plugin_with_config(json!({
         "ttl_seconds": 120,
         "vary_by_headers": ["x-tenant"],
-        "cache_key_include_query": false,
         "cacheable_status_codes": [200, 404]
     }));
     assert_ne!(
@@ -5325,35 +5329,6 @@ async fn test_backend_authenticated_bearer_stored_with_explicit_optin() {
             "`{directive}` must permit shared storage of an authorized response"
         );
     }
-}
-
-/// A local key-partition option cannot replace the origin's explicit
-/// shared-cache permission. Otherwise backend-side revocation remains masked
-/// for the entry lifetime even though credentials do not cross cache keys.
-#[tokio::test]
-async fn test_consumer_key_partition_does_not_override_shared_cache_admission() {
-    let plugin = plugin_with_config(json!({ "cache_key_include_consumer": true }));
-    let request = advisory_headers(&[("authorization", "Bearer backend-validated")]);
-    let response = advisory_headers(&[("cache-control", "max-age=300")]);
-
-    advisory_miss_cycle(
-        &plugin,
-        "/api/consumer-key-partition",
-        &request,
-        200,
-        &response,
-        b"isolated",
-    )
-    .await;
-
-    assert!(
-        response_caching_cache_keys_for_test(&plugin).is_empty(),
-        "cache_key_include_consumer only changes key partitioning and must not authorize storage"
-    );
-    assert!(matches!(
-        advisory_lookup(&plugin, "/api/consumer-key-partition", &request).await,
-        PluginResult::Continue
-    ));
 }
 
 /// The gate reads the same live/restored header view the cache key comes from,
@@ -6370,12 +6345,11 @@ async fn test_forged_public_backend_status_metadata_cannot_force_invalidation() 
 async fn test_sibling_instances_do_not_consume_each_others_pending_invalidation() {
     let _policy_guard = response_cache_replay_policy_guard();
     let instance_a = plugin_with_config(json!({
-        "invalidate_on_unsafe_methods": true,
-        "cache_key_include_query": true
+        "invalidate_on_unsafe_methods": true
     }));
     let instance_b = plugin_with_config(json!({
         "invalidate_on_unsafe_methods": true,
-        "cache_key_include_query": false
+        "ttl_seconds": 120
     }));
     assert_ne!(
         response_caching_instance_id_for_test(&instance_a),
@@ -6704,7 +6678,7 @@ fn ctx_with_stripped_custom_credential(token: &str) -> RequestContext {
     );
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     ctx.authenticated_identity = Some("alice@example.com".to_string());
-    set_replay_credential_headers_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
+    set_request_headers_to_redact_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
     let mut raw = http::HeaderMap::new();
     raw.insert(
         "x-tenant-jwt",
@@ -6753,14 +6727,12 @@ fn ctx_with_query_credential(token: &str) -> RequestContext {
     ctx
 }
 
-/// Query exclusion is an origin-cache policy, not permission to erase an
-/// authentication credential from the mandatory caller partition.
+/// A query credential is bound into the mandatory caller partition.
 #[tokio::test]
-async fn replay_partition_binds_query_credentials_when_cache_key_excludes_query() {
+async fn replay_partition_binds_query_credentials() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
-        "ttl_seconds": 60,
-        "cache_key_include_query": false
+        "ttl_seconds": 60
     }));
 
     let mut narrow = ctx_with_query_credential("scope-read-only");
@@ -6998,8 +6970,7 @@ async fn replay_partition_binds_vary_by_headers_the_backend_never_nominates() {
 async fn replay_partition_binds_effective_transformed_query() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
-        "ttl_seconds": 60,
-        "cache_key_include_query": false
+        "ttl_seconds": 60
     }));
 
     let mut tenant_a = make_ctx_with_raw_query("GET", "/reports", "tenant=wire");

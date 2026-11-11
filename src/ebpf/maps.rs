@@ -4,9 +4,10 @@
 //! between Rust types and the `#[repr(C)]` shared types from
 //! `ferrum-ebpf-common`. Only available on Linux with `--features ebpf`.
 
-#![allow(dead_code)]
+use std::net::{IpAddr, Ipv6Addr};
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
+use std::net::Ipv4Addr;
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::Ebpf;
@@ -26,358 +27,73 @@ use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
-    BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS,
-    BPF_MAP_NODE_PROBE_PORTS6, BPF_MAP_POD_INBOUND_PORTS, BPF_MAP_POD_INBOUND_PORTS6,
-    BPF_MAP_POD_IPS6, BPF_MAP_UDP_RELAY_CGROUPS, BPF_MAP_UDP_REPLY_SOURCE_GATE,
+    BPF_MAP_BYPASS_UIDS, BPF_MAP_CAPTURE_CONFIG, BPF_MAP_CIDR_EXCLUDE4, BPF_MAP_CIDR_EXCLUDE6,
+    BPF_MAP_CIDR_INCLUDE4, BPF_MAP_CIDR_INCLUDE6, BPF_MAP_INCLUDE_PORTS, BPF_MAP_NODE_IPS,
+    BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS, BPF_MAP_NODE_PROBE_PORTS6,
+    BPF_MAP_POD_INBOUND_PORTS, BPF_MAP_POD_INBOUND_PORTS6, BPF_MAP_POD_IPS, BPF_MAP_POD_IPS6,
+    BPF_MAP_PORT_EXCLUDE, BPF_MAP_UDP_RELAY_CGROUPS, BPF_MAP_UDP_REPLY_SOURCE_GATE,
     BPF_MAP_UDP_REPLY_SOURCES, BPF_MAP_UDP_REPLY_SOURCES6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
 };
 
+/// Typed handles to every Ferrum BPF map.
+///
+/// Every map is mandatory. The ELF is built from `ebpf/` in this repository and
+/// shipped in the same image as the node-agent, so a map the loader cannot find
+/// is a packaging defect: [`BpfMaps::from_ebpf`] refuses it at load instead of
+/// booting into a partial posture.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub struct BpfMaps {
     pod_ips: BpfHashMap<MapData, u32, BpfPodInfo>,
     pod_ips6: BpfHashMap<MapData, CidrKey6, BpfPodInfo>,
-    node_ips: Option<BpfHashMap<MapData, u32, u8>>,
-    node_ips6: Option<BpfHashMap<MapData, CidrKey6, u8>>,
-    node_probe_ports: Option<BpfHashMap<MapData, NodeProbePortKey4, u8>>,
-    node_probe_ports6: Option<BpfHashMap<MapData, NodeProbePortKey6, u8>>,
-    pod_inbound_ports: Option<BpfHashMap<MapData, InboundRedirectKey4, u8>>,
-    pod_inbound_ports6: Option<BpfHashMap<MapData, InboundRedirectKey6, u8>>,
-    udp_reply_sources: Option<BpfHashMap<MapData, UdpReplySourceKey4, u8>>,
-    udp_reply_sources6: Option<BpfHashMap<MapData, UdpReplySourceKey6, u8>>,
-    udp_relay_cgroups: Option<BpfHashMap<MapData, u64, u8>>,
-    udp_reply_source_gate: Option<BpfArray<MapData, u8>>,
+    node_ips: BpfHashMap<MapData, u32, u8>,
+    node_ips6: BpfHashMap<MapData, CidrKey6, u8>,
+    node_probe_ports: BpfHashMap<MapData, NodeProbePortKey4, u8>,
+    node_probe_ports6: BpfHashMap<MapData, NodeProbePortKey6, u8>,
+    pod_inbound_ports: BpfHashMap<MapData, InboundRedirectKey4, u8>,
+    pod_inbound_ports6: BpfHashMap<MapData, InboundRedirectKey6, u8>,
+    udp_reply_sources: BpfHashMap<MapData, UdpReplySourceKey4, u8>,
+    udp_reply_sources6: BpfHashMap<MapData, UdpReplySourceKey6, u8>,
+    udp_relay_cgroups: BpfHashMap<MapData, u64, u8>,
+    udp_reply_source_gate: BpfArray<MapData, u8>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_exclude6: LpmTrie<MapData, CidrKey6, u8>,
     cidr_include4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_include6: LpmTrie<MapData, CidrKey6, u8>,
     port_exclude: BpfHashMap<MapData, u16, u8>,
-    capture_config: Option<BpfHashMap<MapData, u32, BpfCaptureConfig>>,
-    include_ports: Option<BpfHashMap<MapData, u64, IncludePortsPolicy>>,
-    workload_identity: Option<BpfHashMap<MapData, u64, WorkloadIdentity>>,
+    capture_config: BpfHashMap<MapData, u32, BpfCaptureConfig>,
+    include_ports: BpfHashMap<MapData, u64, IncludePortsPolicy>,
+    workload_identity: BpfHashMap<MapData, u64, WorkloadIdentity>,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 impl BpfMaps {
+    /// Take ownership of every Ferrum map from the loaded ELF. Any missing or
+    /// mistyped map is an error.
     pub fn from_ebpf(bpf: &mut Ebpf) -> Result<Self, String> {
-        let pod_ips = BpfHashMap::try_from(
-            bpf.take_map("FERRUM_POD_IPS")
-                .ok_or("FERRUM_POD_IPS map not found")?,
-        )
-        .map_err(|e| format!("FERRUM_POD_IPS type mismatch: {e}"))?;
-
-        let pod_ips6 = BpfHashMap::try_from(
-            bpf.take_map(BPF_MAP_POD_IPS6)
-                .ok_or("FERRUM_POD_IPS6 map not found")?,
-        )
-        .map_err(|e| format!("FERRUM_POD_IPS6 type mismatch: {e}"))?;
-
-        let node_ips = match bpf.take_map(BPF_MAP_NODE_IPS) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_NODE_IPS type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_NODE_IPS map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        let node_ips6 = match bpf.take_map(BPF_MAP_NODE_IPS6) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_NODE_IPS6 type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_NODE_IPS6 map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        let node_probe_ports = match bpf.take_map(BPF_MAP_NODE_PROBE_PORTS) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_NODE_PROBE_PORTS type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_NODE_PROBE_PORTS map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        let node_probe_ports6 = match bpf.take_map(BPF_MAP_NODE_PROBE_PORTS6) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_NODE_PROBE_PORTS6 type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_NODE_PROBE_PORTS6 map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        // Redirect scope maps. A stale ELF without them is tolerated here and
-        // refused by `AyaEbpfBackend::attach_ingress_redirect` (through
-        // `supports_inbound_redirect_scope`) when the redirect is enabled, so a
-        // node-agent that cannot scope the redirect fails startup rather than
-        // redirecting on pod-IP alone.
-        let pod_inbound_ports = match bpf.take_map(BPF_MAP_POD_INBOUND_PORTS) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_POD_INBOUND_PORTS type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_POD_INBOUND_PORTS map not found; the NodeWaypoint inbound tc redirect cannot be scoped and startup will refuse to attach it"
-                );
-                None
-            }
-        };
-
-        let pod_inbound_ports6 = match bpf.take_map(BPF_MAP_POD_INBOUND_PORTS6) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_POD_INBOUND_PORTS6 type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_POD_INBOUND_PORTS6 map not found; the NodeWaypoint inbound tc redirect cannot be scoped and startup will refuse to attach it"
-                );
-                None
-            }
-        };
-
-        // NodeWaypoint UDP/DTLS reply-source authorization (issue #3286). A
-        // stale ELF without them is tolerated here and rejected by
-        // `validate_required` for the NodeWaypoint topology, so a node-agent
-        // that cannot authorize the relay's source-pinned replies never reports
-        // ready — rather than serving UDP/DTLS whose every reply this node's own
-        // guard would silently drop.
-        let udp_reply_sources = match bpf.take_map(BPF_MAP_UDP_REPLY_SOURCES) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_UDP_REPLY_SOURCES type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_UDP_REPLY_SOURCES map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        let udp_reply_sources6 = match bpf.take_map(BPF_MAP_UDP_REPLY_SOURCES6) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_UDP_REPLY_SOURCES6 type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_UDP_REPLY_SOURCES6 map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        let udp_relay_cgroups = match bpf.take_map(BPF_MAP_UDP_RELAY_CGROUPS) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_UDP_RELAY_CGROUPS type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_UDP_RELAY_CGROUPS map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        let udp_reply_source_gate = match bpf.take_map(BPF_MAP_UDP_REPLY_SOURCE_GATE) {
-            Some(map) => Some(
-                BpfArray::try_from(map)
-                    .map_err(|e| format!("FERRUM_UDP_REPLY_SOURCE_GATE type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_UDP_REPLY_SOURCE_GATE map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        let bypass_uids = BpfHashMap::try_from(
-            bpf.take_map("FERRUM_BYPASS_UIDS")
-                .ok_or("FERRUM_BYPASS_UIDS map not found")?,
-        )
-        .map_err(|e| format!("FERRUM_BYPASS_UIDS type mismatch: {e}"))?;
-
-        let cidr_exclude4 = LpmTrie::try_from(
-            bpf.take_map("FERRUM_CIDR_EXCLUDE4")
-                .ok_or("FERRUM_CIDR_EXCLUDE4 map not found")?,
-        )
-        .map_err(|e| format!("FERRUM_CIDR_EXCLUDE4 type mismatch: {e}"))?;
-
-        let cidr_exclude6 = LpmTrie::try_from(
-            bpf.take_map("FERRUM_CIDR_EXCLUDE6")
-                .ok_or("FERRUM_CIDR_EXCLUDE6 map not found")?,
-        )
-        .map_err(|e| format!("FERRUM_CIDR_EXCLUDE6 type mismatch: {e}"))?;
-
-        let cidr_include4 = LpmTrie::try_from(
-            bpf.take_map("FERRUM_CIDR_INCLUDE4")
-                .ok_or("FERRUM_CIDR_INCLUDE4 map not found")?,
-        )
-        .map_err(|e| format!("FERRUM_CIDR_INCLUDE4 type mismatch: {e}"))?;
-
-        let cidr_include6 = LpmTrie::try_from(
-            bpf.take_map("FERRUM_CIDR_INCLUDE6")
-                .ok_or("FERRUM_CIDR_INCLUDE6 map not found")?,
-        )
-        .map_err(|e| format!("FERRUM_CIDR_INCLUDE6 type mismatch: {e}"))?;
-
-        let port_exclude = BpfHashMap::try_from(
-            bpf.take_map("FERRUM_PORT_EXCLUDE")
-                .ok_or("FERRUM_PORT_EXCLUDE map not found")?,
-        )
-        .map_err(|e| format!("FERRUM_PORT_EXCLUDE type mismatch: {e}"))?;
-
-        let capture_config = match bpf.take_map("FERRUM_CAPTURE_CONFIG") {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_CAPTURE_CONFIG type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_CAPTURE_CONFIG map not found; startup readiness will reject enabled eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
-        // Older BPF ELFs may predate the include-ports gate. Tolerate the
-        // missing map so the node-agent still boots with a stale program;
-        // the BPF `include_port_allowed` helper fail-opens on missing
-        // lookups, so capture stays correct for unannotated pods. Pods
-        // that DO carry `includeOutboundPorts` will be over-captured (no
-        // narrowing), which is the prior GAP-2K behavior.
-        let include_ports = match bpf.take_map("FERRUM_INCLUDE_PORTS") {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_INCLUDE_PORTS type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_INCLUDE_PORTS map not found; per-pod includeOutboundPorts narrowing disabled (eBPF ELF predates GAP-2K)"
-                );
-                None
-            }
-        };
-
-        // Older BPF ELFs predate the GAP-1b per-cgroup identity map. Tolerate
-        // the missing map so the node-agent still boots; the connect hooks
-        // fall back to the all-zero sentinel, which node-waypoint resolution
-        // treats as fail-closed (the prior behavior).
-        let workload_identity = match bpf.take_map(super::BPF_MAP_WORKLOAD_IDENTITY) {
-            Some(map) => Some(
-                BpfHashMap::try_from(map)
-                    .map_err(|e| format!("FERRUM_WORKLOAD_IDENTITY type mismatch: {e}"))?,
-            ),
-            None => {
-                tracing::warn!(
-                    "FERRUM_WORKLOAD_IDENTITY map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
-                );
-                None
-            }
-        };
-
         Ok(Self {
-            pod_ips,
-            pod_ips6,
-            node_ips,
-            node_ips6,
-            node_probe_ports,
-            node_probe_ports6,
-            pod_inbound_ports,
-            pod_inbound_ports6,
-            udp_reply_sources,
-            udp_reply_sources6,
-            udp_relay_cgroups,
-            udp_reply_source_gate,
-            bypass_uids,
-            cidr_exclude4,
-            cidr_exclude6,
-            cidr_include4,
-            cidr_include6,
-            port_exclude,
-            capture_config,
-            include_ports,
-            workload_identity,
+            pod_ips: take_required_map(bpf, BPF_MAP_POD_IPS)?,
+            pod_ips6: take_required_map(bpf, BPF_MAP_POD_IPS6)?,
+            node_ips: take_required_map(bpf, BPF_MAP_NODE_IPS)?,
+            node_ips6: take_required_map(bpf, BPF_MAP_NODE_IPS6)?,
+            node_probe_ports: take_required_map(bpf, BPF_MAP_NODE_PROBE_PORTS)?,
+            node_probe_ports6: take_required_map(bpf, BPF_MAP_NODE_PROBE_PORTS6)?,
+            pod_inbound_ports: take_required_map(bpf, BPF_MAP_POD_INBOUND_PORTS)?,
+            pod_inbound_ports6: take_required_map(bpf, BPF_MAP_POD_INBOUND_PORTS6)?,
+            udp_reply_sources: take_required_map(bpf, BPF_MAP_UDP_REPLY_SOURCES)?,
+            udp_reply_sources6: take_required_map(bpf, BPF_MAP_UDP_REPLY_SOURCES6)?,
+            udp_relay_cgroups: take_required_map(bpf, BPF_MAP_UDP_RELAY_CGROUPS)?,
+            udp_reply_source_gate: take_required_map(bpf, BPF_MAP_UDP_REPLY_SOURCE_GATE)?,
+            bypass_uids: take_required_map(bpf, BPF_MAP_BYPASS_UIDS)?,
+            cidr_exclude4: take_required_map(bpf, BPF_MAP_CIDR_EXCLUDE4)?,
+            cidr_exclude6: take_required_map(bpf, BPF_MAP_CIDR_EXCLUDE6)?,
+            cidr_include4: take_required_map(bpf, BPF_MAP_CIDR_INCLUDE4)?,
+            cidr_include6: take_required_map(bpf, BPF_MAP_CIDR_INCLUDE6)?,
+            port_exclude: take_required_map(bpf, BPF_MAP_PORT_EXCLUDE)?,
+            capture_config: take_required_map(bpf, BPF_MAP_CAPTURE_CONFIG)?,
+            include_ports: take_required_map(bpf, BPF_MAP_INCLUDE_PORTS)?,
+            workload_identity: take_required_map(bpf, BPF_MAP_WORKLOAD_IDENTITY)?,
         })
-    }
-
-    /// `true` when both redirect scope maps are present. The aya backend
-    /// consults this before arming the inbound tc redirect: without the scope
-    /// maps the kernel could only match on pod IP, which would capture every
-    /// port of an enrolled pod rather than its declared inbound ports.
-    pub fn supports_inbound_redirect_scope(&self) -> bool {
-        self.pod_inbound_ports.is_some() && self.pod_inbound_ports6.is_some()
-    }
-
-    pub fn validate_required(&self, require_workload_identity: bool) -> Result<(), String> {
-        let mut missing = Vec::new();
-        if self.capture_config.is_none() {
-            missing.push(BPF_MAP_CAPTURE_CONFIG);
-        }
-        if require_workload_identity && self.workload_identity.is_none() {
-            missing.push(BPF_MAP_WORKLOAD_IDENTITY);
-        }
-        if require_workload_identity && self.node_ips.is_none() {
-            missing.push(BPF_MAP_NODE_IPS);
-        }
-        if require_workload_identity && self.node_ips6.is_none() {
-            missing.push(BPF_MAP_NODE_IPS6);
-        }
-        if require_workload_identity && self.node_probe_ports.is_none() {
-            missing.push(BPF_MAP_NODE_PROBE_PORTS);
-        }
-        if require_workload_identity && self.node_probe_ports6.is_none() {
-            missing.push(BPF_MAP_NODE_PROBE_PORTS6);
-        }
-        // Both families are required together: a NodeWaypoint with only one
-        // could authorize its reply source on one family and black-hole the
-        // other, which is exactly the silent half-serving posture readiness
-        // exists to prevent.
-        if require_workload_identity && self.udp_reply_sources.is_none() {
-            missing.push(BPF_MAP_UDP_REPLY_SOURCES);
-        }
-        if require_workload_identity && self.udp_reply_sources6.is_none() {
-            missing.push(BPF_MAP_UDP_REPLY_SOURCES6);
-        }
-        // The sender proof is not optional hardening: without it the tc UDP
-        // arms have nothing non-forgeable to require, and a NodeWaypoint that
-        // reported ready on such an ELF would serve the exact admission both
-        // #3956 and #3957 describe.
-        if require_workload_identity && self.udp_relay_cgroups.is_none() {
-            missing.push(BPF_MAP_UDP_RELAY_CGROUPS);
-        }
-        if require_workload_identity && self.udp_reply_source_gate.is_none() {
-            missing.push(BPF_MAP_UDP_REPLY_SOURCE_GATE);
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-        Err(format!(
-            "BPF ELF is missing required map(s) for the selected capture topology: {}",
-            missing.join(", ")
-        ))
     }
 
     pub fn insert_pod_ip(&mut self, ip: Ipv4Addr, info: &PodInfo) -> Result<(), String> {
@@ -415,61 +131,43 @@ impl BpfMaps {
     }
 
     pub fn insert_node_ip(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-        let Some(node_ips) = self.node_ips.as_mut() else {
-            return Ok(());
-        };
         let key = ipv4_to_nbo_key(ip);
-        node_ips
+        self.node_ips
             .insert(&key, &1u8, 0)
             .map_err(|e| format!("Failed to insert node IP {ip}: {e}"))
     }
 
     pub fn insert_node_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
-        let Some(node_ips6) = self.node_ips6.as_mut() else {
-            return Ok(());
-        };
         let key = CidrKey6::host(ipv6_to_nbo_words(ip));
-        node_ips6
+        self.node_ips6
             .insert(&key, &1u8, 0)
             .map_err(|e| format!("Failed to insert node IPv6 {ip}: {e}"))
     }
 
     pub fn insert_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
-        let Some(node_probe_ports) = self.node_probe_ports.as_mut() else {
-            return Ok(());
-        };
         let key = NodeProbePortKey4::new(ipv4_to_nbo_key(ip), port);
-        node_probe_ports
+        self.node_probe_ports
             .insert(&key, &1u8, 0)
             .map_err(|e| format!("Failed to insert node probe port {ip}:{port}: {e}"))
     }
 
     pub fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
-        let Some(node_probe_ports) = self.node_probe_ports.as_mut() else {
-            return Ok(());
-        };
         let key = NodeProbePortKey4::new(ipv4_to_nbo_key(ip), port);
-        tolerate_missing_map_remove(node_probe_ports.remove(&key), || {
+        tolerate_missing_map_remove(self.node_probe_ports.remove(&key), || {
             format!("node probe port {ip}:{port}")
         })
     }
 
     pub fn insert_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
-        let Some(node_probe_ports6) = self.node_probe_ports6.as_mut() else {
-            return Ok(());
-        };
         let key = NodeProbePortKey6::new(ipv6_to_nbo_words(ip), port);
-        node_probe_ports6
+        self.node_probe_ports6
             .insert(&key, &1u8, 0)
             .map_err(|e| format!("Failed to insert node IPv6 probe port {ip}:{port}: {e}"))
     }
 
     pub fn remove_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String> {
-        let Some(node_probe_ports6) = self.node_probe_ports6.as_mut() else {
-            return Ok(());
-        };
         let key = NodeProbePortKey6::new(ipv6_to_nbo_words(ip), port);
-        tolerate_missing_map_remove(node_probe_ports6.remove(&key), || {
+        tolerate_missing_map_remove(self.node_probe_ports6.remove(&key), || {
             format!("node IPv6 probe port {ip}:{port}")
         })
     }
@@ -483,14 +181,7 @@ impl BpfMaps {
     /// the map for this address, which is what lets pod teardown work from a
     /// Kubernetes delete event that carries no spec snapshot.
     ///
-    /// An absent map is a **hard error** when there is anything to write: the
-    /// caller only reaches here after deciding to arm the redirect, and
-    /// silently succeeding would flag a pod as redirect-eligible with no
-    /// reachable port (a black hole, since in-scope traffic fails closed).
-    /// Clearing an absent map is a no-op so teardown still succeeds against an
-    /// older ELF.
-    ///
-    /// A key-iteration error is likewise a **hard error**, never skipped: the
+    /// A key-iteration error is a **hard error**, never skipped: the
     /// scan is what finds the stale keys, so swallowing an error would return
     /// success from a narrowing update that never removed the withdrawn
     /// `(pod, port)` — leaving a port the operator just took out of
@@ -498,14 +189,7 @@ impl BpfMaps {
     /// cleared because the write "succeeded".
     pub fn replace_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String> {
         let addr = ipv4_to_nbo_key(ip);
-        let Some(pod_inbound_ports) = self.pod_inbound_ports.as_mut() else {
-            if ports.is_empty() {
-                return Ok(());
-            }
-            return Err(format!(
-                "FERRUM_POD_INBOUND_PORTS map is absent; cannot scope the inbound redirect for {ip}"
-            ));
-        };
+        let pod_inbound_ports = &mut self.pod_inbound_ports;
 
         let mut stale: Vec<InboundRedirectKey4> = Vec::new();
         for key in pod_inbound_ports.keys() {
@@ -541,14 +225,7 @@ impl BpfMaps {
         ports: &[u16],
     ) -> Result<(), String> {
         let addr = ipv6_to_nbo_words(ip);
-        let Some(pod_inbound_ports6) = self.pod_inbound_ports6.as_mut() else {
-            if ports.is_empty() {
-                return Ok(());
-            }
-            return Err(format!(
-                "FERRUM_POD_INBOUND_PORTS6 map is absent; cannot scope the inbound redirect for {ip}"
-            ));
-        };
+        let pod_inbound_ports6 = &mut self.pod_inbound_ports6;
 
         let mut stale: Vec<InboundRedirectKey6> = Vec::new();
         for key in pod_inbound_ports6.keys() {
@@ -582,32 +259,19 @@ impl BpfMaps {
     /// Open or close the shared BPF-visible reply-source gate. Both classifier
     /// families read this one value before consulting either family map.
     pub fn set_udp_reply_sources_enabled(&mut self, enabled: bool) -> Result<(), String> {
-        let Some(gate) = self.udp_reply_source_gate.as_mut() else {
-            return Err(format!(
-                "{BPF_MAP_UDP_REPLY_SOURCE_GATE} map is absent; NodeWaypoint UDP/DTLS reply-source authorization cannot be fenced"
-            ));
-        };
         let value = if enabled {
             UDP_REPLY_SOURCE_GATE_ENABLED
         } else {
             UDP_REPLY_SOURCE_GATE_DISABLED
         };
-        gate.set(UDP_REPLY_SOURCE_GATE_KEY, &value, 0).map_err(|e| {
-            format!(
-                "Failed to {} NodeWaypoint UDP/DTLS reply-source authorization gate: {e}",
-                if enabled { "enable" } else { "disable" }
-            )
-        })
-    }
-
-    /// Close the gate during backend teardown when this ELF carries it. A
-    /// missing gate is already inert and is rejected separately by NodeWaypoint
-    /// readiness; local-pod cleanup must still support an older irrelevant ELF.
-    pub fn disable_udp_reply_sources_for_cleanup(&mut self) -> Result<(), String> {
-        if self.udp_reply_source_gate.is_none() {
-            return Ok(());
-        }
-        self.set_udp_reply_sources_enabled(false)
+        self.udp_reply_source_gate
+            .set(UDP_REPLY_SOURCE_GATE_KEY, &value, 0)
+            .map_err(|e| {
+                format!(
+                    "Failed to {} NodeWaypoint UDP/DTLS reply-source authorization gate: {e}",
+                    if enabled { "enable" } else { "disable" }
+                )
+            })
     }
 
     /// Replace both NodeWaypoint UDP/DTLS reply-source map contents with
@@ -618,12 +282,9 @@ impl BpfMaps {
     /// not itself a coherence guarantee: a scan/remove/family failure can leave
     /// stale entries behind. The shared gate is the authorization boundary.
     ///
-    /// **BOTH families must be present for every generation**, even when the
-    /// complete desired set (or one family's share of it) is empty: the caller
-    /// acknowledges a whole IPv4+IPv6 generation as applied, and an absent map
-    /// means there is no proof that family was scanned and emptied. A v4-only
-    /// set on an ELF missing `FERRUM_UDP_REPLY_SOURCES6`, or an empty generation
-    /// on either missing map, must therefore NOT report success.
+    /// Both families are scanned and applied for every generation, even when
+    /// the complete desired set (or one family's share of it) is empty: the
+    /// caller acknowledges a whole IPv4+IPv6 generation as applied.
     ///
     /// A key-iteration error is likewise a hard error, never skipped: the scan
     /// is what finds the entries to revoke, so swallowing it would report a
@@ -636,14 +297,6 @@ impl BpfMaps {
                 UDP_REPLY_SOURCE_MAX_ENTRIES
             ));
         }
-        if self.udp_reply_sources.is_none() || self.udp_reply_sources6.is_none() {
-            return Err(format!(
-                "refusing to authorize NodeWaypoint UDP/DTLS reply sources: {} and \
-                 {} must both be present, and at least one is absent from the loaded program",
-                BPF_MAP_UDP_REPLY_SOURCES, BPF_MAP_UDP_REPLY_SOURCES6
-            ));
-        }
-
         let mut desired4: Vec<UdpReplySourceKey4> = Vec::new();
         let mut desired6: Vec<UdpReplySourceKey6> = Vec::new();
         for (addr, port) in sources {
@@ -658,12 +311,12 @@ impl BpfMaps {
         }
 
         replace_udp_reply_source_family(
-            self.udp_reply_sources.as_mut(),
+            &mut self.udp_reply_sources,
             &desired4,
             BPF_MAP_UDP_REPLY_SOURCES,
         )?;
         replace_udp_reply_source_family(
-            self.udp_reply_sources6.as_mut(),
+            &mut self.udp_reply_sources6,
             &desired6,
             BPF_MAP_UDP_REPLY_SOURCES6,
         )
@@ -673,12 +326,10 @@ impl BpfMaps {
     /// NodeWaypoint relay pod's own cgroup-v2 subtree (issues #3956, #3957).
     ///
     /// Same whole-set, gate-fenced discipline as
-    /// [`BpfMaps::replace_udp_reply_sources`], and the same reason the map must
-    /// be PRESENT for every generation including an empty withdrawal: the
-    /// caller acknowledges one applied generation, and an absent map is not
-    /// proof that the previous sender proof was revoked. A key-iteration error
-    /// is a hard error for the same reason — the scan is what finds the ids to
-    /// revoke, so swallowing it would report a withdrawal that never happened.
+    /// [`BpfMaps::replace_udp_reply_sources`], applied for every generation
+    /// including an empty withdrawal. A key-iteration error is a hard error —
+    /// the scan is what finds the ids to revoke, so swallowing it would report
+    /// a withdrawal that never happened.
     ///
     /// An entry here is inert while the shared gate is closed, which is what
     /// lets the node-agent apply the sender proof and the source proof as one
@@ -691,12 +342,7 @@ impl BpfMaps {
                 UDP_RELAY_CGROUP_MAX_ENTRIES
             ));
         }
-        let Some(map) = self.udp_relay_cgroups.as_mut() else {
-            return Err(format!(
-                "{BPF_MAP_UDP_RELAY_CGROUPS} map is absent; cannot apply a NodeWaypoint UDP relay \
-                 sender proof"
-            ));
-        };
+        let map = &mut self.udp_relay_cgroups;
 
         let mut stale: Vec<u64> = Vec::new();
         for key in map.keys() {
@@ -770,72 +416,51 @@ impl BpfMaps {
     }
 
     pub fn update_capture_config(&mut self, config: &BpfCaptureConfig) -> Result<(), String> {
-        let Some(capture_config) = self.capture_config.as_mut() else {
-            tracing::warn!(
-                "Skipping capture config update because FERRUM_CAPTURE_CONFIG map is absent"
-            );
-            return Ok(());
-        };
-        capture_config
+        self.capture_config
             .insert(&FERRUM_CAPTURE_CONFIG_KEY, config, 0)
             .map_err(|e| format!("Failed to update capture config: {e}"))
     }
 
     /// Insert (or replace) a per-cgroup `includeOutboundPorts` narrowing
-    /// policy. Absent map (older ELF) is a no-op so the node agent boots
-    /// even when the new gate is unavailable.
+    /// policy.
     pub fn insert_include_ports(
         &mut self,
         cgroup_id: u64,
         policy: &IncludePortsPolicy,
     ) -> Result<(), String> {
-        let Some(include_ports) = self.include_ports.as_mut() else {
-            return Ok(());
-        };
-        include_ports
+        self.include_ports
             .insert(&cgroup_id, policy, 0)
             .map_err(|e| format!("Failed to insert include-ports for cgroup {cgroup_id}: {e}"))
     }
 
     /// Remove a per-cgroup `includeOutboundPorts` entry, e.g. on pod
-    /// un-enrollment. Absent map (older ELF) is a no-op; an absent key is
-    /// tolerated because pods that were never annotated legitimately have no
-    /// entry. Any other failure is returned: a stale narrowing keyed by a
-    /// cgroup inode would apply the old port list to a pod that later reuses
-    /// that inode, so the caller must keep retrying the removal.
+    /// un-enrollment. An absent key is tolerated because pods that were never
+    /// annotated legitimately have no entry. Any other failure is returned: a
+    /// stale narrowing keyed by a cgroup inode would apply the old port list to
+    /// a pod that later reuses that inode, so the caller must keep retrying the
+    /// removal.
     pub fn remove_include_ports(&mut self, cgroup_id: u64) -> Result<(), String> {
-        let Some(include_ports) = self.include_ports.as_mut() else {
-            return Ok(());
-        };
-        tolerate_missing_map_remove(include_ports.remove(&cgroup_id), || {
+        tolerate_missing_map_remove(self.include_ports.remove(&cgroup_id), || {
             format!("the include-ports entry for cgroup {cgroup_id}")
         })
     }
 
     /// Insert (or replace) a per-cgroup source workload identity (GAP-1b).
-    /// Absent map (older ELF) is a no-op so the node agent boots even when
-    /// the new map is unavailable.
     pub fn insert_workload_identity(
         &mut self,
         cgroup_id: u64,
         identity: &WorkloadIdentity,
     ) -> Result<(), String> {
-        let Some(workload_identity) = self.workload_identity.as_mut() else {
-            return Ok(());
-        };
-        workload_identity
+        self.workload_identity
             .insert(&cgroup_id, identity, 0)
             .map_err(|e| format!("Failed to insert workload identity for cgroup {cgroup_id}: {e}"))
     }
 
     /// Remove a per-cgroup workload identity entry, e.g. on pod
-    /// un-enrollment. Absent map (older ELF) is a no-op; absent key is
-    /// tolerated because the connect hooks fail-open to the unknown sentinel.
+    /// un-enrollment. An absent key is tolerated because the connect hooks
+    /// fail-open to the unknown sentinel.
     pub fn remove_workload_identity(&mut self, cgroup_id: u64) -> Result<(), String> {
-        let Some(workload_identity) = self.workload_identity.as_mut() else {
-            return Ok(());
-        };
-        match workload_identity.remove(&cgroup_id) {
+        match self.workload_identity.remove(&cgroup_id) {
             Ok(()) => Ok(()),
             // An absent key is benign (already removed / never written): the
             // connect hooks fail-open to the unknown sentinel, so tolerate it.
@@ -860,19 +485,13 @@ impl BpfMaps {
 /// asymmetry that would make one family fail open.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 fn replace_udp_reply_source_family<K>(
-    map: Option<&mut BpfHashMap<MapData, K, u8>>,
+    map: &mut BpfHashMap<MapData, K, u8>,
     desired: &[K],
     map_name: &str,
 ) -> Result<(), String>
 where
     K: aya::Pod + PartialEq,
 {
-    let Some(map) = map else {
-        return Err(format!(
-            "{map_name} map is absent; cannot apply a NodeWaypoint UDP/DTLS reply-source generation"
-        ));
-    };
-
     let mut stale: Vec<K> = Vec::new();
     for key in map.keys() {
         let key = key.map_err(|e| {
@@ -896,6 +515,19 @@ where
         })?;
     }
     Ok(())
+}
+
+/// Take one map out of the loaded ELF as its typed handle, refusing a missing
+/// or mistyped map.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn take_required_map<T>(bpf: &mut Ebpf, name: &str) -> Result<T, String>
+where
+    T: TryFrom<aya::maps::Map, Error = aya::maps::MapError>,
+{
+    let map = bpf
+        .take_map(name)
+        .ok_or_else(|| format!("{name} map not found in the loaded BPF ELF"))?;
+    T::try_from(map).map_err(|e| format!("{name} type mismatch: {e}"))
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -980,6 +612,7 @@ pub fn parse_cidr_to_lpm_key_data(cidr: &str) -> Result<ParsedCidrKey, String> {
     }
 }
 
+#[cfg(any(test, all(feature = "ebpf", target_os = "linux")))]
 fn ipv4_to_nbo_key(addr: Ipv4Addr) -> u32 {
     u32::from(addr).to_be()
 }

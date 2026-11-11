@@ -300,6 +300,9 @@ mesh:
   peer_authentications:
     - name: strict-default
       namespace: default
+      scope:
+        kind: namespace
+        namespace: default
       mtls_mode: strict
 "#;
 

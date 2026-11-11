@@ -120,11 +120,11 @@ impl RequestTermination {
                 REQUEST_TERMINATION_CONFIG_KEYS.join("`, `")
             )
         })?;
-        reject_unknown_keys(
+        crate::util::unknown_keys::reject_unknown_keys(
             config,
             "config",
             REQUEST_TERMINATION_CONFIG_KEYS,
-            "request_termination",
+            "request_termination: `config`: ",
         )?;
 
         let status_code = parse_status_code(config)?;
@@ -175,28 +175,6 @@ impl RequestTermination {
             trigger,
         })
     }
-}
-
-fn reject_unknown_keys(
-    object: &Map<String, Value>,
-    path: &str,
-    allowed: &[&str],
-    plugin: &str,
-) -> Result<(), String> {
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .filter(|key| !allowed.contains(&key.as_str()))
-        .map(String::as_str)
-        .collect();
-    if unknown.is_empty() {
-        return Ok(());
-    }
-    unknown.sort_unstable();
-    Err(format!(
-        "{plugin}: unknown config key(s) under `{path}`: {:?}; allowed keys: `{}`",
-        unknown.join(", "),
-        allowed.join("`, `")
-    ))
 }
 
 fn parse_status_code(config: &Map<String, Value>) -> Result<u16, String> {
@@ -269,11 +247,11 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
     let Value::Object(trigger) = trigger else {
         return Err("request_termination: `trigger` must be an object".to_string());
     };
-    reject_unknown_keys(
+    crate::util::unknown_keys::reject_unknown_keys(
         trigger,
         "trigger",
         REQUEST_TERMINATION_TRIGGER_KEYS,
-        "request_termination",
+        "request_termination: `trigger`: ",
     )?;
 
     let has_path = trigger.contains_key("path_prefix");

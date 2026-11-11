@@ -283,7 +283,6 @@ pub fn probe_node_agent_status(config: &RollbackWatchConfig) -> bool {
         container_id: String::new(),
         ifname: None,
         netns_path: None,
-        args: Default::default(),
         valid_attachments: Vec::new(),
     };
     if request.validate().is_err() {

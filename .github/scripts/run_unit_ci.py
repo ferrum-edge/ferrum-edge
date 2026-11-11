@@ -185,7 +185,7 @@ REQUIRED_TESTS: dict[str, set[str]] = {
         "tls::acme_renewal_resume_tests::a_resumed_order_with_ambiguous_challenges_fails_before_any_side_effect",
         "tls::acme_renewal_resume_tests::a_resumed_order_with_corrupt_finalization_material_fails_closed",
         "tls::acme_renewal_resume_tests::a_resumed_order_without_finalization_material_fails_before_any_side_effect",
-        "tls::acme_renewal_resume_tests::ambiguous_or_missing_challenge_families_fail_closed",
+        "tls::acme_renewal_resume_tests::ambiguous_challenge_families_fail_closed_and_none_needs_no_type",
         "tls::acme_renewal_resume_tests::an_order_without_a_url_is_resumed_rather_than_skipped",
         "tls::acme_renewal_resume_tests::every_active_order_status_is_resumed_after_takeover",
         "tls::acme_renewal_resume_tests::expired_claim_takeover_resumes_a_persisted_dns01_order",

@@ -191,10 +191,6 @@ impl BasicAuth {
         VerifyOutcome::VerificationFailed(r#"{"error":"Invalid credentials"}"#.into())
     }
 
-    // The library target exposes this through `_test_support` to external unit
-    // tests. The binary test target compiles this module separately without
-    // that bridge, so the helper is intentionally unused there.
-    #[allow(dead_code)]
     pub(crate) fn verify_with_test_material(
         dummy_password_hash: String,
         verification_rounds: usize,

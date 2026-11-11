@@ -555,43 +555,4 @@ impl PoolConfig {
         }
         let _ = write!(buf, ";mf{max_frame}");
     }
-
-    /// Validate and clamp `max_idle_per_host` to the allowed range, logging
-    /// a warning when the value is adjusted.
-    ///
-    /// Global env/`ferrum.conf` parsing ([`Self::from_env_with_conf`]) rejects
-    /// out-of-range values instead of clamping, and no production call site
-    /// uses this clamp today; only tests call it.
-    pub fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
-        if value < MIN_IDLE_PER_HOST {
-            tracing::warn!(
-                "{}",
-                crate::startup::sanitize_startup_cause(
-                    format!(
-                        "pool_max_idle_per_host=\"{value}\" for {source:?} is below the minimum \
-                         ({MIN_IDLE_PER_HOST}). Values this low cause excessive connection churn \
-                         under load, leading to high latency and errors. Clamping to \
-                         {MIN_IDLE_PER_HOST}."
-                    ),
-                    &[]
-                )
-            );
-            MIN_IDLE_PER_HOST
-        } else if value > MAX_IDLE_PER_HOST {
-            tracing::warn!(
-                "{}",
-                crate::startup::sanitize_startup_cause(
-                    format!(
-                        "pool_max_idle_per_host=\"{value}\" for {source:?} exceeds the maximum \
-                         ({MAX_IDLE_PER_HOST}). Very high values waste file descriptors and \
-                         memory without improving performance. Clamping to {MAX_IDLE_PER_HOST}."
-                    ),
-                    &[]
-                )
-            );
-            MAX_IDLE_PER_HOST
-        } else {
-            value
-        }
-    }
 }

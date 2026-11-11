@@ -5,7 +5,7 @@ use ferrum_edge::plugins::response_mock::{
     RESPONSE_MOCK_CONFIG_KEYS, RESPONSE_MOCK_MATCH_KEYS, RESPONSE_MOCK_MAX_BODY_BYTES,
     RESPONSE_MOCK_MAX_DELAY_MS, RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES,
     RESPONSE_MOCK_MAX_HEADERS_PER_RULE, RESPONSE_MOCK_MAX_MATCH_CONDITIONS,
-    RESPONSE_MOCK_MAX_RULES, RESPONSE_MOCK_RULE_KEYS, ResponseMock,
+    RESPONSE_MOCK_MAX_RULES, ResponseMock,
 };
 use ferrum_edge::plugins::utils::fault_delay::FaultDelayAdmission;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -260,13 +260,13 @@ fn test_creation_rejects_unknown_top_level_key() {
     .err()
     .expect("misspelled top-level key must be rejected");
     assert!(
-        err.contains("unknown config key(s) under `config`"),
+        err.contains("`config`: unknown configuration key(s)"),
         "got: {err}"
     );
     assert!(err.contains("passthrough_on_no_mach"), "got: {err}");
     assert!(
-        err.contains(RESPONSE_MOCK_CONFIG_KEYS[0]),
-        "error should list allowed keys: {err}"
+        err.contains(&format!("did you mean `{}`?", RESPONSE_MOCK_CONFIG_KEYS[1])),
+        "error should suggest the intended key: {err}"
     );
 }
 
@@ -282,13 +282,13 @@ fn test_creation_rejects_unknown_rule_key() {
     .err()
     .expect("misspelled rule key must be rejected");
     assert!(
-        err.contains("unknown config key(s) under `config.rules[0]`"),
+        err.contains("`config.rules[0]`: unknown configuration key(s)"),
         "got: {err}"
     );
     assert!(err.contains("status_cod"), "got: {err}");
     assert!(
-        err.contains(RESPONSE_MOCK_RULE_KEYS[0]),
-        "error should list allowed keys: {err}"
+        err.contains("did you mean `status_code`?"),
+        "error should suggest the intended key: {err}"
     );
 }
 
@@ -1575,7 +1575,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({"rules": [{token: true}]}),
             "`config.rules[0]`",
-            "unknown config key",
+            "unknown configuration key",
         ),
         (
             json!({"rules": [{"path": "/", "status_code": 103}]}),
@@ -2075,8 +2075,11 @@ fn test_match_configuration_is_validated() {
     .err()
     .expect("misspelled match key must be rejected");
     assert!(
-        err.contains("unknown config key(s) under `config.rules[0].match`"),
+        err.contains("`config.rules[0].match`: unknown configuration key(s)"),
         "got: {err}"
     );
-    assert!(err.contains(RESPONSE_MOCK_MATCH_KEYS[0]), "got: {err}");
+    assert!(
+        err.contains(&format!("did you mean `{}`?", RESPONSE_MOCK_MATCH_KEYS[0])),
+        "got: {err}"
+    );
 }

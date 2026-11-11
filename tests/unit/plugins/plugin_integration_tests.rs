@@ -529,7 +529,10 @@ async fn test_plugin_error_handling() {
     let error = create_plugin("jwt_auth", &json!({"invalid": "config"}))
         .err()
         .expect("jwt_auth must reject unknown config keys");
-    assert_eq!(error, "jwt_auth: unknown config key \"invalid\"");
+    assert_eq!(
+        error,
+        "jwt_auth: `config`: unknown configuration key(s): \"config.invalid\""
+    );
 }
 
 #[tokio::test]
@@ -629,7 +632,6 @@ async fn test_response_caching_stores_transformed_body() {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -743,10 +745,6 @@ mod runtime_overlay_cache_provenance {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                // Partitioning only: authenticated fixtures still need
-                // `Cache-Control: public` (see `origin_headers`) under
-                // RFC 9111 §3.5 / GHSA-7f28.
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -1526,7 +1524,6 @@ async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -1702,7 +1699,6 @@ async fn response_cache_misses_after_route_response_header_policy_changes() {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()
@@ -1792,7 +1788,6 @@ fn route_override_replay_plugins() -> Vec<Arc<dyn Plugin>> {
         &json!({
             "ttl_seconds": 60,
             "add_cache_status_header": true,
-            "cache_key_include_consumer": true,
         }),
     )
     .unwrap()
@@ -1969,7 +1964,6 @@ async fn test_response_cache_revalidated_lifecycle_skips_header_transforms() {
             &json!({
                 "ttl_seconds": 60,
                 "add_cache_status_header": true,
-                "cache_key_include_consumer": true,
             }),
         )
         .unwrap()

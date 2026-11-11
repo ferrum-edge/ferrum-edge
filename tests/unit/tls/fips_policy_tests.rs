@@ -1208,3 +1208,22 @@ fn fips_tcp_logging_no_verify_advertises_only_provider_schemes() {
     expected.sort_by_key(|scheme| format!("{scheme:?}"));
     assert_eq!(advertised, expected);
 }
+
+/// The skip-verify `NoVerifier` offers exactly the build's base provider
+/// signature schemes, so a FIPS build never advertises a scheme outside its
+/// provider (the list is cached once, not rebuilt per handshake).
+#[test]
+fn no_verifier_offers_the_base_provider_schemes() {
+    use rustls::client::danger::ServerCertVerifier;
+
+    let expected = fips::base_crypto_provider()
+        .signature_verification_algorithms
+        .supported_schemes();
+    let verifier = ferrum_edge::tls::NoVerifier;
+    assert_eq!(verifier.supported_verify_schemes(), expected);
+    assert_eq!(
+        verifier.supported_verify_schemes(),
+        expected,
+        "the cached list must be stable across calls"
+    );
+}

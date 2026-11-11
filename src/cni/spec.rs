@@ -113,7 +113,6 @@ pub struct CniInvocation {
     pub netns: Option<String>,
     pub ifname: Option<String>,
     pub args: Option<String>,
-    pub path: Option<String>,
 }
 
 impl CniInvocation {
@@ -138,7 +137,6 @@ impl CniInvocation {
                 netns: None,
                 ifname: None,
                 args: None,
-                path: env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty()),
             }),
             CniCommand::Status => {
                 // SPEC §2 STATUS: only CNI_COMMAND is required. CNI_PATH is
@@ -149,14 +147,13 @@ impl CniInvocation {
                     netns: None,
                     ifname: None,
                     args: None,
-                    path: env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty()),
                 })
             }
             CniCommand::Gc => {
                 // SPEC §2 GC: only CNI_COMMAND + CNI_PATH are required; there
-                // are no attachment parameters.
-                let path = env::var("CNI_PATH").map_err(|_| CniError::missing_env("CNI_PATH"))?;
-                if path.trim().is_empty() {
+                // are no attachment parameters. Ferrum never execs a delegate
+                // plugin, so the search path is checked for presence only.
+                if !env::var("CNI_PATH").is_ok_and(|path| !path.trim().is_empty()) {
                     return Err(CniError::missing_env("CNI_PATH"));
                 }
                 Ok(Self {
@@ -165,7 +162,6 @@ impl CniInvocation {
                     netns: None,
                     ifname: None,
                     args: None,
-                    path: Some(path),
                 })
             }
             CniCommand::Unsupported => Ok(Self {
@@ -174,7 +170,6 @@ impl CniInvocation {
                 netns: None,
                 ifname: None,
                 args: None,
-                path: None,
             }),
             CniCommand::Add | CniCommand::Del | CniCommand::Check => {
                 let container_id = env::var("CNI_CONTAINERID")
@@ -199,14 +194,12 @@ impl CniInvocation {
                     return Err(CniError::missing_env("CNI_IFNAME"));
                 }
                 let args = env::var("CNI_ARGS").ok().filter(|v| !v.trim().is_empty());
-                let path = env::var("CNI_PATH").ok().filter(|v| !v.trim().is_empty());
                 Ok(Self {
                     command,
                     container_id,
                     netns,
                     ifname,
                     args,
-                    path,
                 })
             }
         }

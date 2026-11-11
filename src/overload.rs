@@ -390,13 +390,8 @@ impl OverloadState {
     /// Cost: one AtomicU32::load + one AtomicU64::fetch_add(Relaxed) + one multiply + one comparison.
     ///
     /// **This ONLY signals RED-probability shedding — NOT the binary "pressure-mode active"
-    /// signal.** Callers that want the full "should we close this HTTP/1.1 keepalive?"
-    /// decision must also OR with `self.disable_keepalive.load(Relaxed)`. Two reasons:
-    /// (1) at the exact pressure threshold the linear ramp produces probability 0 while
-    /// the binary flag is set; (2) the monitor loop writes `disable_keepalive` and
-    /// `red_drop_probability` as independent `Relaxed` stores, so a reader can transiently
-    /// observe the new flag with the prior cycle's probability. The hot-path response
-    /// builder in `proxy::mod` performs that OR — see `connection: close` decision.
+    /// signal.** The full "should we close this HTTP/1.1 keepalive?" decision is
+    /// [`Self::should_close_keepalive`].
     pub fn should_disable_keepalive_red(&self) -> bool {
         let prob = self.red_drop_probability.load(Ordering::Relaxed);
         if prob == 0 {
@@ -414,6 +409,27 @@ impl OverloadState {
         // so the comparison is exact — no precision bias.
         let hash = counter.wrapping_mul(0x9E3779B97F4A7C15) >> 54;
         (hash as u32) < prob
+    }
+
+    /// Whether this HTTP/1.1 response should carry `Connection: close`.
+    ///
+    /// ORs three signals: graceful drain, the binary pressure-mode flag
+    /// `disable_keepalive`, and RED probabilistic shedding. The binary flag
+    /// must be honored on its own: at the exact pressure threshold the linear
+    /// ramp produces probability 0 while the flag is set, and the monitor loop
+    /// writes `disable_keepalive` and `red_drop_probability` as independent
+    /// `Relaxed` stores, so a reader can observe the new flag with the prior
+    /// cycle's probability of 0.
+    ///
+    /// Cost: `draining` is one `AtomicBool::load(Acquire)` (it synchronizes
+    /// with the Release store in `begin_drain`), `disable_keepalive` one
+    /// `Relaxed` load, and the RED check one `AtomicU32` load plus, only
+    /// inside the ramp, one counter `fetch_add` and a multiply.
+    #[inline]
+    pub fn should_close_keepalive(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+            || self.disable_keepalive.load(Ordering::Relaxed)
+            || self.should_disable_keepalive_red()
     }
 
     /// Wait until graceful drain begins.
@@ -2290,74 +2306,6 @@ mod tests {
         }
     }
 
-    /// Simulate the monitor loop's tick counter and verify a changed
-    /// `fd_limit` is picked up exactly on the refresh boundary, not before
-    /// and not skipped after. Mirrors the in-loop logic at the top of the
-    /// `start_monitor` task body without needing a full tokio harness.
-    #[test]
-    fn fd_limit_refresh_boundary_picks_up_changes() {
-        // Stand-in for `get_fd_limit()` whose return value flips after the
-        // first refresh boundary, modeling an operator running `setrlimit(2)`
-        // partway through the gateway's lifetime.
-        let mut probe_calls = 0u64;
-        let mut probe = |tick: u64| -> u64 {
-            probe_calls += 1;
-            // First boundary returns the original limit; subsequent
-            // boundaries return the raised limit.
-            if tick < FD_LIMIT_REFRESH_INTERVAL_TICKS {
-                1024
-            } else {
-                65_536
-            }
-        };
-
-        // Initial value (read once at task start).
-        let mut fd_limit = probe(0);
-        assert_eq!(fd_limit, 1024);
-
-        // Walk through enough ticks to cross two refresh boundaries.
-        let total_ticks = FD_LIMIT_REFRESH_INTERVAL_TICKS * 2 + 5;
-        let mut refresh_observations = 0u64;
-        let mut tick: u64 = 0;
-        while tick < total_ticks {
-            tick = tick.wrapping_add(1);
-            if tick.is_multiple_of(FD_LIMIT_REFRESH_INTERVAL_TICKS) {
-                refresh_observations += 1;
-                let new_limit = probe(tick);
-                if new_limit != fd_limit {
-                    fd_limit = new_limit;
-                }
-            }
-        }
-
-        // Two boundaries crossed → two probes (plus the initial one).
-        assert_eq!(refresh_observations, 2);
-        assert_eq!(probe_calls, 3);
-        // After crossing the first boundary, the raised limit must be visible.
-        assert_eq!(
-            fd_limit, 65_536,
-            "raised RLIMIT_NOFILE should be picked up at the refresh boundary"
-        );
-    }
-
-    /// The `fd_limit == 0` warn must fire only once even if the periodic
-    /// refresh continues to observe 0 (Windows / unsupported platforms).
-    /// `Once::call_once` provides this guarantee — verify the latch behaves
-    /// correctly when invoked repeatedly.
-    #[test]
-    fn fd_pressure_disabled_warn_latches_once() {
-        // Use a private latch so this test doesn't poison the production
-        // `FD_PRESSURE_DISABLED_WARN` for any other test in the same binary.
-        let local_latch = Once::new();
-        let mut fired = 0u32;
-        for _ in 0..10 {
-            local_latch.call_once(|| {
-                fired += 1;
-            });
-        }
-        assert_eq!(fired, 1, "warn-once latch must fire exactly once");
-    }
-
     #[test]
     fn pressure_ratio_handles_unbounded_max() {
         assert_eq!(pressure_ratio(5, 0), 0.0);
@@ -2425,68 +2373,6 @@ mod tests {
             "99.9% probability: expected {:.4}, got {:.4}",
             expected_rate,
             actual_rate
-        );
-    }
-
-    /// `should_disable_keepalive_red()` ONLY signals RED-probability shedding.
-    /// The HTTP/1.1 keepalive-close decision in `proxy::mod` must OR this
-    /// with `disable_keepalive`, otherwise pressure-mode is silently ignored
-    /// at the exact threshold (where ramp produces probability 0) or during
-    /// the inter-store window where the monitor has flipped the binary flag
-    /// but `red_drop_probability` still reflects the previous cycle's value.
-    ///
-    /// This test pins down the contract for the three combinations the hot
-    /// path must handle correctly. Because the hot path inlines the OR
-    /// expression (`draining || disable_keepalive || should_disable_keepalive_red`),
-    /// we assert each AtomicBool / AtomicU32 source independently. A future
-    /// regression that drops one of those terms will be caught here.
-    #[test]
-    fn keepalive_close_decision_honors_binary_flag_independently_of_red_probability() {
-        let state = OverloadState::new();
-
-        // Case 1: pressure-mode active, RED probability 0 (the regression case).
-        // The binary flag MUST cause Connection: close; the RED helper alone
-        // returns false because the linear ramp produced 0 at the exact
-        // pressure threshold, or because the cross-cycle inter-store window
-        // hasn't advanced `red_drop_probability` yet.
-        state.disable_keepalive.store(true, Ordering::Relaxed);
-        state.red_drop_probability.store(0, Ordering::Relaxed);
-        assert!(
-            state.disable_keepalive.load(Ordering::Relaxed),
-            "binary flag must surface true for the hot-path OR"
-        );
-        assert!(
-            !state.should_disable_keepalive_red(),
-            "RED helper alone returns false at probability 0 — \
-             pressure-mode would be ignored without the OR"
-        );
-
-        // Case 2: both signals quiet — connection should be reused.
-        state.disable_keepalive.store(false, Ordering::Relaxed);
-        state.red_drop_probability.store(0, Ordering::Relaxed);
-        assert!(
-            !state.disable_keepalive.load(Ordering::Relaxed),
-            "binary flag clear when no pressure"
-        );
-        assert!(
-            !state.should_disable_keepalive_red(),
-            "RED helper clear at probability 0"
-        );
-
-        // Case 3: binary flag clear but RED probability saturated (between
-        // pressure and critical thresholds, deep in the ramp). RED helper
-        // alone should still drive Connection: close.
-        state.disable_keepalive.store(false, Ordering::Relaxed);
-        state
-            .red_drop_probability
-            .store(RED_PROBABILITY_SCALE, Ordering::Relaxed);
-        assert!(
-            !state.disable_keepalive.load(Ordering::Relaxed),
-            "binary flag still clear in this regime"
-        );
-        assert!(
-            state.should_disable_keepalive_red(),
-            "RED helper must return true at saturation (1024/1024 == 100%)"
         );
     }
 

@@ -11,8 +11,7 @@ use tracing::warn;
 use super::utils::rate_limit::{
     LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
     STANDALONE_RATE_LIMIT_CONFIG_ID, UdpRateLimitAlgorithm, UdpRateLimitOp,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
-    validate_window_seconds,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_window_seconds,
 };
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
@@ -142,7 +141,6 @@ pub struct UdpRateLimiting {
 }
 
 impl UdpRateLimiting {
-    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new_with_http_client(
         config: &Value,
         http_client: PluginHttpClient,
@@ -330,7 +328,6 @@ impl UdpRateLimiting {
 
     /// Local/fallback key this policy uses for a client-IP literal, or `None`
     /// for a string that is not an address. Test support only.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     fn local_key_for_test(&self, client_ip: &str) -> Option<IpAddr> {
         crate::util::client_identity::parse_canonical_client_ip(client_ip)
             .map(|ip| crate::util::client_identity::rate_limit_ip(ip, self.ipv6_prefix))
@@ -338,7 +335,6 @@ impl UdpRateLimiting {
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
     /// A non-address `client_ip` seeds nothing.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_client_at_for_test(
         &self,
         client_ip: &str,
@@ -355,7 +351,6 @@ impl UdpRateLimiting {
     /// Attempt to seed one local/fallback key through the production atomic
     /// capacity gate. Returns false for a previously unseen key at cap (and
     /// for a non-address `client_ip`).
-    #[allow(dead_code)]
     pub(crate) fn seed_client_at_with_cap_for_test(
         &self,
         client_ip: &str,
@@ -386,7 +381,6 @@ impl UdpRateLimiting {
     }
 
     /// Force the cooldown clock so the next armed periodic sweep is blocked.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn block_eviction_cooldown_at_for_test(&self, now: Instant) {
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         self.last_eviction_secs.store(now_secs, Ordering::Relaxed);
@@ -399,7 +393,6 @@ impl UdpRateLimiting {
     }
 
     /// Exercise the production sampled/cooldown path with a testable cap.
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn maybe_evict_at_with_cap_for_test(
         &self,
         now: Instant,
@@ -408,13 +401,11 @@ impl UdpRateLimiting {
         self.maybe_evict_at_with_cap(now, max_entries)
     }
 
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn contains_client_for_test(&self, client_ip: &str) -> bool {
         self.local_key_for_test(client_ip)
             .is_some_and(|key| self.limiter.contains_local_key(&key))
     }
 
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn epoch_base_for_test(&self) -> Instant {
         self.epoch_base
     }
@@ -422,7 +413,6 @@ impl UdpRateLimiting {
     /// Exercise the production dual-gate decision with an isolated global
     /// limiter so parallel external tests never mutate process-global state.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn record_rate_limit_rejection_warn_detail_for_test(
         &self,
         global: &AtomicLogRateLimiter,
@@ -435,14 +425,12 @@ impl UdpRateLimiting {
 
     /// Observed per-instance suppressed-event accumulator. Test-only.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn rejection_warn_suppressed_count_for_test(&self) -> u64 {
         self.rejection_warn.suppressed_count_for_test()
     }
 
     /// Reset this instance's rejection diagnostic limiter. Test-only.
     #[doc(hidden)]
-    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn reset_rate_limit_rejection_warn_for_test(&self) {
         self.rejection_warn.reset_for_test();
     }
@@ -540,7 +528,7 @@ impl UdpRateLimiting {
                     .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
-                apply_rate_limit_cleanup(&self.limiter, max_entries, now, true);
+                self.limiter.prune_stale_at(now);
             }
             return true;
         }
@@ -557,7 +545,7 @@ impl UdpRateLimiting {
                 // below the hard cap. A later at-cap observation keeps the
                 // new-key guard active and reclaims idle state at most once
                 // per second after pruning.
-                apply_rate_limit_cleanup(&self.limiter, max_entries, now, false);
+                self.limiter.prune_stale_at(now);
             }
         }
 

@@ -825,7 +825,6 @@ impl AuthorizationCancellableBody {
     /// Whether the pump has released the upstream body. Reached through
     /// `crate::_test_support` so an external test can prove the release happens
     /// while the transport is polling nothing.
-    #[allow(dead_code)]
     pub fn upstream_released(&self) -> bool {
         self.released.load(Ordering::Acquire)
     }

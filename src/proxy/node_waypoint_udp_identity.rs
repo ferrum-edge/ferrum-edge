@@ -436,17 +436,14 @@ impl NodeWaypointUdpSourceIndex {
         }));
     }
 
-    #[allow(dead_code)] // Diagnostics/test seam; the datapath compares bindings, not generations.
     pub fn generation(&self) -> u64 {
         self.current.load().generation
     }
 
-    #[allow(dead_code)] // Diagnostics/test seam.
     pub fn len(&self) -> usize {
         self.current.load().by_ifindex.len()
     }
 
-    #[allow(dead_code)] // Diagnostics/test seam.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -517,7 +514,6 @@ impl NodeWaypointUdpSourceIndex {
 
     /// Monotonic per-reason refusal counts, in [`NodeWaypointUdpSourceRefusal`]
     /// order. Closed-set labels only.
-    #[allow(dead_code)] // Diagnostics/test seam.
     pub fn refusal_counts(&self) -> [(&'static str, u64); NodeWaypointUdpSourceRefusal::COUNT] {
         NodeWaypointUdpSourceRefusal::all().map(|refusal| {
             (
@@ -569,7 +565,6 @@ impl NodeWaypointUdpSourceIndex {
     /// Warns suppressed by the rate limiter since the last emitted record, for
     /// the given refusal kind. Test seam for the external unit suite.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit-test seam.
     pub fn suppressed_warn_count(&self, refusal: NodeWaypointUdpSourceRefusal) -> u64 {
         self.warn_suppressed[refusal.index()].load(Ordering::Relaxed)
     }
@@ -674,7 +669,6 @@ impl NodeWaypointUdpSourceScoping {
 
     /// Attribute a datagram and resolve its per-pod policy scope from the same
     /// live-slice read that vouches the pod.
-    #[allow(dead_code)] // Exercised through the external integration-test API.
     pub fn resolve(
         &self,
         ingress_ifindex: Option<u32>,
@@ -695,7 +689,6 @@ impl NodeWaypointUdpSourceScoping {
     /// interface a packet entered on, but it CAN name an established session —
     /// so the datagram is dropped and the session continues under its own,
     /// still-vouched-for evidence. The datagram is never forwarded either way.
-    #[allow(dead_code)] // Exercised through the external integration-test API.
     pub fn revalidate_datagram(
         &self,
         pinned: &NodeWaypointUdpSourceBinding,
@@ -758,7 +751,6 @@ impl NodeWaypointUdpSourceScoping {
 
     /// Re-authorize a live session against both current attribution evidence
     /// and the current slice's coherent pod-identity/scope generation.
-    #[allow(dead_code)] // Exercised through the external integration-test API.
     pub fn revalidate(
         &self,
         pinned: &NodeWaypointUdpSourceBinding,
@@ -968,7 +960,6 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
 
     /// One reconcile pass. Returns the published bindings so tests can assert
     /// the fail-closed refusals without touching the datapath.
-    #[allow(dead_code)] // Also an external test seam for one deterministic pass.
     pub fn reconcile_once(&self) -> Vec<HostUdpPodBinding> {
         let targets = self.source.list_targets();
         let mut resolved: HashMap<String, ResolvedInterface> = HashMap::new();
@@ -1037,10 +1028,25 @@ impl<R: NodeWaypointUdpInterfaceResolver> NodeWaypointUdpSourceIndexManager<R> {
         );
         let mut ticker = tokio::time::interval(self.poll_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // A pass reads sysfs per enrolled pod and reconciles Service steering
+        // through `sh -c` iptables scripts that block until the child exits,
+        // so it runs on the blocking pool rather than a runtime worker (issue
+        // #7170). Passes stay sequential: each is awaited before the next tick.
+        let manager = Arc::new(self);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.reconcile_once();
+                    let pass = Arc::clone(&manager);
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
+                        pass.reconcile_once();
+                    })
+                    .await
+                    {
+                        warn!(
+                            %error,
+                            "NodeWaypoint UDP source-identity reconcile pass did not complete"
+                        );
+                    }
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {

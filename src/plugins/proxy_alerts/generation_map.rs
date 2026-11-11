@@ -127,7 +127,6 @@ impl<V: Clone> GenerationMap<V> {
 
     /// Run `f` while holding the writer mutex. Test-only: proves established
     /// reads are served from the snapshot and never wait on a writer.
-    #[allow(dead_code)] // Reached only through external-test hooks.
     pub(crate) fn with_writer_lock_held<R>(&self, f: impl FnOnce() -> R) -> R {
         let _guard = self.lock();
         f()

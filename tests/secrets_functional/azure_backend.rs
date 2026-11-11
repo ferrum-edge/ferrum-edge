@@ -727,3 +727,124 @@ async fn azure_ca_bundle_reads_are_admission_gated() {
         .expect("fetch should succeed after admission");
     assert_eq!(secret.value, "azure-admin-jwt");
 }
+
+// ---------------------------------------------------------------------------
+// Reference grammar (pure parsing, no fake or environment needed). These moved
+// here from the former `tests/unit/secrets/azure_tests.rs`, which was gated on
+// `secrets-azure` in a binary CI never compiles with that feature (#7294).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn azure_empty_secret_name_segment_is_rejected() {
+    let err = azure_parse_keyvault_reference("https://vault.example.net/secrets//v1", KEY)
+        .expect_err("empty secret name must fail");
+    assert!(
+        err.contains("secret name must not be empty"),
+        "expected empty-name error, got: {err}"
+    );
+}
+
+#[test]
+fn azure_trailing_slash_on_unversioned_reference_stays_latest() {
+    let (vault_url, name, version) =
+        azure_parse_keyvault_reference("https://vault.example.net/secrets/admin-jwt/", KEY)
+            .expect("trailing slash on an unversioned URL must stay latest");
+    assert_eq!(vault_url, "https://vault.example.net");
+    assert_eq!(name, "admin-jwt");
+    assert_eq!(version, None);
+}
+
+#[test]
+fn azure_empty_interior_version_segment_is_rejected() {
+    let err = azure_parse_keyvault_reference("https://vault.example.net/secrets/admin-jwt//", KEY)
+        .expect_err("empty interior version segment must fail");
+    assert!(
+        err.contains("version segment must not be empty"),
+        "expected empty-version error, got: {err}"
+    );
+}
+
+#[test]
+fn azure_non_https_schemes_are_refused_without_echoing_the_reference() {
+    for reference in [
+        "http://127.0.0.1:12345/secrets/admin-jwt",
+        "http://myvault.vault.azure.net/secrets/admin-jwt/v1",
+        "ftp://myvault.vault.azure.net/secrets/admin-jwt",
+    ] {
+        let err = azure_parse_keyvault_reference(reference, KEY)
+            .expect_err("non-https vault URL must be refused");
+        assert!(
+            err.contains("must use https://") && err.contains(KEY),
+            "expected an https-required error naming the key, got: {err}"
+        );
+        assert!(
+            !err.contains("myvault") && !err.contains("127.0.0.1") && !err.contains("admin-jwt"),
+            "the refusal must not echo the source reference: {err}"
+        );
+    }
+}
+
+#[test]
+fn azure_tls_version_option_rejects_http_reference() {
+    let err = azure_apply_tls_version_option(
+        "http://vault.example.net/secrets/admin-jwt",
+        Some("v1"),
+        "TLS cert material",
+    )
+    .expect_err("typed azure:// sources must also require https");
+    assert!(err.contains("must use https://"), "got: {err}");
+}
+
+#[test]
+fn azure_tls_version_option_matching_path_version_is_accepted() {
+    let merged = azure_apply_tls_version_option(
+        "https://vault.example.net/secrets/admin-jwt/v1",
+        Some("v1"),
+        "TLS cert material",
+    )
+    .expect("matching versions should accept");
+    assert_eq!(merged, "https://vault.example.net/secrets/admin-jwt/v1");
+}
+
+#[test]
+fn azure_tls_version_option_alone_pins_fetch_reference() {
+    let merged = azure_apply_tls_version_option(
+        "https://vault.example.net/secrets/admin-jwt",
+        Some("v1"),
+        "TLS cert material",
+    )
+    .expect("query-only version should pin");
+    assert_eq!(merged, "https://vault.example.net/secrets/admin-jwt/v1");
+}
+
+#[test]
+fn azure_tls_version_option_conflict_does_not_echo_the_reference() {
+    let err = azure_apply_tls_version_option(
+        "https://myvault.vault.azure.net/secrets/admin-jwt/v1",
+        Some("v2"),
+        "TLS cert material",
+    )
+    .expect_err("conflicting versions must fail closed");
+    assert!(
+        err.contains("Conflicting Azure Key Vault versions"),
+        "expected conflict error, got: {err}"
+    );
+    assert!(
+        !err.contains("myvault") && !err.contains("admin-jwt"),
+        "conflict error must not leak the source reference: {err}"
+    );
+}
+
+#[test]
+fn azure_tls_version_option_rejects_empty_query_version() {
+    let err = azure_apply_tls_version_option(
+        "https://vault.example.net/secrets/admin-jwt",
+        Some("  "),
+        "TLS cert material",
+    )
+    .expect_err("empty ?version= must fail");
+    assert!(
+        err.contains("version must not be empty"),
+        "expected empty-version error, got: {err}"
+    );
+}

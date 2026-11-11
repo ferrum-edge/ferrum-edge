@@ -237,12 +237,6 @@ pub const LOOP_DETECTED_STATUS: u16 = 508;
 /// Header spelling is independent of `ferrum_requests_total{error_class}`
 /// and of access-log `error_class` (those use [`ErrorClass::as_str`] plus
 /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`]).
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
     OBS_CONNECTION_FAILURE,
     OBS_BACKEND_TIMEOUT,
@@ -261,12 +255,6 @@ pub const HTTP_OBSERVABILITY_ERROR_CLASSES: &[&str] = &[
 /// stays selectable and agrees with its `X-Gateway-Error` header. Combined
 /// with [`ErrorClass::ALL`] they are the closed HTTP metrics label set
 /// (bound: [`HTTP_METRICS_ERROR_CLASS_BOUND`]).
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
     OBS_CIRCUIT_BREAKER_OPEN,
     OBS_OVERLOAD,
@@ -285,12 +273,6 @@ pub const HTTP_METRICS_GATEWAY_ERROR_CLASSES: &[&str] = &[
 /// on the coarser nine-token [`HTTP_OBSERVABILITY_ERROR_CLASSES`] set;
 /// map each granular class to its header token with
 /// [`x_gateway_error_token_for_class`].
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub const HTTP_METRICS_ERROR_CLASS_BOUND: usize = 25;
 
 /// Map a backend-path HTTP status plus the pre-wire flag onto the closed
@@ -316,9 +298,7 @@ pub fn http_observability_error_class(connection_error: bool, status: u16) -> Op
 ///
 /// The dispatch paths derive the header from `BackendResponse` state rather
 /// than from a class, so this mapping exists for the external `tests/` crate
-/// to assert the granular-to-coarse relationship in one place. `tests/` is a
-/// separate crate, so the `ferrum-edge` binary target sees it as dead.
-#[allow(dead_code)]
+/// to assert the granular-to-coarse relationship in one place.
 #[inline]
 pub fn x_gateway_error_token_for_class(class: ErrorClass) -> &'static str {
     if !request_reached_wire(class) {
@@ -350,12 +330,6 @@ pub fn token_for_rejection_phase(phase: &str) -> Option<&'static str> {
 /// Intern a candidate `X-Gateway-Error` token. Values outside the closed
 /// nine-token header set are rejected rather than forwarded.
 #[inline]
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub fn intern_http_observability_error_class(value: &str) -> Option<&'static str> {
     HTTP_OBSERVABILITY_ERROR_CLASSES
         .iter()
@@ -368,12 +342,6 @@ pub fn intern_http_observability_error_class(value: &str) -> Option<&'static str
 /// [`HTTP_METRICS_GATEWAY_ERROR_CLASSES`]. Header-only tokens such as
 /// `connection_failure` are rejected.
 #[inline]
-// The closed label sets and their interners exist so the external `tests/`
-// crate can prove the vocabulary is bounded and that no out-of-set string
-// can become a metrics label. Production reaches the tokens through the
-// `OBS_*` constants and the classifier functions, so the `ferrum-edge`
-// binary target reports these as dead code.
-#[allow(dead_code)]
 pub fn intern_http_metrics_error_class(value: &str) -> Option<&'static str> {
     for class in ErrorClass::ALL {
         if class.as_str() == value {
@@ -589,7 +557,15 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         // keep the unmatched-SNI catch-all; mapping ConnectionRefused would
         // keep the `"refused"` substring trap on the Display string. The
         // typed kind is the only signal that yields DispatchPolicyRejected.
-        StreamSetupKind::SniAdmissionRefused => ErrorClass::DispatchPolicyRejected,
+        // The L4 `stream_match` refusal is the same decision on an
+        // `__l4_{port}` listener (issue #7185).
+        StreamSetupKind::SniAdmissionRefused | StreamSetupKind::L4RouteRefused => {
+            ErrorClass::DispatchPolicyRejected
+        }
+        // A failed inspected-prefix write after a successful dial. The typed
+        // chain walk classifies its retained io source as post-wire first;
+        // this is the post-wire catch-all for a source it cannot type.
+        StreamSetupKind::BackendFirstBytesForward => ErrorClass::RequestError,
     }
 }
 
@@ -823,6 +799,17 @@ fn classify_typed_chain(
         }
         if let Some(setup_err) = err.downcast_ref::<crate::proxy::stream_error::StreamSetupError>()
         {
+            // The inspected-prefix forward failed AFTER the dial, so bytes may
+            // already have reached the backend: its io source is classified
+            // post-wire whatever phase the caller reports (issue #7185), so a
+            // reset there never becomes a pre-wire `ConnectionRefused`.
+            if setup_err.kind
+                == crate::proxy::stream_error::StreamSetupKind::BackendFirstBytesForward
+                && let Some(class) =
+                    classify_typed_chain(std::error::Error::source(setup_err), false)
+            {
+                return Some(class);
+            }
             return Some(classify_stream_setup_kind(setup_err.kind));
         }
         if let Some(ws_err) = err.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
@@ -864,12 +851,24 @@ fn classify_typed_chain(
                 // coverage for some genuinely pre-wire errors that
                 // surface as Error::Io(ConnectionReset/TimedOut), but
                 // that's the right side of the safety boundary.
+                //
+                // The two pre-wire exceptions (ECONNREFUSED and the dial's
+                // EADDRNOTAVAIL) still need the CALLER's phase (issue #7213):
+                // the same errno on an established WebSocket session
+                // (`classify_boxed_error`, `phase_is_connect = false`) proves
+                // nothing about the request, so it keeps the post-wire twin
+                // the io arm below uses.
                 WsError::Io(io_err) => {
-                    if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
+                    if phase_is_connect
+                        && matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049))
+                    {
                         return Some(ErrorClass::PortExhaustion);
                     }
                     return Some(match io_err.kind() {
-                        std::io::ErrorKind::ConnectionRefused => ErrorClass::ConnectionRefused,
+                        std::io::ErrorKind::ConnectionRefused if phase_is_connect => {
+                            ErrorClass::ConnectionRefused
+                        }
+                        std::io::ErrorKind::ConnectionRefused => ErrorClass::ConnectionReset,
                         std::io::ErrorKind::TimedOut => ErrorClass::ReadWriteTimeout,
                         std::io::ErrorKind::ConnectionReset => ErrorClass::ConnectionReset,
                         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
@@ -1227,8 +1226,25 @@ pub fn error_looks_like_https_to_plaintext(error: &(dyn StdError + 'static)) -> 
 /// stringly-typed errors where the typed source chain doesn't expose a
 /// downcastable error — `classify_typed_chain` covers every typed case the
 /// gateway emits in-process.
-fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<ErrorClass> {
-    if is_port_exhaustion_message(error_str) || is_port_exhaustion_message(debug_str) {
+///
+/// **Phase-gated like the typed walk (issues #4536, #7213).** The text of an
+/// error is not phase evidence: `"timed out"`, `"refused"`, an
+/// `EADDRNOTAVAIL` message or a TLS token seen after the connect phase cannot
+/// prove the request never reached the backend. With `phase_is_connect =
+/// false` each pre-wire verdict maps to the post-wire twin the typed walk
+/// uses — timeout → `ReadWriteTimeout`, refusal → `ConnectionReset`, TLS text
+/// → `ConnectionReset` (as `classify_rustls_error(.., false)`), and
+/// port-exhaustion text is not claimed at all (only a dial can exhaust
+/// ephemeral ports). DNS and the gateway-side dispatch refusals name a
+/// failure that dialed nothing, so they keep their class in either phase.
+fn classify_substring_fallback(
+    error_str: &str,
+    debug_str: &str,
+    phase_is_connect: bool,
+) -> Option<ErrorClass> {
+    if phase_is_connect
+        && (is_port_exhaustion_message(error_str) || is_port_exhaustion_message(debug_str))
+    {
         return Some(ErrorClass::PortExhaustion);
     }
     // Gateway-side egress-policy rejection (e.g. a literal-IP WebSocket backend
@@ -1260,7 +1276,11 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
         return Some(ErrorClass::DispatchPolicyRejected);
     }
     if error_str.contains("connect timeout") || error_str.contains("timed out") {
-        return Some(ErrorClass::ConnectionTimeout);
+        return Some(if phase_is_connect {
+            ErrorClass::ConnectionTimeout
+        } else {
+            ErrorClass::ReadWriteTimeout
+        });
     }
     // Peer omitted TLS `close_notify` on close. Must run BEFORE the TLS
     // token block: the rustls wording contains `" TLS "` inside
@@ -1287,7 +1307,11 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
         return Some(ErrorClass::DnsLookupError);
     }
     if error_str.contains("refused") || debug_str.contains("ConnectionRefused") {
-        return Some(ErrorClass::ConnectionRefused);
+        return Some(if phase_is_connect {
+            ErrorClass::ConnectionRefused
+        } else {
+            ErrorClass::ConnectionReset
+        });
     }
     // TLS: anchor tokens to avoid the historical false positives where the
     // bare 3-char `"tls"` matched any string (e.g., a backend hostname
@@ -1308,14 +1332,17 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
         || debug_str.contains("tls handshake")
         || debug_str.contains("tls alert")
     {
-        return Some(ErrorClass::TlsError);
+        return Some(if phase_is_connect {
+            ErrorClass::TlsError
+        } else {
+            ErrorClass::ConnectionReset
+        });
     }
     // Reset / broken pipe — typed io::Error already caught these in the
     // typed walk; the substrings here only fire for stringified errors
     // (plain `String` boxed as `dyn Error`, plus any call site that did
     // `e.to_string()` before reaching the classifier — TCP fast-path
-    // copy errors and UDP backend recv/send errors stringify their
-    // io::Error before classifying). Anchored multi-word phrases avoid
+    // copy errors stringify their io::Error before classifying). Anchored multi-word phrases avoid
     // the historical false-positive matches where a bare `"reset"`
     // substring caught unrelated wording (`"reset_stream"`, `"upstream"`).
     //
@@ -1403,7 +1430,8 @@ fn classify_boxed_with_phase(
     }
     let error_str = format!("{}", e);
     let debug_str = format!("{:?}", e);
-    classify_substring_fallback(&error_str, &debug_str).unwrap_or(ErrorClass::RequestError)
+    classify_substring_fallback(&error_str, &debug_str, phase_is_connect)
+        .unwrap_or(ErrorClass::RequestError)
 }
 
 /// Is this `reqwest::Error` an HTTP/2 **protocol NACK** — a per-RFC-9113
@@ -1718,10 +1746,13 @@ fn h3_stream_error_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
 /// instances are inspected regardless of how many layers of `Box<dyn Error>`
 /// sit between them and the caller.
 pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass, bool) {
-    // Port exhaustion is extremely unlikely during body streaming, but walk
-    // the chain anyway so we never misclassify it as a generic error.
+    // A body error is post-headers by definition, so `EADDRNOTAVAIL` here
+    // cannot be a dial's port exhaustion (a pre-wire class, issues #4536 and
+    // #7213). Charge it as the post-wire backend failure the typed io walk
+    // gives a post-connect reset, so the deferred dispatch does not bank it
+    // as a success.
     if is_port_exhaustion(e) {
-        return (ErrorClass::PortExhaustion, false);
+        return (ErrorClass::ConnectionReset, false);
     }
 
     // Native-H3 streaming bodies surface `h3::error::StreamError` (e.g.
@@ -1921,7 +1952,6 @@ pub struct BackendResponse {
 
 impl BackendResponse {
     /// Returns the buffered body bytes, or an empty slice for streaming responses.
-    #[allow(dead_code)]
     pub fn body_bytes(&self) -> &[u8] {
         match &self.body {
             ResponseBody::Buffered(b) => b,

@@ -2290,7 +2290,6 @@ impl KafkaLogging {
     }
 
     /// Snapshot lifecycle counters for external integration and unit tests.
-    #[allow(dead_code)] // public test support is unused by the binary target
     pub fn snapshot(&self) -> KafkaSinkSnapshot {
         if let Some(generation) = self.generation.get() {
             return generation.state.snapshot();
@@ -2322,7 +2321,6 @@ impl KafkaLogging {
     }
 
     /// Finalize this generation deterministically from external tests.
-    #[allow(dead_code)] // public test support is unused by the binary target
     pub async fn finalize(&self) {
         let Some(generation) = self.generation.get() else {
             return;
@@ -2388,7 +2386,6 @@ fn resolve_gateway_crl_path(http_client: &PluginHttpClient) -> Result<Option<Str
 /// only observe channel rejection (never `entry_oversize`). The gate is then
 /// released and the worker is joined normally. Returns
 /// `(ferrum_dropped_total, entry_oversize_total)`.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) async fn probe_reserve_before_serialize_for_test(
     oversized: &TransactionSummary,
 ) -> (u64, u64) {
@@ -2474,7 +2471,6 @@ pub(crate) async fn probe_reserve_before_serialize_for_test(
 /// consumes the entire aggregate byte budget must reject an oversized summary
 /// before its serializer runs. Returns
 /// `(byte_budget_exhausted_total, entry_oversize_total)`.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) async fn probe_byte_budget_before_serialize_for_test(
     oversized: &TransactionSummary,
 ) -> (u64, u64) {
@@ -2540,7 +2536,6 @@ pub(crate) async fn probe_byte_budget_before_serialize_for_test(
 /// silent "capability unavailable" skip: librdkafka is an unconditional
 /// dependency and the broker address is a local unreachable port, so a producer
 /// that cannot be created is a defect, not a missing environment feature.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_downstream_lease_ownership_for_test(
     ceiling: &'static RetainedByteCeiling,
     record_count: usize,
@@ -2629,7 +2624,6 @@ pub(crate) fn probe_downstream_lease_ownership_for_test(
 /// the last two are exact for this probe's own generation. `queue_full_delta`
 /// is reported so a caller can assert that a post-admission librdkafka
 /// rejection does *not* land on the admission-time `queue_full` reason.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_terminal_loss_accounting_for_test(
     record_count: usize,
     queue_max_messages: Option<u32>,
@@ -2698,7 +2692,6 @@ pub(crate) fn probe_terminal_loss_accounting_for_test(
 }
 
 /// Outcome of [`probe_queue_full_backoff_for_test`].
-#[allow(dead_code)] // fields are read by the external test crate only
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KafkaQueueFullProbeOutcome {
     /// Records librdkafka accepted.
@@ -2732,7 +2725,6 @@ fn probe_record(byte_budget: &KafkaByteBudget) -> Result<KafkaRecord, String> {
 /// recovering broker would — and the waiting record must then be accepted
 /// rather than dropped. Without it, the record exhausts `budget`, and a
 /// follow-up `QueueFull` record must drop without waiting again.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) async fn probe_queue_full_backoff_for_test(
     free_queue_after: Option<Duration>,
     budget: Duration,
@@ -2807,7 +2799,6 @@ pub(crate) async fn probe_queue_full_backoff_for_test(
 /// (kafka_logging-CLAUDE-5): sends `records` records through a
 /// [`BatchingLogger`] built from [`kafka_worker_batch_config`] and returns
 /// `(flushes, records_flushed)`.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) async fn probe_worker_batching_for_test(
     records: usize,
 ) -> Result<(usize, usize), String> {
@@ -2852,7 +2843,6 @@ pub(crate) async fn probe_worker_batching_for_test(
 
 /// The partition key the plugin derives for an HTTP summary under `config`'s
 /// `key_field`.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn http_record_key_for_test(
     config: &Value,
     summary: &TransactionSummary,
@@ -2864,7 +2854,6 @@ pub(crate) fn http_record_key_for_test(
 
 /// The partition key the plugin derives for a stream summary under
 /// `config`'s `key_field`.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn stream_record_key_for_test(
     config: &Value,
     summary: &StreamTransactionSummary,
@@ -2878,7 +2867,6 @@ pub(crate) fn stream_record_key_for_test(
 ///
 /// Admission alone cannot show that a padded credential survives intact, so the
 /// verbatim contract (#5216) is asserted on the parsed values themselves.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn parsed_sasl_credentials_for_test(
     config: &Value,
     http_client: &PluginHttpClient,
@@ -2887,7 +2875,6 @@ pub(crate) fn parsed_sasl_credentials_for_test(
     Ok((security.sasl_username, security.sasl_password))
 }
 
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn serialize_http_with_config_for_test(
     config: &Value,
     summary: &TransactionSummary,
@@ -2903,7 +2890,6 @@ pub(crate) fn serialize_http_with_config_for_test(
     .map_err(|error| error.to_string())
 }
 
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn serialize_stream_with_config_for_test(
     config: &Value,
     summary: &StreamTransactionSummary,
@@ -2922,7 +2908,6 @@ pub(crate) fn serialize_stream_with_config_for_test(
 /// Pure producer-configuration admission used by construction and exposed to
 /// external unit tests through `_test_support`. Keeps CRL conflict / budget
 /// policy coverage independent of librdkafka OpenSSL availability.
-#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn validate_producer_admission(
     config: &Value,
     http_client: &PluginHttpClient,

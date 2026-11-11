@@ -348,7 +348,6 @@ impl NodeWaypointUdpSteering {
     }
 
     /// Destinations currently owned by this serving instance.
-    #[allow(dead_code)] // External tests assert the serving plan.
     pub fn bound_destinations(&self) -> Vec<NodeWaypointUdpSteerDestination> {
         self.bound_destinations.load_full().as_ref().clone()
     }
@@ -356,7 +355,6 @@ impl NodeWaypointUdpSteering {
     /// Whether this serving instance currently has at least one actually bound
     /// NodeWaypoint UDP/DTLS listener. Distinct from
     /// [`Self::bound_destinations`]: a headless listener is serving with none.
-    #[allow(dead_code)] // External tests assert serving independently of ClusterIP tuples.
     pub fn serving(&self) -> bool {
         self.serving.load(Ordering::Acquire)
     }
@@ -434,7 +432,6 @@ impl NodeWaypointUdpSteering {
     /// Filters the latest desired set while holding the same mutex the full
     /// plan update uses, so a concurrent `set_bound_destinations` cannot be
     /// lost to a stale load/filter/store.
-    #[allow(dead_code)] // External unit-test seam; production exit retraction is generation-fenced.
     pub fn retract_port(&self, port: u16) -> SteerReconcileOutcome {
         let mut state = self.lock_state();
         state
@@ -461,7 +458,6 @@ impl NodeWaypointUdpSteering {
 
     /// [`Self::reconcile`] against an explicit destination set. Tests drive this
     /// form so they do not depend on another task mutating this instance.
-    #[allow(dead_code)] // External unit-test seam; production uses the state-specific entry points.
     pub fn reconcile_with(
         &self,
         ifaces: &[String],

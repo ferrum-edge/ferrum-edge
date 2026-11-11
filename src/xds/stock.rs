@@ -173,6 +173,7 @@ pub mod refusal {
     pub const AMBIGUOUS_VIRTUAL_HOST_TARGET: &str = "ambiguous_virtual_host_target";
     pub const AMBIGUOUS_PORT_PROTOCOL: &str = "ambiguous_port_protocol";
     pub const AMBIGUOUS_PEER_IDENTITY: &str = "ambiguous_peer_identity";
+    pub const DUPLICATE_SERVICE_PORT_CLUSTER: &str = "duplicate_service_port_cluster";
     pub const NO_PINNED_PEER_IDENTITY: &str = "no_pinned_peer_identity";
     pub const RESOURCE_LIMIT_EXCEEDED: &str = "resource_limit_exceeded";
     pub const SDS_SECRET_REFUSED: &str = "sds_secret_refused";
@@ -344,11 +345,12 @@ impl PortClass {
 pub struct StockListener {
     pub name: String,
     /// Concrete bind address, or `None` for a wildcard (`0.0.0.0` / `::`)
-    /// listener. A concrete address on an outbound listener is the service VIP.
+    /// listener. A concrete address on an OUTBOUND listener is the service VIP.
     pub bind_address: Option<IpAddr>,
     pub port: u16,
     /// `envoy.config.core.v3.TrafficDirection`: 0 unspecified, 1 inbound,
-    /// 2 outbound.
+    /// 2 outbound. Only an outbound listener names a service VIP; an inbound or
+    /// unspecified listener's concrete bind is never attributed to a service.
     pub traffic_direction: i32,
     class: Option<PortClass>,
     /// RDS route configuration names referenced by this listener's HCM chains.
@@ -1846,7 +1848,15 @@ struct PortBuild {
     target_ports: BTreeSet<u16>,
     endpoints: Vec<StockEndpoint>,
     identity: Option<SpiffeId>,
+    /// The one cluster that owns this `(namespace, service, port)`. Distinct
+    /// CDS names can resolve to the same service port (a trailing dot, another
+    /// cluster domain after `.svc.`); only the first claims it, so one cluster
+    /// can never publish endpoints under another cluster's pinned identity.
+    claimed: bool,
 }
+
+/// `envoy.config.core.v3.TrafficDirection::OUTBOUND`.
+const TRAFFIC_DIRECTION_OUTBOUND: i32 = 2;
 
 fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
     let mut refusals = accumulator.refusals();
@@ -1856,14 +1866,27 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
     let mut service_by_cluster: BTreeMap<&str, (String, String)> = BTreeMap::new();
 
     for (name, cluster) in &accumulator.clusters {
-        service_by_cluster.insert(
-            name.as_str(),
-            (cluster.namespace.clone(), cluster.service.clone()),
-        );
         let entry = services
             .entry((cluster.namespace.clone(), cluster.service.clone()))
             .or_default();
         let port = entry.ports.entry(cluster.port).or_default();
+        // Clusters iterate in name order, so the claimant is deterministic.
+        // A second cluster for an already-claimed service port is refused
+        // whole: it contributes no identity, endpoints, VIP, or protocol.
+        if port.claimed {
+            refusals.push(StockRefusal::new(
+                "cds",
+                cluster.name.clone(),
+                refusal::DUPLICATE_SERVICE_PORT_CLUSTER,
+                "name.host",
+            ));
+            continue;
+        }
+        port.claimed = true;
+        service_by_cluster.insert(
+            name.as_str(),
+            (cluster.namespace.clone(), cluster.service.clone()),
+        );
 
         let endpoints: &[StockEndpoint] = match cluster.eds_resource.as_deref() {
             Some(resource) => accumulator
@@ -1874,9 +1897,15 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
             None => cluster.inline_endpoints.as_slice(),
         };
 
+        // Endpoints are published only under THIS cluster's own pinned
+        // identity, never under one a sibling cluster left on the port.
+        let mut pinned = false;
         match cluster.peer_identities.len() {
             1 => match SpiffeId::new(cluster.peer_identities[0].clone()) {
-                Ok(spiffe) => port.identity = Some(spiffe),
+                Ok(spiffe) => {
+                    port.identity = Some(spiffe);
+                    pinned = true;
+                }
                 Err(_) => refusals.push(StockRefusal::new(
                     "cds",
                     cluster.name.clone(),
@@ -1906,7 +1935,7 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
             )),
         }
 
-        if port.identity.is_some() {
+        if pinned {
             for endpoint in endpoints {
                 port.target_ports.insert(endpoint.port);
                 port.endpoints.push(endpoint.clone());
@@ -1975,8 +2004,13 @@ fn build_discovery(accumulator: &StockXdsAccumulator) -> StockDiscovery {
                 }
             }
         }
-        // A concrete-bind listener names its service's VIP. Attribute it
-        // through the listener's TcpProxy cluster or its route configuration.
+        // A concrete-bind OUTBOUND listener names its service's VIP. Attribute
+        // it through the listener's TcpProxy cluster or its route
+        // configuration. An inbound (or unspecified) listener's bind address
+        // is this proxy's own wiring, never a peer service's VIP.
+        if listener.traffic_direction != TRAFFIC_DIRECTION_OUTBOUND {
+            continue;
+        }
         let Some(bind_address) = listener.bind_address else {
             continue;
         };

@@ -1445,7 +1445,6 @@ pub(crate) fn dtls_packet_error_is_droppable_for_test(error: &dimpl::Error) -> b
 
 /// Pin the fairness-boundary decision for external hosted tests without
 /// exposing it as runtime API.
-#[allow(dead_code)] // used through library `_test_support`
 pub(crate) fn client_send_output_drain_needs_another_round_for_test(
     has_pending_completion: bool,
     wrote_ciphertext_datagram: bool,
@@ -2312,7 +2311,6 @@ pub(crate) fn dtls_handshake_timeout_warning_accounting_for_test(
 ///
 /// The pre-handshake table is opened by exactly this record, so the harness
 /// sprays the genuine article rather than a synthetic prefix.
-#[allow(dead_code)] // used through library `_test_support`
 fn client_hello_record_for_test() -> Result<Vec<u8>, String> {
     let config = Arc::new(
         Config::builder()
@@ -2570,13 +2568,11 @@ impl DtlsServerSender {
 
 impl DtlsServerConn {
     /// Send application data through the DTLS tunnel to this client.
-    #[allow(dead_code)]
     pub async fn send(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         self.send_committed(data, None).await
     }
 
     /// Deadline-aware actual-commit send. See [`DtlsServerSender::send_committed`].
-    #[allow(dead_code)]
     pub async fn send_committed(
         &self,
         data: &[u8],
@@ -2665,7 +2661,6 @@ impl Drop for DtlsServerConn {
 
 impl DtlsServer {
     /// Create a new DTLS server bound to the given address.
-    #[allow(dead_code)] // Public helper used by tests and external DTLS backends.
     pub async fn bind(
         addr: SocketAddr,
         frontend_config: FrontendDtlsConfig,
@@ -2691,7 +2686,6 @@ impl DtlsServer {
     /// reserve-then-construct gap to avoid the bind-drop-rebind race) and
     /// wants to hand the socket directly to the DTLS server without any
     /// release/rebind window.
-    #[allow(dead_code)] // Public helper used by tests and scripted DTLS backends.
     pub fn from_socket(socket: UdpSocket, frontend_config: FrontendDtlsConfig) -> Self {
         // `DtlsServerLimits::default()` leaves both scoped socket options
         // (`capture_ingress_ifindex`, `socket_mark`) off, and they are the only
@@ -2803,7 +2797,6 @@ impl DtlsServer {
     /// of the active config (exact identity) and whether a client-certificate
     /// verifier is installed.
     #[doc(hidden)]
-    #[allow(dead_code)] // External unit/integration-test seam.
     pub fn frontend_config_identity_for_test(&self) -> (usize, bool) {
         let active = self.active_config.load_full();
         (
@@ -2813,7 +2806,6 @@ impl DtlsServer {
     }
 
     /// Get the local address this server is bound to.
-    #[allow(dead_code)] // Used by integration tests
     pub fn local_addr(&self) -> SocketAddr {
         self.socket
             .local_addr()
@@ -2821,7 +2813,6 @@ impl DtlsServer {
     }
 
     /// Number of peers currently tracked by the DTLS demuxer.
-    #[allow(dead_code)] // Used by tests and useful for diagnostics.
     pub fn active_session_count(&self) -> usize {
         self.active_sessions.load(Ordering::Relaxed)
     }
@@ -2918,7 +2909,6 @@ impl DtlsServer {
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, peer_addr) = batch.datagram(i);
-                                    let data = data.to_vec();
                                     // The WHOLE captured local destination is
                                     // carried forward, not just its interface
                                     // index: the address half is this session's
@@ -2994,8 +2984,7 @@ impl DtlsServer {
                 return Ok(());
             }
 
-            let data = buf[..len].to_vec();
-            self.dispatch_datagram(peer_addr, data, None).await;
+            self.dispatch_datagram(peer_addr, &buf[..len], None).await;
         }
     }
 
@@ -3011,17 +3000,21 @@ impl DtlsServer {
     /// here: it can neither be attributed to a source workload nor answered from
     /// the address the client addressed, so it is dropped before any session
     /// state is allocated or delivered.
+    ///
+    /// The datagram is borrowed from the receive buffer and the (decoded)
+    /// payload is copied exactly once, only when it is delivered to a session
+    /// or starts one; refused datagrams allocate nothing (issue #7207).
     async fn dispatch_datagram(
         &self,
         peer_addr: SocketAddr,
-        data: Vec<u8>,
+        datagram: &[u8],
         reply_local: Option<crate::socket_opts::PktinfoLocal>,
     ) {
         // Datagram client-address boundary (issue #3289).
         let (data, forwarded_client) = match self.limits.datagram_client_address.as_ref() {
-            None => (data, None),
-            Some(gate) => match gate.decode(&data, &peer_addr) {
-                Ok(decoded) => (decoded.payload.to_vec(), decoded.forwarded),
+            None => (datagram, None),
+            Some(gate) => match gate.decode(datagram, &peer_addr) {
+                Ok(decoded) => (decoded.payload, decoded.forwarded),
                 Err(error) => {
                     let _ = record_datagram_metadata_refusal(
                         &self.datagram_client_address_warn,
@@ -3104,7 +3097,7 @@ impl DtlsServer {
             // freezing demux — handshakes, retransmits, everything — for
             // EVERY peer on the listener. Dropping the datagram is correct
             // UDP semantics; DTLS retransmission recovers the loss.
-            match tx.try_send(data) {
+            match tx.try_send(data.to_vec()) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     trace!(
@@ -3134,14 +3127,14 @@ impl DtlsServer {
                     }
                 }
             }
-        } else if dtls_datagram_opens_session(&data) {
+        } else if dtls_datagram_opens_session(data) {
             // New client — spawn a session driver. Only the initial fragment
             // of a ClientHello starts a handshake: spawning reserves a
             // `max_sessions` slot, allocates four channels, and holds the
             // slot for the handshake timeout, so later handshake records
             // (a refused peer's Certificate/Finished retransmits) and
             // scanner garbage must not reach it.
-            self.spawn_session(peer_addr, data, reply_local, forwarded_client);
+            self.spawn_session(peer_addr, data.to_vec(), reply_local, forwarded_client);
         } else {
             trace!(
                 client = %peer_addr,

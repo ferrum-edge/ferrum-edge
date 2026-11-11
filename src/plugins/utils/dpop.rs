@@ -24,7 +24,6 @@
 //! so a marker always outlives every window in which its proof could be
 //! re-presented.
 
-use crate::fips::approved::Sha256;
 use std::time::Duration;
 
 use base64::Engine;
@@ -34,6 +33,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::auth_flow::constant_time_eq;
+use super::cert_hash::sha256_base64url_no_pad;
 use super::claim_resolver::extract_claim_string;
 use super::replay_authority::{ReplayDomain, ReplayMarker};
 
@@ -211,7 +211,7 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
     // same key. (A token-endpoint PoP flow without `ath` would need its own code
     // path, not a relaxation of this one.)
     let ath = claims.ath.ok_or("DPoP proof missing ath")?;
-    let expected = access_token_hash(input.access_token);
+    let expected = sha256_base64url_no_pad(input.access_token.as_bytes());
     if !constant_time_eq(ath.as_bytes(), expected.as_bytes()) {
         return Err("DPoP access token hash mismatch");
     }
@@ -307,15 +307,7 @@ pub fn jwk_thumbprint_sha256(jwk: &Jwk) -> Result<String, String> {
         }
         _ => return Err("unsupported JWK type".to_string()),
     };
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize()))
-}
-
-fn access_token_hash(access_token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(access_token.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+    Ok(sha256_base64url_no_pad(canonical.as_bytes()))
 }
 
 #[cfg(test)]

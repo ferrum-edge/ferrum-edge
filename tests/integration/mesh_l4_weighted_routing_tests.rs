@@ -100,10 +100,15 @@ fn virtual_service_tcp_weighted_split_uses_generated_upstream_weights() {
     let lb = LoadBalancerCache::new(&result.config);
     let mut counts: HashMap<String, usize> = HashMap::new();
     for i in 0..1000 {
-        let target = lb
-            .select_target("default", &upstream.id, &i.to_string(), None)
-            .expect("target")
-            .target;
+        let target = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            &upstream.id,
+            &i.to_string(),
+            None,
+        )
+        .expect("target")
+        .target;
         *counts.entry(target.host.clone()).or_default() += 1;
     }
     assert_eq!(
@@ -312,10 +317,15 @@ fn virtual_service_tcp_weighted_split_failover_skips_unhealthy_target() {
 
     let mut counts: HashMap<String, usize> = HashMap::new();
     for i in 0..40 {
-        let target = lb
-            .select_target("default", &upstream.id, &i.to_string(), Some(&health))
-            .expect("healthy target")
-            .target;
+        let target = LoadBalancerCache::select_target_from(
+            &lb.load(),
+            "default",
+            &upstream.id,
+            &i.to_string(),
+            Some(&health),
+        )
+        .expect("healthy target")
+        .target;
         *counts.entry(target.host.clone()).or_default() += 1;
     }
     assert_eq!(
