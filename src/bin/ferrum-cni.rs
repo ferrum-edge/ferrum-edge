@@ -44,7 +44,8 @@ mod cni_main {
         MAX_CNI_ATTACHMENT_FIELD_BYTES, MAX_CNI_STDIN_BYTES, SUPPORTED_CNI_VERSIONS,
         build_error_result, cni_version_supports_gc, cni_version_supports_status, ingest_cni_args,
         ingest_valid_attachments, is_safe_cni_container_id, is_safe_cni_netns_path,
-        is_safe_cni_network_name, is_supported_cni_version, read_stdin_bounded,
+        is_safe_cni_network_name, is_supported_cni_version, prev_result_pod_ips,
+        read_stdin_bounded,
     };
 
     /// Default socket path the binary connects to when the chained CNI
@@ -459,6 +460,7 @@ mod cni_main {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
 
         if let Err(reason) = request.validate() {
@@ -533,6 +535,7 @@ mod cni_main {
             ifname: None,
             netns_path: None,
             valid_attachments,
+            pod_ips: Vec::new(),
         };
 
         if let Err(reason) = request.validate() {
@@ -599,6 +602,13 @@ mod cni_main {
             ifname: invocation.ifname.clone(),
             netns_path: invocation.netns.clone(),
             valid_attachments: Vec::new(),
+            // ADD forwards the primary CNI's allocation so the node-agent can
+            // enroll the pod before kubelet starts it (GHSA-7x6j-vmqm-xx2v).
+            pod_ips: if verb == RpcVerb::Add {
+                prev_result_pod_ips(net_config.prev_result.as_ref())
+            } else {
+                Vec::new()
+            },
         };
 
         if let Err(reason) = request.validate() {

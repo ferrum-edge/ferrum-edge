@@ -73,6 +73,20 @@ const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_BPF_FS_PATH: &str = crate::ebpf::BPF_FS_MOUNT_PATH;
 const DEFAULT_FALLBACK_MODE: &str = "fail";
 const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
+/// Bounded attempts at the CNI ADD pod metadata GET. Two attempts plus the
+/// pause between them stay well under the ferrum-cni RPC client timeout
+/// (`DEFAULT_RPC_TIMEOUT` = 5s), so a transient API hiccup is absorbed while a
+/// real outage still answers ADD (fail closed) before the client gives up.
+const CNI_METADATA_FETCH_ATTEMPTS: u32 = 2;
+const CNI_METADATA_FETCH_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Sanitized ADD refusal when the pod's Kubernetes metadata cannot be read:
+/// without labels/annotations the node-agent cannot tell whether the pod must
+/// be captured, and acknowledging ADD would let an opted-in pod start outside
+/// the mesh (GHSA-7x6j-vmqm-xx2v). kubelet retries the sandbox.
+pub(crate) const CNI_ADD_METADATA_UNAVAILABLE_REASON: &str = "Kubernetes API pod metadata is unavailable; ADD fails closed so the pod cannot start outside the mesh";
+/// Sanitized ADD refusal when an opted-in pod's capture enrollment did not land
+/// (GHSA-7x6j-vmqm-xx2v). kubelet retries the sandbox.
+pub(crate) const CNI_ADD_ENROLLMENT_INCOMPLETE_REASON: &str = "pod is opted in to the mesh but capture enrollment did not complete; ADD fails closed so the pod cannot start outside the mesh";
 /// Live Kubernetes ADD-dependency probe budget for CNI STATUS.
 ///
 /// Equal to the ADD metadata GET budget so STATUS cannot occupy the serial
@@ -230,6 +244,25 @@ pub struct PodSourceIps {
 }
 
 impl PodSourceIps {
+    /// Prefer the primary CNI's allocation for THIS sandbox (the chained
+    /// `prevResult` the ADD carried) over Kubernetes status, which is usually
+    /// still empty at ADD and can name a previous sandbox's address on a
+    /// sandbox restart. An empty allocation keeps the status view unchanged.
+    fn preferring_cni_allocation(self, allocation: &[std::net::IpAddr]) -> Self {
+        if allocation.is_empty() {
+            return self;
+        }
+        let mut ips = Self::default();
+        for ip in allocation {
+            match ip {
+                std::net::IpAddr::V4(ip) if ips.ipv4.is_none() => ips.ipv4 = Some(*ip),
+                std::net::IpAddr::V6(ip) if ips.ipv6.is_none() => ips.ipv6 = Some(*ip),
+                _ => {}
+            }
+        }
+        ips
+    }
+
     #[cfg(test)]
     fn from_primary_str(ip: Option<&str>) -> Self {
         let mut ips = Self::default();
@@ -3667,10 +3700,10 @@ fn mark_relist_seen_from_cni_add(pod_sync: &mut PodSyncState, enrolled_uid: Opti
 /// calls with the same identity are no-ops.
 ///
 /// The production ADD path first fetches pod metadata from the Kubernetes API
-/// in [`apply_cni_request_with_kube_metadata`]. This pure helper keeps the
-/// no-metadata fallback behavior testable: if that API GET fails, ADD is
-/// acknowledged without BPF attachment and the kube-rs watcher reconciles when
-/// its event arrives.
+/// in [`apply_cni_request_with_kube_metadata`] and fails ADD closed when that
+/// read fails or when an opted-in pod's enrollment does not land
+/// (GHSA-7x6j-vmqm-xx2v), so kubelet never starts an opted-in pod outside the
+/// mesh. [`apply_cni_request`] is the metadata-free core for the other verbs.
 ///
 /// On the DEL path: when we already have a pod-state entry, we tear
 /// down BPF attachment immediately — the CNI DEL is a strong signal
@@ -3735,34 +3768,44 @@ async fn apply_cni_request_with_kube_metadata(
         );
     }
 
+    // Fail closed (GHSA-7x6j-vmqm-xx2v): without the pod's labels and
+    // annotations the node-agent cannot tell whether the pod must be captured,
+    // and acknowledging ADD would let an opted-in pod start outside the mesh
+    // until the watcher (which depends on the same API server) catches up.
+    // STATUS already reports the Kubernetes API as an ADD dependency.
     let pod_api: Api<Pod> = Api::namespaced(kube_client.clone(), &request.pod_namespace);
-    match tokio::time::timeout(CNI_METADATA_FETCH_TIMEOUT, pod_api.get(&request.pod_name)).await {
-        Ok(Ok(pod)) => apply_cni_add_from_pod(backend, pod_states, config, metrics, request, &pod),
-        Ok(Err(err)) => {
-            debug!(
-                namespace = %crate::startup::sanitize_startup_scalar(&request.pod_namespace),
-                pod_name = %crate::startup::sanitize_startup_scalar(&request.pod_name),
-                error = %crate::startup::sanitize_startup_scalar(&err),
-                "CNI ADD could not fetch pod metadata; kube-rs watcher will reconcile"
-            );
-            (
-                apply_cni_request(backend, pod_states, config, metrics, request),
-                None,
-            )
+    let mut attempt = 0;
+    let pod = loop {
+        attempt += 1;
+        match tokio::time::timeout(CNI_METADATA_FETCH_TIMEOUT, pod_api.get(&request.pod_name)).await
+        {
+            Ok(Ok(pod)) => break Some(pod),
+            Ok(Err(_)) | Err(_) if attempt < CNI_METADATA_FETCH_ATTEMPTS => {
+                tokio::time::sleep(CNI_METADATA_FETCH_RETRY_DELAY).await;
+            }
+            outcome => {
+                // The Kubernetes error text and request URI are
+                // remote-controlled; log only fixed fields.
+                warn!(
+                    namespace = %crate::startup::sanitize_startup_scalar(&request.pod_namespace),
+                    pod_name = %crate::startup::sanitize_startup_scalar(&request.pod_name),
+                    attempts = attempt,
+                    timed_out = outcome.is_err(),
+                    "CNI ADD refused: Kubernetes pod metadata is unavailable, so the node-agent cannot evaluate mesh enrollment; failing closed (kubelet retries the sandbox)"
+                );
+                break None;
+            }
         }
-        Err(_elapsed) => {
-            debug!(
-                namespace = %crate::startup::sanitize_startup_scalar(&request.pod_namespace),
-                pod_name = %crate::startup::sanitize_startup_scalar(&request.pod_name),
-                timeout_ms = CNI_METADATA_FETCH_TIMEOUT.as_millis(),
-                "CNI ADD pod metadata fetch timed out; kube-rs watcher will reconcile"
-            );
-            (
-                apply_cni_request(backend, pod_states, config, metrics, request),
-                None,
-            )
-        }
-    }
+    };
+    let Some(pod) = pod else {
+        return (
+            CniRpcResponse::Error {
+                reason: CNI_ADD_METADATA_UNAVAILABLE_REASON.to_string(),
+            },
+            None,
+        );
+    };
+    apply_cni_add_from_pod(backend, pod_states, config, metrics, request, &pod)
 }
 
 /// Re-attempt a durable ownership load that failed on a transient I/O error, so
@@ -3854,12 +3897,14 @@ fn apply_cni_add_from_pod(
     request: &CniRpcRequest,
     pod: &Pod,
 ) -> (CniRpcResponse, Option<String>) {
+    // Both refusals below fail closed (GHSA-7x6j-vmqm-xx2v): a `Rejected`
+    // ADD is passed through by ferrum-cni, which would start the sandbox
+    // without the node-agent having evaluated THIS pod's enrollment.
     let Some(api_uid) = pod_uid(pod) else {
         return (
-            CniRpcResponse::Rejected {
-                reason:
-                    "Kubernetes API pod is missing metadata.uid; kube-rs watcher will reconcile"
-                        .to_string(),
+            CniRpcResponse::Error {
+                reason: "Kubernetes API pod is missing metadata.uid; ADD fails closed until it can be evaluated"
+                    .to_string(),
             },
             None,
         );
@@ -3868,8 +3913,8 @@ fn apply_cni_add_from_pod(
         && request_uid != api_uid
     {
         return (
-            CniRpcResponse::Rejected {
-                reason: "CNI pod UID does not match Kubernetes API pod UID; kube-rs watcher will reconcile"
+            CniRpcResponse::Error {
+                reason: "CNI pod UID does not match Kubernetes API pod UID; ADD fails closed until the API view catches up"
                     .to_string(),
             },
             None,
@@ -3901,8 +3946,18 @@ fn apply_cni_add_from_pod(
         .as_deref()
         .unwrap_or(request.pod_namespace.as_str());
     let status = pod.status.as_ref();
-    let pod_ip = status.and_then(|status| status.pod_ip.as_deref());
-    let pod_source_ips = PodSourceIps::from_status(status);
+    // Kubernetes publishes `status.podIP` only after ADD returns, so the
+    // primary CNI's allocation carried on the request is what lets the pod's
+    // dedicated host route resolve and enrollment land before kubelet starts
+    // the pod. It is authoritative for this sandbox; status is the fallback.
+    let pod_ip = if request.pod_ips.is_empty() {
+        status.and_then(|status| status.pod_ip.as_deref())
+    } else {
+        None
+    };
+    let pod_source_ips =
+        PodSourceIps::from_status(status).preferring_cni_allocation(&request.pod_ips);
+    let host_network = pod_uses_host_network(pod);
     let node_probe_ports = pod_probe_ports_from_spec(pod.spec.as_ref());
     let inbound_redirect_ports = pod_inbound_redirect_ports_from_spec(pod.spec.as_ref());
     let service_account = pod
@@ -3921,7 +3976,7 @@ fn apply_cni_add_from_pod(
         node_probe_ports,
         inbound_redirect_ports,
         veth_iface_override: None,
-        host_network: pod_uses_host_network(pod),
+        host_network,
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
     // Surface the UID that was actually inserted into `pod_states` (the
@@ -3934,6 +3989,32 @@ fn apply_cni_add_from_pod(
     } else {
         None
     };
+    // An opted-in pod whose enrollment did not land (no dedicated host route
+    // for its address, a missing cgroup, an attach or map failure, or a retry
+    // still inside its backoff) must not start: acknowledging ADD here is the
+    // capture gap GHSA-7x6j-vmqm-xx2v describes. kubelet retries the sandbox,
+    // and every retry re-runs enrollment.
+    let enrollment_required = pod_watcher::evaluate_enrollment(
+        &labels,
+        &annotations,
+        namespace,
+        &config.excluded_namespaces,
+        host_network,
+    ) == EnrollmentDecision::Enroll;
+    if enrollment_required && enrolled_uid.is_none() {
+        warn!(
+            namespace = %crate::startup::sanitize_startup_scalar(namespace),
+            pod_name = %crate::startup::sanitize_startup_scalar(pod_name),
+            cni_addresses = request.pod_ips.len(),
+            "CNI ADD refused: the pod is opted in to the mesh but capture enrollment did not complete; failing closed (kubelet retries the sandbox)"
+        );
+        return (
+            CniRpcResponse::Error {
+                reason: CNI_ADD_ENROLLMENT_INCOMPLETE_REASON.to_string(),
+            },
+            None,
+        );
+    }
     if let Some(uid) = enrolled_uid.as_deref()
         && let Some(ifname) = request.ifname.as_deref()
         && let Err(reason) = remember_cni_owned_attachment(
@@ -3969,18 +4050,15 @@ pub fn apply_cni_request(
     let event = node_agent_cni_server::pod_event_from_request(request, &labels, &annotations);
     match request.verb {
         RpcVerb::Add => {
-            // Metadata-free ADD requests must not drive enrollment
-            // decisions. They arrive before we can reliably evaluate
-            // labels/annotations, so we acknowledge and let either
-            // `apply_cni_request_with_kube_metadata` (when available)
-            // or the kube-rs watcher perform authoritative reconcile.
-            if event.pod_uid.is_empty() {
-                return CniRpcResponse::Rejected {
-                    reason: "missing K8S_POD_UID in CNI args; kube-rs watcher will reconcile"
-                        .to_string(),
-                };
+            // ADD is decided only by `apply_cni_add_from_pod` over the pod's
+            // Kubernetes metadata. Without labels/annotations nothing can say
+            // whether the pod must be captured, and acknowledging (or
+            // `Rejected`, which ferrum-cni passes through) would let an
+            // opted-in pod start outside the mesh (GHSA-7x6j-vmqm-xx2v).
+            CniRpcResponse::Error {
+                reason: "CNI ADD requires the pod's Kubernetes metadata; a metadata-free ADD fails closed"
+                    .to_string(),
             }
-            CniRpcResponse::Ok
         }
         RpcVerb::Del => {
             if event.pod_uid.is_empty() {
@@ -14175,6 +14253,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments,
+            pod_ips: Vec::new(),
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("node-agent-cni.sock");
@@ -17791,11 +17870,11 @@ mod tests {
         assert!(keep.exists(), "unsafe UID must not delete a sibling entry");
     }
 
-    /// `apply_cni_request` ADD without Kubernetes metadata is a no-op and
-    /// returns `Ok`. The kube-rs watcher (or the metadata-enriched ADD path)
-    /// performs the real enrollment once labels/annotations are available.
+    /// `apply_cni_request` ADD without Kubernetes metadata cannot decide
+    /// enrollment, so it fails closed and touches nothing
+    /// (GHSA-7x6j-vmqm-xx2v).
     #[test]
-    fn apply_cni_request_add_with_empty_labels_returns_ok_and_skips_enrollment() {
+    fn apply_cni_request_add_without_metadata_fails_closed_and_skips_enrollment() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -17822,12 +17901,16 @@ mod tests {
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
-        assert_eq!(resp, CniRpcResponse::Ok);
+        assert!(
+            matches!(resp, CniRpcResponse::Error { .. }),
+            "a metadata-free ADD must fail closed, got {resp:?}"
+        );
         assert!(
             !pod_states.contains_key("pod-uid-1"),
-            "empty labels intentionally short-circuit enrollment; the watcher reconciles later"
+            "a metadata-free ADD must not enroll"
         );
         assert_eq!(
             metrics.pods_enrolled.load(Ordering::Relaxed),
@@ -17837,7 +17920,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_cni_request_add_with_empty_labels_does_not_unenroll_existing_pod() {
+    fn apply_cni_request_add_without_metadata_does_not_unenroll_existing_pod() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -17883,10 +17966,11 @@ mod tests {
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
 
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
-        assert_eq!(resp, CniRpcResponse::Ok);
+        assert!(matches!(resp, CniRpcResponse::Error { .. }), "got {resp:?}");
         assert!(pod_states.contains_key("pod-uid-1"));
         assert!(backend.detached_pods.is_empty());
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
@@ -18007,6 +18091,7 @@ mod tests {
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
 
         let (response, enrolled_uid) =
@@ -18030,13 +18115,177 @@ mod tests {
         ));
     }
 
-    /// `apply_cni_request` ADD without a pod_uid maps to `Rejected` (we
-    /// cannot key BPF state without a UID) — the watcher fallback handles
-    /// the reconcile by selector instead. Kubelet treats `Rejected` as a
-    /// soft signal but the CNI binary still emits a success result so
-    /// pod networking isn't broken.
+    fn cni_add_test_config(cgroup_root: &std::path::Path) -> NodeAgentConfig {
+        NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        }
+    }
+
+    fn cni_add_test_pod(
+        uid: &str,
+        opted_in: bool,
+        status_pod_ip: Option<&str>,
+    ) -> k8s_openapi::api::core::v1::Pod {
+        use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+        Pod {
+            metadata: ObjectMeta {
+                name: Some("alpha".to_string()),
+                namespace: Some("default".to_string()),
+                uid: Some(uid.to_string()),
+                labels: opted_in.then(|| {
+                    [("ferrum.io/mesh".to_string(), "enabled".to_string())]
+                        .into_iter()
+                        .collect()
+                }),
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: Some(PodStatus {
+                pod_ip: status_pod_ip.map(str::to_string),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn cni_add_test_request(
+        uid: Option<&str>,
+        pod_ips: Vec<std::net::IpAddr>,
+    ) -> crate::cni::rpc::CniRpcRequest {
+        crate::cni::rpc::CniRpcRequest {
+            verb: crate::cni::rpc::RpcVerb::Add,
+            network_name: "ferrum-mesh".to_string(),
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: uid.map(str::to_string),
+            container_id: "ctr-ghsa".to_string(),
+            ifname: Some("eth0".to_string()),
+            netns_path: Some("/var/run/netns/cni-ghsa".to_string()),
+            valid_attachments: Vec::new(),
+            pod_ips,
+        }
+    }
+
+    /// GHSA-7x6j-vmqm-xx2v: `status.podIP` is not published until after ADD
+    /// returns, so the primary CNI's `prevResult` address carried on the
+    /// request is what enrolls the pod at ADD. It also wins over a stale status
+    /// address left by a previous sandbox.
     #[test]
-    fn apply_cni_request_add_without_pod_uid_returns_rejected() {
+    fn cni_add_enrolls_from_the_prev_result_address_before_status_has_one() {
+        let _cni_guard = lock_cni_ownership_tests();
+        crate::cni::ownership::reset_cni_ownership_store_for_tests();
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        for (uid, status_ip) in [("ghsa-uid-1", None), ("ghsa-uid-2", Some("10.0.0.5"))] {
+            let mut backend = MockEbpfBackend::default();
+            backend.load_programs().unwrap();
+            let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+            let metrics = NodeAgentMetrics::default();
+            let cgroup_root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(cgroup_root.path().join(format!("kubepods/pod{uid}"))).unwrap();
+            let config = cni_add_test_config(cgroup_root.path());
+            let pod = cni_add_test_pod(uid, true, status_ip);
+            let req = cni_add_test_request(
+                Some(uid),
+                vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 9))],
+            );
+
+            let (response, enrolled_uid) =
+                apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+            assert_eq!(response, crate::cni::rpc::CniRpcResponse::Ok, "{uid}");
+            assert_eq!(enrolled_uid.as_deref(), Some(uid));
+            let state = pod_states.get(uid).expect("enrolled at ADD");
+            assert_eq!(
+                state.pod_ip,
+                Some(std::net::Ipv4Addr::new(10, 0, 0, 9)),
+                "{uid}: the CNI allocation for this sandbox is the enrolled address"
+            );
+            drop(state);
+            CNI_OWNED_ATTACHMENTS.remove(&cni_owned_attachment_key(
+                &pod_states,
+                "ferrum-mesh",
+                "ctr-ghsa",
+                "eth0",
+            ));
+        }
+    }
+
+    /// GHSA-7x6j-vmqm-xx2v: an opted-in pod whose enrollment does not land (no
+    /// dedicated host route for its address here) fails ADD closed instead of
+    /// starting outside the mesh. A pod that is not opted in is unaffected.
+    #[test]
+    fn cni_add_fails_closed_when_an_opted_in_pod_does_not_enroll() {
+        let _cni_guard = lock_cni_ownership_tests();
+        crate::cni::ownership::reset_cni_ownership_store_for_tests();
+        // No veth override: the production resolver finds no route to the
+        // documentation address on the test host.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podghsa-no-route")).unwrap();
+        let config = cni_add_test_config(cgroup_root.path());
+        let address = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            203, 0, 113, 78,
+        ))];
+
+        let pod = cni_add_test_pod("ghsa-no-route", true, None);
+        let req = cni_add_test_request(Some("ghsa-no-route"), address.clone());
+        let (response, enrolled_uid) =
+            apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+        assert_eq!(
+            response,
+            crate::cni::rpc::CniRpcResponse::Error {
+                reason: CNI_ADD_ENROLLMENT_INCOMPLETE_REASON.to_string(),
+            }
+        );
+        assert!(enrolled_uid.is_none());
+        assert!(!pod_states.contains_key("ghsa-no-route"));
+        assert!(backend.tc_attachments.is_empty());
+        forget_failed_pod_enrollment(&pod_state_key(&pod_states, "ghsa-no-route"));
+
+        let pod = cni_add_test_pod("ghsa-not-meshed", false, None);
+        let req = cni_add_test_request(Some("ghsa-not-meshed"), address);
+        let (response, enrolled_uid) =
+            apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+        assert_eq!(response, crate::cni::rpc::CniRpcResponse::Ok);
+        assert!(enrolled_uid.is_none());
+    }
+
+    /// GHSA-7x6j-vmqm-xx2v: a CNI UID the API pod does not carry means the API
+    /// view does not describe this sandbox yet; ADD fails closed rather than
+    /// passing the sandbox through unevaluated.
+    #[test]
+    fn cni_add_with_mismatched_pod_uid_fails_closed() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = cni_add_test_config(std::path::Path::new("/nonexistent"));
+        let pod = cni_add_test_pod("api-uid", true, None);
+        let req = cni_add_test_request(Some("other-uid"), Vec::new());
+        let (response, enrolled_uid) =
+            apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+        assert!(
+            matches!(response, crate::cni::rpc::CniRpcResponse::Error { .. }),
+            "got {response:?}"
+        );
+        assert!(enrolled_uid.is_none());
+        assert!(pod_states.is_empty());
+    }
+
+    /// A metadata-free ADD without a pod UID also fails closed: ferrum-cni
+    /// passes a `Rejected` ADD through, which would start the pod unevaluated.
+    #[test]
+    fn apply_cni_request_add_without_pod_uid_fails_closed() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -18063,17 +18312,19 @@ mod tests {
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
         match resp {
-            CniRpcResponse::Rejected { reason } => {
+            CniRpcResponse::Error { reason } => {
                 assert!(
-                    reason.contains("K8S_POD_UID"),
-                    "rejection message should explain why; got: {reason}"
+                    reason.contains("fails closed"),
+                    "refusal should explain why; got: {reason}"
                 );
             }
-            other => panic!("expected Rejected, got {other:?}"),
+            other => panic!("expected Error, got {other:?}"),
         }
+        assert!(pod_states.is_empty());
     }
 
     /// `apply_cni_request` DEL tears down BPF state for a pod the watcher
@@ -18125,6 +18376,7 @@ mod tests {
             ifname: Some("eth0".to_string()),
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
         assert_eq!(resp, CniRpcResponse::Ok);
@@ -18185,6 +18437,7 @@ mod tests {
             ifname: Some("eth0".to_string()),
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
             CniRpcResponse::Rejected { reason } => {
@@ -18267,6 +18520,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         assert_eq!(
             apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
@@ -18351,6 +18605,7 @@ mod tests {
                 container_id: "ctr-live".to_string(),
                 ifname: "eth0".to_string(),
             }],
+            pod_ips: Vec::new(),
         };
         assert_eq!(
             apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
@@ -18431,6 +18686,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         assert_eq!(
             apply_cni_request(
@@ -18507,6 +18763,7 @@ mod tests {
                 container_id: "ctr-live".to_string(),
                 ifname: "eth0".to_string(),
             }],
+            pod_ips: Vec::new(),
         };
 
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
@@ -18616,6 +18873,7 @@ mod tests {
                 ifname: None,
                 netns_path: None,
                 valid_attachments: Vec::new(),
+                pod_ips: Vec::new(),
             },
         );
         match response {
@@ -18698,6 +18956,7 @@ mod tests {
                 container_id: "../escape".to_string(),
                 ifname: "eth0".to_string(),
             }],
+            pod_ips: Vec::new(),
         };
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
             CniRpcResponse::Error { reason } => {
@@ -18819,6 +19078,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         assert_eq!(
             apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req),
@@ -18944,6 +19204,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
 
         match apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req) {
@@ -19088,6 +19349,7 @@ mod tests {
                 ifname: None,
                 netns_path: None,
                 valid_attachments: Vec::new(),
+                pod_ips: Vec::new(),
             },
         ) {
             CniRpcResponse::Error { reason } => {

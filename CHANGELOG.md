@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- **CNI ADD no longer lets an opted-in pod start uncaptured**
+  (GHSA-7x6j-vmqm-xx2v). With the chained `ferrum-cni` conflist, ADD was
+  acknowledged when the node-agent could not read the pod from the Kubernetes
+  API, or when an opted-in pod's enrollment did not land (it never could at
+  ADD, because `status.podIP` is published only after ADD returns), so the pod
+  ran outside the mesh until the watcher caught up. `ferrum-cni` now forwards
+  the primary CNI's `prevResult` pod addresses, the node-agent enrolls the pod
+  during ADD, and ADD fails closed (kubelet retries the sandbox) when the pod
+  metadata cannot be read after one bounded retry, when the API pod UID is
+  missing or differs, or when an opted-in pod is not enrolled. Refusals log a
+  `warn!` and count in `ferrum_node_agent_cni_calls_total{verb="add",outcome="error"}`.
+  **Operator action:** none on CNIs that give each pod a dedicated host route;
+  on a CNI that reaches pods only through a shared device, opted-in pods now
+  stay in `ContainerCreating` instead of running uncaptured, so remove the mesh
+  opt-in or the chained conflist on such nodes. Upgrade `ferrum-cni` and the
+  node-agent together (the chart's DaemonSet does).
 - **A ListenerSet can no longer withdraw another tenant's Gateway listener
   on a shared port** (GHSA-496f-3547-p3fw). A raw TCP/TLS listener (or a
   plaintext one, or a different TLS credential set) declared in a ListenerSet

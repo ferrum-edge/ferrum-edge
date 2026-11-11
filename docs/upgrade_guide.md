@@ -55,6 +55,24 @@ any host other than a loopback IP literal now reports `FerrumAccepted=False` /
 to `0`), and configure mirroring with a native `request_mirror` plugin using
 `mirror_protocol: https`.
 
+### CNI ADD fails closed until an opted-in pod is enrolled (GHSA-7x6j-vmqm-xx2v)
+
+With `nodeAgent.cni.enabled=true`, ADD now enrolls an opted-in pod from the
+primary CNI's `prevResult` addresses and returns a CNI error (kubelet retries
+the sandbox) instead of acknowledging it when the pod's Kubernetes metadata
+cannot be read, when the API pod UID is missing or differs from
+`K8S_POD_UID`, or when an opted-in pod's enrollment did not land.
+
+**Operator action:** on a CNI that gives every pod a dedicated host route
+(an exact `/32` or `/128` route to a per-pod veth) nothing changes except that
+enrollment now happens before the pod starts. On a CNI that reaches pods only
+through a shared device (`cni0`, Cilium's default `cilium_host`), the
+node-agent could never capture those pods; opted-in pods there now stay in
+`ContainerCreating`, so remove the mesh opt-in or the chained conflist on such
+nodes. The new ADD request field means `ferrum-cni` and the node-agent must run
+the same build; the chart installs the binary from the node-agent DaemonSet, so
+a normal rolling upgrade keeps them in step.
+
 ### ferrum-mesh chart value removals (#7297, #7299)
 
 Two `charts/ferrum-mesh` values are removed. The values schema rejects them, so
