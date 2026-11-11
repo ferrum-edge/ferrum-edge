@@ -63,7 +63,7 @@ jobs:
       shard-matrix: ${{ steps.plan.outputs.shard-matrix }}
       plugin_gate: ${{ steps.plan.outputs.plugin_gate }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -182,7 +182,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.coverage-plan.outputs.shard-matrix) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -547,7 +547,7 @@ jobs:
         if: needs.coverage-plan.outputs.mode != 'skip' && needs.coverage-shard.result != 'success'
         run: exit 1
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.coverage-plan.outputs.mode != 'skip'
         with:
           persist-credentials: false

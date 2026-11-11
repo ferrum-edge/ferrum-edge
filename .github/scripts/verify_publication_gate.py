@@ -2230,7 +2230,7 @@ _CONFORMING_RELEASE_JOB = """    name: Validate release SHA
       checks: read
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -3554,7 +3554,7 @@ def self_test() -> list[str]:
         "release env owned by the job instead of the named step must fail",
     )
     release_missing_checkout = _CONFORMING_RELEASE_JOB.replace(
-        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6\n"
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
         "        with:\n"
         "          persist-credentials: false\n"
         "          fetch-depth: 0\n\n",
@@ -3578,7 +3578,7 @@ def self_test() -> list[str]:
         )
         expect(_release_errors(release_wrong_pin) != [], label)
     release_rotated_pin = _CONFORMING_RELEASE_JOB.replace(
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
         "actions/checkout@1111111111111111111111111111111111111111 # v7.0.9",
     )
     expect(

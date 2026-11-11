@@ -948,8 +948,6 @@ The rules for any action pin, whoever proposes it:
 2. The trailing version comment is informational. Keep it accurate for new
    uses. It is not part of any frozen surface, so Dependabot may rewrite it
    (`# v7.4.0` → `# v7.5.0`) or leave a major-only comment (`# v7`) alone.
-   Some guarded checkout sites still carry a historical `# v6` annotation on
-   the v7.0.1 SHA; an ordinary PR may now correct it.
 
 ### Automated action pin rotation
 

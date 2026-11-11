@@ -1,8 +1,7 @@
 name: Dependency Audit
 
 # Scheduled supply-chain governance for the dependency tree and the vendored,
-# patched crates (reqwest / h3 / tungstenite / tokio-tungstenite / dimpl —
-# canonically docs/vendored-patch-lifecycle.json). The blocking
+# patched crates listed in docs/vendored-patch-lifecycle.json. The blocking
 # advisories gate also runs per-PR in ci.yml; this workflow re-checks against the
 # latest advisory database WITHOUT a PR (so a newly-published RUSTSEC advisory is
 # caught within a week even on a quiet repo) and adds two time-sensitive checks
@@ -37,7 +36,7 @@ jobs:
     name: Advisories & exception expiry
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -148,7 +147,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

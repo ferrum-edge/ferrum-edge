@@ -1421,7 +1421,7 @@ jobs:
   collect:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust-ci
       - run: sudo apt-get install -y protobuf-compiler lsof curl
       - run: authz_match ip_restriction slice_apply xds_translation
@@ -1472,7 +1472,7 @@ jobs:
         run: --check-acceptance
       - name: Upload mesh baseline artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mesh-performance-baselines-${{ github.sha }}
 """

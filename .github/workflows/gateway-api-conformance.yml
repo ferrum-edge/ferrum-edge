@@ -54,7 +54,7 @@ jobs:
       relevant: ${{ steps.filter.outputs.relevant }}
     steps:
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -237,7 +237,7 @@ jobs:
         run: echo "GATEWAY_API_LAB_OWNERSHIP_FILE=$RUNNER_TEMP/gateway-api-gatewayclass-ownership.tsv" >> "$GITHUB_ENV"
 
       - name: Checkout Ferrum Edge
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

@@ -841,7 +841,7 @@ jobs:
   regress:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-rust-ci
       - run: echo ci-release
       - run: python3 tests/performance/multi_protocol/run_protocol_regression_scenarios.py
@@ -849,7 +849,7 @@ jobs:
       - run: echo protocol_perf_budgets.json alert trends runner_health
       - run: python3 -I .github/scripts/latest_trusted_scheduled_runs.py --self-test
       - run: python3 -I .github/scripts/latest_trusted_scheduled_runs.py --workflow protocol-perf-regression.yml --current-sha "$CURRENT_SHA"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
 """
     validate_workflow_text(good, failures)
 
@@ -918,7 +918,7 @@ SIGHUP was not delivered
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Verify protocol-perf contracts (static)
@@ -987,7 +987,7 @@ runs:
   using: composite
   steps:
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         shared-key: ${{ inputs.shared-key }}
         workspaces: ${{ inputs.workspaces }}
