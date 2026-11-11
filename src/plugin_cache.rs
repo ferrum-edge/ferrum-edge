@@ -279,6 +279,13 @@ const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS: &[FinalizedRequestPolicyCompos
         default_priority: crate::plugins::priority::BODY_VALIDATOR,
         protocols: crate::plugins::HTTP_GRPC_PROTOCOLS,
     },
+    // Every `graphql` instance has a protection rule (the constructor refuses
+    // one without), so it always enforces finalized request policy.
+    FinalizedRequestPolicyCompositionSpec {
+        name: "graphql",
+        default_priority: crate::plugins::priority::GRAPHQL,
+        protocols: crate::plugins::graphql::GRAPHQL_PROTOCOLS,
+    },
     FinalizedRequestPolicyCompositionSpec {
         name: "openapi_validator",
         default_priority: crate::plugins::priority::OPENAPI_VALIDATOR,

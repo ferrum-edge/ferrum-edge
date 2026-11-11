@@ -59,7 +59,7 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const CAPACITY_REJECT_BODY: &str =
     r#"{"errors":[{"message":"Rate limit state capacity exceeded"}]}"#;
-const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
+pub(crate) const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
     &[super::ProxyProtocol::Http, super::ProxyProtocol::WebSocket];
 
 /// GraphQL-specific top-level config keys (excludes shared Redis sync fields).
