@@ -2808,9 +2808,10 @@ its surface and is refused. `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS` in
 `.github/scripts/verify_cross_build_policy.py` admits exact retired→adopted
 pairs for those jobs, keyed by the workflow filename AND the job name.
 
-The table is currently **empty**. Its only entry, the `coverage.yml`
-`coverage-merge` pair for PR #3917 (issue #3907), was retired after #3917
-merged and a later action-pin bump moved the job off that digest.
+The table is currently **empty**. Both of its entries were `coverage.yml`
+`coverage-merge` pairs: PR #3917's (issue #3907), retired after #3917 merged
+and a later action-pin bump moved the job off that digest, and PR #6958's
+45 → 75-minute timeout pair, retired once the 75-minute job was main's.
 
 A future entry follows the same rules: each digest is the SHA-256 of
 `extract_job_block` text, both ends are exact, the binding includes the
