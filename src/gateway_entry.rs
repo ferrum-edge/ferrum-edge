@@ -1059,8 +1059,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         tokio::spawn(async move {
             let mut first_signal_tx = Some(first_signal_tx);
             let mut observed: u32 = 0;
-            let mut on_signal = move |name: &'static str, count: u32| {
-                match overload::classify_shutdown_signal(count) {
+            let mut on_signal =
+                move |name: &'static str, count: u32| match overload::classify_shutdown_signal(
+                    count,
+                ) {
                     overload::ShutdownSignalAction::InitiateDrain => {
                         info!("{} received, initiating graceful shutdown...", name);
                         if let Some(tx) = first_signal_tx.take() {
@@ -1085,8 +1087,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
                             name
                         );
                     }
-                }
-            };
+                };
 
             #[cfg(unix)]
             {
