@@ -1792,7 +1792,7 @@ impl DnsCache {
         // queries together through the same caching resolver, then take the
         // first non-empty answer in configured order. For an address-only host
         // this saves the SRV round trip; for an SRV-backed host the address
-        // answer is simply unused (and left in the resolver's cache).
+        // query is wasted (dropped if still pending when SRV answers).
         if known_record_type.is_none()
             && let [
                 CachedRecordType::Srv,
@@ -1816,9 +1816,11 @@ impl DnsCache {
     }
 
     /// Resolve the SRV step and the address step after it concurrently, and
-    /// return the first non-empty answer in that order. An address answer that
-    /// expired while SRV was still pending is looked up again, so the result
-    /// is never older than a sequential walk's would be.
+    /// return the first non-empty answer in that order. When the address
+    /// lookup finished before SRV, its result is only used if it is a success
+    /// that is still valid; otherwise the address step runs again through the
+    /// caching resolver once SRV has come back empty, as a sequential walk
+    /// would (an unexpired cached negative answer is returned at once).
     async fn srv_then_address(
         &self,
         hostname: &str,
@@ -1827,12 +1829,14 @@ impl DnsCache {
         // Boxed so the two lookups do not inflate every caller's future.
         let srv = Box::pin(self.lookup_record_type(hostname, CachedRecordType::Srv));
         let address = Box::pin(self.lookup_record_type(hostname, address_type));
-        let address_answer = match futures_util::future::select(srv, address).await {
+        let early_answer = match futures_util::future::select(srv, address).await {
             futures_util::future::Either::Left((srv_answer, address)) => {
                 if srv_answer.is_some() {
                     return srv_answer;
                 }
-                address.await
+                // SRV came back empty first: the address lookup still in
+                // flight is the sequential walk's next step.
+                return address.await;
             }
             futures_util::future::Either::Right((address_answer, srv)) => {
                 if let Some(srv_answer) = srv.await {
@@ -1841,11 +1845,9 @@ impl DnsCache {
                 address_answer
             }
         };
-        match address_answer {
-            Some(answer) if answer.valid_until <= Instant::now() => {
-                Box::pin(self.lookup_record_type(hostname, address_type)).await
-            }
-            other => other,
+        match early_answer {
+            Some(answer) if answer.valid_until > Instant::now() => Some(answer),
+            _ => Box::pin(self.lookup_record_type(hostname, address_type)).await,
         }
     }
 

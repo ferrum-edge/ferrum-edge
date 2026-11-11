@@ -64,8 +64,6 @@ struct Behavior {
     /// Never answer A queries for the host itself (SRV-target A queries are
     /// still answered).
     hold_host_a: bool,
-    /// Never answer the first A query for each host name; answer later ones.
-    hold_first_host_a: bool,
     /// Answer the first A query for each host name; never answer later ones.
     hold_repeat_host_a: bool,
     ttl: u32,
@@ -81,7 +79,6 @@ impl ColdMissDnsServer {
             rotate_host_a,
             negative_first_host_a,
             hold_host_a,
-            hold_first_host_a,
             hold_repeat_host_a,
             ttl,
         } = behavior;
@@ -136,10 +133,7 @@ impl ColdMissDnsServer {
                                     answer_addresses = false;
                                 }
                                 host_a_queries += 1;
-                                if hold_host_a
-                                    || (hold_first_host_a && first_for_name)
-                                    || (hold_repeat_host_a && !first_for_name)
-                                {
+                                if hold_host_a || (hold_repeat_host_a && !first_for_name) {
                                     task_a_query_names.lock().expect("A query log").push(name);
                                     continue;
                                 }
@@ -185,11 +179,17 @@ impl ColdMissDnsServer {
 
     /// `dns_order: None` is the default `CACHE,SRV,A,CNAME`.
     fn cache_with_order(&self, dns_order: Option<&str>) -> DnsCache {
+        self.cache_with(dns_order, DnsConfig::default().error_ttl_seconds)
+    }
+
+    /// `error_ttl_seconds` also sets the resolver's negative-answer TTL.
+    fn cache_with(&self, dns_order: Option<&str>, error_ttl_seconds: u64) -> DnsCache {
         DnsCache::new(DnsConfig {
             resolver_addresses: Some(self.addr.to_string()),
             dns_order: dns_order.map(str::to_owned),
             min_ttl_seconds: 1,
             stale_ttl_seconds: 0,
+            error_ttl_seconds,
             ..DnsConfig::default()
         })
     }
@@ -265,7 +265,6 @@ impl Default for Behavior {
             rotate_host_a: false,
             negative_first_host_a: false,
             hold_host_a: false,
-            hold_first_host_a: false,
             hold_repeat_host_a: false,
             ttl: 60,
         }
@@ -353,6 +352,38 @@ async fn address_answer_that_expired_while_srv_was_pending_is_looked_up_again() 
         resolved,
         IpAddr::V4(ROTATED_HOST_IP),
         "the fresh answer must be used, not the one that expired while SRV was pending"
+    );
+}
+
+#[tokio::test]
+async fn early_negative_address_answer_is_rechecked_after_srv() {
+    // The first A query answers NODATA, which the resolver caches for the 1 s
+    // error TTL, and the record exists from then on. SRV answers empty 2 s
+    // later, after that negative answer has expired, so the address step must
+    // ask again and find the record, as a sequential walk would. `SRV,A` has
+    // no CNAME step that could re-query A and hide a stale failure.
+    let dns = ColdMissDnsServer::spawn(Behavior {
+        hold_srv_until_a: true,
+        srv_delay_after_a: Some(Duration::from_secs(2)),
+        negative_first_host_a: true,
+        ..Behavior::default()
+    })
+    .await;
+    let cache = dns.cache_with(Some("SRV,A"), 1);
+
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(4),
+        cache.resolve("cold-negative.test.", None, None),
+    )
+    .await
+    .expect("the delayed SRV reply arrives well inside the resolver timeout")
+    .expect("the address published after the early NODATA answer must resolve");
+
+    assert_eq!(resolved, IpAddr::V4(HOST_IP));
+    assert_eq!(dns.a_queries_named("cold-negative.test."), 2);
+    assert!(
+        !cache.is_cached_error("cold-negative.test."),
+        "a resolvable host must not be cached as an error"
     );
 }
 

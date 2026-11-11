@@ -75,7 +75,7 @@ Ferrum starts from the platform system DNS configuration (on Linux, `/etc/resolv
 
 The `FERRUM_DNS_ORDER` setting controls which DNS record types are queried and in what order. The resolver returns the first non-empty answer in that order, normally trying one type at a time.
 
-On a **cold miss** (no cache row yet records which type answered for the hostname), an order that starts with `SRV` followed by `A` or `AAAA`, as the default does, sends those two queries together through the same caching resolver. The SRV answer still wins when it has addresses. Otherwise the address answer is used, and is looked up again if it expired while SRV was pending. For an address-only host this saves the SRV round trip. For an SRV-backed host the address answer goes unused but stays in the resolver cache. Warm lookups, and any other order, stay sequential.
+On a **cold miss** (no cache row yet records which type answered for the hostname), an order that starts with `SRV` followed by `A` or `AAAA`, as the default does, sends those two queries together through the same caching resolver. The SRV answer still wins when it has addresses, and a still-pending address lookup is dropped. Otherwise the address answer is used; if it arrived before SRV and has since expired, or was a failure, the address step runs again through the cache, as a sequential walk would. For an address-only host this saves the SRV round trip. For an SRV-backed host the address query is wasted. Warm lookups, and any other order, stay sequential.
 
 Valid values (case-insensitive):
 
