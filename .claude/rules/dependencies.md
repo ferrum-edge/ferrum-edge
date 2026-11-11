@@ -121,10 +121,10 @@ sections:
   exactly once in its host (a generation that carries the budget, or
   `fuzz-smoke-main.yml` beside one that does not; `fuzz_budget_placement_errors`).
   → "Admitted `fuzz-smoke` generations".
-- Release image families (`RELEASE_IMAGE_FAMILY_GENERATIONS`): `release.yml` is
-  either the two-family shape or the complete three-family `-ebpf-tools`
-  contract; the trusted base decides, and a three-family base refuses a revert.
-  → "Admitted release image-family adoption".
+- Release image families (`PUBLISH_CONTROL_CONTRACTS`, `DIGEST_ARTIFACT_OWNERS`):
+  `release.yml` must carry the complete three-family (`-ebpf-tools`) publication
+  contract, as an absolute check and against the trusted base; dropping a family
+  is a direct-to-`main` policy edit. → "Release image-family contract".
 - GNU producer (`LINUX_GNU_X86_PRODUCERS`, `linux_gnu_producer_contract_errors`):
   the published x86_64 GNU binaries are built only by `release.yml`'s
   `build-release-binaries` in the digest-pinned AlmaLinux 8.10 sysroot and are
