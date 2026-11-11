@@ -930,7 +930,7 @@ fn unknown_keys_are_rejected_even_when_another_policy_list_is_valid() {
     for config in [
         json!({"alow": ["10.0.0.0/8"], "deny": ["192.0.2.0/24"]}),
         json!({"allow": ["10.0.0.0/8"], "denny": ["192.0.2.0/24"]}),
-        json!({"allow": ["10.0.0.0/8"], "mod": "deny_first"}),
+        json!({"allows": ["10.0.0.0/8"], "deny": ["192.0.2.0/24"]}),
     ] {
         let error = IpRestriction::new(&config)
             .err()
