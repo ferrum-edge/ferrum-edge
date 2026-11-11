@@ -1118,10 +1118,14 @@ fn test_hostname_normalized_to_lowercase() {
 
 #[test]
 fn test_warmup_hostnames_skips_ip_literals() {
+    // The two documentation-range IPv6 literals are not loopback, so cleartext
+    // to them needs the explicit opt-in (GHSA-gcwp-xp94-4pcv).
     for host in ["127.0.0.1", "2001:db8::10", "[2001:db8::10]"] {
-        let plugin =
-            RequestMirror::new(&json!({ "mirror_host": host }), PluginHttpClient::default())
-                .unwrap();
+        let plugin = RequestMirror::new(
+            &json!({ "allow_plaintext": true, "mirror_host": host }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
         assert!(
             plugin.warmup_hostnames().is_empty(),
             "IP literal {host} should not be DNS-warmed"
