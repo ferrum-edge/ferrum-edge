@@ -1458,7 +1458,9 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // upstream-backed stream proxy). Malformed predicates, `destination.subset`,
     // and invalid weights surface via the `Invalid` arm of
     // `virtual_service_status`. `mirror` /
-    // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
+    // `mirrorPercentage` / `redirect` / `rewrite` are translated (a non-zero
+    // mirror to anything but a loopback IP literal is omitted and reported
+    // below, GHSA-gcwp-xp94-4pcv), and
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
     // `StringMatch` (exact projected LITERALLY, so a wildcard-shaped or
@@ -1484,6 +1486,31 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
         deferred.push(
             "http[].corsPolicy with an unrepresentable policy combination \
              (not projected; use the cors plugin)",
+        );
+    }
+    // A valid `http[].mirror` the translator omits instead of opting in to
+    // cleartext, and the never-projected `http[].mirrors` list. The shared
+    // predicates are the translator's own decision (GHSA-gcwp-xp94-4pcv).
+    if http_routes.is_some_and(|routes| {
+        routes
+            .iter()
+            .any(crate::config_sources::k8s::virtual_service_route_mirror_is_deferred)
+    }) {
+        deferred.push(
+            "http[].mirror to a destination other than a loopback IP literal (not projected; \
+             Ferrum would send the mirror traffic in cleartext outside the mesh's mTLS, and a \
+             VirtualService cannot express the request_mirror allow_plaintext opt-in — use a \
+             request_mirror plugin with mirror_protocol https)",
+        );
+    }
+    if http_routes.is_some_and(|routes| {
+        routes
+            .iter()
+            .any(crate::config_sources::k8s::virtual_service_route_mirrors_are_deferred)
+    }) {
+        deferred.push(
+            "http[].mirrors (not projected; only a single http[].mirror to a loopback IP literal \
+             is translated)",
         );
     }
     // `http[].headers.{request,response}.{set,add,remove}` IS translated onto
@@ -3841,7 +3868,7 @@ mod tests {
                 "http": [
                     {
                         "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
-                        "mirror": { "host": "reviews-canary.default.svc.cluster.local" },
+                        "mirror": { "host": "127.0.0.1" },
                         "corsPolicy": { "allowOrigins": [ { "exact": "https://example.com" } ] }
                     }
                 ]
@@ -3867,6 +3894,55 @@ mod tests {
         assert!(
             !deferred.iter().any(|f| f.contains("mirror")),
             "http[].mirror is translated and must not be deferred, got {deferred:?}"
+        );
+    }
+
+    /// GHSA-gcwp-xp94-4pcv: a mirror to a Service host is omitted, not
+    /// refused. The VirtualService stays accepted and the omission is reported
+    /// in `deferred_fields`, as is the never-projected `mirrors` list.
+    #[test]
+    fn virtual_service_cleartext_mirror_is_deferred_not_refused() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "mirror-vs",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "mirror": { "host": "reviews-canary.default.svc.cluster.local" },
+                        "mirrors": [ { "destination": { "host": "reviews-shadow.default.svc.cluster.local" } } ]
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(
+            c["status"].as_str(),
+            Some("True"),
+            "the VirtualService must stay accepted"
+        );
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred
+                .iter()
+                .any(|f| f.starts_with("http[].mirror to a destination") && f.contains("mTLS")),
+            "the omitted mirror must be reported with its reason, got {deferred:?}"
+        );
+        assert!(
+            deferred.iter().any(|f| f.starts_with("http[].mirrors ")),
+            "the unprojected mirrors list must be reported, got {deferred:?}"
         );
     }
 

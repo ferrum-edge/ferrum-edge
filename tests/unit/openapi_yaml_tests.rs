@@ -7168,7 +7168,7 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         ),
         (
             "request_mirror",
-            json!({"mirror_host": "mirror.example", "max_in_flight": 8}),
+            json!({"allow_plaintext": true, "mirror_host": "mirror.example", "max_in_flight": 8}),
         ),
         (
             "request_transformer",
@@ -9944,6 +9944,7 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
     assert!(validate_plugin_config("request_mirror", &valid).is_ok());
 
     let typo = json!({
+        "allow_plaintext": true,
         "mirror_host": "mirror.local",
         "mirror_protcol": "https",
         "percentage": 0,
@@ -9988,22 +9989,22 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         }),
         // The runtime lowercases the protocol, so uppercase is the same setting.
         json!({"mirror_host": "127.0.0.1", "mirror_protocol": "HTTPS"}),
-        json!({"mirror_host": "[2001:db8::10]"}),
+        json!({"allow_plaintext": true, "mirror_host": "[2001:db8::10]"}),
         // The constructor strips one pair of brackets and parses an IP before
         // refusing colons, so bare IPv6 (bracketed for the URL authority) and
         // bracketed IPv4 (normalized to bare) are admitted. The schema models
         // the same IP grammar exactly.
-        json!({"mirror_host": "2001:db8::10"}),
-        json!({"mirror_host": " 2001:db8::10 "}),
-        json!({"mirror_host": "::"}),
+        json!({"allow_plaintext": true, "mirror_host": "2001:db8::10"}),
+        json!({"allow_plaintext": true, "mirror_host": " 2001:db8::10 "}),
+        json!({"allow_plaintext": true, "mirror_host": "::"}),
         json!({"mirror_host": "::1"}),
         json!({"mirror_host": "[::1]"}),
-        json!({"mirror_host": "1:2:3:4:5:6:7:8"}),
-        json!({"mirror_host": "1:2:3:4:5:6:7::"}),
-        json!({"mirror_host": "A:B:C:D:E:F:0:1"}),
-        json!({"mirror_host": "::ffff:192.0.2.1"}),
-        json!({"mirror_host": "1:2:3:4:5:6:1.2.3.4"}),
-        json!({"mirror_host": "[::ffff:192.0.2.1]"}),
+        json!({"allow_plaintext": true, "mirror_host": "1:2:3:4:5:6:7:8"}),
+        json!({"allow_plaintext": true, "mirror_host": "1:2:3:4:5:6:7::"}),
+        json!({"allow_plaintext": true, "mirror_host": "A:B:C:D:E:F:0:1"}),
+        json!({"allow_plaintext": true, "mirror_host": "::ffff:192.0.2.1"}),
+        json!({"allow_plaintext": true, "mirror_host": "1:2:3:4:5:6:1.2.3.4"}),
+        json!({"allow_plaintext": true, "mirror_host": "[::ffff:192.0.2.1]"}),
         json!({"mirror_host": "[127.0.0.1]"}),
         // Paired, fail-closed credential-forwarding opt-ins.
         json!({
@@ -10025,6 +10026,9 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": ["x-vault-"]}),
         json!({"mirror_host": "127.0.0.1", "percentage": 0}),
         json!({"mirror_host": "127.0.0.1", "mirror_path": ""}),
+        // The explicit cleartext opt-in for a non-loopback mirror host.
+        json!({"mirror_host": "shadow.internal", "allow_plaintext": true}),
+        json!({"mirror_host": "shadow.internal", "mirror_protocol": "http", "allow_plaintext": true}),
     ];
     // Every optional scalar and list accepts an explicit JSON null (the runtime
     // treats null as omitted), so the schema must not reject it by type.
@@ -10162,6 +10166,12 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         }),
         // A whole-valued float is not an integer literal.
         json!({"mirror_host": "127.0.0.1", "max_response_body_bytes": 1.0}),
+        // Cleartext (the default `http`) to a host that is not a loopback IP
+        // literal needs `allow_plaintext: true` (GHSA-gcwp-xp94-4pcv); the
+        // rule spans three sibling keys and the IP grammar of the host.
+        json!({"mirror_host": "shadow.internal"}),
+        json!({"mirror_host": "shadow.internal", "mirror_protocol": "http"}),
+        json!({"mirror_host": "10.0.0.7", "allow_plaintext": false}),
     ] {
         assert!(
             RequestMirror::new(&runtime_only_rejection, shared_client.clone()).is_err(),

@@ -924,6 +924,40 @@ async fn password_ref_rejects_disabled_tls_verification() {
     assert!(error.contains("`clickhouse.password_ref` cannot be used when ClickHouse TLS"));
 }
 
+/// reqwest's rustls backend disables hostname verification only with a pinned
+/// CA bundle or with certificate verification off, so `verify_hostname: false`
+/// with neither could never activate the sink; admission refuses it.
+#[tokio::test]
+async fn disabled_hostname_verification_requires_a_pinned_ca_or_no_verification() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://localhost:8443");
+    config["clickhouse"]["tls"] = json!({ "verify_hostname": false });
+    let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("verify_hostname: false without a CA bundle must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("`clickhouse.tls.verify_hostname: false` requires `clickhouse.tls.ca_file`"),
+        "got: {error}"
+    );
+    assert!(validate_plugin_config("api_chargeback_sink", &config).is_err());
+
+    for tls in [
+        json!({ "verify_hostname": false, "ca_file": "/nonexistent/clickhouse-ca.pem" }),
+        json!({ "verify_hostname": false, "insecure_skip_verify": true }),
+    ] {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"]["url"] = json!("https://localhost:8443");
+        config["clickhouse"]["tls"] = tls.clone();
+        if let Err(error) = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+            panic!("{tls} must be admitted: {error}");
+        }
+    }
+}
+
 /// Issue #2627: OpenAPI must reject the same required/cross-field failures the
 /// constructor rejects, and admit each minimal valid pricing shape.
 #[tokio::test]
@@ -1094,6 +1128,17 @@ async fn openapi_schema_matches_runtime_admission_boundaries() {
                 "clickhouse": {
                     "url": "https://clickhouse.example:8443",
                     "password_ref": "FERRUM_PLUGIN_SECRET_CLICKHOUSE_PASSWORD",
+                    "tls": { "verify_hostname": false }
+                },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "verify_hostname disabled without a pinned CA",
+            json!({
+                "clickhouse": {
+                    "url": "https://clickhouse.example:8443",
                     "tls": { "verify_hostname": false }
                 },
                 "spool": { "enabled": false },

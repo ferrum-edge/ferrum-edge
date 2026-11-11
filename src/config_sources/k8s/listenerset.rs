@@ -6,12 +6,25 @@
 //! [`super::GatewayApiListenerPolicy`] map as Gateway listeners so HTTP/L4
 //! route materialization stays one engine.
 //!
-//! Precedence for conflict resolution (pinned Gateway API v1.5.1):
+//! Precedence for conflict resolution (pinned Gateway API v1.5.1, GEP-1713:
+//! "the first Listener in the precedence list MUST be accepted", conflicting
+//! later listeners MUST be `Conflicted`):
 //! 1. Parent Gateway listeners
 //! 2. ListenerSets by oldest `metadata.creationTimestamp`
 //! 3. ListenerSets by `{namespace}/{name}`
+//!
+//! HTTP-family vs raw TCP/TLS-stream `ProtocolConflict` is decided per numeric
+//! TCP port across the whole process (one socket serves one family), with the
+//! same precedence extended across parents (GHSA-496f-3547-p3fw): every
+//! Gateway's own listeners form the first tier, then each ListenerSet in the
+//! global creation-time/name order. The first tier holding a claim on the port
+//! decides its family; later claims of the other family are `Conflicted` and
+//! the earlier claims keep serving, so a ListenerSet cannot withdraw a
+//! Gateway's (or an older ListenerSet's) listener. Only a tier that itself
+//! holds both families (two Gateways, one Gateway's own listeners, or one
+//! ListenerSet) withdraws every claim on that port.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::DateTime;
 use serde_json::Value;
@@ -308,7 +321,7 @@ fn collect_one_listenerset(
 
 /// Apply Gateway→ListenerSet precedence and mark conflicted listeners.
 pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: &[&K8sObject]) {
-    let listenerset_order = listenerset_precedence_index(objects);
+    acc.gateway_api_listenerset_precedence = listenerset_precedence_index(objects);
     let mut by_gateway: HashMap<(String, String), Vec<ConflictCandidate>> = HashMap::new();
 
     for (key, policy) in &acc.gateway_api_listener_policies {
@@ -323,15 +336,7 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                 None => continue,
             },
         };
-        let precedence = match key.parent_kind {
-            GatewayApiListenerParentKind::Gateway => 0u64,
-            GatewayApiListenerParentKind::ListenerSet => {
-                1 + listenerset_order
-                    .get(&(key.namespace.clone(), key.gateway.clone()))
-                    .copied()
-                    .unwrap_or(u64::MAX / 2)
-            }
-        };
+        let precedence = listener_claim_precedence(&*acc, key);
         by_gateway
             .entry(gateway)
             .or_default()
@@ -346,20 +351,35 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
     }
 
     let mut conflicted: HashMap<GatewayApiListenerKey, &'static str> = HashMap::new();
+    // ProtocolConflict losers refused by precedence (an earlier claim of the
+    // other family keeps the port), as opposed to an all-lose port.
+    let mut protocol_precedence_losers: HashSet<GatewayApiListenerKey> = HashSet::new();
 
     // ProtocolConflict is physical and process-wide: socket ownership is not
     // parent-Gateway-scoped (`GatewayListenerPlan::from_config` builds one
-    // global stream_ports set). For each numeric TCP port across every eligible
-    // managed Gateway and attached ListenerSet claim in this accumulator, if any
-    // eligible HTTP-family claim coexists with any eligible raw TCP/TLS-stream
-    // claim, every eligible claim in those two families is refused. TCP and UDP
-    // are independent socket namespaces, so a UDP/DTLS claim on the same
-    // numeric port is not a translation ProtocolConflict. Runtime admission
+    // global stream_ports set), so HTTP-family vs raw TCP/TLS-stream claims are
+    // arbitrated per numeric TCP port across every eligible managed Gateway
+    // and attached ListenerSet claim in this accumulator. TCP and UDP are
+    // independent socket namespaces, so a UDP/DTLS claim on the same numeric
+    // port is not a translation ProtocolConflict. Runtime admission
     // (`GatewayListenerPlan::quic_refused`) refuses only the optional QUIC/H3
     // half while both the HTTPS TCP listener and the UDP/DTLS stream remain
-    // materialized. A sequential accept/remove walk is wrong for 3+ claims
-    // (HTTP, TCP, HTTP): removing the first pair from `accepted` would let a
-    // later same-family sibling survive depending on listener/name order.
+    // materialized.
+    //
+    // Arbitration follows Gateway API precedence (GEP-1713: the first listener
+    // in the precedence list MUST be accepted, later conflicting ones MUST be
+    // Conflicted), extended across parents because the socket is shared
+    // (GHSA-496f-3547-p3fw). Tier 0 is every Gateway's own listeners; each
+    // ListenerSet is its own later tier in the global creation-time/name
+    // order. The first tier with a claim on the port decides:
+    //   - one family: every claim of that family (any tier) survives this
+    //     pass; every claim of the other family is Conflicted, so a ListenerSet
+    //     can never withdraw a Gateway's listener or an older ListenerSet's;
+    //   - both families: that tier is internally conflicted (two peer
+    //     Gateways, one Gateway, or one ListenerSet), so every family claim on
+    //     the port is Conflicted and no later tier may take the port over.
+    // The decision depends only on the claim set, never on listener or object
+    // observation order.
     let mut candidates_by_port: BTreeMap<u64, Vec<&ConflictCandidate>> = BTreeMap::new();
     for candidates in by_gateway.values() {
         for candidate in candidates.iter() {
@@ -375,15 +395,41 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
         }
     }
     for port_candidates in candidates_by_port.values() {
-        let has_http = port_candidates.iter().any(|candidate| {
-            listener_port_family(candidate.protocol.as_str()) == Some(ListenerPortFamily::Http)
-        });
-        let has_tcp_stream = port_candidates.iter().any(|candidate| {
-            listener_port_family(candidate.protocol.as_str()) == Some(ListenerPortFamily::TcpStream)
-        });
-        if has_http && has_tcp_stream {
-            for candidate in port_candidates {
-                conflicted.insert(candidate.key.clone(), "ProtocolConflict");
+        let has_family = |family: ListenerPortFamily| {
+            port_candidates
+                .iter()
+                .any(|candidate| listener_port_family(candidate.protocol.as_str()) == Some(family))
+        };
+        if !(has_family(ListenerPortFamily::Http) && has_family(ListenerPortFamily::TcpStream)) {
+            continue;
+        }
+        let Some(first_tier) = port_candidates
+            .iter()
+            .map(|candidate| candidate.precedence)
+            .min()
+        else {
+            continue;
+        };
+        let first_tier_families: HashSet<ListenerPortFamily> = port_candidates
+            .iter()
+            .filter(|candidate| candidate.precedence == first_tier)
+            .filter_map(|candidate| listener_port_family(candidate.protocol.as_str()))
+            .collect();
+        let winning_family = match first_tier_families.len() {
+            1 => first_tier_families.into_iter().next(),
+            _ => None,
+        };
+        for candidate in port_candidates {
+            let family = listener_port_family(candidate.protocol.as_str());
+            match winning_family {
+                Some(winner) if family == Some(winner) => {}
+                Some(_) => {
+                    conflicted.insert(candidate.key.clone(), "ProtocolConflict");
+                    protocol_precedence_losers.insert(candidate.key.clone());
+                }
+                None => {
+                    conflicted.insert(candidate.key.clone(), "ProtocolConflict");
+                }
             }
         }
     }
@@ -460,11 +506,19 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                     .unwrap_or(0);
                 // Deterministic bounded wording: numeric port + families only.
                 // Never echo object/listener/hostname names (cross-tenant risk).
-                format!(
-                    "Port \"{port}\" is claimed by incompatible protocol families on the same TCP \
-                     transport (HTTP-family vs raw stream), so every conflicting claim on this \
-                     port is refused (Conflicted)."
-                )
+                if protocol_precedence_losers.contains(key) {
+                    format!(
+                        "Port \"{port}\" is already claimed by a higher-precedence listener of the \
+                         other protocol family on the same TCP transport (HTTP-family vs raw \
+                         stream), so this claim is refused (Conflicted)."
+                    )
+                } else {
+                    format!(
+                        "Port \"{port}\" is claimed by incompatible protocol families on the same \
+                         TCP transport (HTTP-family vs raw stream), so every conflicting claim on \
+                         this port is refused (Conflicted)."
+                    )
+                }
             }
             "HostnameConflict" => {
                 "Listener hostname conflicts with a higher-precedence listener on the same port."
@@ -674,6 +728,23 @@ pub(super) fn refresh_listenerset_status_after_conflicts(acc: &mut K8sAccumulato
     }
 }
 
+/// A listener claim's position in Gateway API precedence (GEP-1713): `0` for
+/// any Gateway's own listener, then `1 + index` for a ListenerSet in the global
+/// oldest-`creationTimestamp`, then `{namespace}/{name}` order. A ListenerSet
+/// the index does not know sorts after every known one. Lower wins.
+pub(crate) fn listener_claim_precedence(acc: &K8sAccumulator, key: &GatewayApiListenerKey) -> u64 {
+    match key.parent_kind {
+        GatewayApiListenerParentKind::Gateway => 0,
+        GatewayApiListenerParentKind::ListenerSet => {
+            1 + acc
+                .gateway_api_listenerset_precedence
+                .get(&(key.namespace.clone(), key.gateway.clone()))
+                .copied()
+                .unwrap_or(u64::MAX / 2)
+        }
+    }
+}
+
 fn conflict_against_accepted(
     candidate: &ConflictCandidate,
     accepted: &[&ConflictCandidate],
@@ -706,7 +777,7 @@ fn conflict_against_accepted(
 /// opaque TCP/TLS stream siblings are not ProtocolConflict here —
 /// plaintext-vs-TLS HTTP shapes are refused by
 /// [`super::gateway_api::refuse_incompatible_same_port_listeners`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ListenerPortFamily {
     Http,
     TcpStream,

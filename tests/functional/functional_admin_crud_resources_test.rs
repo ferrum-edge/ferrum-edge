@@ -2371,7 +2371,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
         "statsd_logging" => json!({"host": "127.0.0.1", "port": 8125}),
         "loki_logging" => json!({"endpoint_url": "http://localhost:3100/loki/api/v1/push"}),
-        "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "request_mirror" => json!({"allow_plaintext": true, "mirror_host": "mirror.local"}),
         "load_testing" => {
             json!({
                 "key": "test-load-key-0123456789abcdef!!",

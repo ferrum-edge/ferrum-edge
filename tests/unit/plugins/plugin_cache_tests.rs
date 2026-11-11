@@ -3730,6 +3730,7 @@ async fn test_request_mirror_unknown_key_reload_keeps_last_known_good() {
             "request-mirror-1",
             "request_mirror",
             json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "percentage": 0,
                 "mirror_request_body": false
@@ -3749,6 +3750,7 @@ async fn test_request_mirror_unknown_key_reload_keeps_last_known_good() {
             "request-mirror-1",
             "request_mirror",
             json!({
+                "allow_plaintext": true,
                 "mirror_host": "mirror.local",
                 "mirror_protcol": "https",
                 "percentage": 0,

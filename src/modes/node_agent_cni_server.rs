@@ -957,6 +957,7 @@ mod tests {
             ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let labels = HashMap::new();
         let annotations = HashMap::new();
@@ -983,6 +984,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let labels = HashMap::new();
         let annotations = HashMap::new();
@@ -1261,6 +1263,7 @@ mod tests {
                     ifname: None,
                     netns_path: None,
                     valid_attachments: Vec::new(),
+                    pod_ips: Vec::new(),
                 },
                 respond: _resp,
             };
@@ -1278,6 +1281,7 @@ mod tests {
                 ifname: None,
                 netns_path: None,
                 valid_attachments: Vec::new(),
+                pod_ips: Vec::new(),
             },
             respond: resp_tx,
         };

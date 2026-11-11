@@ -143,6 +143,7 @@ mod tests {
             ifname: None,
             netns_path: Some("/var/run/netns/cni-1".to_string()),
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let resp =
             send_rpc(&socket_path_str, &req, Duration::from_secs(2)).expect("send_rpc succeeds");
@@ -164,6 +165,7 @@ mod tests {
             ifname: None,
             netns_path: None,
             valid_attachments: Vec::new(),
+            pod_ips: Vec::new(),
         };
         let err = send_rpc(
             &socket_path.to_string_lossy(),

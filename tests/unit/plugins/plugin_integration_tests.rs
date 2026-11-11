@@ -303,7 +303,7 @@ async fn test_plugin_creation_all_plugins() {
             "serverless_function" => {
                 json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
             }
-            "request_mirror" => json!({"mirror_host": "mirror.local"}),
+            "request_mirror" => json!({"allow_plaintext": true, "mirror_host": "mirror.local"}),
             "load_testing" => {
                 json!({
                     "key": "test-load-key-0123456789abcdef!!",
