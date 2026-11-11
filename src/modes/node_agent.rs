@@ -2356,9 +2356,9 @@ where
 
     // Optional CNI plugin listener: when enabled, spawns a UDS server that
     // funnels ADD/DEL/CHECK/STATUS/GC calls from the `ferrum-cni` binary into this
-    // loop via the `cni_work_rx` channel. When disabled (the default), the
-    // channel stays empty and the receiver in the select! arm parks
-    // forever — the kube-rs watcher remains the sole enrollment driver.
+    // loop via the `cni_work_rx` channel. When disabled (the default), no
+    // listener holds a sender and the select! arm is never enabled — the
+    // kube-rs watcher remains the sole enrollment driver.
     let (cni_work_tx, mut cni_work_rx): (_, CniWorkReceiver) = cni_work_channel();
     let mut cni_listener_handle = if cni_config.enabled {
         // Durable ownership rides beside the configured CNI socket. Rehydrate
@@ -2396,9 +2396,11 @@ where
     };
     // Drop the local sender so the receiver closes cleanly when the
     // listener task exits — otherwise the select! would park forever on
-    // the receiver during shutdown.
+    // the receiver during shutdown. With the listener disabled no sender
+    // remains and the receiver is closed from the start: keep its arm off
+    // rather than reading that as a listener that stopped serving (#7253).
     drop(cni_work_tx);
-    let mut cni_work_open = true;
+    let mut cni_work_open = cni_listener_handle.is_some();
 
     info!(
         "Node agent initialized, watching pod events on node {}",
