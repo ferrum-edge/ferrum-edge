@@ -487,24 +487,39 @@ PUBLISH_ARTIFACT_STEP_CONTRACTS = {
 # reads it as the tail of the `name:` field block rather than as part of `needs:`.
 # The whole block is therefore frozen as one control field: the published
 # rationale names exactly the manifests the `needs` graph waits for, and the two
-# must move together or not at all.
+# must move together or not at all: a rationale that names fewer manifests
+# than the release notes advertise would describe a gate the workflow does
+# not have.
 RELEASE_CREATE_RELEASE_NAME_COMMENT = (
-    "    # Wait for BOTH manifests: the release notes advertise the `:<tag>` "
-    "default\n"
-    "    # image AND the `:<tag>-ebpf` variant, so the GitHub Release must not "
-    "publish\n"
-    "    # until the eBPF manifest exists — otherwise the notes link `-ebpf` "
-    "tags that\n"
-    "    # were never pushed. Both `docker-manifest` and `docker-ebpf-manifest` "
-    "run\n"
-    "    # unconditionally on every `v*` tag (no `if:`/path filters), so this "
-    "keeps the\n"
-    "    # default release path intact.\n"
+    "    # Wait for ALL THREE manifests: the release notes advertise "
+    "the `:<tag>`\n"
+    "    # default image, the `:<tag>-ebpf` variant, AND the "
+    "`:<tag>-ebpf-tools`\n"
+    "    # Ambient UDP lifecycle variant, so the GitHub Release must not "
+    "publish until\n"
+    "    # every advertised manifest exists — otherwise the notes link "
+    "tags that were\n"
+    "    # never pushed. All three manifest jobs run unconditionally on "
+    "every `v*` tag\n"
+    "    # (no `if:`/path filters), so this keeps the default release "
+    "path intact.\n"
 )
 RELEASE_CREATE_RELEASE_NAME = (
     "    name: Create GitHub Release\n" + RELEASE_CREATE_RELEASE_NAME_COMMENT
 )
+# `create-release` publishes the GitHub Release page. Gating it on every
+# manifest keeps the page from advertising a family whose tags were never
+# pushed.
+RELEASE_CREATE_RELEASE_NEEDS = (
+    "    needs: [build-release-binaries, build-release-arm64-cross, "
+    "docker-manifest, docker-ebpf-manifest, "
+    "docker-ebpf-tools-manifest]\n"
+)
 
+# The release notes are the published description of what a release contains, and
+# they are inside the frozen `create-release` step list. Advertising a tag the
+# workflow does not sign, or omitting the one it does, is the failure this text
+# freeze exists to prevent.
 RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
       - uses: actions/checkout@0000000000000000000000000000000000000000
 
@@ -631,18 +646,32 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
           On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
           **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
           degrading. The published \`-ebpf\` image is **distroless** — it has no
-          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
-          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
-          published image **crash-loops**. To use the iptables fallback, build a
-          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
-          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
-          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
-          host iptables capture:
+          \`/bin/sh\` and no \`iptables\` — and stays that way on purpose:
 
           \`\`\`bash
           docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
           docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
           \`\`\`
+
+          The host iptables fallback and the Ambient host-network UDP capture
+          lifecycle run generated \`sh -c\` \`iptables\`/\`ip6tables\`/\`ip\`
+          commands, which the distroless \`-ebpf\` image cannot execute, so
+          \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` crash-loops there. Use the
+          **\`-ebpf-tools\`** variant instead: the same Linux-only eBPF build on a
+          Debian slim base carrying \`/bin/sh\`, \`iptables\`, \`ip6tables\`, and
+          \`ip\` (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)).
+          The mesh Helm chart auto-selects it for the Ambient UDP lifecycle:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf-tools
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf-tools
+          \`\`\`
+
+          All three image families — default, \`-ebpf\`, and \`-ebpf-tools\` — are
+          Cosign-signed on their immutable multi-arch digests in both registries
+          and carry SLSA provenance plus per-platform SPDX SBOM attestations; see
+          [docs/ci_cd.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/ci_cd.md#image-signatures-sboms-and-provenance)
+          for the verification commands.
 
           ## Checksums
 
@@ -680,6 +709,10 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 """
 
+# Every published family must be a first-class subject of this job: resolved,
+# compared across registries, SBOM'd, provenance'd, signed, attested, and
+# verified. A family that is published but skipped here ships an unsigned image
+# under a release tag the notes advertise.
 RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@0000000000000000000000000000000000000000
@@ -748,6 +781,10 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           resolve_manifest standard_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}"
           resolve_manifest ebpf_docker "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf"
           resolve_manifest ebpf_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"
+          resolve_manifest ebpftools_docker \
+            "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf-tools"
+          resolve_manifest ebpftools_ghcr \
+            "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf-tools"
 
           compare_registry_manifests() {
             local family="$1"
@@ -765,6 +802,7 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
 
           compare_registry_manifests standard
           compare_registry_manifests ebpf
+          compare_registry_manifests ebpftools
 
       - name: Generate SPDX SBOMs and manifest provenance
         env:
@@ -776,6 +814,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -827,6 +867,12 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
             "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
           generate_sboms \
             ebpf ghcr "$EBPF_GHCR_REF" \
+            "$GHCR_USERNAME" "$GHCR_TOKEN"
+          generate_sboms \
+            ebpftools docker "$EBPF_TOOLS_DOCKER_REF" \
+            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
+          generate_sboms \
+            ebpftools ghcr "$EBPF_TOOLS_GHCR_REF" \
             "$GHCR_USERNAME" "$GHCR_TOKEN"
 
           cat > "$work/create_provenance.jq" <<'JQ'
@@ -902,6 +948,16 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
             "ghcr.io/${GITHUB_REPOSITORY}" \
             "$work/ebpf_ghcr.manifest.json" \
             "$work/ebpf_ghcr.provenance.json"
+          create_provenance \
+            ebpftools \
+            ferrumedge/ferrum-edge \
+            "$work/ebpftools_docker.manifest.json" \
+            "$work/ebpftools_docker.provenance.json"
+          create_provenance \
+            ebpftools \
+            "ghcr.io/${GITHUB_REPOSITORY}" \
+            "$work/ebpftools_ghcr.manifest.json" \
+            "$work/ebpftools_ghcr.provenance.json"
 
       - name: Sign and attest immutable image digests
         env:
@@ -909,6 +965,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/image-attestations"
@@ -938,6 +996,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           sign_and_attest standard ghcr "$STANDARD_GHCR_REF"
           sign_and_attest ebpf docker "$EBPF_DOCKER_REF"
           sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"
+          sign_and_attest ebpftools docker "$EBPF_TOOLS_DOCKER_REF"
+          sign_and_attest ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"
 
       - name: Verify signatures, provenance, subjects, and SBOMs
         env:
@@ -945,6 +1005,8 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
           EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
           EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          EBPF_TOOLS_DOCKER_REF: ${{ steps.images.outputs.ebpftools_docker_ref }}
+          EBPF_TOOLS_GHCR_REF: ${{ steps.images.outputs.ebpftools_ghcr_ref }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/image-attestations"
@@ -1041,12 +1103,14 @@ RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
           verify_image standard ghcr "$STANDARD_GHCR_REF"
           verify_image ebpf docker "$EBPF_DOCKER_REF"
           verify_image ebpf ghcr "$EBPF_GHCR_REF"
+          verify_image ebpftools docker "$EBPF_TOOLS_DOCKER_REF"
+          verify_image ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"
 """
 
 RELEASE_ATTEST_RELEASE_IMAGES_JOB = (
     r"""  attest-release-images:
     name: Sign and attest release images
-    needs: [docker-manifest, docker-ebpf-manifest]
+    needs: [docker-manifest, docker-ebpf-manifest, docker-ebpf-tools-manifest]
     runs-on: ubuntu-26.04
     permissions:
       id-token: write
@@ -1193,254 +1257,6 @@ RELEASE_DOCKER_EBPF_MANIFEST_STEPS = r"""    steps:
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 """
 
-# ---------------------------------------------------------------------------
-# Third release image family (`-ebpf-tools`): a one-time, base-aware adoption.
-#
-# The release workflow publishes two image families today. A third one cannot be
-# introduced by an ordinary pull request, because every publishing job here is
-# frozen byte for byte, and the frozen text cannot be widened without a policy
-# change that this same policy refuses to let a pull request make. The transition
-# is therefore modelled exactly like the admitted fuzz lane: the trusted base is
-# read, and a pull request may either leave the release workflow at the shape the
-# base already carries or move it, in one step, to the complete three-family
-# shape written below. Nothing in between is accepted, and once the base carries
-# the three-family shape the two-family shape is no longer reachable.
-#
-# The three-family contracts are derived from the two-family originals by
-# anchored substitution rather than being restated, so the parts that must not
-# change cannot drift while the parts that must change are the visible diff.
-# Every anchor is required to occur an exact number of times; a miss is a policy
-# failure reported by `self_test`, never a silently skipped substitution.
-RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS: list[str] = []
-
-
-def adopted_release_contract(
-    text: str,
-    replacements: tuple[tuple[str, str, int], ...],
-    label: str,
-) -> str:
-    """Derive one three-family contract from its frozen two-family original."""
-
-    derived = text
-    for anchor, replacement, expected in replacements:
-        found = derived.count(anchor)
-        if found != expected:
-            RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS.append(
-                f"the {label} three-family adoption anchor {anchor[:120]!r} "
-                f"occurs {found} times, expected {expected}"
-            )
-            continue
-        derived = derived.replace(anchor, replacement, expected)
-    if derived == text:
-        RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS.append(
-            f"the {label} three-family contract is identical to the two-family "
-            "one, so the adoption would admit no change at all"
-        )
-    return derived
-
-
-# The release notes are the published description of what a release contains, and
-# they are inside the frozen `create-release` step list. Advertising a tag the
-# workflow does not sign, or omitting the one it does, is the failure this text
-# freeze exists to prevent.
-RELEASE_THREE_FAMILY_CREATE_RELEASE_STEPS = adopted_release_contract(
-    RELEASE_CREATE_RELEASE_STEPS,
-    (
-        (
-            r"""          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
-          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
-          published image **crash-loops**. To use the iptables fallback, build a
-          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
-          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
-          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
-          host iptables capture:
-
-          \`\`\`bash
-          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
-          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
-          \`\`\`
-""",
-            r"""          \`/bin/sh\` and no \`iptables\` — and stays that way on purpose:
-
-          \`\`\`bash
-          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
-          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
-          \`\`\`
-
-          The host iptables fallback and the Ambient host-network UDP capture
-          lifecycle run generated \`sh -c\` \`iptables\`/\`ip6tables\`/\`ip\`
-          commands, which the distroless \`-ebpf\` image cannot execute, so
-          \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` crash-loops there. Use the
-          **\`-ebpf-tools\`** variant instead: the same Linux-only eBPF build on a
-          Debian slim base carrying \`/bin/sh\`, \`iptables\`, \`ip6tables\`, and
-          \`ip\` (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)).
-          The mesh Helm chart auto-selects it for the Ambient UDP lifecycle:
-
-          \`\`\`bash
-          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf-tools
-          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf-tools
-          \`\`\`
-
-          All three image families — default, \`-ebpf\`, and \`-ebpf-tools\` — are
-          Cosign-signed on their immutable multi-arch digests in both registries
-          and carry SLSA provenance plus per-platform SPDX SBOM attestations; see
-          [docs/ci_cd.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/ci_cd.md#image-signatures-sboms-and-provenance)
-          for the verification commands.
-""",
-            1,
-        ),
-    ),
-    "create-release",
-)
-
-# Every published family must be a first-class subject of this job: resolved,
-# compared across registries, SBOM'd, provenance'd, signed, attested, and
-# verified. A family that is published but skipped here ships an unsigned image
-# under a release tag the notes advertise.
-RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_STEPS = adopted_release_contract(
-    RELEASE_ATTEST_RELEASE_IMAGES_STEPS,
-    (
-        (
-            '          resolve_manifest ebpf_ghcr '
-            '"ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"\n',
-            '          resolve_manifest ebpf_ghcr '
-            '"ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"\n'
-            "          resolve_manifest ebpftools_docker \\\n"
-            '            "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf-tools"\n'
-            "          resolve_manifest ebpftools_ghcr \\\n"
-            '            "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf-tools"\n',
-            1,
-        ),
-        (
-            "          compare_registry_manifests ebpf\n",
-            "          compare_registry_manifests ebpf\n"
-            "          compare_registry_manifests ebpftools\n",
-            1,
-        ),
-        # The same two refs are exported to each of the three shell steps that
-        # consume them, so this anchor is deliberately replaced three times.
-        (
-            "          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}\n",
-            "          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}\n"
-            "          EBPF_TOOLS_DOCKER_REF: "
-            "${{ steps.images.outputs.ebpftools_docker_ref }}\n"
-            "          EBPF_TOOLS_GHCR_REF: "
-            "${{ steps.images.outputs.ebpftools_ghcr_ref }}\n",
-            3,
-        ),
-        (
-            "          generate_sboms \\\n"
-            '            ebpf ghcr "$EBPF_GHCR_REF" \\\n'
-            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n',
-            "          generate_sboms \\\n"
-            '            ebpf ghcr "$EBPF_GHCR_REF" \\\n'
-            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n'
-            "          generate_sboms \\\n"
-            '            ebpftools docker "$EBPF_TOOLS_DOCKER_REF" \\\n'
-            '            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"\n'
-            "          generate_sboms \\\n"
-            '            ebpftools ghcr "$EBPF_TOOLS_GHCR_REF" \\\n'
-            '            "$GHCR_USERNAME" "$GHCR_TOKEN"\n',
-            1,
-        ),
-        (
-            "          create_provenance \\\n"
-            "            ebpf \\\n"
-            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
-            '            "$work/ebpf_ghcr.manifest.json" \\\n'
-            '            "$work/ebpf_ghcr.provenance.json"\n',
-            "          create_provenance \\\n"
-            "            ebpf \\\n"
-            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
-            '            "$work/ebpf_ghcr.manifest.json" \\\n'
-            '            "$work/ebpf_ghcr.provenance.json"\n'
-            "          create_provenance \\\n"
-            "            ebpftools \\\n"
-            "            ferrumedge/ferrum-edge \\\n"
-            '            "$work/ebpftools_docker.manifest.json" \\\n'
-            '            "$work/ebpftools_docker.provenance.json"\n'
-            "          create_provenance \\\n"
-            "            ebpftools \\\n"
-            '            "ghcr.io/${GITHUB_REPOSITORY}" \\\n'
-            '            "$work/ebpftools_ghcr.manifest.json" \\\n'
-            '            "$work/ebpftools_ghcr.provenance.json"\n',
-            1,
-        ),
-        (
-            '          sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"\n',
-            '          sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"\n'
-            '          sign_and_attest ebpftools docker "$EBPF_TOOLS_DOCKER_REF"\n'
-            '          sign_and_attest ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"\n',
-            1,
-        ),
-        (
-            '          verify_image ebpf ghcr "$EBPF_GHCR_REF"\n',
-            '          verify_image ebpf ghcr "$EBPF_GHCR_REF"\n'
-            '          verify_image ebpftools docker "$EBPF_TOOLS_DOCKER_REF"\n'
-            '          verify_image ebpftools ghcr "$EBPF_TOOLS_GHCR_REF"\n',
-            1,
-        ),
-    ),
-    "attest-release-images steps",
-)
-
-RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_JOB = (
-    adopted_release_contract(
-        RELEASE_ATTEST_RELEASE_IMAGES_JOB.replace(
-            RELEASE_ATTEST_RELEASE_IMAGES_STEPS,
-            RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_STEPS,
-            1,
-        ),
-        (
-            (
-                "    needs: [docker-manifest, docker-ebpf-manifest]\n",
-                "    needs: [docker-manifest, docker-ebpf-manifest, "
-                "docker-ebpf-tools-manifest]\n",
-                1,
-            ),
-        ),
-        "attest-release-images job",
-    )
-)
-
-# `create-release` publishes the GitHub Release page. Gating it on the third
-# manifest keeps the page from advertising a family whose tags were never
-# pushed.
-RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS = (
-    "    needs: [build-release-binaries, build-release-arm64-cross, "
-    "docker-manifest, docker-ebpf-manifest, "
-    "docker-ebpf-tools-manifest]\n"
-)
-
-# The rationale comment above that `needs` graph is part of the same frozen
-# control field, so the adoption moves it in the same step. Restating which
-# manifests the release page waits for is not cosmetic: the comment is the
-# reviewed justification for the gate, and a version of it that still says "BOTH
-# manifests" after a third family is published would describe a gate the workflow
-# no longer has.
-RELEASE_THREE_FAMILY_CREATE_RELEASE_NAME = adopted_release_contract(
-    RELEASE_CREATE_RELEASE_NAME,
-    (
-        (
-            RELEASE_CREATE_RELEASE_NAME_COMMENT,
-            "    # Wait for ALL THREE manifests: the release notes advertise "
-            "the `:<tag>`\n"
-            "    # default image, the `:<tag>-ebpf` variant, AND the "
-            "`:<tag>-ebpf-tools`\n"
-            "    # Ambient UDP lifecycle variant, so the GitHub Release must not "
-            "publish until\n"
-            "    # every advertised manifest exists — otherwise the notes link "
-            "tags that were\n"
-            "    # never pushed. All three manifest jobs run unconditionally on "
-            "every `v*` tag\n"
-            "    # (no `if:`/path filters), so this keeps the default release "
-            "path intact.\n",
-            1,
-        ),
-    ),
-    "create-release name",
-)
-
 # The `-ebpf-tools` tag family assembles from its own digest name space in its
 # own job. It publishes by wildcard exactly like the other manifest jobs, so its
 # whole step list is frozen: the download pattern, the working directory the
@@ -1510,10 +1326,11 @@ RELEASE_DOCKER_EBPF_TOOLS_MANIFEST_STEPS = r"""    steps:
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 """
 
-RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS = (
+RELEASE_TOOLS_MANIFEST_NEEDS = (
     "    needs: [build-release-binaries, docker-manifest, "
     "docker-ebpf, docker-ebpf-manifest]\n"
 )
+
 # The eBPF producer owns package-write credentials and the source tree handed to
 # both image builds. Freezing only its named build/export/upload fragments is not
 # sufficient: an extra step could rewrite the Docker context before either
@@ -1553,11 +1370,31 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
           outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
           provenance: false
 
+      # `-ebpf-tools`: the Ambient UDP lifecycle runtime the mesh chart selects
+      # for `ambient.captureMode`-independent UDP capture (#3705). It is built in
+      # THIS job, from the same source and the same `FEATURES`, so the tools tag
+      # can never lag or drift from the `-ebpf` tag the chart's other tiers use;
+      # its manifest is gated by exactly the same release path below.
+      - name: Build and push per-platform eBPF tools digest
+        id: build_tools
+        uses: docker/build-push-action@0000000000000000000000000000000000000000
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime-ebpf-tools
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
       - name: Export digest
         run: |
-          mkdir -p /tmp/digests
+          mkdir -p /tmp/digests /tmp/digests-tools
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
+          tools_digest="${{ steps.build_tools.outputs.digest }}"
+          touch "/tmp/digests-tools/${tools_digest#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@0000000000000000000000000000000000000000
@@ -1565,59 +1402,14 @@ RELEASE_DOCKER_EBPF_STEPS = r"""    steps:
           name: docker-ebpf-digest-${{ matrix.arch_dir }}
           path: /tmp/digests/*
           if-no-files-found: error
-"""
 
-RELEASE_DOCKER_EBPF_BUILD_STEP = r"""      - name: Build and push per-platform eBPF digest
-        id: build
-        uses: docker/build-push-action@0000000000000000000000000000000000000000
+      - name: Upload tools digest
+        uses: actions/upload-artifact@0000000000000000000000000000000000000000
         with:
-          context: .
-          file: Dockerfile
-          target: runtime-ebpf
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            FEATURES=cloud-secrets,ebpf
-          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
-          provenance: false
+          name: docker-ebpf-tools-digest-${{ matrix.arch_dir }}
+          path: /tmp/digests-tools/*
+          if-no-files-found: error
 """
-RELEASE_DOCKER_EBPF_EXPORT_DIGEST_STEP = r"""      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-"""
-RELEASE_DOCKER_EBPF_TOOLS_COMMENT = r"""      # `-ebpf-tools`: the Ambient UDP lifecycle runtime the mesh chart selects
-      # for `ambient.captureMode`-independent UDP capture (#3705). It is built in
-      # THIS job, from the same source and the same `FEATURES`, so the tools tag
-      # can never lag or drift from the `-ebpf` tag the chart's other tiers use;
-      # its manifest is gated by exactly the same release path below.
-"""
-RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS = adopted_release_contract(
-    RELEASE_DOCKER_EBPF_STEPS,
-    (
-        (
-            RELEASE_DOCKER_EBPF_BUILD_STEP,
-            RELEASE_DOCKER_EBPF_BUILD_STEP
-            + "\n"
-            + RELEASE_DOCKER_EBPF_TOOLS_COMMENT
-            + DOCKER_EBPF_TOOLS_BUILD_STEP,
-            1,
-        ),
-        (
-            RELEASE_DOCKER_EBPF_EXPORT_DIGEST_STEP,
-            DOCKER_EBPF_TOOLS_EXPORT_DIGEST_STEP,
-            1,
-        ),
-        (
-            DOCKER_EBPF_UPLOAD_DIGEST_STEP,
-            DOCKER_EBPF_UPLOAD_DIGEST_STEP
-            + "\n"
-            + DOCKER_EBPF_TOOLS_UPLOAD_DIGEST_STEP,
-            1,
-        ),
-    ),
-    "docker-ebpf steps",
-)
 
 # Direct fields of these jobs form a closed set. This is the semantic equivalent
 # of an exact whole-job contract while allowing comments to remain review notes:
@@ -1643,7 +1435,7 @@ GATEWAY_WORKFLOW_FILENAME = "gateway-api-conformance.yml"
 
 PUBLISH_EXACT_JOB_CONTRACTS = {
     "release workflow": {
-        "attest-release-images": RELEASE_THREE_FAMILY_ATTEST_RELEASE_IMAGES_JOB,
+        "attest-release-images": RELEASE_ATTEST_RELEASE_IMAGES_JOB,
     },
 }
 
@@ -1661,9 +1453,9 @@ PUBLISH_FORBIDDEN_TOP_LEVEL_KEYS = {
 PUBLISH_CONTROL_CONTRACTS = {
     "release workflow": {
         "create-release": {
-            "name": RELEASE_THREE_FAMILY_CREATE_RELEASE_NAME,
-            "needs": RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
-            "steps": RELEASE_THREE_FAMILY_CREATE_RELEASE_STEPS,
+            "name": RELEASE_CREATE_RELEASE_NAME,
+            "needs": RELEASE_CREATE_RELEASE_NEEDS,
+            "steps": RELEASE_CREATE_RELEASE_STEPS,
         },
         "docker": {
             "needs": (
@@ -1704,7 +1496,7 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "            platform: linux/arm64\n"
                 "            arch_dir: arm64\n"
             ),
-            "steps": RELEASE_THREE_FAMILY_DOCKER_EBPF_STEPS,
+            "steps": RELEASE_DOCKER_EBPF_STEPS,
         },
         "docker-ebpf-manifest": {
             "needs": (
@@ -1715,7 +1507,7 @@ PUBLISH_CONTROL_CONTRACTS = {
         },
         RELEASE_TOOLS_MANIFEST_JOB_NAME: {
             "name": "    name: Docker eBPF Tools Manifest\n",
-            "needs": RELEASE_THREE_FAMILY_TOOLS_MANIFEST_NEEDS,
+            "needs": RELEASE_TOOLS_MANIFEST_NEEDS,
             "runs-on": "    runs-on: ubuntu-26.04\n",
             "permissions": (
                 "    permissions:\n"
@@ -26999,8 +26791,6 @@ pre_build = []
     # ----------------------------------------------------------------------
     # The three release image families (default, `-ebpf`, `-ebpf-tools`).
     # ----------------------------------------------------------------------
-    failures.extend(RELEASE_THREE_FAMILY_SUBSTITUTION_ERRORS)
-
     release_control = PUBLISH_CONTROL_CONTRACTS["release workflow"]
 
     # Every published image family must be a first-class subject of the frozen
