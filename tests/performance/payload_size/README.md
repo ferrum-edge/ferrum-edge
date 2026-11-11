@@ -412,7 +412,7 @@ The P99 advantage is most pronounced on HTTP/1.1 at 10KB-100KB, where Ferrum del
 - **Response body coalescing** — `CoalescingBody` batches small response chunks (8-32 KB) into 128 KB frames, reducing write syscalls ~16x for large streaming responses
 - **Small response buffering** — `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (default 64 KiB) eagerly buffers response bodies with known Content-Length ≤ cutoff into a single allocation, eliminating async coalescing adapter overhead for typical JSON API payloads. SSE responses always stream regardless
 - **Frequency-aware router cache eviction** — Count-Min Sketch frequency estimation replaces random 25% eviction, protecting hot route entries from scanner traffic
-- **Thread-local Date header caching** — `date_cache::get_cached_date()` refreshed once per second per thread, avoids `SystemTime::now()` + formatting on every response
+- **Thread-local Date header caching** — hyper's server caches the formatted `Date` header per thread and refreshes it once per second, avoiding `SystemTime::now()` + formatting on every response
 - **Lazy timeout wrapper** — `lazy_timeout::lazy_timeout()` defers tokio timer allocation until inner future returns `Pending`, eliminating timer overhead on fast-path operations
 - **TCP_FASTOPEN + IP_BIND_ADDRESS_NO_PORT** — Linux socket optimizations saving 1 RTT on repeat connections and preventing ephemeral port exhaustion
 - **RED adaptive load shedding** — Linear probability ramp between pressure and critical thresholds for smoother degradation
