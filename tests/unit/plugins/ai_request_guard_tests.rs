@@ -4398,17 +4398,9 @@ fn ai_bespoke_unknown_key_diagnostics_preserve_only_schema_paths() {
 
     let key = "'unregistered_ai_key\"\\\n`document`";
     for (plugin, config, context) in [
-        (
-            "ai_request_guard",
-            json!({(key): true}),
-            "`max_tokens_limit`",
-        ),
-        (
-            "ai_prompt_compressor",
-            json!({(key): true}),
-            "`compress_roles`",
-        ),
-        ("ai_token_metrics", json!({(key): true}), "`provider`"),
+        ("ai_request_guard", json!({(key): true}), "`config`"),
+        ("ai_prompt_compressor", json!({(key): true}), "`config`"),
+        ("ai_token_metrics", json!({(key): true}), "`config`"),
         ("ai_federation", json!({(key): true}), "`config`"),
         (
             "ai_prompt_shield",

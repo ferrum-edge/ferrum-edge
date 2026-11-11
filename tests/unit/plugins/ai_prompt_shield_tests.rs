@@ -3431,7 +3431,7 @@ fn test_custom_pattern_entries_reject_unknown_members() {
     .err()
     .unwrap_or_else(|| panic!("nested unknown member must be fatal"));
     assert!(
-        err.contains("`custom_patterns[1]` key \"note\""),
+        err.contains("`custom_patterns[1]`") && err.contains("\"custom_patterns[1].note\""),
         "error must carry the entry index, got: {err}"
     );
 
